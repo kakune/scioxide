@@ -1,0 +1,869 @@
+---
+title: "Collocation for two-point boundary value problems"
+description: "Solve first-order systems determined by both endpoints using three-stage Lobatto IIIA collocation (fourth-order) and residual-based mesh refinement. Newton and linear solvers, two Bratu solutions and unknown parameters, singular endpoint terms, and interpreting Plans, workspaces, and statuses."
+sidebar:
+  order: 370
+references:
+  ode-bvp-collocation-equations: "three-stage-lobatto-iiia-collocation-equations"
+  ode-bvp-newton-and-backends: "newton-iteration-and-linear-solvers"
+  ode-bvp-residual-control: "residual-error-estimation-and-mesh-refinement"
+  ode-bratu-two-solutions: "two-solutions-of-the-bratu-problem"
+  ode-bratu-unknown-parameter: "passing-a-fold-with-an-unknown-parameter"
+  ode-bvp-singular-endpoint: "singular-endpoint-terms"
+  ode-bvp-plans-and-termination: "plans-workspaces-and-termination-statuses"
+---
+
+Initial value problems supply all of $y(t_0)$ and advance one time step at a time.
+Two-point boundary value problems (BVPs) split conditions between endpoints of $[a, b]$ and may include unknown parameters $p$.
+
+$$
+y'(x) = f(x, y(x), p), \qquad g\bigl(y(a), y(b), p\bigr) = 0, \qquad a \le x \le b
+$$
+
+The state $y$ has $n$ components, $p$ contains $k$ unknown parameters, and boundary conditions $g$ must number $n + k$.
+The coordinate $x$ is real; states and parameters may be complex.
+Complex Jacobians are treated as complex-linear, requiring holomorphic $f$ and $g$.
+
+The crate `scioxide-ode` provides whole-interval collocation through `BvpPlan` and one-shot `solve_bvp`.
+It does not provide shooting, which finds unknown left-end initial values through root finding.
+Shooting amplifies initial-value errors for exponentially growing solutions.
+If needed, compose it from initial value integrator objects and scioxide-rootfind.
+
+## Three-stage Lobatto IIIA collocation equations
+
+Combine mesh values $y_j$ at $a = x_0 < x_1 < \dots < x_{m-1} = b$ and unknown parameters $p$ into $mn + k$ unknowns.
+On each interval $[x_j, x_{j+1}]$ (width $h_j$), use cubic Hermite polynomial $u(x)$ through endpoint values $y_j, y_{j+1}$ and slopes $f_j = f(x_j, y_j, p)$ and $f_{j+1}$.
+The interpolant $u$ has continuous values and first derivatives across interval boundaries ($C^1$).
+The midpoint value of $u$ is
+
+$$
+y_{j+1/2} = \frac{y_j + y_{j+1}}{2} - \frac{h_j}{8}\,(f_{j+1} - f_j)
+$$
+
+with slope $f_{j+1/2} = f(x_j + h_j/2,\ y_{j+1/2},\ p)$ there.
+Collocation equations take Simpson-rule form,
+
+$$
+\frac{y_{j+1} - y_j}{h_j} - \frac{f_j + 4 f_{j+1/2} + f_{j+1}}{6} = 0, \qquad j = 0, \dots, m-2
+$$
+
+
+This enforces $u' = f$ at endpoints and midpoint, giving three-stage Lobatto IIIA.
+Combining $(m-1)n$ collocation equations and $n+k$ boundary conditions matches the $mn + k$ unknowns.
+For smooth solutions, mesh-point errors are $O(h^4)$ (fourth-order).
+The solution is $C^1$ cubic Hermite interpolation of mesh values and slopes; `BvpSolution::evaluate_into(x, &mut y)` returns values anywhere in $[a, b]$, and `evaluate_with_derivative_into` returns values and derivatives.
+At mesh points, stored values and slopes are returned directly; evaluating one point costs $O(\log m + n)$ for $m$ mesh points.
+
+## Newton iteration and linear solvers
+
+Solve these $mn + k$ nonlinear equations by damped Newton with backtracking line search.
+The inner solver is scioxide-rootfind Newton–Krylov, normalizing collocation residuals in units of 1/1000 of tolerance and boundary residuals in units of 1/1000 of boundary tolerance for stopping.
+Supply controls through `BvpNewtonOptions`.
+Defaults match scioxide-rootfind's `NewtonKrylovOptions`: at most 100 Newton iterations per mesh, Armijo constant $10^{-4}$, minimum relative step $\varepsilon^{2/3}$ ($\varepsilon$ is machine epsilon), nonmonotone line-search weight 0.85, and Eisenstat–Walker stopping for Krylov corrections.
+Override through `with_max_iterations`, `with_backtracking`, `with_nonmonotone`, and `with_forcing`, supplying through `BvpOptions::with_newton`.
+
+Select Newton correction linear solvers through `BvpBackend`.
+Only the selected solver is used, without switching.
+
+| `BvpBackend` | Correction-system solution | Memory and suitable cases |
+|---|---|---|
+| `Sparse { limits }` (default) | Pivoted sparse LU of an assembled block-sparse matrix | Memory proportional to mesh size. Under `limits: None`, determine fill and memory bounds per mesh |
+| `Dense` | Partial-pivoted LU of an assembled dense matrix | Memory proportional to $(mn + k)^2$, restricting use to few mesh points and small dimensions |
+| `Krylov { iterations, restart }` | Restarted GMRES without matrix assembly | No matrix storage. Without preconditioning, larger meshes readily exhaust iterations |
+
+Systems implement `BvpSystem`, supplying dimension `dimension`, unknown-parameter count `parameter_dimension` (default 0), `rhs` writing right-hand side $f(x, y, p)$, and `boundary` writing $n + k$ boundary residuals $g(y(a), y(b), p)$.
+Select Jacobians through `BvpProblem`.
+`BvpProblem::analytic(&system)` uses local Jacobians from `BvpJacobian` (right-hand-side $\partial f/\partial y$ and $\partial f/\partial p$, boundary $\partial g/\partial y(a)$, $\partial g/\partial y(b)$, and $\partial g/\partial p$, all row-major).
+The policy `BvpProblem::numerical(&system)` uses forward differences: local blocks for direct solvers, full-collocation Jacobian–vector products for `Krylov`.
+
+## Residual error estimation and mesh refinement
+
+After solving, residual $r(x) = u'(x) - f(x, u(x), p)$ measures how well $u$ satisfies the differential equation.
+Normalize each component $i$ as $\tilde r_i = r_i / (\varepsilon_{\mathrm{abs}} + \varepsilon_{\mathrm{rel}} |f_i(x, u(x), p)|)$ and require on every interval
+
+$$
+\left( \frac{1}{h_j} \int_{x_j}^{x_{j+1}} \lVert \tilde r(x) \rVert_2^2 \, dx \right)^{1/2} \le 1
+$$
+
+
+Use five-point Lobatto quadrature for the integral.
+Endpoint collocation gives $u' = f$ at both endpoints, so evaluate the right-hand side only at three points: midpoint and offsets $\pm\sqrt{3/7}\,h_j/2$.
+One residual evaluation calls the right-hand side $4m - 3$ times for $m$ mesh points, and boundary conditions once.
+The maximum interval residual is report `max_residual()`; boundary residual $\max_i |g_i|$ is `boundary_residual()`.
+
+Termination is `BvpTermination::Converged` when all of the following hold.
+
+- Every interval has normalized residual at most 1 (`max_residual() <= 1`).
+- Boundary residuals satisfy boundary tolerance.
+  Boundary tolerance is absolute only; its relative part must be zero.
+- With singular terms, residual $S\,y(a)$ also meets boundary tolerance.
+
+Otherwise bisect every interval whose normalized residual exceeds 1 and solve on the new mesh from current solution $u$.
+Default tolerances are $\varepsilon_{\mathrm{abs}} = \varepsilon_{\mathrm{rel}} = 10^{-3}$ for differential equations and $10^{-3}$ for boundaries, with at most 20 refinements, configurable through `BvpOptions::with_tolerances` and `with_refinements`.
+
+Control concerns residuals, not error $u - y$.
+They are close for well-conditioned problems, but report residuals do not bound errors.
+Check against analytical solutions, invariants, or solutions with more mesh points.
+
+## Two solutions of the Bratu problem
+
+The Bratu problem, a one-dimensional thermal-runaway combustion model (Gelfand problem),
+
+$$
+u'' + \lambda e^{u} = 0, \qquad u(0) = u(1) = 0
+$$
+
+becomes first-order system $n = 2$ with $y = (u, u')$.
+The dimensionless parameter $\lambda > 0$ measures heat release, and $u$ is dimensionless temperature.
+The analytical solution is
+
+$$
+u(x) = 2\ln\cosh\frac{\theta}{4} - 2\ln\cosh\frac{(x - 1/2)\,\theta}{2}, \qquad \theta = \sqrt{2\lambda}\,\cosh\frac{\theta}{4}
+$$
+
+where the equation for $\theta$ has two roots when $0 < \lambda < \lambda_c \approx 3.513831$.
+The BVP therefore has a lower solution with small $u$ and an upper solution with large values.
+At $\lambda = 1$ they are $\theta = 1.517165$ ($u(1/2) = 0.140539$) and $\theta = 10.938703$ ($u(1/2) = 4.091467$).
+scioxide-rootfind follows the same problem's finite-difference approximation using [Pseudo-arclength continuation](oxref:rootfind-bratu-branch), obtaining both solutions at the same $\lambda = 1$ ([Tracking solution branches by continuation](../../../scioxide-rootfind/algorithms/continuation-and-deflation/)).
+
+The following block defines helpers shared by two cells.
+The type `Bratu { lambda, slope }` supplies a system with given $\lambda$ when `slope` is `None`, or treats $\lambda$ as unknown parameter $p_0$ and adds boundary condition $u'(0) = s$ when it is `Some(s)`.
+Its `BvpJacobian` implementation returns analytical local Jacobians.
+The function `bratu_exact` is the analytical solution, and `reference_root` Brent root finding for references.
+
+```rust
+//| id: ode-bratu-model
+//| kind: definitions
+//| title: "Bratu system, local Jacobians, and reference values"
+//| crates: [scioxide-core, scioxide-ode, scioxide-rootfind]
+use scioxide_core::{
+    SciOxideError, Interval, RealScalar, ResidualTolerance, SolveContext, StepTolerance,
+};
+use scioxide_linalg::Matrix;
+use scioxide_ode::{BvpJacobian, BvpSolution, BvpSystem};
+use scioxide_rootfind::{Brent, ScalarFn, ScalarRootOptions, ScalarRootSolver};
+
+/// Bratu u'' + λeᵘ = 0, u(0) = u(1) = 0 as first-order system y = (u, u').
+/// For slope = Some(s), treat λ as unknown p[0] and add third boundary condition u'(0) = s.
+pub(crate) struct Bratu {
+    pub(crate) lambda: f64,
+    pub(crate) slope: Option<f64>,
+}
+impl Bratu {
+    fn lambda(&self, p: &[f64]) -> f64 {
+        if self.slope.is_some() {
+            p[0]
+        } else {
+            self.lambda
+        }
+    }
+}
+impl BvpSystem<f64> for Bratu {
+    fn dimension(&self) -> usize {
+        2
+    }
+    fn parameter_dimension(&self) -> usize {
+        usize::from(self.slope.is_some())
+    }
+    fn rhs(
+        &self,
+        _: f64,
+        y: &[f64],
+        p: &[f64],
+        out: &mut [f64],
+        _: &mut SolveContext<'_, '_>,
+    ) -> Result<(), SciOxideError> {
+        out[0] = y[1];
+        out[1] = -self.lambda(p) * scioxide_core::RealScalar::exp(y[0]);
+        Ok(())
+    }
+    fn boundary(
+        &self,
+        a: &[f64],
+        b: &[f64],
+        _: &[f64],
+        out: &mut [f64],
+        _: &mut SolveContext<'_, '_>,
+    ) -> Result<(), SciOxideError> {
+        out[0] = a[0];
+        out[1] = b[0];
+        if let Some(s) = self.slope {
+            out[2] = a[1] - s;
+        }
+        Ok(())
+    }
+}
+/// Local Jacobians are row-major. Boundary row 0 depends on u at y(a), row 1 on u at y(b), and row 2 on u' at y(a).
+impl BvpJacobian<f64> for Bratu {
+    fn rhs_jacobian(
+        &self,
+        _: f64,
+        y: &[f64],
+        p: &[f64],
+        state: &mut [f64],
+        parameters: &mut [f64],
+        _: &mut SolveContext<'_, '_>,
+    ) -> Result<(), SciOxideError> {
+        let e = scioxide_core::RealScalar::exp(y[0]);
+        state.copy_from_slice(&[0.0, 1.0, -self.lambda(p) * e, 0.0]);
+        if self.slope.is_some() {
+            parameters.copy_from_slice(&[0.0, -e]);
+        }
+        Ok(())
+    }
+    fn boundary_jacobian(
+        &self,
+        _: &[f64],
+        _: &[f64],
+        _: &[f64],
+        a: &mut [f64],
+        b: &mut [f64],
+        parameters: &mut [f64],
+        _: &mut SolveContext<'_, '_>,
+    ) -> Result<(), SciOxideError> {
+        let rows = a.len() / 2;
+        a.fill(0.0);
+        b.fill(0.0);
+        parameters.fill(0.0);
+        a[0] = 1.0;
+        b[2] = 1.0;
+        if rows == 3 {
+            a[5] = 1.0;
+        }
+        Ok(())
+    }
+}
+/// Analytical u(x) = 2 ln cosh(θ/4) − 2 ln cosh((x − 1/2)θ/2) (reference from f64 inherent methods).
+pub(crate) fn bratu_exact(x: f64, theta: f64) -> f64 {
+    2.0 * (theta / 4.0).cosh().ln() - 2.0 * ((x - 0.5) * theta / 2.0).cosh().ln()
+}
+/// Initial guess u = A sin(πx), u' = Aπ cos(πx), one row per mesh point.
+pub(crate) fn sine_guess(mesh: &[f64], amplitude: f64) -> Result<Matrix<f64>, SciOxideError> {
+    let pi = core::f64::consts::PI;
+    let values = mesh.iter().flat_map(|&x| {
+        let (s, c) = RealScalar::sin_cos(pi * x);
+        [amplitude * s, amplitude * pi * c]
+    });
+    Matrix::from_vec(mesh.len(), 2, values.collect())
+}
+/// One table row: (solution branch, θ, u(1/2), max|u − u_analytical|, maximum normalized residual, mesh points, refinements, termination status).
+pub(crate) type Row = (&'static str, f64, f64, f64, f64, usize, usize, String);
+/// Compare at 101 points with the analytical solution, returning a row, convergence flag, and plotted points.
+pub(crate) fn summarize(
+    branch: &'static str,
+    theta: f64,
+    solution: &BvpSolution<f64>,
+) -> Result<(Row, bool, Vec<[f64; 2]>), SciOxideError> {
+    let (mut y, mut points, mut worst) = ([0.0; 2], Vec::new(), 0.0_f64);
+    for x in (0..=100).map(|i| f64::from(i) / 100.0) {
+        solution.evaluate_into(x, &mut y)?;
+        worst = worst.max((y[0] - bratu_exact(x, theta)).abs());
+        points.push([x, y[0]]);
+    }
+    solution.evaluate_into(0.5, &mut y)?;
+    let report = solution.report().ok_or_else(|| {
+        SciOxideError::invalid_input(
+            scioxide_core::argument!("solution"),
+            scioxide_core::InvalidInputReason::Empty,
+            "no report",
+        )
+    })?;
+    let status = format!("{:?}", report.termination());
+    let residual = report.max_residual();
+    let row = (
+        branch,
+        theta,
+        y[0],
+        worst,
+        residual,
+        report.nodes(),
+        report.refinements(),
+        status,
+    );
+    Ok((row, report.is_success(), points))
+}
+/// Reference roots: Brent zero of g on [lo, hi] to 10⁻¹⁵.
+pub(crate) fn reference_root(
+    g: impl Fn(f64) -> f64,
+    lo: f64,
+    hi: f64,
+) -> Result<f64, SciOxideError> {
+    let options = ScalarRootOptions::default()
+        .with_residual_tolerance(ResidualTolerance::new(1e-15, 0.0)?)
+        .with_step_tolerance(StepTolerance::new(1e-15, 1e-15)?);
+    let f = ScalarFn::new(|t: f64| Ok(g(t)));
+    let result = Brent.solve(&f, Interval::new(lo, hi)?, &options)?;
+    Ok(result.point())
+}
+```
+
+The next cell reuses one Plan (`BvpPlan`) twice with initial-guess $u_0 = A \sin \pi x$ amplitudes $A = 0.1$ and $A = 4$, obtaining both solutions with analytical Jacobians.
+Limits are 400 mesh points and 64 MiB workspace; the linear solver is default sparse LU.
+Find reference $\theta$ by Brent and compare the computed solution with the analytical solution at 101 points.
+The last row gives the lower solution from one-shot `solve_bvp` (default tolerance $10^{-3}$, difference Jacobians).
+As $\lambda$ approaches $\lambda_c$, both solutions approach one another and Newton Jacobians approach singularity.
+
+```rust
+//| id: ode-bratu-collocation
+//| ref: ode-bratu-collocation
+//| title: "Compute lower and upper Bratu solutions by collocation"
+//| run: button
+//| uses: [ode-bratu-model]
+//| crates: [scioxide-core, scioxide-linalg, scioxide-ode, scioxide-rootfind]
+//| inputs:
+//|   lambda: {"type":"range","label":"Parameter λ [-]","description":"Closer to fold λc ≈ 3.5138, the two solutions approach one another.","min":0.2,"max":3.4,"step":0.1,"value":1}
+//|   tolerance_exponent: {"type":"range","label":"Exponent q of tolerance 10^q","description":"Absolute and relative differential-residual tolerances and absolute boundary tolerance.","min":-9,"max":-3,"step":1,"value":-6}
+//| cases:
+//|   - {"id":"tight","label":"q = −9","description":"The upper solution reaches 400 mesh points and stops with NodeLimit.","inputs":{"tolerance_exponent":-9}}
+//|   - {"id":"small-lambda","label":"λ = 0.2","description":"An amplitude-4 initial guess also converges to the lower solution.","inputs":{"lambda":0.2}}
+//|   - {"id":"near-fold","label":"λ = 3.4","description":"The two u(1/2) values approach one another.","inputs":{"lambda":3.4}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"branches","path":"/rows/0/2","approx":{"value":0.140539,"atol":1e-6}}
+//|       - {"artifact":"branches","path":"/rows/1/2","approx":{"value":4.091467,"atol":1e-6}}
+//|       - {"artifact":"branches","path":"/rows/0/3","range":{"max":1e-7}}
+//|       - {"artifact":"branches","path":"/rows/1/3","range":{"max":1e-7}}
+//|       - {"artifact":"branches","path":"/rows/2/3","range":{"max":1e-6}}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+//|   - case: tight
+//|     expect:
+//|       - {"artifact":"branches","path":"/rows/1/7","equals":"NodeLimit"}
+//|       - {"artifact":"branches","path":"/rows/0/3","range":{"max":1e-11}}
+//|       - {"path":"/outputs/2/state","equals":"partial"}
+//|   - case: small-lambda
+//|     expect:
+//|       - {"artifact":"branches","path":"/rows/1/3","range":{"min":1}}
+//|   - case: near-fold
+//|     expect:
+//|       - {"artifact":"branches","path":"/rows/0/2","approx":{"value":0.909143,"atol":1e-5}}
+//|       - {"artifact":"branches","path":"/rows/1/2","approx":{"value":1.515097,"atol":1e-5}}
+use scioxide_core::{RealScalar, ResidualTolerance};
+use scioxide_ode::{BvpOptions, BvpPlan, BvpProblem, BvpSystem, solve_bvp};
+
+// References: bracket the two roots of θ = √(2λ) cosh(θ/4) on either side of θ*, where their difference is maximal.
+let g = |t: f64| t - (2.0 * lambda).sqrt() * (t / 4.0).cosh();
+let peak = 4.0 * (4.0 / (2.0 * lambda).sqrt()).asinh();
+let lower = reference_root(g, 0.0, peak).map_err(|e| e.to_string())?;
+let upper = reference_root(g, peak, 40.0).map_err(|e| e.to_string())?;
+let tol = 10.0_f64.powf(tolerance_exponent);
+let options = BvpOptions::new()
+    .with_max_nodes(400)
+    .with_max_workspace_bytes(64 << 20)
+    .with_tolerances(
+        ResidualTolerance::new(tol, tol).map_err(|e| e.to_string())?,
+        ResidualTolerance::new(tol, 0.0).map_err(|e| e.to_string())?,
+    );
+let system = Bratu {
+    lambda,
+    slope: None,
+};
+let mesh: Vec<f64> = (0..=10).map(|i| f64::from(i) / 10.0).collect();
+let plan = BvpPlan::new(
+    system.dimension(),
+    system.parameter_dimension(),
+    &mesh,
+    options,
+)
+.map_err(|e| e.to_string())?;
+let (mut rows, mut series, mut converged) = (Vec::new(), Vec::new(), 0);
+let mut status = "Converged".to_string();
+// Reuse one Plan with two different initial-guess amplitudes.
+for (branch, amplitude, theta) in [("Lower", 0.1, lower), ("Upper", 4.0, upper)] {
+    let start = sine_guess(&mesh, amplitude).map_err(|e| e.to_string())?;
+    let solution = plan
+        .solve(&BvpProblem::analytic(&system), start.view(), &[])
+        .map_err(|e| e.to_string())?;
+    let (row, success, points) =
+        summarize(branch, theta, &solution).map_err(|e| e.to_string())?;
+    converged += usize::from(success);
+    if !success {
+        status = row.7.clone();
+    }
+    rows.push(row);
+    series.push(serde_json::json!({ "name": format!("{branch} (collocation)"), "points": points }));
+}
+// Find the lower solution with one-shot solve_bvp (default tolerance 10⁻³, sparse LU, difference Jacobians).
+let rhs = |_x: f64, y: &[f64], dy: &mut [f64]| {
+    dy[0] = y[1];
+    dy[1] = -lambda * RealScalar::exp(y[0]);
+    Ok(())
+};
+let boundary = |a: &[f64], b: &[f64], r: &mut [f64]| {
+    r[0] = a[0];
+    r[1] = b[0];
+    Ok(())
+};
+let start = sine_guess(&mesh, 0.1).map_err(|e| e.to_string())?;
+let quick = solve_bvp(rhs, boundary, &mesh, start.view()).map_err(|e| e.to_string())?;
+rows.push(
+    summarize("solve_bvp (lower)", lower, &quick)
+        .map_err(|e| e.to_string())?
+        .0,
+);
+// Overlay analytical solutions dashed.
+let dashed = serde_json::json!({ "lineType": "dashed", "showSymbol": false });
+for (branch, theta) in [("Lower", lower), ("Upper", upper)] {
+    let grid = (0..=100).map(|i| f64::from(i) / 100.0);
+    let points: Vec<_> = grid.map(|x| [x, bratu_exact(x, theta)]).collect();
+    let name = format!("{branch} (analytical)");
+    series.push(serde_json::json!({ "name": name, "points": points, "style": dashed }));
+}
+emit_line_chart!(
+    &series,
+    options = &serde_json::json!({ "xLabel": "Position x [-]", "yLabel": "Solution u(x) [-]" })
+);
+let fixed6 = serde_json::json!({ "fractionDigits": 6 });
+let fixed9 = serde_json::json!({ "fractionDigits": 9 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Solution branch" },
+    { "key": "1", "label": "θ (reference) [-]", "type": "number", "format": fixed6 },
+    { "key": "2", "label": "u(1/2) [-]", "type": "number", "format": fixed9 },
+    { "key": "3", "label": "max |u − u_analytical| [-]", "type": "number", "format": sci2 },
+    { "key": "4", "label": "Maximum normalized residual [-]", "type": "number", "format": sci2 },
+    { "key": "5", "label": "Mesh points", "type": "integer" },
+    { "key": "6", "label": "Refinements [count]", "type": "integer" },
+    { "key": "7", "label": "Termination status" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "branches" })
+);
+let outcome = if converged == 2 {
+    Outcome::satisfied("Both Plan solutions terminated with Converged")
+        .explanation("Determine which branch converged by comparing u(1/2) with references.")
+} else {
+    Outcome::partial("Some solutions did not terminate with Converged")
+        .explanation("They are estimates on the final mesh and do not satisfy tolerances.")
+};
+emit_outcome!(
+    outcome
+        .status(status)
+        .diagnostic("Converged solutions", converged as f64, None)
+);
+```
+
+With default $\lambda = 1$ and tolerance $10^{-6}$, both solutions terminate with `Converged`.
+The lower solution starts with 11 mesh points and refines once to 21, with maximum analytical difference $2.7 \times 10^{-8}$ over 101 points.
+The upper solution bends sharply to $|u''| = \lambda e^{u} \approx 60$ centrally, requiring five refinements to 247 mesh points, with maximum difference $7.5 \times 10^{-9}$.
+The one-shot `solve_bvp` uses default tolerance $10^{-3}$, reaches `Converged` on the initial 11 points, and has maximum difference $4.5 \times 10^{-7}$.
+
+Changing controls shows the following.
+
+- At tolerance $10^{-3}$, the lower solution retains the initial mesh (difference $4.5 \times 10^{-7}$), while the upper uses 23 points (difference $5.2 \times 10^{-5}$).
+- At tolerance $10^{-9}$, the lower converges with 321 points and difference $4.0 \times 10^{-13}$.
+  The upper would exceed 400 at the next refinement, stopping at 321 with `NodeLimit` and maximum normalized residual 577.
+  Its small difference $8.9 \times 10^{-10}$ does not justify treating a result without `Converged` as tolerance-satisfying.
+- At $\lambda = 0.2$, the upper solution reaches $u(1/2) \approx 6.41$, but Newton from amplitude $A = 4$ also converges to the lower solution.
+  The upper-branch row of the table has the same $u(1/2)$ value 0.025538 as the lower, with large analytical difference 6.38.
+- At $\lambda = 3.4$, the two $u(1/2)$ values approach 0.909143 and 1.515097, converging with 81 and 119 mesh points.
+
+Termination status alone does not identify the branch; compare table $u(1/2)$ with reference values.
+
+## Passing a fold with an unknown parameter
+
+With given $\lambda$ and unknown $u$, no solution exists at $\lambda > \lambda_c$, and Newton Jacobians approach singularity near $\lambda_c$.
+Instead make $\lambda$ an unknown parameter ($k = 1$), prescribing left-end slope $u'(0) = s$ as a third boundary condition.
+In the analytical solution, $s = \theta \tanh(\theta/4)$ grows monotonically with $\theta$, so specifying $s$ uniquely determines a point on the solution branch and keeps equations nonsingular even at the fold.
+This follows the same idea as adding an arclength condition in scioxide-rootfind pseudo-arclength continuation.
+
+The next cell sweeps 16 $s$ values through the maximum, solving systems whose `parameter_dimension()` returns 1 with `BvpProblem::numerical` (difference Jacobians).
+The Plan depends only on state dimension and unknown-parameter count, so the same `BvpPlan` handles 16 systems with different $s$.
+Initial unknown-parameter guesses are always $\lambda_0 = 1$; compare computed $\lambda$ (`BvpSolution::parameters()`) with analytical $\lambda = \theta^2 / (2\cosh^2(\theta/4))$.
+
+```rust
+//| id: ode-bratu-unknown-lambda
+//| ref: ode-bratu-unknown-lambda
+//| title: "Prescribe a slope to find unknown λ and follow a Bratu solution branch"
+//| run: button
+//| uses: [ode-bratu-model]
+//| crates: [scioxide-core, scioxide-linalg, scioxide-ode, scioxide-rootfind]
+//| inputs:
+//|   max_slope: {"type":"range","label":"Maximum swept slope s = u'(0) [-]","description":"Larger values follow the upper branch farther.","min":4,"max":16,"step":1,"value":10}
+//| cases:
+//|   - {"id":"fold","label":"Maximum slope 4","description":"The last point is exactly the fold.","inputs":{"max_slope":4}}
+//|   - {"id":"deep","label":"Maximum slope 16","description":"Follow the upper branch farther.","inputs":{"max_slope":16}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"sweep","path":"/rows/5/3","range":{"max":1e-7}}
+//|       - {"artifact":"sweep","path":"/rows/15/3","range":{"max":1e-7}}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+//|   - case: fold
+//|     expect:
+//|       - {"artifact":"sweep","path":"/rows/15/1","approx":{"value":3.5138307,"atol":1e-7}}
+//|   - case: deep
+//|     expect:
+//|       - {"artifact":"sweep","path":"/rows/15/3","range":{"max":1e-7}}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+use scioxide_core::ResidualTolerance;
+use scioxide_linalg::Matrix;
+use scioxide_ode::{BvpOptions, BvpPlan, BvpProblem};
+
+let options = BvpOptions::new()
+    .with_max_nodes(400)
+    .with_max_workspace_bytes(64 << 20)
+    .with_tolerances(
+        ResidualTolerance::new(1e-6, 1e-6).map_err(|e| e.to_string())?,
+        ResidualTolerance::new(1e-6, 0.0).map_err(|e| e.to_string())?,
+    );
+let mesh: Vec<f64> = (0..=10).map(|i| f64::from(i) / 10.0).collect();
+// The Plan depends only on state dimension n = 2 and unknown count k = 1, so reuse it as s changes.
+let plan = BvpPlan::new(2, 1, &mesh, options).map_err(|e| e.to_string())?;
+let (mut rows, mut computed) = (Vec::new(), Vec::new());
+let (mut converged, mut status) = (0, "Converged".to_string());
+for i in 1..=16 {
+    let slope = max_slope * f64::from(i) / 16.0;
+    let system = Bratu {
+        lambda: 0.0,
+        slope: Some(slope),
+    };
+    // Initial guess u = s x(1 − x) (satisfying u'(0) = s), λ₀ = 1.
+    let values = mesh
+        .iter()
+        .flat_map(|&x| [slope * x * (1.0 - x), slope * (1.0 - 2.0 * x)]);
+    let guess = Matrix::from_vec(mesh.len(), 2, values.collect()).map_err(|e| e.to_string())?;
+    let solution = plan
+        .solve(&BvpProblem::numerical(&system), guess.view(), &[1.0])
+        .map_err(|e| e.to_string())?;
+    let report = solution.report().ok_or("No report")?;
+    let mut y = [0.0; 2];
+    solution
+        .evaluate_into(0.5, &mut y)
+        .map_err(|e| e.to_string())?;
+    // Reference: solve θ tanh(θ/4) = s, then λ = θ²/(2 cosh²(θ/4)).
+    let theta = reference_root(|t| t * (t / 4.0).tanh() - slope, 0.0, 2.0 * slope + 8.0)
+        .map_err(|e| e.to_string())?;
+    let exact = theta * theta / (2.0 * (theta / 4.0).cosh().powi(2));
+    let lambda = solution.parameters()[0];
+    converged += usize::from(report.is_success());
+    if !report.is_success() {
+        status = format!("{:?}", report.termination());
+    }
+    computed.push([lambda, y[0]]);
+    let status = format!("{:?}", report.termination());
+    rows.push((
+        slope,
+        lambda,
+        exact,
+        (lambda - exact).abs(),
+        y[0],
+        report.nodes(),
+        status,
+    ));
+}
+// Overlay the analytical branch (λ(θ), u(1/2)) dashed.
+let branch: Vec<[f64; 2]> = (1..=200)
+    .map(|i| 0.1 * f64::from(i))
+    .map(|t| {
+        [
+            t * t / (2.0 * (t / 4.0).cosh().powi(2)),
+            2.0 * (t / 4.0).cosh().ln(),
+        ]
+    })
+    .collect();
+let dashed = serde_json::json!({ "lineType": "dashed", "showSymbol": false });
+let series = vec![
+    serde_json::json!({ "name": "Analytical solution branch", "points": branch, "style": dashed }),
+    serde_json::json!({ "name": "Collocation (unknown λ)", "points": computed, "kind": "scatter" }),
+];
+let fold =
+    serde_json::json!({ "kind": "line", "axis": "x", "value": 3.5138307, "label": "λc" });
+emit_line_chart!(
+    &series,
+    options = &serde_json::json!({
+        "xLabel": "Parameter λ [-]",
+        "yLabel": "Midpoint value u(1/2) [-]",
+        "xMin": 0.0,
+        "xMax": 4.0,
+        "annotations": [fold]
+    })
+);
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let fixed9 = serde_json::json!({ "fractionDigits": 9 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "s = u'(0) [-]", "type": "number", "format": fixed2 },
+    { "key": "1", "label": "λ (collocation) [-]", "type": "number", "format": fixed9 },
+    { "key": "2", "label": "λ (analytical) [-]", "type": "number", "format": fixed9 },
+    { "key": "3", "label": "|Δλ| [-]", "type": "number", "format": sci2 },
+    { "key": "4", "label": "u(1/2) [-]", "type": "number", "format": { "fractionDigits": 6 } },
+    { "key": "5", "label": "Mesh points", "type": "integer" },
+    { "key": "6", "label": "Termination status" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "sweep" })
+);
+let outcome = if converged == 16 {
+    Outcome::satisfied("All 16 points terminated with Converged")
+} else {
+    Outcome::partial("Some points did not terminate with Converged")
+        .explanation("Their λ values are estimates not satisfying tolerances.")
+};
+emit_outcome!(
+    outcome
+        .status(status)
+        .diagnostic("Converged points", converged as f64, None)
+);
+```
+
+The analytical fold occurs at $\theta \tanh(\theta/4) = 4$, or $s = 4$.
+At default maximum slope 10, $\lambda$ turns downward from 3.504018 at $s = 3.75$ to 3.493304 at $s = 4.375$, passing the fold into the upper branch.
+All 16 terminate with `Converged`, with $\lambda$ errors at most $2.4 \times 10^{-8}$; mesh points increase from 41 to 179 with $u(1/2)$.
+Maximum slope 4 places the last point exactly at the fold, obtaining $\lambda_c = 3.5138307$ with error $2.1 \times 10^{-8}$.
+Even at maximum slope 16, all 16 converge with `Converged`; at $s = 16$, $\lambda = 0.170956$ has error $4.9 \times 10^{-10}$ and uses 317 points.
+
+## Singular endpoint terms
+
+Radial cylindrical or spherical equations have coefficients $1/(x - a)$ at left endpoint $x = a$.
+The constructor `BvpPlan::with_singular(S)` sets the right-hand side to
+
+$$
+y' = \frac{S\,y}{x - a} + f(x, y, p)
+$$
+
+adding a term with constant $n \times n$ matrix $S$.
+It assumes $S\,y(a) = 0$ for a $C^1$ solution, with boundary conditions consistent with that constraint.
+Use endpoint derivative $y'(a) = (I - S)^{+} f(a, y(a), p)$ at $x = a$ ($^{+}$ is a pseudoinverse), projecting $y(a)$ into the nullspace of $S$ in each solution.
+Report `regularity_residual()` is $\max|S\,y(a)|$.
+`with_singular` precomputes pseudoinverses of $S$ and $I - S$ by SVD; if $f(a, y(a), p)$ lies outside the range of $I - S$ under boundary tolerance, solving gives `InvalidInput`.
+
+As an example, consider the Lane–Emden equation for stellar structure with index 5:
+
+$$
+w'' + \frac{2}{x}\,w' + w^5 = 0, \qquad w'(0) = 0, \qquad w(1) = \frac{\sqrt 3}{2}
+$$
+
+(Shampine 2003).
+The exact solution is $w = (1 + x^2/3)^{-1/2}$.
+Setting $y = (w, w')$ gives $S = \begin{bmatrix} 0 & 0 \\ 0 & -2 \end{bmatrix}$ and $f = (w', -w^5)$; requiring $S\,y(0) = (0, -2w'(0))$ to vanish matches boundary condition $w'(0) = 0$.
+
+The next cell uses closure-based right-hand sides and boundaries in `BvpFn`, solving three Plans at tolerances $10^{-3}$, $10^{-6}$, and $10^{-9}$ with the same `BvpWorkspace` and `BvpSolution`.
+The constructor `BvpFn::new(dimension, rhs, boundary)` creates closure systems without unknown parameters; one-shot `solve_bvp` uses it internally too.
+Prepare workspace through `try_reserve` from estimate `BvpRequirements` of `workspace_requirements`; `solve_into` grows it if refinement exceeds capacity.
+Limits are 64 MiB workspace and 2000 mesh points; inputs select the linear solver and refinement limit.
+
+```rust
+//| id: ode-lane-emden-singular
+//| ref: ode-lane-emden-singular
+//| title: "Solve the Lane–Emden equation with a singular term using three linear solvers"
+//| run: button
+//| crates: [scioxide-core, scioxide-linalg, scioxide-ode]
+//| inputs:
+//|   backend: {"type":"select","label":"Newton correction linear solver","options":["Sparse","Dense","Krylov"],"value":"Sparse"}
+//|   refinements: {"type":"range","label":"Maximum refinements [count]","description":"BvpOptions::with_refinements.","min":2,"max":20,"step":1,"value":20}
+//| cases:
+//|   - {"id":"dense","label":"Dense","description":"Dense memory exceeds 64 MiB, stopping with MemoryLimit.","inputs":{"backend":"Dense"}}
+//|   - {"id":"krylov","label":"Krylov","description":"Unpreconditioned GMRES reaches its iteration limit, preventing Newton convergence.","inputs":{"backend":"Krylov"}}
+//|   - {"id":"few-refinements","label":"Two refinements","description":"Tolerance 10⁻⁹ stops at the refinement limit.","inputs":{"refinements":2}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"emden","path":"/rows/2/1","equals":"Converged"}
+//|       - {"artifact":"emden","path":"/rows/2/5","range":{"max":1e-10}}
+//|       - {"artifact":"emden","path":"/rows/0/5","range":{"max":1e-5}}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+//|   - case: dense
+//|     expect:
+//|       - {"artifact":"emden","path":"/rows/2/1","equals":"MemoryLimit"}
+//|       - {"path":"/outputs/1/state","equals":"partial"}
+//|   - case: krylov
+//|     expect:
+//|       - {"artifact":"emden","path":"/rows/0/1","equals":"Converged"}
+//|       - {"path":"/outputs/1/state","equals":"failed"}
+//|   - case: few-refinements
+//|     expect:
+//|       - {"artifact":"emden","path":"/rows/2/1","equals":"RefinementLimit"}
+//|       - {"path":"/outputs/1/state","equals":"partial"}
+use scioxide_core::{Budget, ExecutionContext, ResidualTolerance};
+use scioxide_linalg::Matrix;
+use scioxide_ode::{
+    BvpBackend, BvpFn, BvpOptions, BvpPlan, BvpProblem, BvpSolution, BvpTermination,
+    BvpWorkspace,
+};
+
+// With y = (w, w'), w'' + (2/x)w' + w⁵ = 0. Excluding singular S y/x, f = (w', −w⁵).
+let emden = BvpFn::new(
+    2,
+    |_x: f64, y: &[f64], dy: &mut [f64]| {
+        dy[0] = y[1];
+        dy[1] = -scioxide_core::RealScalar::powi(y[0], 5);
+        Ok(())
+    },
+    // Boundary conditions w'(0) = 0 and w(1) = √3/2.
+    |a: &[f64], b: &[f64], r: &mut [f64]| {
+        r[0] = a[1];
+        r[1] = b[0] - 0.75_f64.sqrt();
+        Ok(())
+    },
+);
+let singular = Matrix::from_rows(&[[0.0, 0.0], [0.0, -2.0]]).map_err(|e| e.to_string())?;
+let budget = |n: usize| Budget::try_from(n);
+let backend = match backend.as_str() {
+    "Dense" => BvpBackend::Dense,
+    "Sparse" => BvpBackend::Sparse { limits: None },
+    _ => BvpBackend::Krylov {
+        iterations: budget(200).map_err(|e| e.to_string())?,
+        restart: budget(40).map_err(|e| e.to_string())?,
+    },
+};
+let mesh: Vec<f64> = (0..=10).map(|i| f64::from(i) / 10.0).collect();
+let guess = Matrix::from_vec(11, 2, [1.0, 0.0].repeat(11)).map_err(|e| e.to_string())?;
+let problem = BvpProblem::numerical(&emden);
+// Reuse one workspace and output across three tolerance-specific Plans.
+let mut workspace = BvpWorkspace::new();
+let mut solution = BvpSolution::new();
+let (mut rows, mut last) = (Vec::new(), None);
+for tol in [1e-3, 1e-6, 1e-9] {
+    let options = BvpOptions::new()
+        .with_max_nodes(2000)
+        .with_max_workspace_bytes(64 << 20)
+        .with_backend(backend)
+        .with_refinements(budget(refinements as usize).map_err(|e| e.to_string())?)
+        .with_tolerances(
+            ResidualTolerance::new(tol, tol).map_err(|e| e.to_string())?,
+            ResidualTolerance::new(tol, 0.0).map_err(|e| e.to_string())?,
+        );
+    let plan = BvpPlan::new(2, 0, &mesh, options)
+        .and_then(|plan| plan.with_singular(singular.view()))
+        .map_err(|e| e.to_string())?;
+    let requirements = plan
+        .workspace_requirements(&problem)
+        .map_err(|e| e.to_string())?;
+    // Allocate enough for the initial mesh; solve_into grows it if refinement needs more.
+    workspace
+        .try_reserve(&requirements)
+        .map_err(|e| e.to_string())?;
+    let report = plan
+        .solve_into(
+            &problem,
+            guess.view(),
+            &[],
+            &mut solution,
+            &mut workspace,
+            ExecutionContext::sequential(),
+        )
+        .map_err(|e| e.to_string())?;
+    // Independent check: exact w = (1 + x²/3)^(−1/2) (reference from f64 inherent methods).
+    let mut y = [0.0; 2];
+    let mut worst = 0.0_f64;
+    for x in (0..=100).map(|i| f64::from(i) / 100.0) {
+        solution
+            .evaluate_into(x, &mut y)
+            .map_err(|e| e.to_string())?;
+        worst = worst.max((y[0] - (1.0 + x * x / 3.0).powf(-0.5)).abs());
+    }
+    last = Some(report.termination());
+    let status = format!("{:?}", report.termination());
+    let (residual, regularity) = (report.max_residual(), report.regularity_residual());
+    let bytes = (requirements.required_bytes(), report.workspace_bytes());
+    rows.push((
+        tol,
+        status,
+        report.nodes(),
+        residual,
+        regularity,
+        worst,
+        bytes.0,
+        bytes.1,
+    ));
+}
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Tolerance [-]", "type": "number", "format": sci2 },
+    { "key": "1", "label": "Termination status" },
+    { "key": "2", "label": "Mesh points", "type": "integer" },
+    { "key": "3", "label": "Maximum normalized residual [-]", "type": "number", "format": sci2 },
+    { "key": "4", "label": "max |S y(0)| [-]", "type": "number", "format": sci2 },
+    { "key": "5", "label": "max |w − w_exact| [-]", "type": "number", "format": sci2 },
+    { "key": "6", "label": "Initial-mesh estimate [B]", "type": "integer" },
+    { "key": "7", "label": "Final estimate [B]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "emden" })
+);
+// Use termination at the tightest tolerance 10⁻⁹ for the cell outcome.
+let termination = last.ok_or("Not solved")?;
+let outcome = match termination {
+    BvpTermination::Converged => Outcome::satisfied("Met residual conditions at tolerance 10⁻⁹"),
+    BvpTermination::Nonlinear(_) | BvpTermination::BoundaryFailure => {
+        Outcome::failed("Newton did not converge on the final mesh")
+            .explanation("The returned solution does not satisfy tolerance. Select another linear solver.")
+    }
+    _ => Outcome::partial("Refinement stopped at a limit")
+        .explanation("The returned solution is an estimate on the final mesh."),
+};
+emit_outcome!(outcome.status(format!("{termination:?}")));
+```
+
+With default sparse LU, all three tolerances terminate with `Converged`, with maximum exact-solution differences $2.5 \times 10^{-7}$ ($10^{-3}$, 11 points), $1.6 \times 10^{-8}$ ($10^{-6}$, 30 points), and $1.4 \times 10^{-12}$ ($10^{-9}$, 302 points).
+Projection makes singular-term condition $\max|S\,y(0)|$ zero.
+Sparse-LU memory estimates are large even initially: 33 744 384 B.
+The `limits: None` allowance comes from the 64 MiB workspace bound; even 302 points increases it only to 38 661 120 B.
+
+- With `Dense`, estimates grow quadratically in unknown count; tolerance $10^{-9}$ reaches 161 points, then the next refinement would exceed 64 MiB, stopping with `MemoryLimit`.
+  Maximum normalized residual is 2.47; the small maximum difference $2.7 \times 10^{-12}$ does not give `Converged`.
+- With `Krylov`, $10^{-3}$ converges, but at $10^{-6}$ and $10^{-9}$ unpreconditioned GMRES reaches 200 iterations, ending with `Nonlinear(LinearFailure(IterationLimit))`.
+  The returned solution differs by order $10^{-8}$ but does not satisfy tolerance.
+- Limiting refinements to two makes $10^{-9}$ stop at 41 points with `RefinementLimit` and maximum normalized residual 158.
+
+## Plans, workspaces, and termination statuses
+
+The constructor `BvpPlan::new(dimension, parameter_dimension, mesh, options)` borrows no system, validates dimension, initial mesh (at least two strictly increasing finite points), and settings, and compares initial-mesh memory estimates with limits.
+At solve time, check problem `dimension()` and `parameter_dimension()` against the Plan, returning `InvalidInput` on mismatch.
+The Plan is immutable and supports any same-dimension problem.
+Supply initial state guesses as `MatrixView` with one row per initial mesh point and one column per state component; unknown-parameter guesses are a slice.
+Each solve starts from the Plan's initial mesh.
+
+The constructor `BvpOptions::new()` returns settings without mesh-point or workspace-byte limits.
+Supply limits through `with_max_nodes` and `with_max_workspace_bytes`.
+Byte counts bound linear-solver memory estimates, rather than allocated amounts.
+The estimate for `Dense` grows quadratically in unknown count $mn + k$; `Sparse { limits: None }` includes sparse-LU allowance determined by the workspace bound (twice one-quarter of the bound).
+Each refinement compares its estimate with the bound; exceeding it prevents refinement and stops with `MemoryLimit`.
+
+There are three APIs.
+
+- One-shot `solve_bvp(rhs, boundary, mesh, guess)` wraps closures in `BvpFn` and uses defaults (tolerance $10^{-3}$, sparse LU, difference Jacobians).
+  Termination other than `Converged` becomes an error (`ConvergenceFailure`, or `ResourceLimit` for mesh and memory limits).
+- `BvpPlan::solve(&problem, guess, &parameters)` allocates new workspace and output, solves sequentially, and returns `BvpSolution`.
+  It returns solutions even without `Converged`; check through `report()`.
+- `BvpPlan::solve_into(&problem, guess, &parameters, &mut solution, &mut workspace, scope)` reuses workspace and output.
+  Construct `BvpWorkspace` through `BvpPlan::workspace(&problem)`, or `BvpWorkspace::new()` and `try_reserve(&requirements)`, reusing across Plans and problems.
+  The method `check(&requirements)` indicates whether capacity suffices.
+  Workspace already used on the final mesh plus sufficient output capacity avoids allocation.
+
+If any mesh produced a solution, `solve_into` returns `Ok` and a report even without status `Converged`.
+The report `BvpReport` holds termination status `termination()`, `is_success()`, refinement count `refinements()`, mesh-point count `nodes()`, `max_residual()`, `boundary_residual()`, `regularity_residual()`, evaluation counts `counts()` and `accounting()`, and final memory estimate `workspace_bytes()`; it is also stored in `BvpSolution::report()`.
+Errors leave the output solution unchanged, with workspace `last_attempt()` recording failed-attempt counts.
+Evaluation limits, cancellation, or deadlines stopping before mesh evaluation also give errors rather than termination statuses.
+Right-hand sides and boundary conditions are evaluated sequentially.
+
+| `BvpTermination` | Meaning | Solution treatment |
+|---|---|---|
+| `Converged` | All residual, boundary, and singular-term conditions satisfied | Usable |
+| `NodeLimit` | Next refinement would exceed `max_nodes` mesh points | Estimate on the final mesh |
+| `MemoryLimit` | Next refinement memory estimate would exceed `max_workspace_bytes` | Same as above |
+| `RefinementLimit` | Refinement-count limit reached | Same as above |
+| `ResourceLimit(kind)` | Outer solve work limit prevents another refinement | Same as above |
+| `MeshStagnation` | No representable floating-point midpoint in an interval to bisect | Same as above |
+| `BoundaryFailure` | All interval residuals satisfy requirements, but boundary residuals exceed tolerance; refinement cannot improve this | Does not satisfy tolerance |
+| `Nonlinear(reason)` | Newton did not converge on this mesh (`reason` is scioxide-rootfind's `RootTermination`) | Does not satisfy tolerance |
+
+Non-`Converged` solutions can still be inspected and used as initial guesses for subsequent computations.
+Termination status does not identify solution branches; compare with references or solutions from other initial guesses.
+
+## Summary
+
+Two-point BVPs combine endpoint conditions and collocation equations into equations for all unknowns.
+The Plan `BvpPlan` solves three-stage Lobatto IIIA (fourth-order) equations with Newton, bisecting intervals whose normalized residual exceeds 1 and solving again.
+Only `termination()` equal to `Converged` satisfies tolerance; `max_residual()` and `boundary_residual()` are residuals rather than error bounds, so verify against analytical solutions or finer meshes.
+For multiple solutions, initial guesses determine convergence; near folds, making $\lambda$ unknown and prescribing another quantity permits tracking beyond the fold along the branch.
+For many mesh points use default sparse LU; `Dense` first faces memory limits and unpreconditioned `Krylov` iteration limits.
+
+[scioxide-rootfind continuation and deflation](../../../scioxide-rootfind/algorithms/continuation-and-deflation/) covers root-based branch tracking, [Newton–Krylov](../../../scioxide-rootfind/algorithms/matrix-free-newton-krylov/) inner Newton contracts, [Solving procedure and result contracts](oxref:ode-termination-and-partial-results) general solving and partial-result rules, and the [API guide](../../api/) type tables.

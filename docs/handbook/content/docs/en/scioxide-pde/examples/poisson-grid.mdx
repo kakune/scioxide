@@ -1,0 +1,413 @@
+---
+title: "Following the Poisson problem from conservation to grid convergence"
+description: "Solve one-dimensional steady heat conduction by finite differences, finite elements, and finite volumes on the same grid; examine amplitude predictions from discrete eigenvalues, algebraic residuals versus discretization errors, and observed refinement convergence orders."
+sidebar:
+  order: 405
+references:
+  pde-poisson-rod-problem: "steady-conduction-in-a-rod-and-manufactured-solution"
+  pde-poisson-discrete-eigenvalue: "three-discretizations-and-discrete-eigenvalues"
+  pde-poisson-observed-order: "grid-refinement-and-observed-orders"
+---
+
+The Poisson equation is elliptic and describes steady heat conduction, electrostatic potential, and steady groundwater seepage, among other phenomena.
+It describes balance at each point between internal generation and flux entering or leaving the surroundings.
+This example supplies an exact solution to the one-dimensional Poisson equation $-u''=f$ using manufactured solutions (choosing a solution first and deriving the source).
+Prepare `StructuredFdmPlan`, `SimplexFemPlan` (P1 elements), and `StructuredFvmPlan` on the same vertex grid and solve all with `EllipticProblem`.
+Check amplitude predictions from discrete eigenvalues, the distinction between algebraic residuals and discretization errors, and refinement convergence orders.
+
+## Steady conduction in a rod and manufactured solution
+
+Use dimensionless quantities, dividing position along a rod of length $L$ by $L$ and temperature by a reference temperature difference.
+A uniform rod $\Omega=(0,1)$ with conductivity $k=1$ has volumetric heating $f(x)$, with both ends held at $0$.
+Over a small interval of length $\Delta x$, the difference in outward end-face flux $q=-u'$ balances heating, giving $q(x+\Delta x)-q(x)=f\,\Delta x$; setting $\Delta x\to0$ gives the following boundary-value problem.
+
+$$
+-\frac{d^2u}{dx^2}=f(x),\qquad x\in(0,1),\qquad u(0)=u(1)=0
+$$
+
+Choosing exact solution $u_*(x)=\sin(m\pi x)$ as sine mode $m$ gives source $f(x)=(m\pi)^2\sin(m\pi x)$.
+Supply $f$ through `FieldData::time_invariant` and impose endpoint values $0$ as Dirichlet conditions to measure error $\max_i|u_i-u_*(x_i)|$ directly.
+Cells compute the manufactured solution and source using `sin` of `f64` as reference values.
+
+## Three discretizations and discrete eigenvalues
+
+The grid has $N$ vertices $x_i=ih$ ($h=1/(N-1)$); all three plans use the same vertices.
+See [FDM, FEM, and FVM for elliptic problems](../../algorithms/elliptic-fdm-fem-fvm/) for derivations; here only differences affecting results are listed.
+
+- **Finite differences (FDM)**: `StructuredFdmPlan` uses vertex values as unknowns and balances heat over interval $[x_i-h/2,x_i+h/2]$ surrounding each vertex.
+  On a one-dimensional uniform grid, rows are three-point central differences $(2u_i-u_{i-1}-u_{i+1})/h=h f_i$.
+  Conductivity is sampled at interval midpoints.
+- **Finite elements (FEM)**: `SimplexFemPlan` takes each interval as an element and discretizes the weak form using piecewise linear (P1) basis functions.
+  Load $\int f\varphi_i\,dx$ is computed by elementwise quadrature; one-dimensional P1 defaults to two-point Gauss–Legendre.
+- **Finite volumes (FVM)**: `StructuredFvmPlan` uses values at centers of $N-1$ cells as unknowns.
+  Conductivity is sampled at cell centers, and flux between adjacent cells follows two half-cell thermal resistances in series.
+  Dirichlet conditions enter as boundary-face laws without fixing unknowns.
+
+Different conductivity-sampling locations change results for discontinuous material properties.
+Here $k=1$ removes this effect; see the [two-layer-wall example](../layered-wall-conduction/) for discontinuous properties.
+All three plans implement `SpatialDiscretization`, so unknown locations are read through `dof_point` independently of family.
+Compare FDM/FEM vertex values and FVM cell-center values with the exact solution at their respective locations.
+
+For uniform-grid central differences, $\sin(m\pi x_i)$ is an eigenvector of the discrete operator, with eigenvalue divided by $h$ given by:
+
+$$
+\lambda_h=\frac{4}{h^2}\sin^2\left(\frac{m\pi h}{2}\right)
+$$
+
+Since the load is $(m\pi)^2h$ times this eigenvector, the FDM nodal solution equals $\rho=(m\pi)^2/\lambda_h$ times the exact solution.
+$\sin z<z$ gives $\rho>1$, and since $\rho-1=(m\pi h)^2/12+O(h^4)$, the error is $O(h^2)$.
+
+FEM nodal values have a different property.
+For one-dimensional P1 elements with constant coefficients and exact load integration, nodal values match the exact solution.
+This follows because the one-dimensional Green's function belongs to the P1 space.
+Nodal error therefore comes only from load quadrature; two-point Gauss–Legendre predicts $O(h^4)$.
+
+Both cells use the following definitions of three plans on the same grid and pairing solved values with unknown locations.
+
+```rust
+//| id: pde-poisson-rod-model
+//| kind: definitions
+//| title: "Three plans and solves for a one-dimensional rod"
+//| crates: [scioxide-core, scioxide-pde, scioxide-spatial]
+use scioxide_core::SciOxideError;
+use scioxide_pde::{
+    BoundaryData, BoundaryKind, ConstantDiffusion, EllipticProblem, FieldData,
+    SimplexFemGeometry, SimplexFemOrder, SimplexFemPlan, SpatialDiscretization,
+    StructuredBoundaries, StructuredFdmPlan, StructuredFvmPlan, TaggedBoundaries,
+};
+use scioxide_spatial::{IntervalMesh, Point};
+
+/// Three plans on the same grid of N vertices. Conductivity k = 1, both ends u = 0.
+pub(crate) struct Rod {
+    pub(crate) fdm: StructuredFdmPlan<f64, f64, 1>,
+    pub(crate) fem: SimplexFemPlan<f64, f64, 1>,
+    pub(crate) fvm: StructuredFvmPlan<f64, f64, 1>,
+}
+
+pub(crate) fn rod(nodes: usize) -> Result<Rod, SciOxideError> {
+    let fdm = StructuredFdmPlan::dirichlet_laplacian([0.0], [1.0], [nodes])?;
+    let unit = ConstantDiffusion::new(1.0);
+    let mesh = fdm.mesh().clone();
+    let ends =
+        StructuredBoundaries::uniform(&mesh, 1, BoundaryKind::Dirichlet, BoundaryData::zero())?;
+    let fvm = StructuredFvmPlan::new(mesh, &unit, &ends)?;
+    // FEM places the same vertices as FDM in an interval mesh.
+    let mut points = Vec::with_capacity(nodes);
+    for node in 0..nodes {
+        points.push(Point::new(fdm.node_point(node)?)?);
+    }
+    let segments = (0..nodes - 1).map(|i| [i, i + 1]).collect();
+    let interval = IntervalMesh::new(points, segments)?;
+    let tagged =
+        TaggedBoundaries::uniform(&interval, 1, BoundaryKind::Dirichlet, BoundaryData::zero())?;
+    let fem = SimplexFemPlan::new(
+        interval,
+        SimplexFemGeometry::Affine,
+        SimplexFemOrder::P1,
+        &unit,
+        &tagged,
+    )?;
+    Ok(Rod { fdm, fem, fvm })
+}
+
+/// Solve with the default direct method and return unknown-location/value pairs [x, u], together with
+/// direct-method backward error (scaled residual in the `linear_residual_report` norm).
+pub(crate) fn solve<P: SpatialDiscretization<f64, f64, 1>>(
+    plan: &P,
+    source: &FieldData<f64, f64, 1>,
+) -> Result<(Vec<[f64; 2]>, Option<f64>), SciOxideError> {
+    let solution = EllipticProblem::new(plan, source).solve_with_options(&Default::default())?;
+    let mut points = Vec::with_capacity(solution.values().len());
+    for (unknown, &u) in solution.values().iter().enumerate() {
+        points.push([plan.dof_point(unknown)?.point[0], u]);
+    }
+    let backward = solution
+        .report()
+        .diagnostics()
+        .linear_residual_report()
+        .map(|r| r.scaled_norm());
+    Ok((points, backward))
+}
+```
+
+`EllipticProblem::solve_with_options` uses default `EllipticOptions`, solving with a tridiagonal direct method if the eliminated matrix is tridiagonal, otherwise sparse LU.
+All three one-dimensional plans assemble tridiagonal matrices.
+Direct-method solutions are returned only after checking original-equation residuals against the backward-error tolerance of $\sqrt{\varepsilon}$; a failed check gives an error.
+
+The next cell varies mode number $m$ and vertex count $N$, solving with all three methods.
+The table shows maximum error and direct-method backward error per method, plus measured FDM amplitude ratio and prediction $\rho$.
+Measure amplitude ratio at the vertex maximizing $|\sin(m\pi x_i)|$ by dividing FDM solution by exact solution.
+
+```rust
+//| id: pde-poisson-methods
+//| ref: pde-poisson-methods
+//| title: "Compare FDM, FEM, and FVM with different sine modes and vertex counts"
+//| run: reactive
+//| uses: [pde-poisson-rod-model]
+//| crates: [scioxide-core, scioxide-pde, scioxide-spatial]
+//| inputs:
+//|   poisson_mode_number: {"type":"range","label":"Sine mode m [-]","description":"Changes spatial frequency in the solution.","min":1,"max":7,"step":1,"value":3}
+//|   poisson_grid_nodes: {"type":"range","label":"Vertex count N [points]","description":"Changes vertices per wavelength and discretization error.","min":17,"max":81,"step":8,"value":41}
+//| cases:
+//|   - {"id":"short-wave","label":"m = 7 (about 11 points per wavelength)","description":"FDM error grows to 2.6×10⁻²; amplitude ratio 1.025573 agrees with the discrete-eigenvalue prediction.","inputs":{"poisson_mode_number":7}}
+//|   - {"id":"coarse-grid","label":"N = 17","description":"Mode m = 3 has about 11 points per wavelength, giving FDM error 2.9×10⁻².","inputs":{"poisson_grid_nodes":17}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/0/1","approx":{"value":4.6392474e-3,"rtol":1e-6}}
+//|       - {"artifact":"methods","path":"/rows/1/1","approx":{"value":2.1466365e-6,"rtol":1e-5}}
+//|       - {"artifact":"methods","path":"/rows/2/1","approx":{"value":4.6356707e-3,"rtol":1e-6}}
+//|       - {"artifact":"methods","path":"/rows/0/2","range":{"min":0,"max":1e-14}}
+//|       - {"artifact":"methods","path":"/rows/2/2","range":{"min":0,"max":1e-14}}
+//|       - {"artifact":"amplitude","path":"/rows/0/0","approx":{"value":1.0046392,"rtol":1e-7}}
+//|       - {"artifact":"amplitude","path":"/rows/0/2","range":{"max":1e-12}}
+//|   - case: short-wave
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/0/1","approx":{"value":2.557333e-2,"rtol":1e-6}}
+//|       - {"artifact":"amplitude","path":"/rows/0/1","approx":{"value":1.025573,"rtol":1e-6}}
+//|       - {"artifact":"amplitude","path":"/rows/0/2","range":{"max":1e-12}}
+//|   - case: coarse-grid
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/0/1","approx":{"value":2.942349e-2,"rtol":1e-6}}
+//|       - {"artifact":"amplitude","path":"/rows/0/1","approx":{"value":1.029423,"rtol":1e-6}}
+use scioxide_pde::{FieldData, FieldPoint};
+use std::f64::consts::PI;
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed7 = serde_json::json!({ "fractionDigits": 7 });
+let wave = poisson_mode_number * PI;
+let nodes = poisson_grid_nodes as usize;
+let h = 1.0 / (nodes - 1) as f64;
+// Manufactured solution u* = sin(mπx) and source f = (mπ)² sin(mπx) (f64 sin as a reference).
+let source = FieldData::time_invariant(move |p: FieldPoint<f64, 1>| {
+    Ok(wave * wave * (wave * p.point[0]).sin())
+});
+let plans = rod(nodes).map_err(|e| e.to_string())?;
+let solutions = [
+    (
+        "FDM (vertices)",
+        solve(&plans.fdm, &source).map_err(|e| e.to_string())?,
+    ),
+    (
+        "FEM (vertices)",
+        solve(&plans.fem, &source).map_err(|e| e.to_string())?,
+    ),
+    (
+        "FVM (cell centers)",
+        solve(&plans.fvm, &source).map_err(|e| e.to_string())?,
+    ),
+];
+let exact_points: Vec<[f64; 2]> = (0..=200)
+    .map(|i| [i as f64 / 200.0, (wave * i as f64 / 200.0).sin()])
+    .collect();
+let mut series = vec![serde_json::json!({
+    "name": "Exact solution",
+    "points": exact_points,
+    "style": { "lineType": "dashed" }
+})];
+let mut rows = Vec::new();
+for (label, (points, backward)) in &solutions {
+    let error = points
+        .iter()
+        .map(|[x, u]| (u - (wave * x).sin()).abs())
+        .fold(0.0_f64, f64::max);
+    rows.push((*label, error, *backward));
+    series.push(serde_json::json!({
+        "name": label,
+        "points": points,
+        "style": { "showSymbol": true }
+    }));
+}
+// Measure FDM amplitude ratio at the vertex maximizing |sin(mπx)| and compare with discrete-eigenvalue prediction ρ.
+let fdm_points = &solutions[0].1.0;
+let [x_peak, u_peak] = *fdm_points
+    .iter()
+    .max_by(|a, b| {
+        (wave * a[0])
+            .sin()
+            .abs()
+            .total_cmp(&(wave * b[0]).sin().abs())
+    })
+    .ok_or("No vertices")?;
+let measured = u_peak / (wave * x_peak).sin();
+let predicted = wave * wave / (4.0 / (h * h) * (wave * h / 2.0).sin().powi(2));
+emit_line_chart!(
+    &series,
+    options = &serde_json::json!({ "xLabel": "Position x/L [-]", "yLabel": "Temperature u [-]" })
+);
+let columns = serde_json::json!([
+    { "key": "0", "label": "Method (unknown locations)" },
+    { "key": "1", "label": "Maximum error [-]", "type": "number", "format": sci3 },
+    { "key": "2", "label": "Direct-method backward error [-]", "type": "number", "format": sci3, "nullText": "None" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "methods" })
+);
+let amplitude_columns = serde_json::json!([
+    { "key": "0", "label": "FDM amplitude ratio (measured) [-]", "type": "number", "format": fixed7 },
+    { "key": "1", "label": "Prediction ρ = (mπ)²/λ_h [-]", "type": "number", "format": fixed7 },
+    { "key": "2", "label": "Difference [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    amplitude_columns,
+    vec![(measured, predicted, (measured - predicted).abs())],
+    metadata = serde_json::json!({ "id": "amplitude" })
+);
+```
+
+With defaults ($m=3$, $N=41$), maximum errors for FDM and FVM are both $4.6\times10^{-3}$; FEM nodal error is $2.1\times10^{-6}$.
+Measured FDM amplitude ratio 1.0046392 agrees with the discrete-eigenvalue prediction at the rounding level.
+All three methods have direct-method backward error around $10^{-16}$.
+This measures the accuracy of solving the algebraic equations and is distinct from discretization error.
+Even with small backward error, the difference between discrete and exact solutions remains of order $10^{-3}$.
+At $m=7$, vertices per wavelength fall to about 11 and FDM error grows to $2.6\times10^{-2}$.
+
+## Grid refinement and observed orders
+
+Measure maximum error for vertex-count sequence $N=9,13,17,25,33,49,65,97$ and compute observed order $p_{\mathrm{obs}}=\log(e_1/e_2)/\log(h_1/h_2)$ from the two finest grids.
+FDM and cell-centered FVM are expected to be second order, reducing error to $1/4$ when grid spacing halves.
+The preceding argument predicts fourth-order FEM nodal error.
+On log-log axes, plot observations as symbols and slope-2 and slope-4 reference lines dashed.
+
+```rust
+//| id: pde-poisson-convergence
+//| ref: pde-poisson-convergence
+//| title: "Measure grid errors and observed convergence orders of three methods"
+//| run: reactive
+//| uses: [pde-poisson-rod-model]
+//| crates: [scioxide-core, scioxide-pde, scioxide-spatial]
+//| inputs:
+//|   poisson_convergence_mode: {"type":"range","label":"Convergence-test mode m [-]","description":"Solutions with larger derivatives require finer grids to enter the asymptotic regime.","min":1,"max":6,"step":1,"value":2}
+//| cases:
+//|   - {"id":"high-mode","label":"m = 6","description":"FDM error reaches 0.63 on the 9-point grid, but the two finest grids give observed orders FDM 2.006, FEM 4.006, FVM 2.015.","inputs":{"poisson_convergence_mode":6}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"errors","path":"/rows/7/2","approx":{"value":3.5705001e-4,"rtol":1e-6}}
+//|       - {"artifact":"errors","path":"/rows/7/3","approx":{"value":1.27459e-8,"rtol":1e-4}}
+//|       - {"artifact":"errors","path":"/rows/7/4","approx":{"value":3.5685884e-4,"rtol":1e-6}}
+//|       - {"artifact":"orders","path":"/rows/0/0","approx":{"value":2.0,"atol":5e-3}}
+//|       - {"artifact":"orders","path":"/rows/0/1","approx":{"value":4.0,"atol":5e-3}}
+//|       - {"artifact":"orders","path":"/rows/0/2","approx":{"value":2.0,"atol":5e-3}}
+//|   - case: high-mode
+//|     expect:
+//|       - {"artifact":"errors","path":"/rows/0/2","approx":{"value":0.62604136,"rtol":1e-6}}
+//|       - {"artifact":"orders","path":"/rows/0/0","approx":{"value":2.006,"atol":1e-3}}
+//|       - {"artifact":"orders","path":"/rows/0/1","approx":{"value":4.006,"atol":1e-3}}
+//|       - {"artifact":"orders","path":"/rows/0/2","approx":{"value":2.015,"atol":1e-3}}
+use scioxide_pde::{FieldData, FieldPoint};
+use std::f64::consts::PI;
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed3 = serde_json::json!({ "fractionDigits": 3 });
+let wave = poisson_convergence_mode * PI;
+// Manufactured-solution source (f64 sin as a reference).
+let source = FieldData::time_invariant(move |p: FieldPoint<f64, 1>| {
+    Ok(wave * wave * (wave * p.point[0]).sin())
+});
+let max_error = |points: &[[f64; 2]]| {
+    points
+        .iter()
+        .map(|[x, u]| (u - (wave * x).sin()).abs())
+        .fold(0.0_f64, f64::max)
+};
+let mut curves: [Vec<[f64; 2]>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+let mut rows = Vec::new();
+for nodes in [9_usize, 13, 17, 25, 33, 49, 65, 97] {
+    let h = 1.0 / (nodes - 1) as f64;
+    let plans = rod(nodes).map_err(|e| e.to_string())?;
+    let errors = [
+        max_error(&solve(&plans.fdm, &source).map_err(|e| e.to_string())?.0),
+        max_error(&solve(&plans.fem, &source).map_err(|e| e.to_string())?.0),
+        max_error(&solve(&plans.fvm, &source).map_err(|e| e.to_string())?.0),
+    ];
+    for (curve, e) in curves.iter_mut().zip(errors) {
+        curve.push([h, e]);
+    }
+    rows.push((nodes, h, errors[0], errors[1], errors[2]));
+}
+// Compute observed orders from the two finest grids.
+let order = |c: &Vec<[f64; 2]>| {
+    let (a, b) = (c[c.len() - 2], c[c.len() - 1]);
+    (a[1] / b[1]).ln() / (a[0] / b[0]).ln()
+};
+// Slope-p reference line through the finest-grid point.
+let reference = |c: &Vec<[f64; 2]>, p: i32| -> Vec<[f64; 2]> {
+    let [h, e] = c[c.len() - 1];
+    c.iter().map(|q| [q[0], e * (q[0] / h).powi(p)]).collect()
+};
+let mut series: Vec<_> = ["FDM", "FEM", "FVM"]
+    .iter()
+    .zip(&curves)
+    .zip(["circle", "diamond", "triangle"])
+    .map(|((name, c), symbol)| {
+        serde_json::json!({ "name": name, "points": c, "style": { "symbol": symbol } })
+    })
+    .collect();
+for (name, curve, p) in [
+    ("Slope 2 (reference)", &curves[0], 2),
+    ("Slope 4 (reference)", &curves[1], 4),
+] {
+    series.push(serde_json::json!({
+        "name": name,
+        "points": reference(curve, p),
+        "style": { "lineType": "dashed" }
+    }));
+}
+emit_line_chart!(
+    &series,
+    options = &serde_json::json!({
+        "xLabel": "Grid spacing h [-]",
+        "yLabel": "Maximum error [-]",
+        "xType": "log",
+        "yType": "log"
+    })
+);
+let columns = serde_json::json!([
+    { "key": "0", "label": "Vertex count N", "type": "integer" },
+    { "key": "1", "label": "Grid spacing h [-]", "type": "number", "format": sci3 },
+    { "key": "2", "label": "Maximum FDM error [-]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "Maximum FEM error [-]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "Maximum FVM error [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "errors" })
+);
+let order_columns = serde_json::json!([
+    { "key": "0", "label": "Observed FDM order [-]", "type": "number", "format": fixed3 },
+    { "key": "1", "label": "Observed FEM order [-]", "type": "number", "format": fixed3 },
+    { "key": "2", "label": "Observed FVM order [-]", "type": "number", "format": fixed3 }
+]);
+emit_table_with_columns!(
+    order_columns,
+    vec![(order(&curves[0]), order(&curves[1]), order(&curves[2]))],
+    metadata = serde_json::json!({ "id": "orders" })
+);
+```
+
+With default $m=2$, observed orders are FDM 2.001, FEM 4.001, and FVM 1.999.
+FEM points follow the dashed slope-4 line, consistent with nodal error coming solely from load quadrature.
+Increasing mode number leaves coarse grids unable to resolve the wave, bending the curve; grids finer than about 10 points per wavelength approach theoretical slopes.
+At $m=6$, FDM error reaches 0.63 on the 9-point grid, but the two finest grids give observed orders FDM 2.006, FEM 4.006, and FVM 2.015.
+
+Fourth-order FEM convergence is superconvergence specific to nodes of one-dimensional P1 elements with constant coefficients.
+Errors between nodes and $L^2$ errors retain normal P1 order (second order in $L^2$); fourth-order nodal convergence is also not expected for P1 elements in two or more dimensions.
+
+## Summary
+
+Manufactured solutions allow direct comparison of errors from three discretizations with the exact solution.
+The three plans implement `SpatialDiscretization`, so one `EllipticProblem` solves each by the same procedure, and `dof_point` reads unknown locations.
+Uniform-grid FDM nodal solutions equal $\rho=(m\pi)^2/\lambda_h$ times the exact solution, allowing advance error predictions to check the implementation.
+FDM and FVM converge at second order; one-dimensional P1 FEM nodal values converge at fourth order.
+Direct-method backward error measures algebraic accuracy and cannot estimate discretization error.
+
+## Further reading
+
+- [FDM, FEM, and FVM for elliptic problems](../../algorithms/elliptic-fdm-fem-fvm/) examines derivations of matrices and loads for all three discretizations.
+- [The two-layer-wall example](../layered-wall-conduction/) examines how coefficient-sampling locations change results with discontinuous conductivity.
+- [Poisson equation and convergence order on an anisotropic plate](../poisson-2d-manufactured/) applies the same order measurement to two-dimensional differences and handles mixed and all-Neumann boundaries.
+- See the [scioxide-sparse example](../../../scioxide-sparse/examples/poisson-reordering-fill/) for reordering and fill in the two-dimensional Poisson matrix, and the [scioxide-fft example](../../../scioxide-fft/examples/spectral-poisson/) for periodic spectral methods.

@@ -1,0 +1,450 @@
+---
+title: 逐次集計するセンサー列と大きな基準値
+description: 大きな基準値に周期成分と線形ドリフトが乗った温度の測定列を OnlineMoments で逐次集計し、逐次平均の追従、分散の成分の解析値、1 パスの公式の桁落ち、浮動小数点の間隔による測定値の量子化、歪度と尖度の逐次集計を確かめる。
+sidebar:
+  order: 405
+references:
+  stats-online-sensor-skew-kurtosis: "歪度と尖度の逐次集計"
+---
+
+測定値を保存せずに到着順に要約する場面では、標本を保持しない逐次集計を使う。
+実際の測定列には、大きな基準値、周期的な変動、機器のドリフトが重なる。
+このページは温度の測定列を `OnlineMoments` で逐次集計し、逐次平均が何に追従するか、標本分散がどの成分から成るか、基準値が大きいときに何が失われるかを、解析値と 2 パスの計算に照らして確かめる。
+後半では同じ測定列の歪度と尖度を逐次集計し、生の冪和から求める公式と比べる。
+
+## 測定列のモデル
+
+時刻 $i = 0, 1, \dots, N-1$ の測定値を
+
+$$
+x_i = B + A \sin\!\left(\frac{2\pi i}{P}\right) + D\,\frac{i}{N-1}
+$$
+
+とする。
+$B = 20 + 10^p$ °C は基準値、$A = 0.2$ °C は周期 $P = 16$ 標本の変動の振幅、$D$ °C は観測期間全体のドリフトである。
+基準値の指数 $p$ は、平均に対して変動が何桁小さいかを決める。
+実際の温度計で $10^6$ °C を測ることはないが、同じ比の状況は大きな絶対時刻、累積の電力量、緯度経度の座標などで普通に起こる。
+
+$N$ が $P$ の倍数なら正弦の和は 0 になり、$\sum_i i = N(N-1)/2$ なので、平均は
+
+$$
+\bar x = B + \frac{D}{2}
+$$
+
+である。
+逐次平均 $\bar x_n$ は最初の $n$ 個の平均なので、ドリフトの部分は $D(n-1)/(2(N-1))$ のように少しずつ上がり、$n = N$ で $D/2$ に達する。
+逐次平均は過去の観測すべてに同じ重みを置くので、現在の値ではなく、ここまでのドリフトの中点を追う。
+現在の値への追従を求めるなら、指数移動平均や状態空間モデルのような別の推定量が要る。
+
+標本分散は測定のノイズだけを表すわけではない。
+偏差平方和 $\sum_i (x_i - \bar x)^2$ を正弦、ドリフト、その交差項に分けると、$N$ が $P$ の倍数のとき
+
+$$
+(N-1)\,s^2 = \frac{N A^2}{2} - \frac{A D N}{N-1}\cot\frac{\pi}{P} + \frac{D^2 N (N+1)}{12 (N-1)}
+$$
+
+となる。
+第 1 項は完全な周期の正弦の平方和 $\sum_i \sin^2(2\pi i/P) = N/2$、第 3 項は等間隔の格子の偏差平方和 $\sum_i (i - (N-1)/2)^2 = N(N^2-1)/12$ から来る。
+第 2 項は交差項で、$\sum_i i \sin(2\pi i/P) = -(N/2)\cot(\pi/P)$ を使った。
+この列では正弦の山が各周期の前半にあるので、ドリフトとの共分散は負になる。
+トレンドを除かずに求めた分散は、この確定的な変化を含む。
+
+次の定義のブロックは、このページの二つのセルが使う測定列を作る。
+`sensor_series` は偏差 $A\sin(2\pi i/P) + D\,i/(N-1)$ と、それに $B$ を加えて `f64` に丸めた測定値 $x_i$ を返す。
+
+```rust
+//| id: stats-online-sensor-model
+//| kind: definitions
+//| title: 基準値、周期成分、ドリフトを重ねた測定列
+//| crates: [scioxide-core]
+use scioxide_core::RealScalar;
+
+/// 周期成分の振幅 A [°C] と周期 P [標本]。
+pub(crate) const AMPLITUDE: f64 = 0.2;
+pub(crate) const PERIOD: f64 = 16.0;
+
+/// 基準値 B [°C]、基準値を加える前の偏差 [°C]、保存される測定値 xᵢ = B + 偏差 [°C]。
+pub(crate) struct SensorSeries {
+    pub(crate) baseline: f64,
+    pub(crate) deviations: Vec<f64>,
+    pub(crate) values: Vec<f64>,
+}
+
+/// xᵢ = B + A sin(2πi/P) + D i/(N − 1)、B = 20 + 10ᵖ。
+pub(crate) fn sensor_series(drift: f64, baseline_exponent: f64, count: usize) -> SensorSeries {
+    let baseline = 20.0 + RealScalar::powf(10.0_f64, baseline_exponent);
+    let last = (count - 1) as f64;
+    let deviations: Vec<f64> = (0..count)
+        .map(|i| {
+            let phase = 2.0 * std::f64::consts::PI * i as f64 / PERIOD;
+            AMPLITUDE * RealScalar::sin(phase) + drift * i as f64 / last
+        })
+        .collect();
+    let values = deviations.iter().map(|d| baseline + d).collect();
+    SensorSeries {
+        baseline,
+        deviations,
+        values,
+    }
+}
+```
+
+## 逐次集計の実験
+
+次のセルはドリフト $D$、基準値の指数 $p$、標本数 $N$ を変えて測定列を作り、`OnlineMoments::observe` で 1 個ずつ集計する。
+各時点で `snapshot().mean()` を読み、逐次平均の軌跡を基準値からの偏差として描く。
+破線はドリフトだけの逐次平均 $D\,i/(2(N-1))$、横線は最終の理論平均 $D/2$ である。
+
+分散は四つの経路で求め、上の解析値と比べる。
+`OnlineMoments` の `sample_variance`、保存した測定値から平均を単純な総和で求めて偏差を足す 2 パスの計算、1 パスの公式（平方和の差）、基準値を加える前の偏差の 2 パスの計算である。
+最後の経路は基準値による丸めを含まないモデルの分散で、解析値と別の方法による検算になる。
+2 パスと 1 パスの計算はセルの中の `f64` の算術で書いた比較用の経路で、SciOxide の関数を通らない。
+表の下段には最終の平均と理論平均の差、基準値の近くの浮動小数点の間隔（1 ulp）、独立を仮定した平均の標準誤差 $s/\sqrt N$ を出す。
+
+```rust
+//| id: stats-online-sensor
+//| ref: stats-online-sensor
+//| title: 大きな基準値を持つドリフト測定列を逐次集計する
+//| run: reactive
+//| uses: [stats-online-sensor-model]
+//| crates: [scioxide-core, scioxide-stats]
+//| exports: [drift, baseline_exponent, sensor_sample_count]
+//| inputs:
+//|   drift: {"type":"range","label":"全期間のドリフト D [°C]","description":"測定列に加える線形の変化。","min":0,"max":4,"step":0.25,"value":0.5}
+//|   baseline_exponent: {"type":"range","label":"基準値の指数 p（B = 20 + 10ᵖ °C）","description":"平均に対して変動が何桁小さいかを変える。","min":0,"max":15,"step":1,"value":6}
+//|   sensor_sample_count: {"type":"range","label":"標本数 N [個]","description":"16 標本の周期を整数回含む観測期間。","min":64,"max":256,"step":16,"value":128}
+//| cases:
+//|   - {"id":"strong-drift","label":"D = 4 °C","description":"分散のほとんどがドリフトの寄与になり、逐次平均が直線的に上がる。","inputs":{"drift":4}}
+//|   - {"id":"small-baseline","label":"p = 0","description":"基準値が小さいと 1 パスの公式も解析値に近い値を返す。","inputs":{"baseline_exponent":0}}
+//|   - {"id":"quantized","label":"p = 15","description":"浮動小数点の間隔が振幅に近づき、保存した測定値そのものが量子化される。","inputs":{"baseline_exponent":15}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"variance","path":"/rows/0/1","approx":{"value":0.0374958183729549,"rtol":1e-09}}
+//|       - {"artifact":"variance","path":"/rows/2/2","approx":{"value":0.000767,"rtol":0.01}}
+//|       - {"artifact":"variance","path":"/rows/3/2","approx":{"value":2.269e-12,"rtol":0.01}}
+//|       - {"artifact":"variance","path":"/rows/4/2","range":{"min":-1e-15,"max":1e-15}}
+//|       - {"artifact":"summary","path":"/rows/0/1","approx":{"value":0.0374958183706857,"rtol":1e-12}}
+//|       - {"artifact":"summary","path":"/rows/1/1","range":{"min":-1e-12,"max":1e-12}}
+//|       - {"artifact":"summary","path":"/rows/2/1","approx":{"value":1.1641532182693481e-10,"rtol":1e-12}}
+//|   - case: strong-drift
+//|     expect:
+//|       - {"artifact":"variance","path":"/rows/0/1","approx":{"value":1.35323457351,"rtol":1e-09}}
+//|       - {"artifact":"summary","path":"/rows/0/1","approx":{"value":1.35323457350154,"rtol":1e-12}}
+//|   - case: small-baseline
+//|     expect:
+//|       - {"artifact":"variance","path":"/rows/2/2","range":{"min":-1e-12,"max":1e-12}}
+//|       - {"artifact":"summary","path":"/rows/2/1","approx":{"value":3.552713678800501e-15,"rtol":1e-12}}
+//|   - case: quantized
+//|     expect:
+//|       - {"artifact":"variance","path":"/rows/0/1","approx":{"value":0.0393700787401575,"rtol":1e-09}}
+//|       - {"artifact":"variance","path":"/rows/3/1","approx":{"value":0.0393700787401575,"rtol":1e-09}}
+//|       - {"artifact":"variance","path":"/rows/1/1","approx":{"value":1.94488,"rtol":0.001}}
+//|       - {"artifact":"summary","path":"/rows/2/1","equals":0.125}
+use scioxide_core::RealScalar;
+use scioxide_stats::{MomentOrder, OnlineMoments};
+
+let n = sensor_sample_count as usize;
+let count = n as f64;
+let SensorSeries {
+    baseline,
+    deviations,
+    values,
+} = sensor_series(drift, baseline_exponent, n);
+// 主計算: 到着順に集計し、各時点の逐次平均を記録する。
+let mut moments = OnlineMoments::new(MomentOrder::Second);
+let (mut signal, mut running, mut drift_mean) = (Vec::new(), Vec::new(), Vec::new());
+for (i, &value) in values.iter().enumerate() {
+    moments.observe(value).map_err(|e| e.to_string())?;
+    let mean = moments.snapshot().mean().map_err(|e| e.to_string())?;
+    let mean = mean.ok_or("平均が未定義")?;
+    signal.push([i as f64, value - baseline]);
+    running.push([i as f64, mean - baseline]);
+    drift_mean.push([i as f64, drift * i as f64 / (2.0 * (count - 1.0))]);
+}
+let snapshot = moments.snapshot();
+let online = snapshot.sample_variance().map_err(|e| e.to_string())?;
+let online = online.ok_or("標本分散が未定義")?;
+// 比較用: f64 の算術で書いた 2 パスと 1 パスの公式（SciOxide を通らない）。
+let two_pass = |xs: &[f64]| {
+    let m = xs.iter().sum::<f64>() / count;
+    xs.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / (count - 1.0)
+};
+let sum: f64 = values.iter().sum();
+let squares: f64 = values.iter().map(|v| v * v).sum();
+let one_pass = (squares - sum * sum / count) / (count - 1.0);
+// 検算: N が P の倍数のときの解析値（本文の式）。
+let cot = 1.0 / RealScalar::tan(std::f64::consts::PI / PERIOD);
+let analytic = (count * AMPLITUDE * AMPLITUDE / 2.0
+    - AMPLITUDE * drift * count * cot / (count - 1.0)
+    + drift * drift * count * (count + 1.0) / (12.0 * (count - 1.0)))
+    / (count - 1.0);
+emit_chart!(
+    serde_json::json!({
+        "kind": "line",
+        "dataZoom": true,
+        "tooltip": true,
+        "series": [
+            { "name": "測定値 xᵢ − B", "points": signal, "style": { "symbol": "circle" } },
+            { "name": "逐次平均 x̄ₙ − B", "points": running },
+            {
+                "name": "ドリフトだけの逐次平均",
+                "points": drift_mean,
+                "style": { "lineType": "dashed" }
+            }
+        ],
+        "xLabel": "標本番号 i [-]",
+        "yLabel": "基準値 B からの偏差 [°C]",
+        "annotations": [
+            { "kind": "line", "axis": "y", "value": drift / 2.0, "label": "理論平均 D/2" }
+        ]
+    }),
+    metadata = serde_json::json!({ "id": "running" })
+);
+let full = serde_json::json!({ "significantDigits": 10 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "分散の経路" },
+    { "key": "1", "label": "標本分散 [°C²]", "type": "number", "format": full },
+    { "key": "2", "label": "解析値との差 [°C²]", "type": "number", "format": sci2 }
+]);
+// 保存した測定値から B を引いた値（この引き算は丸めない）。丸めた測定値そのものの分散の参照。
+let stored: Vec<f64> = values.iter().map(|v| v - baseline).collect();
+let paths = [
+    ("OnlineMoments", online),
+    ("測定値の 2 パス", two_pass(&values)),
+    ("1 パスの公式", one_pass),
+    ("保存した測定値 − B の 2 パス", two_pass(&stored)),
+    ("偏差の 2 パス（丸める前のモデル）", two_pass(&deviations)),
+];
+let rows: Vec<(&str, f64, f64)> = paths
+    .iter()
+    .map(|&(name, v)| (name, v, v - analytic))
+    .collect();
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "variance" })
+);
+let final_mean = snapshot.mean().map_err(|e| e.to_string())?;
+let final_mean = final_mean.ok_or("平均が未定義")?;
+let standard_error = snapshot
+    .standard_error_of_sample_mean()
+    .map_err(|e| e.to_string())?
+    .ok_or("標準誤差が未定義")?;
+let ulp = RealScalar::next_after(baseline, f64::INFINITY) - baseline;
+let summary = vec![
+    ("解析的な標本分散 [°C²]", analytic),
+    (
+        "最終の平均 − 理論平均 B + D/2 [°C]",
+        final_mean - (baseline + drift / 2.0),
+    ),
+    ("基準値の近くの浮動小数点の間隔 [°C]", ulp),
+    ("独立を仮定した平均の標準誤差 s/√N [°C]", standard_error),
+];
+let value_format = serde_json::json!({ "significantDigits": 5 });
+let summary_columns = serde_json::json!([
+    { "key": "0", "label": "量" },
+    { "key": "1", "label": "値", "type": "number", "format": value_format }
+]);
+emit_table_with_columns!(
+    summary_columns,
+    summary,
+    metadata = serde_json::json!({ "id": "summary" })
+);
+export!(drift, drift);
+export!(baseline_exponent, baseline_exponent);
+export!(sensor_sample_count, sensor_sample_count);
+```
+
+既定の $D = 0.5$ °C、$p = 6$、$N = 128$ では、解析的な標本分散は $3.7496 \times 10^{-2}$ °C² である。
+内訳は正弦の項 $NA^2/(2(N-1)) = 0.02016$ °C²、ドリフトの項 0.02133 °C²、負の交差項 $-0.00399$ °C² である。
+基準値を加える前の偏差の 2 パスは解析値と $10^{-17}$ °C² の程度で一致し、解析式と測定列の作り方が合っていることを確かめられる。
+
+`OnlineMoments` と測定値の 2 パスの計算は解析値と $2.3 \times 10^{-12}$ °C² 違うが、保存した測定値から $B$ を引いて 2 パスで求めた値も同じだけ違う。
+基準値 $10^6$ の近くの浮動小数点の間隔は $1.16 \times 10^{-10}$ °C で、保存した測定値はこの格子に丸められている。
+この差は丸めた測定値そのものの分散と丸める前のモデルの分散の差で、集計のアルゴリズムの誤差ではない。
+1 パスの公式は $7.7 \times 10^{-4}$ °C²（相対誤差 2%）ずれる。
+二つの平方和 $\sum_i x_i^2 \approx 1.28 \times 10^{14}$ °C² の差から偏差平方和 4.76 °C² を取り出すので、1 ulp が 0.016 °C² の平方和の丸めがそのまま残り、偏差平方和で 0.097 °C² の誤差になる。
+
+逐次平均の軌跡は、ドリフトだけの逐次平均（破線）の周りを周期成分の分だけ揺れながら上がり、最後に理論平均 $D/2$ に達する。
+最終の平均と理論平均 $B + D/2$（`f64` で計算した値）の差は、試したどの入力でも 0 になる。
+`OnlineMoments` は平均を上位と下位の二つの部分からなる補償付きの和で持ち、保存した測定値の平均を最後の `f64` への丸め 1 回分ほどの誤差で返すので、$B + D/2$ を `f64` に丸めた値と一致している。
+表の最下行の $s/\sqrt N = 0.0171$ °C は、観測が独立なら平均の標準誤差になる量である。
+この列は確定的な正弦とドリフトから成るので、この値は平均の不確かさを表さない。
+
+ドリフトを $D = 4$ °C にすると、分散は 1.3532 °C² に増え、そのうち 1.3650 °C² がドリフトの項になる。
+$p = 0$ では 1 パスの公式も解析値との差が $3.3 \times 10^{-13}$ °C² に収まる。
+
+$p = 15$ では、基準値の近くの間隔が 0.125 °C になり、振幅 0.2 °C と同じ桁になる。
+保存した測定値は 0.125 °C の格子に量子化され、`OnlineMoments` の分散 0.03937 °C² は、保存した測定値から $B$ を引いた 2 パスの値と一致する。
+モデルの分散との差 $1.9 \times 10^{-3}$ °C² は量子化によるもので、表現の時点で失った情報はどの集計のアルゴリズムでも取り戻せない。
+一方、単純な総和で平均を求める 2 パスの計算は 1.94 °C²、1 パスの公式は $1.6 \times 10^{15}$ °C² になり、丸めた測定値の分散さえ求められない。
+
+## 歪度と尖度の逐次集計
+
+分布の形を要約する歪度と尖度は、中心モーメント $m_k = \frac1N \sum_i (x_i - \bar x)^k$ から
+
+$$
+g_1 = \frac{m_3}{m_2^{3/2}}, \qquad g_2 = \frac{m_4}{m_2^2} - 3
+$$
+
+で定義する。
+$g_1$ は Fisher–Pearson の歪度、$g_2$ は正規分布で 0 になる過剰尖度である。
+完全な周期の正弦だけなら $m_2 = A^2/2$、$m_3 = 0$、$m_4 = 3A^4/8$ なので、$g_1 = 0$、$g_2 = -1.5$ になる。
+ドリフトは一様分布に近い値を加えるので、$g_2$ を一様分布の $-1.2$ の側へ動かし、正弦との交差項が $g_1$ をわずかに 0 からずらす。
+
+`OnlineMoments::new(MomentOrder::Fourth)` は 3 次と 4 次の中心モーメントも逐次に更新する。
+更新と結合には Pébay の公式を使い、平均からの偏差の冪だけを足し込むので、生の冪和 $\sum_i x_i^k$ を作らない。
+`MomentsSnapshot::skewness` と `kurtosis` は `BiasCorrection::None` で $g_1$、$g_2$ を返し、`BiasCorrection::Corrected` で独立標本に対する補正 $G_1$、$G_2$ を返す。
+`KurtosisConvention::Fisher` は過剰尖度、`Pearson` は $m_4/m_2^2$ を返す。
+`central_moment(k)` は $m_k$ を返し、累積器が保持しない次数を求めると `NotImplemented` になる。
+定数の標本では歪度と尖度が `None` になり、`Corrected` では 3 個（歪度）と 4 個（尖度）未満も `None` になる。
+
+比較に使う生の冪和の公式は、$S_k = \sum_i x_i^k$ と $\bar x = S_1/N$ から
+
+$$
+m_4 = \frac{S_4}{N} - 4\bar x \frac{S_3}{N} + 6\bar x^2 \frac{S_2}{N} - 3\bar x^4
+$$
+
+のように中心モーメントを組み立てる。
+$p = 6$ では各項が $B^4 \approx 10^{24}$ °C⁴ の大きさを持ち、$m_4 \approx 3 \times 10^{-3}$ °C⁴ より 27 桁大きい項の差を取ることになる。
+
+次のセルは前のセルの入力 $D$、$p$、$N$ を受け取って同じ測定列を作り、4 次まで逐次集計した $g_1$、$g_2$、$m_4$ を、偏差の 2 パスの計算（参照値）と生の冪和の公式と比べる。
+前のセルの入力を変えると、このセルも同じ列で計算し直す。
+生の冪和の公式で $m_2$ が 0 以下になったときは、歪度と尖度を未定義として表示する。
+
+```rust
+//| id: stats-online-sensor-api-2
+//| ref: stats-online-sensor-api-2
+//| title: 測定列の歪度と尖度を逐次集計し、生の冪和の公式と比べる
+//| run: reactive
+//| uses: [stats-online-sensor-model]
+//| crates: [scioxide-core, scioxide-stats]
+//| dependsOn:
+//|   sensor: stats-online-sensor
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"shape","path":"/rows/0/1","approx":{"value":0.0132019073,"rtol":1e-06}}
+//|       - {"artifact":"shape","path":"/rows/0/2","approx":{"value":-0.66765323,"rtol":1e-07}}
+//|       - {"artifact":"shape","path":"/rows/2/2","approx":{"value":-0.66765323,"rtol":1e-07}}
+//|       - {"artifact":"shape","path":"/rows/3/1","approx":{"value":0.0132019076,"rtol":1e-06}}
+//|       - {"artifact":"shape","path":"/rows/3/2","approx":{"value":-0.6676532303,"rtol":1e-09}}
+//|       - {"artifact":"shape","path":"/rows/1/3","equals":null}
+use scioxide_core::RealScalar;
+use scioxide_stats::{BiasCorrection, KurtosisConvention, MomentOrder, OnlineMoments};
+
+// 前のセルの入力を受け取り、同じ測定列を作る。
+let drift = sensor["drift"].as_f64().ok_or("ドリフトがない")?;
+let exponent = sensor["baseline_exponent"]
+    .as_f64()
+    .ok_or("基準値の指数がない")?;
+let n = sensor["sensor_sample_count"]
+    .as_f64()
+    .ok_or("標本数がない")? as usize;
+let SensorSeries {
+    deviations, values, ..
+} = sensor_series(drift, exponent, n);
+let count = n as f64;
+// 主計算: 4 次までの中心モーメントを到着順に集計する。
+let mut moments = OnlineMoments::new(MomentOrder::Fourth);
+for &value in &values {
+    moments.observe(value).map_err(|e| e.to_string())?;
+}
+let s = moments.snapshot();
+let shape = |correction| -> Result<(Option<f64>, Option<f64>), String> {
+    let skew = s.skewness(correction).map_err(|e| e.to_string())?;
+    let kurt = s.kurtosis(correction, KurtosisConvention::Fisher);
+    Ok((skew, kurt.map_err(|e| e.to_string())?))
+};
+let (g1, g2) = shape(BiasCorrection::None)?;
+let (big_g1, big_g2) = shape(BiasCorrection::Corrected)?;
+let m4 = s.central_moment(4).map_err(|e| e.to_string())?;
+// 中心モーメント (m₂, m₃, m₄) から (g₁, g₂) を作る。m₂ ≤ 0 なら未定義。
+let coefficients = |m2: f64, m3: f64, m4: f64| {
+    (m2 > 0.0).then(|| (m3 / RealScalar::powf(m2, 1.5), m4 / (m2 * m2) - 3.0))
+};
+// 参照値: 中心モーメントの 2 パス（f64 の算術）。保存した測定値は x₀ を引いてから使う。
+let central = |xs: &[f64]| {
+    let center = xs.iter().sum::<f64>() / count;
+    let moment = |k: i32| {
+        xs.iter()
+            .map(|x| RealScalar::powi(x - center, k))
+            .sum::<f64>()
+            / count
+    };
+    (moment(2), moment(3), moment(4))
+};
+let shifted: Vec<f64> = values.iter().map(|v| v - values[0]).collect();
+let (s2, s3, s4) = central(&shifted);
+let (r2, r3, r4) = central(&deviations);
+let stored = coefficients(s2, s3, s4);
+let reference = coefficients(r2, r3, r4);
+// 比較用: 生の冪和 S_k から中心モーメントを組み立てる公式（f64 の算術）。
+let raw = |k: i32| values.iter().map(|v| RealScalar::powi(*v, k)).sum::<f64>() / count;
+let (a1, a2, a3, a4) = (raw(1), raw(2), raw(3), raw(4));
+let n2 = a2 - a1 * a1;
+let n3 = a3 - 3.0 * a1 * a2 + 2.0 * a1 * a1 * a1;
+let n4 = a4 - 4.0 * a1 * a3 + 6.0 * a1 * a1 * a2 - 3.0 * a1 * a1 * a1 * a1;
+let naive = coefficients(n2, n3, n4);
+let fixed4 = serde_json::json!({ "fractionDigits": 4 });
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "経路" },
+    { "key": "1", "label": "歪度 [-]", "type": "number", "format": fixed4, "nullText": "—" },
+    { "key": "2", "label": "過剰尖度 [-]", "type": "number", "format": fixed4, "nullText": "—" },
+    { "key": "3", "label": "m₄ [°C⁴]", "type": "number", "format": sci3, "nullText": "—" }
+]);
+let rows = vec![
+    ("OnlineMoments（g₁, g₂）", g1, g2, m4),
+    ("OnlineMoments（補正 G₁, G₂）", big_g1, big_g2, None),
+    (
+        "保存した測定値 − x₀ の 2 パス",
+        stored.map(|r| r.0),
+        stored.map(|r| r.1),
+        Some(s4),
+    ),
+    (
+        "偏差の 2 パス（丸める前のモデル）",
+        reference.map(|r| r.0),
+        reference.map(|r| r.1),
+        Some(r4),
+    ),
+    (
+        "生の冪和の公式",
+        naive.map(|r| r.0),
+        naive.map(|r| r.1),
+        Some(n4),
+    ),
+];
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "shape" })
+);
+```
+
+既定の入力では、`OnlineMoments` の $g_1 = 0.0132$、$g_2 = -0.6677$、$m_4 = 3.228 \times 10^{-3}$ °C⁴ は、保存した測定値の 2 パスと表示した桁で一致する。
+丸める前のモデルとの差は、$g_2$ と $m_4$ では $10^{-10}$ の程度で、相殺の大きい $g_1$ でも相対 $2 \times 10^{-8}$ である。
+生の冪和の公式は $g_1$ が $-1.7 \times 10^5$、$g_2$ が $1.9 \times 10^{12}$ となり、形の情報は残らない。
+補正した $G_1 = 0.0134$、$G_2 = -0.6461$ は独立な標本の偏りを補正する係数で、確定的なこの列では $g_1$、$g_2$ と読み方は変わらない。
+
+前のセルを $D = 0$ にすると、$g_1$ は $10^{-16}$ の程度、$g_2$ は $-1.5$ と $3 \times 10^{-10}$ 以内で一致し、正弦の解析値を再現する。
+$D = 4$ °C ではドリフトが支配的になり、$g_2 = -1.2208$ は一様分布の $-1.2$ に近づく。
+$p = 15$ では、保存した測定値の $g_1$ がほぼ 0、$g_2$ が $-0.680$ になり、モデルの $0.0132$、$-0.6677$ からずれる。
+量子化した測定値の形を `OnlineMoments` が正しく集計した結果であり、ここでも失われたのは表現の段階の情報である。
+
+## まとめ
+
+逐次平均は過去の全観測に等しい重みを置くので、ドリフトのある測定列では現在の値ではなくドリフトの中点に向かう。
+標本分散はノイズだけでなく周期成分とドリフトの確定的な変化と、その負の交差項を含むので、測定の不確かさとして解釈する前にトレンドを除く。
+同じ理由で、`standard_error_of_sample_mean` が返す $s/\sqrt N$ は独立な観測を仮定した値であり、この列の平均の不確かさを表さない。
+`OnlineMoments` は基準値が大きくても保存した測定値の分散と高次の中心モーメントを解析値の近くに保ち、単純な総和の 2 パスや生の冪和の公式が崩れる $p = 15$ でも、丸めた測定値そのものの統計量を返す。
+ただし基準値の近くの浮動小数点の間隔が変動に近づくと、保存した測定値が量子化されて情報を失い、これはどの集計のアルゴリズムでも取り戻せない。
+
+## 次に読むページ
+
+- [逐次平均・分散・高次モーメント・共分散の数理](../../algorithms/online-moments-and-covariance/)：1 パスの公式の誤差が条件数の 2 乗に比例する理由と、高次モーメントの結合公式を確かめる。
+- [分割集計を一括集計と照合する](../merge-covariance/)：区画ごとの集計を結合しても同じ統計量が得られることを、二変量の場合で確かめる。
+- [信頼区間の被覆率を反復実験で確かめる](../confidence-coverage/)：独立を仮定した $s/\sqrt N$ が、自己相関のある列で平均の不確かさをどれだけ小さく見積もるかを確かめる。

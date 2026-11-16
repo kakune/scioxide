@@ -1,0 +1,458 @@
+---
+title: 心電図の基線変動と電源ノイズの除去
+description: 合成した心電図に呼吸による基線変動、50 Hz の電源ノイズ、筋電の白色雑音を加え、ノッチと Butterworth の二次節の縦続をゼロ位相で適用して、波形の誤差と R 波の時刻のずれを因果的な処理と比べる。
+sidebar:
+  order: 415
+---
+
+心電図（ECG）は心筋の電気的な活動を体表で測った電位で、振幅は 1 mV 程度である。
+記録には、呼吸や体動による 1 Hz 以下のゆっくりした基線変動、商用電源から入る 50 Hz（地域によって 60 Hz）の正弦波、筋肉の活動による広帯域のノイズが重なる。
+診断に使う ST 部分（S 波と T 波の間）は低い周波数の成分を含むので、基線変動を除く高域通過が位相を歪めると波形の形が変わる。
+このページでは、合成した心電図に三つのノイズを加え、IIR フィルタの二次節の縦続をゼロ位相で適用して、波形の誤差と R 波の時刻を確かめる。
+
+使う API は、ノッチの設計 `design_notch_peak`、Butterworth の設計 `design_iir`、二次節 `SecondOrderSections` の因果的な実行 `filter` と前後方向の実行 `forward_backward`、トレンド除去 `detrend`、ピークの検出 `find_peaks_with_options` である。
+設計の理論は[IIR フィルタの設計](../../algorithms/iir-design/)、実行と端の扱いは[IIR フィルタの実行とゼロ位相](../../algorithms/iir-filtering-and-zero-phase/)で扱う。
+
+## 合成心電図
+
+標本化周波数は $f_s = 500$ Hz、記録は 10 s（5000 標本）とする。
+心拍数は 72 回/分で、R 波の時刻を $t_j = 0.4 + j \cdot (60/72)$ s（$j = 0, \dots, 11$）に置く。
+一拍の波形は、R 波の時刻からのずれ $\mu$、振幅 $a$、幅 $\sigma$ を持つ五つの Gauss 関数の和
+
+$$
+s(t) = \sum_{j} \sum_{w} a_w \exp\!\left(-\frac{(t - t_j - \mu_w)^2}{2\sigma_w^2}\right)
+$$
+
+で表す。
+パラメータは次のとおりで、このページで定めたモデルであり、実在の記録の再現ではない。
+
+| 波 | 振幅 $a$ [mV] | ずれ $\mu$ [s] | 幅 $\sigma$ [s] |
+|---|---|---|---|
+| P | 0.15 | −0.200 | 0.025 |
+| Q | −0.10 | −0.025 | 0.008 |
+| R | 1.20 | 0 | 0.010 |
+| S | −0.25 | 0.025 | 0.008 |
+| T | 0.30 | 0.250 | 0.040 |
+
+記録はこれに次の三つを加えたものである。
+
+- 基線変動: $b \sin(2\pi \cdot 0.3\,t + 0.7)$（呼吸の周期 3.3 s を模す）
+- 電源ノイズ: $m \sin(2\pi \cdot 50\,t)$
+- 筋電のノイズ: 標準偏差 $\sigma_n$ の白色 Gauss ノイズ（乱数のシードで系列を変える）
+
+## フィルタの構成
+
+三つのノイズに、三つのフィルタを縦続で当てる。
+周波数は Nyquist 周波数 250 Hz に対する比で設計関数に渡す。
+
+- 50 Hz のノッチ: `design_notch_peak(0.2, Q, ResonanceKind::Notch)`。
+  −3 dB の帯域幅は $50/Q$ Hz で、$Q$ が大きいほど 50 Hz の近くの心電図の成分を残す。
+- 基線変動を除く高域通過: 2 次の Butterworth（`IirBand::Highpass`）。
+  遮断は 0.5 Hz を既定とし、心拍の基本周波数 1.2 Hz より低く、呼吸の 0.3 Hz より高くする。
+- 筋電のノイズを減らす低域通過: 4 次の Butterworth（`IirBand::Lowpass`）。
+  遮断は 40 Hz を既定とする。
+
+三つの設計の二次節の行（1 + 1 + 2 = 4 行）を一つの `SecondOrderSections` に並べれば、縦続全体を一回の呼び出しで適用できる。
+因果的な `filter` は振幅応答 $|H|$ と、周波数ごとに違う群遅延を持つ。
+前後方向の `forward_backward` は振幅応答 $|H|^2$ を持ち、位相を変えない。
+$|H|^2$ では阻止域の減衰が 2 倍の dB になり、遮断での利得は $1/2$（−6 dB）になる。
+
+処理の前に、記録から最小二乗の直線を `detrend(record, DetrendKind::Linear)` で引く。
+記録の端の値と傾きが 0 に近づくので、前後方向の処理の端の過渡が小さくなる。
+
+### 縦続の周波数応答
+
+次のセルは、ノッチの $Q$、高域通過の遮断、低域通過の遮断を入力として縦続を作り、主な周波数での応答を表にする。
+表の周波数は、基線変動（0.3 Hz）、心拍の基本周波数（1.2 Hz）、QRS 波の主な成分（10 Hz）、電源（50 Hz）である。
+因果的な処理の振幅 $|H|$ と群遅延 [ms]、前後方向の処理の振幅 $|H|^2$ を示す。
+独立な検算として、ノッチの閉じた形の式を `f64` の複素数の計算で評価し、`SecondOrderSections::response` との差を示す。
+群遅延はノッチの零点の 50 Hz では定義されないので、空欄にする。
+このセルは縦続の行を次のセルに渡す。
+
+```rust
+//| id: signal-ecg-filter-response
+//| ref: signal-ecg-filter-response
+//| title: 心電図の前処理に使う縦続の周波数応答
+//| run: reactive
+//| crates: [scioxide-core, scioxide-signal]
+//| exports: [rows]
+//| inputs:
+//|   quality: {"type":"range","label":"ノッチの Q 値 [-]","description":"50 Hz と −3 dB の帯域幅の比。","min":5,"max":60,"step":5,"value":30}
+//|   highpass_hz: {"type":"range","label":"高域通過の遮断 [Hz]","description":"基線変動を除く 2 次の Butterworth。","min":0.1,"max":1.5,"step":0.1,"value":0.5}
+//|   lowpass_hz: {"type":"range","label":"低域通過の遮断 [Hz]","description":"筋電のノイズを減らす 4 次の Butterworth。","min":20,"max":100,"step":5,"value":40}
+//| cases:
+//|   - {"id":"aggressive-highpass","label":"高域通過 1.5 Hz","description":"遮断を心拍の基本周波数に近づけると、1.2 Hz の成分が減る。","inputs":{"highpass_hz":1.5}}
+//|   - {"id":"wide-notch","label":"Q = 5","description":"ノッチの帯域幅が 10 Hz になる。","inputs":{"quality":5}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"response","path":"/rows/0/2","approx":{"value":0.1147,"rtol":1e-3}}
+//|       - {"artifact":"response","path":"/rows/1/2","approx":{"value":0.9707,"rtol":1e-4}}
+//|       - {"artifact":"response","path":"/rows/2/3","approx":{"value":11.74,"atol":0.01}}
+//|       - {"artifact":"response","path":"/rows/3/1","range":{"min":0,"max":1e-12}}
+//|       - {"artifact":"response","path":"/rows/3/3","equals":null}
+//|       - {"artifact":"response","path":"/rows/0/5","range":{"min":0,"max":1e-13}}
+//|       - {"artifact":"response","path":"/rows/2/5","range":{"min":0,"max":1e-13}}
+//|   - case: aggressive-highpass
+//|     expect:
+//|       - {"artifact":"response","path":"/rows/0/2","approx":{"value":1.597e-3,"rtol":1e-3}}
+//|       - {"artifact":"response","path":"/rows/1/2","approx":{"value":0.2906,"rtol":1e-3}}
+//|   - case: wide-notch
+//|     expect:
+//|       - {"artifact":"response","path":"/rows/2/4","approx":{"value":0.99907,"rtol":1e-4}}
+use scioxide_core::Complex;
+use scioxide_signal::{
+    IirBand, IirDomain, IirFamily, ResonanceKind, SecondOrderSections, design_iir,
+    design_notch_peak,
+};
+
+let nyquist = 250.0;
+let center = 50.0 / nyquist;
+let notch =
+    design_notch_peak(center, quality, ResonanceKind::Notch).map_err(|e| e.to_string())?;
+let butterworth = |order, band| {
+    design_iir(order, IirFamily::Butterworth, band, IirDomain::Digital)
+        .and_then(|design| design.to_sos())
+        .map_err(|e| e.to_string())
+};
+let highpass = butterworth(2, IirBand::Highpass(highpass_hz / nyquist))?;
+let lowpass = butterworth(4, IirBand::Lowpass(lowpass_hz / nyquist))?;
+// 三つの設計の行を並べ、一つの縦続にする
+let rows: Vec<[f64; 6]> = notch
+    .sections()
+    .iter()
+    .chain(highpass.sections())
+    .chain(lowpass.sections())
+    .copied()
+    .collect();
+let cascade = SecondOrderSections::new(IirDomain::Digital, &rows).map_err(|e| e.to_string())?;
+
+// 独立な検算: ノッチの閉じた形 g(1 − 2cos(πf₀)z⁻¹ + z⁻²)/(1 − 2g cos(πf₀)z⁻¹ + (2g − 1)z⁻²)
+let pi = std::f64::consts::PI;
+let gain = 1.0 / (1.0 + (0.5 * pi * center / quality).tan());
+let c0 = (pi * center).cos();
+let closed_notch = |f: f64| {
+    let z1 = Complex::new((pi * f).cos(), -(pi * f).sin());
+    let z2 = z1 * z1;
+    let one = Complex::new(1.0, 0.0);
+    let numerator = (one - z1 * Complex::new(2.0 * c0, 0.0) + z2) * Complex::new(gain, 0.0);
+    let denominator = one - z1 * Complex::new(2.0 * gain * c0, 0.0)
+        + z2 * Complex::new(2.0 * gain - 1.0, 0.0);
+    (numerator / denominator).norm()
+};
+
+let mut rows_out = Vec::new();
+for hz in [0.3, 1.2, 10.0, 50.0] {
+    let f = hz / nyquist;
+    let h = cascade.response(f).map_err(|e| e.to_string())?.norm();
+    // 群遅延 [標本] を ms に直す。ノッチの零点（|H| ≈ 0）の上では定義されないので出さない
+    let delay = if h > 1e-8 {
+        cascade.group_delay(f).ok().map(|d| 1000.0 * d / 500.0)
+    } else {
+        None
+    };
+    let notch_gain = notch.response(f).map_err(|e| e.to_string())?.norm();
+    rows_out.push((
+        hz,
+        h,
+        h * h,
+        delay,
+        notch_gain,
+        (notch_gain - closed_notch(f)).abs(),
+    ));
+}
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "周波数 [Hz]", "type": "number" },
+    { "key": "1", "label": "因果的 |H| [-]", "type": "number", "format": sci2 },
+    { "key": "2", "label": "ゼロ位相 |H|² [-]", "type": "number", "format": sci2 },
+    { "key": "3", "label": "群遅延 [ms]", "type": "number", "format": fixed2, "nullText": "定義されない" },
+    { "key": "4", "label": "ノッチの |H| [-]", "type": "number", "format": sci2 },
+    { "key": "5", "label": "閉じた形との差 [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows_out,
+    metadata = serde_json::json!({ "id": "response" })
+);
+
+// 0.05〜245 Hz を対数の等間隔に取り、|H|² を描く（0 になる点は除く）
+let mut curve = Vec::new();
+for i in 0..=400 {
+    let hz = 0.05 * (245.0_f64 / 0.05).powf(i as f64 / 400.0);
+    let power = cascade
+        .response(hz / nyquist)
+        .map_err(|e| e.to_string())?
+        .norm_sqr();
+    if power > 0.0 {
+        curve.push([hz, power]);
+    }
+}
+emit_line_chart!(
+    &vec![serde_json::json!({ "name": "ゼロ位相 |H|²", "points": curve })],
+    options = &serde_json::json!({
+        "xLabel": "周波数 [Hz]",
+        "yLabel": "振幅の二乗 |H|² [-]",
+        "xType": "log",
+        "yType": "log",
+        "yMin": 1e-12,
+        "yMax": 2.0,
+        "annotations": [
+            { "kind": "line", "axis": "x", "value": 0.3, "label": "基線変動" },
+            { "kind": "line", "axis": "x", "value": 50.0, "label": "電源" }
+        ]
+    })
+);
+export!(rows, &rows);
+```
+
+既定の $Q = 30$、高域通過 0.5 Hz、低域通過 40 Hz では、ゼロ位相の $|H|^2$ は 0.3 Hz で 0.115、1.2 Hz で 0.971、10 Hz で 0.99993 である。
+基線変動は約 9 分の 1 に減るが、消えはしない。
+50 Hz の $|H|$ は $1.4 \times 10^{-15}$ で、ノッチの零点が電源の周波数に正確に乗っている。
+ノッチの閉じた形の式との差はどの周波数でも $4 \times 10^{-15}$ 以下である。
+
+因果的な処理の群遅延は 0.3 Hz で 552 ms、1.2 Hz で 99 ms、10 Hz で 11.7 ms と周波数で大きく違う。
+低い周波数ほど遅れるので、P 波・QRS 波・T 波の相対的な位置が崩れる。
+高域通過の遮断を 1.5 Hz に上げると 0.3 Hz の $|H|^2$ は $1.6 \times 10^{-3}$ まで下がるが、心拍の基本周波数 1.2 Hz の成分も 0.29 倍になり、波形が変わる。
+$Q = 5$ にするとノッチの帯域幅が 10 Hz に広がり、10 Hz でもノッチだけで $|H| = 0.99907$ に下がる。
+
+## 時間領域の処理と検算
+
+次のセルは、前のセルの縦続で合成した記録を処理する。
+入力は乱数のシード、基線変動の振幅 $b$、電源ノイズの振幅 $m$、筋電のノイズの標準偏差 $\sigma_n$、ゼロ位相にするかどうかである。
+検算は三つある。
+
+- 処理の前後で、ノイズのない心電図（平均を引いたもの）との RMS 誤差を比べる。
+  端の過渡を除くため、1〜9 s の区間で測る。
+- ノイズのない心電図に同じ処理をした波形との RMS 誤差も示す。
+  これはフィルタ自身による波形の変化を除いた、ノイズの残りだけの大きさである。
+  独立な検算として、この値を周波数応答から予測する。
+  正弦波の振幅 $A$ は $A|H|^p/\sqrt2$ の RMS で、白色雑音は $\sigma_n^2 \int_0^1 |H(f)|^{2p}\, df$ の分散で残る（ゼロ位相で $p = 2$、因果的で $p = 1$、積分は 1000 区間の台形則）。
+- 処理後の波形で R 波を `find_peaks_with_options`（高さ 0.6 mV 以上、間隔 200 標本以上）で検出し、真の R 波の時刻とのずれを ms で示す。
+
+図は 2〜4 s の区間の記録・処理後の波形・ノイズのない心電図と、記録全体での処理後の誤差を描き、時間軸を連動させる。
+
+```rust
+//| id: signal-ecg-cleaning
+//| ref: signal-ecg-cleaning
+//| title: 合成心電図のノイズを除いて R 波の時刻を確かめる
+//| run: reactive
+//| crates: [scioxide-core, scioxide-random, scioxide-signal]
+//| dependsOn:
+//|   filters: signal-ecg-filter-response
+//| inputs:
+//|   seed: {"type":"integer","label":"乱数のシード","description":"筋電のノイズの系列を変える。","min":1,"max":9999,"value":11}
+//|   baseline: {"type":"range","label":"基線変動の振幅 b [mV]","description":"0.3 Hz の正弦波の振幅。","min":0,"max":1.5,"step":0.1,"value":0.5}
+//|   mains: {"type":"range","label":"電源ノイズの振幅 m [mV]","description":"50 Hz の正弦波の振幅。","min":0,"max":0.5,"step":0.05,"value":0.2}
+//|   noise: {"type":"range","label":"筋電のノイズ σ_n [mV]","description":"白色 Gauss ノイズの標準偏差。","min":0.005,"max":0.1,"step":0.005,"value":0.02}
+//|   zero_phase: {"type":"checkbox","label":"ゼロ位相（前後方向）","description":"外すと因果的な filter で処理する。","value":true}
+//| cases:
+//|   - {"id":"causal","label":"因果的な処理","description":"R 波が群遅延だけ遅れ、元の心電図との誤差が増える。","inputs":{"zero_phase":false}}
+//|   - {"id":"strong-noise","label":"b = 1.5 mV、m = 0.5 mV、σ_n = 0.1 mV","description":"ノイズが強くても R 波の時刻はずれない。","inputs":{"baseline":1.5,"mains":0.5,"noise":0.1,"seed":2024}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"cleaning","path":"/rows/0/0","approx":{"value":0.3796,"rtol":1e-3}}
+//|       - {"artifact":"cleaning","path":"/rows/0/1","approx":{"value":0.04255,"rtol":1e-3}}
+//|       - {"artifact":"cleaning","path":"/rows/0/2","approx":{"value":0.04188,"rtol":1e-3}}
+//|       - {"artifact":"cleaning","path":"/rows/0/3","approx":{"value":0.04125,"rtol":1e-3}}
+//|       - {"artifact":"cleaning","path":"/rows/0/4","equals":12}
+//|       - {"artifact":"cleaning","path":"/rows/0/5","range":{"min":-1e-9,"max":1e-9}}
+//|       - {"artifact":"cleaning","path":"/rows/0/6","range":{"min":0,"max":1.01}}
+//|   - case: causal
+//|     expect:
+//|       - {"artifact":"cleaning","path":"/rows/0/1","approx":{"value":0.1824,"rtol":1e-3}}
+//|       - {"artifact":"cleaning","path":"/rows/0/3","approx":{"value":0.1200,"rtol":1e-3}}
+//|       - {"artifact":"cleaning","path":"/rows/0/5","approx":{"value":10.67,"atol":0.01}}
+//|   - case: strong-noise
+//|     expect:
+//|       - {"artifact":"cleaning","path":"/rows/0/0","approx":{"value":1.113,"rtol":1e-3}}
+//|       - {"artifact":"cleaning","path":"/rows/0/4","equals":12}
+//|       - {"artifact":"cleaning","path":"/rows/0/5","range":{"min":-1e-9,"max":1e-9}}
+use scioxide_core::Interval;
+use scioxide_random::{Distribution, Normal, SeedableRng, SplitMix64};
+use scioxide_signal::{
+    DetrendKind, IirDomain, PeakOptions, SecondOrderSections, detrend, find_peaks_with_options,
+};
+
+let rows: Vec<[f64; 6]> =
+    serde_json::from_value(filters["rows"].clone()).map_err(|e| e.to_string())?;
+let cascade = SecondOrderSections::new(IirDomain::Digital, &rows).map_err(|e| e.to_string())?;
+let (fs, n) = (500.0, 5000_usize);
+let pi = std::f64::consts::PI;
+// 合成心電図のモデル（f64 の固有メソッドによる合成）。(振幅 [mV], ずれ [s], 幅 [s])
+let waves = [
+    (0.15, -0.200, 0.025),
+    (-0.10, -0.025, 0.008),
+    (1.20, 0.0, 0.010),
+    (-0.25, 0.025, 0.008),
+    (0.30, 0.250, 0.040),
+];
+let beats: Vec<f64> = (0..12).map(|j| 0.4 + j as f64 * 60.0 / 72.0).collect();
+let ecg = |t: f64| -> f64 {
+    let wave = |tr: f64| -> f64 {
+        waves
+            .iter()
+            .map(|&(a, mu, s)| a * (-0.5 * ((t - tr - mu) / s).powi(2)).exp())
+            .sum()
+    };
+    beats.iter().map(|&tr| wave(tr)).sum()
+};
+let normal = Normal::new(0.0, noise).map_err(|e| e.to_string())?;
+let mut rng = SplitMix64::from_seed(seed as u64);
+let clean: Vec<f64> = (0..n).map(|k| ecg(k as f64 / fs)).collect();
+// 記録 = 心電図 + 基線変動 + 電源ノイズ + 筋電のノイズ
+let mut recorded = Vec::with_capacity(n);
+for (k, &s) in clean.iter().enumerate() {
+    let t = k as f64 / fs;
+    let interference =
+        baseline * (2.0 * pi * 0.3 * t + 0.7).sin() + mains * (2.0 * pi * 50.0 * t).sin();
+    let emg = normal.sample(&mut rng).map_err(|e| e.to_string())?;
+    recorded.push(s + interference + emg);
+}
+
+// トレンド除去のあと、縦続を前後方向か因果的に適用する
+let process = |x: &[f64]| -> Result<Vec<f64>, String> {
+    let detrended = detrend(x, DetrendKind::Linear).map_err(|e| e.to_string())?;
+    let y = if zero_phase {
+        cascade.forward_backward(&detrended)
+    } else {
+        cascade.filter(&detrended)
+    };
+    y.map_err(|e| e.to_string())
+};
+let output = process(&recorded)?;
+let reference = process(&clean)?;
+let mean = clean.iter().sum::<f64>() / n as f64;
+let rms = |a: &[f64], b: &dyn Fn(usize) -> f64| -> f64 {
+    let sum: f64 = (500..4500).map(|k| (a[k] - b(k)).powi(2)).sum();
+    (sum / 4000.0).sqrt()
+};
+let before = rms(&recorded, &|k| clean[k] - mean);
+let after = rms(&output, &|k| clean[k] - mean);
+let residual = rms(&output, &|k| reference[k]);
+
+// 独立な検算: 残るノイズの RMS を周波数応答から予測する。
+// 正弦波は振幅 × |H|^p / √2、白色雑音は σ_n² ∫₀¹ |H(f)|^(2p) df（p = 2 がゼロ位相）
+let p = if zero_phase { 2 } else { 1 };
+let gain = |hz: f64| -> Result<f64, String> {
+    Ok(cascade
+        .response(hz / 250.0)
+        .map_err(|e| e.to_string())?
+        .norm()
+        .powi(p))
+};
+let mut white = 0.0;
+for i in 0..=1000 {
+    let weight = if i == 0 || i == 1000 { 0.5 } else { 1.0 };
+    let h = cascade
+        .response(i as f64 / 1000.0)
+        .map_err(|e| e.to_string())?
+        .norm();
+    white += weight * h.powi(2 * p) / 1000.0;
+}
+let predicted = ((baseline * gain(0.3)?).powi(2) / 2.0
+    + (mains * gain(50.0)?).powi(2) / 2.0
+    + noise * noise * white)
+    .sqrt();
+
+// R 波の検出と、真の時刻（最も近い拍）とのずれ [ms]
+let options = PeakOptions::new()
+    .with_height(Interval::new(0.6, 10.0).map_err(|e| e.to_string())?)
+    .with_distance(200);
+let peaks = find_peaks_with_options(&output, options).map_err(|e| e.to_string())?;
+let shifts: Vec<f64> = peaks
+    .iter()
+    .map(|p| {
+        let t = p.index() as f64 / fs;
+        let nearest = beats.iter().fold(f64::INFINITY, |m, &tr| {
+            if (t - tr).abs() < m.abs() { t - tr } else { m }
+        });
+        1000.0 * nearest
+    })
+    .collect();
+let mean_shift = shifts.iter().sum::<f64>() / shifts.len().max(1) as f64;
+let max_shift = shifts.iter().fold(0.0_f64, |m, s| m.max(s.abs()));
+
+let fixed3 = serde_json::json!({ "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "処理前の RMS 誤差 [mV]", "type": "number", "format": fixed3 },
+    { "key": "1", "label": "処理後の RMS 誤差 [mV]", "type": "number", "format": fixed3 },
+    { "key": "2", "label": "同じ処理をした ECG との RMS 差 [mV]", "type": "number", "format": fixed3 },
+    { "key": "3", "label": "その予測 [mV]", "type": "number", "format": fixed3 },
+    { "key": "4", "label": "検出した R 波", "type": "integer" },
+    { "key": "5", "label": "R 波のずれの平均 [ms]", "type": "number", "format": fixed3 },
+    { "key": "6", "label": "R 波のずれの最大 [ms]", "type": "number", "format": fixed3 }
+]);
+let row = (
+    before,
+    after,
+    residual,
+    predicted,
+    peaks.len(),
+    mean_shift,
+    max_shift,
+);
+emit_table_with_columns!(
+    columns,
+    vec![row],
+    metadata = serde_json::json!({ "id": "cleaning" })
+);
+
+// 2〜4 s の波形と、全体の誤差
+let window =
+    |y: &[f64]| -> Vec<[f64; 2]> { (1000..2000).map(|k| [k as f64 / fs, y[k]]).collect() };
+let clean_points: Vec<[f64; 2]> = (1000..2000)
+    .map(|k| [k as f64 / fs, clean[k] - mean])
+    .collect();
+emit_line_chart!(
+    &vec![
+        serde_json::json!({ "name": "記録", "points": window(&recorded) }),
+        serde_json::json!({ "name": "処理後", "points": window(&output) }),
+        serde_json::json!({
+            "name": "ノイズのない ECG（平均を引く）",
+            "points": clean_points,
+            "style": { "lineType": "dashed" }
+        }),
+    ],
+    options = &serde_json::json!({
+        "xLabel": "時刻 t [s]",
+        "yLabel": "電位 [mV]",
+        "link": { "group": "ecg-time" }
+    })
+);
+let error: Vec<[f64; 2]> = (0..n)
+    .step_by(2)
+    .map(|k| [k as f64 / fs, output[k] - (clean[k] - mean)])
+    .collect();
+emit_line_chart!(
+    &vec![serde_json::json!({ "name": "処理後 − ノイズのない ECG", "points": error })],
+    options = &serde_json::json!({
+        "xLabel": "時刻 t [s]",
+        "yLabel": "誤差 [mV]",
+        "link": { "group": "ecg-time" }
+    })
+);
+```
+
+既定の入力では、1〜9 s の RMS 誤差が処理前の 0.380 mV から処理後の 0.0425 mV に下がる。
+ノイズのない心電図に同じ処理をした波形との差は 0.0419 mV で、フィルタ自身による波形の変化は小さい。
+この残りは周波数応答から予測した 0.0413 mV とほぼ一致し、内訳の大半は 0.3 Hz の基線変動の残り（振幅 $0.5 \times 0.115$ mV）である。
+予測は無限に長い記録の定常応答で、8 s の区間に入る基線変動が 2.4 周期しかないこととノイズの標本のばらつきの分だけ、実測とずれる。
+R 波は 12 個すべて検出され、時刻のずれの平均は 0 ms、最大は 0.67 ms である。
+真の R 波の時刻（拍の間隔 416.67 標本）は標本の格子に乗らないので、2 ms の標本間隔より小さいずれは格子の丸めによる。
+
+因果的な処理に切り替えると、処理後の RMS 誤差は 0.182 mV に増える。
+同じ処理をした心電図との差は 0.118 mV（予測 0.120 mV）で、基線変動の残りが $|H| = 0.339$ 倍と大きいことがその主な原因である。
+残りの差は群遅延による波形の遅れと歪みで、R 波の時刻は平均 10.7 ms、最大 11.3 ms 遅れる。
+この遅れは表の 10 Hz の群遅延 11.7 ms に近く、QRS 波の主な成分の遅れとして説明できる。
+ノイズを強くした場合（$b = 1.5$ mV、$m = 0.5$ mV、$\sigma_n = 0.1$ mV）も、ゼロ位相の処理では R 波の時刻のずれの平均は 0 ms である。
+
+## まとめ
+
+心電図の前処理では、電源ノイズをノッチで、基線変動を高域通過で、筋電のノイズを低域通過で除き、三つを一つの二次節の縦続にまとめて適用できる。
+記録を全部持っているなら `forward_backward` でゼロ位相にし、R 波の時刻と ST 部分の形を保つ。
+その代わり振幅は $|H|^2$ になるので、遮断での減衰と基線変動の残りを設計の段階で見込む。
+残るノイズは周波数応答から予測でき、予測と実測の一致で処理の効果を確かめられる。
+実時間の監視のように因果的な処理しか使えない場合は、群遅延による遅れを[群遅延の例題](../iir-group-delay-zero-phase/)の方法で見積もる。

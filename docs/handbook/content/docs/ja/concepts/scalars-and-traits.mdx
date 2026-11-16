@@ -1,0 +1,197 @@
+---
+title: スカラー型とトレイトの仕様
+description: 演算に必要なトレイト、f32とf64の精度、問題と解法の分離を学ぶ。
+sidebar:
+  order: 30
+---
+
+数値計算では、値の型によって使える演算と精度が変わる。
+SciOxide は実数・複素数などの型が持つ機能をトレイトで表し、アルゴリズムが必要とする演算を型の境界に指定する。
+ここでは、型を選ぶ際に確認すべき仕様と、丸め誤差が結果に与える影響を扱う。
+
+## スカラー境界の階層構造と代数的前提
+
+代表的な境界は次の4つである。
+名前が似ていても、要求する機能は異なる。
+
+| トレイト | 主な機能 | 実装できる型 |
+|---|---|---|
+| `AlgebraicScalar` | 加減乗除、ゼロと1 | 外部の型も実装できる |
+| `NumericScalar` | 上記に加え、共役・絶対値・実成分など | `f32`、`f64`、対応する`Complex` |
+| `RealScalar` | 上記に加え、半順序・初等関数・浮動小数点の分類など | `f32`、`f64` |
+| `AffineValue` | 実成分へのアクセスと形状の表現 | 外部のベクトル型なども実装できる |
+
+`RealScalar` は `NumericScalar` を要求し、`NumericScalar` は `AlgebraicScalar` を要求する。
+`AffineValue` はこの継承関係とは別に、成分を持つ値を表す。
+
+
+`NumericScalar` と `RealScalar` は、外部から実装できない sealed トレイトである。
+浮動小数点の分類や型変換の意味を、対応する型の間でそろえるための制約であり、利用者が丸めモードを変更するための仕組みではない。
+ジェネリックなコードでは、これらの境界に応じてコンパイラが具体的な型の処理を生成する。
+
+浮動小数点数は NaN を含むため、通常の比較は `PartialOrd` で表す。
+`RealScalar` を要求する解法は実数向けであり、複素数に対応するかどうかは各 API の境界を確認する。
+四則演算を持つことだけで、丸めのない体の公理まで成立するわけではない。
+
+## 単精度（`f32`）と倍精度（`f64`）の選択基準
+
+精度の必要量がまだ分からないときは、まず `f64` で基準となる結果を作る。
+`f32` を選ぶ場合は、メモリ使用量の削減と、必要な精度を保てるかを併せて確認する。
+
+| 性質 | `f32` | `f64` |
+|---|---|---|
+| 有効ビット数 | 24 | 53 |
+| 十進の有効桁数の目安 | 約7桁 | 約16桁 |
+| 単位丸め誤差 $u$ | $2^{-24}$ | $2^{-53}$ |
+| 1要素のサイズ | 4バイト | 8バイト |
+
+許容できる条件数に、型だけから決まる一律の上限はない。
+必要な桁数、入力誤差、演算回数、アルゴリズムの安定性を含めて判断する。
+独立な丸め誤差が $\sqrt{N}u$ 程度に蓄積すると仮定すれば、残る桁数の粗いモデルは
+
+$$
+d \approx -\log_{10}(\kappa\sqrt{N}u)
+$$
+
+となる。
+ただし、これは誤差の保証式ではない。
+
+次のセルでは $a_k=1+A\sin(k\alpha)$（$\alpha=1.618033988749895$）の総和を計算する。
+入力は無次元の振幅 $A$ と項数 $N$ で、条件数は生成した数列から $\kappa=\sum|a_k|/|\sum a_k|$ として求める。
+`checked_sum` の厳密累積後の丸め値を基準とし、`f32` と `f64` の順次加算を比較する。
+`f32` の誤差には、入力を変換する際の丸めも含まれる。
+
+```rust
+//| id: concept-scalar-digit-budget
+//| title: 入力振幅と項数を動かして f32・f64 の残存桁（理論と実測）を照合する
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   condition_exponent: {"type":"range","label":"入力振幅の指数 p（A=10ᵖ）","description":"振幅を変え、生成した数列の総和条件数を計算する。","min":0,"max":10,"step":1,"value":3}
+//|   operation_exponent: {"type":"range","label":"演算回数の指数 q（N=10ᑫ）","description":"素朴総和を行う項数 N。","min":1,"max":5,"step":0.5,"value":3.5}
+use scioxide_core::{RealScalar, checked_sum};
+
+// 同じ f64 入力を基準にする。f32 側には型変換時の丸めも含まれる。
+fn measure(n: usize, amplitude: f64) -> Result<(f64, f64, f64, f64), String> {
+    let terms: Vec<f64> = (1..=n)
+        .map(|k| 1.0 + amplitude * RealScalar::sin(k as f64 * 1.618033988749895))
+        .collect();
+    let exact = checked_sum(&terms).map_err(|e| e.to_string())?;
+    let absolute: Vec<f64> = terms.iter().map(|v| v.abs()).collect();
+    let magnitude = checked_sum(&absolute).map_err(|e| e.to_string())?;
+    let sum64 = terms.iter().fold(0.0_f64, |s, &v| s + v);
+    let sum32 = terms.iter().fold(0.0_f32, |s, &v| s + v as f32);
+    Ok((
+        magnitude / exact.abs(),
+        exact,
+        (sum32 as f64 - exact).abs() / exact.abs(),
+        (sum64 - exact).abs() / exact.abs(),
+    ))
+}
+let amplitude = 10.0_f64.powf(condition_exponent);
+let n = 10.0_f64.powf(operation_exponent).round() as usize;
+let (condition, exact, error32, error64) = measure(n, amplitude)?;
+emit_table_with_columns!(
+    serde_json::json!([
+    {"key":"0","label":"項数 N","type":"number","format":{"significantDigits":6},"nullText":"未定義"},
+    {"key":"1","label":"入力振幅 A","type":"number","format":{"significantDigits":6},"nullText":"未定義"},
+    {"key":"2","label":"総和の条件数 κ","type":"number","format":{"significantDigits":6},"nullText":"未定義"},
+    {"key":"3","label":"厳密累積後の丸め値","type":"number","format":{"significantDigits":6},"nullText":"未定義"}
+    ]),
+    vec![(n, amplitude, condition, exact)]
+);
+let u = [f32::EPSILON as f64 / 2.0, f64::EPSILON / 2.0];
+let digits = |e: f64| if e == 0.0 { None } else { Some(-e.log10()) };
+emit_table_with_columns!(
+    serde_json::json!([
+    {"key":"0","label":"型","type":"string","nullText":"未定義"},
+    {"key":"1","label":"実測相対誤差","type":"number","format":{"significantDigits":6},"nullText":"未定義"},
+    {"key":"2","label":"実測桁数","type":"number","format":{"significantDigits":6},"nullText":"未定義"},
+    {"key":"3","label":"モデルの桁数","type":"number","format":{"significantDigits":6},"nullText":"未定義"}
+    ]),
+    vec![
+        (
+            "f32",
+            error32,
+            digits(error32),
+            digits(condition * (n as f64).sqrt() * u[0])
+        ),
+        (
+            "f64",
+            error64,
+            digits(error64),
+            digits(condition * (n as f64).sqrt() * u[1])
+        ),
+    ]
+);
+
+let mut measured = [Vec::new(), Vec::new()];
+let mut model = [Vec::new(), Vec::new()];
+let mut exact_matches = [0_usize; 2];
+for i in 0..=12 {
+    let count = 10.0_f64.powf(1.0 + i as f64 / 3.0).round() as usize;
+    let (kappa, _, e32, e64) = measure(count, amplitude)?;
+    for (j, error) in [e32, e64].into_iter().enumerate() {
+        if error == 0.0 {
+            exact_matches[j] += 1;
+        } else {
+            measured[j].push([count as f64, -error.log10()]);
+        }
+        model[j].push([
+            count as f64,
+            -(kappa * (count as f64).sqrt() * u[j]).log10(),
+        ]);
+    }
+}
+// 同じ型の実測とモデルは同じ色にし、モデルを破線で描く。縦軸は桁数なので線形のまま。
+let (c32, c64) = ("#d97706", "#2563eb");
+let series = vec![
+    serde_json::json!({"name":"f32 実測", "points":measured[0], "style": {"color": c32}}),
+    serde_json::json!({"name":"f32 モデル", "points":model[0], "style": {"color": c32, "lineType": "dashed"}}),
+    serde_json::json!({"name":"f64 実測", "points":measured[1], "style": {"color": c64}}),
+    serde_json::json!({"name":"f64 モデル", "points":model[1], "style": {"color": c64, "lineType": "dashed"}}),
+];
+emit_line_chart!(
+    &series,
+    options = &serde_json::json!({"xLabel": "項数 N [-]", "yLabel": "−log₁₀(相対誤差) [桁]", "xType": "log"})
+);
+emit_table_with_columns!(
+    serde_json::json!([
+    {"key":"0","label":"型","type":"string","nullText":"未定義"},
+    {"key":"1","label":"走査13点のうち基準値と一致した点数","type":"number","format":{"significantDigits":6},"nullText":"未定義"}
+    ]),
+    vec![("f32", exact_matches[0]), ("f64", exact_matches[1])]
+);
+```
+
+グラフの横軸は項数（対数軸）、縦軸は相対誤差から求めた桁数で、破線は同じ色の型のモデルである。
+基準値と一致した点では対数を取れないため、桁数を未定義としてグラフから除き、点数を別表に示す。
+負の桁数は相対誤差が1を超えたことを表す。
+振幅が同じでも、項数を変えると相殺の程度が変わる。
+モデルと実測値の差も含めて読み取ることが、この実験の目的である。
+
+## 問題トレイトと解法
+
+問題トレイトは「何を計算するか」を表し、ソルバーは「どう解くか」を受け持つ。
+例えば、同じ右辺関数を異なるODE解法で解けば、モデルを変更せずに手法を比較できる。
+
+| 分野 | 問題トレイト | 提供する処理 |
+|---|---|---|
+| 線形代数 | `LinearOperator` | 行列を明示せずに $y=Ax$ を計算する |
+| 求積 | `Fn(S) -> Result<V, SciOxideError>`、`Fn(&[S]) -> Result<V, SciOxideError>` | 被積分関数を評価する |
+| 最適化 | `ObjectiveFunction` | 目的関数と、対応する場合は導関数を評価する |
+| 求根 | `ScalarFunction`、`ResidualOperator` | 関数値と、対応する場合は導関数を評価する |
+| ODE | `OdeSystem` | 右辺関数と、対応する場合はヤコビ行列を評価する |
+
+導関数をどの方法で求めるかは、各ソルバーの仕様による。
+`DerivativeStrategy` を使う経路では、指定された候補を順に試し、`Ok(None)` のときだけ次の候補へ進む。
+エラーは呼び出し側へ返す。
+どのソルバーも自動微分へ自動的に切り替わる、という意味ではない。
+詳しくは [Richardson 外挿と Ridders の方法](../../scioxide-differentiate/algorithms/richardson-and-ridders/) を参照されたい。
+
+## まとめと次に読むページ
+
+型を選ぶときは、必要な対応する演算と精度を分けて考える。
+条件数は型の性質ではなく、入力と求める量の関係で決まる。
+実測誤差を基準値と照合したうえで、次に[許容誤差と残差](../tolerances-and-residuals/)で停止判定の尺度を決める。
+各トレイトの詳しい仕様は[基盤クレートの API ガイド](../../scioxide-core/api/)で確認できる。

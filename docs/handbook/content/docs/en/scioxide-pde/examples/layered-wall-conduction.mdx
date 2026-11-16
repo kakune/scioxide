@@ -1,0 +1,543 @@
+---
+title: "Examining interface fluxes and grid alignment in a composite wall"
+description: "Compare steady two-layer-wall conduction with the exact series-resistance solution; examine FDM/FEM/FVM flux reproduction when interfaces lie on grid points and why refinement need not reduce error monotonically otherwise."
+sidebar:
+  order: 420
+---
+
+Thermal conductivity changes sharply between layers in insulated building walls, thermal-barrier coatings, and multilayer cooling structures on circuit boards.
+At a material interface, temperature $T(x)$ is continuous but gradient $dT/dx$ has a kink.
+The quantity continuous across the interface is heat flux $q = -k\,dT/dx$.
+
+This page derives an exact solution for steady conduction through a two-layer wall using thermal resistances in series.
+Check how finite differences (FDM), finite elements (FEM), and finite volumes (FVM) reproduce interface temperatures and fluxes.
+Also examine why error need not decrease monotonically under refinement when the interface does not coincide with grid points.
+
+## Series thermal resistances and exact solution
+
+Let a wall of thickness $d = 0.2$ m be split at interface $x = a d$ ($0 < a < 1$) into a left layer of conductivity $k_L$ and a right layer of conductivity $k_R$.
+Hold left surface $x = 0$ at indoor-side temperature $T_{\mathrm{hot}} = 20$ °C and right surface $x = d$ at outdoor-side temperature $T_{\mathrm{cold}} = 0$ °C, with no internal heat generation.
+Set the left layer to $k_L = 1$ W/(m·K) and vary right-layer $k_R$ through an input.
+
+At steady state $-d(k\,dT/dx)/dx = 0$, so heat flux $q$ [W/m²] is constant throughout the wall.
+Thermal resistances per unit area are $R_L = ad/k_L$ and $R_R = (1 - a)d/k_R$ [m²·K/W]; connecting both layers in series gives
+
+$$
+q = \frac{T_{\mathrm{hot}} - T_{\mathrm{cold}}}{R_L + R_R},
+\qquad
+T_{\mathrm{int}} = T_{\mathrm{hot}} - q R_L
+$$
+
+
+$T_{\mathrm{int}}$ is interface temperature.
+Temperature is linear within each layer, with a kink at the interface.
+
+$$
+T(x) =
+\begin{cases}
+T_{\mathrm{hot}} - q x / k_L & (0 \le x \le ad) \\
+T_{\mathrm{int}} - q (x - ad) / k_R & (ad < x \le d)
+\end{cases}
+$$
+
+The lower-conductivity (insulating) layer requires a larger temperature gradient to carry the same $q$, so most of the temperature drop occurs there.
+
+## Three plans and coefficient sampling
+
+The three plans sample the same material coefficient at different locations.
+
+- Three-point differences in `StructuredFdmPlan` read diffusion coefficients at face midpoints between adjacent nodes.
+- P1 elements in `SimplexFemPlan` read coefficients at interior quadrature points to integrate element stiffness matrices.
+- Cell-centered FVM in `StructuredFvmPlan` forms two half-cell thermal resistances from cell-center coefficients and eliminates the face value to obtain a two-point flux with series resistances.
+  When the interface coincides with a face, face conductance is the weighted harmonic mean of the two half-cells.
+
+For every method, when coefficients are constant within each element (cell), the discrete solution is the exact series-resistance solution for a wall with conductivities sampled elementwise.
+If the interface coincides with a grid point, the sampled wall matches the original, so all three methods reproduce the exact solution.
+If the interface lies inside an element, its conductivity is replaced by the left or right value (or an average of quadrature-point values), apparently shifting the interface.
+
+The following definitions block provides material `Wall` (implementing all three coefficient-provider traits), the exact series-resistance solution, and function `wall_plans` constructing the three plans; both cells use it.
+For the FEM interval mesh, tag the left exterior face 0 and the right face 1, assigning separate Dirichlet values.
+
+```rust
+//| id: pde-layered-wall-model
+//| kind: definitions
+//| title: "Two-layer-wall material, exact series-resistance solution, and three plans"
+//| crates: [scioxide-core, scioxide-pde, scioxide-spatial]
+use scioxide_core::SciOxideError;
+use scioxide_pde::{
+    BoundaryCondition, BoundaryData, FvmCoefficients, SimplexFemCoefficients, SimplexFemGeometry,
+    SimplexFemOrder, SimplexFemPlan, StructuredBoundaries, StructuredFdmCoefficients,
+    StructuredFdmPlan, StructuredFvmPlan, TaggedBoundaries,
+};
+use scioxide_spatial::{
+    AxisSide, AxisTopology, BoundarySet, CoordinateAxis, Grid1d, IntervalMesh, Point, SegmentMesh,
+    SimplexBoundaryTags,
+};
+
+/// Wall thickness d [m], indoor- and outdoor-side surface temperatures [°C], and left-layer conductivity k_L [W/(m·K)].
+pub(crate) const THICKNESS: f64 = 0.2;
+pub(crate) const HOT: f64 = 20.0;
+pub(crate) const COLD: f64 = 0.0;
+pub(crate) const LEFT: f64 = 1.0;
+
+/// Two-layer wall with k_L left of interface x = interface [m] and k_R right of it.
+pub(crate) struct Wall {
+    pub(crate) interface: f64,
+    pub(crate) right: f64,
+}
+impl Wall {
+    /// Thermal conductivity at x [m]. Points on the interface belong to the right layer.
+    pub(crate) fn conductivity(&self, x: f64) -> f64 {
+        if x < self.interface { LEFT } else { self.right }
+    }
+    /// Constant heat flux q [W/m²] from series resistances.
+    pub(crate) fn flux(&self) -> f64 {
+        let resistance = self.interface / LEFT + (THICKNESS - self.interface) / self.right;
+        (HOT - COLD) / resistance
+    }
+    /// Exact piecewise linear temperature [°C].
+    pub(crate) fn temperature(&self, x: f64) -> f64 {
+        let q = self.flux();
+        if x <= self.interface {
+            HOT - q * x / LEFT
+        } else {
+            HOT - q * self.interface / LEFT - q * (x - self.interface) / self.right
+        }
+    }
+}
+impl StructuredFdmCoefficients<f64, f64, 1> for Wall {
+    fn diffusion(&self, _: usize, _: usize, x: [f64; 1]) -> Result<f64, SciOxideError> {
+        Ok(self.conductivity(x[0]))
+    }
+}
+impl FvmCoefficients<f64, f64, 1> for Wall {
+    fn diffusion(&self, x: [f64; 1]) -> Result<[[f64; 1]; 1], SciOxideError> {
+        Ok([[self.conductivity(x[0])]])
+    }
+}
+impl SimplexFemCoefficients<f64, f64, 1> for Wall {
+    fn evaluate(&self, x: [f64; 1], k: &mut [f64], c: &mut [f64]) -> Result<(), SciOxideError> {
+        (k[0], c[0]) = (self.conductivity(x[0]), 0.0);
+        Ok(())
+    }
+}
+
+/// FDM, FVM (N − 1 cells), and P1 FEM on the same N nodes.
+pub(crate) struct WallPlans {
+    pub(crate) fdm: StructuredFdmPlan<f64, f64, 1>,
+    pub(crate) fvm: StructuredFvmPlan<f64, f64, 1>,
+    pub(crate) fem: SimplexFemPlan<f64, f64, 1>,
+}
+pub(crate) fn wall_plans(wall: &Wall, nodes: usize) -> Result<WallPlans, String> {
+    let axis = CoordinateAxis::uniform(0.0, THICKNESS, nodes).map_err(|e| e.to_string())?;
+    let grid = Grid1d::new([axis], [AxisTopology::Bounded]).map_err(|e| e.to_string())?;
+    let segment = SegmentMesh::new(grid).map_err(|e| e.to_string())?;
+    let mut sides = Vec::new();
+    for (side, value) in [(AxisSide::Start, HOT), (AxisSide::End, COLD)] {
+        let set = BoundarySet::axis_side(&segment, 0, side).map_err(|e| e.to_string())?;
+        sides.push(BoundaryCondition::dirichlet(
+            set,
+            BoundaryData::constant(value),
+        ));
+    }
+    let ends = StructuredBoundaries::new(&segment, 1, sides).map_err(|e| e.to_string())?;
+    let h = THICKNESS / (nodes - 1) as f64;
+    let points = (0..nodes)
+        .map(|i| Point::new([i as f64 * h]))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    let cells = (0..nodes - 1).map(|i| [i, i + 1]).collect();
+    let interval = IntervalMesh::new(points, cells).map_err(|e| e.to_string())?;
+    // Tag endpoint x = 0 with 0 and endpoint x = d with 1.
+    let mut faces = Vec::new();
+    for face in interval.boundary_faces() {
+        let vertex = interval.face_vertices(face).map_err(|e| e.to_string())?[0];
+        faces.push((face, u32::from(vertex != 0)));
+    }
+    let tags = SimplexBoundaryTags::new(&interval, faces).map_err(|e| e.to_string())?;
+    let conditions = vec![
+        BoundaryCondition::dirichlet(0, BoundaryData::constant(HOT)),
+        BoundaryCondition::dirichlet(1, BoundaryData::constant(COLD)),
+    ];
+    let tagged =
+        TaggedBoundaries::new(&interval, &tags, 1, conditions).map_err(|e| e.to_string())?;
+    let (affine, p1) = (SimplexFemGeometry::Affine, SimplexFemOrder::P1);
+    Ok(WallPlans {
+        fdm: StructuredFdmPlan::new(segment.clone(), wall, &ends).map_err(|e| e.to_string())?,
+        fvm: StructuredFvmPlan::new(segment, wall, &ends).map_err(|e| e.to_string())?,
+        fem: SimplexFemPlan::new(interval, affine, p1, wall, &tagged).map_err(|e| e.to_string())?,
+    })
+}
+```
+
+## Three methods on an interface-aligned grid
+
+Consider a grid whose points coincide with interface $x = ad$ (an aligned grid).
+The next cell takes interface position $a$, conductivity ratio $\log_{10}(k_R/k_L)$, and grid-point count $N$, and solves all three plans with `EllipticProblem`.
+Reconstruct FVM fluxes at every face with `face_fluxes::<0>(values, time)`.
+Positive flux points toward increasing coordinates, here heat flowing from indoors to outdoors.
+Compute FDM and FEM fluxes from difference $-k_L(u_1 - u_0)/h$ on the leftmost interval in the left layer.
+
+Outputs are a temperature-distribution plot, a table of termination reason, maximum temperature error, interface-temperature error, and relative flux error for each method, a table of exact $q$ and $T_{\mathrm{int}}$, and conclusions for all three solves.
+FVM unknowns lie at cell centers, away from the interface, so interface-temperature error is undefined.
+
+```rust
+//| id: pde-layered-wall-methods
+//| ref: pde-layered-wall-methods
+//| title: "Check two-layer-wall temperature distribution and constant heat flux with FDM, FEM, and FVM"
+//| run: reactive
+//| uses: [pde-layered-wall-model]
+//| crates: [scioxide-core, scioxide-pde, scioxide-spatial]
+//| inputs:
+//|   wall_interface_fraction: {"type":"range","label":"Left-layer fraction a [-]","description":"Changes interface position ad and each layer's thermal resistance.","min":0.25,"max":0.75,"step":0.25,"value":0.5}
+//|   wall_conductivity_log10: {"type":"range","label":"log₁₀(k_R/k_L) [-]","description":"Varies the conductivity ratio of the two materials logarithmically.","min":-2,"max":2,"step":0.25,"value":-1}
+//|   wall_grid_nodes: {"type":"range","label":"Grid-point count N [points]","description":"Changes the resolution of the interface-aligned grid.","min":17,"max":81,"step":8,"value":41}
+//| cases:
+//|   - {"id":"insulating-right","label":"k_R/k_L = 0.01","description":"The right layer becomes nearly insulating, reducing flux to 1.98 W/m². Relative flux error stays below 3 × 10⁻¹² for all three methods.","inputs":{"wall_conductivity_log10":-2}}
+//|   - {"id":"thin-left","label":"a = 0.25","description":"Interface temperature rises to 19.35 °C and flux becomes 12.9 W/m².","inputs":{"wall_interface_fraction":0.25}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/0/2","range":{"min":0,"max":1e-11}}
+//|       - {"artifact":"methods","path":"/rows/1/2","range":{"min":0,"max":1e-11}}
+//|       - {"artifact":"methods","path":"/rows/2/2","range":{"min":0,"max":1e-11}}
+//|       - {"artifact":"methods","path":"/rows/0/4","range":{"min":0,"max":1e-11}}
+//|       - {"artifact":"methods","path":"/rows/2/4","range":{"min":0,"max":1e-11}}
+//|       - {"artifact":"methods","path":"/rows/2/3","equals":null}
+//|       - {"artifact":"exact","path":"/rows/0/0","approx":{"value":18.181818,"rtol":1e-7}}
+//|       - {"artifact":"exact","path":"/rows/0/1","approx":{"value":18.181818,"rtol":1e-7}}
+//|       - {"path":"/outputs/3/state","equals":"satisfied"}
+//|   - case: insulating-right
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/1/4","range":{"min":0,"max":1e-10}}
+//|       - {"artifact":"methods","path":"/rows/2/4","range":{"min":0,"max":1e-10}}
+//|       - {"artifact":"exact","path":"/rows/0/0","approx":{"value":1.980198,"rtol":1e-6}}
+//|   - case: thin-left
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/1/2","range":{"min":0,"max":1e-11}}
+//|       - {"artifact":"exact","path":"/rows/0/1","approx":{"value":19.354839,"rtol":1e-7}}
+use scioxide_pde::{EllipticOptions, EllipticProblem, FieldData};
+use scioxide_spatial::{Cell, FieldView};
+
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let fixed4 = serde_json::json!({ "fractionDigits": 4 });
+let nodes = wall_grid_nodes as usize;
+let wall = Wall {
+    interface: wall_interface_fraction * THICKNESS,
+    right: LEFT * 10f64.powf(wall_conductivity_log10),
+};
+let plans = wall_plans(&wall, nodes)?;
+let h = THICKNESS / (nodes - 1) as f64;
+let (q, interface) = (wall.flux(), wall.temperature(wall.interface));
+let source = FieldData::zero();
+let options = EllipticOptions::new();
+let exact: Vec<[f64; 2]> = (0..=200)
+    .map(|i| i as f64 * THICKNESS / 200.0)
+    .map(|x| [x, wall.temperature(x)])
+    .collect();
+let mut series = vec![serde_json::json!({
+    "name": "Exact solution",
+    "style": { "lineType": "dashed", "symbol": "none" },
+    "points": exact
+})];
+let mut rows = Vec::new();
+// FDM and FEM unknowns are nodal values. The interface node has index round(ad/h).
+let node_solutions = [
+    (
+        "FDM",
+        EllipticProblem::new(&plans.fdm, &source).solve_with_options(&options),
+    ),
+    (
+        "FEM",
+        EllipticProblem::new(&plans.fem, &source).solve_with_options(&options),
+    ),
+];
+for (name, solution) in node_solutions {
+    let solution = solution.map_err(|e| e.to_string())?;
+    let u = solution.values();
+    let x = |i: usize| i as f64 * h;
+    let error = (0..nodes)
+        .map(|i| (u[i] - wall.temperature(x(i))).abs())
+        .fold(0.0, f64::max);
+    let at_interface = (u[(wall.interface / h).round() as usize] - interface).abs();
+    let flux = -LEFT * (u[1] - u[0]) / h;
+    let status = solution.report().termination().to_string();
+    rows.push((
+        name,
+        status,
+        error,
+        Some(at_interface),
+        (flux - q).abs() / q,
+    ));
+    let points: Vec<[f64; 2]> = (0..nodes).map(|i| [x(i), u[i]]).collect();
+    series.push(
+        serde_json::json!({ "name": name, "style": { "symbol": "circle" }, "points": points }),
+    );
+}
+// FVM unknowns are values at cell centers (i + 1/2)h. Reconstruct fluxes at every face.
+let solution = EllipticProblem::new(&plans.fvm, &source)
+    .solve_with_options(&options)
+    .map_err(|e| e.to_string())?;
+let cells = solution.values();
+let center = |i: usize| (i as f64 + 0.5) * h;
+let error = (0..cells.len())
+    .map(|i| (cells[i] - wall.temperature(center(i))).abs())
+    .fold(0.0, f64::max);
+let view = FieldView::<_, Cell, 1>::new(plans.fvm.mesh(), cells).map_err(|e| e.to_string())?;
+let faces = plans
+    .fvm
+    .face_fluxes::<0>(view, 0.0)
+    .map_err(|e| e.to_string())?;
+let flux_error = faces
+    .values()
+    .iter()
+    .map(|f| (f - q).abs())
+    .fold(0.0, f64::max)
+    / q;
+rows.push((
+    "FVM",
+    solution.report().termination().to_string(),
+    error,
+    None,
+    flux_error,
+));
+let points: Vec<[f64; 2]> = (0..cells.len()).map(|i| [center(i), cells[i]]).collect();
+series.push(
+    serde_json::json!({ "name": "FVM", "style": { "symbol": "circle" }, "points": points }),
+);
+emit_line_chart!(
+    &series,
+    options = &serde_json::json!({
+        "xLabel": "Position within the wall x [m]",
+        "yLabel": "Temperature T [°C]",
+        "yMin": 0.0,
+        "yMax": 20.0,
+        "annotations": [{ "kind": "line", "axis": "x", "value": wall.interface, "label": "Material interface" }]
+    })
+);
+let columns = serde_json::json!([
+    { "key": "0", "label": "Method" },
+    { "key": "1", "label": "Termination reason" },
+    { "key": "2", "label": "Maximum temperature error [K]", "type": "number", "format": sci2 },
+    { "key": "3", "label": "Interface-temperature error [K]", "type": "number", "format": sci2, "nullText": "Cell values" },
+    { "key": "4", "label": "Relative flux error [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "methods" })
+);
+let exact_columns = serde_json::json!([
+    { "key": "0", "label": "Exact flux q [W/m²]", "type": "number", "format": fixed4 },
+    { "key": "1", "label": "Interface temperature T_int [°C]", "type": "number", "format": fixed4 }
+]);
+emit_table_with_columns!(
+    exact_columns,
+    vec![(q, interface)],
+    metadata = serde_json::json!({ "id": "exact" })
+);
+let completed = rows.iter().all(|row| row.1 == "Completed");
+let outcome = if completed {
+    Outcome::satisfied("Linear solves completed for all three plans")
+} else {
+    Outcome::partial("Some plans did not complete")
+};
+emit_outcome!(
+    outcome
+        .status(
+            rows.iter()
+                .map(|row| row.1.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+        .diagnostic(
+            "Maximum temperature error",
+            rows.iter().map(|r| r.2).fold(0.0, f64::max),
+            Some("K")
+        )
+);
+```
+
+With defaults ($a = 0.5$, $k_R/k_L = 0.1$, 41 points), exact flux is $q = 18.1818$ W/m² and interface temperature 18.1818 °C.
+All three methods end with `Completed`; maximum temperature error and relative flux error are no greater than $3 \times 10^{-13}$, agreeing with the exact solution to rounding error.
+The exact solution is linear in each layer, so placing the interface on a node gives zero truncation error for three-point differences, P1 elements, and two-point fluxes.
+All 41 FVM face fluxes equal constant $q$ because half-cell series resistances are formed from cell-center coefficients.
+Simply return each cell's material coefficient; no manually computed harmonic mean is needed.
+Even changing the conductivity ratio to $10^{\pm 2}$ keeps relative flux error no greater than $2 \times 10^{-12}$.
+
+## Unaligned grids and error oscillations
+
+On grids where interface $x = ad$ does not coincide with a grid point (unaligned grids), increasing point count $N$ need not reduce error monotonically.
+The distance to the nearest grid point (offset in grid-spacing units) alternates between values near 0 and near 0.5 as $N$ changes.
+
+The preceding interpretation predicts FDM error.
+Three-point differences read coefficients at face midpoints, assigning the interface-containing interval the material of the midpoint's side.
+These are the same discrete equations as for a wall with its interface moved to nearest node $a_{\mathrm{eff}}d$.
+That wall has an aligned grid, so FDM reproduces its exact nodal solution.
+Thus FDM nodal error equals the exact temperature difference between shifted-interface and original walls, computable solely from series-resistance formulas.
+
+P1 FEM reads coefficients with a two-point Gauss–Legendre interval rule (points at $0.211h$ from the element ends).
+If interface-to-nearest-node distance is below $0.211h$, both quadrature points lie in one material and FEM solves the same wall as FDM.
+If the interface lies between the quadrature points, element conductivity is the arithmetic mean $(k_L + k_R)/2$, solving a different wall from FDM.
+FVM reads coefficients at the center of the interface-containing cell; the cell takes that center's material, moving the interface to the nearest face.
+Cell faces coincide with nodes, so FVM solves the same shifted-interface wall as FDM and reproduces its exact cell-center temperatures.
+FVM error is the temperature difference between the two walls at cell centers, differing from FDM error only in measurement location.
+
+The next cell defaults to interface position $a = 0.37$ and solves all three methods for point counts from $N = 17$ to 81 in increments of 4.
+Inputs are interface position $a$ and conductivity ratio.
+Outputs are maximum-temperature-error plots against grid-point count, a table of offsets and errors per grid, and counts of refinements increasing error.
+“Shifted-wall difference” is an independent check computing the FDM prediction above from series-resistance formulas; check its agreement with FDM error.
+The three plans share `SpatialDiscretization`, so solve them with one function `max_error` and compare with exact values at `dof_point` locations.
+
+```rust
+//| id: pde-layered-wall-alignment
+//| ref: pde-layered-wall-alignment
+//| title: "Refine an unaligned grid and observe error oscillations"
+//| run: reactive
+//| uses: [pde-layered-wall-model]
+//| crates: [scioxide-core, scioxide-pde, scioxide-spatial]
+//| inputs:
+//|   wall_unfitted_interface: {"type":"range","label":"Left-layer fraction a [-]","description":"Changes where the interface crosses each grid.","min":0.28,"max":0.72,"step":0.01,"value":0.37}
+//|   wall_unfitted_log10_contrast: {"type":"range","label":"log₁₀(k_R/k_L) [-]","description":"Changes how strongly apparent interface shifts affect temperature.","min":-2,"max":2,"step":0.25,"value":-1}
+//| cases:
+//|   - {"id":"near-quarter","label":"a = 0.28","description":"The offset sequence changes, giving error-increase counts FDM 7, FEM 5, FVM 7.","inputs":{"wall_unfitted_interface":0.28}}
+//|   - {"id":"conductive-right","label":"k_R/k_L = 100","description":"Even with a conducting right layer, errors oscillate between grids; increase counts are FDM 8, FEM 9, FVM 8.","inputs":{"wall_unfitted_log10_contrast":2}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"grids","path":"/rows/0/2","approx":{"value":0.12729484,"rtol":1e-6}}
+//|       - {"artifact":"grids","path":"/rows/0/3","approx":{"value":0.12729484,"rtol":1e-6}}
+//|       - {"artifact":"grids","path":"/rows/1/4","approx":{"value":0.63990588,"rtol":1e-6}}
+//|       - {"artifact":"increases","path":"/rows/0/1","equals":8}
+//|       - {"artifact":"increases","path":"/rows/1/1","equals":8}
+//|       - {"artifact":"increases","path":"/rows/2/1","equals":8}
+//|   - case: near-quarter
+//|     expect:
+//|       - {"artifact":"increases","path":"/rows/1/1","equals":5}
+//|   - case: conductive-right
+//|     expect:
+//|       - {"artifact":"increases","path":"/rows/1/1","equals":9}
+use scioxide_pde::{EllipticOptions, EllipticProblem, FieldData, SpatialDiscretization};
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let a = wall_unfitted_interface;
+let wall = Wall {
+    interface: a * THICKNESS,
+    right: LEFT * 10f64.powf(wall_unfitted_log10_contrast),
+};
+// Solve and return maximum exact-solution error [K] at unknown locations (nodes or cell centers).
+fn max_error<P: SpatialDiscretization<f64, f64, 1>>(
+    plan: &P,
+    wall: &Wall,
+) -> Result<f64, String> {
+    let source = FieldData::zero();
+    let solution = EllipticProblem::new(plan, &source)
+        .solve_with_options(&EllipticOptions::new())
+        .map_err(|e| e.to_string())?;
+    if !solution.report().is_success() {
+        return Err(format!("Incomplete: {}", solution.report().termination()));
+    }
+    let mut error = 0.0_f64;
+    for (unknown, u) in solution.values().iter().enumerate() {
+        let x = plan.dof_point(unknown).map_err(|e| e.to_string())?.point[0];
+        error = error.max((u - wall.temperature(x)).abs());
+    }
+    Ok(error)
+}
+let mut curves = [Vec::new(), Vec::new(), Vec::new()];
+let mut rows = Vec::new();
+for nodes in (17..=81).step_by(4) {
+    let plans = wall_plans(&wall, nodes)?;
+    let errors = [
+        max_error(&plans.fdm, &wall).map_err(|e| format!("FDM N={nodes}: {e}"))?,
+        max_error(&plans.fem, &wall).map_err(|e| format!("FEM N={nodes}: {e}"))?,
+        max_error(&plans.fvm, &wall).map_err(|e| format!("FVM N={nodes}: {e}"))?,
+    ];
+    // FDM prediction (independent check): reading coefficients at face midpoints moves the interface to the nearest node.
+    // Compute maximum exact temperature difference between shifted and original walls using series-resistance formulas.
+    let h = THICKNESS / (nodes - 1) as f64;
+    let shifted = Wall {
+        interface: (wall.interface / h).round() * h,
+        right: wall.right,
+    };
+    let predicted = (0..nodes)
+        .map(|i| (shifted.temperature(i as f64 * h) - wall.temperature(i as f64 * h)).abs())
+        .fold(0.0, f64::max);
+    // Distance from interface to nearest node divided by grid spacing (0 means aligned, 0.5 means interval midpoint).
+    let offset = (wall.interface / h - (wall.interface / h).round()).abs();
+    rows.push((nodes, offset, errors[0], predicted, errors[1], errors[2]));
+    for (curve, e) in curves.iter_mut().zip(errors) {
+        curve.push([nodes as f64, e]);
+    }
+}
+// Count refinements where error increases despite a finer grid.
+let mut increases = Vec::new();
+let mut series = Vec::new();
+for (name, curve) in ["FDM", "FEM", "FVM"].into_iter().zip(&curves) {
+    increases.push((name, curve.windows(2).filter(|p| p[1][1] > p[0][1]).count()));
+    series.push(
+        serde_json::json!({ "name": name, "style": { "symbol": "circle" }, "points": curve }),
+    );
+}
+emit_line_chart!(
+    &series,
+    options = &serde_json::json!({
+        "xLabel": "Grid-point count N [points]",
+        "yLabel": "Maximum temperature error [K]",
+        "xType": "log",
+        "yType": "log"
+    })
+);
+let columns = serde_json::json!([
+    { "key": "0", "label": "Grid-point count N [points]", "type": "integer" },
+    { "key": "1", "label": "Interface offset [grid spacings]", "type": "number", "format": fixed2 },
+    { "key": "2", "label": "FDM error [K]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "Shifted-wall difference [K]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "FEM error [K]", "type": "number", "format": sci3 },
+    { "key": "5", "label": "FVM error [K]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "grids" })
+);
+let count_columns = serde_json::json!([
+    { "key": "0", "label": "Method" },
+    { "key": "1", "label": "Error-increasing refinements (out of 16) [count]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    count_columns,
+    increases,
+    metadata = serde_json::json!({ "id": "increases" })
+);
+```
+
+By default, error increases in 8 of 16 refinements for all three methods.
+FDM error and “Shifted-wall difference” agree within $10^{-12}$ K on every grid, confirming that apparent interface shift alone determines FDM error.
+FDM error stays at 0.127 K on the nine grids $N = 17, 25, \dots, 81$.
+These grids have form $h = d/(8j)$, all placing the nearest node to interface $0.37d$ at $0.375d$ and therefore solving the same wall.
+At $N = 21$ with offset 0.40, FDM error grows to 0.47 K.
+
+FEM error matches FDM for offsets no larger than 0.20 and separates for offsets at least 0.24.
+At $N = 21$, the arithmetic-mean-conductivity element underestimates interface resistance, making FEM error 0.64 K, largest of the three.
+Some grids such as $N = 49, 57, \dots$ give smaller FEM error than FDM even with offsets 0.24–0.40.
+Error size depends on the combination of offset and quadrature-point locations; refinement alone does not reduce it at a uniform order.
+
+To measure grid-convergence order in multilayer materials, use aligned grids placing interfaces on grid points.
+For structured grids, construct `SegmentMesh` with nonuniform coordinates from `CoordinateAxis::explicit`; for simplex meshes, construct `IntervalMesh` with the same vertices.
+`scioxide-pde` does not provide formulations that incorporate flux continuity with special shape functions in interface-crossing elements (such as extended finite elements).
+
+## Summary
+
+Aligning interfaces with grid points reproduces the two-layer wall's piecewise linear solution to rounding error with all three methods, while FVM face fluxes match the constant series-resistance value.
+Supplying FVM with each cell's material coefficient directly uses face-aligned half-cell series resistances.
+With unaligned interfaces, each method solves a wall with an apparent interface shift determined by coefficient-sampling locations; errors oscillate with the shift even under refinement.
+FDM error is predicted by series resistances as the difference from a wall with its interface moved to the nearest node.
+For discontinuous material properties, first construct an aligned grid and compare methods using location-independent quantities such as flux or interface temperature.
+
+## Further reading
+
+- [Coefficient-sampling locations and interfaces](oxref:pde-interface-sampling): examine derivations of where each discretization reads coefficients and how it approximates interface conditions.
+- [Following the Poisson problem from conservation to grid convergence](../poisson-grid/): examine measurement of refinement convergence order for smooth coefficients.
+- [Boundary conditions and outward signs](../../algorithms/boundary-conditions/): examine Dirichlet specification on structured and simplex meshes and flux sign conventions.

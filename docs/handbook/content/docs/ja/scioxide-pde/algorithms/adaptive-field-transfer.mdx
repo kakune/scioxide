@@ -1,0 +1,475 @@
+---
+title: 適応細分化の revision 間の場の転送
+description: 細分と粗化の前後で、セル平均を保存的に移す転送、節点の場の補間と L² 射影、外部の面のラベルの引き継ぎ。
+sidebar:
+  order: 366
+references:
+  pde-amr-transfer: "revision-間の対応と転送の種類"
+  pde-amr-cell-transfer: "セル平均の保存的な転送"
+  pde-amr-boundary-tags: "境界のラベルの引き継ぎ"
+  pde-amr-l2-projection: "節点の場の補間と-l-射影"
+---
+
+適応細分化でメッシュを細分または粗化すると、セルの数と番号が変わった新しいメッシュができる。
+`scioxide-spatial` の章に合わせて、それぞれのメッシュを revisionと呼ぶ。
+このページは、前の revision の場を新しい revision へ移す転送の公式、保存する量、失敗の分類を説明し、2 つのセルで確かめる。
+節点空間 `AmrSpace` と宙づり節点の拘束は[誤差推定に基づく適応細分化](../adaptive-mesh-refinement/)で説明している。
+
+## revision 間の対応と転送の種類
+
+新しい revision を作ったら、前の revision の場（時間発展の途中の解、反復の初期値、材料の量）を新しい revision へ移す必要がある。
+`TopologyMap` は revision 間のセル・面・辺・頂点の対応だけを持ち、値を移す重みは持たない（[トポロジーの対応と世代の追跡](oxref:spatial-adaptive-topology-relations)）。
+`scioxide-pde` は、セルごとの定数の場と節点の場について次の転送を提供し、外部の面のラベルも新しい revision へ引き継ぐ。
+
+| 場 | 転送 | 保つもの | 使える revision の変更 |
+|---|---|---|---|
+| セル平均 | `AmrCellTransfer` | 量 $\sum_K u_K\vert K\vert$（丸めの範囲） | 細分と粗化 |
+| 節点の場 | `AmrNodalTransfer::interpolate_into`（補間） | 関数そのもの | 細分だけ |
+| 節点の場 | `AmrNodalTransfer::project_into`（$L^2$ 射影） | 積分 $\int_\Omega u_h$（線形方程式の残差の範囲） | 細分と粗化 |
+| 外部の面のラベル | `AmrBoundaryTags::transfer` | 各面のラベル | 細分と粗化（違うラベルの併合は拒否） |
+
+このページの 2 つのセルの前の revision には、[誤差推定に基づく適応細分化](../adaptive-mesh-refinement/)のセルと同じく、単位正方形の $4\times4$ の三角形メッシュの左下の隅を 2 回細分した revision を使う。
+新しい revision は、重心が右上の隅 $(1,1)$ に近い（$x_K+y_K>1.6$）セルを細分して作る。
+「細分と粗化」では、同時に深さ 2 のセルの族（隅の 2 つ）をすべて粗化する。
+定義のブロックには、この 2 つの revision と revision 間の写像を作る `versions`、移す関数 $f(x,y)=1+\sin(3x)\cos(2y)$、P1 の場の積分 `p1_integral`、質量の方程式を解く `mass_solve` を置く。
+
+```rust
+//| id: pde-amr-transfer-model
+//| kind: definitions
+//| title: 隅を細分した前の revision、細分・粗化した新しい revision、P1 の場の積分と質量の方程式の解法
+//| crates: [scioxide-core, scioxide-spatial, scioxide-pde, scioxide-linalg]
+use scioxide_core::{Budget, SciOxideError, RealScalar, ResidualTolerance, SolveContext};
+use scioxide_linalg::{CgSolver, IterativeWorkspace, Preconditioning, Vector};
+use scioxide_pde::{AmrMap, AmrSpace};
+use scioxide_spatial::{
+    AdaptationLimits, AdaptationRequest, AdaptationResult, AdaptiveMesh, Point, TriangleMesh,
+};
+
+/// 移す関数 f(x, y) = 1 + sin(3x) cos(2y)。
+pub(crate) fn f(p: [f64; 2]) -> f64 {
+    1.0 + RealScalar::sin(3.0 * p[0]) * RealScalar::cos(2.0 * p[1])
+}
+
+/// 活性セル cell の重心。
+pub(crate) fn centroid(mesh: &AdaptiveMesh<f64, 2>, cell: usize) -> Result<[f64; 2], String> {
+    let mut c = [0.0; 2];
+    for vertex in mesh.cell_vertices(cell).map_err(|e| e.to_string())? {
+        let p = mesh.point(vertex).map_err(|e| e.to_string())?;
+        c[0] += p.as_array()[0] / 3.0;
+        c[1] += p.as_array()[1] / 3.0;
+    }
+    Ok(c)
+}
+
+/// 重心が条件 select を満たす活性セルを細分し、coarsen の親を粗化する。
+fn adapt(
+    mesh: &AdaptiveMesh<f64, 2>,
+    select: impl Fn([f64; 2]) -> bool,
+    coarsen: &[usize],
+) -> Result<AdaptationResult<f64, 2>, String> {
+    let mut refine = Vec::new();
+    for (cell, &id) in mesh.active_cells().iter().enumerate() {
+        if select(centroid(mesh, cell)?) {
+            refine.push(id);
+        }
+    }
+    let request = AdaptationRequest {
+        source: mesh.mesh_token(),
+        refine: &refine,
+        coarsen,
+    };
+    mesh.adapt(request).map_err(|e| e.to_string())
+}
+
+/// 前の revision（隅を 2 回細分）と、前の revision から新しい revision への細分の結果。
+pub(crate) fn versions(
+    mixed: bool,
+) -> Result<(AdaptiveMesh<f64, 2>, AdaptationResult<f64, 2>), String> {
+    let n = 4;
+    let mut points = Vec::new();
+    for j in 0..=n {
+        for i in 0..=n {
+            let p = Point::new([i as f64 / n as f64, j as f64 / n as f64]);
+            points.push(p.map_err(|e| e.to_string())?);
+        }
+    }
+    let mut cells = Vec::new();
+    for j in 0..n {
+        for i in 0..n {
+            let a = j * (n + 1) + i;
+            cells.push([a, a + 1, a + n + 2]);
+            cells.push([a, a + n + 2, a + n + 1]);
+        }
+    }
+    let triangles = TriangleMesh::new(points, cells).map_err(|e| e.to_string())?;
+    let root = AdaptiveMesh::from_simplex(&triangles, AdaptationLimits::new())
+        .map_err(|e| e.to_string())?;
+    let near = |radius: f64| move |c: [f64; 2]| RealScalar::hypot(c[0], c[1]) < radius;
+    let once = adapt(&root, near(0.3), &[])?.mesh;
+    let source = adapt(&once, near(0.15), &[])?.mesh;
+    // 「細分と粗化」では深さ 2 のセルの親（子がすべて活性な族）をすべて粗化する。
+    let mut coarsen = Vec::new();
+    for &id in source.active_cells() {
+        if mixed && source.level(id).map_err(|e| e.to_string())? == 2 {
+            coarsen.extend(source.parent(id).map_err(|e| e.to_string())?);
+        }
+    }
+    coarsen.sort_unstable();
+    coarsen.dedup();
+    let next = adapt(&source, |c| c[0] + c[1] > 1.6, &coarsen)?;
+    Ok((source, next))
+}
+
+/// P1 の場の積分 ∫ u_h = Σ_K |K| (u_1 + u_2 + u_3) / 3（三角形で厳密）。
+pub(crate) fn p1_integral(space: &AmrSpace<f64, 2>, values: &[f64]) -> Result<f64, String> {
+    let mut sum = 0.0;
+    for cell in 0..space.mesh().cell_count() {
+        let nodes = space.cell_dofs(cell).map_err(|e| e.to_string())?;
+        let corners: f64 = nodes.iter().map(|&i| values[i]).sum();
+        sum += corners * space.mesh().cell_measure(cell).map_err(|e| e.to_string())? / 3.0;
+    }
+    Ok(sum)
+}
+
+/// 呼び出し側の解法（`AmrMassSolve`）：整合質量の方程式 M z = C u を零の初期値から CG で解く。
+pub(crate) fn mass_solve(
+    mass: &AmrMap<f64>,
+    rhs: &[f64],
+    z: &mut [f64],
+    context: &mut SolveContext<'_, '_>,
+) -> Result<(), SciOxideError> {
+    let solver = CgSolver::new(
+        ResidualTolerance::new(1e-14, 1e-14)?,
+        Budget::try_from(500)?,
+    );
+    let rhs = Vector::from_vec(rhs.to_vec());
+    let mut x = Vector::zeros(rhs.len())?;
+    let mut work = IterativeWorkspace::new();
+    let unpreconditioned = Preconditioning::None;
+    let report = solver.solve_into(
+        mass,
+        &rhs,
+        unpreconditioned,
+        x.view_mut(),
+        &mut work,
+        &mut *context,
+    )?;
+    if !report.termination().is_success() {
+        return Err(SciOxideError::external("質量の方程式の CG が収束しなかった"));
+    }
+    z.copy_from_slice(x.as_slice());
+    Ok(())
+}
+```
+
+## セル平均の保存的な転送
+
+`AmrCellTransfer` は、セルごとの定数の場（セル平均）を、量 $\sum_K u_K\vert K\vert$ を保って移す。
+細分された親 $K$ の子 $K_j$ には $u_{K_j}=u_K\,\vert K\vert/\sum_j\vert K_j\vert$ を、粗化された子 $K_i$ の親 $K$ には $u_K=\sum_i u_{K_i}\vert K_i\vert/\vert K\vert$ を入れ、変わらないセルは値を写す。
+体積 $\vert K\vert$ は丸めた頂点の座標から求めるので、子の体積の和は親の体積と丸めの分だけ違いうる。
+重みをこの形にしているので、その場合も量の和は丸めの範囲で保たれる。
+対応に `Created` や `Removed` のセルがあると、準備は `InvalidInput` を返す。
+
+`AmrCellTransfer::new(source, destination, topology, options)` は重みを準備し、`options` のうち上限と実行方針だけを使う。
+`build(…, scope)` は同じ準備を求解のスコープの一回分として行い、スコープの計算回数の上限と取り消しに従う。
+すべての適応セルの族と周期的なセルを扱う。
+`apply_into(input, output, scratch, execution)` は呼び出し側の領域に書き、`field(destination, input)` は新しい revision の場を確保して返す。
+古い revision の場、形の不一致、非有限値を渡すと、出力を変えずにエラーを返す。
+`operator` は重みの `AmrMap`、`destination` は新しい revision のトークン、`preparation_storage_bound` は準備で認めた確保の累積の上限を返す。
+`pullback_into` は、幾何を固定したときの転送の随伴を余接ベクトルに作用させる。
+
+## 境界のラベルの引き継ぎ
+
+`AmrBoundaryTags::transfer(source, destination, map)` は、面の祖先と子孫の関係でラベルを新しい revision へ移す。
+粗化で違うラベルの面が 1 つの面に併合されるとき、新しい revision の外部の面にラベルが付かないときは `InvalidInput` になる。
+`transfer_with_options` は上限 `AmrLimits` を受け取り、`view` はラベルを面の場として借用する。
+
+次のセルはセルの場 $u_K=f(x_K,y_K)$（$(x_K,y_K)$ は重心）を `AmrCellTransfer` で新しい revision へ移し、量 $\sum_K u_K\vert K\vert$ を前後で比べる。
+同時に、外部の面すべてに付けたラベル 0 を `AmrBoundaryTags::transfer` で引き継ぎ、外部の面の数とラベルの付いた面の数を比べる。
+入力は revision の変更の種類である。
+
+```rust
+//| id: pde-amr-cell-transfer-conservation
+//| ref: pde-amr-cell-transfer-conservation
+//| title: セル平均の転送で量が保たれ、境界のラベルが引き継がれることを確かめる
+//| run: reactive
+//| uses: [pde-amr-transfer-model]
+//| crates: [scioxide-core, scioxide-spatial, scioxide-pde]
+//| inputs:
+//|   change: {"type":"select","label":"revision の変更","options":["細分だけ","細分と粗化"],"value":"細分だけ"}
+//| cases:
+//|   - {"id":"mixed","label":"細分と粗化","description":"粗化した親には子の量の和が入り、量の和は丸めの範囲で変わらない。","inputs":{"change":"細分と粗化"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"cell-amount","path":"/rows/0/3","range":{"min":-1e-14,"max":1e-14}}
+//|   - case: mixed
+//|     expect:
+//|       - {"artifact":"cell-amount","path":"/rows/0/3","range":{"min":-1e-14,"max":1e-14}}
+use scioxide_pde::{AmrBoundaryTags, AmrCellTransfer, AmrOptions};
+use scioxide_spatial::{AdaptiveMesh, Cell, Field};
+
+let (source, next) = versions(change == "細分と粗化")?;
+let target = &next.mesh;
+// セルの場 u_K = f(重心) と、量 Σ u_K |K|。
+let amount = |mesh: &AdaptiveMesh<f64, 2>, values: &[f64]| -> Result<f64, String> {
+    let mut sum = 0.0;
+    for (cell, value) in values.iter().enumerate() {
+        sum += value * mesh.cell_measure(cell).map_err(|e| e.to_string())?;
+    }
+    Ok(sum)
+};
+let mut averages = Vec::new();
+for cell in 0..source.cell_count() {
+    averages.push(f(centroid(&source, cell)?));
+}
+let field = Field::<f64, Cell, 2>::new(&source, averages).map_err(|e| e.to_string())?;
+let transfer = AmrCellTransfer::new(&source, target, &next.map, AmrOptions::new())
+    .map_err(|e| e.to_string())?;
+let moved = transfer
+    .field(target, field.view())
+    .map_err(|e| e.to_string())?;
+let before = amount(&source, field.values())?;
+let after = amount(target, moved.values())?;
+
+// 外部の面すべてにラベル 0 を付け、新しい revision へ引き継ぐ。
+let entries: Vec<(usize, u32)> = source
+    .interfaces()
+    .iter()
+    .filter(|interface| interface.right.is_none())
+    .map(|interface| (interface.left_face, 0))
+    .collect();
+let tags = AmrBoundaryTags::new(&source, &entries).map_err(|e| e.to_string())?;
+let moved_tags = tags
+    .transfer(&source, target, &next.map)
+    .map_err(|e| e.to_string())?;
+let labelled = |values: &[Option<u32>]| values.iter().filter(|tag| tag.is_some()).count();
+let exterior = |mesh: &AdaptiveMesh<f64, 2>| {
+    mesh.interfaces()
+        .iter()
+        .filter(|interface| interface.right.is_none())
+        .count()
+};
+
+let fixed12 = serde_json::json!({ "fractionDigits": 12 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "活性セル（前 → 新）[個]" },
+    { "key": "1", "label": "前の revision の Σ u_K |K| [-]", "type": "number", "format": fixed12 },
+    { "key": "2", "label": "新しい revision の Σ u_K |K| [-]", "type": "number", "format": fixed12 },
+    { "key": "3", "label": "相対差 [-]", "type": "number", "format": sci2 }
+]);
+let cells = format!("{} → {}", source.cell_count(), target.cell_count());
+let rows = vec![(cells, before, after, (after - before) / before)];
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "cell-amount" })
+);
+let columns = serde_json::json!([
+    { "key": "0", "label": "revision" },
+    { "key": "1", "label": "外部の面 [個]", "type": "integer" },
+    { "key": "2", "label": "ラベルの付いた面 [個]", "type": "integer" }
+]);
+let rows = vec![
+    ("前の revision", exterior(&source), labelled(tags.view().values())),
+    (
+        "新しい revision",
+        exterior(target),
+        labelled(moved_tags.view().values()),
+    ),
+];
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "labels" })
+);
+```
+
+「細分だけ」では、右上の隅の 2 個のセルがそれぞれ 4 個の子に分かれ、活性セルは 44 個から 50 個になる。
+量は前後とも $1.308358383929$ で、相対差は $1.7\times10^{-16}$ である。
+「細分と粗化」では、隅の 2 つの族が親に戻る分と右上の細分が打ち消し合って活性セルは 44 個のままだが、量の相対差は同じく $1.7\times10^{-16}$ である。
+粗化した親の値は子の量の和を親の体積で割った値なので、量は丸めの範囲で変わらない。
+ラベルは、細分で外部の面が 20 個から 22 個に増えた場合も、すべての外部の面に引き継がれる。
+
+## 節点の場の補間と L² 射影
+
+`AmrNodalTransfer::new(source, destination, map)` は、同じ次数の 2 つの `AmrSpace` の間で節点の場を移す準備をする。
+次数が違うと `InvalidInput` になる。
+上限は `with_options(…, limits)`、スコープの中での準備は `build(…, limits, scope)` で与える。
+次数と拘束の広がりが一定なら、準備は前後の revision のセル数 $n$ について $O(n\log n)$ の処理と $O(n)$ のメモリ領域で済む。
+補間と射影は、入力の全節点のベクトルが前の空間の拘束を満たすことを `validate_field` で確かめ、満たさなければ `InvalidInput` を返す。
+
+細分だけの revision 間では、前の空間が新しい空間に含まれる（入れ子になる）ので、新しい節点で前の関数の値を取る補間が関数を変えずに移す。
+`interpolation` はこの写像を返し、`interpolate_into` が適用する。
+粗化を含むと前の関数は新しい空間に入らず、補間は用意されない（`interpolation` は `None` で、`interpolate_into` は `InvalidInput` を返す）。
+
+一般の場合は $L^2$ 射影を使う。
+新しい空間の独立な基底 $\psi_i$ に対して、射影 $z_h$ は
+
+$$
+\int_\Omega z_h\,\psi_i=\int_\Omega u_h\,\psi_i\quad(\text{すべての } i),\qquad
+M\mathbf{z}=C\mathbf{u}
+$$
+
+を満たす。
+$M$ は新しい空間の整合質量行列（拘束で縮約した $P^{\mathsf T}M_{\text{全}}P$）、$C$ は前の空間の全節点から新しい独立な節点への交差質量行列である。
+$C$ の各要素は祖先と子孫の関係にある 2 つのセルのうち細かいほうのセルの上で積分する。
+細かいセルの上では両方の関数が多項式なので、求積の次数が足りていれば $C$ は厳密に計算される。
+新しい空間は定数関数を含む（拘束の重みの和が 1）ので、基底の和 $\sum_i\psi_i=1$ を試験関数に取ると $\int_\Omega z_h=\int_\Omega u_h$ になる。
+つまり $L^2$ 射影は線形方程式の残差の範囲で場の積分を保つ。
+
+`mass` は $M$（行和で集中化しない）、`cross_mass` は $C$ を返す。
+`project_into(input, tolerance, solve, output, workspace, scope)` は、$C\mathbf{u}$ を作り、呼び出し側の解法 `solve` に $M\mathbf{z}=C\mathbf{u}$ を零の初期値から解かせる。
+`solve` の型は `AmrMassSolve` で、質量の作用素、右辺、解の領域、求解コンテキストを受け取り、解法の失敗をエラーで返す関数である。
+戻った解について元の方程式の残差 $\Vert M\mathbf{z}-C\mathbf{u}\Vert$ を計算し、`tolerance` の閾値を超えれば `InvalidInput` を返して出力を変えない。
+閾値以内なら $P\mathbf{z}$ を全節点の出力に書き、`AmrProjectionReport` の `residual_norm` と `rhs_norm` を返す。
+これは代数方程式の残差で、連続の場の誤差の上界ではない。
+射影は Dirichlet の値を課さないので、境界の値が必要な場合は次の組立で課す。
+`interpolate_pullback_into` は幾何を固定して補間の随伴を余接 $\bar{\mathbf{z}}$ に作用させ、前の revision の全節点の座標で結果を返す。
+`project_pullback_into` は、幾何を固定して $M\boldsymbol{\mu}=P^{\mathsf T}\bar{\mathbf{z}}$ を呼び出し側の解法で解き、$C^{\mathsf T}\boldsymbol{\mu}$ を返す。
+作業領域 `AmrTransferWorkspace` は `workspace()` で一度確保し、補間、射影、2 つの随伴で共有する。
+作った後は大きさが変わらない。
+射影の線形解法のメモリ領域は `solve` の側が持つ。
+細分化をまたぐ勾配での随伴の使い方は[場の転送の微分](oxref:pde-transfer-derivatives)で扱う。
+
+次のセルは独立な節点で $f$ を取り、拘束で全節点へ延長した P1 の場 $u_h$ を新しい revision へ移す。
+$L^2$ 射影は定義のブロックの `mass_solve`（零の初期値からの CG、許容誤差は絶対・相対とも $10^{-14}$）で質量の方程式を解き、残差の閾値は絶対・相対とも $10^{-12}$ とする。
+細分だけの場合は補間でも移し、2 つの結果の差の最大を求める。
+表は前後の積分 $\int_\Omega u_h$、相対差、射影の相対残差 $\Vert M\mathbf{z}-C\mathbf{u}\Vert/\Vert C\mathbf{u}\Vert$ である。
+
+```rust
+//| id: pde-amr-nodal-projection
+//| ref: pde-amr-nodal-projection
+//| title: 節点の場を L² 射影と補間で移し、積分の保存と両者の一致を確かめる
+//| run: reactive
+//| uses: [pde-amr-transfer-model]
+//| crates: [scioxide-core, scioxide-spatial, scioxide-pde, scioxide-linalg]
+//| inputs:
+//|   change: {"type":"select","label":"revision の変更","options":["細分だけ","細分と粗化"],"value":"細分だけ"}
+//| cases:
+//|   - {"id":"mixed","label":"細分と粗化","description":"粗化を含むので補間は使えず、L² 射影だけが積分を保つ。","inputs":{"change":"細分と粗化"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"nodal","path":"/rows/0/3","range":{"min":-1e-12,"max":1e-12}}
+//|       - {"artifact":"nodal","path":"/rows/0/4","range":{"min":0,"max":1e-12}}
+//|       - {"artifact":"nodal","path":"/rows/1/3","range":{"min":-1e-14,"max":1e-14}}
+//|   - case: mixed
+//|     expect:
+//|       - {"artifact":"nodal","path":"/rows/0/3","range":{"min":-1e-12,"max":1e-12}}
+//|       - {"artifact":"nodal","path":"/rows/1/2","equals":null}
+use scioxide_core::{ExecutionContext, LinearOperator, ResidualTolerance};
+use scioxide_pde::{AmrNodalTransfer, AmrOrder, AmrSpace};
+
+let (source, next) = versions(change == "細分と粗化")?;
+let from = AmrSpace::new(&source, AmrOrder::P1).map_err(|e| e.to_string())?;
+let to = AmrSpace::new(&next.mesh, AmrOrder::P1).map_err(|e| e.to_string())?;
+// 独立な節点で f を取り、拘束 P で全節点へ延長した P1 の場 u。
+let mut independent = Vec::new();
+for &node in from.independent_nodes() {
+    independent.push(f(from.node_point(node).map_err(|e| e.to_string())?));
+}
+let mut u = vec![0.0; from.full_dofs()];
+let mut scratch = u.clone();
+from.constraints()
+    .apply_into(&independent, &mut u, &mut scratch)
+    .map_err(|e| e.to_string())?;
+
+let transfer = AmrNodalTransfer::new(&from, &to, &next.map).map_err(|e| e.to_string())?;
+let mut workspace = transfer.workspace::<f64>().map_err(|e| e.to_string())?;
+let mut projected = vec![0.0; to.full_dofs()];
+let tolerance = ResidualTolerance::new(1e-12, 1e-12).map_err(|e| e.to_string())?;
+let projection = transfer
+    .project_into(
+        &u,
+        tolerance,
+        &mut mass_solve,
+        &mut projected,
+        &mut workspace,
+        ExecutionContext::sequential(),
+    )
+    .map_err(|e| e.to_string())?;
+// 補間は細分だけの revision 間でしか用意されない。
+let mut interpolated = None;
+if transfer.interpolation().is_some() {
+    let mut values = vec![0.0; to.full_dofs()];
+    transfer
+        .interpolate_into(
+            &u,
+            &mut values,
+            &mut workspace,
+            ExecutionContext::sequential(),
+        )
+        .map_err(|e| e.to_string())?;
+    interpolated = Some(values);
+}
+
+let before = p1_integral(&from, &u)?;
+let after = p1_integral(&to, &projected)?;
+let interpolated_after = interpolated
+    .as_ref()
+    .map(|v| p1_integral(&to, v))
+    .transpose()?;
+let gap = interpolated.as_ref().map(|v| {
+    v.iter()
+        .zip(&projected)
+        .fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()))
+});
+let fixed12 = serde_json::json!({ "fractionDigits": 12 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "転送" },
+    { "key": "1", "label": "前の revision の ∫u_h [-]", "type": "number", "format": fixed12 },
+    { "key": "2", "label": "新しい revision の ∫ [-]", "type": "number", "format": fixed12, "nullText": "使えない" },
+    { "key": "3", "label": "相対差 [-]", "type": "number", "format": sci2, "nullText": "—" },
+    { "key": "4", "label": "相対残差 [-]", "type": "number", "format": sci2, "nullText": "—" },
+    { "key": "5", "label": "射影との差の最大 [-]", "type": "number", "format": sci2, "nullText": "—" }
+]);
+let residual = projection.residual_norm() / projection.rhs_norm();
+let rows = vec![
+    (
+        "L² 射影",
+        before,
+        Some(after),
+        Some((after - before) / before),
+        Some(residual),
+        None,
+    ),
+    (
+        "補間",
+        before,
+        interpolated_after,
+        interpolated_after.map(|value| (value - before) / before),
+        None,
+        gap,
+    ),
+];
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "nodal" })
+);
+```
+
+「細分だけ」では、射影の積分の相対差は $-2.6\times10^{-15}$、相対残差は $1.0\times10^{-14}$ である。
+補間の積分の相対差は $-3.5\times10^{-16}$ で、補間と射影の差の最大は $5.8\times10^{-14}$ になる。
+入れ子の空間では前の関数が新しい空間に入っているので、射影と補間は同じ関数を返し、差は CG の許容誤差の程度に収まる。
+「細分と粗化」では補間が用意されず、表の補間の行は「使えない」になる。
+射影の積分の相対差は丸めの範囲で 0、相対残差は $3.3\times10^{-14}$ で、粗化した revision でも射影は積分を保つ。
+保たれるのは積分であって節点の値ではなく、粗化した領域では細かい変化が失われる。
+
+## まとめ
+
+セル平均の場は `AmrCellTransfer` で移すと、細分と粗化のどちらでも量 $\sum_K u_K\vert K\vert$ が丸めの範囲で保たれる。
+節点の場は細分だけなら補間で関数を変えずに移せ、粗化を含むなら $L^2$ 射影が線形方程式の残差の範囲で積分を保つ。
+射影の精度は呼び出し側の質量の解法と残差の閾値で決まり、`AmrProjectionReport` の残差はその確認に使えるが、連続の誤差の上界ではない。
+射影は Dirichlet の値を課さないので、次の組立で境界条件を課す。
+外部の面のラベルは `AmrBoundaryTags::transfer` で引き継ぎ、異なるラベルの面を併合する粗化は拒否される。
+
+## 次に読むページ
+
+- [誤差推定に基づく適応細分化](../adaptive-mesh-refinement/)：転送の前段の推定子とマーキング、宙づり節点の拘束を確かめる。
+- [L 字領域の角特異性と適応細分化](../../examples/l-shaped-amr/)：補間した前の解を CG の初期値に使う細分の循環を、収束率とともに見る。
+- [時間発展問題の離散随伴](../transient-adjoints/)：細分化をまたぐ勾配で、転送の写像の随伴をどう組み合わせるかを確かめる。
+- [適応細分化の API](../../api/adaptive-refinement/)：転送の各項目の仕様を一覧で確かめる。

@@ -1,0 +1,323 @@
+---
+title: 実行形式・作業領域・再現性
+description: ホットループにおけるゼロアロケーション設計、実行形式、Capacity と ResourceLimit、浮動小数点の非結合性、および再現性の 3 段階。
+sidebar:
+  order: 60
+---
+
+同じ形の計算を繰り返すときは、Plan・分解因子・作業領域を再利用すると、準備とメモリ確保の負担を減らせる。
+並列計算では、値を足し合わせる順序も結果の再現性に関わる。
+ここでは、実行前に用意するものと、再現性を確認する際の条件を整理する。
+
+---
+
+## 統一された実行形式
+
+SciOxide は設定、準備、実行を分ける設計を基本とする。
+次の表は実行形式の分類を示す概略であり、そのまま呼び出せる共通のシグネチャではない。
+具体的な引数と失敗時の扱いは、利用する型の仕様で確認する。
+
+| 実行分類 | 実行形式のシグネチャ | 失敗時の仕様 |
+|---|---|---|
+| **アトミック出力（Atomic output）** | `verb(..)`, `verb_into(inputs, out, ws, cx)`, `verb_in_place(data, ws, cx)` | エラー発生時、出力領域 `out` や入力バッファー `data` の値は**一切変更されない**（原子性の維持）。 |
+| **漸進的求解（Progressive）** | `advance(problem, state, sink, ws, scope) -> Result<Report, SciOxideError>` | 事前検証棄却時は `state` は入力のまま。任意の受理ステップ後は**最後に受理された状態**（Last Accepted State）を保持。出力済みサンプルは取り消されない。 |
+| **セッション（Session）** | `Tape::linearize` が返す `Linearization` のように、1 点で複数の積を取るために作業領域を借用するビュー | 次のセッションは作業領域を完全に初期化する。 |
+| **プラン不要の関数（Plan-less function）** | `f(x)`, `f_with_options(x, opts)`, `f_scoped(x, opts, scope)` | 特殊関数など。結果を値で返す。`f_scoped` は反復や入れ子の処理をする関数だけが持ち、固定計算コストの関数にはない。 |
+
+プラン不要のスカラー関数にはバッチ形式がない。
+複数の点で評価するときは要素ごとに呼ぶ。
+例外は、次数の漸化式を再利用する数列形式（特殊関数の列など）だけである。
+
+- **所有値を返す API（`verb`）**: 出力型が一意かつ所有可能である場合に限り提供される簡易 API。
+  作業領域を一時確保して結果を所有して返す。
+  `ExecutionContext::sequential_native()` で逐次実行し、`std` では検証済みのネイティブ命令経路、`no_std` では可搬なスカラー経路を使う。
+  クロック・キャンセル・エントロピーは渡らないので、時間上限を設定すると `CapabilityUnavailable` で失敗する。
+- **出力先を指定する API（`verb_into`）**: ホットループでゼロアロケーションを実現する正規の実行形式。
+  呼び出し側が用意した出力スライスと作業領域（`Workspace`）を可変借用して結果を直接書き込む。
+
+同じ係数行列 $A$ に対して右辺 $b_k$ だけを変えるなら、LU分解を再利用できる。
+分解にはおよそ $2n^3/3$、各右辺の代入には $2n^2$ の演算が必要になる。
+`LuDecomposition` の借用出力を使う経路では、出力と `LinalgWorkspace` を事前に用意し、実行中の追加確保を避けられる。
+
+---
+
+## 作業領域の容量手順と `ResourceLimit`
+
+作業領域（`Workspace`）を再利用するときは、必要容量の取得、事前確保、適合性の確認を分ける。
+
+| 手順 | 操作 |
+|---|---|
+| 必要容量を調べる | `plan.workspace_requirements(request)` |
+| 領域を事前確保する | `ws.try_reserve(&requirements)` |
+| 容量を確認する | `ws.check(&requirements)` |
+
+`plan.workspace(request)` は、必要容量を満たす作業領域を作る別の API である。
+事前確保済みの領域を再利用する場合に、毎回作り直す必要はない。
+
+### 容量の適合性判定（`Capacity`）
+
+`ws.check(&requirements)` は列挙型 `Capacity` を返す。
+
+- **`Capacity::Sufficient`**: ワークスペースに保持されている既存のストレージ領域が要求を満たしており、その要求について領域を増やす必要がない。
+  利用者のコールバックや、別の出力領域の確保まで保証するものではない。
+- **`Capacity::NeedsGrowth`**: 保持領域が不足しており、数値計算を実行する前に領域の拡張が必要である。
+
+要件の検査では、以前の呼び出しから保持している容量も数える。
+確保に失敗しても、それまでに拡張した領域は残る場合がある。
+出力の原子性は、作業領域の容量まで元に戻す保証ではない。
+
+### リソース制限とエラー仕様
+
+- 借用スライスの長さが要求最小長に満たない場合は、形状不整合として **`DimensionMismatch`** を返す。
+- 所有ワークスペースの拡張時にメモリアロケーションが失敗した場合は **`AllocationFailure`** を返す。
+- 必要容量の計算において整数オーバーフローが生じた場合は **`SizeOverflow`** を返す。
+- 呼び出し側が設定したメモリ上限・容量リソース枠を超過した場合は、構造化エラー **`SciOxideErrorKind::ResourceLimit`** を返す。
+
+---
+
+## 準備費の償却モデル対話型実験
+
+次のセルは、準備を再利用したときの**計算量のモデル**を示す。
+適用1回分を1、準備を $P$ とすると、$N$ 回の総計算量は毎回準備する場合に $N(P+1)$、再利用する場合に $P+N$ となる。
+入力は $P$ と $N$ であり、実行時間の測定値ではない。
+併せて、出力先を指定する API の実例として、20 行 10 列の配列を `softmax_axis_into` で行ごとに正規化する。
+出力と作業領域は呼び出し側が実行前に用意し、同じ領域を 3 回の実行で使い回す。
+表は、用意した出力と作業領域の長さ、各行の確率の和が 1 からずれた最大、作業領域を 1 要素だけ短くしたときのエラーの分類を示す。
+作業領域が必要な長さ（入力の要素数）に満たない場合は `DimensionMismatch` になり、出力は変わらない。
+
+```rust
+//| id: concept-plan-amortization
+//| title: 準備費と反復回数を動かして Plan 再利用の償却を見る（コストモデルと要件実例）
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   preparation_cost_ratio: {"type":"range","label":"準備費 / 一回適用費 P [-]","description":"分解や Plan 構築が一回の適用何回分かを変える。","min":1,"max":500,"step":1,"value":80}
+//|   selected_repetitions: {"type":"range","label":"観察する反復回数 N [回]","description":"同じ準備を共有する計算回数を変える。","min":1,"max":200,"step":1,"value":24}
+use scioxide_core::{
+    ExecutionContext, ExecutionPolicy, SciOxideErrorKind, NdView, NdViewMut, checked_sum,
+    softmax_axis_into,
+};
+
+// 20 行 10 列を行ごと（軸 1）に正規化する。出力先を指定する API は出力と、要素数以上の長さの作業領域を取る。
+let shape = [20, 10];
+let logits: Vec<f64> = (0..200).map(|i| 0.01 * f64::from(i)).collect();
+let input = NdView::row_major(&logits, &shape).map_err(|e| e.to_string())?;
+let mut output = vec![0.0; 200];
+let mut scratch = vec![0.0; 200];
+// 同じ出力と作業領域を 3 回の実行で使い回す。
+for _ in 0..3 {
+    let target = NdViewMut::row_major(&mut output, &shape).map_err(|e| e.to_string())?;
+    softmax_axis_into(
+        input,
+        1,
+        ExecutionPolicy::Sequential,
+        target,
+        &mut scratch,
+        ExecutionContext::sequential(),
+    )
+    .map_err(|e| e.to_string())?;
+}
+let mut worst_total = 0.0_f64;
+for row in output.chunks(10) {
+    let total = checked_sum(row).map_err(|e| e.to_string())?;
+    worst_total = worst_total.max((total - 1.0).abs());
+}
+// 1 要素短い作業領域は、計算の前に DimensionMismatch として拒否される。
+let target = NdViewMut::row_major(&mut output, &shape).map_err(|e| e.to_string())?;
+let short = softmax_axis_into(
+    input,
+    1,
+    ExecutionPolicy::Sequential,
+    target,
+    &mut scratch[..199],
+    ExecutionContext::sequential(),
+);
+let short_result = match short {
+    Ok(()) => "Ok",
+    Err(error) if error.kind() == SciOxideErrorKind::DimensionMismatch => "DimensionMismatch",
+    Err(error) => return Err(error.to_string()),
+};
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let workspace_columns = serde_json::json!([
+    { "key": "0", "label": "入力の形" },
+    { "key": "1", "label": "出力の長さ [スカラー数]", "type": "integer" },
+    { "key": "2", "label": "作業領域の長さ [スカラー数]", "type": "integer" },
+    { "key": "3", "label": "行の確率の和と 1 の差の最大 [-]", "type": "number", "format": sci2 },
+    { "key": "4", "label": "作業領域が 199 のときの結果" }
+]);
+emit_table_with_columns!(
+    workspace_columns,
+    vec![(
+        "20 × 10",
+        output.len(),
+        scratch.len(),
+        worst_total,
+        short_result
+    )],
+    metadata = serde_json::json!({ "id": "workspace" })
+);
+
+// 以下は計算量のモデル。実行時間を測った値ではない。
+let p = preparation_cost_ratio;
+let n = selected_repetitions.round();
+let repeated: Vec<_> = (1..=200).map(|k| [k as f64, p + 1.0]).collect();
+let reused: Vec<_> = (1..=200).map(|k| [k as f64, p / k as f64 + 1.0]).collect();
+let series = vec![
+    serde_json::json!({"name":"毎回準備", "points":repeated}),
+    serde_json::json!({"name":"準備を再利用", "points":reused}),
+];
+// 再利用の計算コスト p/N + 1 は両対数軸で 1 に近づく。縦線は表で比べる N。
+emit_line_chart!(
+    &series,
+    options = &serde_json::json!({"xLabel": "繰り返し回数 N [回]", "yLabel": "1回あたりの計算量 [適用1回分]",
+"xType": "log", "yType": "log", "annotations": [{"kind": "line", "axis": "x", "value": n, "label": "選んだ N"}]})
+);
+emit_table_with_columns!(
+    serde_json::json!([
+    {"key":"0","label":"経路","type":"string","nullText":"未定義"},
+    {"key":"1","label":"総計算量 [適用1回分]","type":"number","format":{"significantDigits":6},"nullText":"未定義"},
+    {"key":"2","label":"1回あたりの計算量","type":"number","format":{"significantDigits":6},"nullText":"未定義"}
+    ]),
+    vec![
+        ("毎回準備", n * (p + 1.0), p + 1.0),
+        ("準備を再利用", p + n, p / n + 1.0),
+    ]
+);
+```
+
+反復回数 $N$ が増大するにつれて、1 回あたりの実効コストは $1 + P/N$ へと減少し、理論上の限界値である 1 へと漸近する。
+
+---
+
+## `ExecutionPolicy` と `ExecutionContext` の分離
+
+SciOxide では、「並列化を行うか否かという利用者の意図」と、「実際に並列スレッドを実行するプラットフォーム機能」を明確に分離している。
+
+- **`ExecutionPolicy`**: リソースの割り当て意図を表す列挙型。
+  - `Sequential`: 完全な逐次実行を強制する。
+  - `Auto`: 演算ごとの規模の閾値と計算量の見積もり、エグゼキューターが要求する 1 ワーカーあたりの最小計算量から決定する（既定値）。
+    `ThreadExecutor` では最小計算量が 32,768 単位であり、これに満たない小さな計算はスレッドを使わずに実行する。
+  - `Parallel(NonZeroUsize)`: 指定された上限ワーカー数（正の整数）で並列実行する。
+- **`ExecutionContext`**: エグゼキューター（`Executor`）、キャンセル通知、任意の単調クロック（`ClockBinding`）、任意のエントロピー源、プロセッサ機能の方針（`ProcessorCapabilities`）を借用してまとめた実行コンテキスト。
+
+グローバルな環境変数や静的変数に依存せず、必要な機能を実行コンテキスト経由で明示的に注入するため、`no_std` 環境、組み込みシステム、およびテスト環境における決定論的テストが容易となる。
+
+---
+
+## 浮動小数点の非結合性と再現性の 3 段階
+
+実数の加算においては結合法則 $(a + b) + c = a + (b + c)$ が成立するが、浮動小数点演算においては中間丸め誤差の混入により、この等式は一般に成立しない。
+
+### 集約順序による丸め差の対話型実験
+
+大項 $L = 10^{16}$ と小項 $s = 1$ を含む式 $L + s - L$ を考える。
+実数体上ではどのような順序で加算しても厳密に $s = 1$ となるが、浮動小数点演算では中間加算の順序によって計算結果が完全に乖離する。
+
+```rust
+//| id: concept-reduction-order
+//| title: 大項・小項の尺度を動かして総和順序による差を見る（素朴浮動小数点と checked_sum 厳密和）
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   large_exponent: {"type":"range","label":"大項の指数 a（L=10ᵃ）","description":"小項を吸収する巨大な尺度。","min":10,"max":18,"step":1,"value":16}
+//|   small_exponent: {"type":"range","label":"小項の指数 b（s=10ᵇ）","description":"保持したい微小な真値。","min":-2,"max":4,"step":1,"value":0}
+use scioxide_core::checked_sum;
+
+let large = 10.0_f64.powf(large_exponent);
+let small = 10.0_f64.powf(small_exponent);
+// 素朴な加算を対照に、同じ3項の順序を比較する。
+#[allow(clippy::eq_op)]
+let values = vec![
+    (large + small) - large,
+    (large - large) + small,
+    (small + large) - large,
+    (small - large) + large,
+    (-large + large) + small,
+    (-large + small) + large,
+];
+let labels = vec![
+    "(L+s)−L",
+    "(L−L)+s",
+    "(s+L)−L",
+    "(s−L)+L",
+    "(−L+L)+s",
+    "(−L+s)+L",
+];
+let exact = checked_sum(&[large, small, -large]).map_err(|e| e.to_string())?;
+emit_bar_chart!(
+    &labels,
+    &values,
+    options = &serde_json::json!({"xLabel": "加算順序", "yLabel": "総和 [-]", "style": {"animation": false},
+"annotations": [{"kind": "line", "axis": "y", "value": exact, "label": "厳密な和 s"}]})
+);
+let rows: Vec<_> = labels
+    .iter()
+    .zip(&values)
+    .map(|(&label, &value)| (label, value, exact, (value - exact).abs()))
+    .collect();
+emit_table_with_columns!(
+    serde_json::json!([
+    {"key":"0","label":"加算順序","type":"string","nullText":"未定義"},
+    {"key":"1","label":"素朴な和","type":"number","format":{"significantDigits":6},"nullText":"未定義"},
+    {"key":"2","label":"厳密累積後の丸め値","type":"number","format":{"significantDigits":6},"nullText":"未定義"},
+    {"key":"3","label":"絶対差","type":"number","format":{"significantDigits":6},"nullText":"未定義"}
+    ]),
+    rows
+);
+
+// 並列実行はせず、チャンクに分けたときの加算順序だけを再現する。
+let terms = [large, small, -large, small, large, -large, small, small];
+let reference = checked_sum(&terms).map_err(|e| e.to_string())?;
+let mut rows = Vec::new();
+for count in [1, 2, 4, 8] {
+    let parts: Vec<_> = terms
+        .chunks(8 / count)
+        .map(|part| part.iter().fold(0.0, |s, &v| s + v))
+        .collect();
+    let value = parts.iter().fold(0.0, |s, &v| s + v);
+    rows.push((count, value, reference, (value - reference).abs()));
+}
+emit_table_with_columns!(
+    serde_json::json!([
+    {"key":"0","label":"分割数","type":"number","format":{"significantDigits":6},"nullText":"未定義"},
+    {"key":"1","label":"素朴な分割和","type":"number","format":{"significantDigits":6},"nullText":"未定義"},
+    {"key":"2","label":"厳密累積後の丸め値","type":"number","format":{"significantDigits":6},"nullText":"未定義"},
+    {"key":"3","label":"絶対差","type":"number","format":{"significantDigits":6},"nullText":"未定義"}
+    ]),
+    rows
+);
+```
+
+既定値 $L=10^{16}$、$s=1$ では、先に $L-L$ を計算すると1が得られ、先に $L+s$ を計算すると小項が失われて0になる。
+尺度を変えると、小項が一部だけ丸められる場合や、どの順序でも一致する場合もある。
+表の絶対差と棒グラフを併せて確認する。
+分割和の表は、ブラウザでスレッドを動かした結果ではなく、分割による加算順序の違いを逐次計算で再現したものである。
+
+### 再現性の 3 段階と SciOxide における根拠
+
+科学技術計算の目的に応じ、以下のどの段階の再現性を要求しているかを明確に規定する。
+
+1. **ビット再現（Bit-level Reproducibility）**: 同一入力に対して出力ビット列が一致する状態。
+   ビット単位の再現を検査する場合は、演算環境と各 API が保証する範囲をそろえる。
+   - **分割順線形併合**: `scioxide-core` の `ExecutionPlan::reduce` は、スレッド完了順（非決定論的）ではなく、Plan で定めた分割の順序で決定論的に結合する。
+     同じ入力・分割・処理・演算環境であれば、完了順の違いによる結果の揺れを避けられる。
+   - **ワーカー数に依存しないビット再現**: `scioxide_core::Accuracy` は密・疎行列に共通の方針で、標準精度（`Accuracy::Standard`）の結果は、オプションと命令セットのバックエンド（ネイティブの SIMD 経路か可搬なスカラー経路か）を固定すれば、並列ワーカー数によらずビット単位で一致する。
+     バックエンドが変わると、仕様が定める誤差限界の範囲で丸めが異なりうる。
+   - **ハードウェアアーキテクチャを超えるビット再現**: `RangeAccumulator` による厳密累積、および `Accuracy::Exact` による積和演算は、単一の最終丸めのみを行うため、対応する演算環境で、同じ入力値に対して同じ丸め結果を得られる。
+     前段で入力値を作る計算まで再現するという主張ではない。
+2. **数値再現（Numerical Reproducibility）**: 指定された許容誤差（$\gamma_k$ 限界や `Tolerance`）の範囲内において解が一致する状態。
+   異なるスレッド数やハードウェアでも、その許容範囲に収まることを確認する。
+3. **科学的再現（Scientific Reproducibility）**: 異なる離散化手法（差分法・有限要素法など）や独立なアルゴリズムを用いても、物理的な結論や統計的不確実性の評価が一致する状態。
+
+---
+
+## まとめと次のステップ
+
+準備を再利用するには、入力の形状と必要容量が引き続き合っていることを確認する。
+容量が足りることと、結果が再現することは別の仕様である。
+再現性を比較するときは、入力、ワーカー数、精度設定、演算環境のどれを変えたかを明確にする。
+次は、複数の計算をつないだときの誤差と計算回数の上限の扱いに進む。
+
+- 次の共通概念: [クレート接続と複合誤差伝播](../composition/)
+- 実行 Plan と分割アルゴリズムの仕様: [`scioxide-core` 実行方針・分割・実行コンテキスト](../../scioxide-core/algorithms/execution-and-partitions/)
+- 線形代数における作業領域と精度の保証: [`scioxide-linalg` 密行列と実行設定](../../scioxide-linalg/api/dense-and-execution/)

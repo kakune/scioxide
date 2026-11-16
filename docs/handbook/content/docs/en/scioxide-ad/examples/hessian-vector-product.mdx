@@ -1,0 +1,707 @@
+---
+title: "Hessians and Hessian–vector products"
+description: "Find the equilibrium of a hardening spring chain on an elastic foundation with Newton–CG by passing HessianOperator to scioxide-linalg's CgSolver, and compare the Hessian–vector products from hvp, hvp_into, HessianOperator, and hessian at equilibrium with a closed form and scioxide-differentiate's central differences."
+sidebar:
+  order: 415
+references:
+  ad-hvp-forward-over-reverse: "forward-over-reverse-hvps"
+  ad-hvp-newton-cg: "newtoncg"
+  ad-hvp-equilibrium-check: "comparing-hvps-at-equilibrium"
+---
+
+At each iteration, Newton's method solves the linear equation $\mathbf{H}\mathbf{p} = -\nabla f$ with the Hessian $\mathbf{H}$ as its coefficient matrix.
+With $n$ unknowns, $\mathbf{H}$ has $n^2$ entries, and forming it densely by automatic differentiation requires about $n$ times the computation of a gradient.
+Krylov subspace methods such as conjugate gradients (CG) solve this equation using only products $\mathbf{H}\mathbf{v}$ of $\mathbf{H}$ with a vector (Hessian–vector products, HVPs).
+Automatic differentiation returns an HVP at a small constant multiple of the computational cost of a gradient, without truncation error.
+
+This example finds the equilibrium of a chain of point masses connected by hardening springs with Newton–CG, passing `HessianOperator` to scioxide-linalg's `CgSolver`.
+It then compares four HVP implementations, `hvp`, `Tape<Dual<f64>>::hvp_into`, `HessianOperator`, and `hessian`, with a closed form at equilibrium, and shows how the error of scioxide-differentiate's central differences changes with step size.
+
+## A hardening spring chain on an elastic foundation
+
+Arrange $n$ point masses along a straight line between two fixed walls, and connect neighboring masses and the end walls with hardening springs.
+For a spring extension $s$ [m], the restoring force is $\sigma(s) = k s + \alpha s^3$ [kN], where $k$ [kN/m] is the linear spring constant and $\alpha$ [kN/m³] is the hardening coefficient.
+Each mass is also connected to the ground by a linear spring $g$ [kN/m] (the elastic foundation) and receives the same force $F$ [kN] in the loading direction.
+Let $x_j$ [m] denote the displacement of mass $j$ ($j = 0, \dots, n-1$), and $s_i = x_i - x_{i-1}$ ($x_{-1} = x_n = 0$) the extension of spring $i$ ($i = 0, \dots, n$); the total potential energy is
+
+$$
+\Pi(\mathbf{x}) = \sum_{i=0}^{n} \left( \frac{k}{2} s_i^2 + \frac{\alpha}{4} s_i^4 \right) + \frac{g}{2} \sum_{j=0}^{n-1} x_j^2 - F \sum_{j=0}^{n-1} x_j \quad [\mathrm{kJ}]
+$$
+
+
+This example fixes $k = 1$ kN/m and $\alpha = 1$ kN/m³.
+For a spring stretched beyond the length scale $\sqrt{k/\alpha} = 1$ m, the cubic term exceeds the linear term.
+
+The equilibrium condition $\nabla\Pi = \mathbf{0}$ expresses force balance at mass $j$:
+
+$$
+\frac{\partial \Pi}{\partial x_j} = \sigma(s_j) - \sigma(s_{j+1}) + g\,x_j - F = 0
+$$
+
+
+Using the tangent stiffness $c_i = \sigma'(s_i) = k + 3\alpha s_i^2$ of each spring, the Hessian is
+
+$$
+\mathbf{H} = \mathbf{D}^\mathsf{T}\mathbf{C}\,\mathbf{D} + g\,\mathbf{I}, \qquad
+(\mathbf{H}\mathbf{v})_j = c_j\,(v_j - v_{j-1}) - c_{j+1}\,(v_{j+1} - v_j) + g\,v_j
+$$
+
+where $v_{-1} = v_n = 0$.
+Here $\mathbf{D}$ is the $(n+1) \times n$ difference matrix that produces the extensions, $\mathbf{C} = \operatorname{diag}(c_0, \dots, c_n)$, and $\mathbf{H}$ is tridiagonal.
+Since $c_i \ge k > 0$, $\mathbf{H}$ is positive definite at every displacement even when $g = 0$, so $\Pi$ is strictly convex and the equilibrium is unique.
+The problem is invariant under the exchange $j \leftrightarrow n - 1 - j$, so the equilibrium displacements are symmetric about the center.
+
+The eigenvalues of $\mathbf{D}^\mathsf{T}\mathbf{D}$ are $4\sin^2(m\pi/(2(n+1)))$ ($m = 1, \dots, n$), so the eigenvalues of $\mathbf{H}$ lie in the interval $[\,g + 4c_{\min}\sin^2(\pi/(2(n+1))),\ g + 4c_{\max}\,]$.
+When $g = 0$, the upper bound on the condition number $\kappa(\mathbf{H})$ grows in proportion to $(n+1)^2$; when $g > 0$, it is bounded by $1 + 4c_{\max}/g$ independently of $n$.
+
+The following block defines the model shared by the two cells.
+`Chain` holds the coefficients $k$, $\alpha$, $g$, and $F$, and `energy` is the generic function corresponding to $\Pi$.
+`imbalance` is the closed form of $\nabla\Pi$ and `stiffness_times` is the closed form of $\mathbf{H}\mathbf{v}$; both provide independent checks.
+
+```rust
+//| id: ad-chain-model
+//| kind: definitions
+//| title: "A hardening spring chain on an elastic foundation"
+//| crates: [scioxide-ad]
+use scioxide_ad::Real;
+
+/// Spring-chain coefficients: linear spring constant k [kN/m], hardening coefficient α [kN/m³], foundation spring g [kN/m], and load F [kN].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Chain {
+    pub(crate) stiffness: f64,
+    pub(crate) hardening: f64,
+    pub(crate) foundation: f64,
+    pub(crate) load: f64,
+}
+
+/// Total potential Π(x) = Σᵢ (k sᵢ²/2 + α sᵢ⁴/4) + g Σⱼ xⱼ²/2 − F Σⱼ xⱼ [kJ] (sᵢ = xᵢ − xᵢ₋₁, with walls at both ends).
+pub(crate) fn energy<R: Real>(x: &[R], c: &Chain) -> R {
+    let mut total = R::zero();
+    let mut previous = R::zero();
+    for i in 0..=x.len() {
+        let current = if i < x.len() { x[i] } else { R::zero() };
+        let s = current - previous;
+        total += s * s * (0.5 * c.stiffness) + s.powi(4) * (0.25 * c.hardening);
+        previous = current;
+    }
+    for &xj in x {
+        total += xj * xj * (0.5 * c.foundation) - xj * c.load;
+    }
+    total
+}
+
+/// Extensions sᵢ (i = 0, …, n).
+fn stretches(x: &[f64]) -> Vec<f64> {
+    (0..=x.len())
+        .map(|i| {
+            let current = if i < x.len() { x[i] } else { 0.0 };
+            let previous = if i > 0 { x[i - 1] } else { 0.0 };
+            current - previous
+        })
+        .collect()
+}
+
+/// Closed-form force imbalance ∇Π: σ(sⱼ) − σ(sⱼ₊₁) + g xⱼ − F, σ(s) = k s + α s³.
+pub(crate) fn imbalance(x: &[f64], c: &Chain) -> Vec<f64> {
+    let s = stretches(x);
+    let force = |s: f64| c.stiffness * s + c.hardening * s * s * s;
+    (0..x.len())
+        .map(|j| force(s[j]) - force(s[j + 1]) + c.foundation * x[j] - c.load)
+        .collect()
+}
+
+/// Closed-form H v: cⱼ (vⱼ − vⱼ₋₁) − cⱼ₊₁ (vⱼ₊₁ − vⱼ) + g vⱼ, cᵢ = k + 3α sᵢ².
+pub(crate) fn stiffness_times(x: &[f64], c: &Chain, v: &[f64]) -> Vec<f64> {
+    let s = stretches(x);
+    let tangent = |s: f64| c.stiffness + 3.0 * c.hardening * s * s;
+    let dv = stretches(v);
+    (0..x.len())
+        .map(|j| tangent(s[j]) * dv[j] - tangent(s[j + 1]) * dv[j + 1] + c.foundation * v[j])
+        .collect()
+}
+```
+
+## Forward-over-reverse HVPs
+
+Record $\Pi$ on the tape with inputs at $\mathbf{x}$ represented by the dual numbers $x_i + v_i\,\varepsilon$, then run a reverse sweep with output adjoint 1; the input adjoints become
+
+$$
+\bar{\mathbf{x}} = \nabla\Pi(\mathbf{x} + \varepsilon\mathbf{v}) = \nabla\Pi(\mathbf{x}) + \varepsilon\,\mathbf{H}(\mathbf{x})\,\mathbf{v}
+$$
+
+where $\varepsilon^2 = 0$.
+The value part is the gradient and the coefficient of $\varepsilon$ is the HVP, so one recording and one reverse sweep obtain both.
+This is called forward-over-reverse because forward mode (dual numbers) is layered over reverse mode (the tape).
+The computational cost is a small constant multiple of a gradient, and memory use exceeds that of an `f64` tape because the tape's value and partial-derivative arrays contain dual numbers.
+There is no finite-difference truncation error; only rounding error from each operation remains.
+
+`hvp(function, point, direction)` is a one-shot call for this computation: it creates a new tape `Tape<Dual<f64>>` and returns the HVP as a `scioxide_linalg::Vector`.
+Because the new tape is empty, every call executes the function twice: first to count statements, then to record after expanding the tape.
+To differentiate the same function repeatedly, call `hvp_into(function, point, direction, product, cx)` on a tape created with `Tape::<Dual<f64>>::new(TapeOptions::new())`.
+`hvp_into` returns the value of $\Pi$ and writes the HVP to `product`; it returns `DimensionMismatch` if the length of `direction` or `product` differs from `point`.
+The recording rules and errors are the same as for `gradient_into`, and failure leaves `product` unchanged.
+Write the argument type of a closure passed to `Tape<Dual<f64>>` as `|z: &[Var<'_, Dual<f64>>]|`.
+
+`hessian_operator(function, point, cx)` returns $\mathbf{H}$ at `point` as a scioxide-core `LinearOperator` (`HessianOperator`).
+`apply_into(v, out, workspace)` records the function seeded with direction $\mathbf{v}$ and performs one reverse sweep.
+The workspace length `apply_workspace_len()` is 0; pass an empty slice.
+The operator mutably borrows the tape and, at construction, records once with direction 0 to determine the tape capacity (an empty tape executes the function twice).
+Each subsequent application records the function once and allocates no memory.
+NaN or infinity in the input or result produces `NonFinite`.
+The dense `hessian(function, point)` records once per unit direction, requiring $n$ recordings (the new tape executes the function $n + 1$ times).
+[Second derivatives and Hessian operators](../../algorithms/second-order-derivatives/) covers second-derivative rules, and [Structural patterns and sparse derivative recovery](../../algorithms/sparse-derivatives/) covers sparse Hessians.
+
+## Newton–CG
+
+At the current point $\mathbf{x}_k$, Newton's method solves $\mathbf{H}(\mathbf{x}_k)\,\mathbf{p}_k = -\nabla\Pi(\mathbf{x}_k)$ and advances by $\mathbf{x}_{k+1} = \mathbf{x}_k + \mathbf{p}_k$.
+Near the solution, the error decreases approximately by squaring at each step (quadratic convergence).
+
+CG solves a symmetric positive definite equation $\mathbf{A}\mathbf{p} = \mathbf{b}$ using one product of $\mathbf{A}$ with a vector per iteration.
+After $k$ iterations, the $\mathbf{A}$-norm of the error is at most $2\bigl((\sqrt{\kappa} - 1)/(\sqrt{\kappa} + 1)\bigr)^k$ times its initial value; without rounding error, CG reaches the exact solution within $n$ iterations.
+Stopping CG when the residual falls to $\eta\,\lVert\nabla\Pi\rVert_2$ or below gives an inexact Newton method.
+With constant $\eta$, convergence is linear and the contraction factor per step is approximately at most $\eta$; decreasing $\eta$ approaches Newton's quadratic convergence (Dembo, Eisenstat and Steihaug, *SIAM J. Numer. Anal.* 19(2), 1982).
+
+scioxide-linalg's `CgSolver::new(tolerance, max_iterations)` stops with `Converged` when the true residual satisfies $\lVert\mathbf{b} - \mathbf{A}\mathbf{x}\rVert_2 \le \mathrm{atol} + \mathrm{rtol}\,\lVert\mathbf{b}\rVert_2$.
+Specify the tolerance with `ResidualTolerance::new(atol, rtol)` and the iteration limit with `Budget`.
+Create a workspace from `IterativeWorkspaceRequest::operator(&operator)` with `solver.workspace(&request)`, then solve with `solve_into(&operator, &b, Preconditioning::None, x.view_mut(), &mut workspace, cx)`.
+Since `solve_into` accepts `&dyn LinearOperator<f64>`, `HessianOperator` can be passed directly.
+CG computes the initial residual $\mathbf{b} - \mathbf{A}\mathbf{x}_0$ with the operator and replaces its recursively updated residual with the true residual every 50 iterations and before accepting convergence.
+Operator evaluations therefore exceed the iteration count by at least two.
+Reaching the limit stops with `IterationLimit`.
+If the true residual verified at a checkpoint neither meets the tolerance nor improves the best residual, and that best residual is at or below the rounding-error level $16\varepsilon(\lVert\mathbf{b}\rVert_2 + \lVert\mathbf{A}(\mathbf{s}\circ\mathbf{x})\rVert_2)$, CG stops with `Stagnation`.
+Here $\mathbf{x}$ is the verified iterate with the smallest true residual, $\mathbf{s}$ is a fixed sign sequence with entries $\pm 1$, and $\lVert\mathbf{A}(\mathbf{s}\circ\mathbf{x})\rVert_2 \le \lVert\mathbf{A}\rVert_2\lVert\mathbf{x}\rVert_2$.
+Both return the verified iterate with the smallest true residual.
+A direction with $\mathbf{p}^\mathsf{T}\mathbf{A}\mathbf{p} \le 0$ stops CG with `Breakdown(NonPositiveCurvature)`; this does not occur here because $\mathbf{H}$ is positive definite.
+Read the termination status from `report.termination()` (`LinearSolveTermination`) and success from `report.is_success()`.
+
+The following cell selects the number of masses $n$ (4–200), load $F$ (0.01–1 kN), foundation spring $g$ (0–1 kN/m), and CG relative tolerance $\eta$ ($10^{-12}$–$10^{-1}$), then finds equilibrium with Newton–CG starting from $\mathbf{x}_0 = \mathbf{0}$.
+It computes the gradient with `Tape<f64>::gradient_into` and the Newton direction with a `HessianOperator` rebuilt at each iteration and `CgSolver` ($\mathrm{atol} = 0$, $\mathrm{rtol} = \eta$, and at most $4n + 50$ iterations), without a line search.
+It stops at $\lVert\nabla\Pi\rVert_2 \le 10^{-10} F\sqrt{n}$ ($10^{-10}$ times the magnitude of the external-force vector), with a limit of 40 iterations.
+The first graph plots $\lVert\nabla\Pi\rVert_2$ at each iteration on a logarithmic axis, and the second plots the equilibrium displacements.
+The first table shows each iteration's CG iteration count, the number of executions of $\Pi$ during that Newton iteration, and the CG termination status.
+The second table shows the Newton iteration count, total function executions, closed-form $\lVert\nabla\Pi\rVert_2$, departure from symmetry, and maximum displacement.
+The outcome is satisfied when every CG solve converges and the stopping criterion is met, partial when an intermediate CG solve stops before meeting the tolerance or Newton reaches its iteration limit, and failed when CG breaks down.
+The checks verify that the closed-form force imbalance is small and the displacements are symmetric about the center.
+This cell passes the equilibrium displacements and coefficients to the next cell.
+
+```rust
+//| id: ad-chain-newton-cg
+//| ref: ad-chain-newton-cg
+//| title: "Equilibrium with Newton–CG using only HVPs"
+//| run: reactive
+//| uses: [ad-chain-model]
+//| crates: [scioxide-ad, scioxide-core, scioxide-linalg]
+//| exports: [displacement, stiffness, hardening, foundation, load]
+//| inputs:
+//|   masses: {"type":"range","label":"Number of masses n","description":"Number of unknowns.","min":4,"max":200,"step":1,"value":50}
+//|   load: {"type":"range","label":"Load F [kN]","description":"The same force applied to every mass in the same direction.","min":0.01,"max":1,"step":0.01,"value":0.2}
+//|   foundation: {"type":"range","label":"Foundation spring g [kN/m]","description":"Linear spring connecting each mass to the ground.","min":0,"max":1,"step":0.01,"value":0}
+//|   forcing_exponent: {"type":"range","label":"CG relative-tolerance exponent p (η = 10^p)","description":"CG stopping criterion for the Newton direction.","min":-12,"max":-1,"step":1,"value":-10}
+//| cases:
+//|   - {"id":"foundation-long","label":"n = 200, g = 0.5 kN/m","description":"The foundation springs bound the condition number independently of n, so the CG iteration count does not grow in proportion to n.","inputs":{"masses":200,"foundation":0.5}}
+//|   - {"id":"loose-forcing","label":"η = 0.1","description":"Stopping CG early gives linear Newton convergence and increases the Newton iteration count.","inputs":{"forcing_exponent":-1}}
+//|   - {"id":"strict-tolerance","label":"n = 200, F = 1 kN, η = 10⁻¹²","description":"The condition number is about 10⁶, and η is below the residual reachable under rounding error, so some intermediate CG solves stop with Stagnation.","inputs":{"masses":200,"load":1,"forcing_exponent":-12}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":8}
+//|       - {"artifact":"summary","path":"/rows/0/2","range":{"max":1e-12}}
+//|       - {"artifact":"summary","path":"/rows/0/3","range":{"max":1e-12}}
+//|       - {"artifact":"summary","path":"/rows/0/4","approx":{"value":26.2952472469,"rtol":1e-9}}
+//|       - {"artifact":"steps","path":"/rows/1/1","approx":{"value":47.413085,"rtol":1e-6}}
+//|       - {"path":"/outputs/4/state","equals":"satisfied"}
+//|   - case: foundation-long
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":3}
+//|       - {"artifact":"summary","path":"/rows/0/2","range":{"max":1e-10}}
+//|       - {"artifact":"steps","path":"/rows/0/2","range":{"max":40}}
+//|       - {"path":"/outputs/4/state","equals":"satisfied"}
+//|   - case: loose-forcing
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","range":{"min":10,"max":16}}
+//|       - {"artifact":"summary","path":"/rows/0/2","range":{"max":1e-10}}
+//|       - {"path":"/outputs/4/state","equals":"satisfied"}
+//|   - case: strict-tolerance
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/2","range":{"max":1e-9}}
+//|       - {"artifact":"summary","path":"/rows/0/3","range":{"max":1e-11}}
+//|       - {"path":"/outputs/4/state","equals":"partial"}
+use std::cell::Cell;
+
+use scioxide_ad::{Dual, Tape, TapeOptions, Var};
+use scioxide_core::{Budget, ExecutionContext, RealScalar, ResidualTolerance};
+use scioxide_linalg::{
+    CgSolver, IterativeWorkspaceRequest, LinearSolveTermination, Preconditioning, Vector,
+};
+
+let n = masses as usize;
+let chain = Chain {
+    stiffness: 1.0,
+    hardening: 1.0,
+    foundation,
+    load,
+};
+let eta = RealScalar::powf(10.0_f64, forcing_exponent);
+let cx = ExecutionContext::sequential();
+// records counts executions of Π passed to HessianOperator.
+let records = Cell::new(0_usize);
+let norm = |v: &[f64]| RealScalar::sqrt(v.iter().map(|g| g * g).sum::<f64>());
+// Stopping criterion: 10⁻¹⁰ times the external-force magnitude ‖F 1‖₂ = F √n.
+let target = 1e-10 * load * RealScalar::sqrt(n as f64);
+let name = |t: LinearSolveTermination| match t {
+    LinearSolveTermination::Converged => "Converged",
+    LinearSolveTermination::LeastSquaresConverged => "LeastSquaresConverged",
+    LinearSolveTermination::ConditionLimit => "ConditionLimit",
+    LinearSolveTermination::IterationLimit => "IterationLimit",
+    LinearSolveTermination::EvaluationLimit => "EvaluationLimit",
+    LinearSolveTermination::Stagnation => "Stagnation",
+    LinearSolveTermination::Breakdown(_) => "Breakdown",
+    LinearSolveTermination::ExecutionStopped(_) => "ExecutionStopped",
+};
+
+let mut x = vec![0.0; n];
+let mut gradient = vec![0.0; n];
+let mut gradient_tape = Tape::<f64>::new(TapeOptions::new());
+let mut hessian_tape = Tape::<Dual<f64>>::new(TapeOptions::new());
+let mut history = Vec::new();
+let mut steps = Vec::new();
+let mut all_success = true;
+let mut broke_down = false;
+let mut first_stop = None;
+let mut last = LinearSolveTermination::Converged;
+let mut converged = false;
+for newton in 0..=40 {
+    gradient_tape
+        .gradient_into(|z| Ok(energy(z, &chain)), &x, &mut gradient, cx)
+        .map_err(|e| e.to_string())?;
+    let size = norm(&gradient);
+    history.push([newton as f64, size]);
+    if size <= target {
+        converged = true;
+        break;
+    }
+    // Solve H p = −∇Π with CG. Use H only through the HessianOperator action (HVP).
+    let before = records.get();
+    let operator = hessian_tape
+        .hessian_operator(
+            |z: &[Var<'_, Dual<f64>>]| {
+                records.set(records.get() + 1);
+                Ok(energy(z, &chain))
+            },
+            &x,
+            cx,
+        )
+        .map_err(|e| e.to_string())?;
+    let solver = CgSolver::new(
+        ResidualTolerance::new(0.0, eta).map_err(|e| e.to_string())?,
+        Budget::try_from(4 * n + 50).map_err(|e| e.to_string())?,
+    );
+    let request = IterativeWorkspaceRequest::operator(&operator).map_err(|e| e.to_string())?;
+    let mut workspace = solver.workspace(&request).map_err(|e| e.to_string())?;
+    let rhs = Vector::from_vec(gradient.iter().map(|g| -g).collect());
+    let mut step = Vector::zeros(n).map_err(|e| e.to_string())?;
+    let report = solver
+        .solve_into(
+            &operator,
+            &rhs,
+            Preconditioning::None,
+            step.view_mut(),
+            &mut workspace,
+            cx,
+        )
+        .map_err(|e| e.to_string())?;
+    drop(operator);
+    last = report.termination();
+    all_success &= report.is_success();
+    broke_down |= matches!(last, LinearSolveTermination::Breakdown(_));
+    if !report.is_success() && first_stop.is_none() {
+        first_stop = Some(last);
+    }
+    steps.push((
+        newton,
+        size,
+        report.iterations(),
+        records.get() - before,
+        name(last),
+    ));
+    for (xi, pi) in x.iter_mut().zip(step.as_slice()) {
+        *xi += pi;
+    }
+}
+
+// Independent checks: closed-form force imbalance and symmetry xⱼ = xₙ₋₁₋ⱼ.
+let residual = norm(&imbalance(&x, &chain));
+let asymmetry = (0..n).fold(0.0_f64, |m, j| m.max((x[j] - x[n - 1 - j]).abs()));
+let largest = x.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+emit_line_chart!(
+    &vec![serde_json::json!({ "name": "‖∇Π‖₂（gradient_into）", "points": history })],
+    options = &serde_json::json!({
+        "xLabel": "Newton iteration k [count]",
+        "yLabel": "Force imbalance ‖∇Π‖₂ [kN]",
+        "yType": "log",
+        "annotations": [
+            { "kind": "line", "axis": "y", "value": target, "label": "Stopping criterion" }
+        ]
+    })
+);
+let profile: Vec<[f64; 2]> = x.iter().enumerate().map(|(j, &v)| [j as f64, v]).collect();
+emit_line_chart!(
+    &vec![serde_json::json!({ "name": "Equilibrium displacements", "points": profile })],
+    options = &serde_json::json!({
+        "xLabel": "Mass index j [-]",
+        "yLabel": "Displacement xⱼ [m]"
+    })
+);
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let step_columns = serde_json::json!([
+    { "key": "0", "label": "Newton iteration k", "type": "integer" },
+    { "key": "1", "label": "‖∇Π‖₂ [kN]", "type": "number", "format": sci3 },
+    { "key": "2", "label": "CG iterations [count]", "type": "integer" },
+    { "key": "3", "label": "Function executions [count]", "type": "integer" },
+    { "key": "4", "label": "CG termination status" }
+]);
+emit_table_with_columns!(
+    step_columns,
+    steps,
+    metadata = serde_json::json!({ "id": "steps" })
+);
+let summary_columns = serde_json::json!([
+    { "key": "0", "label": "Newton iterations [count]", "type": "integer" },
+    { "key": "1", "label": "Total function executions [count]", "type": "integer" },
+    { "key": "2", "label": "Closed-form ‖∇Π‖₂ [kN]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "Asymmetry max|xⱼ − xₙ₋₁₋ⱼ| [m]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "Maximum displacement [m]", "type": "number", "format": { "significantDigits": 6 } }
+]);
+emit_table_with_columns!(
+    summary_columns,
+    vec![(
+        history.len() - 1,
+        records.get(),
+        residual,
+        asymmetry,
+        largest
+    )],
+    metadata = serde_json::json!({ "id": "summary" })
+);
+export!(displacement, &x);
+export!(stiffness, chain.stiffness);
+export!(hardening, chain.hardening);
+export!(foundation, chain.foundation);
+export!(load, chain.load);
+
+let outcome = if broke_down {
+    Outcome::failed("CG broke down and no Newton direction was obtained")
+} else if converged && all_success {
+    Outcome::satisfied("The force imbalance fell below the stopping criterion and every CG solve converged")
+} else if converged {
+    Outcome::partial("Equilibrium was reached, but an intermediate CG solve stopped before meeting the tolerance")
+        .explanation("The stopped CG solve returned its best verified iterate as the Newton direction.")
+} else {
+    Outcome::partial("Stopped at the Newton iteration limit")
+        .explanation("Treat the last displacement as an estimate and reconsider the load or tolerance.")
+};
+emit_outcome!(
+    outcome
+        .status(name(first_stop.unwrap_or(last)))
+        .diagnostic("Newton iterations", (history.len() - 1) as f64, None)
+        .diagnostic("Function executions", records.get() as f64, None)
+        .diagnostic("Closed-form ‖∇Π‖₂", residual, Some("kN"))
+);
+```
+
+At the defaults ($n = 50$, $F = 0.2$ kN, $g = 0$, $\eta = 10^{-10}$), 8 Newton iterations meet the stopping criterion and the outcome is satisfied.
+The first Newton direction uses only the linear-spring stiffness at $\mathbf{x} = \mathbf{0}$ and ignores hardening, so it overshoots substantially: $\lVert\nabla\Pi\rVert_2$ increases from 1.41 kN to 47.4 kN.
+Subsequent steps return with the hardened stiffness, decreasing through $13.8 \to 3.86 \to 0.899 \to 0.109 \to 2.04 \times 10^{-3} \to 6.05 \times 10^{-7} \to 6.6 \times 10^{-14}$ kN; the last three exhibit quadratic convergence, with the magnitude of the negative exponent approximately doubling each time.
+Recomputing the force imbalance in closed form gives $6.6 \times 10^{-14}$ kN, the departure from symmetry is $3.6 \times 10^{-15}$ m, and the maximum displacement is 26.30 m at the chain's center.
+CG takes 25–52 iterations per Newton iteration, and $\Pi$ is executed 308 times in total.
+Function executions per Newton iteration exceed the CG iteration count by 3–4.
+Most iterations add three: one when constructing the operator, and two for CG's initial residual and true residual before accepting convergence.
+The first Newton iteration ($k = 0$), which starts with an empty tape, adds one execution to count statements; $k = 7$, where CG exceeds 50 iterations, adds one true-residual evaluation at iteration 50.
+Forming a dense Hessian each time would require 50 recordings per iteration and 400 over eight iterations, so for this problem with $g = 0$, the HVP count is comparable to forming dense matrices.
+
+With $n = 200$ and $g = 0.5$ kN/m, the condition number is bounded at about $1 + 4c_{\max}/g$, and CG takes 32–33 iterations, almost the same as with $n = 50$.
+The central displacement is $F/g = 0.4$ m and nonlinearity is weak, giving 3 Newton iterations and 108 total function executions, whereas forming one dense Hessian requires 200 recordings.
+With $\eta = 0.1$, each Newton direction is less accurate and convergence becomes linear.
+From $k = 6$ onward, $\lVert\nabla\Pi\rVert_2$ decreases by a factor of 10–17 per iteration, and the Newton iteration count increases to 13.
+In this ill-conditioned problem, even reducing the residual tenfold requires 9–39 CG iterations, so total function executions instead increase to 413.
+
+With $n = 200$, $F = 1$ kN, and $\eta = 10^{-12}$, the maximum displacement is about 340 m, and the tangent stiffness of springs near the walls is about 64 times that at the center.
+The condition-number upper bound estimated from the eigenvalue interval is about $10^6$.
+Since $\lVert\mathbf{H}\rVert\,\lVert\mathbf{p}\rVert_2 \le \kappa\lVert\mathbf{b}\rVert_2$ when $\mathbf{p} = \mathbf{H}^{-1}\mathbf{b}$, the rounding-error level used to detect `Stagnation` can reach $16\varepsilon(1 + \kappa)$ in relative residual, or about $3.6 \times 10^{-9}$ when $\kappa = 10^6$, more than three orders of magnitude above $\eta = 10^{-12}$.
+Once CG reaches this level, it stops if the recursive residual meets the tolerance while the true residual does not, or if the true residual fails to improve the best value.
+CG stopped with `Stagnation` in 3 of the 13 Newton iterations ($k = 3, 6, 9$).
+This count is sensitive to rounding in arithmetic and can vary across execution environments.
+Newton's method proceeds with the best verified iterate returned by CG at `Stagnation` and meets the stopping criterion in 13 iterations; the closed-form imbalance also reaches $9.9 \times 10^{-12}$ kN.
+Since not every CG solve converged, the outcome is nevertheless partial (status `Stagnation`).
+
+## Comparing HVPs at equilibrium
+
+The following cell receives the equilibrium displacements and coefficients from the previous cell, then computes the product of the tangent stiffness $\mathbf{H}$ at that point with a direction $\mathbf{v}$ in five ways.
+Choose the direction from the linear spring chain's lowest eigenmode $v_j = \sin(\pi(j+1)/(n+1))$ (a smooth hump), highest mode $v_j = \sin(n\pi(j+1)/(n+1))$ (a zigzag), or the unit vector for the central mass alone.
+All satisfy $\lVert\mathbf{v}\rVert_\infty \le 1$.
+
+The four automatic-differentiation methods are a one-shot `hvp` call, a second `hvp_into` call on the same tape, `HessianOperator::apply_into`, and a dense `hessian` followed by a matrix–vector product with `gemv_into`.
+The fifth is an independent check: centrally difference the gradient (`Tape<f64>::gradient_into`) with scioxide-differentiate's `FiniteDifference::jvp` to obtain $(\nabla\Pi(\mathbf{x} + h\mathbf{v}) - \nabla\Pi(\mathbf{x} - h\mathbf{v}))/(2h)$.
+`DifferenceStep::absolute(h)` makes the displacement of the fastest-moving coordinate $h$, so when $\lVert\mathbf{v}\rVert_\infty = 1$, the step along the direction is exactly $h$.
+The gradient $\nabla\Pi(\mathbf{x})$ is passed as a known value, so one difference evaluates the gradient twice.
+The central-difference error is U-shaped against step size: truncation error is proportional to $h^2$ and rounding error to $\varepsilon/h$.
+
+The graph plots the relative difference of central differences at 25 points $h = 1, 10^{-1/2}, \dots, 10^{-12}$ on logarithmic axes, and shows the relative difference of `hvp_into` as a dashed line (at $\varepsilon$ if zero).
+The first table shows each method's execution count for $\Pi$ and relative difference $\lVert\Delta\rVert_\infty/\lVert\mathbf{H}\mathbf{v}\rVert_\infty$ from the closed-form $\mathbf{H}\mathbf{v}$.
+The second table shows the directional curvature $\mathbf{v}^\mathsf{T}\mathbf{H}\mathbf{v}/\mathbf{v}^\mathsf{T}\mathbf{v}$ (the Rayleigh quotient) and $\lVert\mathbf{H}\mathbf{v}\rVert_\infty$.
+The checks verify that the four automatic-differentiation methods agree with the closed form at the rounding-error level, while central-difference error is U-shaped against step size and remains orders of magnitude larger even at its minimum.
+
+```rust
+//| id: ad-chain-hvp-check
+//| ref: ad-chain-hvp-check
+//| title: "Compare HVPs using the tangent stiffness at equilibrium"
+//| run: reactive
+//| uses: [ad-chain-model]
+//| crates: [scioxide-ad, scioxide-core, scioxide-differentiate]
+//| dependsOn:
+//|   solve: ad-chain-newton-cg
+//| inputs:
+//|   direction: {"type":"select","label":"Direction v","description":"Direction in which to compute the HVP.","options":[{"label":"Smooth hump (lowest mode)","value":"smooth"},{"label":"Zigzag (highest mode)","value":"zigzag"},{"label":"Central mass only","value":"point"}],"value":"smooth"}
+//| cases:
+//|   - {"id":"zigzag","label":"Zigzag direction","description":"A stiff direction in which neighbors move in opposite directions, giving large directional curvature.","inputs":{"direction":"zigzag"}}
+//|   - {"id":"point","label":"Central mass only","description":"H v is one column of H, with only three nonzero tridiagonal entries.","inputs":{"direction":"point"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/0/1","equals":2}
+//|       - {"artifact":"methods","path":"/rows/1/1","equals":1}
+//|       - {"artifact":"methods","path":"/rows/2/1","equals":1}
+//|       - {"artifact":"methods","path":"/rows/3/1","equals":51}
+//|       - {"artifact":"methods","path":"/rows/0/2","range":{"max":1e-13}}
+//|       - {"artifact":"methods","path":"/rows/1/2","range":{"max":1e-13}}
+//|       - {"artifact":"methods","path":"/rows/2/2","range":{"max":1e-13}}
+//|       - {"artifact":"methods","path":"/rows/3/2","range":{"max":1e-12}}
+//|       - {"artifact":"methods","path":"/rows/4/2","range":{"min":1e-11,"max":1e-6}}
+//|       - {"artifact":"curvature","path":"/rows/0/1","approx":{"value":0.0231976802,"rtol":1e-8}}
+//|   - case: zigzag
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/1/2","range":{"max":1e-14}}
+//|       - {"artifact":"curvature","path":"/rows/0/1","approx":{"value":12.6870361613,"rtol":1e-8}}
+//|   - case: point
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/1/2","range":{"max":1e-15}}
+//|       - {"artifact":"curvature","path":"/rows/0/1","approx":{"value":2.1115501468,"rtol":1e-8}}
+use std::cell::Cell;
+
+use scioxide_ad::{Dual, Real, Tape, TapeOptions, Var, gemv_into, hessian, hvp};
+use scioxide_core::{ExecutionContext, LinearOperator, RealScalar};
+use scioxide_differentiate::{DifferenceScheme, DifferenceStep, FiniteDifference};
+
+// Count executions of Π.
+fn counted<R: Real>(records: &Cell<usize>, x: &[R], chain: &Chain) -> R {
+    records.set(records.get() + 1);
+    energy(x, chain)
+}
+
+let x: Vec<f64> =
+    serde_json::from_value(solve["displacement"].clone()).map_err(|e| e.to_string())?;
+let value = |key: &str| solve[key].as_f64().ok_or(format!("Missing {key}"));
+let chain = Chain {
+    stiffness: value("stiffness")?,
+    hardening: value("hardening")?,
+    foundation: value("foundation")?,
+    load: value("load")?,
+};
+let n = x.len();
+let phase = |j: usize, mode: f64| {
+    RealScalar::sin(mode * std::f64::consts::PI * (j + 1) as f64 / (n + 1) as f64)
+};
+// Direction v (‖v‖∞ ≤ 1). The lowest and highest modes have the shapes of the linear spring chain's eigenmodes.
+let v: Vec<f64> = (0..n)
+    .map(|j| match direction.as_str() {
+        "smooth" => phase(j, 1.0),
+        "zigzag" => phase(j, n as f64),
+        _ => f64::from(u8::from(j == n / 2)),
+    })
+    .collect();
+let exact = stiffness_times(&x, &chain, &v);
+let size = exact.iter().fold(0.0_f64, |m, h| m.max(h.abs()));
+let relative = |h: &[f64]| {
+    h.iter()
+        .zip(&exact)
+        .fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()))
+        / size
+};
+let cx = ExecutionContext::sequential();
+let records = Cell::new(0_usize);
+
+// 1. One-shot hvp: seed dual numbers on a new tape, record, and perform one reverse sweep.
+let one_shot = hvp(|z| Ok(counted(&records, z, &chain)), &x, &v).map_err(|e| e.to_string())?;
+let one_shot_records = records.replace(0);
+// 2. Tape<Dual<f64>>::hvp_into: the second call on the same tape executes the function only once.
+let mut tape = Tape::<Dual<f64>>::new(TapeOptions::new());
+let mut product = vec![0.0; n];
+for _ in 0..2 {
+    records.set(0);
+    tape.hvp_into(
+        |z: &[Var<'_, Dual<f64>>]| Ok(counted(&records, z, &chain)),
+        &x,
+        &v,
+        &mut product,
+        cx,
+    )
+    .map_err(|e| e.to_string())?;
+}
+let warm_records = records.replace(0);
+// 3. HessianOperator: record the function once per application.
+let operator = tape
+    .hessian_operator(
+        |z: &[Var<'_, Dual<f64>>]| Ok(counted(&records, z, &chain)),
+        &x,
+        cx,
+    )
+    .map_err(|e| e.to_string())?;
+records.set(0);
+let mut applied = vec![0.0; n];
+operator
+    .apply_into(&v, &mut applied, &mut [])
+    .map_err(|e| e.to_string())?;
+let operator_records = records.replace(0);
+drop(operator);
+// 4. Dense Hessian (recorded once per unit direction) and a matrix–vector product.
+let matrix = hessian(|z| Ok(counted(&records, z, &chain)), &x).map_err(|e| e.to_string())?;
+let dense_records = records.replace(0);
+let mut dense = vec![0.0; n];
+gemv_into(matrix.as_slice(), n, n, &v, &mut dense).map_err(|e| e.to_string())?;
+
+// 5. Independent check: centrally difference the gradient (reverse mode on Tape<f64>) with scioxide-differentiate.
+let mut gradient_tape = Tape::<f64>::new(TapeOptions::new());
+let mut base = vec![0.0; n];
+gradient_tape
+    .gradient_into(|z| Ok(energy(z, &chain)), &x, &mut base, cx)
+    .map_err(|e| e.to_string())?;
+let mut difference = |step: Option<f64>| -> Result<(Vec<f64>, usize), String> {
+    let mut method = FiniteDifference::default().with_scheme(DifferenceScheme::Central);
+    if let Some(h) = step {
+        method = method.with_step(DifferenceStep::absolute(h).map_err(|e| e.to_string())?);
+    }
+    let result = method
+        .jvp(
+            |point: &[f64], out: &mut [f64]| {
+                gradient_tape
+                    .gradient_into(|z| Ok(energy(z, &chain)), point, out, cx)
+                    .map(|_| ())
+            },
+            &x,
+            &v,
+            n,
+            None,
+            Some(&base),
+        )
+        .map_err(|e| e.to_string())?;
+    let values = result.values().ok_or("Missing finite-difference value")?.to_vec();
+    Ok((values, result.report().evaluations()))
+};
+let (default_step, evaluations) = difference(None)?;
+let mut sweep = Vec::new();
+for k in 0..=24 {
+    let h = RealScalar::powf(10.0_f64, -f64::from(k) / 2.0);
+    let (estimate, _) = difference(Some(h))?;
+    sweep.push([h, relative(&estimate)]);
+}
+emit_line_chart!(
+    &vec![serde_json::json!({
+        "name": "Central difference (scioxide-differentiate)",
+        "points": sweep,
+        "style": { "symbol": "circle" }
+    })],
+    options = &serde_json::json!({
+        "xLabel": "Difference step h [m]",
+        "yLabel": "Relative difference from closed form [-]",
+        "xType": "log",
+        "yType": "log",
+        "annotations": [
+            {
+                "kind": "line",
+                "axis": "y",
+                "value": relative(&product).max(f64::EPSILON),
+                "label": "hvp_into relative difference (ε if zero)",
+                "style": { "lineType": "dashed" }
+            }
+        ]
+    })
+);
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Method" },
+    { "key": "1", "label": "Π executions [count]", "type": "integer" },
+    { "key": "2", "label": "Relative difference from closed form [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    vec![
+        (
+            "hvp (one-shot)",
+            one_shot_records,
+            relative(one_shot.as_slice())
+        ),
+        (
+            "Tape<Dual<f64>>::hvp_into (second call)",
+            warm_records,
+            relative(&product)
+        ),
+        (
+            "HessianOperator::apply_into",
+            operator_records,
+            relative(&applied)
+        ),
+        ("hessian and gemv_into", dense_records, relative(&dense)),
+        (
+            "Central difference (default step)",
+            evaluations,
+            relative(&default_step)
+        ),
+    ],
+    metadata = serde_json::json!({ "id": "methods" })
+);
+let quotient = |h: &[f64]| {
+    let num: f64 = v.iter().zip(h).map(|(a, b)| a * b).sum();
+    num / v.iter().map(|a| a * a).sum::<f64>()
+};
+let curvature_columns = serde_json::json!([
+    { "key": "0", "label": "Number of masses n", "type": "integer" },
+    { "key": "1", "label": "vᵀHv/vᵀv（hvp_into）[kN/m]", "type": "number", "format": sci3 },
+    { "key": "2", "label": "vᵀHv/vᵀv (closed form) [kN/m]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "‖Hv‖∞ (closed form) [kN]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    curvature_columns,
+    vec![(n, quotient(&product), quotient(&exact), size)],
+    metadata = serde_json::json!({ "id": "curvature" })
+);
+```
+
+For the smooth-hump direction, the HVPs from `hvp`, `hvp_into`, and `apply_into` agree with the closed form to a relative difference of $6.5 \times 10^{-15}$, and the product from `hessian` and `gemv_into` to $2.9 \times 10^{-14}$.
+The directional curvature is 0.0232 kN/m: this is a soft direction in which the entire chain moves in the same direction with a hump-shaped profile.
+The value $\lVert\mathbf{H}\mathbf{v}\rVert_\infty = 0.0256$ kN is small because spring-stiffness terms cancel, so the relative difference is about 30 times $\varepsilon$.
+Execution counts for $\Pi$ are 2 for `hvp` using a new tape (one statement-counting pass and one recording), 1 for the second `hvp_into` call and for `apply_into`, and 51 for `hessian` (50 directional recordings and one initial statement-counting pass).
+
+The central-difference relative difference decreases proportionally to $h^2$ from $6.5 \times 10^{-4}$ at $h = 1$ m, reaching its minimum of $1.2 \times 10^{-9}$ at $h = 10^{-3}$ m.
+At smaller steps, rounding error increases in proportion to $1/h$ and reaches 0.54 at $h = 10^{-12}$ m.
+The relative difference at the default step is $4.4 \times 10^{-9}$; even the best step gives an error about five orders of magnitude larger than the error in an automatic-differentiation HVP.
+
+For the zigzag direction, directional curvature increases to 12.7 kN/m, and the relative differences of the four HVPs are $2.6 \times 10^{-16}$.
+Central differences give $2.5 \times 10^{-8}$ at the default step and $1.5 \times 10^{-10}$ at the best step of $h = 10^{-5}$ m; the truncation-error coefficient depends on direction, so the best step does too.
+For the central-mass-only direction, $\mathbf{H}\mathbf{v}$ is one column of $\mathbf{H}$ with just three nonzero entries, so all four methods agree with the closed form with zero relative difference.
+
+## Summary
+
+A forward-over-reverse HVP returns $\nabla\Pi$ and $\mathbf{H}\mathbf{v}$ together with one dual-seeded recording and one reverse sweep, at a small constant multiple of the computational cost of a gradient.
+The `HessianOperator` returned by `Tape<Dual<f64>>::hessian_operator` is a `LinearOperator`, so it can be passed directly to scioxide-linalg's `CgSolver` to implement Newton–CG without forming a Hessian.
+The condition number determines the CG iteration count; in the spring chain, when foundation springs $g$ bound the condition number, even $n = 200$ requires only about 35 HVPs per Newton direction.
+Stopping CG loosely (increasing $\eta$) makes Newton convergence linear, so choose $\eta$ by balancing HVP count against Newton iteration count.
+Setting $\eta$ below the rounding-error level $16\varepsilon\kappa$ can make CG stop with `Stagnation`, so choose $\eta$ above that level for ill-conditioned problems.
+HVPs can be checked against a closed form or differences of gradients, but finite-difference error is U-shaped against step size and exceeds the automatic-differentiation HVP error by more than five orders of magnitude even at the best step.
+
+## Further reading
+
+- [Second derivatives and Hessian operators](../../algorithms/second-order-derivatives/): examine the forward-over-reverse rules and the specifications of `HessianOperator` and `JacobianOperator`.
+- [Recovering sparse Hessians by coloring](../sparse-hessian-chain/): examine how to recover a tridiagonal Hessian with a number of recordings equal to the number of colors, fewer than $n$.
+- [Gradients and curvature of the Rosenbrock function](../rosenbrock-sensitivity/): examine how the Hessian condition number determines the slowness of gradient descent.
+- [JVP–VJP duality](../jvp-vjp-duality/): examine first-order products in forward and reverse mode, and the sweep count for assembling a Jacobian.

@@ -1,0 +1,240 @@
+---
+title: 数値計算結果の解釈と診断情報の仕様
+description: 内部構造を公開しない型 SciOxideError と 20 種類の分類、終了理由と部分結果、前進誤差と残差、計算量診断の解釈体系。
+sidebar:
+  order: 20
+---
+
+数値計算では、値が返ったことと、必要な精度を得られたことは同じではない。
+まずエラーの有無を確認し、結果がある場合は終了理由と診断を読む。
+
+エラー、終了理由、部分結果、計算量は異なる情報である。
+一つずつ確認すると、結果を使えるか、条件を変えて計算し直すべきかを判断できる。
+
+
+---
+
+## 内部構造を公開しない型 `SciOxideError` と 20 種類の構造的分類
+
+失敗しうるSciOxideの数値 API は、主に `Result<T, SciOxideError>` で結果を返す。
+`SciOxideError` は内部構造を公開しない構造体なので、分類は `kind()`、詳細は `view()` で調べる。
+
+代表的な原因を次の表に示す。
+詳細な分類と失敗後の状態は[エラーと部分結果](../../concepts/errors-and-partial-results/)で説明する。
+
+| エラー種別 (`SciOxideErrorKind`) | 主な原因と意味 | 代表的な発生箇所 |
+|---|---|---|
+| `InvalidInput` | パラメータの構造的・論理的不整合（$a > b$ の区間指定など） | `Interval::new` |
+| `DimensionMismatch` | 行列・ベクトルの行数・列数・次数の不一致 | `Matrix`, 線形ソルバー |
+| `SizeOverflow` | 表現可能なインデックスやバッファー容量の上限超過 | 整数組合せ、階乗 |
+| `AccountingInvariant` | 求解の回数集計の内部整合性（own/nested 回数の合計）の破綻 | `SolveContext` |
+| `ResourceLimit` | 呼び出し側が事前に設定したメモリや探索容量の上限超過 | `Capacity` |
+| `AllocationFailure` | ワークスペースや一時メモリの確保失敗 | `try_reserve` |
+| `ExecutionFailure` | 注入された並列エグゼキューターの起動・スケジューリング失敗 | `ExecutionContext` |
+| `CapabilityUnavailable` | 要求されたハードウェア機能（特定の SIMD 命令等）が未提供 | `ProcessorCapabilities` |
+| `CapabilityFailure` | 注入されたハードウェア機能の実行時障害 | カーネル実行 |
+| `ExecutionStopped` | 実行中の処理によるキャンセル要求の確認（`CancellationToken`）や時間切れ（`Deadline`） | 長時間求解 |
+| `OutOfBounds` | コレクションや配列の有効範囲外インデックスへのアクセス | ビュー操作 |
+| `DomainError` | 数学的定義域違反（非正定値行列に対する Cholesky 分解など） | 分解・初等関数 |
+| `NonFinite` | 入力または中間計算における NaN（非数）や無限大の発生 | 算術・求積 |
+| `ScalarConversion` | スカラー型間の安全な変換（`try_from`）の失敗 | 精度変換 |
+| `ConvergenceFailure` | 未収束や回数制限による実行の拒否をエラーとして返した | 成功を要求する境界、`Admission::require` |
+| `Singular` | 行列が特異（厳密に零のピボットなど、逆写像が存在しない） | LU 分解、三角系の求解 |
+| `NumericalInstability` | 浮動小数点丸めの極端な蓄積やアルゴリズム的破綻（Breakdown） | Krylov 法 |
+| `DifferentiationFailure` | ステンシル節点での関数値取得や刻み幅選択の失敗 | 数値微分 |
+| `NotImplemented` | 当該構成・型に対する意図的な未サポート操作 | バックエンド |
+| `External` | コールバック、注入されたプロバイダー、利用側アプリケーションが返した失敗 | 利用者のコールバック |
+
+以下のセルでは、不正な区間入力、特異行列の分解、非有限値の総和という 3 種類の典型的な失敗から得られる `kind()` と `view()` の出力を検証する。
+
+```rust
+//| id: error-classification-showcase
+//| title: 代表的なエラー種別と SciOxideError の構造的分解
+//| run: button
+//| crates: [scioxide-core, scioxide-linalg]
+use scioxide_core::{Interval, checked_sum};
+use scioxide_linalg::{LuDecomposition, Matrix};
+
+let interval_error = Interval::new(5.0_f64, 1.0)
+    .err()
+    .ok_or("区間のエラーがない")?;
+let a = Matrix::from_vec(2, 2, vec![1.0_f64; 4]).map_err(|e| e.to_string())?;
+let lu_error = LuDecomposition::factor(&a)
+    .err()
+    .ok_or("特異行列のエラーがない")?;
+let sum_error = checked_sum(&[1.0_f64, f64::NAN])
+    .err()
+    .ok_or("非有限値のエラーがない")?;
+let rows: Vec<_> = [
+    ("端点が逆の区間", interval_error),
+    ("特異行列のLU分解", lu_error),
+    ("NaNを含む総和", sum_error),
+]
+.into_iter()
+.map(|(name, e)| (name, format!("{:?}", e.kind()), format!("{:?}", e.view())))
+.collect();
+emit_table_with_columns!(
+    serde_json::json!([
+    {"key":"0","label":"操作","type":"string","nullText":"未定義"},
+    {"key":"1","label":"分類 kind()","type":"string","nullText":"未定義"},
+    {"key":"2","label":"詳細 view()","type":"string","nullText":"未定義"}
+    ]),
+    rows
+);
+```
+
+---
+
+## 終了理由（Termination）の読み分けと領域別仕様
+
+`Ok(result)` が返された場合でも、ソルバーが「許容誤差を満たして収束した」のか、「反復回数や計算回数の上限に達した部分結果として停止した」のかを確認する必要がある。
+
+SciOxide では、各問題領域の特性に応じた**終了列挙型**が定義されており、結果またはそのレポートから `.termination()` で終了理由を取得する。
+
+| 分野とクレート | 終了列挙型 | 代表的な成功状態 | 代表的な打ち切り・非収束状態 |
+|---|---|---|---|
+| 求根 (`scioxide-rootfind`) | [`RootTermination`](https://docs.rs/scioxide-rootfind/0.1.0/scioxide_rootfind/enum.RootTermination.html) | `ResidualTolerance`, `StepTolerance`, `BracketTolerance` | `IterationLimit`, `WorkLimit(_)`, `Stagnation` |
+| 最適化 (`scioxide-optimize`) | [`OptimizeTermination`](https://docs.rs/scioxide-optimize/0.1.0/scioxide_optimize/enum.OptimizeTermination.html) | `Converged`, `GradientSmall` | `IterationLimit`, `EvaluationLimit`, `Stagnation` |
+| 直接線形法 (`scioxide-linalg`) | [`DirectSolveTermination`](https://docs.rs/scioxide-linalg/0.1.0/scioxide_linalg/enum.DirectSolveTermination.html) | `Accepted` | `RankDeficient`, `IllConditioned` |
+| 反復線形法 (`scioxide-linalg`) | [`LinearSolveTermination`](https://docs.rs/scioxide-linalg/0.1.0/scioxide_linalg/enum.LinearSolveTermination.html) | `Converged` | `IterationLimit`, `Breakdown` |
+| 数値微分 (`scioxide-differentiate`) | [`DifferentiationTermination`](https://docs.rs/scioxide-differentiate/0.1.0/scioxide_differentiate/enum.DifferentiationTermination.html) | `Completed`（固定ステンシル）, `Converged`（適応外挿） | `RoundoffLimit`, `RefinementLimit`, `StepSizeLimit` |
+| 常微分方程式 (`scioxide-ode`) | [`OdeTermination`](https://docs.rs/scioxide-ode/0.1.0/scioxide_ode/enum.OdeTermination.html) | `ReachedEnd`, `TerminalEvent` | `BudgetLimit(BudgetKind::Proposal)`, `StepSizeLimit` |
+| 偏微分方程式 (`scioxide-pde`) | [`PdeTermination`](https://docs.rs/scioxide-pde/0.1.0/scioxide_pde/enum.PdeTermination.html) | `Completed` | `TimeStepLimit`, `LinearIterationLimit`, `LinearBreakdown(_)` |
+
+上記の終了列挙型はいずれも `termination.is_success()` を備える。
+数値微分では、`RoundoffLimit`・`RefinementLimit`・`StepSizeLimit` で止まった場合も、全成分の推定が得られていれば `report().output_available()` が真になって値と誤差推定が出力に反映される。
+その値は成功ではなく部分結果として扱う。
+直接線形法の `solve(&b)` は解だけを返し、棄却をエラー（`Singular` または `NumericalInstability`）に変換する。
+`solve_with_options(&b, &options)` では `result.report().termination()` が `DirectSolveTermination::Accepted` かを確認する。
+受理された解は `result.solution()` で取得できる。
+
+---
+
+## `Err` と「未収束などの結果を含む `Ok`」の違いと部分結果
+
+部分結果を返す反復ソルバーでは、上限に達した時点の受理済み状態を、残差や終了理由とともに取得できる。
+その値は、次の初期値や計算状況の診断に使える。
+
+部分結果を返さない境界では、同じ未達が `ConvergenceFailure` になることもある。
+例えば `Admission::require` は、回数制限によって実行が拒否された場合にエラーへ変換する。
+詳しい使い分けは[エラーと部分結果](../../concepts/errors-and-partial-results/)で扱う。
+
+### 部分結果の信頼区分（`PartialResultTrust`）
+
+得られた状態がどの程度の数学的・工学的裏付けを持つかは、`PartialResultTrust` によって階層化されている。
+
+1. **`DiagnosticOnly`**: 有限値であるが実行可能性や残差について何の主張もしない診断用状態。
+2. **`Admissible`**: 探索空間の幾何学的境界や物理的非負性などの制約を満たした受理状態。
+3. **`ResidualChecked`**: 独立した残差検証ルーチンを通過し、残差が設定された閾値を満たした状態。
+4. **`CertificateVerified`**: その API が定義する証明用データを独立に検証した状態。
+   非凸最適化では KKT 条件だけで大域最適性を保証しないため、証明用データが何を証明するかも確認する。
+
+### 計算量の正確な把握（`SolveCounts` と `EvaluationCounts`）
+
+計算性能の評価には、反復回数だけでなく詳細な評価回数が必要である。
+SciOxide は `SolveCounts` を通じて、自身のソルバー層が消費した回数（`own()`）と、内部で呼び出した入れ子の副ソルバーが消費した回数（`nested()`）を分けて記録し、`total()` で合計を取得できる。
+`EvaluationCounts` は、反復・提案・受理・棄却・各種プロバイダー呼び出しなどを表す。
+
+---
+
+## 操作して確かめる例：Dottie 数の固定点反復と回数制限による打ち切り
+
+以下の対話型セルでは、$x = \cos x$ の実数における唯一の固定点である **Dottie 数**（$d \approx 0.7390851332151607$）を `scioxide_rootfind::FixedPointSolver`（Picard 反復）によって求める。
+
+スライダーで反復回数の上限を操作することにより、反復回数の上限が小さいことによる「未収束などの結果を含む `Ok`（`RootTermination::IterationLimit`）」から、十分に大きい反復回数の上限による「成功の `Ok`（`RootTermination::ResidualTolerance`）」へと推移する挙動、および `is_success()`、残差、反復回数の変化を観察できる。
+
+```rust
+//| id: fixed-point-budget-termination
+//| title: 反復回数の上限に応じた終了理由と部分結果の推移
+//| run: reactive
+//| crates: [scioxide-rootfind, scioxide-core]
+//| inputs:
+//|   iteration_budget: {"type":"range","label":"反復回数の上限 (回)","description":"許可される最大反復回数。小さい値では回数上限への到達で停止する。","min":2,"max":60,"step":2,"value":10}
+use scioxide_core::{Budget, RealScalar};
+use scioxide_rootfind::{FixedPointMethod, FixedPointOptions, FixedPointSolver, ResidualFn};
+
+let budget = Budget::try_from(iteration_budget as usize).map_err(|e| e.to_string())?;
+let options = FixedPointOptions::default().with_max_iterations(budget);
+let result = FixedPointSolver::new(
+    FixedPointMethod::Picard,
+    scioxide_rootfind::FixedPointInput::Map,
+    options,
+)
+.map_err(|e| e.to_string())?
+.solve(
+    &ResidualFn::new(1, |x: &[f64], out: &mut [f64]| {
+        out[0] = RealScalar::cos(x[0]);
+        Ok(())
+    }),
+    &[0.5_f64],
+)
+.map_err(|e| e.to_string())?;
+let x = result.point()[0];
+// 返却点から残差を再評価し、既知の固定点との誤差も比較する。
+let residual = (RealScalar::cos(x) - x).abs();
+let error = (x - 0.7390851332151607_f64).abs();
+emit_table_with_columns!(
+    serde_json::json!([
+    {"key":"0","label":"反復上限","type":"number","format":{"significantDigits":6},"nullText":"未定義"},
+    {"key":"1","label":"終了理由","type":"string","nullText":"未定義"},
+    {"key":"2","label":"成功","type":"boolean","nullText":"未定義"},
+    {"key":"3","label":"近似解","type":"number","format":{"significantDigits":6},"nullText":"未定義"},
+    {"key":"4","label":"前進誤差","type":"number","format":{"significantDigits":6},"nullText":"未定義"},
+    {"key":"5","label":"独立残差","type":"number","format":{"significantDigits":6},"nullText":"未定義"},
+    {"key":"6","label":"反復数","type":"number","format":{"significantDigits":6},"nullText":"未定義"}
+    ]),
+    vec![(
+        iteration_budget,
+        format!("{:?}", result.termination()),
+        result.is_success(),
+        x,
+        error,
+        residual,
+        result.counts().iterations()
+    )]
+);
+let outcome = if result.is_success() {
+    Outcome::satisfied("固定点反復の収束条件を満たした")
+} else {
+    Outcome::partial("上限までに収束条件を満たさなかった")
+};
+emit_outcome!(
+    outcome
+        .status(result.termination().to_string())
+        .diagnostic("独立に評価した残差", residual, None)
+        .diagnostic("反復回数", result.counts().iterations() as f64, None)
+);
+```
+
+---
+
+## 前進誤差と残差の分離：条件数 $\kappa$ による解釈
+
+前進誤差と残差は異なる量である。
+正則な線形方程式 $Ax^*=b$、$b\ne0$ を例に取ると、同じノルムで定義した条件数 $\kappa(A)$ と残差 $r=A\hat{x}-b$ の間に次の関係がある。
+
+$$
+\frac{\|\hat{\mathbf{x}} - \mathbf{x}^*\|}{\|\mathbf{x}^*\|} \le \kappa \frac{\|\mathbf{r}\|}{\|\mathbf{b}\|}.
+$$
+
+右辺の観測誤差がある場合は、それも別に評価する。
+測定された方程式を正確に解いても、観測前の真の解に近いとは限らない。
+残差の小ささだけで判断せず、既知解との比較、条件数、後退誤差、独立な方法による検算を組み合わせる。
+
+---
+
+## まとめと次のステップ
+
+結果の利用前に、エラー、終了理由、残差の順に確認する。
+部分結果については、どの検査を通った状態なのかを信頼区分から読む。
+計算量の記録も見ると、再試行で上限を増やすべきか、方法を変えるべきかを考えやすい。
+
+- `SciOxideError` は内部構造を公開しない型であり、`kind()`（20 種類）と `view()` で分類する。
+- ソルバーの停止は `is_success()` と終了列挙型で確認し、未収束の `Ok` は部分結果として扱う。
+- 残差と前進誤差を区別し、条件数や独立検算を使って解の精度を調べる。
+
+次節では、19 のクレートから自身の課題に最適な解法を選定するための判断フローを解説する。
+
+- **クレートの選定**: [クレートの選び方](../choosing-a-crate/)
+- **エラーとトランザクションの詳細**: [共通概念：エラーと部分結果](../../concepts/errors-and-partial-results/)
+- **許容誤差の仕様**: [共通概念：許容誤差と残差](../../concepts/tolerances-and-residuals/)

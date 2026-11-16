@@ -1,0 +1,283 @@
+---
+title: "QMC sequence position, randomization, and error estimation"
+description: "Sequence families and supported randomizations, cursor positions and block partitioning, saving and resuming positions, randomization types and unbiasedness, standard errors from independent replicates, and transport of QMC points to multivariate normal and multinomial distributions."
+sidebar:
+  order: 365
+references:
+  random-qmc-families-and-cursor: "sequence-families-and-cursor-positions"
+  random-qmc-replicate-error: "randomization-and-replicate-error-estimates"
+  random-qmc-transport: "transporting-qmc-points-to-distributions"
+---
+
+The sequences in [Constructing Halton and Sobol sequences and measuring discrepancy](../quasi-random-and-brownian-bridges/) are deterministic and depend only on index $n$.
+Practical calculations generate separate blocks of long sequences, save and resume intermediate positions, and estimate errors from multiple randomized sequences.
+This page explains sequence families and cursor positions in `scioxide-random`, randomization types and unbiasedness, independent-replicate standard errors, and mapping QMC points to distribution samples.
+
+## Sequence families and cursor positions
+
+`QmcPlan` is immutable validated preparation; `family()` returns its mathematical sequence family as `QmcFamily`.
+`QmcFamily` has four values: `Sobol`, `Halton`, `ReverseHalton`, and `NiederreiterBase2`; discriminants 32–35 identify families in saved state.
+The family determines supported randomizations; the function selecting randomization validates the combination.
+
+| Family | Seeded `QmcScramble` | Generator-based `QmcRandomization` | `with_permutations` |
+|---|---|---|---|
+| `Sobol`, `NiederreiterBase2` | `DigitalShift` | `LinearMatrixShift` | Unavailable |
+| `Halton` | `DigitPermutation` | `RandomShift` | Available |
+| `ReverseHalton` | None | None | Unavailable |
+
+Unlisted combinations give `InvalidInput`; `with_randomization` checks this before reading generator words.
+Selecting a new randomization replaces the previous one.
+
+`plan.sequence::<S>()` creates a cursor `QmcSequence` borrowing the plan; output precision `S` (`f32` or `f64`) is selected here.
+Cursor position is `QmcPosition` returned by `position()`; `next_index()` returns the next point's index.
+A sequence contains $2^{64}$ points at indices $0, \dots, 2^{64} - 1$; after the last point, the cursor reaches the end and `next_index()` becomes `None`.
+Requesting another point at the end gives `InvalidInput` (`OutOfRange`).
+Positions do not include output precision, so either `f32` or `f64` cursors can resume from the same position.
+
+`skip_to(index)` moves to any `u64` index, including backward movement.
+Digital sequences rebuild state by XORing direction numbers corresponding to set bits of the index's Gray code, taking work per coordinate proportional to the set-bit count (at most 64) without replaying from the beginning.
+Halton state stores only the index, expanding it in each base when generating a point.
+`skip(n)` advances relatively, entering the terminal state exactly one past the final point; advancing farther errors without changing state.
+
+There are two forms of position storage.
+`QmcSequence` implements `SnapshotGenerator` with snapshot `QmcPosition` itself, so passing `SamplingPolicy::rollback` to `points_into` restores position after a failed batch.
+For byte storage, write plan and position with `export_state` and restore them to `QmcCheckpoint` with `QmcPlan::import_state`.
+Bytes are little-endian with a CRC-32C checksum, recording only plan-defining inputs (polynomials and initial direction numbers, bases, user digit permutations, randomization seeds and words).
+Direction tables are reconstructed on import, and the plan undergoes the same validation as direct construction.
+Truncated bytes, checksum mismatches, and invalid plans give `InvalidInput` (`Malformed`); unknown formats or families give `InvalidInput` (`UnsupportedConfiguration`).
+`QmcCheckpoint` contains `plan()` and `position()`; `sequence::<S>()` returns a cursor resuming from its saved position.
+
+To share an index range among cursors, callers select disjoint blocks $[s_c, e_c)$ and place each cursor at its block start using `skip_to(s_c)`.
+Cursors borrow a shared plan but retain independent positions, so they may run on separate threads.
+`point_into(index, out)` writes a point at one index without a cursor.
+Every method determines points solely by index, agreeing bit-for-bit with sequential generation by one cursor, independently of execution order.
+
+The following cell partitions $N$ points among $C$ cursors and compares against sequential generation with a single cursor.
+Inputs are family, dimension $d$, point count $N$, and cursor count $C$.
+Blocks are generated backward to check independence from generation order.
+The first table shows each block's index range, final `next_index()`, and maximum difference from the reference.
+The second shows differences for the sequence resumed from bytes saved at the midpoint and for the final point generated by `point_into`.
+
+```rust
+//| id: random-qmc-cursor-ranges
+//| ref: random-qmc-cursor-ranges
+//| title: "Generate identical points from partitioned cursors and saved positions"
+//| run: reactive
+//| crates: [scioxide-random]
+//| inputs:
+//|   family: {"type":"select","label":"Sequence family","options":["Sobol（DigitalShift）","Halton（DigitPermutation）","Niederreiter base 2","Reverse Halton"],"value":"Sobol（DigitalShift）"}
+//|   dimension: {"type":"range","label":"Dimension d [-]","min":1,"max":8,"step":1,"value":3}
+//|   points: {"type":"range","label":"Point count N [points]","min":64,"max":1024,"step":64,"value":256}
+//|   cursors: {"type":"range","label":"Cursor count C [count]","description":"Divide N points into blocks of ⌈N/C⌉ points.","min":1,"max":8,"step":1,"value":3}
+//| cases:
+//|   - {"id":"halton-eight","label":"Halton, C = 8","description":"Halton block points also agree with sequential generation.","inputs":{"family":"Halton（DigitPermutation）","cursors":8,"dimension":5}}
+//|   - {"id":"reverse-halton","label":"Reverse Halton, N = 1024","description":"Partitioning and resuming also return identical points for an unrandomized family.","inputs":{"family":"Reverse Halton","points":1024}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"ranges","path":"/rows/2/1","range":{"min":172,"max":172}}
+//|       - {"artifact":"ranges","path":"/rows/2/3","range":{"min":256,"max":256}}
+//|       - {"artifact":"ranges","path":"/rows/0/4","range":{"min":0,"max":0}}
+//|       - {"artifact":"ranges","path":"/rows/2/4","range":{"min":0,"max":0}}
+//|       - {"artifact":"resume","path":"/rows/0/2","range":{"min":0,"max":0}}
+//|       - {"artifact":"resume","path":"/rows/0/3","range":{"min":42,"max":42}}
+//|       - {"artifact":"resume","path":"/rows/1/2","range":{"min":0,"max":0}}
+//|   - case: halton-eight
+//|     expect:
+//|       - {"artifact":"ranges","path":"/rows/7/4","range":{"min":0,"max":0}}
+//|       - {"artifact":"resume","path":"/rows/0/2","range":{"min":0,"max":0}}
+//|   - case: reverse-halton
+//|     expect:
+//|       - {"artifact":"ranges","path":"/rows/2/3","range":{"min":1024,"max":1024}}
+//|       - {"artifact":"resume","path":"/rows/0/1","range":{"min":512,"max":512}}
+//|       - {"artifact":"resume","path":"/rows/1/2","range":{"min":0,"max":0}}
+use scioxide_random::{QmcPlan, QmcScramble, QuasiRng};
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let (d, n, c) = (
+    dimension.round() as usize,
+    points.round() as usize,
+    cursors.round() as usize,
+);
+let plan = match family.as_str() {
+    "Sobol（DigitalShift）" => {
+        QmcPlan::sobol(d).and_then(|plan| plan.with_scramble(QmcScramble::DigitalShift(11)))
+    }
+    "Halton（DigitPermutation）" => QmcPlan::halton(d)
+        .and_then(|plan| plan.with_scramble(QmcScramble::DigitPermutation(11))),
+    "Niederreiter base 2" => QmcPlan::niederreiter_base2(d),
+    _ => QmcPlan::reverse_halton(d),
+}
+.map_err(|e| e.to_string())?;
+// Reference: generate indices 0..N sequentially with one cursor (row-major, N rows and d columns).
+let reference = plan
+    .sequence::<f64>()
+    .map_err(|e| e.to_string())?
+    .points(n)
+    .map_err(|e| e.to_string())?;
+let largest_gap = |part: &[f64], start: usize| {
+    part.iter()
+        .zip(&reference[start * d..])
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0_f64, f64::max)
+};
+// Assign consecutive blocks [start, end) to C cursors and generate from the final block backward.
+let chunk = n.div_ceil(c);
+let mut rows = Vec::new();
+for index in (0..c).rev() {
+    let (start, end) = (index * chunk, ((index + 1) * chunk).min(n));
+    let mut cursor = plan.sequence::<f64>().map_err(|e| e.to_string())?;
+    cursor.skip_to(start as u64).map_err(|e| e.to_string())?;
+    let part = cursor.points(end - start).map_err(|e| e.to_string())?;
+    let next = cursor.position().next_index();
+    rows.push((index, start, end, next, largest_gap(&part, start)));
+}
+rows.reverse();
+// Write the plan and midpoint position to bytes and resume with another cursor.
+let mut first = plan.sequence::<f64>().map_err(|e| e.to_string())?;
+first.skip((n / 2) as u64).map_err(|e| e.to_string())?;
+let bytes = first.export_state().map_err(|e| e.to_string())?;
+let checkpoint = QmcPlan::import_state(&bytes).map_err(|e| e.to_string())?;
+let saved = checkpoint.position().next_index();
+let mut resumed = checkpoint.sequence::<f64>().map_err(|e| e.to_string())?;
+let tail = resumed.points(n - n / 2).map_err(|e| e.to_string())?;
+// Write the final-index point without a cursor.
+let mut last = vec![0.0_f64; d];
+plan.point_into((n - 1) as u64, &mut last)
+    .map_err(|e| e.to_string())?;
+let checks = vec![
+    (
+        "Resume from exported bytes".to_string(),
+        saved,
+        largest_gap(&tail, n / 2),
+        Some(bytes.len()),
+    ),
+    (
+        "Final point via point_into".to_string(),
+        Some((n - 1) as u64),
+        largest_gap(&last, n - 1),
+        None,
+    ),
+];
+let range_columns = serde_json::json!([
+    { "key": "0", "label": "Cursor", "type": "integer" },
+    { "key": "1", "label": "Start index", "type": "integer" },
+    { "key": "2", "label": "Exclusive end index", "type": "integer" },
+    { "key": "3", "label": "Final next_index()", "type": "integer", "nullText": "End" },
+    { "key": "4", "label": "Maximum reference difference [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    range_columns,
+    rows,
+    metadata = serde_json::json!({ "id": "ranges" })
+);
+let check_columns = serde_json::json!([
+    { "key": "0", "label": "Check" },
+    { "key": "1", "label": "Starting index", "type": "integer", "nullText": "End" },
+    { "key": "2", "label": "Maximum reference difference [-]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "Byte length [bytes]", "type": "integer", "nullText": "Not applicable" }
+]);
+emit_table_with_columns!(
+    check_columns,
+    checks,
+    metadata = serde_json::json!({ "id": "resume" })
+);
+```
+
+With defaults (Sobol randomized by `DigitalShift`, $d = 3$, $N = 256$, $C = 3$), blocks are $[0, 86)$, $[86, 172)$, and $[172, 256)$.
+Every block ends with `next_index()` equal to its right endpoint $e_c$ and maximum reference difference 0.
+Bytes exported at midpoint index 128 have length 42; the 128 resumed points and index-255 point generated by `point_into` also differ from the reference by 0.
+Every difference is also 0 for five-dimensional Halton across 8 cursors and for 1,024 unrandomized reverse Halton points.
+Zero differences show that block partitioning and generation order do not affect point values.
+
+## Randomization and replicate error estimates
+
+Errors of deterministic sequences can only be assessed through Koksma–Hlawka bounds, without a statistical estimate.
+Randomize the sequence and estimate standard error from variation among independently randomized replicate estimates.
+There are two randomization types.
+`with_scramble(QmcScramble)` selects randomization determined solely by a seed; `with_randomization(QmcRandomization, rng)` prepares randomization by reading uniform generator words.
+They are distinct types, so interchanging them fails to compile.
+
+### Randomization types and unbiasedness
+
+Halton's `RandomShift` (Cranley–Patterson) draws one uniform $\Delta_j$ per coordinate and sets $y_{nj} = (x_{nj} + \Delta_j) \bmod 1$.
+For fixed $x$, if $\Delta$ is uniform on $[0, 1)$, then $(x + \Delta) \bmod 1$ is also uniform.
+Independent coordinate shifts thus make each point uniform on $[0, 1)^d$, and mean $\frac{1}{N}\sum_n f(\mathbf{y}_n)$ is an unbiased estimator of $\int f$.
+Relative point positions remain unchanged, preserving point-set structure.
+
+For each coordinate, digital `LinearMatrixShift` (Matoušek) draws a binary lower-triangular $64 \times 64$ matrix $M_j$ with diagonal 1 and random entries below it, plus shift $\boldsymbol{\Delta}_j$, applying $y = M_j x \oplus \Delta_j$ to binary digits.
+Invertibility of $M_j$ preserves net properties, and the shift makes each point uniform.
+It reads 65 words per coordinate (64 rows and one shift word), accessible through `randomization_words()` and saved in state bytes.
+The matrix is applied to direction numbers once at preparation ($O(64^2 d)$ word operations), so point generation costs the same as for an unrandomized sequence.
+
+Seeded `DigitalShift(seed)` uses coordinate-wise 64-bit XOR $\mathbf{y}_n = \mathbf{x}_n \oplus \boldsymbol{\Delta}$, constructing each shift $\Delta_j$ from the seed and coordinate index.
+XOR with a constant maps elementary intervals to elementary intervals, preserving net properties.
+A uniformly random seed makes each coordinate uniform over the rounded finite grid, but the $d$ shifts derive from one 64-bit seed and cannot be assumed independent across coordinates.
+Uniform marginals do not establish joint uniformity on $[0, 1)^d$, so use `LinearMatrixShift` or `RandomShift` for unbiased replicates.
+
+Digit permutations fixing 0 (`DigitPermutation` and `with_permutations`) break Halton striping but guarantee neither uniform points nor unbiased estimates.
+Actual coordinates for every randomization are rounded onto a finite grid; unbiasedness arguments hold in a model assuming continuous uniforms.
+For `f64` output, grid spacing is about $2^{-53}$, making discretization effects much smaller than ordinary standard errors.
+
+The algorithm version stored in state bytes is 2 for Halton seeded digit permutations and 1 for other randomizations.
+`QmcPlan::import_state` rejects bytes whose version mismatches their randomization with `InvalidInput` (`UnsupportedConfiguration`), rather than silently returning a different sequence.
+Thus identical seeds do not imply agreement between sequences created under different version conventions.
+
+### Standard errors from independent replicates
+
+`QmcReplicatePlan::new(&base, &root, options)` creates $R$ independently randomized replicate plans from a `Philox4x64` root.
+Randomization of `base` is replaced, using `LinearMatrixShift` for digital sequences and `RandomShift` for Halton.
+Reverse Halton cannot be replicated and gives `InvalidInput`.
+Replicate $r$ uses a root-derived node `fork` with domain identifier `0x51` and the four big-endian bytes of $r$, so changing total replicate count preserves replicate $r$ randomization without advancing the root.
+`QmcReplicateOptions` contains replicate count $R$ (at least 2, default 8), points per replicate $N$ (positive, default 1,024), and replicate execution arrangement (default sequential).
+For digital sequences, $N$ must be a power of 2, preserving the property that the first $2^m$ points form a net in every replicate.
+
+`estimate(f)` computes mean $I_r$ of $f$ over the first $N$ points of each replicate and returns the following quantities
+
+$$
+\bar{I} = \frac{1}{R} \sum_{r=1}^R I_r, \qquad \widehat{\mathrm{SE}} = \sqrt{\frac{1}{R(R-1)} \sum_{r=1}^R (I_r - \bar{I})^2}
+$$
+
+as `QmcReplicateEstimate` (`mean`, `standard_error`, `replicate_means`, `points_per_replicate`).
+Since $I_r$ are independent unbiased estimators, $\widehat{\mathrm{SE}}$ estimates the standard error of $\bar{I}$ and is not a certified bound.
+For small $R$, $\widehat{\mathrm{SE}}$ itself fluctuates; assuming normal $I_r$, its relative standard deviation is about $1/\sqrt{2(R-1)}$ (about 27% for $R = 8$).
+NaN or infinity from $f$ gives `NonFinite`; errors from $f$ propagate unchanged, and no estimate is returned even if some replicates finished.
+`estimate` runs on the calling thread.
+
+`estimate_scoped(f, scope)` performs the same estimation as a stage in the execution scope (`ExecutionContext` or an outer solve's `SolveContext`).
+Before the first $f$ call, it charges $RN$ evaluations to the scope; an insufficient outer evaluation limit returns `ConvergenceFailure` without calling $f$ even once.
+Cancellation and deadlines are checked before each evaluation; replicates run through the scope's executor in the arrangement specified by `QmcReplicateOptions::with_execution_policy`, with results independent of execution order.
+Use of randomized replicates in multidimensional quadrature is covered in `scioxide-integrate`'s [Sparse grids and randomized quasi-Monte Carlo](../../../scioxide-integrate/algorithms/sparse-grids-and-qmc/); comparison of standard errors with analytical solutions is in [Comparing Monte Carlo and Sobol quasi-Monte Carlo integration](../../examples/monte-carlo-vs-sobol/).
+
+## Transporting QMC points to distributions
+
+When mapping uniform points to another distribution, rejection and Box–Muller methods disrupt point order and coordinate correspondence, losing low-discrepancy structure.
+Inverse-transform sampling is monotone coordinate by coordinate and transfers stratified structure directly.
+
+`QmcMultivariateNormal` borrows a `MultivariateNormal` law, maps each coordinate of $\mathbf{u} \in (0, 1)^r$ to standard normal quantile $z_k = \Phi^{-1}(u_k)$, and returns $\mathbf{x} = \boldsymbol{\mu} + V \Lambda^{1/2} \mathbf{z}$ using the law's factorization.
+$r$ is the covariance rank; match sequence dimension to $r$ returned by `input_dimension()`.
+One sample costs $r$ quantile evaluations and $O(dr)$ operations; rank-0 laws return $\boldsymbol{\mu}$ without consuming a point.
+The first unrandomized Sobol point is the origin, whose normal quantiles are infinite (`DomainError`), so exclude it with `skip(1)` or use a randomized plan.
+
+For `Multinomial` with trial count $n$ and probabilities $p_1, \dots, p_K$, `QmcMultinomial` partitions $[0, 1)$ into consecutive intervals of lengths $p_k / \sum_j p_j$.
+The interval containing coordinate $u_t$ of point $\mathbf{u} \in [0, 1)^n$ determines trial $t$, so sequence dimension equals trial count $n$ and counts sum exactly to $n$.
+`QmcMultinomial::new(&law)` prepares interval boundaries in `f64` and returns `InvalidInput` if no positive-probability interval exists or one rounds to zero width in `f64`.
+A coordinate equal to 1 also gives `InvalidInput`.
+
+For both, `sample(sequence)` returns one sample from the next point; `sample_n(sequence, n)` returns $n$ samples arranged by row in an owned `Vec`.
+`sample_n_into(sequence, policy, output, workspace)` reuses `QmcTransportWorkspace` to write caller-owned output, with output and cursor position governed by `policy`.
+Mismatched sequence dimensions or workspaces return `DimensionMismatch` before consuming points.
+
+## Summary
+
+`QmcFamily` determines supported randomizations; combinations absent from the table give `InvalidInput`.
+Since points depend solely on index, block partitioning through `skip_to` and `point_into` or resuming from `export_state` agrees bit-for-bit with sequential generation by one cursor.
+For error estimation, use `QmcReplicatePlan` independently randomized by `LinearMatrixShift` or `RandomShift`; seeds of `DigitalShift` do not give independent coordinates and are unsuitable for replicates.
+Replicate standard errors are empirical estimates that fluctuate themselves for small $R$; increase replicates or check against a function with an analytical solution.
+Use inverse-transform transport for QMC normal or multinomial samples, excluding the origin of an unrandomized sequence.
+
+## Further reading
+
+- [Constructing paths with a Brownian bridge](../brownian-bridge-construction/): examine concentration of path variance in leading coordinates through the assignment order of normal coordinates.
+- [Comparing Monte Carlo and Sobol quasi-Monte Carlo integration](../../examples/monte-carlo-vs-sobol/): examine randomized Sobol errors and `QmcReplicatePlan` standard errors in a worked example.
+- [Quasi-random sequence and sampling design API](../../api/quasi-random-and-designs/): look up sequence, randomization, cursor, and transport contracts.

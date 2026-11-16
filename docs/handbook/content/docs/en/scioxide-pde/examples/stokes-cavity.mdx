@@ -1,0 +1,377 @@
+---
+title: "Stokes driven cavity"
+description: "Solve slow flow in a square container with a moving lid using Taylor–Hood elements, checking the primary vortex center and streamfunction through refinement and symmetry, and reading corner-singularity and algebraic-error effects from centerline flux and divergence."
+sidebar:
+  order: 455
+references:
+  pde-stokes-cavity-setup: "problem-setup"
+  pde-stokes-cavity-solve-section: "plan-and-solve"
+  pde-stokes-cavity-centre-section: "finding-the-primary-vortex-center-and-streamfunction"
+---
+
+The driven cavity examines vortices inside a square container when only its lid moves at constant speed; it is a common incompressible-flow verification problem.
+This example solves slow flow of a highly viscous liquid with `StokesPlan` (Taylor–Hood P2/P1 elements), checking the primary vortex center and streamfunction by grid refinement.
+No exact solution is known, so independent checks use Stokes-flow symmetry, refinement differences, and flux across the centerline.
+See [Mixed finite elements for incompressible flow](../../algorithms/incompressible-flow/) for the weak form, inf-sup condition, and pressure gauges, and [Solvers for incompressible-flow saddle-point systems](../../algorithms/incompressible-solvers/) for preconditioning.
+
+## Problem setup
+
+The container is square $[0,L]^2$ of side $L=10$ mm; lid $y=L$ moves right at $U=5$ mm/s, while the other three sides are stationary walls.
+Liquid viscosity is $\mu=1.41$ Pa·s and density $\rho=1261$ kg/m³ (near glycerol values at 20 °C).
+Reynolds number $\mathrm{Re}=\rho UL/\mu\approx0.045$ makes inertia negligible relative to viscosity, so steady Stokes equations are a good approximation.
+There is no body force; velocity is prescribed on the full boundary, so the default gauge (zero area mean) fixes the pressure constant.
+Stokes equations are linear, so velocity is proportional to $U$ and pressure scale is $\mu U/L\approx0.71$ Pa.
+
+At the two upper corners where lid meets walls, boundary velocity jumps from $U$ to 0.
+Near these corners, pressure diverges as $1/r$ with distance $r$ from the corner, and velocity gradients are unbounded.
+Finite element nodes require one corner velocity; applying `DirichletConflictPolicy::LastConditionWins` to `TaggedBoundaries` uses the later condition in the list at corner nodes.
+By default, walls come last, setting corner velocity to 0 and preventing fluid entry or exit through the container boundary.
+
+The mesh splits each of $n\times n$ squares into two triangles using diagonals in the same direction, doubling resolution from $n=4$ onward.
+This diagonal orientation makes the mesh asymmetric about $x=L/2$.
+
+## Plan and solve
+
+The next cell prepares `StokesPlan` from each grid's mesh and boundary conditions and solves with `solve_with_options`.
+The table lists unknowns, GMRES iterations, the $L^2$ norm of pointwise divergence, discrete-continuity residual (weak divergence), and termination reason; pass centerline P2 nodal velocities to the next cell.
+Inputs select the finest grid, GMRES true-residual tolerance, and upper-corner nodal velocities.
+Computation repeats for each grid, so run by button and save results for reuse with identical inputs.
+
+```rust
+//| id: pde-stokes-cavity-solve
+//| ref: pde-stokes-cavity-solve
+//| title: "Solve driven-cavity Stokes flow while refining the grid"
+//| run: button
+//| cache: inputs
+//| timeoutMs: 60000
+//| crates: [scioxide-pde, scioxide-spatial, scioxide-core, scioxide-linalg]
+//| exports: [side, lid_speed, profiles]
+//| inputs:
+//|   finest: {"type":"select","label":"Finest grid n [-]","description":"Double resolution from n = 4 up to this value.","options":["8","16","32"],"value":"16"}
+//|   tolerance: {"type":"select","label":"GMRES true-residual tolerance","description":"Compare a solve stopped at default √ε with one solved to 10⁻¹⁴.","options":["√ε (default)","10⁻¹⁴"],"value":"10⁻¹⁴"}
+//|   corner: {"type":"select","label":"Upper-corner nodal velocity","description":"Velocity is discontinuous where lid meets walls; choose which value to impose at the node.","options":["Wall value 0","Lid value U"],"value":"Wall value 0"}
+//| cases:
+//|   - {"id":"loose","label":"Tolerance √ε","description":"GMRES stops in 7 iterations, leaving weak divergence around 10⁻⁹ m²/s.","inputs":{"tolerance":"√ε (default)"}}
+//|   - {"id":"leaky","label":"Corner velocity U","description":"The container leaks at corners; the pointwise-divergence norm is about 1.6 mm/s.","inputs":{"corner":"Lid value U"}}
+//|   - {"id":"fine","label":"Up to n = 32","description":"Even with 9,540 unknowns, GMRES stops in 19 iterations.","inputs":{"finest":"32"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"solves","path":"/rows/2/1","equals":2468}
+//|       - {"artifact":"solves","path":"/rows/2/2","range":{"min":15,"max":22}}
+//|       - {"artifact":"solves","path":"/rows/2/3","approx":{"value":8.4753,"rtol":1e-3}}
+//|       - {"artifact":"solves","path":"/rows/2/4","range":{"min":0,"max":1e-12}}
+//|       - {"artifact":"solves","path":"/rows/2/5","equals":"Converged"}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+//|   - case: loose
+//|     expect:
+//|       - {"artifact":"solves","path":"/rows/2/2","range":{"min":1,"max":10}}
+//|       - {"artifact":"solves","path":"/rows/2/4","range":{"min":1e-10,"max":1e-7}}
+//|   - case: leaky
+//|     expect:
+//|       - {"artifact":"solves","path":"/rows/2/3","approx":{"value":1.5817,"rtol":1e-3}}
+//|   - case: fine
+//|     expect:
+//|       - {"artifact":"solves","path":"/rows/3/1","equals":9540}
+//|       - {"artifact":"solves","path":"/rows/3/2","range":{"min":15,"max":22}}
+use scioxide_core::{LinearOperator, ResidualTolerance};
+use scioxide_linalg::LinearSolveTermination;
+use scioxide_pde::{
+    BoundaryCondition, BoundaryData, BoundaryPoint, DirichletConflictPolicy,
+    IncompressibleOptions, IncompressibleSolveOptions, SimplexFemGeometry, StokesPlan,
+    TaggedBoundaries,
+};
+use scioxide_spatial::{Point, SimplexBoundaryTags, TriangleMesh};
+
+// Square of side L = 10 mm, lid speed U = 5 mm/s, near-glycerol μ = 1.41 Pa·s and ρ = 1261 kg/m³.
+let (side, lid_speed, viscosity, density) = (0.01_f64, 0.005_f64, 1.41_f64, 1261.0_f64);
+let finest: usize = finest.parse().map_err(|_| "Cannot read grid count")?;
+// Default true-residual tolerance √ε and 10⁻¹⁴ to make algebraic error smaller than discretization error.
+let options = if tolerance == "10⁻¹⁴" {
+    let residual = ResidualTolerance::new(1e-14, 1e-14).map_err(|e| e.to_string())?;
+    IncompressibleSolveOptions::new().with_residual(residual)
+} else {
+    IncompressibleSolveOptions::new()
+};
+let mut rows = Vec::new();
+let mut profiles = Vec::new();
+// (Termination reason, whether breakdown) for the first unsuccessful grid.
+let mut first_failure: Option<(String, bool)> = None;
+let mut n = 4_usize;
+while n <= finest {
+    let mut points = Vec::new();
+    for j in 0..=n {
+        for i in 0..=n {
+            let point = [side * i as f64 / n as f64, side * j as f64 / n as f64];
+            points.push(Point::new(point).map_err(|e| e.to_string())?);
+        }
+    }
+    let mut triangles = Vec::new();
+    for j in 0..n {
+        for i in 0..n {
+            let a = j * (n + 1) + i;
+            triangles.push([a, a + 1, a + n + 2]);
+            triangles.push([a, a + n + 2, a + n + 1]);
+        }
+    }
+    let mesh = TriangleMesh::new(points, triangles).map_err(|e| e.to_string())?;
+    // Face tags: lid 1 if both endpoints are top-row (j = n) vertices; otherwise wall 0.
+    let mut faces = Vec::new();
+    for face in mesh.boundary_faces() {
+        let vertices = mesh.face_vertices(face).map_err(|e| e.to_string())?;
+        faces.push((face, u32::from(vertices.iter().all(|&v| v / (n + 1) == n))));
+    }
+    let tags = SimplexBoundaryTags::new(&mesh, faces).map_err(|e| e.to_string())?;
+    let lid_velocity = BoundaryData::time_invariant(move |p: BoundaryPoint<f64, 2>| {
+        Ok(if p.component == 0 { lid_speed } else { 0.0 })
+    });
+    let lid = BoundaryCondition::dirichlet(1, lid_velocity);
+    let wall = BoundaryCondition::dirichlet(0, BoundaryData::zero());
+    // LastConditionWins uses the later condition to determine corner-node values belonging to both.
+    let conditions = if corner == "Lid value U" {
+        vec![wall, lid]
+    } else {
+        vec![lid, wall]
+    };
+    let boundaries = TaggedBoundaries::new(&mesh, &tags, 2, conditions)
+        .map_err(|e| e.to_string())?
+        .with_dirichlet_conflict_policy(DirichletConflictPolicy::LastConditionWins);
+    let plan = StokesPlan::with_options(
+        mesh,
+        SimplexFemGeometry::Affine,
+        density,
+        viscosity,
+        &boundaries,
+        &|_| Ok([0.0; 2]),
+        IncompressibleOptions::new(),
+    )
+    .map_err(|e| e.to_string())?;
+    let result = plan
+        .solve_with_options(&options)
+        .map_err(|e| e.to_string())?;
+    let report = result.report();
+    let status = format!("{:?}", report.termination());
+    if !report.is_success() && first_failure.is_none() {
+        let broken = matches!(report.termination(), LinearSolveTermination::Breakdown(_));
+        first_failure = Some((status.clone(), broken));
+    }
+    let x = result.solution().as_slice();
+    // Pass P2 nodes (y, u, v) along vertical centerline x = L/2 ordered bottom to top.
+    let nodes = plan.velocity_nodes();
+    let mut line = Vec::new();
+    for i in 0..nodes {
+        let point = plan.node_point(i).map_err(|e| e.to_string())?;
+        if (point[0] - 0.5 * side).abs() < 1e-9 * side {
+            line.push([point[1], x[i], x[nodes + i]]);
+        }
+    }
+    line.sort_by(|a, b| a[0].total_cmp(&b[0]));
+    let mut scratch = vec![0.0; plan.apply_workspace_len().map_err(|e| e.to_string())?];
+    let diagnostics = plan
+        .diagnostics(x, side, 0.0, &mut scratch)
+        .map_err(|e| e.to_string())?;
+    let divergence = diagnostics.divergence_l2() * 1e3;
+    let weak = diagnostics.weak_divergence();
+    rows.push((
+        n,
+        plan.unknowns(),
+        report.iterations(),
+        divergence,
+        weak,
+        status,
+    ));
+    profiles.push((n, line));
+    n *= 2;
+}
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "n [-]", "type": "integer" },
+    { "key": "1", "label": "Unknowns [-]", "type": "integer" },
+    { "key": "2", "label": "GMRES iterations [-]", "type": "integer" },
+    { "key": "3", "label": "‖∇·u_h‖ [mm/s]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "Weak divergence [m²/s]", "type": "number", "format": sci3 },
+    { "key": "5", "label": "Termination reason" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "solves" })
+);
+let outcome = match first_failure {
+    None => Outcome::satisfied("GMRES reached tolerance on every grid").status("Converged"),
+    Some((status, true)) => Outcome::failed("GMRES broke down on some grids").status(status),
+    Some((status, false)) => Outcome::partial("Some grids stopped at the limit").status(status),
+};
+emit_outcome!(outcome.diagnostic("Finest grid n", finest as f64, None));
+export!(side, &side);
+export!(lid_speed, &lid_speed);
+export!(profiles, &profiles);
+```
+
+With defaults (tolerance $10^{-14}$, corner velocity 0), GMRES takes 17, 18, and 19 iterations for $n=4,8,16$, and 19 even for $n=32$, barely changing as unknown count increases from 188 to 9,540.
+Weak divergence is $4\times10^{-15}$–$8\times10^{-15}$ m²/s, satisfying discrete continuity to the specified tolerance.
+In contrast, the $L^2$ norm $\|\nabla\cdot u_h\|$ of pointwise divergence barely changes across grids, at 8.45–8.48 mm/s.
+Corner-element velocity changes from $U$ to 0 over width $h$, giving gradient of order $U/h$ and area of order $h^2$; its contribution to gradient $L^2$ norm is of order $U$ independently of $h$.
+The corner singularity prevents this quantity from showing the $O(h^2)$ decrease valid for smooth solutions.
+At default tolerance $\sqrt{\varepsilon}$, GMRES stops after 7 iterations, leaving weak divergence around $10^{-9}$ m²/s.
+
+## Finding the primary vortex center and streamfunction
+
+Reflecting a Stokes solution about $x=L/2$ and then reversing its overall sign gives a solution with identical boundary conditions (reflection changes lid velocity to $-U$; sign reversal restores $U$).
+Uniqueness implies $u$ is symmetric about $x=L/2$ and $v$ antisymmetric, with $v(L/2,y)=0$ on the centerline.
+Thus the primary vortex center (where $u=v=0$) lies on the centerline, at height $y_c$ where $u$ vanishes.
+Inertia breaks reflection symmetry, shifting the center in the lid's direction.
+
+The centerline consists of vertical edges; on each, P2 velocity is a quadratic through three nodes (endpoints and midpoint).
+Since $u>0$ near the lid and $u<0$ below the center, find $y_c$ by bisecting the quadratic on the edge where $u$ changes from positive to negative.
+The central value of streamfunction $\psi$ ($u=\partial\psi/\partial y$, $v=-\partial\psi/\partial x$, $\psi=0$ on walls) is $\psi(L/2,y_c)=\int_0^{y_c}u(L/2,y)\,dy$, computed by exact quadratic integration.
+Extending the same integral to the lid gives $Q=\int_0^Lu(L/2,y)\,dy$, the net centerline flux, zero for the exact solution in a closed container.
+Taylor–Hood velocity satisfies only discrete continuity, so $Q$ is nonzero; check that it decreases under refinement.
+Central $|v_h(L/2,y_c)|$ measures asymmetry introduced by the asymmetric mesh.
+
+The next cell takes centerline nodal values from the first cell, tabulates $y_c$, $\psi(L/2,y_c)$, central $|v_h|$, and $|Q|$ on each grid, and overlays centerline velocities.
+The vertical dashed line marks finest-grid $y_c$.
+
+```rust
+//| id: pde-stokes-cavity-centre
+//| ref: pde-stokes-cavity-centre
+//| title: "Find the primary vortex center, streamfunction, and flux from centerline velocities"
+//| run: reactive
+//| crates: [scioxide-core]
+//| dependsOn:
+//|   solve: pde-stokes-cavity-solve
+//| inputs:
+//|   component: {"type":"select","label":"Velocity component to plot","description":"Horizontal u shows vortex shape; vertical v shows asymmetry.","options":["u","v"],"value":"u"}
+//| cases:
+//|   - {"id":"vertical","label":"Vertical component v","description":"Maximum centerline v/U decreases from 1.5 × 10⁻² at n = 4 to 1.2 × 10⁻⁴ at n = 16.","inputs":{"component":"v"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"centre","path":"/rows/2/1","approx":{"value":7.6512785,"rtol":1e-6}}
+//|       - {"artifact":"centre","path":"/rows/2/2","approx":{"value":-5.0011227,"rtol":1e-6}}
+//|       - {"artifact":"centre","path":"/rows/2/4","range":{"min":0,"max":1e-3}}
+//|       - {"artifact":"profile","path":"/spec/series/2/points/16/1","approx":{"value":-0.2050542,"rtol":1e-5}}
+//|   - case: vertical
+//|     expect:
+//|       - {"artifact":"profile","path":"/spec/series/0/points/7/1","approx":{"value":0.0145766,"rtol":1e-4}}
+//|       - {"artifact":"profile","path":"/spec/series/2/points/30/1","range":{"min":-2e-4,"max":2e-4}}
+let side = solve["side"].as_f64().ok_or("Missing side length")?;
+let lid_speed = solve["lid_speed"].as_f64().ok_or("Missing lid speed")?;
+let profiles: Vec<(usize, Vec<[f64; 3]>)> =
+    serde_json::from_value(solve["profiles"].clone()).map_err(|e| e.to_string())?;
+// The centerline consists of vertical edges; P2 velocity on each is a quadratic through three nodes.
+// Coefficients, value, and integral from 0 to s of q(s) = c₀ + c₁ s + c₂ s² (s ∈ [0, 1]).
+let quadratic = |q: [f64; 3]| {
+    [
+        q[0],
+        -3.0 * q[0] + 4.0 * q[1] - q[2],
+        2.0 * (q[0] - 2.0 * q[1] + q[2]),
+    ]
+};
+let value = |c: [f64; 3], s: f64| c[0] + s * (c[1] + s * c[2]);
+let integral = |c: [f64; 3], s: f64| s * (c[0] + s * (c[1] / 2.0 + s * c[2] / 3.0));
+let mut rows = Vec::new();
+let mut centre = 0.0;
+for (n, line) in &profiles {
+    let (mut flux, mut found) = (0.0_f64, None);
+    for k in (0..line.len() - 1).step_by(2) {
+        let (lower, upper) = (line[k], line[k + 2]);
+        let h = upper[0] - lower[0];
+        let u = quadratic([lower[1], line[k + 1][1], upper[1]]);
+        let v = quadratic([lower[2], line[k + 1][2], upper[2]]);
+        // The primary vortex center lies on an edge negative below and positive above. Bisect to find u = 0.
+        if lower[1] < 0.0 && upper[1] > 0.0 {
+            let (mut a, mut b) = (0.0_f64, 1.0_f64);
+            for _ in 0..60 {
+                let m = 0.5 * (a + b);
+                if value(u, m) < 0.0 { a = m } else { b = m }
+            }
+            let s = 0.5 * (a + b);
+            found = Some((lower[0] + s * h, flux + h * integral(u, s), value(v, s)));
+        }
+        // Accumulate ψ and Q using exact quadratic integrals (Simpson's rule).
+        flux += h * integral(u, 1.0);
+    }
+    let (yc, psi, vc) = found.ok_or("No u sign change on the centerline")?;
+    centre = yc;
+    rows.push((*n, yc * 1e3, psi * 1e6, vc.abs() * 1e3, flux.abs() * 1e6));
+}
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let digits6 = serde_json::json!({ "significantDigits": 6 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "n [-]", "type": "integer" },
+    { "key": "1", "label": "Primary vortex center y_c [mm]", "type": "number", "format": digits6 },
+    { "key": "2", "label": "Streamfunction ψ(L/2, y_c) [mm²/s]", "type": "number", "format": digits6 },
+    { "key": "3", "label": "Central |v_h| [mm/s]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "Centerline flux |Q| [mm²/s]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "centre" })
+);
+// Overlay centerline nodal velocities for all grids, with finest-grid y_c as a vertical dashed line.
+let index = if component == "u" { 1 } else { 2 };
+let symbol = serde_json::json!({ "showSymbol": true });
+let mut series = Vec::new();
+for (n, line) in &profiles {
+    let points: Vec<[f64; 2]> = line
+        .iter()
+        .map(|p| [p[0] * 1e3, p[index] / lid_speed])
+        .collect();
+    let name = format!("n = {n}");
+    series.push(serde_json::json!({ "name": name, "points": points, "style": symbol }));
+}
+let dashed = serde_json::json!({ "lineType": "dashed" });
+let annotations = serde_json::json!([
+    { "kind": "line", "axis": "x", "value": centre * 1e3, "label": "y_c", "style": dashed }
+]);
+emit_chart!(
+    serde_json::json!({
+        "kind": "line",
+        "dataZoom": true,
+        "tooltip": true,
+        "series": series,
+        "xLabel": "Height y [mm]",
+        "yLabel": format!("{component} / U [-]"),
+        "xMin": 0.0,
+        "xMax": side * 1e3,
+        "annotations": annotations
+    }),
+    metadata = serde_json::json!({ "id": "profile" })
+);
+```
+
+By default, $y_c$ takes values 7.6041, 7.6462, and 7.6513 mm for $n=4,8,16$, reducing differences from 0.042 to 0.0051 mm.
+With finest grid $n=32$, it is $y_c=7.6503$ mm, differing from $n=16$ by 0.001 mm ($10^{-4}$ of $L$).
+Central streamfunction converges through −4.692, −4.968, and −5.001 mm²/s (−5.004 mm²/s at $n=32$); dividing by $UL=50$ mm²/s gives $\psi_c/(UL)\approx-0.1001$.
+Centerline flux $|Q|$ decreases rapidly through 0.33, 0.021, and $2.0\times10^{-4}$ mm²/s ($1.1\times10^{-5}$ mm²/s at $n=32$).
+At the single central point, $|v_h|$ is no greater than $1.2\times10^{-4}$ times $U$ for $n\ge8$, but does not decrease monotonically.
+
+Horizontal component $u/U$ drops rapidly from 1 just below the lid, changes sign at $y_c$, passes minimum $-0.21$, and returns to 0 at the bottom wall.
+Compared with $n=16$ at nodes of the same height, maximum difference is $0.028$ for $n=4$ and $0.0035$ for $n=8$, so even coarse grids broadly capture the primary vortex.
+Selecting vertical component $v/U$ gives maximum centerline magnitudes $1.5\times10^{-2}$, $1.0\times10^{-3}$, and $1.2\times10^{-4}$ for $n=4,8,16$, approaching symmetric exact-solution value $v=0$.
+
+Changing tolerance above to $\sqrt{\varepsilon}$ and rereading this cell gives $|Q|$ of $3.0\times10^{-3}$ mm²/s at $n=16$, 15 times $2.0\times10^{-4}$ mm²/s from solving to $10^{-14}$, and shifts $y_c$ by $3.9\times10^{-4}$ mm.
+Relative tolerance is measured against the right-hand-side norm; when comparing small refinement differences, tighten until algebraic error is smaller than those differences.
+
+Assigning corner nodes lid value $U$ gives nonzero normal velocity on the uppermost edges of the side walls, making the container leak at corners.
+P2 velocity on such an edge is $U$ at the corner and 0 at midpoint and lower endpoint, giving exact leakage $Uh/6$ by Simpson's rule.
+Then $|Q|$ takes values 2.17, 1.05, and 0.52 mm²/s, approaching $Uh/6=2.08$, 1.04, and 0.52 mm²/s.
+$y_c$ also approaches more slowly than with zero corner velocity, taking values 7.156, 7.451, and 7.556 mm; pointwise-divergence norm becomes 1.55–1.59 mm/s.
+Corner treatment changes boundary conditions over width $h$ and vanishes under refinement, but visibly shifts vortex position on coarse grids.
+
+## Summary
+
+Reflection symmetry of the Stokes cavity places the primary vortex center on the centerline; its height and streamfunction follow from centerline P2 quadratics and exact integration.
+Solving to $10^{-14}$ makes central heights at $n=16$ and $32$ differ by only $10^{-4}$ of $L$, while centerline flux rapidly decreases with refinement.
+The $L^2$ norm of pointwise divergence does not decrease because of corner singularities; judge convergence with discrete continuity and interior quantities instead.
+Default tolerance $\sqrt{\varepsilon}$ buries fine-grid differences in algebraic error, so tighten tolerance when comparing refinement.
+Lid velocity at corner nodes causes leakage $Uh/6$; use wall values there when flux matters.
+
+## Further reading
+
+- [Mixed finite elements for incompressible flow](../../algorithms/incompressible-flow/): examine Taylor–Hood inf-sup conditions and pressure-gauge selection.
+- [Solvers for incompressible-flow saddle-point systems](../../algorithms/incompressible-solvers/): examine grid-independent GMRES iterations and Newton's method for Navier–Stokes.
+- [Cantilever deflection and locking](../cantilever-beam/): compare volumetric locking in nearly incompressible elasticity with the same mixed P2/P1 elements.
+- [PDE examples and applications](../): browse subjects and independent checks of other examples.

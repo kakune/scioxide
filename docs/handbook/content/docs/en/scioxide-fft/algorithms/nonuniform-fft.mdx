@@ -1,0 +1,491 @@
+---
+title: "Nonuniform Fourier transforms"
+description: "Explain the sign, scale, coordinate conventions, mode ordering, plans, diagnostics, and resource limits for all 3 NUFFT types; check types 1 and 3 against direct sums and reversed-direction type 2 through the adjoint identity, and use diagnostics to demonstrate limits."
+sidebar:
+  order: 340
+references:
+  fft-nufft-types: "the-3-types-signs-and-scales"
+  fft-nufft-coordinates: "coordinate-units-and-mode-order"
+  fft-nufft-plan: "plans-diagnostics-and-resource-limits"
+  fft-nufft-adjoint-check: "checks-using-direct-sums-and-the-adjoint-identity"
+  fft-nufft-type3-check: "checking-type-3-and-resource-limits"
+---
+
+The nonuniform fast Fourier transform (NUFFT) approximates exponential sums at nonuniform positions or frequencies in fewer operations than the direct-summation cost $O(MK)$.
+$M$ is the number of nonuniform points and $K$ the output count.
+Applications include irregularly timed observations, MRI data measured on polar or radial grids, and structure factors from particle configurations.
+Unlike preprocessing that interpolates observations onto a uniform grid before an FFT, NUFFT approximates the exponential sum itself to the requested accuracy.
+`scioxide-fft` provides single-use functions `nufft_type1`, `nufft_type2`, and `nufft_type3`, and a reusable plan `NufftPlan`.
+This page explains conventions for all 3 types, coordinates and mode order, plans, and resource limits, then checks them using direct sums and the adjoint identity.
+It also compares type 3 with direct summation, checks agreement between functions and plans, and demonstrates limits using diagnostic values.
+[NUFFT kernels and requested accuracy](../nufft-kernel-and-accuracy/) covers approximation by kernels and oversampled grids, requested accuracy, and error estimates.
+
+## The 3 types, signs, and scales
+
+Let the nonuniform points be $\mathbf x_j\in\mathbb R^d$ ($j=0,\ldots,M-1$), with $\sigma=-1$ for `FftDirection::Forward` and $\sigma=+1$ for `FftDirection::Inverse`.
+The 3 types compute the following sums.
+
+| Type | Computed sum | Input | Output | Function |
+|---|---|---|---|---|
+| Type 1 | $f_{\mathbf k}=s\sum_j c_j e^{\sigma i\mathbf k\cdot\mathbf x_j}$, $\mathbf k\in K$ | Values $c_j$ at points | Values on integer-mode grid $K$ | `nufft_type1` |
+| Type 2 | $c_j=s\sum_{\mathbf k\in K}f_{\mathbf k}e^{\sigma i\mathbf k\cdot\mathbf x_j}$ | Mode coefficients $f_{\mathbf k}$ | Values at points | `nufft_type2` |
+| Type 3 | $f_\ell=s\sum_j c_j e^{\sigma i\boldsymbol\omega_\ell\cdot\mathbf x_j}$ | Values $c_j$ at points | Values at arbitrary angular frequencies $\boldsymbol\omega_\ell$ | `nufft_type3` |
+
+$s$ is the factor determined by `Normalization`; the reference count is the number of summed terms: point count $M$ for types 1 and 3, and mode count $N_1\cdots N_d$ for type 2.
+`Forward` divides by that count only for direction `Forward`, and `Inverse` only for direction `Inverse`.
+`Orthonormal` divides by its square root regardless of direction; `Unscaled` does not divide.
+Output count is not the reference count, and an empty sum is 0.
+
+When passing geometry to a plan, select the type and geometry with `NufftTransform` variants `Type1 { points, modes }`, `Type2 { points, modes }`, and `Type3 { points, frequencies }`.
+Specify sign, normalization, and requested accuracy separately with `NufftPlanSpec::new(direction, normalization, accuracy)`.
+
+Type 2 is not the inverse of type 1.
+Type 1 and reversed-direction type 2 at the same points and modes are adjoints (conjugate transposes) of each other.
+`NufftPlan` implements `scioxide_core::LinearOperator` and `AdjointOperator`; the adjoint is the conjugate transpose with the same factor $s$.
+Construct inverse problems estimating coefficients from irregular observations separately as least-squares or regularized problems using this adjoint.
+
+## Coordinate units and mode order
+
+Pass points and frequencies as an `NdView` of shape `[point count, d]` (one point per row).
+For types 1 and 2, modes $K$ increase as $-\lfloor N_a/2\rfloor,\ldots,\lceil N_a/2\rceil-1$ on each axis $a$ and use row-major order in multiple dimensions (last axis varying fastest).
+This differs from the ordinary FFT ordering with zero frequency first.
+`modes` contains per-axis mode counts $N_a$; 0 gives `InvalidInput` (`Empty`), and a length differing from $d$ gives `DimensionMismatch`.
+
+Type-1 and type-2 coordinates are angles [rad], periodic with period $2\pi$ in each coordinate.
+Nondimensionalizing time $t_j$ [s] using time scale $T_0$ [s] as $x_j=2\pi t_j/T_0$ makes mode $k$ correspond to frequency $k/T_0$ [Hz].
+Coordinates outside $[-\pi,\pi]$ are accepted and reduced to $[-\pi,\pi]$ through sine and cosine.
+Large coordinates, however, have already lost digits in floating-point representation before they are supplied.
+For example, representing $x=2\pi\cdot1000+0.5$ in `f64` can round by up to $4.5\times10^{-13}$ rad; the resulting error in mode $k$'s phase $kx$ is $\lvert k\rvert$ times as large.
+Therefore, place coordinates in $[-\pi,\pi]$ before passing them.
+
+Type-3 points and frequencies are arbitrary real values, with units chosen so that the inner product $\boldsymbol\omega_\ell\cdot\mathbf x_j$ is dimensionless [rad].
+For times in days, pass angular frequencies [rad/day]; converting from frequencies [day⁻¹] requires the factor $2\pi$.
+The plan translates the point and frequency boxes to their respective centers before placing them on a grid, so a distant time origin does not enlarge the grid.
+Frequency dimensions differing from point dimensions give `DimensionMismatch`.
+
+## Plans, diagnostics, and resource limits
+
+`NufftPlan::new(transform, spec)` prepares the plan and releases point and frequency borrows after reading them.
+`NufftPlan::build(transform, spec, context)` uses the FFT implementation from `FftPlanningContext` ([Injecting an external FFT implementation](oxref:fft-providers)).
+`NufftPlanSpec` defaults to oversampling factor 2, no limits, sequential execution, and automatic FFT implementation selection; change these with `with_oversampling`, `with_limits`, `with_execution_policy`, and `with_backend_strategy`.
+Requested accuracy outside $(0,1)$ or an oversampling factor below 2 gives `InvalidInput` (`OutOfRange`); NaN or infinite requested accuracy or coordinates gives `NonFinite`.
+Functions such as `nufft_type1` create a plan with default settings, use it once, and discard it.
+
+`plan.diagnostics()` returns `NufftDiagnostics`.
+`approximation_error` and `roundoff_error` are aliasing and rounding estimates $E_a$ and $E_r$; `kernel_support` is kernel width $w$, and `grid_points` is oversampled-grid point count $G$ (defined in [Requested accuracy and error estimates](oxref:fft-nufft-accuracy)).
+`stencil_visits` is the total grid-point visits for one transform or adjoint; `preparation_bytes` and `workspace_bytes` are peak preparation storage and one execution's workspace bytes.
+Read requested accuracy and oversampling factor back with `plan.spec()`.
+`grid_shape()` returns per-axis grid counts, `input_len()` and `output_len()` input and output lengths, `dimension()` the $d$, and `plan_bytes()` plan storage including FFT plans.
+
+`NufftLimits` has the following fields, all defaulting to `usize::MAX`.
+
+| Field | Quantity limited |
+|---|---|
+| `preparation_bytes` | Storage simultaneously held during preparation, including FFT plans |
+| `workspace_bytes` | Execution workspace, including temporary output storage |
+| `grid_points` | Point count of either oversampled grid |
+| `stencil_visits` | Total grid-point visits in spreading and interpolation for one transform or adjoint |
+| `kernel_support` | Kernel width $w$ (grid-point count per axis) |
+
+Preparation checks every limit before allocating and returns `ResourceLimit` if any is exceeded.
+It does not narrow the kernel or relax requested accuracy to satisfy limits.
+
+Allocate a workspace with `plan.workspace(())` and transform with `execute_into(input, output, &mut workspace, scope)`.
+Input may be a real or complex sequence; output must be complex.
+One call counts as one linear-operator evaluation in `scope`.
+The result is assembled in the workspace and copied to output only on success, so a failed call leaves output unchanged.
+`execute_axis_into` transforms every sequence along one multidimensional-array axis, writing all or none.
+NaN or infinite input gives `NonFinite`; incompatible lengths give `DimensionMismatch`.
+
+## Checks using direct sums and the adjoint identity
+
+The following cell computes one-dimensional type 1 on $M=12$ points scattered in $[-\pi,\pi)$ using a plan, and reversed-direction type 2 with function `nufft_type2`.
+Inputs are mode count $N$, the requested-accuracy exponent, and the multiple of $2\pi$ added to every coordinate.
+There are 2 independent checks.
+Compare each type-1 mode with direct sum $\sum_jc_je^{-ikx_j}$ and compute the relative difference in adjoint identity $\langle T_1c,f\rangle=\langle c,T_2f\rangle$.
+Compute direct sums with unshifted coordinates and the intrinsic methods of `f64`.
+
+```rust
+//| id: fft-nufft-type1-type2-adjoint
+//| ref: fft-nufft-type1-type2-adjoint
+//| title: "Type-1 mode order and direct sums, and the adjoint identity with type 2"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-fft]
+//| inputs:
+//|   mode_count: {"type":"integer","label":"Mode count N","description":"Modes increase as −⌊N/2⌋, …, ⌈N/2⌉ − 1.","min":4,"max":12,"value":8}
+//|   accuracy_exponent: {"type":"integer","label":"Requested-accuracy exponent p (ε_r = 10^p)","description":"Requested maximum error relative to the input 1-norm.","min":-13,"max":-3,"value":-10}
+//|   wraps: {"type":"integer","label":"Multiple of 2π added to coordinates","description":"Values should be unchanged, but coordinate rounding shifts the phase.","min":0,"max":1000,"value":0}
+//| cases:
+//|   - {"id":"odd-modes","label":"N = 7","description":"An odd mode count gives symmetric order −3, …, 3.","inputs":{"mode_count":7}}
+//|   - {"id":"strict","label":"ε_r = 10⁻¹³","description":"The kernel widens and the direct-sum difference falls within the requested range.","inputs":{"accuracy_exponent":-13}}
+//|   - {"id":"far-coordinates","label":"ε_r = 10⁻¹³, shifted by 2π × 1000","description":"Phase error from coordinate rounding exceeds the requested accuracy.","inputs":{"wraps":1000,"accuracy_exponent":-13}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"modes","path":"/rows/0/0","equals":-4}
+//|       - {"artifact":"modes","path":"/rows/7/0","equals":3}
+//|       - {"artifact":"checks","path":"/rows/0/0","approx":{"value":12,"atol":0.5}}
+//|       - {"artifact":"checks","path":"/rows/0/4","range":{"max":1e-10}}
+//|       - {"artifact":"checks","path":"/rows/0/5","range":{"max":1e-10}}
+//|   - case: odd-modes
+//|     expect:
+//|       - {"artifact":"modes","path":"/rows/0/0","equals":-3}
+//|       - {"artifact":"modes","path":"/rows/6/0","equals":3}
+//|       - {"artifact":"checks","path":"/rows/0/4","range":{"max":1e-10}}
+//|   - case: strict
+//|     expect:
+//|       - {"artifact":"checks","path":"/rows/0/4","range":{"max":1e-13}}
+//|   - case: far-coordinates
+//|     expect:
+//|       - {"artifact":"checks","path":"/rows/0/3","range":{"min":5e-15}}
+//|       - {"artifact":"checks","path":"/rows/0/4","range":{"min":1e-13}}
+use scioxide_core::{Complex, ExecutionContext, NdView, StridedLayout};
+use scioxide_fft::{
+    FftDirection, Normalization, NufftPlan, NufftPlanSpec, NufftTransform, nufft_type2,
+};
+
+let (count, modes) = (12_usize, [mode_count as usize]);
+let accuracy = 10f64.powi(accuracy_exponent);
+let tau = 2.0 * std::f64::consts::PI;
+// Points scattered in [−π, π), point values c_j, and mode coefficients f_k (f64 trigonometric functions only generate input)
+let x: Vec<f64> = (0..count)
+    .map(|j| -std::f64::consts::PI + tau * (0.1 + 0.618_033_988_749_895 * j as f64).fract())
+    .collect();
+let shifted: Vec<f64> = x.iter().map(|v| v + tau * wraps as f64).collect();
+let c: Vec<Complex<f64>> = (0..count)
+    .map(|j| Complex::new((1.3 * j as f64).cos(), (0.7 * j as f64).sin()))
+    .collect();
+let first = -((modes[0] / 2) as i64);
+let ks: Vec<i64> = (0..modes[0] as i64).map(|i| first + i).collect();
+let f: Vec<Complex<f64>> = ks
+    .iter()
+    .map(|&k| Complex::new(1.0 / (1.0 + k.abs() as f64), 0.1 * k as f64))
+    .collect();
+
+// Compute type 1 (Forward, σ = −1) using a plan. Coordinates are a view of shape [M, 1]
+let shape = [count, 1];
+let layout = StridedLayout::new(&shape, &[1, 1]).map_err(|e| e.to_string())?;
+let points = NdView::new(&shifted, layout).map_err(|e| e.to_string())?;
+let spec = NufftPlanSpec::new(FftDirection::Forward, Normalization::Unscaled, accuracy);
+let transform = NufftTransform::Type1 {
+    points,
+    modes: &modes,
+};
+let plan = NufftPlan::new(transform, spec).map_err(|e| e.to_string())?;
+let mut workspace = plan.workspace(()).map_err(|e| e.to_string())?;
+let mut type1 = vec![Complex::new(0.0, 0.0); modes[0]];
+plan.execute_into(
+    &c[..],
+    &mut type1[..],
+    &mut workspace,
+    ExecutionContext::sequential(),
+)
+.map_err(|e| e.to_string())?;
+// Reversed-direction type 2 (Inverse, σ = +1) is the type-1 adjoint
+let points = NdView::new(&shifted, layout).map_err(|e| e.to_string())?;
+let type2 = nufft_type2(
+    points,
+    &f,
+    &modes,
+    FftDirection::Inverse,
+    Normalization::Unscaled,
+    accuracy,
+)
+.map_err(|e| e.to_string())?;
+
+// Independent check 1: direct sum Σ_j c_j exp(−i k x_j) at unshifted coordinates
+let l1: f64 = c.iter().map(|v| v.norm()).sum();
+let mut rows = Vec::new();
+let mut worst = 0.0_f64;
+for (&k, value) in ks.iter().zip(&type1) {
+    let direct: Complex<f64> = c
+        .iter()
+        .zip(&x)
+        .map(|(cj, xj)| *cj * Complex::from_polar(1.0, -(k as f64) * xj))
+        .sum();
+    let error = (*value - direct).norm() / l1;
+    worst = worst.max(error);
+    rows.push((k, value.re, value.im, error));
+}
+// Independent check 2: adjoint identity ⟨T1 c, f⟩ = ⟨c, T2 f⟩
+let left: Complex<f64> = type1.iter().zip(&f).map(|(a, b)| *a * b.conj()).sum();
+let right: Complex<f64> = c.iter().zip(&type2).map(|(a, b)| *a * b.conj()).sum();
+let adjoint = (left - right).norm() / left.norm().max(right.norm());
+
+let fixed6 = serde_json::json!({ "fractionDigits": 6 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let mode_columns = serde_json::json!([
+    { "key": "0", "label": "Mode k", "type": "integer" },
+    { "key": "1", "label": "Re f_k [-]", "type": "number", "format": fixed6 },
+    { "key": "2", "label": "Im f_k [-]", "type": "number", "format": fixed6 },
+    { "key": "3", "label": "Difference from direct sum / Σ|c_j| [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    mode_columns,
+    rows,
+    metadata = serde_json::json!({ "id": "modes" })
+);
+let d = plan.diagnostics();
+let check_columns = serde_json::json!([
+    { "key": "0", "label": "Kernel width w", "type": "integer" },
+    { "key": "1", "label": "Grid points G", "type": "integer" },
+    { "key": "2", "label": "Estimate E_a [-]", "type": "number", "format": sci2 },
+    { "key": "3", "label": "Estimate E_r [-]", "type": "number", "format": sci2 },
+    { "key": "4", "label": "Maximum measured error [-]", "type": "number", "format": sci2 },
+    { "key": "5", "label": "Relative adjoint-identity difference [-]", "type": "number", "format": sci2 }
+]);
+let check = (
+    d.kernel_support,
+    d.grid_points,
+    d.approximation_error,
+    d.roundoff_error,
+    worst,
+    adjoint,
+);
+emit_table_with_columns!(
+    check_columns,
+    vec![check],
+    metadata = serde_json::json!({ "id": "checks" })
+);
+```
+
+At the default $N=8$, modes are ordered as $k=-4,\ldots,3$.
+For requested $10^{-10}$, kernel width is 12, the grid has 16 points, and estimates are $E_a=7.3\times10^{-11}$ and $E_r=3.6\times10^{-15}$.
+The direct-sum difference is $1.7\times10^{-12}$ times the input 1-norm, within the requested range.
+The relative adjoint-identity difference is $6.9\times10^{-16}$, confirming that type 1 and reversed-direction type 2 are conjugate transposes with matching conventions.
+At $N=7$, the modes are symmetric as $-3,\ldots,3$.
+
+Requesting $10^{-13}$ widens the kernel to 15 and lowers the direct-sum difference to $1.4\times10^{-15}$.
+For the same request with coordinates shifted by $2\pi\times1000$, the coordinate term in $E_r$ (the sum $P=N$ of mode counts for axes with $\lvert x\rvert>\pi$) increases $E_r$ to $7.3\times10^{-15}$, and kernel width becomes 16.
+Even so, the direct-sum difference is $1.2\times10^{-12}$, exceeding the requested accuracy.
+Most of this difference comes from rounding when shifted coordinates are represented as floating-point values, rather than computation error; estimate $E_r$ also excludes it.
+The difference being smallest at $k=0$ and generally increasing with $\lvert k\rvert$ also indicates that phase error in $kx_j$ is the cause.
+Requested-accuracy estimates treat supplied coordinates as exact, so place coordinates in $[-\pi,\pi]$ before passing them.
+
+## Checking type 3 and resource limits
+
+The following cell applies type 3 (`Forward`, $\sigma=-1$) to values $c_j$ at $M=40$ irregular times $t_j$ [days] in $[0, 40]$ days, evaluating at $L=16$ angular frequencies $\omega_\ell$ [rad/day] equally spaced in $[0,\omega_{\max}]$.
+Inputs are the requested-accuracy exponent and $\omega_{\max}$.
+Increasing $\omega_{\max}$ increases the product of point spread and frequency spread, enlarging the oversampled grid.
+It checks 3 things.
+Compare the type-3 plan result with direct sum $\sum_jc_je^{-i\omega_\ell t_j}$ computed using the intrinsic methods of `f64`.
+Compare function `nufft_type3` with the plan; also convert the same times to angles $x_j=2\pi t_j/40-\pi$ and compare function `nufft_type1` with a type-1 plan (16 modes).
+Prepare with every `NufftLimits` field limited to the corresponding value reported by the type-3 plan's `NufftDiagnostics`, then prepare again with each field decreased by 1 in turn.
+Every difference is divided by the input 1-norm $\sum_j\lvert c_j\rvert$.
+
+```rust
+//| id: fft-nufft-type3-limits
+//| ref: fft-nufft-type3-limits
+//| title: "Type-3 direct-sum comparison, function–plan agreement, diagnostics, and limits"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-fft]
+//| inputs:
+//|   accuracy_exponent: {"type":"integer","label":"Requested-accuracy exponent p (ε_r = 10^p)","description":"Requested maximum error relative to the input 1-norm.","min":-12,"max":-3,"value":-9}
+//|   max_frequency: {"type":"range","label":"Maximum angular frequency ω_max [rad/day]","description":"16 frequencies span [0, ω_max]. Larger values enlarge the grid.","min":2,"max":50,"step":2,"value":10}
+//| cases:
+//|   - {"id":"strict","label":"ε_r = 10⁻¹²","description":"The kernel widens, lowering the direct-sum difference into the requested range.","inputs":{"accuracy_exponent":-12}}
+//|   - {"id":"wide-band","label":"ω_max = 50 rad/day","description":"Grid points and workspace increase; kernel width and total visits stay unchanged.","inputs":{"max_frequency":50}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"type3","path":"/rows/0/4","range":{"max":1e-9}}
+//|       - {"artifact":"type3","path":"/rows/0/5","range":{"max":1e-14}}
+//|       - {"artifact":"type3","path":"/rows/0/6","range":{"max":1e-14}}
+//|       - {"artifact":"limits","path":"/rows/0/2","equals":"Success"}
+//|       - {"artifact":"limits","path":"/rows/0/3","equals":"ResourceLimit"}
+//|       - {"artifact":"limits","path":"/rows/4/3","equals":"ResourceLimit"}
+//|   - case: strict
+//|     expect:
+//|       - {"artifact":"type3","path":"/rows/0/4","range":{"max":1e-12}}
+//|       - {"artifact":"limits","path":"/rows/2/3","equals":"ResourceLimit"}
+//|   - case: wide-band
+//|     expect:
+//|       - {"artifact":"type3","path":"/rows/0/4","range":{"max":1e-9}}
+//|       - {"artifact":"limits","path":"/rows/1/3","equals":"ResourceLimit"}
+use scioxide_core::{Complex, ExecutionContext, SciOxideError, NdView};
+use scioxide_fft::{
+    FftDirection, Normalization, NufftDiagnostics, NufftLimits, NufftPlan, NufftPlanSpec,
+    NufftTransform, nufft_type1, nufft_type3,
+};
+
+let (count, bins, span) = (40_usize, 16_usize, 40.0_f64);
+let accuracy = 10f64.powi(accuracy_exponent);
+let pi = std::f64::consts::PI;
+// Irregular times t_j [days], values c_j, angular frequencies ω_ℓ [rad/day] (f64 trigonometric functions only generate input)
+let t: Vec<f64> = (0..count)
+    .map(|j| {
+        span * (j as f64 + 0.8 * (0.618_033_988_749_895 * j as f64).fract()) / count as f64
+    })
+    .collect();
+let c: Vec<Complex<f64>> = (0..count)
+    .map(|j| Complex::new((0.9 * t[j]).cos(), 0.3 * (2.1 * t[j]).sin()))
+    .collect();
+let omega: Vec<f64> = (0..bins)
+    .map(|l| max_frequency * l as f64 / (bins - 1) as f64)
+    .collect();
+let x: Vec<f64> = t.iter().map(|v| 2.0 * pi * v / span - pi).collect();
+// Coordinates are views of shape [point count, 1] and [frequency count, 1]
+let (point_shape, frequency_shape) = ([count, 1], [bins, 1]);
+let points = NdView::row_major(&t, &point_shape).map_err(|e| e.to_string())?;
+let frequencies = NdView::row_major(&omega, &frequency_shape).map_err(|e| e.to_string())?;
+let angles = NdView::row_major(&x, &point_shape).map_err(|e| e.to_string())?;
+let type3 = || NufftTransform::Type3 {
+    points,
+    frequencies,
+};
+let spec = NufftPlanSpec::new(FftDirection::Forward, Normalization::Unscaled, accuracy);
+let cx = ExecutionContext::sequential();
+let l1: f64 = c.iter().map(|v| v.norm()).sum();
+let gap = |p: &[Complex<f64>], q: &[Complex<f64>]| {
+    p.iter()
+        .zip(q)
+        .map(|(a, b)| (*a - *b).norm())
+        .fold(0.0_f64, f64::max)
+        / l1
+};
+
+// Compute type 3 with a plan and compare with function nufft_type3
+let plan = NufftPlan::new(type3(), spec).map_err(|e| e.to_string())?;
+let mut workspace = plan.workspace(()).map_err(|e| e.to_string())?;
+let mut planned = vec![Complex::new(0.0, 0.0); bins];
+plan.execute_into(&c[..], &mut planned[..], &mut workspace, cx)
+    .map_err(|e| e.to_string())?;
+let once = nufft_type3(
+    points,
+    &c[..],
+    frequencies,
+    FftDirection::Forward,
+    Normalization::Unscaled,
+    accuracy,
+)
+.map_err(|e| e.to_string())?;
+// Independent check: direct sum Σ_j c_j exp(−i ω_ℓ t_j)
+let direct: Vec<Complex<f64>> = omega
+    .iter()
+    .map(|w| {
+        c.iter()
+            .zip(&t)
+            .map(|(cj, tj)| *cj * Complex::from_polar(1.0, -w * tj))
+            .sum()
+    })
+    .collect();
+
+// Also compute type 1 (16 modes) with function nufft_type1 and a plan, and compare
+let modes = [bins];
+let type1 = NufftTransform::Type1 {
+    points: angles,
+    modes: &modes,
+};
+let plan1 = NufftPlan::new(type1, spec).map_err(|e| e.to_string())?;
+let mut workspace1 = plan1.workspace(()).map_err(|e| e.to_string())?;
+let mut planned1 = vec![Complex::new(0.0, 0.0); bins];
+plan1
+    .execute_into(&c[..], &mut planned1[..], &mut workspace1, cx)
+    .map_err(|e| e.to_string())?;
+let once1 = nufft_type1(
+    angles,
+    &c[..],
+    &modes,
+    FftDirection::Forward,
+    Normalization::Unscaled,
+    accuracy,
+)
+.map_err(|e| e.to_string())?;
+
+// Prepare type 3 at limits equal to diagnostics and with only one field decreased by 1
+let d: NufftDiagnostics = plan.diagnostics();
+let exact = NufftLimits {
+    preparation_bytes: d.preparation_bytes,
+    workspace_bytes: d.workspace_bytes,
+    grid_points: d.grid_points,
+    stencil_visits: d.stencil_visits,
+    kernel_support: d.kernel_support,
+};
+let label = |outcome: Result<NufftPlan<f64>, SciOxideError>| match outcome {
+    Ok(_) => "Success".to_string(),
+    Err(e) => format!("{:?}", e.kind()),
+};
+let fields = [
+    ("kernel_support", d.kernel_support),
+    ("grid_points", d.grid_points),
+    ("stencil_visits", d.stencil_visits),
+    ("workspace_bytes", d.workspace_bytes),
+    ("preparation_bytes", d.preparation_bytes),
+];
+let mut rows = Vec::new();
+for (index, (name, value)) in fields.into_iter().enumerate() {
+    let mut tight = exact;
+    match index {
+        0 => tight.kernel_support -= 1,
+        1 => tight.grid_points -= 1,
+        2 => tight.stencil_visits -= 1,
+        3 => tight.workspace_bytes -= 1,
+        _ => tight.preparation_bytes -= 1,
+    }
+    let at = label(NufftPlan::new(type3(), spec.with_limits(exact)));
+    let below = label(NufftPlan::new(type3(), spec.with_limits(tight)));
+    rows.push((name, value, at, below));
+}
+
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let type3_columns = serde_json::json!([
+    { "key": "0", "label": "Kernel width w", "type": "integer" },
+    { "key": "1", "label": "Grid points G", "type": "integer" },
+    { "key": "2", "label": "Estimate E_a [-]", "type": "number", "format": sci2 },
+    { "key": "3", "label": "Estimate E_r [-]", "type": "number", "format": sci2 },
+    { "key": "4", "label": "Difference from direct sum / Σ|c_j| [-]", "type": "number", "format": sci2 },
+    { "key": "5", "label": "nufft_type3–plan difference / Σ|c_j| [-]", "type": "number", "format": sci2 },
+    { "key": "6", "label": "nufft_type1–plan difference / Σ|c_j| [-]", "type": "number", "format": sci2 }
+]);
+let summary = (
+    d.kernel_support,
+    d.grid_points,
+    d.approximation_error,
+    d.roundoff_error,
+    gap(&planned, &direct),
+    gap(&once, &planned),
+    gap(&once1, &planned1),
+);
+emit_table_with_columns!(
+    type3_columns,
+    vec![summary],
+    metadata = serde_json::json!({ "id": "type3" })
+);
+let limit_columns = serde_json::json!([
+    { "key": "0", "label": "NufftLimits field" },
+    { "key": "1", "label": "Diagnostic value", "type": "integer" },
+    { "key": "2", "label": "Limit = diagnostic value" },
+    { "key": "3", "label": "Limit one smaller in this field only" }
+]);
+emit_table_with_columns!(
+    limit_columns,
+    rows,
+    metadata = serde_json::json!({ "id": "limits" })
+);
+```
+
+At default requested $10^{-9}$ and $\omega_{\max}=10$ rad/day, the kernel width is 12, grid size 512, and estimates $E_a=1.5\times10^{-10}$ and $E_r=4.7\times10^{-15}$.
+The direct-sum difference is $3.0\times10^{-12}$ times the input 1-norm, within the requested range.
+Requesting $10^{-12}$ widens the kernel to 15 and lowers the difference ratio to $7.6\times10^{-15}$.
+At $\omega_{\max}=50$ rad/day the grid grows to 2048 points and workspace from 38048 B to 152288 B, while kernel width and total visits 672 stay unchanged.
+Total visits are the sum of point and frequency counts, 56, times kernel width ($56\times12=672$), independent of grid size.
+Functions `nufft_type3` and `nufft_type1` exactly match plan results in every case.
+
+In the limits table, preparation succeeds with every field exactly equal to its diagnostic value; decreasing only that field by 1 gives `ResourceLimit`.
+For this plan, `NufftDiagnostics` values equal the quantities used in preparation-limit checks.
+The plan does not narrow kernels or shrink grids to satisfy limits, so lowering a limit fails preparation rather than producing a less accurate plan.
+
+## Summary
+
+Type 1 sums exponentials from nonuniform point values to integer modes, type 2 from integer modes to nonuniform points, and type 3 from nonuniform points to arbitrary angular frequencies.
+`FftDirection` selects the sign; `Normalization` and the number of summed terms determine factor $s$.
+Type-1 and type-2 coordinates are angles with period $2\pi$; modes increase from $-\lfloor N/2\rfloor$, and coordinates should be supplied in $[-\pi,\pi]$.
+Plans retain no borrows; read the selected kernel width, grid, and error estimates with `diagnostics()`, and impose storage and work limits with `NufftLimits`.
+A limit below the preparation requirement gives `ResourceLimit`, without switching to a narrower kernel or smaller grid.
+Type 2 is not the inverse of type 1 but becomes its adjoint when the direction is reversed; solve inverse problems separately using that adjoint.
+
+## Further reading
+
+- [NUFFT kernels and requested accuracy](../nufft-kernel-and-accuracy/): examine how kernel widths and oversampled grids are chosen, the formulas for error estimates $E_a$ and $E_r$, and type-3 accuracy and cost.
+- [Fourier sums of irregular observations with NUFFT](../../examples/nonuniform-periodogram/): compute Fourier sums of a variable-star light curve with type 1 and examine relationships among requested accuracy, kernel width, grid, and work.
+- [FFT plans, workspaces, and caches](../plans-workspaces-and-providers/): examine ownership of grid FFT plans and workspaces and injection of [external FFT implementations](oxref:fft-providers).

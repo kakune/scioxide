@@ -1,0 +1,531 @@
+---
+title: Plan・要件・作業領域の再利用
+description: 手法オブジェクト・Plan・要件・作業領域の構成と種類ごとの型の対応、DerivativeRequest と DerivativeShape による作業領域の大きさ、容量の検査 check と事前確保 try_reserve、作業領域の上限とエラーの分類（ResourceLimit、DimensionMismatch、AllocationFailure）、作業領域の使い回しと拒否の実測、所有値を返す API と出力先を指定する API _into、作業領域を使わない derivative_into、DifferentiationResult の読み方。
+sidebar:
+  order: 345
+references:
+  differentiate-capacity-checks: "容量の検査と事前確保"
+  differentiate-owned-borrowed: "所有値を返す-api-と出力先を指定する-api"
+  differentiate-plans-requirements: "plan要件作業領域"
+---
+
+数値微分は最適化の各反復や時間発展の各段のように、同じ形の導関数を何度も求める場面で使われることが多い。
+そのたびに作業用のメモリを確保すると、確保に時間がかかるうえ、確保の失敗が計算の途中で起こりうる。
+`scioxide-differentiate` は、設定だけを持つ手法オブジェクト、前計算したデータを持つ Plan、評価に必要なメモリの大きさを表す要件、そのメモリを確保して使い回す作業領域を別々の型にしている。
+このページでは種類ごとの型の対応、容量の検査と事前確保、作業領域の使い回しと拒否、所有値を返す API と出力先を指定する API を説明する。
+評価回数と反復回数の上限、レポートと結果を出力に反映する規則、関数の受け渡しの形は [評価回数の上限・レポート・結果の出力への反映](../budgets-reports-and-publication/) にある。
+作業領域と再現性についてクレートに共通の考え方は [実行形式・作業領域・再現性](../../../concepts/workspaces-and-reproducibility/) にある。
+
+## Plan・要件・作業領域
+
+SciOxide では作成時に前計算したデータ（表、節点と重み、構造など）を持ち、多くの入力に使い回す不変の値を Plan と呼ぶ。
+検査済みの設定だけを持つ値は Plan ではなく、手法オブジェクトと呼んで区別する。
+このクレートの手法オブジェクト `FiniteDifference`、`AdaptiveDifference`、`ComplexStep` は設定だけを持ち、評価のたびに、その演算が使う設定を検査する。
+入力の次元 $n$ は評価点 $\mathbf{x}$ の長さで、関数の出力の数 $m$ はヤコビ行列と方向微分の引数で決まる。
+そのため、手法オブジェクトの作業領域の大きさは手法オブジェクトと演算の形の組 [`DerivativeRequest`](https://docs.rs/scioxide-differentiate/0.1.0/scioxide_differentiate/struct.DerivativeRequest.html)`::new(&method, shape)` で表す。
+形 [`DerivativeShape`](https://docs.rs/scioxide-differentiate/0.1.0/scioxide_differentiate/struct.DerivativeShape.html) は `gradient(n)`、`jacobian(n, m)`、`hessian(n)`、`jvp(n, m)` の四つで、出力の要素数はそれぞれ $n$、$mn$、$n^2$、$m$ である。
+1 変数の関数の導関数を出力先を指定する API で求めるときは、1 変数の勾配 `gradient(1)` か、二階なら `hessian(1)` の形を使う。
+固定刻みの一階導関数だけは作業領域を使わない `FiniteDifference::derivative_into` でも求まる（[所有値を返す API と出力先を指定する API](#所有値を返す-api-と出力先を指定する-api)）。
+
+Plan は `ColoredJacobianPlan`、`PhysicalDifferencePlan`、`ComplexStepPlan` の三つである。
+`ColoredJacobianPlan` は列の彩色から各列の行の位置と許容誤差を、`PhysicalDifferencePlan` と `ComplexStepPlan` は与えた節点の差分の重みを前計算する。
+節点を指定する差分法オブジェクト `RelativeDifference` と `RelativeComplexStep` は節点の変位だけを持ち、重みは評価のたびに丸めのあとに残った変位から計算し直す。
+Plan と節点を指定する差分法オブジェクトはどれも `new` で作り、演算、次元、設定を作成時に検査して大きさを固定する。
+どれも関数に依存しないので、一度作れば何度でも使える。
+作成時に評価点を固定するのは `PhysicalDifferencePlan` と `ComplexStepPlan` だけで、ほかは評価点を評価のたびに受け取る。
+`ColoredJacobianPlan` は彩色の `ColoringSchedule` を借用する。
+
+手法オブジェクトでは、作業領域の型の関連関数 `workspace_requirements(request)` が評価に必要なメモリの大きさを要件として返し、`workspace(request)` が空の作業領域にその要件の分を事前確保して返す。
+Plan と節点を指定する差分法オブジェクトでは、そのメソッド `workspace_requirements(())` と `workspace(())` が同じことをする。
+要件の `bytes()` は、新しい作業領域がその評価のために保持する配列の大きさの合計（バイト）である。
+入れ子の配列も数え、スタックに置く値、アロケーターの付随情報、準備の途中の一時的な確保は数えない。
+大きさを決めるのは演算の形、関数の値の型、適応差分と彩色の準位の数、彩色の構造が持つ非零要素の数、節点の数で、評価点や境界の値には依存しない。
+
+| 手法オブジェクト・Plan | 要件を求める呼び出し | 要件の型 | 作業領域の型 | 関数の値の型 |
+|---|---|---|---|---|
+| `FiniteDifference<S>` | `FiniteDifferenceWorkspace::<S>::workspace_requirements(request)` | [`FiniteDifferenceRequirements<S>`](https://docs.rs/scioxide-differentiate/0.1.0/scioxide_differentiate/struct.FiniteDifferenceRequirements.html) | [`FiniteDifferenceWorkspace<S>`](https://docs.rs/scioxide-differentiate/0.1.0/scioxide_differentiate/struct.FiniteDifferenceWorkspace.html) | 実数 `S` |
+| `AdaptiveDifference<S>` | `AdaptiveDifferenceWorkspace::<T>::workspace_requirements(request)` | [`AdaptiveDifferenceRequirements<T>`](https://docs.rs/scioxide-differentiate/0.1.0/scioxide_differentiate/struct.AdaptiveDifferenceRequirements.html) | [`AdaptiveDifferenceWorkspace<T>`](https://docs.rs/scioxide-differentiate/0.1.0/scioxide_differentiate/struct.AdaptiveDifferenceWorkspace.html) | 実数か複素数 `T` |
+| `ColoredJacobianPlan<S>` | `plan.workspace_requirements::<T>(())` | [`ColoredJacobianRequirements<T>`](https://docs.rs/scioxide-differentiate/0.1.0/scioxide_differentiate/struct.ColoredJacobianRequirements.html)（Plan を借用） | [`ColoredJacobianWorkspace<T>`](https://docs.rs/scioxide-differentiate/0.1.0/scioxide_differentiate/struct.ColoredJacobianWorkspace.html) | 実数か複素数 `T` |
+| `PhysicalDifferencePlan<S>` | `plan.workspace_requirements::<T>(())` | [`PhysicalDifferenceRequirements<T>`](https://docs.rs/scioxide-differentiate/0.1.0/scioxide_differentiate/struct.PhysicalDifferenceRequirements.html) | [`PhysicalDifferenceWorkspace<T>`](https://docs.rs/scioxide-differentiate/0.1.0/scioxide_differentiate/struct.PhysicalDifferenceWorkspace.html) | 実数か複素数 `T` |
+| `RelativeDifference<S>` | `method.workspace_requirements::<T>(())` | [`RelativeDifferenceRequirements<T>`](https://docs.rs/scioxide-differentiate/0.1.0/scioxide_differentiate/struct.RelativeDifferenceRequirements.html)（手法オブジェクトを借用） | [`RelativeDifferenceWorkspace<T>`](https://docs.rs/scioxide-differentiate/0.1.0/scioxide_differentiate/struct.RelativeDifferenceWorkspace.html) | 実数か複素数 `T` |
+| `ComplexStep<S>` | `ComplexStepWorkspace::<S>::workspace_requirements(request)` | [`ComplexStepRequirements<S>`](https://docs.rs/scioxide-differentiate/0.1.0/scioxide_differentiate/struct.ComplexStepRequirements.html) | [`ComplexStepWorkspace<S>`](https://docs.rs/scioxide-differentiate/0.1.0/scioxide_differentiate/struct.ComplexStepWorkspace.html) | 複素数 `Complex<S>` |
+| `ComplexStepPlan<S>`、`RelativeComplexStep<S>` | `plan.workspace_requirements(())` | `ComplexStepRequirements<S>`（Plan・手法オブジェクトを借用） | `ComplexStepWorkspace<S>` | 複素数 `Complex<S>` |
+
+`S` は座標の実数の型（`f32` か `f64`）で、`T` は関数の値の型である。
+適応差分、彩色、節点差分は複素数の値を返す関数も受け取り、実部と虚部を実数の座標で微分する。
+値の型によって配列の大きさが変わるので、`AdaptiveDifferenceWorkspace::<f64>::workspace_requirements(request)` や `plan.workspace_requirements::<f64>(())` のように型を指定する。
+`ComplexStep` の要件は手法オブジェクトを借用しないが、`ComplexStepWorkspace::workspace_requirements` に `hessian(n)` の形を渡すと `InvalidInput` を返す。
+複素ステップのヘッセ行列は `ComplexStepPlan` か `RelativeComplexStep` で求める（[複素ステップ微分と解析的拡張](../complex-step/)）。
+借用する要件は借用元の Plan や手法オブジェクトより長くは保持できない。
+どの作業領域も、前の大きな要件の分を含めて保持している配列の大きさ `retained_bytes()`（バイト）を確保なしに返す。
+`FiniteDifferenceWorkspace` はさらに、最後に事前確保か評価に使った形の次元 `input_dimension()`、`output_dimension()` も返す。
+
+## 要件と作業領域の実測
+
+次のセルは上の表の六つの手法オブジェクトと Plan（`ComplexStepPlan` と `RelativeComplexStep` を除く）について、$n$ 変数の勾配（彩色は $n \times n$ のヤコビ行列）の要件の大きさを読み、空の作業領域に `check`、`try_reserve`、`check` を順に適用する。
+彩色は対角の構造（全列が同じ色）、節点の種類は各軸 3 点とする。
+表は選んだ $n$ での要件の大きさ、二つの `check` の結果、事前確保後の `retained_bytes()` を示し、図は $n = 1, \ldots, 16$ の要件の大きさを対数軸に描いて、選んだ $n$ を縦線で示す。
+要件の大きさは `usize` の大きさに依存する配列を含むので、ブラウザ（wasm32）とネイティブの 64 ビット環境では値が少し違う。
+
+```rust
+//| id: differentiate-workspace-reuse
+//| ref: differentiate-workspace-reuse
+//| title: 種類ごとの要件と作業領域の事前確保
+//| run: reactive
+//| crates: [scioxide-core, scioxide-differentiate]
+//| inputs:
+//|   n: {"type":"range","label":"変数の数 n [-]","min":1,"max":16,"step":1,"value":3}
+//| cases:
+//|   - {"id":"sixteen","label":"n = 16","description":"彩色の要件は列ごとの外挿の表の分だけ n に比例して増え、複素ステップの要件は 24n + 16 バイトのまま小さい。","inputs":{"n":16}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"requirements","path":"/rows/0/2","equals":"NeedsGrowth"}
+//|       - {"artifact":"requirements","path":"/rows/0/3","equals":"Sufficient"}
+//|       - {"artifact":"requirements","path":"/rows/3/2","equals":"NeedsGrowth"}
+//|       - {"artifact":"requirements","path":"/rows/3/3","equals":"Sufficient"}
+//|       - {"artifact":"requirements","path":"/rows/5/3","equals":"Sufficient"}
+//|       - {"artifact":"requirements","path":"/rows/2/1","equals":88}
+//|   - case: sixteen
+//|     expect:
+//|       - {"artifact":"requirements","path":"/rows/2/1","equals":400}
+//|       - {"artifact":"requirements","path":"/rows/3/3","equals":"Sufficient"}
+use scioxide_core::{Capacity, ColoringKind, ColoringSchedule, SciOxideError, StructuralPattern};
+use scioxide_differentiate::DerivativeOperation::Gradient;
+use scioxide_differentiate::{
+    AdaptiveDifference, AdaptiveDifferenceWorkspace, ColoredJacobianPlan,
+    ColoredJacobianWorkspace, ComplexStep, ComplexStepWorkspace, DerivativeRequest,
+    DerivativeShape, FiniteDifference, FiniteDifferenceWorkspace, NodeDifferenceOptions,
+    PhysicalDifferencePlan, PhysicalDifferenceWorkspace, RelativeDifference,
+    RelativeDifferenceWorkspace,
+};
+
+type Row = (&'static str, usize, &'static str, &'static str, usize);
+fn capacity(c: Capacity) -> &'static str {
+    match c {
+        Capacity::Sufficient => "Sufficient",
+        Capacity::NeedsGrowth => "NeedsGrowth",
+    }
+}
+/// n 変数の六つの種類の要件を求め、空の作業領域に check、try_reserve、check を適用する。
+fn lifecycle(n: usize) -> Result<Vec<Row>, SciOxideError> {
+    let x: Vec<f64> = (0..n).map(|i| 0.5 + 0.1 * i as f64).collect();
+    let shape = DerivativeShape::gradient(n);
+    let (fixed, adaptive) = (FiniteDifference::default(), AdaptiveDifference::default());
+    let complex = ComplexStep::<f64>::default();
+    let diagonal = StructuralPattern::new(n, n, (0..=n).collect(), (0..n).collect())?;
+    let schedule =
+        ColoringSchedule::new(diagonal, ColoringKind::DerivativeColumns, vec![0; n])?;
+    let colored = ColoredJacobianPlan::new(&schedule, adaptive.clone())?;
+    let offsets = [-1e-3, 0.0, 1e-3];
+    let axes: Vec<&[f64]> = vec![&offsets[..]; n];
+    let options = NodeDifferenceOptions::default();
+    let relative = RelativeDifference::new(Gradient, &axes, 1, options)?;
+    let nodes: Vec<Vec<f64>> = x
+        .iter()
+        .map(|c| offsets.iter().map(|d| c + d).collect())
+        .collect();
+    let node_refs: Vec<&[f64]> = nodes.iter().map(Vec::as_slice).collect();
+    let physical = PhysicalDifferencePlan::new(Gradient, &x, &node_refs, 1, options)?;
+    let mut rows = Vec::new();
+    macro_rules! reserve {
+        ($name:expr, $requirements:expr, $workspace:ty) => {{
+            let r = $requirements;
+            let mut w = <$workspace>::default();
+            let before = w.check(&r)?;
+            w.try_reserve(&r)?;
+            let after = w.check(&r)?;
+            let held = w.retained_bytes()?;
+            rows.push(($name, r.bytes(), capacity(before), capacity(after), held));
+        }};
+    }
+    let request = DerivativeRequest::new(&fixed, shape);
+    let r = FiniteDifferenceWorkspace::workspace_requirements(request)?;
+    reserve!("FiniteDifference", r, FiniteDifferenceWorkspace<f64>);
+    let request = DerivativeRequest::new(&adaptive, shape);
+    let r = AdaptiveDifferenceWorkspace::<f64>::workspace_requirements(request)?;
+    reserve!("AdaptiveDifference", r, AdaptiveDifferenceWorkspace<f64>);
+    let request = DerivativeRequest::new(&complex, shape);
+    let r = ComplexStepWorkspace::workspace_requirements(request)?;
+    reserve!("ComplexStep", r, ComplexStepWorkspace<f64>);
+    let r = colored.workspace_requirements::<f64>(())?;
+    reserve!("ColoredJacobianPlan", r, ColoredJacobianWorkspace<f64>);
+    let r = physical.workspace_requirements::<f64>(())?;
+    reserve!(
+        "PhysicalDifferencePlan",
+        r,
+        PhysicalDifferenceWorkspace<f64>
+    );
+    let r = relative.workspace_requirements::<f64>(())?;
+    reserve!("RelativeDifference", r, RelativeDifferenceWorkspace<f64>);
+    Ok(rows)
+}
+
+let n = n as usize;
+let (mut table, mut series) = (Vec::new(), Vec::new());
+for k in 1..=16 {
+    let rows = lifecycle(k).map_err(|e| e.to_string())?;
+    series.resize_with(rows.len(), Vec::new);
+    for (points, row) in series.iter_mut().zip(&rows) {
+        points.push([k as f64, row.1 as f64]);
+    }
+    if k == n {
+        table = rows;
+    }
+}
+let series: Vec<_> = table
+    .iter()
+    .zip(series)
+    .map(|(row, points)| serde_json::json!({ "name": row.0, "points": points }))
+    .collect();
+emit_chart!(serde_json::json!({
+    "kind": "line",
+    "dataZoom": true,
+    "tooltip": true,
+    "xLabel": "変数の数 n [-]",
+    "yLabel": "要件の大きさ [バイト]",
+    "yType": "log",
+    "series": series,
+    "annotations": [{ "kind": "line", "axis": "x", "value": n, "label": "選んだ n" }]
+}));
+let columns = serde_json::json!([
+    { "key": "0", "label": "手法オブジェクト・Plan" },
+    { "key": "1", "label": "要件の大きさ [バイト]", "type": "integer" },
+    { "key": "2", "label": "事前確保前の check" },
+    { "key": "3", "label": "事前確保後の check" },
+    { "key": "4", "label": "事前確保後の保持量 [バイト]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    table,
+    metadata = serde_json::json!({ "id": "requirements" })
+);
+```
+
+既定の $n = 3$ では、ブラウザで要件の大きさは複素ステップの 88 バイトから彩色の 13032 バイトまで、150 倍ほど違う。
+どの種類でも、事前確保前の `check` は `NeedsGrowth`、事前確保後は `Sufficient` になり、事前確保後の `retained_bytes()` は要件の大きさと一致する。
+図では、彩色の要件だけが 1 列あたり 4344 バイトで $n$ に比例して増え、ほかの種類は $n$ によらない部分が大きいのでゆっくり増える。
+彩色の作業領域は列ごとに外挿の表（既定で 16 準位）を持つので、構造の非零要素の数と準位の数の積に比例する。
+複素ステップの勾配の作業領域は複素数の点（$16n$ バイト）、関数の値（16 バイト）、勾配（$8n$ バイト）だけを持ち、$24n + 16$ バイトになる。
+
+## 容量の検査と事前確保
+
+作業領域は `Default::default()` で空のものを作り、次の手順で要件に合わせる。
+`workspace(request)` と `workspace(())` はこの手順を一度に済ませる。
+
+1. `check(&requirements)` は確保をせずに容量を調べ、`Capacity::Sufficient` か `Capacity::NeedsGrowth` を返す。
+2. `NeedsGrowth` なら、`try_reserve(&requirements)` で足りない配列を伸ばす。
+3. `Sufficient` になった作業領域を出力先を指定する API に渡す。
+
+作業領域が保持してよい大きさの上限は、手法オブジェクト `FiniteDifference`、`AdaptiveDifference`、`ComplexStep` と節点差分の選択肢 `NodeDifferenceOptions` の `with_max_workspace_bytes` で決める。
+既定では上限はない。
+Plan と節点を指定する差分法オブジェクトは、作成時に渡した手法オブジェクトか選択肢の上限を使う（`ColoredJacobianPlan` は `AdaptiveDifference`、`ComplexStepPlan` と `RelativeComplexStep` は `ComplexStep`、`PhysicalDifferencePlan` と `RelativeDifference` は `NodeDifferenceOptions` の上限）。
+上限は前の大きな評価のために確保して残っている容量も含めて、作業領域が保持しているすべての容量に掛かる。
+
+| 呼び出し | エラー | 起こる条件 |
+|---|---|---|
+| `workspace_requirements` | `ResourceLimit` | 要件の大きさが上限を超える |
+| `check` | `ResourceLimit` | 作業領域が保持している大きさが上限を超える |
+| `try_reserve` | `ResourceLimit` | 伸ばしたあとの見積もりが上限を超える（何も確保しない）か、伸ばしたあとに実際に保持している大きさが上限を超える |
+| `try_reserve` | `AllocationFailure` | 配列を伸ばせない。それまでに伸ばした配列は残る |
+| 出力先を指定する API | `ResourceLimit` | 要件か、作業領域が保持している大きさが上限を超える |
+| 出力先を指定する API | `DimensionMismatch` | 作業領域の容量が要件に足りない。期待値は必要な大きさ、実際の値は保持している大きさ（どちらもバイト） |
+
+大きさが `usize` に収まらないときは、どの呼び出しも `SizeOverflow` を返す。
+アロケーターは要求より大きな容量を返すことがあるので、`try_reserve` は確保の前に見積もった大きさと、確保のあとに実際に保持している大きさの両方を上限と比べる。
+`try_reserve` が `AllocationFailure` で止まったら、評価の前に `check` をやり直す。
+
+出力先を指定する API（名前が `_into` で終わる形）は作業領域を伸ばさない。
+容量が足りないか上限を超えるときは、関数を一度も呼ばずにエラーを返す。
+一つの作業領域は同じ種類の評価のうち要件を満たすものすべてに使い回せる。
+たとえば $m$ 出力のヤコビ行列のために事前確保した `FiniteDifferenceWorkspace` は、同じ $n$ の勾配にもそのまま使える。
+大きい評価に使うときは、その要件で `check` と `try_reserve` をやり直す。
+エラーで止まった評価のあとも、作業領域の中身は変わりうるが壊れず、そのまま次の評価に使える。
+保持している容量が上限を超えたときは、上限の大きい手法オブジェクトで使うか、新しい作業領域に替える。
+
+## 作業領域の使い回しと拒否
+
+次の二つのセルは固定刻みの `FiniteDifference` の作業領域で上の規則を確かめる。
+関数は $f(\mathbf{x}) = \sum_i x_i^2$ で、勾配の厳密値は $2\mathbf{x}$ である。
+ヤコビ行列の評価では 2 つ目の出力 $\sum_i x_i$ も返す。
+次のブロックは二つのセルが共有する関数の定義で、`squares` が出力の配列の長さに応じてこの一つか二つの値を書く。
+
+```rust
+//| id: differentiate-workspace-model
+//| kind: definitions
+//| title: 二乗和と和を書く関数
+//| crates: [scioxide-core]
+use scioxide_core::SciOxideError;
+
+/// y₀ = Σ xᵢ²。出力が 2 つあれば y₁ = Σ xᵢ も書く。
+pub(crate) fn squares(p: &[f64], y: &mut [f64]) -> Result<(), SciOxideError> {
+    y[0] = p.iter().map(|v| v * v).sum();
+    if let Some(second) = y.get_mut(1) {
+        *second = p.iter().sum();
+    }
+    Ok(())
+}
+```
+
+最初のセルは $n$ 変数の勾配の作業領域を一つだけ事前確保し、点を少しずつ動かして `gradient_into` を 1000 回呼ぶ。
+評価回数の合計を理論値 $1000 (2n + 1)$ と、勾配の最大誤差を厳密値と、1000 回の後の保持量の増加を 0 と比べる。
+
+```rust
+//| id: differentiate-workspace-repeat
+//| ref: differentiate-workspace-repeat
+//| title: 一つの作業領域による 1000 回の勾配
+//| run: reactive
+//| uses: [differentiate-workspace-model]
+//| crates: [scioxide-core, scioxide-differentiate]
+//| inputs:
+//|   n: {"type":"range","label":"変数の数 n [-]","min":1,"max":8,"step":1,"value":3}
+//| cases:
+//|   - {"id":"eight","label":"n = 8","description":"評価回数の合計は 1000 · 17 = 17000 回で、作業領域は 1000 回の後も伸びない。","inputs":{"n":8}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"reuse","path":"/rows/0/1","equals":7000}
+//|       - {"artifact":"reuse","path":"/rows/0/2","equals":7000}
+//|       - {"artifact":"reuse","path":"/rows/0/3","range":{"max":1e-8}}
+//|       - {"artifact":"reuse","path":"/rows/0/5","equals":0}
+//|   - case: eight
+//|     expect:
+//|       - {"artifact":"reuse","path":"/rows/0/1","equals":17000}
+//|       - {"artifact":"reuse","path":"/rows/0/3","range":{"max":1e-8}}
+//|       - {"artifact":"reuse","path":"/rows/0/5","equals":0}
+use scioxide_core::{ExecutionContext, SciOxideError};
+use scioxide_differentiate::{
+    DerivativeRequest, DerivativeShape, FiniteDifference, FiniteDifferenceWorkspace,
+};
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let n = n as usize;
+let x: Vec<f64> = (0..n).map(|i| 0.5 + 0.1 * i as f64).collect();
+let s = |e: SciOxideError| e.to_string();
+let method = FiniteDifference::default();
+let request = DerivativeRequest::new(&method, DerivativeShape::gradient(n));
+let mut workspace = FiniteDifferenceWorkspace::workspace(request).map_err(s)?;
+let held = workspace.retained_bytes().map_err(s)?;
+// 1000 点の勾配を同じ作業領域で求める。点と出力の配列も使い回す。
+let (mut point, mut out) = (x.clone(), vec![0.0; n]);
+let (mut total, mut worst) = (0, 0.0_f64);
+for k in 0..1000 {
+    for (p, v) in point.iter_mut().zip(&x) {
+        *p = v + 0.001 * k as f64;
+    }
+    let scope = ExecutionContext::sequential();
+    let report = method
+        .gradient_into(squares, &point, None, None, &mut out, &mut workspace, scope)
+        .map_err(s)?;
+    total += report.evaluations();
+    // 厳密な勾配 2x との差。
+    let errors = out.iter().zip(&point).map(|(g, p)| (g - 2.0 * p).abs());
+    worst = errors.fold(worst, f64::max);
+}
+let growth = workspace.retained_bytes().map_err(s)? - held;
+let columns = serde_json::json!([
+    { "key": "0", "label": "呼び出し [回]", "type": "integer" },
+    { "key": "1", "label": "評価回数の合計 [回]", "type": "integer" },
+    { "key": "2", "label": "理論値 1000(2n + 1) [回]", "type": "integer" },
+    { "key": "3", "label": "勾配の最大誤差 [-]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "事前確保後の保持量 [バイト]", "type": "integer" },
+    { "key": "5", "label": "1000 回後の増加 [バイト]", "type": "integer" }
+]);
+let rows = vec![(1000, total, 1000 * (2 * n + 1), worst, held, growth)];
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "reuse" })
+);
+```
+
+既定の $n = 3$ では、1000 回の `gradient_into` の評価回数の合計は理論値 $1000 (2n + 1) = 7000$ と一致する。
+勾配の最大誤差は $9.7 \times 10^{-11}$ である。
+$f$ は 2 次式なので中心差分の打ち切り誤差は 0 で、この誤差は丸め誤差である。
+1000 回の後も保持量（ブラウザで 1904 バイト）は増えておらず、評価の途中で作業領域は伸びていない。
+
+2 つ目のセルは作業領域と上限の組み合わせごとに評価を試み、拒まれる場合と使える場合を比べる。
+関数は呼ばれた回数を数え、エラーが関数を呼ぶ前に返ったことを確かめる。
+表は評価の結果（終了理由かエラーの分類）、必要な大きさ、作業領域が保持している大きさ、上限、関数を呼んだ回数を示す。
+
+```rust
+//| id: differentiate-workspace-errors
+//| ref: differentiate-workspace-errors
+//| title: 容量の不足と上限の超過による作業領域の拒否
+//| run: reactive
+//| uses: [differentiate-workspace-model]
+//| crates: [scioxide-core, scioxide-differentiate]
+//| inputs:
+//|   n: {"type":"range","label":"変数の数 n [-]","min":1,"max":8,"step":1,"value":3}
+//| cases:
+//|   - {"id":"eight","label":"n = 8","description":"必要な大きさは n とともに増えるが、拒否の分類と関数を呼ばない性質は変わらず、使える場合の評価回数は 2n + 1 = 17 回になる。","inputs":{"n":8}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"rejections","path":"/rows/0/1","equals":"ResourceLimit"}
+//|       - {"artifact":"rejections","path":"/rows/0/5","equals":0}
+//|       - {"artifact":"rejections","path":"/rows/1/1","equals":"DimensionMismatch"}
+//|       - {"artifact":"rejections","path":"/rows/1/3","equals":0}
+//|       - {"artifact":"rejections","path":"/rows/1/5","equals":0}
+//|       - {"artifact":"rejections","path":"/rows/2/1","equals":"DimensionMismatch"}
+//|       - {"artifact":"rejections","path":"/rows/2/5","equals":0}
+//|       - {"artifact":"rejections","path":"/rows/3/1","equals":"Completed"}
+//|       - {"artifact":"rejections","path":"/rows/3/5","equals":7}
+//|       - {"artifact":"rejections","path":"/rows/4/1","equals":"ResourceLimit"}
+//|       - {"artifact":"rejections","path":"/rows/4/5","equals":0}
+//|   - case: eight
+//|     expect:
+//|       - {"artifact":"rejections","path":"/rows/2/1","equals":"DimensionMismatch"}
+//|       - {"artifact":"rejections","path":"/rows/3/5","equals":17}
+//|       - {"artifact":"rejections","path":"/rows/4/1","equals":"ResourceLimit"}
+use scioxide_core::{ExecutionContext, SciOxideError};
+use scioxide_differentiate::{
+    DerivativeRequest, DerivativeShape, DifferentiationReport, FiniteDifference,
+    FiniteDifferenceWorkspace,
+};
+use std::cell::Cell;
+
+let n = n as usize;
+let x: Vec<f64> = (0..n).map(|i| 0.5 + 0.1 * i as f64).collect();
+let calls = Cell::new(0_usize);
+// 呼ばれた回数を数えてから squares を評価する。
+let f = |p: &[f64], y: &mut [f64]| {
+    calls.set(calls.get() + 1);
+    squares(p, y)
+};
+let s = |e: SciOxideError| e.to_string();
+let method = FiniteDifference::default();
+let gradient = DerivativeRequest::new(&method, DerivativeShape::gradient(n));
+let jacobian = DerivativeRequest::new(&method, DerivativeShape::jacobian(n, 2));
+let need_gradient = FiniteDifferenceWorkspace::workspace_requirements(gradient)
+    .map_err(s)?
+    .bytes();
+let need_jacobian = FiniteDifferenceWorkspace::workspace_requirements(jacobian)
+    .map_err(s)?
+    .bytes();
+// 勾配用とヤコビ行列用の作業領域を事前確保し、保持している大きさを読む。
+let mut narrow = FiniteDifferenceWorkspace::workspace(gradient).map_err(s)?;
+let mut wide = FiniteDifferenceWorkspace::workspace(jacobian).map_err(s)?;
+let held = (
+    Some(narrow.retained_bytes().map_err(s)?),
+    Some(wide.retained_bytes().map_err(s)?),
+);
+let small = FiniteDifference::<f64>::default().with_max_workspace_bytes(16);
+let tight = FiniteDifference::default().with_max_workspace_bytes(need_gradient);
+let mut empty = FiniteDifferenceWorkspace::default();
+let mut out = vec![0.0; 2 * n];
+// 評価の結果を、終了理由かエラーの分類の名前にする。
+let result = |r: Result<DifferentiationReport, SciOxideError>| match r {
+    Ok(report) => report.termination().to_string(),
+    Err(e) => format!("{:?}", e.kind()),
+};
+let scope = ExecutionContext::sequential;
+// 各場合の結果と大きさを記録し、関数を呼んだ回数を読んで 0 に戻す。
+calls.set(0);
+let mut rows = Vec::new();
+let mut record = |case, outcome, need, held: Option<usize>, limit: Option<usize>| {
+    rows.push((case, outcome, need, held, limit, calls.replace(0)));
+};
+let request = DerivativeRequest::new(&small, DerivativeShape::gradient(n));
+let r = FiniteDifferenceWorkspace::workspace_requirements(request);
+let outcome = r.map_or_else(|e| format!("{:?}", e.kind()), |_| "要件を返した".into());
+let case = "上限 16 バイトで要件を求める";
+record(case, outcome, need_gradient, None, Some(16));
+let r = method.gradient_into(f, &x, None, None, &mut out[..n], &mut empty, scope());
+record(
+    "空の作業領域で勾配",
+    result(r),
+    need_gradient,
+    Some(0),
+    None,
+);
+let r = method.jacobian_into(f, &x, 2, None, None, &mut out, &mut narrow, scope());
+record(
+    "勾配の作業領域でヤコビ行列",
+    result(r),
+    need_jacobian,
+    held.0,
+    None,
+);
+let r = method.gradient_into(f, &x, None, None, &mut out[..n], &mut wide, scope());
+record(
+    "ヤコビ行列の作業領域で勾配",
+    result(r),
+    need_gradient,
+    held.1,
+    None,
+);
+let r = tight.gradient_into(f, &x, None, None, &mut out[..n], &mut wide, scope());
+let case = "同じ作業領域を、上限を勾配の要件にして";
+record(case, result(r), need_gradient, held.1, Some(need_gradient));
+let columns = serde_json::json!([
+    { "key": "0", "label": "場合" },
+    { "key": "1", "label": "結果" },
+    { "key": "2", "label": "必要な大きさ [バイト]", "type": "integer" },
+    { "key": "3", "label": "保持している大きさ [バイト]", "type": "integer", "nullText": "—" },
+    { "key": "4", "label": "上限 [バイト]", "type": "integer", "nullText": "なし" },
+    { "key": "5", "label": "関数の呼び出し [回]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "rejections" })
+);
+```
+
+既定の $n = 3$ では、拒まれた 4 つの場合はどれも関数を一度も呼んでいない。
+上限 16 バイトの手法オブジェクトでは、要件の 1904 バイト（ブラウザでの値）が上限を超えるので、`workspace_requirements` が `ResourceLimit` を返す。
+空の作業領域を勾配に使った場合と、勾配のために事前確保した作業領域（1904 バイト）をヤコビ行列（2024 バイト）に使った場合は、容量が足りないので `DimensionMismatch` になる。
+逆に、ヤコビ行列のために事前確保した作業領域は勾配の要件を満たすので、そのまま勾配に使え、関数を $2n + 1 = 7$ 回呼んで `Completed` になる。
+同じ作業領域でも、上限を勾配の要件と同じ 1904 バイトにした手法オブジェクトで使うと、保持している 2024 バイトが上限を超えるので `ResourceLimit` で拒まれる。
+上限はその評価の要件ではなく、作業領域が保持している容量に掛かる。
+
+## 所有値を返す API と出力先を指定する API
+
+同じ計算を、必要な制御の量に応じていくつかの形で呼べる（用語の定義は [呼び出しの形](oxref:differentiate-call-forms-terms)）。
+作業領域と出力の扱いに注目すると、形は次のように分かれる。
+
+| 形 | 例 | 受け取るもの | 返すもの | 実行コンテキスト |
+|---|---|---|---|---|
+| ワンショット関数 | `derivative(f, x)`、`gradient(f, x)`、`sparse_jacobian`、`complex_step_derivative` | 関数と点 | 値。成功でない終了はエラー | `ExecutionContext::sequential_native()` |
+| 所有値を返す API | `method.gradient(f, x, bounds, base)`、`plan.evaluate(f, bounds)` | 関数、点、境界など | `DifferentiationResult`（値、推定誤差、レポート） | `ExecutionContext::sequential_native()` |
+| 出力先を指定する API | `method.gradient_into(f, x, bounds, base, out, workspace, scope)`、`plan.evaluate_into(…)` | 所有値を返す API の引数に加え、出力、作業領域、実行コンテキスト | `DifferentiationReport`（値は出力に書く） | 渡した `scope` |
+| 作業領域を使わない出力先を指定する API | `FiniteDifference::derivative_into(f, x, bounds, base, out, scope)` | 1 変数の関数、点、区間、既知の $f(x)$、出力、実行コンテキスト | `DifferentiationReport` | 渡した `scope` |
+
+所有値を返す API は呼ぶたびに作業領域と出力を確保する。
+ワンショット関数は所有値を返す API と同じく逐次に評価し、値だけを返す。
+`derivative` は作業領域を使わない出力先を指定する API `derivative_into` を内部で呼ぶので確保をせず、ほかのワンショット関数は所有値を返す API を呼ぶので確保する。
+終了理由が成功でなければ、`require_success` と同じ規則でエラーにする（[レポートと出力への反映の規則](oxref:differentiate-report-rules)）。
+十分な容量の作業領域を渡した出力先を指定する API は、数値計算のための確保をしない。
+適応差分が `StepSizeLimit` で止まった場合も同じである。
+関数の中の確保と、`Parallel` の標本をエグゼキューターに配るときのエグゼキューターの確保は、それぞれの仕様に従う。
+
+`scope` には、最上位の計算なら `ExecutionContext::sequential()` などの実行コンテキストを、実行中の別の求解の中から呼ぶなら、その求解の `&mut SolveContext` を渡す。
+後者は入れ子の求解になり、親の取り消しと期限を守り、評価回数を親の上限にも数える（[評価回数・反復回数の上限と求解の回数の集計](oxref:differentiate-budgets)）。
+`FiniteDifference::derivative_into` は、1 変数の一階導関数をスタックのメモリだけで計算する。
+区間は `ExtendedInterval` で渡し、刻み、差分の公式、上限は 1 変数の `gradient_into` と同じである。
+1 次元の求根や最適化の内側のように、同じ導関数を何度も求める場面に向く。
+
+所有値を返す API の結果 [`DifferentiationResult`](https://docs.rs/scioxide-differentiate/0.1.0/scioxide_differentiate/struct.DifferentiationResult.html) は、次のメソッドを持つ。
+
+- `values()` は、出力が出力に反映されたときだけ `Some` の値（行優先）を返す。
+- `errors()` は、適応差分と彩色の出力が出力に反映されたときだけ `Some` の推定誤差を返す。
+- `report()` はレポートを返し、`into_parts()` はレポート、値、推定誤差に分ける。
+- `into_values()` は、成功のときだけ値を返し、それ以外は `require_success` のエラーを返す。
+  早く止まった適応差分の最良の推定を使うときは、`values()` か `into_parts()` で読む。
+
+出力先を指定する API では、適応差分と彩色だけが推定誤差の出力配列 `errors` を別に受け取り、値と同時に書く。
+
+## まとめ
+
+手法オブジェクトは設定だけを持ち、Plan は前計算したデータを持つ不変の値で、どちらも関数に依存しないので繰り返し使える。
+手法オブジェクトでは `DerivativeRequest`、Plan と節点を指定する差分法オブジェクトでは `()` で要件を求め、`workspace` か `check` と `try_reserve` で作業領域を用意すれば、出力先を指定する API は数値計算のための確保をせずに何度でも使える。
+一つの作業領域は要件を満たす同じ種類の評価（たとえば大きいヤコビ行列のために事前確保した作業領域での勾配）にも使い回せる。
+容量の足りない作業領域は `DimensionMismatch`、上限を超える要件や保持は `ResourceLimit` で、どちらも関数を呼ぶ前に拒まれ、評価の途中で作業領域が伸びることはない。
+1 変数の一階導関数を繰り返し求めるなら、作業領域の要らない `FiniteDifference::derivative_into` で足りる。
+
+## 次に読むページ
+
+- [評価回数の上限・レポート・結果の出力への反映](../budgets-reports-and-publication/)：出力先を指定する API に評価回数の上限を付けたときのレポート、結果を出力に反映する規則、関数の受け渡しの形を確かめる。
+- [軌道計算で作業領域を再利用し保存量で検算する](../../examples/kepler-orbit-workspace/)：時間発展の各段で同じ作業領域を使い回して力を求め、作業領域を使わない `derivative_into` も使う例題を確かめる。
+- [ワンショット呼び出し・結果・選択](../../api/plans-results-and-selection/)：作業領域の大きさを決める型と結果の型の仕様を一覧で引く。

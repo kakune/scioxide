@@ -1,0 +1,919 @@
+---
+title: 多数の項目の一括評価
+description: 独立な項目の和と平均を lane に詰めて評価する BatchPlan、BatchFunction と BatchData の約束（表と BatchDataFn）、ブロックと群、ペアごとの和による決定論的な結果と誤差の限界、値・前進・逆の方式の選び方、標準誤差とバッチ平均、ワンショット呼び出しの batch_mean と batch_mean_and_grad、jvp_into と hvp_into、作業領域と並列の実行。
+sidebar:
+  order: 390
+references:
+  ad-batch-function-and-data: "batchfunction-と-batchdata"
+  ad-batch-plan-blocks: "batchplan-とブロック"
+  ad-batch-modes: "値前進逆の方式"
+  ad-batch-outputs: "出力と推定値"
+  ad-batch-one-shot: "ワンショット呼び出しの平均と関数のプロバイダー"
+  ad-batch-directional-products: "方向微分とヘッセ行列ベクトル積"
+  ad-batch-workspace: "作業領域と並列の実行"
+---
+
+Monte Carlo 法の期待値、標本ごとの損失の平均、部分的に分離できる関数の和のように、共有のパラメータ $\theta$ と項目ごとの値から同じ式を多数評価し、その和か平均と勾配を求める計算は多い。
+`BatchPlan` は多数の独立な項目を `W` 個ずつ lane（SIMD の 1 要素）に詰めて評価し、勾配を求めるかどうかで数値型を選んで、ワーカーの数によらず同じビットの結果を返す。
+このページは評価する関数とデータの書き方、ブロックと和の順序、方式の選び方、標準誤差、方向微分と作業領域を扱う。
+
+## 和と平均の微分
+
+項目 $i = 0, \dots, n - 1$ について、共有のパラメータ $\theta$、微分対象の入力 $a_i$（微分する項目ごとの値）、微分対象外のデータ $d_i$（微分しない値）から $y_i = f(\theta, a_i, d_i)$ を評価し、和 $F = \sum_i y_i$ か平均 $\bar F = F/n$ を求める。
+微分は線形なので
+
+$$
+\nabla_\theta F = \sum_{i} \nabla_\theta f(\theta, a_i, d_i), \qquad
+\nabla_{a_i} F = \nabla_{a_i} f(\theta, a_i, d_i)
+$$
+
+で、パラメータの勾配は項目ごとの勾配の和、入力の勾配は項目ごとに独立である。
+
+$f(\theta, a, d) = h(q(\theta), a, d)$ のように、パラメータだけで決まる中間量 $q$ があるとする。
+連鎖律から $\nabla_\theta F = J_q(\theta)^\top \sum_i \bigl(\partial h / \partial q\bigr)^{\!\top}$ なので、$q(\theta)$ は 1 回だけ評価し、項目ごとの逆走査は $q$ で止めて随伴を足し合わせ、$q$ から $\theta$ への逆走査は最後に 1 回で済む。
+
+$d_i$ が確率変数 $Z$ の独立な標本なら、$\bar F$ は期待値 $\mathbb{E}[f(\theta, Z)]$ の Monte Carlo 推定量で、その標準誤差は標本標準偏差 $s$ を使って $s/\sqrt{n}$ である。
+$\nabla_\theta \bar F$ は経路ごとの導関数（pathwise derivative）の平均で、微分と期待値を交換できるとき $\nabla_\theta \mathbb{E}[f]$ の不偏推定量になる。
+交換できる十分条件は、$f$ が $\theta$ についてほとんど確実に微分可能で、Lipschitz 連続であり、その定数が可積分であることである。
+$\max(S - K, 0)$ のような折れ点が確率 0 の集合にしかない関数はこれを満たす。
+$\mathbf{1}\{S > K\}$ のような不連続な関数では、経路ごとの導関数がほとんどいたるところで 0 になり、期待値の導関数を推定できない。
+
+## `BatchFunction` と `BatchData`
+
+`BatchFunction<S>` は評価する関数を、数値型 `R: Real<S>` について一度だけ書くトレイトで、ワーカーで共有するので `Sync` を要求する。
+
+- `type Shared<R: Real<S>>` は、項目によらない中間量 $q(\theta)$ の型である。
+- `prepare(parameters)` はパラメータから `Shared<R>` を作り、ブロック（後述）ごとに 1 回呼ばれる。
+- `item(shared, inputs, data)` は 1 つの群（`W` 個の項目）について 1 回呼ばれ、lane ごとに 1 つの項目を評価する。
+  `inputs` は微分対象の入力の `R` で、`data` は微分対象外のデータの `R::Base`（`Lanes<S, W>`）である。
+  データは `R::passive(d)` で算術に入れる。
+
+どちらのメソッドも数値型について汎用なので、同じ実装が値の評価（`Lanes`）、前進モード（`MultiDual<Lanes, N>`）、逆モード（`Var<Lanes>`）、方向微分（`Dual<Lanes>`）で動く。
+単体試験では `prepare` と `item` を `f64` で直接呼べる。
+エラーを返すと一括評価が中止される。
+`item` は lane のある型で動くので、値による分岐は `if` ではなく `select` で書く（[分岐・マスク・表引き](../control-flow/)）。
+
+`BatchData<S>` は項目ごとの値（微分対象の入力、方向、微分対象外のデータ）のプロバイダーで、これも `Sync` を要求する。
+各項目は `width` 個の値を持ち、`fill(first, width, column, lanes)` は項目 `first..first + lanes.len()` の `column` 番目の値を `lanes` に書く。
+一括評価は値ごと・群ごとに 1 回、`column < width` と高々 `W` 個の lane で呼ぶ。
+連続する項目の同じ値が隣り合うプロバイダー（同じ配列の重なったウインドウ、値ごとの配列）は、並べ替えずに写せる。
+
+スライス `[S]`、`Vec<S>`、配列 `[S; N]` は行優先の表（項目 × `width`）として `BatchData` を実装し、項目 `i` の `column` 番目の値は `i·width + column` 番目の要素である。
+`column ≥ width` なら `OutOfBounds`（数量 `batch_columns`）、行が足りなければ `OutOfBounds`（数量 `batch_rows`）を返す。
+微分対象の入力やデータがないときは、要素 0 個の配列 `&[]` を渡す。
+`BatchDataFn::new(|first, width, column, lanes| …)` は `fill` と同じ引数のクロージャをプロバイダーにし、自身は検査も確保もしない。
+乱数のように項目と列の番号から値を作れるプロバイダーは、これで表を作らずに渡せる（[ワンショット呼び出しの平均と関数のプロバイダー](#ワンショット呼び出しの平均と関数のプロバイダー)）。
+
+## `BatchPlan` とブロック
+
+`BatchPlan::<W>::new(items, parameters, inputs, data, reduction, options)` は、`items` 個の項目、`parameters` 個の共有のパラメータ、項目ごとに `inputs` 個の微分対象の入力と `data` 個の微分対象外の値を持つ Plan を作る。
+`W`（既定 8）は 1 つの `Lanes` に詰める項目の数である。
+`W = 0` なら `InvalidInput`（引数 `lanes`、`OutOfRange`）、`BatchReduction::Mean` で `items = 0` なら `InvalidInput`（引数 `items`、`Empty`）を返す。
+
+`BatchReduction` は `Sum`（既定、項目がなければ $+0$）と `Mean` の 2 つである。
+
+項目は連続するブロックに分けられ、ブロックは `W` 個ずつの群に分けられる。
+ブロックの大きさ `block()` は `BatchOptions::with_block` の値（既定 256）を `W` の倍数に切り上げたもので、ブロックの数は `blocks()` $= \lceil n / \text{block} \rceil$ である。
+最後の群の欠けた lane には最後の項目を繰り返して入れ、その lane はすべての出力から除く。
+逆モードでは欠けた lane のシードを 0 にする。
+
+各ブロックは項目の値を項目の順に足し、`Mean` のときは平均と偏差の 2 乗和も求める。
+ブロックの結果は、呼び出したスレッドがブロックの番号について、ペアごとの和（隣のブロックと足し、その結果を 2 つずつ足す）でまとめる。
+和の木はブロックの数だけで決まり、ブロックをワーカーにどう分けたかによらないので、推定値、勾配、誤差は実行方針とワーカーの数によらず同じビットになる。
+平均と偏差の 2 乗和は Chan、Golub、LeVeque の式で合わせる。
+
+ブロックの大きさを $b$、ブロックの数を $B$ とする。
+ブロックの中の項目の順の和は高々 $b - 1$ 回、ブロックのペアごとの和は $\lceil \log_2 B \rceil$ 段の丸めを加えるので、逐次の和とペアごとの和の誤差の評価（Higham、§4.2）から、和の丸め誤差は
+
+$$
+\Bigl| \widehat{F} - F \Bigr| \le \gamma_k \sum_i |y_i|, \qquad k = b + \lceil \log_2 B \rceil, \qquad \gamma_k = \frac{k\varepsilon}{1 - k\varepsilon}
+$$
+
+以下である（$\varepsilon$ は単位丸め、[浮動小数点数と条件数](../../../concepts/floating-point-and-conditioning/)）。
+$k$ は丸めの段数 $b - 1 + \lceil \log_2 B \rceil$ より 1 大きいので、`Mean` で $n$ で割る丸めを加えても、平均の誤差は $\gamma_k \sum_i |y_i| / n$ 以下である。
+前進モードの勾配は項目ごとの接ベクトルを同じ順序で足すので、同じ形の限界を持つ。
+逆モードの勾配は群ごとの随伴を lane ごとに溜めてから共有部分を逆走査し、最後に lane について足すので、足す順序が前進モードと違う。
+項目ごとの値と導関数そのものは、数値型の精度を持つ。
+
+## 値・前進・逆の方式
+
+一括評価は勾配を求めるかどうかと微分対象の値の数 $m$（パラメータと入力の数の和）で数値型を選ぶ。
+条件は表の上の行から順に調べる。
+
+| 条件 | 項目の数値型 | `BatchMode` |
+|---|---|---|
+| 勾配を求めない、または $m = 0$ | `Lanes<S, W>` | `Value` |
+| `KinkPolicy::Error`、`DerivativeMode::Reverse`、または `Auto` で $m > 4$ | `Var<Lanes<S, W>>` | `Reverse` |
+| `Auto` か `DerivativeMode::Forward` で $m \le 4$ | `MultiDual<Lanes<S, W>, m>` | `Forward { tangents: m }` |
+
+`DerivativeMode::Forward` で $m > 4$ なら `InvalidInput`（引数 `options.derivative_mode`、`UnsupportedConfiguration`）を返す。
+ただし `KinkPolicy::Error` のときは先に逆モードが選ばれるので、このエラーにはならない。
+前進モードは各値に $m$ 本の接ベクトルを持たせ、演算ごとにそのすべてを更新するので、1 項目あたりの計算コストは $m$ とともに増えるが、テープを使わない。
+逆モードの計算コストは $m$ によらず値の評価の定数倍で、テープの記録と走査が加わる。
+
+逆モードはワーカーごとに 1 本のテープを使う。
+ブロックごとに、パラメータと `prepare` を一度だけ記録し、記録の長さを覚えておく。
+群ごとに `item` を記録し、覚えておいた位置まで逆走査して入力の随伴を読み、テープをその位置まで巻き戻す。
+最後に、すべての群の随伴が溜まった共有部分を一度だけ逆走査して、パラメータの勾配を lane について足す。
+テープの長さは共有部分と 1 つの群の分で済む。
+
+どの方式でも、ラッパー型は値を primal 値から取るので、推定値 `value()` は値・前進・逆の方式で同じビットになる。
+勾配は方式によって足す順序が違い、丸めの範囲で一致する。
+逆モードでは、`BatchEstimate::kinks()` が、能動的な引数が折れ点にあった演算の数を、項目の lane ごとに 1 回（`prepare` の分はブロックごとに 1 回）数えて返す。
+前進モードは折れ点の規約（中点）だけを使い、回数を数えない。
+
+`KinkPolicy::Error` は逆モードを選ばせる。
+評価する Plan は、自分の折れ点の方針とバイト上限をワーカーのテープに適用する。
+そのため `KinkPolicy::Error` では、能動的な引数が折れ点に当たると `evaluate_into` と `hvp_into` が `DomainError` を返す。
+`jvp_into` は二重数で評価してテープを使わず、折れ点を数えないので、この方針は効かない。
+
+`NonFinitePolicy::Error` では、パラメータと方向を評価の前に、微分対象の入力を読み込むときに確かめ、非有限なら `NonFinite`（`Input`）を返す。
+微分対象外のデータは確かめない。
+推定値、項目ごとの値、勾配、要求した入力の勾配は、書き込む前に確かめ、非有限なら `NonFinite`（`Output`）を返す。
+既定の `Propagate` では、計算した値をそのまま書く（[折れ点と非有限値の扱い](../nonsmooth-and-nonfinite-policies/)）。
+
+## 出力と推定値
+
+`evaluate_into(function, parameters, inputs, data, outputs, workspace, context)` は、`BatchOutputs` で要求した出力を書き、`BatchEstimate` を返す。
+勾配を要求するかどうかだけが自動微分を使うかどうかの違いである。
+
+- `with_values(values)` は項目ごとの $y_i$（長さ `items`）を書く。
+  集約の尺度（平均の $1/n$）は掛けない。
+- `with_parameter_gradient(gradient)` は縮約した値のパラメータについての勾配（長さ `parameters`）を書く。
+- `with_parameter_gradient_error(error)` は勾配の各成分の標準誤差を、ブロックのバッチ平均（後述）で書く。
+- `with_input_gradient(gradient)` は項目ごとの入力の勾配（行優先の `items × inputs`）を書き、集約の尺度は掛けない。
+
+出力の長さが合わなければ `DimensionMismatch` を返す。
+出力は作業領域に溜めてから、すべてのブロックが成功した後に書くので、エラーのときはどの出力も変わらない。
+関数とデータのプロバイダーのエラーはそのまま返り、`context` が中止されると `ExecutionStopped` を返す。
+作業領域の大きさや微分対象の値の数（パラメータと入力の数の和）が `usize` に収まらなければ `SizeOverflow`、作業領域を広げられなければ `AllocationFailure` を返す。
+
+`BatchEstimate` は次の値を持つ。
+
+- `value()` は和か平均である。
+- `standard_error()` は `Mean` で項目が 2 つ以上のときの平均の標準誤差 $s/\sqrt{n}$（$s^2 = \sum_i (y_i - \bar y)^2/(n - 1)$）で、それ以外は `None` である。
+- `derivative()` は `jvp_into` の縮約した方向微分で、`evaluate_into` では `None` である。
+- `items()` と `blocks()` は項目とブロックの数、`mode()` は使った方式（`BatchMode`）である。
+- `kinks()` は逆モードの折れ点の回数で、値と前進の方式では `None` である。
+
+項目ごとのパラメータの勾配は保存しないので、勾配の標準誤差はブロックの平均から推定する（バッチ平均、batch means）。
+ブロック $j$ の項目の数を $n_j$、ブロックの勾配の平均を $\bar g_j$、全体の平均を $\bar g$ とすると、平均の勾配の標準誤差は
+
+$$
+\mathrm{SE}(\bar g) = \sqrt{\frac{\sum_j n_j (\bar g_j - \bar g)^2}{(B - 1)\,n}}
+$$
+
+で、`Sum` ではこれに $n$ を掛ける。
+ブロックの平均がほぼ独立で同じ分布に従うことを仮定し、推定値自身が $B - 1$ の自由度のばらつきを持つので、ブロックが少ないと標準誤差の推定は粗い。
+ブロックが 2 つ未満なら `InvalidInput`（引数 `outputs.parameter_gradient_error`、`OutOfRange`）を返す。
+
+次の 2 つのセルは幾何 Brown 運動の満期 $T$ の終値
+
+$$
+S_T = S_0 \exp\Bigl( \bigl(r - \tfrac{1}{2}\sigma^2\bigr) T + \sigma \sqrt{T}\, Z \Bigr), \qquad Z \sim N(0, 1)
+$$
+
+の期待値を、標準正規の標本 $z_i$ から一括評価する。
+パラメータは $\theta = (S_0, \sigma, r)$（$S_0$ [円]、$\sigma$ [1/√年]、$r$ [1/年]）で、$T = 1$ 年とする。
+`prepare` はドリフト $(r - \sigma^2/2)T$ と拡散 $\sigma\sqrt{T}$ を作り、`item` は $S_0 \exp(\text{ドリフト} + \text{拡散} \cdot z_i)$ を返す。
+閉形式は $\mathbb{E}[S_T] = S_0 e^{rT}$ で、$\partial/\partial S_0 = e^{rT}$、$\partial/\partial \sigma = 0$、$\partial/\partial r = T S_0 e^{rT}$ である。
+標本は scioxide-random の `Normal` と `Xoshiro256StarStar` で、シードから作る（[scioxide-random の章](../../../scioxide-random/)）。
+
+```rust
+//| id: ad-batch-forward-model
+//| kind: definitions
+//| title: 幾何 Brown 運動の終値と標準正規の標本
+//| crates: [scioxide-ad, scioxide-core, scioxide-random]
+use scioxide_ad::{BatchFunction, Real};
+use scioxide_core::SciOxideError;
+use scioxide_random::{Distribution, Normal, SeedableRng, Xoshiro256StarStar};
+
+/// 満期 T [年] の終値 S_T。パラメータは [S₀, σ, r]、データは標準正規の z。
+pub(crate) struct Terminal {
+    pub(crate) maturity: f64,
+}
+
+/// 経路によらない量: S₀、ドリフト (r − σ²/2)T、拡散 σ√T。
+pub(crate) struct Market<R> {
+    spot: R,
+    drift: R,
+    diffusion: R,
+}
+
+impl BatchFunction for Terminal {
+    type Shared<R: Real> = Market<R>;
+    fn prepare<R: Real>(&self, p: &[R]) -> Result<Market<R>, SciOxideError> {
+        let (spot, sigma, rate) = (p[0], p[1], p[2]);
+        Ok(Market {
+            spot,
+            drift: (rate - sigma * sigma * 0.5) * self.maturity,
+            diffusion: sigma * Real::sqrt(self.maturity),
+        })
+    }
+    fn item<R: Real>(&self, m: &Market<R>, _: &[R], z: &[R::Base]) -> Result<R, SciOxideError> {
+        Ok(m.spot * (m.drift + m.diffusion * R::passive(z[0])).exp())
+    }
+}
+
+/// 標準正規の標本を n 個、シード seed から作る。
+pub(crate) fn normals(n: usize, seed: u64) -> Result<Vec<f64>, SciOxideError> {
+    let law = Normal::new(0.0, 1.0)?;
+    let mut rng = Xoshiro256StarStar::from_seed(seed);
+    law.sample_n(&mut rng, n)
+}
+```
+
+1 つ目のセルは同じ Plan を勾配なし、`DerivativeMode::Auto`、`DerivativeMode::Reverse` で評価する。
+1 つ目の表は方式、推定値、推定値のビットが値の方式と一致するか、勾配、折れ点の回数を示す。
+2 つ目の表は推定値と勾配を閉形式と比べ、差を標準誤差で割った値を示す。
+推定値の標準誤差は `standard_error()`、勾配の標準誤差はバッチ平均（256 項目のブロック）である。
+独立な検算として、同じ標本から $S_T$ を `f64` で計算した $s/\sqrt{n}$ を並べる。
+
+```rust
+//| id: ad-batch-mean-gradient
+//| ref: ad-batch-mean-gradient
+//| title: 終値の期待値と勾配を値・前進・逆の方式で一括評価する
+//| run: reactive
+//| uses: [ad-batch-forward-model]
+//| crates: [scioxide-ad, scioxide-core, scioxide-random]
+//| inputs:
+//|   paths: {"type":"range","label":"経路の数 n","description":"標準正規の標本 z_i の数。","min":512,"max":16384,"step":512,"value":4096}
+//|   volatility: {"type":"range","label":"ボラティリティ σ [1/√年]","description":"大きいほど S_T の裾が重く、標準誤差が大きい。","min":0.1,"max":1,"step":0.05,"value":0.2}
+//|   seed: {"type":"range","label":"乱数のシード","description":"Xoshiro256StarStar のシード。","min":0,"max":99,"step":1,"value":42}
+//| cases:
+//|   - {"id":"other-seed","label":"シード 7","description":"別の標本でも、差は標準誤差の数倍に収まる。","inputs":{"seed":7}}
+//|   - {"id":"volatile","label":"σ = 1、n = 16384","description":"裾が重く、推定値と ∂/∂σ の標準誤差が大きくなる。","inputs":{"volatility":1,"paths":16384}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"modes","path":"/rows/1/2","equals":"一致"}
+//|       - {"artifact":"modes","path":"/rows/2/2","equals":"一致"}
+//|       - {"artifact":"modes","path":"/rows/1/0","equals":"前進（接ベクトル 3 本）"}
+//|       - {"artifact":"modes","path":"/rows/2/6","equals":0}
+//|       - {"artifact":"modes","path":"/rows/0/3","equals":null}
+//|       - {"artifact":"estimates","path":"/rows/0/2","approx":{"value":0.32701484276112736,"rtol":1e-9}}
+//|       - {"artifact":"estimates","path":"/rows/0/5","approx":{"value":0.32701484276112736,"rtol":1e-9}}
+//|       - {"artifact":"estimates","path":"/rows/0/4","range":{"min":-4,"max":4}}
+//|       - {"artifact":"estimates","path":"/rows/2/4","range":{"min":-4,"max":4}}
+//|   - case: other-seed
+//|     expect:
+//|       - {"artifact":"modes","path":"/rows/2/2","equals":"一致"}
+//|       - {"artifact":"estimates","path":"/rows/0/4","range":{"min":-4,"max":4}}
+//|       - {"artifact":"estimates","path":"/rows/2/4","range":{"min":-4,"max":4}}
+//|   - case: volatile
+//|     expect:
+//|       - {"artifact":"estimates","path":"/rows/0/2","range":{"min":0.5,"max":2}}
+//|       - {"artifact":"estimates","path":"/rows/0/4","range":{"min":-4,"max":4}}
+//|       - {"artifact":"estimates","path":"/rows/2/4","range":{"min":-4,"max":4}}
+use scioxide_ad::{
+    BatchMode, BatchOptions, BatchOutputs, BatchPlan, BatchReduction, DerivativeMode,
+};
+use scioxide_core::ExecutionContext;
+
+let n = paths as usize;
+let z = normals(n, seed as u64).map_err(|e| e.to_string())?;
+let (spot, rate, maturity) = (100.0, 0.03, 1.0);
+let model = Terminal { maturity };
+let theta = [spot, volatility, rate];
+let cx = ExecutionContext::sequential();
+let runs = [
+    (false, DerivativeMode::Auto),
+    (true, DerivativeMode::Auto),
+    (true, DerivativeMode::Reverse),
+];
+let (mut rows, mut reference_bits, mut results) = (Vec::new(), None, Vec::new());
+for (wanted, mode) in runs {
+    let options = BatchOptions::new().with_derivative_mode(mode);
+    let plan = BatchPlan::<8>::new(n, 3, 0, 1, BatchReduction::Mean, options)
+        .map_err(|e| e.to_string())?;
+    let mut workspace = plan.workspace(1).map_err(|e| e.to_string())?;
+    let (mut gradient, mut error) = ([0.0; 3], [0.0; 3]);
+    let outputs = if wanted {
+        BatchOutputs::new()
+            .with_parameter_gradient(&mut gradient)
+            .with_parameter_gradient_error(&mut error)
+    } else {
+        BatchOutputs::new()
+    };
+    let estimate = plan
+        .evaluate_into(&model, &theta, &[], &z, outputs, &mut workspace, cx)
+        .map_err(|e| e.to_string())?;
+    let name = match estimate.mode() {
+        BatchMode::Value => "値のみ（Lanes<f64, 8>）".to_string(),
+        BatchMode::Forward { tangents } => format!("前進（接ベクトル {tangents} 本）"),
+        BatchMode::Reverse => "逆（Var<Lanes<f64, 8>>）".to_string(),
+    };
+    let bits = estimate.value().to_bits();
+    let same = if *reference_bits.get_or_insert(bits) == bits {
+        "一致"
+    } else {
+        "不一致"
+    };
+    let g = wanted.then_some(gradient);
+    rows.push((
+        name,
+        estimate.value(),
+        same,
+        g.map(|g| g[0]),
+        g.map(|g| g[1]),
+        g.map(|g| g[2]),
+        estimate.kinks(),
+    ));
+    results.push((estimate, gradient, error));
+}
+let digits = serde_json::json!({ "significantDigits": 10 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "方式" },
+    { "key": "1", "label": "推定値 E[S_T] [円]", "type": "number", "format": digits },
+    { "key": "2", "label": "値の方式とのビット" },
+    { "key": "3", "label": "∂/∂S₀ [-]", "type": "number", "format": digits, "nullText": "求めない" },
+    { "key": "4", "label": "∂/∂σ [円·√年]", "type": "number", "format": digits, "nullText": "求めない" },
+    { "key": "5", "label": "∂/∂r [円·年]", "type": "number", "format": digits, "nullText": "求めない" },
+    { "key": "6", "label": "折れ点の回数 [回]", "type": "integer", "nullText": "数えない" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "modes" })
+);
+
+// 2 回目（Auto が選んだ前進モード）の推定値、勾配、勾配の標準誤差。
+let (estimate, gradient, error) = results[1];
+// 独立検算: 同じ標本から S_T を f64 で計算した s/√n（参照値なので f64 の固有メソッドを使う）。
+let drift = (rate - 0.5 * volatility * volatility) * maturity;
+let values: Vec<f64> = z
+    .iter()
+    .map(|&zi| spot * (drift + volatility * maturity.sqrt() * zi).exp())
+    .collect();
+let mean = values.iter().sum::<f64>() / n as f64;
+let variance = values.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / (n - 1) as f64;
+let by_hand = (variance / n as f64).sqrt();
+// 閉形式（参照値）: E[S_T] = S₀e^{rT}、∂/∂S₀ = e^{rT}、∂/∂σ = 0、∂/∂r = T S₀ e^{rT}。
+let growth = (rate * maturity).exp();
+let se = estimate.standard_error().unwrap_or(f64::NAN);
+let quantities = [
+    (
+        "E[S_T] [円]",
+        estimate.value(),
+        se,
+        spot * growth,
+        Some(by_hand),
+    ),
+    ("∂/∂S₀ [-]", gradient[0], error[0], growth, None),
+    ("∂/∂σ [円·√年]", gradient[1], error[1], 0.0, None),
+    (
+        "∂/∂r [円·年]",
+        gradient[2],
+        error[2],
+        maturity * spot * growth,
+        None,
+    ),
+];
+let rows: Vec<_> = quantities
+    .iter()
+    .map(|&(name, value, se, exact, hand)| (name, value, se, exact, (value - exact) / se, hand))
+    .collect();
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let estimate_columns = serde_json::json!([
+    { "key": "0", "label": "量" },
+    { "key": "1", "label": "推定値", "type": "number", "format": digits },
+    { "key": "2", "label": "標準誤差", "type": "number", "format": sci3 },
+    { "key": "3", "label": "閉形式", "type": "number", "format": digits },
+    { "key": "4", "label": "（推定値 − 閉形式）/ 標準誤差 [-]", "type": "number", "format": fixed2 },
+    { "key": "5", "label": "f64 で計算した s/√n", "type": "number", "format": sci3, "nullText": "−" }
+]);
+emit_table_with_columns!(
+    estimate_columns,
+    rows,
+    metadata = serde_json::json!({ "id": "estimates" })
+);
+```
+
+既定の $n = 4096$、$\sigma = 0.2$、シード 42 では、3 つの方式の推定値はすべて $102.95621368850519$ 円で、同じビットである。
+勾配の方式は、微分対象の値が 3 個なので `Auto` が前進（接ベクトル 3 本）を選び、`Reverse` を指定すると逆になる。
+前進と逆の勾配は最後の桁で違い、足す順序の違いによる丸めの範囲で一致する。
+逆の方式の折れ点の回数は 0 で、このモデルは折れ点のある関数を使っていない。
+
+推定値の標準誤差は 0.327 円で、`f64` で計算した $s/\sqrt{n}$ と一致する。
+閉形式 $S_0 e^{rT} = 103.045$ 円との差は標準誤差の $-0.27$ 倍で、3 つの勾配の差も標準誤差の $-0.34$ 倍から $-0.28$ 倍に収まる。
+$\partial/\partial \sigma$ の閉形式は 0 で、推定値 $-0.35$ は標準誤差 1.25 の中にある。
+経路ごとの導関数 $S_T(-\sigma T + \sqrt{T} z)$ は平均 0 でも分散が大きいので、0 の推定には多くの経路が要る。
+$\partial/\partial S_0 = \bar S / S_0$ と $\partial/\partial r = T \bar S$ は標本ごとに推定値に比例するので、閉形式との差は推定値の差と同じ符号になる。
+差の比の大きさが推定値と違うのは、推定値の標準誤差を項目ごとの値から、勾配の標準誤差を 16 個のブロックのバッチ平均から求めているためである。
+
+シード 7 では差の比が $+1.6$ と $+1.5$ になり、シードによって標準誤差の 1 倍から 2 倍程度ずれるのは標本誤差として自然な大きさである。
+$\sigma = 1$、$n = 16384$ では裾が重くなって推定値の標準誤差が 1.03 円に増え、経路を 4 倍にしても $\sigma = 0.2$ の 3 倍になる。
+
+## ワンショット呼び出しの平均と関数のプロバイダー
+
+`batch_mean(function, parameters, data, items)` は、行優先の表 `data`（`items` 行 × `data.len() / items` 列）の各行を微分対象外のデータとして平均 $\bar F$ を返し、`batch_mean_and_grad` は $\bar F$ とパラメータの勾配（scioxide-linalg の `Vector`）の組を返す。
+中身は `BatchPlan::<8>` に `BatchOptions::new()`、微分対象の入力なし、`BatchReduction::Mean`、ワーカー 1 つを与えた評価で、推定値と勾配はこの構成の `evaluate_into` と同じビットになる。
+呼び出しのたびに作業領域を 1 つ（勾配を求めるときはテープと勾配も）確保する。
+`items = 0` なら `InvalidInput`（引数 `items`、`Empty`）、`data.len()` が `items` の倍数でなければ `DimensionMismatch` を返す。
+和、項目ごとの入力や値、勾配の標準誤差、ほかの lane の数やワーカーの数が要るときは `BatchPlan` を使う。
+
+次のセルは同じ終値のモデルで、標準正規の値 $z_i$ を項目の番号 $i$ から作る。
+$z_i$ は Philox4x64-10 のブロック関数（鍵はシード、カウンタは $(i, \text{列})$）の 2 ワードを一様乱数 $u_1 \in (0, 1]$、$u_2 \in [0, 1)$ にし、Box–Muller 変換 $z = \sqrt{-2\ln u_1}\cos(2\pi u_2)$ で作る。
+カウンタ型の生成器は項目ごとに独立に値を作れるので、`fill` を呼ぶ順序によらず同じ値が出る。
+表は `Vec` の表を渡す `batch_mean_and_grad` と `batch_mean`（勾配を求めない）、同じ `Vec` をプロバイダーにした `BatchPlan::<8>` の `evaluate_into`、値をその場で作る `BatchDataFn` をプロバイダーにした `evaluate_into` の推定値と勾配を並べ、1 行目とビットが一致するかを示す。
+
+```rust
+//| id: ad-batch-one-shot-source
+//| ref: ad-batch-one-shot-source
+//| title: ワンショット呼び出しの平均と、値をその場で作るプロバイダーを BatchPlan と比べる
+//| run: reactive
+//| uses: [ad-batch-forward-model]
+//| crates: [scioxide-ad, scioxide-core, scioxide-random]
+//| inputs:
+//|   paths: {"type":"range","label":"経路の数 n","description":"8 の倍数でなければ最後の群の lane が欠ける。","min":1,"max":10000,"step":1,"value":4096}
+//|   seed: {"type":"range","label":"乱数のシード","description":"Philox4x64-10 の鍵。","min":0,"max":99,"step":1,"value":42}
+//| cases:
+//|   - {"id":"ragged","label":"n = 1001、シード 5","description":"最後の群は 1 項目だけで、欠けた 7 個の lane は出力から除かれる。","inputs":{"paths":1001,"seed":5}}
+//|   - {"id":"single","label":"n = 1","description":"項目が 1 つでも同じビットになる。","inputs":{"paths":1}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"sources","path":"/rows/1/6","equals":"一致"}
+//|       - {"artifact":"sources","path":"/rows/2/6","equals":"一致"}
+//|       - {"artifact":"sources","path":"/rows/3/6","equals":"一致"}
+//|       - {"artifact":"sources","path":"/rows/0/5","equals":3}
+//|       - {"artifact":"sources","path":"/rows/0/1","range":{"min":101,"max":105}}
+//|   - case: ragged
+//|     expect:
+//|       - {"artifact":"sources","path":"/rows/1/6","equals":"一致"}
+//|       - {"artifact":"sources","path":"/rows/2/6","equals":"一致"}
+//|       - {"artifact":"sources","path":"/rows/3/6","equals":"一致"}
+//|   - case: single
+//|     expect:
+//|       - {"artifact":"sources","path":"/rows/1/6","equals":"一致"}
+//|       - {"artifact":"sources","path":"/rows/3/6","equals":"一致"}
+use scioxide_ad::{
+    BatchDataFn, BatchMode, BatchOptions, BatchOutputs, BatchPlan, BatchReduction, batch_mean,
+    batch_mean_and_grad,
+};
+use scioxide_core::{ExecutionContext, RealScalar};
+use scioxide_random::{decode_u64, philox4x64_block};
+
+/// 項目 item の列 column の標準正規値。Philox4x64-10（鍵 seed、カウンタ (item, column)）の
+/// 2 ワードを u₁ ∈ (0, 1]、u₂ ∈ [0, 1) にし、Box–Muller 変換する。
+fn draw(seed: u64, item: usize, column: usize) -> f64 {
+    let [a, b, _, _] = philox4x64_block([item as u64, column as u64, 0, 0], [seed, 0]);
+    let (u1, u2) = (1.0 - decode_u64::<f64>(a), decode_u64::<f64>(b));
+    let radius = RealScalar::sqrt(-2.0 * RealScalar::ln(u1));
+    radius * RealScalar::cos(core::f64::consts::TAU * u2)
+}
+
+let (n, key) = (paths as usize, seed as u64);
+let model = Terminal { maturity: 1.0 };
+let theta = [100.0, 0.2, 0.03];
+// 同じ値を Vec の行優先の表（n 行 × 1 列）に保存する。
+let table: Vec<f64> = (0..n).map(|i| draw(key, i, 0)).collect();
+// 表を持たず、呼ばれた項目と列の値をその場で作るプロバイダー。
+let source = BatchDataFn::new(move |first, _, column, lanes: &mut [f64]| {
+    for (k, lane) in lanes.iter_mut().enumerate() {
+        *lane = draw(key, first + k, column);
+    }
+    Ok(())
+});
+let (estimate, gradient) =
+    batch_mean_and_grad(&model, &theta, &table, n).map_err(|e| e.to_string())?;
+let mut runs = vec![(
+    "batch_mean_and_grad",
+    estimate,
+    Some(gradient.as_slice().to_vec()),
+)];
+// 勾配を求めないワンショット呼び出しは値の方式で評価する。
+let value = batch_mean(&model, &theta, &table, n).map_err(|e| e.to_string())?;
+runs.push(("batch_mean", value, None));
+// 同じ構成の BatchPlan に、Vec の表と BatchDataFn をそれぞれプロバイダーとして渡す。
+let plan = BatchPlan::<8>::new(n, 3, 0, 1, BatchReduction::Mean, BatchOptions::new())
+    .map_err(|e| e.to_string())?;
+let mut workspace = plan.workspace(1).map_err(|e| e.to_string())?;
+let cx = ExecutionContext::sequential();
+for (name, on_demand) in [
+    ("evaluate_into（Vec）", false),
+    ("evaluate_into（BatchDataFn）", true),
+] {
+    let mut g = vec![0.0; 3];
+    let outputs = BatchOutputs::new().with_parameter_gradient(&mut g);
+    let estimate = if on_demand {
+        plan.evaluate_into(&model, &theta, &[], &source, outputs, &mut workspace, cx)
+    } else {
+        plan.evaluate_into(&model, &theta, &[], &table, outputs, &mut workspace, cx)
+    }
+    .map_err(|e| e.to_string())?;
+    runs.push((name, estimate, Some(g)));
+}
+// 推定値と（求めたときは）勾配のビットを 1 行目と比べる。
+let reference = &runs[0];
+let rows: Vec<_> = runs
+    .iter()
+    .map(|(name, estimate, g)| {
+        let tangents = match estimate.mode() {
+            BatchMode::Forward { tangents } => Some(tangents),
+            _ => None,
+        };
+        let same_value = estimate.value().to_bits() == reference.1.value().to_bits();
+        let same_gradient = g.as_ref().is_none_or(|g| {
+            let r = reference.2.as_deref().unwrap_or(&[]);
+            g.iter().zip(r).all(|(a, b)| a.to_bits() == b.to_bits())
+        });
+        let same = if same_value && same_gradient {
+            "一致"
+        } else {
+            "不一致"
+        };
+        let part = |k: usize| g.as_ref().map(|g| g[k]);
+        (
+            *name,
+            estimate.value(),
+            part(0),
+            part(1),
+            part(2),
+            tangents,
+            same,
+        )
+    })
+    .collect();
+let digits = serde_json::json!({ "significantDigits": 17 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "評価" },
+    { "key": "1", "label": "推定値 E[S_T] [円]", "type": "number", "format": digits },
+    { "key": "2", "label": "∂/∂S₀ [-]", "type": "number", "format": digits, "nullText": "求めない" },
+    { "key": "3", "label": "∂/∂σ [円·√年]", "type": "number", "format": digits, "nullText": "求めない" },
+    { "key": "4", "label": "∂/∂r [円·年]", "type": "number", "format": digits, "nullText": "求めない" },
+    { "key": "5", "label": "前進モードの接ベクトル [本]", "type": "integer", "nullText": "前進でない" },
+    { "key": "6", "label": "1 行目とのビット" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "sources" })
+);
+```
+
+既定の $n = 4096$、シード 42 では、4 つの評価の推定値はすべて $103.25921929197078$ 円で、勾配を求めた 3 つは勾配も同じビットである。
+`batch_mean_and_grad` はパラメータが 3 個なので、`BatchPlan` と同じく前進モード（接ベクトル 3 本）を選び、`batch_mean` は値の方式で同じビットの推定値を返す。
+`BatchDataFn` のプロバイダーは呼ばれるたびに値を計算し直すが、表に保存した値と同じ値を書くので、結果は `Vec` を渡したときと同じビットになる。
+最後の群が 1 項目だけの $n = 1001$ と、項目が 1 つの $n = 1$ でも、4 つの評価は同じビットである。
+
+## 方向微分とヘッセ行列・ベクトル積
+
+`jvp_into(function, parameters, inputs, data, parameter_direction, input_direction, derivatives, workspace, context)` は、$\varepsilon$ についての $(\theta + \varepsilon u, a_i + \varepsilon w_i)$ での方向微分を `Dual<Lanes<S, W>>` で求める。
+$u$ はパラメータの方向、$w_i$ は項目ごとの入力の方向で、入力と同じ型のプロバイダーで渡す。
+項目ごとの方向微分を `derivatives`（長さ `items`、集約の尺度は掛けない）に書き、縮約した方向微分を `BatchEstimate::derivative()` で返す。
+方式は `Forward { tangents: 1 }` である。
+
+`hvp_into(function, parameters, inputs, data, parameter_direction, input_direction, parameter_product, input_product, workspace, context)` は、縮約した値のパラメータの勾配と、項目ごとの入力の勾配を、同じ方向に $\varepsilon$ で微分した値を書く。
+`parameter_product`（長さ `parameters`）は縮約した値のパラメータの勾配の微分で、縮約した値のヘッセ行列・ベクトル積のパラメータの部分である。
+`input_product`（`items × inputs`）は、`with_input_gradient` と同じく集約の尺度を掛けない項目ごとの入力の勾配の微分である。
+平均の縮約では、`input_product` を $n$ で割ると縮約した値のヘッセ行列・ベクトル積の入力の部分になる。
+`evaluate_into` が前進モードを選ぶ条件では、各値を `Dual<MultiDual<Lanes<S, W>, N>>`（$N = m$）で表す（前進の上の前進、forward-over-forward）。
+内側の `MultiDual` の値と $N$ 本の接ベクトルは、`evaluate_into` と同じく値と、微分対象の値の単位方向の導関数（勾配の成分）を保持する。
+外側の `Dual` の導関数の成分も `MultiDual` で、その値は方向 $(u, w)$ への方向微分を、$N$ 本の接ベクトルは勾配の成分を $\varepsilon$ で微分した値（ヘッセ行列・ベクトル積の成分）を保持する。
+`BatchMode::Forward { tangents }` はこの 2 組の接ベクトルを数えて $2N$ を返す（微分対象の値が 4 個なら 8）。
+それ以外の条件では `Var<Dual<Lanes<S, W>>>`（逆の上の前進、forward-over-reverse）で項目を評価し、方式は `Reverse` である。
+
+どちらも長さの合わないスライスに `DimensionMismatch` を返し、ほかのエラーは `evaluate_into` と同じである。
+
+## 作業領域と並列の実行
+
+`workspace_requirements(workers)` は `workers` 個のワーカーに要る領域を `BatchRequirements` で返す。
+中身はワーカーごとの lane の領域、ブロックごとの結果、項目ごとに溜める値で、`workers()`、`blocks()`、`items()` と、スカラーの型ごとのバイト数 `bytes::<S>()`（テープの中身を除く）を読める。
+ワーカーの数は 1 から 64 までで、それ以外は `InvalidInput`（引数 `workers`、`OutOfRange`）を返す。
+`workspace::<S>(workers)` は要件どおりに確保した `BatchWorkspace` を返し、確保できなければ `AllocationFailure` を返す。
+
+`BatchWorkspace` の `try_reserve(requirements)` は領域を広げ、`check(requirements)` は保持している領域が足りるかを `Capacity` で返す。
+`evaluate_into` は足りなければ自分で広げる。
+要件はテープを含まない。
+ワーカーは勾配用とヘッセ行列・ベクトル積用の 2 本のテープを持ち、どちらも最初に使うときに、評価する Plan の `BatchOptions::with_byte_limit` の上限の中で広がる。
+上限を超える成長は `ResourceLimit` になる（[テープのライフサイクルと再利用](../tape-lifecycle/)）。
+上限はその Plan が評価するときの成長にだけ効くので、より大きい上限の下で広がったテープはその領域を保つ。
+逐次の実行では、同じ Plan で温まった作業領域を使う評価は何も確保しない。
+
+`BatchOptions` は次の設定を持ち、`BatchOptions::new()` が既定値を返す。
+
+| メソッド | 既定 | 意味 |
+|---|---|---|
+| `with_execution_policy` | `ExecutionPolicy::Sequential` | ブロックをワーカーに分ける方針 |
+| `with_block` | 256 | 1 ブロックの項目の数（`W` の倍数に切り上げる） |
+| `with_derivative_mode` | `DerivativeMode::Auto` | 勾配の方式 |
+| `with_non_finite_policy` | `NonFinitePolicy::Propagate` | 非有限値の扱い |
+| `with_kink_policy` | `KinkPolicy::Midpoint` | 折れ点の扱い（`Error` は逆モードを選び、折れ点で `DomainError` を返す） |
+| `with_byte_limit` | なし | 各ワーカーの各テープが事前確保できるバイト数 |
+
+並列の実行では、実行方針と `ExecutionContext` のワーカーに従って、連続するブロックの範囲をワーカーに分ける。
+各ワーカーは自分の lane の領域とテープを使い、ブロックの結果を作業領域に置く。
+呼び出したスレッドが上のペアごとの和でまとめるので、結果は逐次の実行と同じビットになる。
+`context.check()` は実行の前、ブロックごとに 1 回、出力を書く前に呼ばれるので、項目が 0 個の評価でも、最後のブロックの間に要求した停止でも、出力は書かれない。
+ブラウザのセルは wasm でスレッドを使えないので、以下のセルは逐次の実行だけを示す。
+
+次の 2 つのセルは同じ終値のモデルで、ブロックの大きさと方向微分を調べる。
+1 つ目のセルは要求したブロックの大きさ 5、60、250、1000、5000 について、切り上げた大きさ、ブロックの数、$\partial \mathbb{E}[S_T]/\partial r$ の推定値、そのバッチ平均の標準誤差（ブロックが 1 つのときは「なし」）と基準の標準誤差との比、作業領域の要件のバイト数（`BatchRequirements::bytes::<f64>()`）を表にする。
+$\partial S_T / \partial r = T S_T$ なので、項目ごとの $\partial S_T / \partial r$ の $s/\sqrt{n}$ は $T$ と推定値の標準誤差 `standard_error()` の積に等しく、これを基準の標準誤差にする。
+この等式は 2 つ目のセルで `jvp_into` の項目ごとの方向微分から確かめる。
+
+```rust
+//| id: ad-batch-block-size
+//| ref: ad-batch-block-size
+//| title: ブロックの大きさとバッチ平均の標準誤差を調べる
+//| run: reactive
+//| uses: [ad-batch-forward-model]
+//| crates: [scioxide-ad, scioxide-core, scioxide-random]
+//| inputs:
+//|   paths: {"type":"range","label":"経路の数 n","description":"標準正規の標本 z_i の数。","min":512,"max":16384,"step":512,"value":4096}
+//|   seed: {"type":"range","label":"乱数のシード","description":"Xoshiro256StarStar のシード。","min":0,"max":99,"step":1,"value":42}
+//| cases:
+//|   - {"id":"few","label":"n = 512","description":"ブロックが少なく、大きなブロックのバッチ平均は計算できないか粗い。","inputs":{"paths":512}}
+//|   - {"id":"many","label":"n = 16384、シード 3","description":"ブロックが増え、バッチ平均の標準誤差が基準に近づく。","inputs":{"paths":16384,"seed":3}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"blocks","path":"/rows/0/1","equals":8}
+//|       - {"artifact":"blocks","path":"/rows/1/1","equals":64}
+//|       - {"artifact":"blocks","path":"/rows/2/1","equals":256}
+//|       - {"artifact":"blocks","path":"/rows/2/2","equals":16}
+//|       - {"artifact":"blocks","path":"/rows/4/4","equals":null}
+//|       - {"artifact":"blocks","path":"/rows/0/5","range":{"min":0.8,"max":1.25}}
+//|       - {"artifact":"blocks","path":"/rows/0/6","range":{"min":110000,"max":120000}}
+//|       - {"artifact":"blocks","path":"/rows/4/6","range":{"min":64000,"max":70000}}
+//|   - case: few
+//|     expect:
+//|       - {"artifact":"blocks","path":"/rows/2/2","equals":2}
+//|       - {"artifact":"blocks","path":"/rows/3/4","equals":null}
+//|   - case: many
+//|     expect:
+//|       - {"artifact":"blocks","path":"/rows/0/2","equals":2048}
+//|       - {"artifact":"blocks","path":"/rows/0/5","range":{"min":0.9,"max":1.1}}
+use core::num::NonZeroUsize;
+use scioxide_ad::{BatchOptions, BatchOutputs, BatchPlan, BatchReduction};
+use scioxide_core::ExecutionContext;
+
+let n = paths as usize;
+let z = normals(n, seed as u64).map_err(|e| e.to_string())?;
+let (spot, rate, maturity) = (100.0, 0.03, 1.0);
+let model = Terminal { maturity };
+let theta = [spot, 0.2, rate];
+let cx = ExecutionContext::sequential();
+
+// 基準: ∂S_T/∂r = T·S_T なので、項目ごとの ∂S_T/∂r の s/√n は T·standard_error()。
+let plan = BatchPlan::<8>::new(n, 3, 0, 1, BatchReduction::Mean, BatchOptions::new())
+    .map_err(|e| e.to_string())?;
+let mut workspace = plan.workspace(1).map_err(|e| e.to_string())?;
+let value = plan
+    .evaluate_into(
+        &model,
+        &theta,
+        &[],
+        &z[..],
+        BatchOutputs::new(),
+        &mut workspace,
+        cx,
+    )
+    .map_err(|e| e.to_string())?;
+let item_se = maturity * value.standard_error().unwrap_or(f64::NAN);
+
+let mut rows = Vec::new();
+for requested in [5, 60, 250, 1000, 5000] {
+    let block = NonZeroUsize::new(requested).ok_or("ブロックの大きさは正".to_string())?;
+    let options = BatchOptions::new().with_block(block);
+    let plan = BatchPlan::<8>::new(n, 3, 0, 1, BatchReduction::Mean, options)
+        .map_err(|e| e.to_string())?;
+    let bytes = plan
+        .workspace_requirements(1)
+        .and_then(|r| r.bytes::<f64>())
+        .map_err(|e| e.to_string())?;
+    let mut workspace = plan.workspace(1).map_err(|e| e.to_string())?;
+    let (mut gradient, mut error) = ([0.0; 3], [0.0; 3]);
+    // バッチ平均にはブロックが 2 つ以上要る。
+    let outputs = if plan.blocks() >= 2 {
+        BatchOutputs::new()
+            .with_parameter_gradient(&mut gradient)
+            .with_parameter_gradient_error(&mut error)
+    } else {
+        BatchOutputs::new().with_parameter_gradient(&mut gradient)
+    };
+    let estimate = plan
+        .evaluate_into(&model, &theta, &[], &z, outputs, &mut workspace, cx)
+        .map_err(|e| e.to_string())?;
+    let batch_se = (estimate.blocks() >= 2).then_some(error[2]);
+    let ratio = batch_se.map(|se| se / item_se);
+    rows.push((
+        requested,
+        plan.block(),
+        estimate.blocks(),
+        gradient[2],
+        batch_se,
+        ratio,
+        bytes,
+    ));
+}
+let digits = serde_json::json!({ "significantDigits": 10 });
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "要求したブロック [項目]", "type": "integer" },
+    { "key": "1", "label": "block() [項目]", "type": "integer" },
+    { "key": "2", "label": "ブロックの数", "type": "integer" },
+    { "key": "3", "label": "∂E[S_T]/∂r [円·年]", "type": "number", "format": digits },
+    { "key": "4", "label": "バッチ平均の標準誤差 [円·年]", "type": "number", "format": sci3, "nullText": "なし" },
+    { "key": "5", "label": "基準の標準誤差との比 [-]", "type": "number", "format": fixed2, "nullText": "−" },
+    { "key": "6", "label": "作業領域の要件 [B]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "blocks" })
+);
+```
+
+既定の $n = 4096$ では、要求したブロックの大きさ 5、60、250 は 8、64、256 に切り上げられ、1000 と 5000 は 8 の倍数なのでそのまま使われる。
+ブロックの大きさが変わると和の順序が変わるので、$\partial \mathbb{E}[S_T]/\partial r$ の推定値は最後の桁で変わる（$102.95621368850519$ と $102.95621368850503$）。
+作業領域はブロックごとの結果を持つので、ブロックが 512 個の 115880 B から 1 個の 66824 B まで減る。
+
+基準の標準誤差 0.327 円·年に対して、バッチ平均の標準誤差の比はブロック 512 個で 1.02、64 個で 0.96、16 個で 0.81、5 個で 0.55 である。
+ブロックが少ないほど、バッチ平均の推定は $B - 1$ の自由度の分だけ粗くなる。
+大きさ 5000 ではブロックが 1 つしかないので、バッチ平均は求められない。
+$n = 16384$、シード 3 ではブロック 2048 個で比 1.02、4 個で 1.51 になり、$n = 512$ ではブロック 2 個の比が 0.42 まで下がる。
+
+2 つ目のセルは方向微分とヘッセ行列・ベクトル積を、同じ標本で成り立つ恒等式と比べる。
+$\partial S_T / \partial r = T S_T$ なので、$r$ 方向（$u = e_r$）の方向微分は $T \bar S$、$\partial^2/\partial r^2$ は $T^2 \bar S$、$\partial^2/\partial S_0 \partial r$ は $T \bar S / S_0$ に等しい（$\bar S$ は一括評価の推定値）。
+項目ごとの方向微分の標準誤差は $T$ と推定値の標準誤差の積に等しい。
+表は量ごとに、方式、一括評価の値、恒等式による値、相対差を示す。
+
+```rust
+//| id: ad-batch-jvp-hvp
+//| ref: ad-batch-jvp-hvp
+//| title: 一括評価の方向微分とヘッセ行列・ベクトル積を恒等式と比べる
+//| run: reactive
+//| uses: [ad-batch-forward-model]
+//| crates: [scioxide-ad, scioxide-core, scioxide-random]
+//| inputs:
+//|   paths: {"type":"range","label":"経路の数 n","description":"標準正規の標本 z_i の数。","min":512,"max":16384,"step":512,"value":4096}
+//|   seed: {"type":"range","label":"乱数のシード","description":"Xoshiro256StarStar のシード。","min":0,"max":99,"step":1,"value":42}
+//| cases:
+//|   - {"id":"few","label":"n = 512","description":"経路が少なくても、恒等式は丸めの範囲で成り立つ。","inputs":{"paths":512}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"products","path":"/rows/0/4","range":{"max":1e-13}}
+//|       - {"artifact":"products","path":"/rows/2/4","range":{"max":1e-13}}
+//|       - {"artifact":"products","path":"/rows/3/4","range":{"max":1e-13}}
+//|       - {"artifact":"products","path":"/rows/4/4","range":{"max":1e-13}}
+//|       - {"artifact":"products","path":"/rows/0/1","equals":"前進（接ベクトル 1 本）"}
+//|       - {"artifact":"products","path":"/rows/3/1","equals":"前進（接ベクトル 6 本）"}
+//|   - case: few
+//|     expect:
+//|       - {"artifact":"products","path":"/rows/2/4","range":{"max":1e-13}}
+//|       - {"artifact":"products","path":"/rows/3/4","range":{"max":1e-13}}
+use scioxide_ad::{BatchMode, BatchOptions, BatchOutputs, BatchPlan, BatchReduction};
+use scioxide_core::ExecutionContext;
+
+let n = paths as usize;
+let z = normals(n, seed as u64).map_err(|e| e.to_string())?;
+let (spot, rate, maturity) = (100.0, 0.03, 1.0);
+let model = Terminal { maturity };
+let theta = [spot, 0.2, rate];
+let cx = ExecutionContext::sequential();
+let mode_name = |mode: BatchMode| match mode {
+    BatchMode::Value => "値のみ".to_string(),
+    BatchMode::Forward { tangents } => format!("前進（接ベクトル {tangents} 本）"),
+    BatchMode::Reverse => "逆".to_string(),
+};
+let plan = BatchPlan::<8>::new(n, 3, 0, 1, BatchReduction::Mean, BatchOptions::new())
+    .map_err(|e| e.to_string())?;
+let mut workspace = plan.workspace(1).map_err(|e| e.to_string())?;
+
+// r 方向の方向微分。項目ごとの値 T·S_i も書き出す。
+let direction = [0.0, 0.0, 1.0];
+let mut per_item = vec![0.0; n];
+let jvp = plan
+    .jvp_into(
+        &model,
+        &theta,
+        &[],
+        &z[..],
+        &direction,
+        &[],
+        &mut per_item,
+        &mut workspace,
+        cx,
+    )
+    .map_err(|e| e.to_string())?;
+let mean = per_item.iter().sum::<f64>() / n as f64;
+let spread = per_item
+    .iter()
+    .map(|d| (d - mean) * (d - mean))
+    .sum::<f64>()
+    / (n - 1) as f64;
+let item_se = (spread / n as f64).sqrt();
+
+// 勾配と、r 方向のヘッセ行列・ベクトル積。
+let mut gradient = [0.0; 3];
+let estimate = plan
+    .evaluate_into(
+        &model,
+        &theta,
+        &[],
+        &z[..],
+        BatchOutputs::new().with_parameter_gradient(&mut gradient),
+        &mut workspace,
+        cx,
+    )
+    .map_err(|e| e.to_string())?;
+let mut product = [0.0; 3];
+let hvp = plan
+    .hvp_into(
+        &model,
+        &theta,
+        &[],
+        &z[..],
+        &direction,
+        &[],
+        &mut product,
+        &mut [],
+        &mut workspace,
+        cx,
+    )
+    .map_err(|e| e.to_string())?;
+let average = estimate.value();
+let se = estimate.standard_error().unwrap_or(f64::NAN);
+let derivative = jvp.derivative().unwrap_or(f64::NAN);
+let relative = |a: f64, b: f64| (a - b).abs() / b.abs();
+let checks = vec![
+    (
+        "∂E/∂r（jvp_into）",
+        mode_name(jvp.mode()),
+        derivative,
+        maturity * average,
+    ),
+    (
+        "∂E/∂r（evaluate_into）",
+        mode_name(estimate.mode()),
+        gradient[2],
+        maturity * average,
+    ),
+    (
+        "項目ごとの方向微分の s/√n",
+        mode_name(jvp.mode()),
+        item_se,
+        maturity * se,
+    ),
+    (
+        "∂²E/∂r²（hvp_into）",
+        mode_name(hvp.mode()),
+        product[2],
+        maturity * maturity * average,
+    ),
+    (
+        "∂²E/∂S₀∂r（hvp_into）",
+        mode_name(hvp.mode()),
+        product[0],
+        maturity * average / spot,
+    ),
+];
+let rows: Vec<_> = checks
+    .into_iter()
+    .map(|(name, mode, value, identity)| {
+        (name, mode, value, identity, relative(value, identity))
+    })
+    .collect();
+let digits = serde_json::json!({ "significantDigits": 10 });
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let check_columns = serde_json::json!([
+    { "key": "0", "label": "量" },
+    { "key": "1", "label": "方式" },
+    { "key": "2", "label": "一括評価", "type": "number", "format": digits },
+    { "key": "3", "label": "恒等式による値", "type": "number", "format": digits },
+    { "key": "4", "label": "相対差 [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    check_columns,
+    rows,
+    metadata = serde_json::json!({ "id": "products" })
+);
+```
+
+`jvp_into` の方向微分、`evaluate_into` の勾配、`hvp_into` の 2 つの成分は、同じ標本の恒等式と相対差 $2.2 \times 10^{-16}$ 以内で一致する。
+`jvp_into` は接ベクトル 1 本、`hvp_into` は前進の上の前進で、$2N = 6$ 本の接ベクトルを伝播させる。
+項目ごとの方向微分から作った $s/\sqrt{n}$ は $T$ と推定値の標準誤差の積に一致し、1 つ目のセルで基準にした等式が成り立つことと、`jvp_into` が項目ごとの方向微分をそのまま書き出していることが分かる。
+$n = 512$ でも相対差は $10^{-15}$ 未満である。
+
+## まとめ
+
+多数の独立な項目の和や平均は、`BatchFunction` を数値型について一度だけ書き、`BatchPlan` に評価させると、勾配の有無で値・前進・逆の方式が選ばれ、推定値は方式によらず同じビットになる。
+微分対象の値が 4 個以下なら前進モード、それより多ければ逆モードが既定で、逆モードはパラメータだけに依存する `prepare` の部分をブロックごとに一度だけ記録して走査する。
+結果はブロックの番号についてのペアごとの和で決まるので、ワーカーの数を変えても同じビットになり、和の丸め誤差は $\gamma_{b + \lceil \log_2 B \rceil} \sum_i |y_i|$ 以下である。
+Monte Carlo の推定値を閉形式や別の推定と比べるときは、`standard_error()` と、ブロックが十分に多いときのバッチ平均 `with_parameter_gradient_error` を使い、差を標準誤差の何倍かで読む。
+方向微分とヘッセ行列・ベクトル積は `jvp_into` と `hvp_into` で、同じ Plan と作業領域のまま求まる。
+既定の構成で表の平均と勾配だけが要るなら `batch_mean_and_grad` が一回の呼び出しで同じビットを返し、表に置かずにその場で作る値は `BatchDataFn` でプロバイダーにできる。
+
+## 次に読むページ
+
+- [経路ごとの微分による Monte Carlo のグリークス](../../examples/black-scholes-monte-carlo/)：折れ点を持つコールの割引ペイオフの期待値と勾配を一括評価で求め、バッチ平均の標準誤差で閉形式と比べ、経路ごとの Γ が 0 になる偏りを `hvp_into` で確かめる。
+- [1 層ニューラルネットの逆伝播と勾配検査](../../examples/neural-network-backprop/)：標本ごとの損失を平均した値の勾配を一括評価とテープで求め、丸めの水準で一致することを確かめる。
+- [分岐・マスク・表引き](../control-flow/)：lane のある型で `item` の中の分岐を `select` で書く方法を確かめる。
+- [折れ点と非有限値の扱い](../nonsmooth-and-nonfinite-policies/)：`KinkPolicy` と `NonFinitePolicy` が一括評価の結果にどう効くかを確かめる。
+- [テープのライフサイクルと再利用](../tape-lifecycle/)：逆モードのワーカーが使うテープの容量とバイト上限を確かめる。
+- [二階微分とヘッセ行列の作用素](../second-order-derivatives/)：前進の上の前進と逆の上の前進によるヘッセ行列・ベクトル積の計算コストを確かめる。

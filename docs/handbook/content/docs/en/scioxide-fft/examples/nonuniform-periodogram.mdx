@@ -1,0 +1,485 @@
+---
+title: "Fourier sums of irregular observations with NUFFT"
+description: "Compute Fourier sums of a synthetic variable-star light curve with type-1 NUFFT, compare direct-sum errors normalized by input 1-norm with requested accuracy, and interpret kernel width, grid, and work."
+sidebar:
+  order: 430
+---
+
+Nighttime-only observations do not have uniformly spaced sample times.
+Computing Fourier sum $\sum_jc_je^{-2\pi ift_j}$ from such times $t_j$ at many frequencies requires direct-sum work proportional to observation count times frequency count.
+The nonuniform fast Fourier transform (NUFFT) approximates this sum to requested accuracy while retaining each sample's actual time.
+
+The subject is the same synthetic data as [Variable-star period estimation](../../../scioxide-signal/examples/variable-star-period/) in scioxide-signal (period $P=0.567$ days, 40 nights with 6 observations each).
+That page primarily covers period estimation, daily aliases, and false-alarm probabilities.
+This page focuses on NUFFT accuracy and cost, examining whether direct-sum errors fall below requested accuracy and how kernel width, grid, and work vary with it.
+
+## Synthetic light curve
+
+Use the same observation times [days] and brightness [mag] as the signal chapter:
+
+$$
+t_j=\lfloor j/6\rfloor+0.05+0.25\{0.6180339887498949\,j\},\qquad
+y_j=0.3\sin\frac{2\pi t_j}{P}+0.1\sin\Bigl(\frac{4\pi t_j}{P}+0.7\Bigr)+\sigma g_j
+$$
+
+as above ($j=0,\ldots,239$).
+$\{\cdot\}$ denotes fractional part and $g_j$ standard normal random values, generated from the seed using the same splitmix64 and Box–Muller method as the signal chapter.
+Default $\sigma=0.3$ mag and seed 2024 match the signal chapter; reducing observation count $M$ takes the first points of the 240-point sequence.
+
+## Conversion to type 1
+
+Type-1 NUFFT computes the sum from nonuniform coordinates $x_j$ to uniformly spaced integer modes $k$,
+
+$$
+F_k=\sum_{j=0}^{M-1}c_j e^{-ikx_j},\qquad k=-N/2,\ldots,N/2-1
+$$
+
+as above (`FftDirection::Forward`, `Normalization::Unscaled`).
+Choose time scale $T_0$ and set $x_j=2\pi t_j/T_0$; since $e^{-ikx_j}=e^{-2\pi i(k/T_0)t_j}$, mode $k$ corresponds to frequency $f_k=k/T_0$ [day⁻¹].
+Here use $T_0=500$ days and $N=4096$.
+Frequency spacing is 0.002 day⁻¹, matching the signal chapter's grid; $k=100,\ldots,2000$ covers 0.2–4 day⁻¹.
+Coordinates lie in $0\le x_j<2\pi\cdot40/500\approx0.50$ rad, within $[-\pi,\pi]$ recommended by [Coordinate units and mode order](oxref:fft-nufft-coordinates).
+Weights $c_j=y_j-\bar y$ are mean-subtracted brightness, preventing a large zero-frequency value from leaking into nearby frequencies.
+
+Output is ordered by increasing mode index, starting at $k=-2048$, differing from ordinary FFT order with zero frequency first.
+Use [type 3](oxref:fft-nufft-type3-observations) to evaluate an arbitrary frequency sequence.
+$\lvert F_k\rvert^2/M$ is the classical (Schuster) periodogram, a different quantity from normalized Lomb–Scargle power in the signal chapter.
+
+## Requested accuracy and error measurement
+
+Requested accuracy $\epsilon$ for `NufftPlanSpec::new(direction, normalization, accuracy)` expresses maximum output error relative to input 1-norm $\lVert c\rVert_1=\sum_j\lvert c_j\rvert$.
+Therefore measure differences from direct sum $F_k^{\mathrm{direct}}$ by
+
+$$
+E=\frac{\max_k\lvert F_k^{\mathrm{NUFFT}}-F_k^{\mathrm{direct}}\rvert}{\lVert c\rVert_1}
+$$
+
+the expression above, maximizing over all 4096 modes.
+Because $\lvert F_k\rvert\le\lVert c\rVert_1$, $E$ is a ratio to the largest possible output rather than relative error of each output.
+
+The direct-sum reference must be substantially more accurate than the request.
+Phase $kx_j$ exceeds 1000 rad, so passing product `f64` directly to sine/cosine adds phase rounding of order $10^{-13}$ rad to the error.
+The reference below splits $x_j$ into its leading 26 bits and remainder, forms the product with each mode index satisfying $\lvert k\rvert\le2^{11}$ exactly, subtracts a multiple of $2\pi$ split into 3 constants (Cody–Waite reduction), then uses `sin_cos` from `f64`.
+This keeps reference error on the scale of $10^{-15}$, allowing requests through $10^{-13}$ to be checked.
+
+Plan preparation chooses the smallest kernel width $w$ whose aliasing estimate $E_a$ plus rounding estimate $E_r$ meets the request, reporting it through `NufftDiagnostics`.
+[Requested accuracy and error estimates](oxref:fft-nufft-accuracy) gives both formulas.
+Both are estimates, not proven upper bounds.
+Requests below $E_r$ make preparation fail with `NumericalInstability`.
+
+The following definitions share synthetic-data generation, type-1 weights and coordinates, and the reference direct sum between two cells.
+Constant `TIME_SCALE` is $T_0$, and `MODES` is $N$.
+
+```rust
+//| id: fft-nonuniform-light-curve
+//| kind: definitions
+//| title: "Synthetic light curve and type-1 reference sum"
+//| crates: [scioxide-core]
+use scioxide_core::Complex;
+use std::f64::consts::TAU;
+
+/// Period P [days].
+pub(crate) const PERIOD: f64 = 0.567;
+/// Coordinate time scale T₀ [days]. Mode k corresponds to frequency k/T₀ [day⁻¹].
+pub(crate) const TIME_SCALE: f64 = 500.0;
+/// Integer-mode count N. k = −N/2, …, N/2 − 1.
+pub(crate) const MODES: usize = 4096;
+
+/// Observation times t_j [days] and brightness y_j [mag]. Noise uses splitmix64 and Box–Muller (intrinsic f64 methods).
+pub(crate) fn light_curve(count: usize, sigma: f64, seed: u64) -> (Vec<f64>, Vec<f64>) {
+    let times: Vec<f64> = (0..count)
+        .map(|j| (j / 6) as f64 + 0.05 + 0.25 * (j as f64 * 0.618_033_988_749_894_9).fract())
+        .collect();
+    let mut state = seed;
+    let mut uniform = || -> f64 {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        ((z ^ (z >> 31)) >> 11) as f64 / (1u64 << 53) as f64 + 0.5 / (1u64 << 53) as f64
+    };
+    let values = times
+        .iter()
+        .map(|&t| {
+            let phase = TAU * t / PERIOD;
+            let gauss = (-2.0 * uniform().ln()).sqrt() * (TAU * uniform()).cos();
+            0.3 * phase.sin() + 0.1 * (2.0 * phase + 0.7).sin() + sigma * gauss
+        })
+        .collect();
+    (times, values)
+}
+
+/// Type-1 weights c_j = y_j − ȳ and coordinates x_j = 2π t_j / T₀ [rad].
+pub(crate) fn type1_data(times: &[f64], values: &[f64]) -> (Vec<Complex<f64>>, Vec<f64>) {
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    let weights = values
+        .iter()
+        .map(|&y| Complex::new(y - mean, 0.0))
+        .collect();
+    let positions = times.iter().map(|&t| TAU * t / TIME_SCALE).collect();
+    (weights, positions)
+}
+
+/// Independent check: direct sum F_k = Σ_j c_j exp(−i k x_j) (reference values using f64 sin_cos).
+/// Form phase k x_j without rounding and subtract a multiple of 2π = C1 + C2 + C3 before evaluation.
+pub(crate) fn direct_type1(weights: &[Complex<f64>], positions: &[f64]) -> Vec<Complex<f64>> {
+    // C1 is 2π with its bottom 28 bits zeroed; C3 is the difference between f64 TAU and 2π.
+    let c1 = f64::from_bits(TAU.to_bits() & !((1_u64 << 28) - 1));
+    let (c2, c3) = (TAU - c1, 2.449_293_598_294_706_4e-16);
+    // x = leading 26 bits + remainder. Both products with |k| ≤ 2^11 are exactly representable.
+    let split: Vec<(f64, f64)> = positions
+        .iter()
+        .map(|&x| {
+            let high = f64::from_bits(x.to_bits() & !((1_u64 << 27) - 1));
+            (high, x - high)
+        })
+        .collect();
+    let half = (MODES / 2) as i64;
+    (-half..half)
+        .map(|k| {
+            let k = k as f64;
+            weights
+                .iter()
+                .zip(&split)
+                .map(|(&c, &(high, low))| {
+                    let n = (k * high / TAU).round();
+                    let reduced = ((k * high - n * c1) - n * c2 - n * c3) + k * low;
+                    let (s, co) = reduced.sin_cos();
+                    c * Complex::new(co, -s)
+                })
+                .sum()
+        })
+        .collect()
+}
+```
+
+## Experiment on frequency and cost
+
+The following cell creates a type-1 plan with requested accuracy $\epsilon=10^{-9}$ and plots $\lvert F_k\rvert^2/M$ over 0.2–4 day⁻¹.
+Vertical plot lines mark the input fundamental $f_0=1/P\approx1.764$ day⁻¹ and daily aliases $f_0\pm1$ day⁻¹.
+The table reports maximum-peak frequency from NUFFT and direct summation, all-mode error $E$, kernel width, grid size, and work indicators.
+NUFFT work comprises `stencil_visits` grid-point visits during spreading plus a grid FFT; direct summation evaluates complex exponentials $MN$ times.
+
+```rust
+//| id: fft-nonuniform-periodogram
+//| ref: fft-nonuniform-periodogram
+//| title: "Compare type-1 NUFFT Fourier sums of irregular observations against direct summation"
+//| run: reactive
+//| uses: [fft-nonuniform-light-curve]
+//| crates: [scioxide-core, scioxide-fft]
+//| inputs:
+//|   observations: {"type":"range","label":"Observation count M","description":"Take the first observations from 240 points.","min":60,"max":240,"step":60,"value":240}
+//|   noise_sigma: {"type":"range","label":"Noise standard deviation σ [mag]","min":0,"max":1.5,"step":0.1,"value":0.3}
+//|   seed: {"type":"range","label":"Random seed","min":1,"max":9999,"step":1,"value":2024}
+//| cases:
+//|   - {"id":"ten-nights","label":"M = 60","description":"Only 10 observing nights. The largest peak moves to daily alias f₀ − 1.","inputs":{"observations":60}}
+//|   - {"id":"noisy","label":"σ = 1.5 mag","description":"High noise moves the largest peak to a different frequency.","inputs":{"noise_sigma":1.5}}
+//|   - {"id":"noise-free","label":"σ = 0","description":"No noise. The largest peak occurs at the grid point nearest f₀.","inputs":{"noise_sigma":0}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/1","approx":{"value":1.762,"atol":0.0011}}
+//|       - {"artifact":"summary","path":"/rows/0/2","approx":{"value":1.762,"atol":0.0011}}
+//|       - {"artifact":"summary","path":"/rows/0/3","range":{"max":1e-9}}
+//|       - {"artifact":"summary","path":"/rows/0/7","equals":983040}
+//|   - case: ten-nights
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/1","approx":{"value":0.764,"atol":0.0011}}
+//|       - {"artifact":"summary","path":"/rows/0/3","range":{"max":1e-9}}
+//|   - case: noisy
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/3","range":{"max":1e-9}}
+//|   - case: noise-free
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/1","approx":{"value":1.764,"atol":0.0011}}
+use scioxide_core::{Complex, ExecutionContext, NdView, StridedLayout};
+use scioxide_fft::{FftDirection, Normalization, NufftPlan, NufftPlanSpec, NufftTransform};
+
+let count = observations as usize;
+let (times, values) = light_curve(count, noise_sigma, seed as u64);
+let (weights, positions) = type1_data(&times, &values);
+// Coordinates are rows of shape [M, 1] (one dimension), with N modes.
+let (shape, strides, modes) = ([count, 1], [1, 1], [MODES]);
+let layout = StridedLayout::new(&shape, &strides).map_err(|e| e.to_string())?;
+let points = NdView::new(&positions, layout).map_err(|e| e.to_string())?;
+let transform = NufftTransform::Type1 {
+    points,
+    modes: &modes,
+};
+let spec = NufftPlanSpec::new(FftDirection::Forward, Normalization::Unscaled, 1e-9);
+let plan = NufftPlan::new(transform, spec).map_err(|e| e.to_string())?;
+let diagnostics = plan.diagnostics();
+let mut workspace = plan.workspace(()).map_err(|e| e.to_string())?;
+let mut output = vec![Complex::new(0.0, 0.0); MODES];
+plan.execute_into(
+    &weights,
+    &mut output,
+    &mut workspace,
+    ExecutionContext::sequential(),
+)
+.map_err(|e| e.to_string())?;
+let direct = direct_type1(&weights, &positions);
+let norm1: f64 = weights.iter().map(|c| c.norm()).sum();
+let error = output
+    .iter()
+    .zip(&direct)
+    .map(|(&a, &b)| (a - b).norm())
+    .fold(0.0_f64, f64::max)
+    / norm1;
+// |F_k|²/M and the largest peak for modes k = 100, …, 2000 spanning 0.2–4 day⁻¹.
+let band = |spectrum: &[Complex<f64>]| -> Vec<[f64; 2]> {
+    (100..=2000)
+        .map(|k| {
+            let power = spectrum[k + MODES / 2].norm_sqr() / count as f64;
+            [k as f64 / TIME_SCALE, power]
+        })
+        .collect()
+};
+let peak = |curve: &[[f64; 2]]| {
+    curve
+        .iter()
+        .fold([0.0, 0.0], |b, &p| if p[1] > b[1] { p } else { b })
+};
+let (curve, reference) = (band(&output), band(&direct));
+let (nufft_peak, direct_peak) = (peak(&curve), peak(&reference));
+let f0 = 1.0 / PERIOD;
+emit_line_chart!(
+    &vec![serde_json::json!({ "name": "|F_k|²/M（NUFFT）", "points": curve })],
+    options = &serde_json::json!({
+        "xLabel": "Frequency f [day⁻¹]",
+        "yLabel": "|F|²/M [mag²]",
+        "xMin": 0.2,
+        "xMax": 4.0,
+        "annotations": [
+            { "kind": "line", "axis": "x", "value": f0, "label": "f₀ = 1/P" },
+            { "kind": "line", "axis": "x", "value": f0 - 1.0, "label": "f₀ − 1" },
+            { "kind": "line", "axis": "x", "value": f0 + 1.0, "label": "f₀ + 1" }
+        ]
+    })
+);
+let fixed4 = serde_json::json!({ "significantDigits": 4 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Observation count M", "type": "integer" },
+    { "key": "1", "label": "Largest peak (NUFFT) [day⁻¹]", "type": "number", "format": fixed4 },
+    { "key": "2", "label": "Largest peak (direct sum) [day⁻¹]", "type": "number", "format": fixed4 },
+    { "key": "3", "label": "Error E [-]", "type": "number", "format": sci2 },
+    { "key": "4", "label": "Kernel width w [points]", "type": "integer" },
+    { "key": "5", "label": "Grid points G", "type": "integer" },
+    { "key": "6", "label": "Spreading visits [count]", "type": "integer" },
+    { "key": "7", "label": "Direct-sum terms MN [count]", "type": "integer" }
+]);
+let row = (
+    count,
+    nufft_peak[0],
+    direct_peak[0],
+    error,
+    diagnostics.kernel_support,
+    diagnostics.grid_points,
+    diagnostics.stencil_visits,
+    count * MODES,
+);
+emit_table_with_columns!(
+    columns,
+    vec![row],
+    metadata = serde_json::json!({ "id": "summary" })
+);
+```
+
+At the defaults $M=240$, $\sigma=0.3$ mag, seed 2024, both NUFFT and direct summation place the largest peak at 1.762 day⁻¹, the same frequency as the largest Lomb–Scargle peak in the signal chapter.
+Error over all 4096 modes is $E=2.0\times10^{-11}$, one fiftieth of requested accuracy $10^{-9}$.
+The plot also has daily-alias peaks at $f_0\pm1$ day⁻¹; main-peak widths are approximately $1/(40\ \text{days})=0.025$ day⁻¹.
+
+At $M=60$ (10 nights), the largest peak shifts to 0.764 day⁻¹, the $f_0-1$ alias; at $\sigma=1.5$ mag it shifts to 2.680 day⁻¹.
+In both cases NUFFT and direct summation agree on the largest peak, with error $E$ remaining of order $3\times10^{-11}$.
+Peak shifts from the true frequency arise from the observation window and noise, not NUFFT computation error.
+Without noise, at $\sigma=0$, the largest peak occurs at grid point 1.764 day⁻¹ nearest $f_0=1.7637$ day⁻¹.
+
+NUFFT work is $Mw=240\times11=2640$ spreading grid-point visits and one $G=8192$-point FFT.
+Direct summation requires $MN=983040$ complex-exponential evaluations.
+Direct-sum work is proportional to $MN$ and NUFFT work approximately to $Mw+G\log G$, so their difference grows as both $M$ and $N$ increase.
+
+## Experiment on requested accuracy and kernel width
+
+For the same data ($\sigma=0.3$ mag, seed 2024), the following cell varies requested accuracy as $\epsilon=10^{-2},\ldots,10^{-13}$ and tabulates error $E$ and diagnostics for each plan.
+Inputs are observation count and minimum oversampling factor $\sigma_o$ (`with_oversampling`).
+The grid has the smallest power-of-2 point count at least $\max(\lceil\sigma_oN\rceil,w+2)$; for $N=4096$, this gives $G=8192$ at $\sigma_o=2$ and $G=16384$ at $2<\sigma_o\le4$.
+However, kernel-selection estimate $E_a$ and shape $\beta$ use specified $\sigma_o$ rather than the actual grid ratio.
+
+The upper plot shows $E$ and estimate $E_a+E_r$ versus $\epsilon$ on log-log axes, with $E=\epsilon$ dashed.
+The lower plot shows the selected kernel width $w$ as steps.
+Both plots share and link horizontal axis $\epsilon$.
+
+```rust
+//| id: fft-nonuniform-accuracy
+//| ref: fft-nonuniform-accuracy
+//| title: "NUFFT error, kernel width, and workspace versus requested accuracy"
+//| run: reactive
+//| uses: [fft-nonuniform-light-curve]
+//| crates: [scioxide-core, scioxide-fft]
+//| inputs:
+//|   observations: {"type":"range","label":"Observation count M","min":60,"max":240,"step":60,"value":240}
+//|   oversampling: {"type":"range","label":"Minimum oversampling factor σ_o","description":"Above 2, the grid doubles and the required kernel narrows.","min":2,"max":4,"step":0.5,"value":2}
+//| cases:
+//|   - {"id":"oversampling-3","label":"σ_o = 3","description":"The grid doubles to 16384 points, with unchanged or one-point-smaller kernel width at the same request.","inputs":{"oversampling":3}}
+//|   - {"id":"few-points","label":"M = 60","description":"Even with fewer observations, error ratio E stays below requested accuracy.","inputs":{"observations":60}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"sweep","path":"/rows/0/0","approx":{"value":0.01,"rtol":1e-12}}
+//|       - {"artifact":"sweep","path":"/rows/0/1","range":{"max":0.01}}
+//|       - {"artifact":"sweep","path":"/rows/6/1","range":{"max":1e-8}}
+//|       - {"artifact":"sweep","path":"/rows/11/1","range":{"max":1e-13}}
+//|       - {"artifact":"sweep","path":"/rows/11/5","equals":8192}
+//|   - case: oversampling-3
+//|     expect:
+//|       - {"artifact":"sweep","path":"/rows/11/1","range":{"max":1e-13}}
+//|       - {"artifact":"sweep","path":"/rows/11/5","equals":16384}
+//|   - case: few-points
+//|     expect:
+//|       - {"artifact":"sweep","path":"/rows/11/1","range":{"max":1e-13}}
+use scioxide_core::{Complex, ExecutionContext, NdView, StridedLayout};
+use scioxide_fft::{FftDirection, Normalization, NufftPlan, NufftPlanSpec, NufftTransform};
+
+let count = observations as usize;
+let (times, values) = light_curve(count, 0.3, 2024);
+let (weights, positions) = type1_data(&times, &values);
+let direct = direct_type1(&weights, &positions);
+let norm1: f64 = weights.iter().map(|c| c.norm()).sum();
+let (shape, strides, modes) = ([count, 1], [1, 1], [MODES]);
+let layout = StridedLayout::new(&shape, &strides).map_err(|e| e.to_string())?;
+let mut output = vec![Complex::new(0.0, 0.0); MODES];
+let mut rows = Vec::new();
+let (mut measured, mut estimated, mut widths) = (Vec::new(), Vec::new(), Vec::new());
+for exponent in (-13..=-2).rev() {
+    let accuracy = 10_f64.powi(exponent);
+    let points = NdView::new(&positions, layout).map_err(|e| e.to_string())?;
+    let transform = NufftTransform::Type1 {
+        points,
+        modes: &modes,
+    };
+    let spec = NufftPlanSpec::new(FftDirection::Forward, Normalization::Unscaled, accuracy)
+        .with_oversampling(oversampling);
+    let plan = NufftPlan::new(transform, spec).map_err(|e| e.to_string())?;
+    let d = plan.diagnostics();
+    let mut workspace = plan.workspace(()).map_err(|e| e.to_string())?;
+    plan.execute_into(
+        &weights,
+        &mut output,
+        &mut workspace,
+        ExecutionContext::sequential(),
+    )
+    .map_err(|e| e.to_string())?;
+    let error = output
+        .iter()
+        .zip(&direct)
+        .map(|(&a, &b)| (a - b).norm())
+        .fold(0.0_f64, f64::max)
+        / norm1;
+    rows.push((
+        accuracy,
+        error,
+        d.approximation_error,
+        d.roundoff_error,
+        d.kernel_support,
+        d.grid_points,
+        d.stencil_visits,
+        d.workspace_bytes,
+    ));
+    measured.push([accuracy, error]);
+    estimated.push([accuracy, d.approximation_error + d.roundoff_error]);
+    widths.push([accuracy, d.kernel_support as f64]);
+}
+let reference: Vec<[f64; 2]> = [1e-13, 1e-2].iter().map(|&e| [e, e]).collect();
+emit_line_chart!(
+    &vec![
+        serde_json::json!({
+            "name": "Error E (direct-sum comparison)",
+            "points": measured,
+            "style": { "symbol": "circle", "showSymbol": true }
+        }),
+        serde_json::json!({
+            "name": "Estimate E_a + E_r",
+            "points": estimated,
+            "style": { "symbol": "diamond", "showSymbol": true, "lineType": "dotted" }
+        }),
+        serde_json::json!({
+            "name": "E = ε",
+            "points": reference,
+            "style": { "lineType": "dashed", "showSymbol": false }
+        })
+    ],
+    options = &serde_json::json!({
+        "link": { "group": "nufft-accuracy" },
+        "xLabel": "Requested accuracy ε [-]",
+        "yLabel": "Error / input 1-norm [-]",
+        "xType": "log",
+        "yType": "log",
+        "xMin": 1e-13,
+        "xMax": 1e-2
+    })
+);
+emit_line_chart!(
+    &vec![serde_json::json!({
+        "name": "Kernel width w",
+        "points": widths,
+        "style": { "step": "end", "showSymbol": true }
+    })],
+    options = &serde_json::json!({
+        "link": { "group": "nufft-accuracy" },
+        "xLabel": "Requested accuracy ε [-]",
+        "yLabel": "Kernel width w [grid points]",
+        "xType": "log",
+        "xMin": 1e-13,
+        "xMax": 1e-2,
+        "yMin": 0.0,
+        "yMax": 20.0
+    })
+);
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Requested accuracy ε [-]", "type": "number", "format": sci2 },
+    { "key": "1", "label": "Error E [-]", "type": "number", "format": sci2 },
+    { "key": "2", "label": "Estimate E_a [-]", "type": "number", "format": sci2 },
+    { "key": "3", "label": "Estimate E_r [-]", "type": "number", "format": sci2 },
+    { "key": "4", "label": "Kernel width w [points]", "type": "integer" },
+    { "key": "5", "label": "Grid points G", "type": "integer" },
+    { "key": "6", "label": "Spreading visits [count]", "type": "integer" },
+    { "key": "7", "label": "Workspace [byte]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "sweep" })
+);
+```
+
+At default $\sigma_o=2$, tightening requested accuracy by one decimal order adds one kernel point, giving $w=4$ at $\epsilon=10^{-2}$ and $w=15$ at $10^{-13}$ for width $w$.
+Error $E$ is below every request, at approximately 1/25–1/90 of it ($2.0\times10^{-11}$ at $10^{-9}$, $4.1\times10^{-15}$ at $10^{-13}$).
+Estimate $E_a$ is 20–40 times the actual error, so kernel-width selection is conservative.
+Estimate $E_r=5.6\times10^{-15}$ is independent of kernel width; requests below it give `NumericalInstability` during preparation.
+
+At $\sigma_o=3$, the grid doubles to $G=16384$ points; for the same request the kernel is unchanged or one point narrower ($w=14$ at $10^{-13}$).
+Spreading visits decrease slightly in proportion to width, but workspace increases from 0.59 MB to 1.1 MB and the grid FFT doubles in length.
+At $\sigma_o=4$, both $\epsilon=10^{-2}$ and $10^{-3}$ use the minimum width $w=4$, with errors of order $3.7\times10^{-5}$, 1.4–2.4 decimal orders below the requests.
+In this example, increasing $\sigma_o$ narrows the kernel by at most 2 points while doubling grid and workspace.
+For one-dimensional problems with fewer observations than modes, spreading visits $Mw$ are smaller than grid size $G$, so increasing oversampling to narrow the kernel offers little benefit.
+
+At $M=60$ too, error ratio $E$ remains below requested accuracy.
+Since $E$ is relative to input 1-norm, the same requested accuracy permits comparisons across observation counts.
+Relative error of individual output $F_k$ may greatly exceed $E$ for modes where $\lvert F_k\rvert$ is much smaller than $\lVert c\rVert_1$.
+
+## Summary
+
+Type-1 NUFFT computes weighted exponential sums at irregular times $t_j$ for uniform integer modes; choosing time scale $T_0$ converts mode $k$ to frequency $k/T_0$.
+Requested accuracy is maximum error relative to input 1-norm; use that scale for direct-sum comparisons.
+Construct direct-sum references so phase rounding does not dominate; against such a reference, every request from $10^{-2}$ through $10^{-13}$ in this example gave actual error below the request.
+Tightening accuracy by one decimal order adds about one kernel point and increases spreading work proportionally; grid size depends only on mode count and oversampling.
+Statistical decisions about period detection are separate from Fourier-sum computation accuracy and are handled by false-alarm probabilities in the signal chapter.
+
+## Further reading
+
+- [Variable-star period estimation](../../../scioxide-signal/examples/variable-star-period/) analyzes the same data with Lomb–Scargle and assesses peak significance using false-alarm probabilities.
+- [Nonuniform Fourier transforms](../../algorithms/nonuniform-fft/) examines the 3 types' conventions, mode ordering, and resource limits `NufftLimits`.
+- [NUFFT kernels and requested accuracy](../../algorithms/nufft-kernel-and-accuracy/) examines kernel/grid selection, formulas for estimates $E_a$ and $E_r$, and type-3 grid sizes.
+- [Fine narrowband spectra with zoom FFT](../zoom-fft-tone-resolution/) examines fine narrowband evaluation for uniformly spaced samples and observation-time-limited resolution.

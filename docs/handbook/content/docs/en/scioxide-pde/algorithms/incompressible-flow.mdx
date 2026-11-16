@@ -1,0 +1,542 @@
+---
+title: "Mixed finite elements for incompressible flow"
+description: "Stokes and Navier–Stokes weak forms and saddle-point systems, inf-sup conditions and Taylor–Hood P2/P1 elements, pressure gauges and flux compatibility, StokesPlan boundary conditions and unknown ordering, and diagnostics."
+sidebar:
+  order: 360
+references:
+  pde-incompressible-equations: "governing-equations-and-stress"
+  pde-incompressible-weak-form: "weak-form-and-saddle-point-system"
+  pde-inf-sup-taylor-hood: "inf-sup-condition-and-taylorhood-elements"
+  pde-pressure-gauge: "pressure-gauges-and-flux-compatibility"
+  pde-incompressible-diagnostics: "diagnostics-and-extracting-fields"
+---
+
+This page covers mixed finite-element discretization of incompressible flow with constant density and viscosity on triangular and tetrahedral meshes.
+`StokesPlan` represents velocity with P2 elements and pressure with P1 elements (Taylor–Hood elements), assembling a saddle-point system with velocity and pressure as simultaneous unknowns.
+It explains governing equations, weak forms, discrete stability (the inf-sup condition), and pressure indeterminacy and gauges in that order, then checks the plan with plane Poiseuille flow, whose exact solution lies in the element space.
+Saddle-point solvers and Newton's method for Navier–Stokes are covered in [Solving incompressible-flow saddle-point systems](../incompressible-solvers/), and time evolution in [Time-dependent incompressible flow](../incompressible-time-stepping/).
+Element degrees of freedom, geometry mappings, and quadrature are shared with [Simplex-mesh finite elements](../simplex-finite-elements/).
+
+---
+
+## Governing equations and stress
+
+For velocity $u$ [m/s] and pressure $p$ [Pa] in domain $\Omega\subset\mathbb{R}^D$ ($D=2,3$), the steady Stokes equations are
+
+$$
+-\nabla\cdot\sigma(u,p)=f,\qquad \nabla\cdot u=0,\qquad \sigma(u,p)=-p\,I+\mu\left(\nabla u+\nabla u^{\mathsf T}\right)
+$$
+
+
+$\mu$ [Pa·s] is dynamic viscosity (distinct from kinematic viscosity $\nu=\mu/\rho$), $f$ [N/m³] is body force per unit volume, and $\sigma$ is Cauchy stress.
+Pressure is positive in compression (the isotropic component of $\sigma$ is $-p$).
+The second equation's incompressibility condition is the constraint associated with pressure, which acts as its Lagrange multiplier.
+
+Retaining inertia gives the Navier–Stokes equations with density $\rho$ [kg/m³]:
+
+$$
+\rho\left(\frac{\partial u}{\partial t}+\nabla\cdot(u\otimes u)\right)-\nabla\cdot\sigma(u,p)=f,\qquad \nabla\cdot u=0
+$$
+
+
+Writing advection as the divergence $\nabla\cdot(u\otimes u)$ of momentum flux $u\otimes u$ is called conservative form.
+When $\nabla\cdot u=0$, this equals the convective form $(u\cdot\nabla)u$.
+The Reynolds number $\mathrm{Re}=\rho UL/\mu$, based on characteristic velocity $U$ and length $L$, measures the ratio of advection to viscosity; Stokes is a good approximation for $\mathrm{Re}\ll1$.
+
+Split the boundary into $\Gamma_D$ prescribing velocity $u=g$ and $\Gamma_N$ prescribing traction $\sigma n=t$ [Pa] ($n$ is the outward unit normal).
+Specify `StokesPlan` boundaries through `TaggedBoundaries`; on each face, all $D$ components must be Dirichlet conditions (velocity) or all natural conditions (traction).
+Faces prescribing velocity in only some components, Robin conditions, and time-dependent data are rejected with `InvalidInput` (argument `boundaries`).
+Values at nodes belonging to two conditions, such as lid corners, follow the Dirichlet conflict policy (`DirichletConflictPolicy`) in `TaggedBoundaries`.
+
+## Weak form and saddle-point system
+
+Multiplying by velocity test function $v$ (0 on $\Gamma_D$) and pressure test function $q$ and integrating by parts gives the weak form
+
+$$
+a(u,v)+b(v,p)=\int_\Omega f\cdot v\,dx+\int_{\Gamma_N}t\cdot v\,ds,\qquad b(u,q)=0
+$$
+
+$$
+a(u,v)=\int_\Omega\mu\left(\nabla u+\nabla u^{\mathsf T}\right):\nabla v\,dx=2\mu\int_\Omega\varepsilon(u):\varepsilon(v)\,dx,\qquad b(v,q)=-\int_\Omega q\,\nabla\cdot v\,dx
+$$
+
+where $\varepsilon(u)=(\nabla u+\nabla u^{\mathsf T})/2$ is the strain-rate tensor.
+In this form, the natural condition is traction $\sigma n$ itself.
+Because $a$ has rigid motion (translation and rotation) as its nullspace, Korn's inequality requires at least one prescribed-velocity face on each connected component for $a$ to be positive definite.
+A component without such a face produces `InvalidInput` (argument `boundaries`).
+
+With velocity basis coefficients $\mathbf{u}$ and pressure coefficients $\mathbf{p}$, discretization gives the symmetric indefinite saddle-point system
+
+$$
+\begin{pmatrix}A&B^{\mathsf T}\\B&0\end{pmatrix}\begin{pmatrix}\mathbf{u}\\\mathbf{p}\end{pmatrix}=\begin{pmatrix}\mathbf{f}\\\mathbf{g}\end{pmatrix}
+$$
+
+
+$A$ is the viscous velocity block (symmetric positive definite), $B$ is discrete divergence, and $\mathbf{g}$ includes contributions from lifting Dirichlet values.
+
+`StokesPlan::new(mesh, geometry, density, viscosity, &boundaries, body)` prepares a plan with defaults, and `with_options(…, options)` prepares one with specified `IncompressibleOptions`.
+`build(…, options, scope)` performs the same preparation as one epoch of the caller's solve context.
+`body` returns body force $f(x)$ at position $x$; boundaries and body forces are evaluated once during preparation.
+Density does not enter steady Stokes; it is used for the velocity mass matrix, advection, and the Reynolds-number diagnostic.
+Nonpositive or nonfinite density or viscosity, $D$ other than 2 or 3, or an empty mesh returns `InvalidInput` without a partial plan.
+
+Unknowns are ordered as all P2 velocity nodes for component 0, then component 1 (and component 2 in three dimensions), all P1 pressure vertices, then gauge multipliers.
+`velocity_nodes()` is the P2 node count per component (vertices and edge midpoints), `velocity_unknowns()` is total velocity coordinates, and `unknowns()` is the total including multipliers.
+`node_point(i)` returns physical coordinates of node $i$.
+Dirichlet rows are eliminated, and solution velocity coordinates contain prescribed values.
+`assemble_csr` assembles the matrix including gauges in CSR; `element_matrix`, `element_velocity_mass`, and `element_pressure_mass` return element matrices for custom preconditioners.
+
+## Inf-sup condition and Taylor–Hood elements
+
+For a unique saddle-point solution stable independently of $h$, positive-definite $A$ must be supplemented by the discrete inf-sup condition (Ladyzhenskaya–Babuška–Brezzi condition)
+
+$$
+\inf_{q_h\in Q_h\setminus\{0\}}\ \sup_{v_h\in V_h\setminus\{0\}}\frac{b(v_h,q_h)}{\|v_h\|_{H^1}\,\|q_h\|_{L^2/\mathbb{R}}}\ \ge\ \beta>0
+$$
+
+with $\beta$ uniform over the mesh family.
+If it fails, nonconstant pressures satisfying $B^{\mathsf T}\mathbf{q}=\mathbf{0}$ (spurious pressure modes) can make pressure indeterminate, or $\beta$ can approach 0 under refinement and amplify pressure errors.
+Equal-degree continuous velocity and pressure elements (P1/P1) do not satisfy this condition.
+
+Taylor–Hood elements (P2/P1), with velocity one degree higher, satisfy the inf-sup condition under mild mesh assumptions, such as each triangle having at least one interior vertex (Boffi 1994; Boffi–Brezzi–Fortin 2013).
+For smooth solutions, the error satisfies
+
+$$
+\|u-u_h\|_{H^1}+\|p-p_h\|_{L^2}\le C\,h^2\left(|u|_{H^3}+|p|_{H^2}\right)
+$$
+
+
+Taylor–Hood velocity satisfies $\int q_h\,\nabla\cdot u_h\,dx=0$ for every continuous P1 $q_h$ but is not pointwise divergence free.
+Because $\|\nabla\cdot u_h\|_{L^2}=\|\nabla\cdot(u_h-u)\|_{L^2}\le\sqrt{D}\,|u-u_h|_{H^1}$, this quantity also decreases as $O(h^2)$ for smooth solutions.
+Preparation checks constant pressure modes and boundary fluxes (next section), but not the inf-sup constant.
+
+## Pressure gauges and flux compatibility
+
+On a connected component with velocity prescribed on every boundary (a closed channel), pressure is determined only up to a constant.
+The divergence theorem gives $\int_\Omega\nabla\cdot u\,dx=\int_{\partial\Omega}g\cdot n\,ds$, so boundary velocities must satisfy flux compatibility $\int_{\partial\Omega}g\cdot n\,ds=0$.
+The plan checks a discrete form during preparation; exceeding the `IncompressibleOptions::with_compatibility` tolerance (default $\sqrt{\varepsilon}$) returns `DomainError` (argument `rhs`).
+On components with traction faces, natural conditions determine pressure level, so no gauge is needed.
+
+For each closed component, add one gauge multiplier $\lambda$ and impose $\sum_v w_v p_v=c_{\mathrm{target}}$.
+The multiplier enters pressure rows as $w_v\lambda$; compatible flux gives $\lambda=0$ in the solution.
+`IncompressibleOptions::new()` defaults to automatic gauges: `EllipticGauge::WeightedMean(0)` ($\int p\,dx=0$) on closed components, and no gauge on components whose pressure is fixed by traction.
+`with_gauges(gauges)` explicitly supplies one `EllipticGauge` per connected component; an empty sequence restores automatic selection.
+
+| Gauge | Weight $w_v$ | Imposed condition | Applicable components |
+|---|---|---|---|
+| `WeightedMean(c)` | Integral of P1 basis function $\int\phi_v\,dx$ | Area- or volume-averaged pressure equals $c$ | Closed components |
+| `Orthogonal` | 1 | Sum of vertex pressures equals 0 | Closed components |
+| `Unspecified` | None | No condition | Components with traction faces |
+
+All following settings produce `InvalidInput` (argument `options.gauges`).
+
+- Assigning `Unspecified` to a closed component.
+- Assigning any gauge except `Unspecified` to a component with traction faces.
+- A nonempty sequence whose length differs from the connected-component count.
+
+Gauges choose only the pressure constant and do not change velocity.
+`with_fem` changes quadrature, geometry conditions, execution, and limits (`SimplexFemOptions`); `with_compatibility` changes flux compatibility tolerance; read these with `fem()`, `gauges()`, and `compatibility()`.
+
+## Checking with plane Poiseuille flow
+
+In channel $[0,L]\times[0,H]$ of height $H$ and length $L$, laminar flow with constant pressure-gradient magnitude $G=-\partial p/\partial x$ [Pa/m] is
+
+$$
+u(y)=\frac{G}{2\mu}\,y\,(H-y),\qquad v=0,\qquad p(x)=G\,(x_0-x)
+$$
+
+where $x_0$ sets the pressure level.
+$\Delta u=-G/\mu$ balances $\nabla p=(-G,0)$, and $\nabla\cdot(u\otimes u)=u\,\partial_x u=0$, so this is also a Navier–Stokes solution.
+Velocity is quadratic and pressure linear, placing the exact solution in the P2/P1 space.
+Thus, for a stable discretization, nodal error contains no discretization error, only linear-system algebraic error and roundoff.
+
+Take maximum speed $U=GH^2/(8\mu)$ as 1 m/s, $H=1$ m, $L=2$ m, $\mu=0.1$ Pa·s, and $\rho=1$ kg/m³ ($\mathrm{Re}=10$).
+The following definitions construct the channel mesh and plan.
+Prescribe zero velocity on walls $y=0,H$ and $u(y)$ at inlet $x=0$.
+At outlet $x=L$, choose the same $u(y)$ (closed channel), exact traction $\sigma n=(0,\ \mu u'(y))$ ($p(L)=0$), or zero traction.
+
+```rust
+//| id: pde-incompressible-channel
+//| kind: definitions
+//| title: "Channel and plan for plane Poiseuille flow"
+//| crates: [scioxide-pde, scioxide-spatial, scioxide-core]
+use scioxide_core::SciOxideError;
+use scioxide_pde::{
+    BoundaryCondition, BoundaryData, BoundaryPoint, EllipticGauge, IncompressibleOptions,
+    SimplexFemGeometry, StokesPlan, TaggedBoundaries,
+};
+use scioxide_spatial::{Point, SimplexBoundaryTags, TriangleMesh};
+
+/// Channel [0, 2]×[0, 1] [m], μ = 0.1 Pa·s, ρ = 1 kg/m³, maximum speed U = 1 m/s.
+pub(crate) const LENGTH: f64 = 2.0;
+pub(crate) const VISCOSITY: f64 = 0.1;
+/// Pressure-gradient magnitude G = 8μU/H² [Pa/m] (H = 1 m).
+pub(crate) const GRADIENT: f64 = 8.0 * VISCOSITY;
+
+/// Exact velocity u(y) = G y (H − y) / (2μ) [m/s].
+pub(crate) fn velocity(y: f64) -> f64 {
+    GRADIENT / (2.0 * VISCOSITY) * y * (1.0 - y)
+}
+
+/// Stokes plan on a triangular mesh obtained by splitting 2n × n squares along diagonals.
+/// Face tags: 0 = wall, 1 = inlet, 2 = outlet. `outflow` scales prescribed outlet velocity.
+pub(crate) fn channel(
+    cells: usize,
+    outlet: &str,
+    outflow: f64,
+    gauges: Vec<EllipticGauge<f64>>,
+) -> Result<StokesPlan<f64, f64, 2>, SciOxideError> {
+    let (nx, ny) = (2 * cells, cells);
+    let mut points = Vec::new();
+    for j in 0..=ny {
+        for i in 0..=nx {
+            points.push(Point::new([
+                LENGTH * i as f64 / nx as f64,
+                j as f64 / ny as f64,
+            ])?);
+        }
+    }
+    let mut triangles = Vec::new();
+    for j in 0..ny {
+        for i in 0..nx {
+            let a = j * (nx + 1) + i;
+            triangles.push([a, a + 1, a + nx + 2]);
+            triangles.push([a, a + nx + 2, a + nx + 1]);
+        }
+    }
+    let mesh = TriangleMesh::new(points, triangles)?;
+    let mut faces = Vec::new();
+    for face in mesh.boundary_faces() {
+        let vertices = mesh.face_vertices(face)?;
+        let column = |k: usize| vertices[k] % (nx + 1);
+        let tag = match (column(0), column(1)) {
+            (0, 0) => 1,
+            (a, b) if a == nx && b == nx => 2,
+            _ => 0,
+        };
+        faces.push((face, tag));
+    }
+    let tags = SimplexBoundaryTags::new(&mesh, faces)?;
+    let profile = |scale: f64| {
+        BoundaryData::time_invariant(move |p: BoundaryPoint<f64, 2>| {
+            Ok(if p.component == 0 {
+                scale * velocity(p.point[1])
+            } else {
+                0.0
+            })
+        })
+    };
+    // Outlet traction σn = (−p + 2μ ∂u/∂x, μ (∂u/∂y + ∂v/∂x)) = (0, μ u'(y)). Set p(L) = 0.
+    let traction = BoundaryData::time_invariant(|p: BoundaryPoint<f64, 2>| {
+        let shear = 0.5 * GRADIENT * (1.0 - 2.0 * p.point[1]);
+        Ok(if p.component == 0 { 0.0 } else { shear })
+    });
+    let exit = match outlet {
+        "Velocity (closed channel)" => BoundaryCondition::dirichlet(2, profile(outflow)),
+        "Exact traction" => BoundaryCondition::natural(2, traction),
+        _ => BoundaryCondition::natural(2, BoundaryData::zero()),
+    };
+    let conditions = vec![
+        BoundaryCondition::dirichlet(0, BoundaryData::zero()),
+        BoundaryCondition::dirichlet(1, profile(1.0)),
+        exit,
+    ];
+    let boundaries = TaggedBoundaries::new(&mesh, &tags, 2, conditions)?;
+    StokesPlan::with_options(
+        mesh,
+        SimplexFemGeometry::Affine,
+        1.0,
+        VISCOSITY,
+        &boundaries,
+        &|_| Ok([0.0; 2]),
+        IncompressibleOptions::new().with_gauges(gauges),
+    )
+}
+```
+
+The next cell varies outlet conditions and mesh resolution, solves the plan, and compares all P2 velocity nodes and P1 pressure vertices with the exact solution.
+Linear residual tolerance is tightened from the default $\sqrt{\varepsilon}$ to $10^{-12}$.
+In a closed channel, the automatic gauge sets $\int p\,dx=0$, so the comparison pressure uses $x_0=L/2$; for a traction outlet, use $x_0=L$.
+“Weak divergence” in the table is the norm of the discrete continuity equation $(\int\phi_v\nabla\cdot u_h\,dx)_v$, while $\|\nabla\cdot u_h\|$ is the $L^2$ norm of pointwise divergence.
+
+```rust
+//| id: pde-incompressible-poiseuille
+//| ref: pde-incompressible-poiseuille
+//| title: "Vary outlet conditions to check reproduction of plane Poiseuille flow"
+//| run: reactive
+//| uses: [pde-incompressible-channel]
+//| crates: [scioxide-pde, scioxide-spatial, scioxide-core, scioxide-linalg]
+//| inputs:
+//|   cells: {"type":"range","label":"Height-direction cell count n [-]","description":"Divide the channel into 2n × n squares, each split into two triangles.","min":1,"max":8,"step":1,"value":2}
+//|   outlet: {"type":"select","label":"Outlet x = L condition","description":"Prescribing velocity closes the channel and requires a pressure gauge. Prescribing traction determines pressure.","options":["Velocity (closed channel)","Exact traction","Zero traction"],"value":"Velocity (closed channel)"}
+//| cases:
+//|   - {"id":"traction","label":"Exact-traction outlet","description":"The gauge multiplier disappears, and outlet traction sets pressure level p(L) = 0.","inputs":{"outlet":"Exact traction"}}
+//|   - {"id":"traction-free","label":"Zero-traction outlet","description":"Outlet shear stress also becomes zero, increasing velocity error to 0.12 m/s.","inputs":{"outlet":"Zero traction"}}
+//|   - {"id":"fine","label":"n = 8","description":"Even with 1,276 unknowns, error remains algebraic, around 10⁻¹¹ m/s.","inputs":{"cells":8}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"errors","path":"/rows/0/0","equals":106}
+//|       - {"artifact":"errors","path":"/rows/0/1","equals":1}
+//|       - {"artifact":"errors","path":"/rows/0/3","range":{"min":0,"max":1e-11}}
+//|       - {"artifact":"errors","path":"/rows/0/4","range":{"min":0,"max":1e-11}}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+//|   - case: traction
+//|     expect:
+//|       - {"artifact":"errors","path":"/rows/0/1","equals":0}
+//|       - {"artifact":"errors","path":"/rows/0/4","range":{"min":0,"max":1e-11}}
+//|   - case: traction-free
+//|     expect:
+//|       - {"artifact":"errors","path":"/rows/0/3","approx":{"value":0.1171563,"rtol":1e-5}}
+//|       - {"artifact":"errors","path":"/rows/0/6","range":{"min":0,"max":1e-10}}
+//|   - case: fine
+//|     expect:
+//|       - {"artifact":"errors","path":"/rows/0/0","equals":1276}
+//|       - {"artifact":"errors","path":"/rows/0/3","range":{"min":0,"max":1e-9}}
+use scioxide_core::{LinearOperator, ResidualTolerance};
+use scioxide_linalg::LinearSolveTermination;
+use scioxide_pde::IncompressibleSolveOptions;
+
+let plan = channel(cells as usize, &outlet, 1.0, Vec::new()).map_err(|e| e.to_string())?;
+let residual = ResidualTolerance::new(1e-12, 1e-12).map_err(|e| e.to_string())?;
+let options = IncompressibleSolveOptions::new().with_residual(residual);
+let result = plan
+    .solve_with_options(&options)
+    .map_err(|e| e.to_string())?;
+let report = result.report();
+let state = result.solution().as_slice();
+// The closed channel uses gauge ∫p = 0; a traction outlet fixes the pressure constant through p(L) = 0.
+let origin = if outlet == "Velocity (closed channel)" {
+    0.5 * LENGTH
+} else {
+    LENGTH
+};
+let nodes = plan.velocity_nodes();
+let mut velocity_error = 0.0_f64;
+for i in 0..nodes {
+    let point = plan.node_point(i).map_err(|e| e.to_string())?;
+    velocity_error = velocity_error.max((state[i] - velocity(point[1])).abs());
+    velocity_error = velocity_error.max(state[nodes + i].abs());
+}
+let offset = plan.velocity_unknowns();
+let mut pressure_error = 0.0_f64;
+for (v, point) in plan.mesh().points().iter().enumerate() {
+    let exact = GRADIENT * (origin - point.as_array()[0]);
+    pressure_error = pressure_error.max((state[offset + v] - exact).abs());
+}
+let gauges = plan.unknowns() - offset - plan.mesh().vertex_count();
+let mut scratch = vec![0.0; plan.apply_workspace_len().map_err(|e| e.to_string())?];
+let diagnostics = plan
+    .diagnostics(state, 1.0, 0.0, &mut scratch)
+    .map_err(|e| e.to_string())?;
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Unknowns [-]", "type": "integer" },
+    { "key": "1", "label": "Gauge multipliers [-]", "type": "integer" },
+    { "key": "2", "label": "GMRES iterations [-]", "type": "integer" },
+    { "key": "3", "label": "Maximum nodal velocity error [m/s]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "Maximum nodal pressure error [Pa]", "type": "number", "format": sci3 },
+    { "key": "5", "label": "‖∇·u_h‖ [m/s]", "type": "number", "format": sci3 },
+    { "key": "6", "label": "Weak divergence [m²/s]", "type": "number", "format": sci3 }
+]);
+let rows = vec![(
+    plan.unknowns(),
+    gauges,
+    report.iterations(),
+    velocity_error,
+    pressure_error,
+    diagnostics.divergence_l2(),
+    diagnostics.weak_divergence(),
+)];
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "errors" })
+);
+let outcome = if report.is_success() {
+    Outcome::satisfied("GMRES reached the true residual tolerance")
+} else if matches!(report.termination(), LinearSolveTermination::Breakdown(_)) {
+    Outcome::failed("GMRES broke down")
+} else {
+    Outcome::partial("GMRES stopped before reaching tolerance")
+};
+emit_outcome!(
+    outcome
+        .status(format!("{:?}", report.termination()))
+        .diagnostic("Maximum nodal velocity error", velocity_error, Some("m/s"))
+        .diagnostic("GMRES iterations", report.iterations() as f64, None)
+);
+```
+
+For the closed channel (default, $n=2$), GMRES solved 106 unknowns (including one multiplier) in eight iterations, with maximum nodal errors $3.8\times10^{-13}$ m/s in velocity and $7.1\times10^{-13}$ Pa in pressure.
+Even at $n=8$ (1,276 unknowns), velocity error remains $1.0\times10^{-11}$ m/s and pressure error $1.0\times10^{-10}$ Pa, leaving only algebraic error and roundoff.
+The exact-traction outlet removes the multiplier, and its natural condition sets pressure level $p(L)=0$.
+A zero-traction outlet does not reproduce Poiseuille flow; velocity error becomes 0.12 m/s.
+For the symmetric-gradient form $\mu(\nabla u+\nabla u^{\mathsf T})$, this is because the natural outlet condition forces even shear stress $\mu u'(y)$, which is nonzero in Poiseuille flow, to vanish.
+A do-nothing outlet condition with gradient form $\mu\nabla u$ admits Poiseuille flow (Heywood–Rannacher–Turek 1996), but `StokesPlan` uses actual traction as its natural condition, so supply the physical outlet traction.
+Weak divergence is at algebraic-error level in every case, showing Taylor–Hood velocity satisfies discrete continuity.
+
+The next cell compares pressures under different gauges in the same closed channel and shows rejection of incorrect gauge and flux settings during plan preparation.
+The input is target mean $c$.
+
+```rust
+//| id: pde-incompressible-gauges
+//| ref: pde-incompressible-gauges
+//| title: "Vary gauges in a closed channel and inspect rejected settings"
+//| run: reactive
+//| uses: [pde-incompressible-channel]
+//| crates: [scioxide-pde, scioxide-spatial, scioxide-core]
+//| inputs:
+//|   mean: {"type":"range","label":"Target mean pressure c [Pa]","description":"Area-averaged pressure imposed by WeightedMean(c).","min":-1,"max":1,"step":0.25,"value":0.5}
+//| cases:
+//|   - {"id":"negative-mean","label":"c = −1 Pa","description":"Mean pressure becomes −1 Pa and the sum of vertex pressures −15 Pa. Velocity is unchanged.","inputs":{"mean":-1}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"gauges","path":"/rows/1/2","approx":{"value":0.5,"atol":1e-10}}
+//|       - {"artifact":"gauges","path":"/rows/1/4","range":{"min":0,"max":1e-10}}
+//|       - {"artifact":"gauges","path":"/rows/2/3","range":{"min":-1e-10,"max":1e-10}}
+//|       - {"artifact":"gauges","path":"/rows/3/1","equals":"InvalidInput"}
+//|       - {"artifact":"gauges","path":"/rows/4/1","equals":"DomainError"}
+//|       - {"artifact":"gauges","path":"/rows/5/1","equals":"InvalidInput"}
+//|       - {"artifact":"gauges","path":"/rows/4/2","equals":null}
+//|   - case: negative-mean
+//|     expect:
+//|       - {"artifact":"gauges","path":"/rows/1/2","approx":{"value":-1.0,"atol":1e-10}}
+use scioxide_pde::EllipticGauge;
+
+// (setting, outlet, outlet flow-rate factor, gauge).
+let settings = [
+    (
+        "WeightedMean(0)",
+        "Velocity (closed channel)",
+        1.0,
+        vec![EllipticGauge::WeightedMean(0.0)],
+    ),
+    (
+        "WeightedMean(c)",
+        "Velocity (closed channel)",
+        1.0,
+        vec![EllipticGauge::WeightedMean(mean)],
+    ),
+    (
+        "Orthogonal",
+        "Velocity (closed channel)",
+        1.0,
+        vec![EllipticGauge::Orthogonal],
+    ),
+    (
+        "Unspecified",
+        "Velocity (closed channel)",
+        1.0,
+        vec![EllipticGauge::Unspecified],
+    ),
+    ("Outlet flow rate × 1.01", "Velocity (closed channel)", 1.01, Vec::new()),
+    (
+        "WeightedMean(0) at a traction outlet",
+        "Exact traction",
+        1.0,
+        vec![EllipticGauge::WeightedMean(0.0)],
+    ),
+];
+let mut reference: Option<Vec<f64>> = None;
+let mut rows = Vec::new();
+for (name, outlet, outflow, gauges) in settings {
+    let plan = match channel(2, outlet, outflow, gauges) {
+        Ok(plan) => plan,
+        Err(error) => {
+            let kind = format!("{:?}", error.kind());
+            rows.push((name, kind, None, None, None));
+            continue;
+        }
+    };
+    let state = plan.solve().map_err(|e| e.to_string())?;
+    let (offset, vertices) = (plan.velocity_unknowns(), plan.mesh().vertex_count());
+    let pressure = &state[offset..offset + vertices];
+    // Area mean (1/|Ω|) ∫ p dx. On a P1 triangle, the mean equals the mean of three vertex values;
+    // the uniform mesh gives every triangle area |Ω| / cell count = 2 m² / cell count.
+    let cells = plan.mesh().cell_count();
+    let mut average = 0.0;
+    for cell in 0..cells {
+        let corners = plan.mesh().cell_vertices(cell).map_err(|e| e.to_string())?;
+        average += corners.iter().map(|&v| pressure[v]).sum::<f64>() / (3.0 * cells as f64);
+    }
+    let base = reference.get_or_insert_with(|| state[..offset].to_vec());
+    let change = base
+        .iter()
+        .zip(&state[..offset])
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0, f64::max);
+    let sum: f64 = pressure.iter().sum();
+    rows.push((
+        name,
+        "Accepted".to_string(),
+        Some(average),
+        Some(sum),
+        Some(change),
+    ));
+}
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed3 = serde_json::json!({ "fractionDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Settings" },
+    { "key": "1", "label": "Result" },
+    { "key": "2", "label": "Mean pressure [Pa]", "type": "number", "format": fixed3, "nullText": "-" },
+    { "key": "3", "label": "Sum of vertex pressures [Pa]", "type": "number", "format": sci3, "nullText": "-" },
+    { "key": "4", "label": "Velocity difference from first row [m/s]", "type": "number", "format": sci3, "nullText": "-" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "gauges" })
+);
+```
+
+`WeightedMean(c)` sets the area mean to $c$; velocity differs from the first row by $3.6\times10^{-13}$ m/s, showing that the gauge shifts only the pressure constant.
+This channel's exact pressure is antisymmetric about $x=L/2$, so `Orthogonal` (zero vertex sum) also gives zero area mean.
+On a general mesh with nonuniform vertex weights, the two gauges' pressures differ by a constant.
+`Unspecified` in a closed channel and gauges at traction outlets are rejected with `InvalidInput`.
+Increasing outlet flow by a factor 1.01 sends 1% more flow out of the boundary, violating flux compatibility and making preparation return `DomainError`.
+
+## Diagnostics and extracting fields
+
+`diagnostics(x, length, step, scratch)` independently samples physical quantities from solution $x$ and returns `IncompressibleDiagnostics`.
+`scratch` requires `LinearOperator::apply_workspace_len()` scalars.
+These values are diagnostics, not error bounds or stability guarantees.
+
+| Accessor | Meaning |
+|---|---|
+| `divergence_l2` | $L^2$ norm of $\nabla\cdot u_h$ sampled at volume quadrature points |
+| `integrated_divergence` | $\lvert\int_\Omega\nabla\cdot u_h\,dx\rvert$ |
+| `boundary_flux` | Magnitude of total outward boundary flux $\lvert\int_{\partial\Omega}u_h\cdot n\,ds\rvert$ |
+| `weak_divergence` | Norm of discrete continuity equations $(b(u_h,\phi_v))_v$ before gauge augmentation |
+| `gauge_defect` | Maximum magnitude of gauge constraint $\sum_v w_vp_v-c_{\mathrm{target}}$ |
+| `reynolds` | Maximum sampled speed × `length` / $\nu$ |
+| `courant` | Maximum of speed × `step` / cell length $h$ |
+| `diffusion_number` | Maximum of $\nu$ × `step` / $h^2$ |
+
+$h$ is the minimum cell altitude (Jacobian determinant divided by opposite-face area).
+`length` must be positive and `step` finite and nonnegative; otherwise, `InvalidInput` is returned.
+
+`fields(x)` converts the unknown vector into an owned `IncompressibleField` field.
+`velocity()` is a componentwise P2 `SimplexFemField` (`vertices` holds vertex values, `edges` edge-midpoint values), while `pressure()` is a vertex `VertexField`; `into_parts` splits the two apart.
+Gauge multipliers are solver coordinates and are not included in fields.
+In reverse, construct `IncompressibleFieldView::new(velocity, pressure)` from borrowed fields of the same mesh revision and pack the unknown vector with `pack_fields_into(view, out)`.
+Multipliers are set to 0; invalid shapes or values leave `out` unchanged.
+
+## Summary
+
+The mixed Stokes formulation produces a symmetric indefinite saddle-point system and is stable when the velocity–pressure space pair satisfies the inf-sup condition.
+`StokesPlan` uses Taylor–Hood elements (P2/P1), reproducing exact quadratic velocity and linear pressure up to algebraic error.
+Closed channels require balanced boundary flux, and gauges in `IncompressibleOptions` select the pressure constant.
+Zero traction at an outlet also sets shear stress to zero in the symmetric-gradient form, so developed flows such as Poiseuille require their physical traction.
+Taylor–Hood velocity satisfies only discrete continuity, so read `divergence_l2` and `weak_divergence` separately.
+
+## Further reading
+
+- [Solving incompressible-flow saddle-point systems](../incompressible-solvers/): inspect block preconditioners and Newton's method for Navier–Stokes.
+- [Time-dependent incompressible flow](../incompressible-time-stepping/): advance unsteady flow with an ODE whose state contains only velocity.
+- [Stokes driven cavity](../../examples/stokes-cavity/): check the primary-vortex center and flow rate under mesh refinement for flow with corner singularities.
+- [Simplex-mesh finite elements](../simplex-finite-elements/): inspect P2 degrees of freedom, geometry mappings, and quadrature.
+- [Compatibility conditions, gauges, and conservative fluxes for elliptic problems](../compatibility-gauges-and-fluxes/): organize constant pressure modes and right-hand-side compatibility using the same ideas as pure Neumann problems.
+- [Elasticity and incompressible-flow API](../../api/elasticity-and-incompressible-flow/): consult plan, workspace, and diagnostic specifications in tables.

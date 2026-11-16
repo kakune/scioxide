@@ -1,0 +1,566 @@
+---
+title: 適応メッシュの細分とトポロジーの対応
+description: 構造格子と単体メッシュを根とする適応メッシュの階層、1 段ずつの細分と粗化、面をまたぐ 2:1 平衡を回復する誘導細分、ハンギング頂点・辺・面と界面の断片、revision のトークンと revision 間のトポロジーの対応、他の章との共有。
+sidebar:
+  order: 370
+references:
+  spatial-adaptive-hierarchy: "階層的適応メッシュの構造"
+  spatial-adaptive-balance: "局所細分と-21-平衡化"
+  spatial-adaptive-hanging: "ハンギング頂点辺面と界面"
+  spatial-adaptive-topology-relations: "トポロジーの対応と世代の追跡"
+  spatial-shared-tessellation: "他の章との共有"
+---
+
+偏微分方程式の解が一部の領域だけで急に変わる問題では、その領域のセルだけを細かくし、他のセルを粗いまま残す局所細分（$h$ 細分）を使う。
+細分や粗化のたびに、セルの数と番号が変わった新しいメッシュができる。
+このページではそれぞれのメッシュを revisionと呼ぶ。
+場の値がどの revision のものかを区別し、revision 間でセルや面がどう対応するかを記録する必要がある。
+隣り合うセルの細かさの差を制限しないと、粗いセルの一つの面に多くの細かい面が接し、離散化の拘束が複雑になる。
+`scioxide-spatial` の適応メッシュ `AdaptiveMesh` は作った後は変更されず、細分のたびに新しい revision と、revision 間の対応 `TopologyMap` を返す。
+このページはそれぞれの定義とアルゴリズム、計算量、API と失敗の分類を説明し、1 点へ向けた細分で結果を確かめる。
+並列計算のための分割 `MeshPartition` と再分割 `RepartitionMap` は[適応メッシュの領域分割と再分割](../mesh-partition/)で扱う。
+場の値を新しい revision へ移す公式はこのクレートの外にあり、分担は[他の章との共有](#他の章との共有)で述べる。
+
+## 階層的適応メッシュの構造
+
+`AdaptiveMesh<S, D>`（$S$ はスカラー型、$D$ は空間の次元）は、取り込んだメッシュの各セルを根とする木の集まり（森）である。
+根は次のどちらかで作る。
+
+- `AdaptiveMesh::from_structured(&cell_mesh, limits)` は、`CellMesh` の線分・四角形・六面体を根にする。
+  周期的な継ぎ目と各軸の向きを引き継ぎ、面の接続の符号はどの軸の向きでもセルの外を向く。
+- `AdaptiveMesh::from_simplex(&simplex_mesh, limits)` は、`TriangleMesh` か `TetrahedronMesh` の正の向きの単体を根にする。
+  `SimplexMesh` の検査をそのまま引き継ぐ。
+  区間メッシュ（`D = 1`）は `InvalidInput`（`UnsupportedConfiguration`）で拒むので、1 次元の適応メッシュは `SegmentMesh` から `from_structured` で作る。
+
+細分は辺を半分に分けて、セルを $2^D$ 個の子にする。
+線分は 2 個、四角形と三角形は 4 個、六面体と四面体は 8 個の子になる。
+`cell_kind()` は、セルが格子のセル（`AdaptiveCellKind::Tensor`）か単体（`AdaptiveCellKind::Simplex`）かを返す。
+
+木の節点には、revision をまたいで変わらない階層の ID が付く。
+粗化した後も子は階層に残り、同じセルを再び細分すると同じ ID の子が使われる。
+葉が活性セルで、`active_cells()[i]` は活性セル $i$ の階層の ID である。
+活性セルの順は根の順に、子の順で木をたどる深さ優先の順である。
+活性セル、頂点、面、辺の番号は `0..count` の連続な番号で、revision ごとに付け直される。
+`parent(id)`、`children(id)`、`level(id)`（根は 0）、`hierarchy_len()` で木をたどる。
+
+頂点の同一性は丸めた座標ではなく、根のセルの参照座標を 2 進の分数で表した厳密な値で決める。
+`child_reference_vertices(id)` は、子の頂点を親の参照セルの中で $1/2$ 単位の整数で返す。
+`vertex_provenance(v)` は、頂点を根のメッシュの頂点の厳密な組合せ
+
+$$
+v = \frac{1}{2^k} \sum_r w_r\, v_r
+$$
+
+として、組 $(r, w_r)$ の列と $k$ で返す。
+深さの上限は 20 以下に限られるので、重み $w_r$ は $2^{64}$ 未満に収まる。
+
+`point(v)` が返す座標は、親のセルの頂点の丸めた座標から中点を 2 つずつ取って求めた値で、上の組合せを 1 回で丸めた値と一致するとは限らない。
+新しい頂点の座標が、寄与した頂点のどれかと同じ値に丸まる（その尺度で精度を使い切った）ときは、`adapt` は `InvalidInput` を返す。
+単体の子の向きは丸めた座標で厳密に判定し、退化していれば `InvalidInput`、参照セルでの向きと逆になっていれば `NumericalInstability` を返す。
+`cell_measure` と `face_measure` は丸めた頂点の座標から長さ・面積・体積を求める。
+格子のセルでは各軸の座標の幅の積を、指数を別に持つ拡張範囲値 `Scaled`（[厳密累積と範囲安全な算術](../../../scioxide-core/algorithms/range-safe-arithmetic/)）で計算し、最後に 1 回だけスカラー型に戻すので、途中の積は桁あふれもアンダーフローも起こさない。
+単体のセルでは向きの行列式を厳密に積み上げて 1 回だけ丸め、三角形では 2、四面体では 6 で割る（[単体メッシュ](../simplex-meshes/)と同じ計算）。
+結果がスカラー型で表せなければ `NumericalInstability` になる。
+`cell_diameter` は頂点どうしの距離の最大で、2 乗和を `ScaledNorm` で桁あふれなく求める。
+
+メッシュは変更されない値で、`adapt` は新しい revision を返す。
+各 revision は `MeshToken` を持つ。
+トークンはメッシュの族（取り込んだ元のメッシュと、そこから作ったすべての revision）、世代の番号、revision ごとの識別からなる。
+取り込みと `adapt` は族を保って世代を 1 進め、新しい識別を付ける。
+同じ revision から `adapt` を 2 回呼ぶと、同じ世代の 2 つの兄弟の revision ができるが、識別が違うので互いに組み合わせられない。
+`is_compatible_with` が真になるのは、同じ revision のトークン（その複製を含む）どうしだけである。
+場、境界タグ、トポロジーの対応、分割は作ったときの revision のトークンを持ち、組み合わせるときに $O(1)$ で照合する（[メッシュの同一性と世代トークン](oxref:spatial-mesh-identity-generations)）。
+
+リソースの上限は `AdaptationLimits` で与え、すべての revision と分割が引き継ぐ。
+上限を超えると `ResourceLimit` になり、上限 0 はそのリソースを使う操作をすべて拒む。
+
+| 上限 | 既定値 | 数える量 |
+|---|---|---|
+| `max_depth` | 20 | 細分の深さ（20 を超える値は取り込みで `InvalidInput`） |
+| `max_cells` | 1,000,000 | 活性でないものを含む階層の節点 |
+| `max_entities` | 8,000,000 | 頂点、面、辺をそれぞれ別に |
+| `max_work` | $10^9$ | 1 回の操作の計算量（コピー、比較、隣接と祖先の訪問、出力する関係を各 1 単位） |
+| `max_storage_bytes` | 256 MiB | 1 回の操作で確保するメモリ領域 |
+
+取り込みと細分の計算量は、活性でないものを含む階層の実体の数を $N$ として $O(N \log N)$ である。
+
+## 局所細分と 2:1 平衡化
+
+細分と粗化は `AdaptationRequest` で指示する。
+
+| フィールド | 内容 |
+|---|---|
+| `source` | マーカーを付けた revision の `&MeshToken` |
+| `refine` | 1 段細分する活性セルの階層の ID |
+| `coarsen` | 子をすべて親へ併合する親の階層の ID。子はすべて活性で、細分化マーカーがないこと |
+
+`mesh.adapt(request)` は、マーカーを付けたセルを 1 段だけ細分または粗化し、2:1 平衡に必要な細分を加えた新しい revision を返す。
+実行コンテキストか求解コンテキストで取り消しや上限を与えるときは、同じ処理を `mesh.adapt_scoped(request, cx)` で呼ぶ。
+2 段以上細かくしたいときは、`adapt` を繰り返す。
+マーカーは何かをコピーする前にすべて検査する。
+
+- `source` がこの revision のトークンでない（兄弟の revision のトークンを含む）とき、マーカーが重複しているとき、細分化マーカーが活性セルでないとき、粗化マーカーが活性な子をそろえた親でないとき、丸めで新しいセルが潰れるときは `InvalidInput` になる。
+- マーカーの ID が `hierarchy_len()` 以上なら `OutOfBounds` になる。
+- 単体の子の向きが丸めで参照セルと逆になるときは `NumericalInstability` になる。
+- 深さの上限を超えるセルができるときと、他の上限を超えるときは `ResourceLimit` になる。
+- `adapt_scoped` に渡した実行コンテキストで取り消しや期限に達すると `ExecutionStopped` になる。
+  求解コンテキストでは、セル 1 個の細分が細分回数の上限に、計算量 1 単位が節点数の上限に数えられ、どちらかを使い切ると `ConvergenceFailure` になる。
+
+失敗しても元の revision は変わらない。
+マーカーが空なら、結果は元の revision とメモリ領域とトークンを共有し、恒等の写像だけを作る。
+結果の `AdaptationResult` は新しい revision `mesh`、revision 間の写像 `map`、平衡のために加えた細分 `induced_refinements`、計算量 `work` を持つ。
+
+### 2:1 平衡の数学的条件
+
+面を共有する 2 個の活性セル $K_1$、$K_2$（周期的な継ぎ目を挟む組も含む）について
+
+$$
+\lvert \operatorname{level}(K_1) - \operatorname{level}(K_2) \rvert \le 1
+$$
+
+が成り立つとき、メッシュは 2:1 平衡であるという。
+条件は面を共有する組だけに課し、頂点や辺だけを共有する組には課さない。
+
+平衡なら、粗い面の向こう側にあるのは 1 段だけ細かいセルなので、そのセルが粗い面の中に置く頂点は粗い辺の中点か粗い面の中心に限られる。
+連続な有限要素では、そのような頂点の値を粗い面の頂点の値の補間で拘束する（ハンギング頂点の拘束）。
+2 次元ではセルどうしが接する辺はすべて面なので、2:1 平衡なら拘束は粗い辺の両端の頂点だけで書け、拘束の中に別の拘束が現れる連鎖が起きない。
+3 次元では平衡を面を共有する組にだけ課すので、辺だけを共有する 2 個のセルの深さが 2 以上違うことがあり、その辺の上では拘束が連鎖しうる。
+
+`adapt` は平衡を回復する細分を次のように求める。
+元の revision は平衡で、マーカーは葉を 1 段だけ変えるので、平衡のための細分は元の revision の葉に対して高々 1 回ずつ起きる。
+
+1. マーカーを反映した目標の深さを各セルに割り当てる。
+2. 面を共有する組のうち深さの差が 1 を超える組の浅い側を、階層の ID の小さい順に取り出す最小ヒープに入れる。
+3. ヒープから取り出したセルを細分し、その隣のセルとの組を調べ直して、新しく違反したセルを入れる。
+
+各段階ではその時点で違反している最小の ID を細分するが、後の段階でより小さい ID が加わることがあるので、`induced_refinements` は昇順とは限らない。
+粗化のマーカーを付けた親が平衡のために細分を求められると、要求全体が `InvalidInput` で拒まれる。
+
+### ハンギング頂点・辺・面と界面
+
+深さの違うセルの境目では、細かいセルの頂点・辺・面が粗いセルの面の中に乗る。
+これをハンギング実体と呼び、`hanging_entities()` が `HangingEntity { kind, entity, coarse_face }` の列で返す。
+`entity` は頂点・辺・面の番号、`coarse_face` はそれを含む粗い面の番号である。
+`HangingEntityKind` は次の 3 つである。
+
+- `Vertex`：粗い辺か粗い面の内部にある頂点。
+- `Edge`：粗い面の中にあるが、粗いセルの辺ではない辺。
+- `Face`：粗い面の中にある細かい面。
+
+2 次元ではセルの面は辺なので、粗い辺に沿う細かい辺は `Edge` としても `Face` としても数えられる。
+
+`interfaces()` は、活性セルどうしと、活性セルと外部との境目を、物理的な断片ごとに `AdaptiveInterface` で返す。
+細かさのそろった内部の面、細かさの違う面、外部の境界、周期的な継ぎ目のすべてが断片になる。
+粗い面が細かいセルに接するところでは、粗い面を細かい面ごとの断片に分ける。
+
+- `left_cell` は左側の活性セルである。
+- `right` は右側の `AdaptiveInterfaceSide { cell, face }` で、外部の境界では `None` である。
+- `left_face` は断片を含む左側のセルの面である。
+  粗い面は複数の断片を含むことがある。
+- `piece_face` は断片そのものである面、つまり 2 つの面のうち細かいほうである。
+  周期的な継ぎ目では、継ぎ目の片側にある面を使う。
+- `left_sign` は、左側のセルの外向き法線が断片の向きと一致すれば `1`、逆なら `-1` である。
+  `right_sign()` は `-left_sign` を返し、外部の境界では `None` を返す。
+- `periodic` は、周期的な継ぎ目の断片なら真である。
+
+有限体積法の流束は断片ごとに 1 回求め、`left_sign` と `right_sign()` を掛けて両側のセルへ足せば、各断片の寄与が打ち消し合う。
+`cell_faces(i)` は、活性セル $i$ の面と、面の頂点の順による右手系の法線がセルの外を向くかを表す符号の組を返す。
+
+## トポロジーの対応と世代の追跡
+
+`adapt` が返す `TopologyMap` は、元の revision と新しい revision のセル・頂点・面・辺の対応である。
+`source()` と `destination()` は両側のトークンを返し、`validate(source, destination)` はどちらかが違えば `InvalidInput` を返す。
+`cells()`、`vertices()`、`faces()`、`edges()` は `EntityRelation` の列である。
+各要素は元の実体 1 個と新しい実体 1 個の関係を表し、`Created` は新しい実体だけ、`Removed` は元の実体だけを持つ。
+
+| `EntityRelation` | 意味 |
+|---|---|
+| `Unchanged { source, destination }` | 同じ実体で、番号だけが変わりうる |
+| `Refined { source, destination, orientation }` | 新しい実体が元の実体の真部分 |
+| `Coarsened { source, destination, orientation }` | 元の実体が新しい実体の真部分 |
+| `Created { destination }` | 同じ次元のどの元の実体にも含まれない新しい実体 |
+| `Removed { source }` | 同じ次元のどの新しい実体にも含まれない元の実体 |
+
+`orientation` は両者の向きが同じなら `1`、逆なら `-1` で、セルでは常に `1` である。
+各列は元の番号、次に新しい番号の順に並ぶ。
+関係のない元の実体には `Removed` が 1 個付き、元を持たない新しい実体は `Created` として新しい番号の順に後ろに並ぶ。
+一つの実体が複数の関係を持つことがあり、たとえば細分されたセルは子の数だけ `Refined` を持つ。
+
+頂点の関係は `Unchanged`、`Created`、`Removed` だけで、新しい頂点の位置は `vertex_provenance` で求める。
+面の関係は面の階層の祖先と子孫の組で、周期的な継ぎ目の両側を同一視しない。
+活性な面には細かいセルの面と、その隣の粗いセルの面が両方含まれる。
+そのため、細分だけの revision 間でも、元の revision の細かい面から、新しい revision でも活性な粗い面への `Coarsened` が現れる。
+辺の関係は厳密な包含で決める。
+
+`TopologyMap` はトポロジーの対応だけを表し、場の値を移す重みを含まない。
+保存的なセル平均の移し替えや節点の値の補間は、呼び出し側が組み立てる。
+`scioxide-pde` の `AmrCellTransfer`（区分定数のセル平均を体積で保存的に移す）と `AmrNodalTransfer` は、この写像から作られる（[適応細分化](../../../scioxide-pde/api/adaptive-refinement/)）。
+
+## 他の章との共有
+
+`scioxide-spatial` のメッシュ、三角形分割、領域分割は、他のクレートが複製せずにそのまま使う。
+メッシュのトポロジー、細分の実行、revision の照合は `scioxide-spatial` で行い、他のクレートはその上に数値の処理を載せる。
+
+- 偏微分方程式では、`scioxide-pde` が構造格子と単体メッシュの上に差分・有限要素・有限体積の作用素を作る（[構造格子の多次元差分](../../../scioxide-pde/algorithms/multidimensional-spatial-plans/)、[単体メッシュの有限要素](../../../scioxide-pde/algorithms/simplex-finite-elements/)、[多次元の有限体積](../../../scioxide-pde/algorithms/multidimensional-finite-volumes/)）。
+  適応細分では、誤差推定 `AmrEstimator` とマーキング `AmrMarking` がマーカーの組 `AmrMarks` を作り、`AmrMarks::request()` がそれを借用した `AdaptationRequest` を返す。
+  `AdaptiveMesh::adapt` の後は、`TopologyMap` で場を新しい revision へ移す（[適応細分化](../../../scioxide-pde/api/adaptive-refinement/)）。
+- 散在点の補間では、`scioxide-interp` の `ScatteredValues` が値を一つの `Delaunay` の母点の順に結び付け、同じ三角形分割を複数の値の組と補間方式で使う（[三角形分割を共有する散在点補間](../../../scioxide-interp/algorithms/scattered-tessellations/)）。
+- 単体の求積では、`scioxide-integrate` の `SimplexRule::integrate_mesh_cell_into` が `TriangleMesh` と `TetrahedronMesh` のセルを所有せずに読んで積分する（[単体と球面の求積則](../../../scioxide-integrate/algorithms/simplex-and-sphere-rules/)）。
+- 大域最適化では、`scioxide-optimize` の SHGO が標本点の `Delaunay` 分割の辺で隣接点を決める（[DIRECT と SHGO による大域探索](../../../scioxide-optimize/algorithms/deterministic-and-surrogate-global/)）。
+
+値の配列をメッシュと組にして持つ型（`scioxide-pde` の転送や `scioxide-interp` の `ScatteredValues`）は、作ったときの revision のトークンを持つ。
+別の revision と組み合わせると、$O(1)$ の照合で `InvalidInput` になる。
+
+## 誘導細分とハンギング実体の数え上げ
+
+単位正方形を $2 \times 2$ の根のセルに分け、1 点を頂点に持つ活性セルのうち最も深いものを繰り返し細分する。
+次の定義のブロックは根のメッシュを作る `unit_square_mesh`、1 回の細分 `refine_toward`、それを繰り返して各回の結果を返す `refine_repeatedly` を、このページの 2 つのセルに渡す。
+深さの上限は 8 にする。
+
+```rust
+//| id: spatial-adaptive-corner-model
+//| kind: definitions
+//| title: 単位正方形の適応メッシュと、1 点へ向けた細分
+//| crates: [scioxide-core, scioxide-spatial]
+use scioxide_spatial::{
+    AdaptationLimits, AdaptationRequest, AdaptationResult, AdaptiveMesh, AxisTopology, CellMesh,
+    CoordinateAxis, Grid2d,
+};
+
+/// 単位正方形を 2 × 2 の根のセルに分けた適応メッシュ（深さの上限 8）。
+pub(crate) fn unit_square_mesh() -> Result<AdaptiveMesh<f64, 2>, String> {
+    let axis = CoordinateAxis::uniform(0.0, 1.0, 3).map_err(|e| e.to_string())?;
+    let bounded = [AxisTopology::Bounded; 2];
+    let grid = Grid2d::new([axis.clone(), axis], bounded).map_err(|e| e.to_string())?;
+    let roots = CellMesh::new(grid).map_err(|e| e.to_string())?;
+    AdaptiveMesh::from_structured(&roots, AdaptationLimits::new().with_max_depth(8))
+        .map_err(|e| e.to_string())
+}
+
+/// 点 target を頂点に持つ活性セルのうち最も深いもの（同じ深さなら活性セルの順で最初）を 1 段細分し、
+/// その階層の ID と結果を返す。
+pub(crate) fn refine_toward(
+    mesh: &AdaptiveMesh<f64, 2>,
+    target: [f64; 2],
+) -> Result<(usize, AdaptationResult<f64, 2>), String> {
+    let mut chosen: Option<(usize, u8)> = None;
+    for (index, &id) in mesh.active_cells().iter().enumerate() {
+        let level = mesh.level(id).map_err(|e| e.to_string())?;
+        for vertex in mesh.cell_vertices(index).map_err(|e| e.to_string())? {
+            let point = mesh.point(vertex).map_err(|e| e.to_string())?;
+            if *point.as_array() == target && chosen.is_none_or(|(_, best)| level > best) {
+                chosen = Some((id, level));
+            }
+        }
+    }
+    let (id, _) = chosen.ok_or("target を頂点に持つセルがない")?;
+    let request = AdaptationRequest {
+        source: mesh.mesh_token(),
+        refine: &[id],
+        coarsen: &[],
+    };
+    let result = mesh.adapt(request).map_err(|e| e.to_string())?;
+    Ok((id, result))
+}
+
+/// 根のメッシュと、target へ向けた steps 回の細分の各回の (細分した ID, 結果) を返す。
+pub(crate) fn refine_repeatedly(
+    target: [f64; 2],
+    steps: usize,
+) -> Result<(AdaptiveMesh<f64, 2>, Vec<(usize, AdaptationResult<f64, 2>)>), String> {
+    let first = unit_square_mesh()?;
+    let mut history: Vec<(usize, AdaptationResult<f64, 2>)> = Vec::new();
+    for _ in 0..steps {
+        let current = history.last().map_or(&first, |(_, result)| &result.mesh);
+        let step = refine_toward(current, target)?;
+        history.push(step);
+    }
+    Ok((first, history))
+}
+```
+
+次のセルは細分を集める点と回数を選び、各回について細分した ID とその深さ、活性セルの数、平衡のために加えた細分、ハンギング実体の種類ごとの数、面積の和と 1 の差、revision の世代を表にする。
+頂点の座標はすべて 2 進の分数で表せるので、面積の和は 1 に厳密に一致するはずである。
+細分の点と回数は、次のセルに渡す。
+
+```rust
+//| id: spatial-adaptive-mesh-epoch
+//| ref: spatial-adaptive-mesh-epoch
+//| title: 1 点へ向けて細分を繰り返し、誘導細分・ハンギング実体・世代を確かめる
+//| run: reactive
+//| uses: [spatial-adaptive-corner-model]
+//| crates: [scioxide-core, scioxide-spatial]
+//| exports: [refinements, target]
+//| inputs:
+//|   steps: {"type":"range","label":"細分の回数","min":1,"max":6,"step":1,"value":3}
+//|   focus: {"type":"select","label":"細分を集める点","options":["中心 (1/2, 1/2)","角 (0, 0)"],"value":"中心 (1/2, 1/2)"}
+//| cases:
+//|   - {"id":"corner","label":"角 (0, 0)","description":"角の細分は兄弟のセルと隣り合うだけなので、平衡のための細分が起きない。","inputs":{"focus":"角 (0, 0)"}}
+//|   - {"id":"six-steps","label":"6 回","description":"中心へ 6 回細分すると、3 回目以降は毎回 3 個の誘導細分が加わる。","inputs":{"steps":6}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"steps","path":"/rows/2/3","equals":28}
+//|       - {"artifact":"steps","path":"/rows/2/4","equals":"14, 3, 17"}
+//|       - {"artifact":"steps","path":"/rows/2/5","equals":12}
+//|       - {"artifact":"steps","path":"/rows/2/8","range":{"min":-1e-15,"max":1e-15}}
+//|       - {"artifact":"steps","path":"/rows/2/9","equals":4}
+//|   - case: corner
+//|     expect:
+//|       - {"artifact":"steps","path":"/rows/2/3","equals":13}
+//|       - {"artifact":"steps","path":"/rows/2/4","equals":""}
+//|   - case: six-steps
+//|     expect:
+//|       - {"artifact":"steps","path":"/rows/5/3","equals":64}
+//|       - {"artifact":"steps","path":"/rows/5/5","equals":36}
+use scioxide_spatial::HangingEntityKind;
+
+let target = if focus.starts_with('角') {
+    [0.0, 0.0]
+} else {
+    [0.5, 0.5]
+};
+let (first, history) = refine_repeatedly(target, steps as usize)?;
+let mut rows = Vec::new();
+let mut previous = &first;
+for (step, (id, result)) in history.iter().enumerate() {
+    // 写像が前の revision から新しい revision へのものであることをトークンで確かめる。
+    result
+        .map
+        .validate(previous.mesh_token(), result.mesh.mesh_token())
+        .map_err(|e| e.to_string())?;
+    let next = &result.mesh;
+    let hanging = next.hanging_entities();
+    let count = |kind| hanging.iter().filter(|h| h.kind == kind).count();
+    let mut area = 0.0;
+    for cell in 0..next.cell_count() {
+        area += next.cell_measure(cell).map_err(|e| e.to_string())?;
+    }
+    let induced: Vec<String> = result
+        .induced_refinements
+        .iter()
+        .map(|i| i.to_string())
+        .collect();
+    rows.push((
+        step + 1,
+        *id,
+        previous.level(*id).map_err(|e| e.to_string())?,
+        next.cell_count(),
+        induced.join(", "),
+        count(HangingEntityKind::Vertex),
+        count(HangingEntityKind::Edge),
+        count(HangingEntityKind::Face),
+        area - 1.0,
+        next.mesh_token().generation().get(),
+    ));
+    previous = next;
+}
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "回", "type": "integer" },
+    { "key": "1", "label": "細分した ID", "type": "integer" },
+    { "key": "2", "label": "その深さ", "type": "integer" },
+    { "key": "3", "label": "活性セル [個]", "type": "integer" },
+    { "key": "4", "label": "誘導細分した ID" },
+    { "key": "5", "label": "ハンギング頂点 [個]", "type": "integer" },
+    { "key": "6", "label": "ハンギング辺 [個]", "type": "integer" },
+    { "key": "7", "label": "ハンギング面 [個]", "type": "integer" },
+    { "key": "8", "label": "面積の和 − 1 [-]", "type": "number", "format": sci2 },
+    { "key": "9", "label": "世代", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "steps" })
+);
+export!(refinements, steps as u64);
+export!(target, target);
+```
+
+既定値（中心 $(1/2, 1/2)$ へ 3 回）では、1 回目に左下の根（ID 0）を細分して活性セルが 7 個になる。
+2 回目は ID 0 の子のうち中心に接する ID 7（深さ 1）を細分し、右と上の根（ID 1、2）が平衡のために細分される。
+根 ID 3 は中心で ID 7 と頂点を共有するだけなので、この回では細分されない。
+3 回目は深さ 2 の ID 11 を細分し、誘導細分は 14、3、17 の順で、昇順になっていない。
+最初に ID 14 を細分した後で ID 3 の根が新たに違反し、ID 17 より先に取り出されたためである。
+ハンギング頂点は 3 回目に 12 個で、2 次元なのでハンギング辺とハンギング面はどちらも 24 個と同じ数になる。
+面積の和は毎回ちょうど 1 である。
+revision の世代は、世代 0 の `CellMesh` を取り込んだ revision が 1 で、細分ごとに 1 ずつ進む。
+
+「角 (0, 0)」では、細分したセルの隣は同じ深さの兄弟か元の境界なので、平衡のための細分は起きず、活性セルは毎回 3 個ずつ増える。
+「6 回」では、3 回目以降は毎回 3 個の誘導細分が加わり、活性セルは 64 個、ハンギング頂点は 36 個になる。
+
+## 写像の関係の内訳と拒まれる要求
+
+次のセルは前のセルと同じ細分をやり直し、最後の回の `TopologyMap` の関係を実体と種類ごとに数える。
+続けて、最後の revision に対して三つのことを試す。
+1 つ目は最初の revision のトークンを使った細分の要求、2 つ目は同じ revision と同じマーカーから `adapt` を 2 回呼んで作った兄弟の revision のトークンの比較、3 つ目は子がすべて活性な親を 1 個ずつ粗化する要求である。
+2 つ目の表は、古いトークンの要求の結果、兄弟の revision の世代が等しいか、兄弟の revision のトークンが互換か、粗化を試した親の数、受理された数、拒まれた親の ID と拒否の分類を示す。
+
+```rust
+//| id: spatial-adaptive-topology-map
+//| ref: spatial-adaptive-topology-map
+//| title: 最後の細分のトポロジーの対応を数え、古いトークン・兄弟の revision ・平衡を壊す粗化の扱いを確かめる
+//| run: reactive
+//| uses: [spatial-adaptive-corner-model]
+//| crates: [scioxide-core, scioxide-spatial]
+//| dependsOn:
+//|   epoch: spatial-adaptive-mesh-epoch
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"relations","path":"/rows/0/1","equals":12}
+//|       - {"artifact":"relations","path":"/rows/0/2","equals":16}
+//|       - {"artifact":"relations","path":"/rows/1/4","equals":16}
+//|       - {"artifact":"checks","path":"/rows/0/0","equals":"InvalidInput"}
+//|       - {"artifact":"checks","path":"/rows/0/1","equals":true}
+//|       - {"artifact":"checks","path":"/rows/0/2","equals":false}
+//|       - {"artifact":"checks","path":"/rows/0/3","equals":4}
+//|       - {"artifact":"checks","path":"/rows/0/5","equals":"3, 14, 17"}
+//|       - {"artifact":"checks","path":"/rows/0/6","equals":"InvalidInput"}
+use scioxide_spatial::{AdaptationRequest, EntityRelation};
+
+let steps = epoch["refinements"].as_u64().ok_or("細分の回数がない")?;
+let x = epoch["target"][0].as_f64().ok_or("細分の点がない")?;
+let y = epoch["target"][1].as_f64().ok_or("細分の点がない")?;
+let (first, history) = refine_repeatedly([x, y], steps as usize)?;
+let (_, last) = history.last().ok_or("細分していない")?;
+let (mesh, map) = (&last.mesh, &last.map);
+
+// 最後の細分の写像を、実体と関係の種類ごとに数える。
+let tally = |relations: &[EntityRelation]| {
+    let mut counts = [0_usize; 5];
+    for relation in relations {
+        let slot = match relation {
+            EntityRelation::Unchanged { .. } => 0,
+            EntityRelation::Refined { .. } => 1,
+            EntityRelation::Coarsened { .. } => 2,
+            EntityRelation::Created { .. } => 3,
+            EntityRelation::Removed { .. } => 4,
+        };
+        counts[slot] += 1;
+    }
+    counts
+};
+let lists = [
+    ("セル", map.cells()),
+    ("頂点", map.vertices()),
+    ("面", map.faces()),
+    ("辺", map.edges()),
+];
+let mut relation_rows = Vec::new();
+for (name, list) in lists {
+    let c = tally(list);
+    relation_rows.push((name, c[0], c[1], c[2], c[3], c[4]));
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "実体" },
+    { "key": "1", "label": "Unchanged", "type": "integer" },
+    { "key": "2", "label": "Refined", "type": "integer" },
+    { "key": "3", "label": "Coarsened", "type": "integer" },
+    { "key": "4", "label": "Created", "type": "integer" },
+    { "key": "5", "label": "Removed", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    relation_rows,
+    metadata = serde_json::json!({ "id": "relations" })
+);
+
+// 最初の revision のトークンによる要求は、マーカーを調べる前に拒まれる。
+let stale = AdaptationRequest {
+    source: first.mesh_token(),
+    refine: &[0],
+    coarsen: &[],
+};
+let stale_kind = match mesh.adapt(stale) {
+    Ok(_) => "受理".to_string(),
+    Err(e) => format!("{:?}", e.kind()),
+};
+// 同じ revision と同じマーカーから 2 回 adapt した兄弟の revision は、世代が同じでも互いに組み合わせられない。
+let request = AdaptationRequest {
+    source: mesh.mesh_token(),
+    refine: &mesh.active_cells()[..1],
+    coarsen: &[],
+};
+let first_sibling = mesh.adapt(request).map_err(|e| e.to_string())?;
+let second_sibling = mesh.adapt(request).map_err(|e| e.to_string())?;
+let (left, right) = (
+    first_sibling.mesh.mesh_token(),
+    second_sibling.mesh.mesh_token(),
+);
+let same_generation = left.generation() == right.generation();
+let compatible = left.is_compatible_with(right);
+// 子がすべて活性な親を 1 個ずつ粗化してみる。拒まれるのは 2:1 平衡を壊す親である。
+let active = mesh.active_cells();
+let (mut candidates, mut accepted, mut rejected) = (0, 0, Vec::new());
+let mut kinds = std::collections::BTreeSet::new();
+for id in 0..mesh.hierarchy_len() {
+    let children = mesh.children(id).map_err(|e| e.to_string())?;
+    if children.is_empty() || !children.iter().all(|c| active.contains(c)) {
+        continue;
+    }
+    candidates += 1;
+    let request = AdaptationRequest {
+        source: mesh.mesh_token(),
+        refine: &[],
+        coarsen: &[id],
+    };
+    match mesh.adapt(request) {
+        Ok(_) => accepted += 1,
+        Err(e) => {
+            rejected.push(id.to_string());
+            kinds.insert(format!("{:?}", e.kind()));
+        }
+    }
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "古いトークンの要求" },
+    { "key": "1", "label": "兄弟の revision の世代が等しい", "type": "boolean" },
+    { "key": "2", "label": "兄弟の revision が互換", "type": "boolean" },
+    { "key": "3", "label": "粗化を試した親 [個]", "type": "integer" },
+    { "key": "4", "label": "受理 [個]", "type": "integer" },
+    { "key": "5", "label": "拒まれた親の ID" },
+    { "key": "6", "label": "拒否の分類" }
+]);
+let kinds: Vec<String> = kinds.into_iter().collect();
+let summary = vec![(
+    stale_kind,
+    same_generation,
+    compatible,
+    candidates,
+    accepted,
+    rejected.join(", "),
+    kinds.join(", "),
+)];
+emit_table_with_columns!(
+    columns,
+    summary,
+    metadata = serde_json::json!({ "id": "checks" })
+);
+```
+
+既定値（中心へ 3 回）の最後の細分では、ID 11、14、3、17 の 4 個のセルが細分され、セルの写像は 4 × 4 = 16 個の `Refined` と、変わらない 12 個の `Unchanged` になる。
+新しい頂点 16 個は `Created` で、元の頂点 27 個はすべて `Unchanged` である。
+面の写像は、変わらない 42 個の `Unchanged`、細分した面への 44 個の `Refined`、細分したセルの内部に新しくできた 16 個の `Created` に加えて、4 個の `Coarsened` を含む。
+これは、前の revision で細かいセルの面だった活性な面が、新しい revision でも活性な粗い面の部分であるために現れる組で、粗化をしたわけではない。
+
+最初の revision のトークンを使った要求は `InvalidInput` で拒まれる。
+兄弟の revision は世代が等しいが、トークンは互換でない。
+子がすべて活性な親は 4 個あり、そのうち最後に細分した ID 11 だけが粗化を受け入れる。
+平衡のために細分した ID 3、14、17 を粗化すると、深さの差が 2 の隣が生じるので、どれも `InvalidInput` で拒まれる。
+
+## まとめ
+
+局所細分が要る問題では、構造格子か単体メッシュを `AdaptiveMesh` に取り込み、細分と粗化マーカーを `AdaptationRequest` に入れて `adapt` を呼ぶ。
+2 段以上細かくするときは `adapt` を繰り返し、平衡のために加わった細分は `induced_refinements` で確かめる。
+離散化の拘束や流束は `hanging_entities()` と `interfaces()` から組み立て、3 次元では辺だけを共有するセルの深さの差が平衡で制限されないことに注意する。
+場の値を新しい revision へ移すときは、`TopologyMap` のトポロジーの対応に呼び出し側で重みを与えるか `scioxide-pde` の転送を使う。
+値は作った revision のトークンにだけ結び付き、古い revision や兄弟の revision のトークンを持つ値は `InvalidInput` で拒まれるので、それを前提に処理を組む。
+
+## 次に読むページ
+
+- [適応メッシュの領域分割と再分割](../mesh-partition/)：細分した revision の活性セルを部分に分け、ゴーストセルと界面を通信の単位にする方法を確かめる。
+- [点・範囲・格子・メッシュの基礎](../geometry-grids-and-meshes/)：根に使う `CellMesh` と単体メッシュ、場と `MeshToken` の照合を確かめる。
+- [適応細分化](../../../scioxide-pde/api/adaptive-refinement/)：誤差推定とマーキングから `AdaptationRequest` を作り、`TopologyMap` で場を移す偏微分方程式の適応細分の流れを確かめる。
+- [三角形分割を共有する散在点補間](../../../scioxide-interp/algorithms/scattered-tessellations/)：一つの `Delaunay` を複数の値の組で共有する補間の例を見る。
+- [単体と球面の求積則](../../../scioxide-integrate/algorithms/simplex-and-sphere-rules/)：`TriangleMesh` のセルを直接積分する求積を確かめる。

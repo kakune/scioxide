@@ -1,0 +1,289 @@
+---
+title: 複数クレートを組み合わせる計算
+description: 状態、単位、終了理由を受け渡し、内側の数値誤差が外側の求根へ伝わる過程を確かめる。
+sidebar:
+  order: 1
+---
+
+軌道の最近接時刻や感染モデルのパラメータは、微分方程式を解いた結果から求める。
+このような計算では、ある API の出力が次の API の入力になり、内側の計算の誤差が外側の計算の結果に混ざる。
+各 API の入力条件を満たすだけでなく、前段の誤差が後段の結果へどれだけ伝わるかを見積もる必要がある。
+
+この章では物理・生物・工学の題材で複数のクレートを組み合わせ、結果を独立な方法で検算する。
+このページでは各例に共通する受け渡しの条件をまとめ、最小の例として「微分方程式の解を使う求根」を取り上げる。
+
+## 応用例の読み方
+
+| 題材 | 組み合わせる計算 | 独立検算 |
+|---|---|---|
+| [軌道と最近接時刻](orbital-mechanics/) | 時間積分、求根 | 保存量の変化 |
+| [SEIR のパラメータ推定](epidemiology-seir/) | 前進感度、時間積分、非線形最小二乗、乱数 | 感度と中心差分、合成データの真値 |
+| [Turing 分岐](reaction-diffusion/) | 求根、固有値、空間離散化、時間発展 | 分散関係から得る成長率 |
+| [三角井戸](triangular-quantum-well/) | 三重対角行列の固有値、特殊関数の零点 | Airy 関数による解析解、格子の細分化 |
+| [軌道遷移の最適化](orbital-transfer-optimization/) | 有界最小化、時間積分 | ホーマン遷移、遠日点半径 |
+| [SEIR の識別と区間](epidemiology-seir-uncertainty/) | 最小二乗、特異値、二項信頼区間 | 合成データの被覆率 |
+| [気候のヒステリシス](climate-energy-balance/) | 平衡曲線、折り返しの求根、時間積分 | 陽な平衡曲線、定数アルベドの極限 |
+| [不確かさの伝播](uncertainty-propagation/) | 乱数、準乱数、ODE、Sobol 指数 | SIR 最終規模の閉形式 |
+
+各ページは同じ順で進む。
+最初にモデルの仮定、状態の成分順、単位を定め、次に計算に使う式を導出する。
+そのうえで各 API が使う数値解法と終了条件を説明し、セルの結果を解析解、保存量、精度改善、別の手法のいずれかと比べる。
+表の「独立検算」の列はそのページで数値結果を照合する相手を示す。
+
+独立検算は、主計算と誤差の出方が異なる方法で行う。
+たとえば ODE の解を同じ ODE ソルバーで刻みだけ変えて解き直しても、モデルの取り違えは見つからない。
+解析解や保存量はモデルそのものの誤りも見つけられるので、各例ではできるだけそれらを使う。
+
+作業領域の準備と再利用は[作業領域と再現性](../concepts/workspaces-and-reproducibility/)を参照する。
+
+## 計算の受け渡し
+
+同じ `Vec<f64>` でも、位置、速度、濃度では意味も単位も違う。
+型は成分の意味を区別しないので、受け渡しの約束は文書とコードのコメントで明示する。
+また、適応刻みの ODE が出力する時刻列は不等間隔なので、そのままでは等間隔の標本を前提にする FFT の入力にならない。
+接続する計算ごとに、次の条件を確認する。
+
+1. 成分順、次元、単位、座標系をそろえる。
+   前段が $(x,y,v_x,v_y)$ の順で返す状態を、後段が $(x,v_x,y,v_y)$ の順だと読むと、計算は止まらずに誤った値を返す。
+2. 補間や求根に必要な定義域と連続性を確認する。
+   Brent 法のような区間法は、区間の両端で符号が異なり、その間で関数が連続であることを前提にする。
+3. 内側の終了理由を読み、未完了の値を完成した計算として渡さない。
+   ODE の積分が刻みの上限で止まった場合、最後の状態は終端時刻の値ではない。
+4. 状態の誤差と残差を区別し、観測量への感度で誤差を換算する。
+   残差が小さいことは、求めたい量の誤差が小さいことを直ちには意味しない。
+
+4 番目の換算は次の節の例で具体的に行う。
+誤差の伝播を一般の形で扱う方法は[誤差の伝播](../concepts/composition/)にまとめてある。
+
+## 内側の誤差と求根の精度
+
+濃度 $c(t)$ が一次反応で減衰するモデル $c'=-kc$、$c(0)=1$ を考える。
+時間 $t$ の単位は s、反応速度定数 $k$ の単位は s⁻¹、濃度は初期濃度で無次元化する。
+時刻 $T=2$ s で濃度が $c_*=0.3$ になる $k$ を求める。
+解析解は $c(T;k)=\exp(-kT)$ なので、独立な参照値は $k_*=-\log(c_*)/T\approx 0.601986$ s⁻¹ である。
+
+この問題は解析的に解けるが、ここでは解析解を知らない場合と同じ手順で解く。
+濃度は ODE の数値積分で求め、その結果を求根の目的関数に使う。
+解析解は最後に推定値を照合するためだけに使う。
+
+### 誤差の伝わり方
+
+外側の残差は $F(k)=c(T;k)-c_*$ である。
+数値積分で得る濃度を $\tilde c(T;k)=c(T;k)+\delta c(k)$ と書くと、求根器が実際に零点を探す関数は
+
+$$
+\tilde F(k)=F(k)+\delta c(k)
+$$
+
+になる。
+求根器が $\tilde F$ の零点 $\tilde k$ を正確に求めたとする。
+$F$ を $k_*$ のまわりで一次まで展開すると $0=\tilde F(\tilde k)\approx F'(k_*)(\tilde k-k_*)+\delta c(\tilde k)$ なので、単純根 $F'(k_*)\neq 0$ の近傍では
+
+$$
+|\tilde k-k_*|\approx\frac{|\delta c|}{|F'(k_*)|}
+$$
+
+となる。
+このモデルでは $\partial c/\partial k=-T\exp(-kT)$ なので、$F'(k_*)=-Tc_*=-0.6$ s である。
+濃度の誤差は約 $1/0.6\approx 1.7$ 倍になって反応速度定数の誤差に現れる。
+$\lvert F'(k_*)\rvert$ が小さい問題、つまり観測量がパラメータにほとんど依存しない問題では、同じ $\delta c$ でもパラメータの誤差が大きくなる。
+$1/\lvert F'(k_*)\rvert$ は、この逆問題の絶対条件数にあたる。
+
+この式は一次近似であり、ODE の局所許容誤差を $|\delta c|$ と置けるわけではない。
+適応刻みの ODE ソルバーは各刻みの局所誤差の推定値を許容誤差以下に抑える。
+終端での大域誤差は局所誤差が伝わって積み重なったものであり、許容誤差より大きくも小さくもなりうる。
+実際の $|\delta c|$ は解析解との比較や許容誤差を変えた計算で確かめる。
+
+もう一つの注意点は、$\delta c(k)$ が $k$ について滑らかでないことである。
+$k$ を少し変えると採用される刻みの列が変わり、誤差は許容誤差の大きさで不規則に揺れる。
+そのため $\tilde F$ は $F$ に小さな凹凸を加えた関数になり、外側の許容誤差を $|\delta c|/|F'(k_*)|$ より小さくしても、$k_*$ への近さは改善しない。
+外側の許容誤差だけを小さくしても、内側の評価誤差は消えない。
+
+### 外側の求根
+
+外側の求根には `Brent` を使う。
+Brent 法は、符号の異なる 2 点で零点を挟んだ区間を保ちながら、逆二次補間または割線法の刻みを試し、刻みが十分に縮まないときは二分法に切り替える。
+単純根への収束は超線形であり、二分法への切り替えがあるので、連続な関数なら区間の中の零点への収束が保証される。
+区間は各反復で両端の符号が異なるように更新されるので、$\tilde F$ が凹凸を持ち、刻みの列の切り替わりで不連続になっていても、最終区間は $\tilde F$ の符号の変わる点を挟む。
+その点が $k_*$ からどれだけ離れているかは、前の節の見積もりで決まる。
+
+`ScalarRootOptions` の刻みの許容誤差 $(\tau_a,\tau_r)$ は、区間法では最終区間 $[a,b]$ の幅の判定
+
+$$
+b-a\le\tau_a+\tau_r\max(|a|,|b|)
+$$
+
+に使われる。
+既定値は $\tau_a=\tau_r=4\varepsilon$（$\varepsilon$ は f64 の計算機イプシロン）で、反復回数の上限は 100 回である。
+この判定を満たすと終了状態は `BracketTolerance` になり、`is_success()` が真を返す。
+上限で止まった場合は `IterationLimit` になり、その時点で最良の点が結果に入る。
+
+### セルの構成
+
+次のセルは内側と外側の許容誤差を別々に指定する。
+入力は ODE の許容誤差 $10^{p}$ の指数 $p$ と、求根の許容誤差 $10^{q}$ の指数 $q$ である。
+ODE には絶対・相対とも $10^{p}$、求根には $\tau_a=\tau_r=10^{q}$ を与える。
+
+セルの中では次の順に API を使う。
+
+1. `OdeSystem` を実装した `Decay` が右辺 $-kc$ を返す。
+   状態は 1 成分で、`dimension` が 1 を返す。
+2. 目的関数 `ScalarFn` のクロージャが $k$ ごとに `OdeProblem::new(&system, 2.0)` で終端時刻 $T=2$ の問題を作る。
+3. `ErrorTolerance::scalar(atol, rtol, NormSelection::Infinity)` で、全成分に共通の許容誤差と最大値ノルムを指定する。
+   刻みは、誤差推定 $e_i$ が $|e_i|\le \mathrm{atol}+\mathrm{rtol}\,s_i$ をすべての成分で満たすときに採用される。
+   $s_i$ は解の大きさに応じた尺度である。
+4. `DormandPrince5` は 5 次と 4 次の公式を組み合わせた陽的 Runge–Kutta 法で、2 つの解の差を局所誤差の推定に使い、5 次の解で進む。
+   `workspace` で作業領域を確保し、`advance` で `state` を終端時刻まで進める。
+   `advance` は `state` をその場で書き換え、戻り値のレポートが終了理由を持つ。
+5. レポートの `is_success()` が偽なら、終端に達していない濃度を使わずにエラーを返す。
+   クロージャが返したエラーは、`Brent` の `solve` がそのまま返す。
+6. `Brent.solve` に区間 $[0.1,2]$ s⁻¹ を渡す。
+   両端で $F(0.1)\approx 0.52$、$F(2)\approx-0.28$ なので符号が異なる。
+
+目的関数は評価のたびに作業領域を確保する。
+状態が 1 成分なので確保の計算コストは小さいが、大きな系では作業領域をクロージャの外で用意し、評価のたびに再利用する。
+
+セルは推定値、解析値、その差、解析式で計算した濃度残差 $\exp(-T\tilde k)-c_*$ を表に出す。
+解析値と解析式の残差は、ODE と独立に標準ライブラリの `exp` と `ln` で計算する。
+最後の outcome は求根の終了状態と解析値との差を示す。
+
+```rust
+//| id: app-nested-tolerance
+//| ref: app-nested-tolerance
+//| title: 反応速度定数の推定と内側の積分誤差
+//| run: reactive
+//| crates: [scioxide-core, scioxide-linalg, scioxide-ode, scioxide-rootfind]
+//| inputs:
+//|   inner_exponent: {"type":"range","label":"ODE 許容誤差の指数","min":-10,"max":-3,"step":1,"value":-6}
+//|   outer_exponent: {"type":"range","label":"求根の許容誤差の指数","min":-12,"max":-4,"step":1,"value":-9}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"estimate","path":"/rows/0/2","range":{"max":1e-6}}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+use scioxide_core::{
+    ErrorTolerance, ExecutionContext, SciOxideError, Interval, NormSelection, StepTolerance,
+};
+use scioxide_linalg::Vector;
+use scioxide_ode::{
+    DormandPrince5, OdeMethod, OdeOptions, OdeProblem, OdeState, OdeSystem, OdeTrajectory,
+};
+use scioxide_rootfind::{Brent, ScalarFn, ScalarRootOptions, ScalarRootSolver};
+
+struct Decay(f64);
+impl OdeSystem<f64> for Decay {
+    fn dimension(&self) -> usize {
+        1
+    }
+    fn rhs(
+        &self,
+        _: f64,
+        y: &[f64],
+        dy: &mut [f64],
+        _: &mut scioxide_core::SolveContext<'_, '_>,
+    ) -> Result<(), SciOxideError> {
+        dy[0] = -self.0 * y[0];
+        Ok(())
+    }
+}
+let inner = 10.0_f64.powf(inner_exponent);
+let outer = 10.0_f64.powf(outer_exponent);
+let objective = ScalarFn::new(|rate: f64| {
+    let system = Decay(rate);
+    let problem = OdeProblem::new(&system, 2.0);
+    let tolerance = ErrorTolerance::scalar(inner, inner, NormSelection::Infinity)?;
+    let options = OdeOptions::default().with_error_tolerance(tolerance);
+    let method = DormandPrince5::new();
+    let mut workspace = method.workspace(&problem, &options)?;
+    let mut state = OdeState::new(0.0, Vector::from_vec(vec![1.0]));
+    let mut path = OdeTrajectory::new();
+    let report = method.advance(
+        &problem,
+        &options,
+        &mut state,
+        &mut path,
+        &mut workspace,
+        ExecutionContext::sequential(),
+    )?;
+    if !report.is_success() {
+        return Err(SciOxideError::external("内側の積分が終端に達しなかった"));
+    }
+    Ok(state.values()[0] - 0.3)
+});
+let options = ScalarRootOptions::default()
+    .with_step_tolerance(StepTolerance::new(outer, outer).map_err(|e| e.to_string())?);
+let root = Brent
+    .solve(
+        &objective,
+        Interval::new(0.1, 2.0).map_err(|e| e.to_string())?,
+        &options,
+    )
+    .map_err(|e| e.to_string())?;
+// 解析解と解析的な濃度は、ODE と独立に標準ライブラリで検算する。
+let exact = -0.3_f64.ln() / 2.0;
+let residual = (-2.0 * root.point()).exp() - 0.3;
+emit_table_with_columns!(
+    serde_json::json!([
+    {"key":"0","label":"推定 k [s⁻¹]","type":"number","format":{"significantDigits":6},"nullText":"未定義"},
+    {"key":"1","label":"解析値 [s⁻¹]","type":"number","format":{"significantDigits":6},"nullText":"未定義"},
+    {"key":"2","label":"絶対誤差 [s⁻¹]","type":"number","format":{"significantDigits":6},"nullText":"未定義"},
+    {"key":"3","label":"解析式での濃度残差 [-]","type":"number","format":{"significantDigits":6},"nullText":"未定義"}
+    ]),
+    vec![(root.point(), exact, (root.point() - exact).abs(), residual)],
+    metadata = serde_json::json!({"id":"estimate"})
+);
+let outcome = if root.is_success() {
+    Outcome::satisfied("求根の終了条件を満たした")
+} else {
+    Outcome::partial("求根の終了条件を満たしていない")
+};
+emit_outcome!(outcome.status(root.termination().to_string()).diagnostic(
+    "解析値との絶対差",
+    (root.point() - exact).abs(),
+    Some("s⁻¹")
+));
+```
+
+### 結果の読み方
+
+解析式での残差は、求根器自身が見ている残差 $\tilde F(\tilde k)$ とは異なる。
+求根器の残差は数値積分の濃度で計算するので、終了時にはほぼ 0 になる。
+一方、解析式での残差は一次近似で $F'(k_*)(\tilde k-k_*)$ に等しく、表の絶対誤差の約 0.6 倍になる。
+この関係が成り立っていれば、表の 2 つの列は同じ誤差を別の量で見ていることになる。
+
+入力を変えて、次の 2 つの場合を比べる。
+
+- ODE の許容誤差を固定して、求根の許容誤差だけを厳しくする。
+  ある値から先は絶対誤差が下がらなくなり、ODE の誤差で決まる下限に達する。
+- 両方を同時に厳しくする。
+  絶対誤差は ODE の許容誤差とともに下がる。
+
+この比較から、外側の収束と、モデルの方程式を満たす精度を区別できる。
+逆に、求根の許容誤差を ODE の誤差の見積もりより緩くすると、絶対誤差は求根の許容誤差で決まる。
+外側の許容誤差を内側から伝わる誤差 $|\delta c|/|F'(k_*)|$ と同じ程度に選ぶと、どちらの計算にも無駄が少ない。
+
+## 計算量と終了理由
+
+外側が $m$ 回評価し、内側の 1 回の積分が平均 $n$ 回の右辺評価を使うなら、主な計算量は $mn$ 回の右辺評価になる。
+`DormandPrince5` は採用した 1 刻みあたり右辺を 6 回評価し、最後の段の値を次の刻みの最初の段に使う。
+誤差推定は刻み幅 $h$ に対して $O(h^5)$ なので、滑らかな解では刻みの数はおよそ $\mathrm{tol}^{-1/5}$ に比例する。
+許容誤差を 4 桁厳しくすると、刻みの数は約 $10^{4/5}\approx 6.3$ 倍になる。
+Brent 法の評価回数 $m$ は超線形収束のため区間幅の桁数に対してゆっくりしか増えない。
+
+内側の計算の精度を過度に上げると、外側のすべての評価コストが大きくなる。
+一方、内側が粗すぎると、$\tilde F$ の凹凸が大きくなり、外側で小さなパラメータ変化を比較できなくなる。
+まず解析解や精度改善で必要な内側精度を調べ、そのうえで外側の停止条件を選ぶ。
+
+終了理由は内側から外側へ順に確かめる。
+内側の積分が終端に達しなかった評価はエラーとして外側に伝え、外側の求根はそのエラーで止める。
+外側の結果は `termination()` で終了状態を確かめ、成功でなければ outcome を `partial` にする。
+こうすることで、未完了の内側の値が外側の成功した結果に紛れ込まない。
+入れ子の計算で評価回数の上限を共有する方法は、[誤差の伝播](../concepts/composition/)の入れ子の計算回数の上限の管理で扱う。
+
+## まとめと次に読むページ
+
+複数のクレートを組み合わせるときは、値の成分順、単位、定義域、終了理由を引き継ぐ。
+内側の数値誤差 $\delta c$ は、外側の結果に $\delta c/\lvert F'\rvert$ の大きさで伝わるので、感度の小さい問題ほど内側を精密にする必要がある。
+外側の許容誤差はこの伝わった誤差より小さくしても結果を改善しない。
+許容誤差を選ぶときは、解析解か精度改善で内側の誤差を測り、その値から外側の許容誤差を決める。
+[誤差の伝播](../concepts/composition/)で一般形と計算回数の上限の配分を確認し、上の応用例で保存量や感度を使う検算へ進む。

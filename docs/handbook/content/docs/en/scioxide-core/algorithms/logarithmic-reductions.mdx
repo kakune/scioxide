@@ -1,0 +1,372 @@
+---
+title: "Logarithmic sums, weighted sums, and normalization"
+description: "Maximum-shift log-sum derivation and error estimates, positive-sum 16 ULP contracts and staged evaluation, vector softmax and log-softmax, and conditioning and error bounds for signed or complex weighted sums."
+sidebar:
+  order: 340
+references:
+  core-logsumexp-shift: "logarithmic-sums-with-maximum-shifts"
+  core-positive-sum-stages: "positive-sum-errors-and-staged-evaluation"
+  core-weighted-sum-conditioning: "signed-and-complex-weighted-sums-and-conditioning"
+  core-softmax: "softmax-and-log-softmax"
+---
+
+Partition functions, likelihoods, and softmax commonly sum positive quantities stored logarithmically.
+In double precision, $\exp(x)$ overflows at $x > 709.78$ and becomes zero at $x < -745.13$.
+Logarithmic sums in `scioxide-core` shift by the maximum before forming exponentials, checking sum error in stages before returning.
+This page covers logarithmic sums, softmax, and weighted sums for one vector.
+[Axiswise normalization and logarithmic sums](../axis-reductions/) covers the same computations along array axes.
+
+## Logarithmic sums with maximum shifts
+
+Write the log-sum-exp of real vector $\mathbf{x} = (x_1, \dots, x_n)$ as $y = \operatorname{LSE}(\mathbf{x}) = \ln \sum_{i} e^{x_i}$.
+Each input $x_i$ is the logarithm of a positive term $e^{x_i}$; these are simply called logarithms below.
+Setting $c = \max_i x_i$ and splitting each term as $e^{x_i} = e^{c}\, e^{x_i - c}$ gives
+
+$$
+y = c + \ln S, \qquad S = \sum_{i=1}^{n} e^{x_i - c}
+$$
+
+the reformulation above.
+Since $x_i - c \le 0$, exponentials cannot overflow; the largest term is $e^0 = 1$, so $1 \le S \le n$, equivalently $c \le y \le c + \ln n$.
+
+When the largest term dominates, $S = 1 + \delta$ ($\delta \ll 1$); taking the logarithm of rounded $S$ loses the contribution of $\delta$.
+Retain the sum $\delta = S - 1$ excluding the largest term and evaluate $\ln S = \ln(1 + \delta)$ through `ln_1p` instead.
+
+Differentiating $y$ with respect to $x_i$ gives $p_i = e^{x_i - y}$ (softmax probabilities), with $\sum_i p_i = 1$.
+Thus, for input perturbations $\Delta x_i$, $|\Delta y| \le \max_i |\Delta x_i|$ holds to first order: log-sum-exp is well-conditioned in absolute error.
+
+`logsumexp(values)` accepts real or complex logarithms.
+
+- Real logarithm $-\infty$ is a mask contributing an exactly zero term.
+  Empty or entirely masked input returns $-\infty$.
+- NaN and $+\infty$ are rejected as `NonFinite`.
+  A result outside finite range produces `NumericalInstability`.
+- For complex logarithms, only the real part may be $-\infty$; imaginary parts must remain finite even for masked terms.
+  Results are principal logarithms; empty or entirely masked input returns $(-\infty, +0)$, while exact cancellation of active terms produces `DomainError`.
+- `logsumexp_value` returns the same sum as `LogValue`, representing empty or exactly cancelling sums as a separate zero state, not an infinite logarithm.
+- Use `logaddexp(x, y)` for two-value logarithmic sums.
+
+### Error estimates for shifted computation
+
+Assume the standard model (relative error within unit roundoff $u$ for arithmetic, `exp`, and `ln_1p`), neglecting second and higher orders in $u$.
+Rounding in $d_i = x_i - c$ introduces exponent error $u|d_i|$, bounding the relative error of $e^{d_i}$ by $u(1 + |d_i|)$.
+Sequentially summing $n - 1$ positive terms to obtain $\delta$ incurs error at most $(n-2)u\,\delta$; $\ln(1 + \delta)$ has slope at most $1/S$ at $\delta \ge 0$.
+Combining these bounds and using $t\,e^{-t} \le e^{-1}$ ($t \ge 0$), the absolute error $E$ of $\ln S$ satisfies
+
+$$
+E \le u \Bigl[ \ln S + (n - 1)(1 - p_{\max}) + \sum_{i} p_i\, |x_i - c| \Bigr]
+\le u \bigl[ \ln n + (1 + e^{-1})(n - 1) \bigr]
+$$
+
+
+Here $p_{\max} = 1/S$ is the largest term's probability.
+A final addition of $c + \ln S$ rounds once, so for $y \ne 0$ the relative error is bounded by $|\hat{y} - y| / |y| \le u + E/|y|$.
+
+Since $E$ remains $O(nu)$ regardless of input magnitudes, results are relatively accurate when $|y|$ is of order 1 or larger.
+Conversely, if cancellation in $c + \ln S$ at $c < 0$ makes $|y|$ small, the second term $E/|y|$ becomes large.
+For example, with $x_1 = x_2 = -\ln 2$ (rounded to double), true $y$ is about $2.3 \times 10^{-17}$, but double-precision $c + \ln 2$ gives zero.
+Here the relative condition number $\sum_i p_i |x_i| / |y|$ of $y$ is about $3 \times 10^{16}$, so input relative error $u$ alone changes $y$ by its own magnitude.
+
+Rather than relying on this a priori estimate, `scioxide-core` checks an error bound per computed result and recomputes at higher precision if necessary, as described next.
+Even the example above returns approximately $2.3 \times 10^{-17}$ through `logsumexp`.
+
+## Positive-sum errors and staged evaluation
+
+Positive sums (`logsumexp` and `logaddexp` of real logarithms and `weighted_logsumexp` with nonnegative weights) stay within 16 ULP measured at the result itself.
+This is a tested accuracy contract covering near-zero and subnormal results as well.
+
+To meet it, computation increases precision in the following order, stopping when the checked error bound fits the contract.
+
+1. Double-precision exponentials and compensated summation.
+2. Double-double exponentials (pairs of doubles).
+3. Exact accumulation of exponential components.
+
+The second and third stages sum terms in exact accumulators, so addition rounding error does not grow with input length.
+The first stage rejects near-zero results with strong cancellation in $c + \ln S$ and subnormal results, passing them to later stages.
+Results satisfy the contract regardless of the finishing stage.
+Real log-sum work is $O(n)$, with no heap allocation at any stage.
+
+## Softmax and log-softmax
+
+Probabilities $p_i = e^{x_i - y}$ are softmax; their logarithms $\ln p_i = (x_i - c) - \ln S$ are log-softmax.
+Computing log probabilities directly as $(x_i - c) - \ln S$ avoids forming probabilities, allowing finite $\ln p_i$ even when $p_i$ rounds to zero in double precision.
+
+Four functions operate on one-dimensional slices.
+
+| Function | Result | Storage |
+|---|---|---|
+| `softmax(input)` | Probability `Vec` | Allocate result `Vec` once |
+| `log_softmax(input)` | Log-probability `Vec` | As above |
+| `softmax_into(input, output, scratch)` | Write probabilities into `output` | No allocation; `scratch` length at least input length |
+| `log_softmax_into(input, output, scratch)` | Write log probabilities into `output` | As above |
+
+All four require $O(n)$ work.
+Borrowed forms compute into `scratch` before copying to `output` after every term succeeds, preserving `output` on failure.
+An `output` length different from input, or `scratch` shorter than input, produces `DimensionMismatch`.
+Owned result allocation failure produces `AllocationFailure`.
+
+Masks ($-\infty$) have exact probability $+0$ and log probability $-\infty$.
+Empty or entirely masked input gives `DomainError` because the normalization sum is zero.
+NaN and $+\infty$ are rejected as `NonFinite`.
+
+The following cell computes logarithmic sums, probabilities, and log probabilities for $c$ and $c + d$, optionally adding mask $-\infty$ as a third term.
+Inputs are shared shift $c$ and logarithm difference $d$ (both dimensionless), and whether to add a mask.
+The first table compares quantities with analytical values such as $y = c + \ln(1 + e^{d})$, $p_0 = 1/(1 + e^{d})$, $\ln p_0 = -\ln(1 + e^{d})$, and $\ln p_1 = -\ln(1 + e^{-d})$, reporting error as $|\text{computed value} - \text{analytical value}| / (\varepsilon |\text{analytical value}|)$.
+Analytical values use intrinsic `f64` methods as references and themselves have rounding errors of a few $\varepsilon$.
+The second table shows direct exponential-sum logarithms and masked outputs.
+
+```rust
+//| id: core-stable-logsumexp-shift
+//| ref: core-stable-logsumexp-shift
+//| title: "Logarithmic sums and probabilities under a shared shift"
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   common_shift: {"type":"range","label":"Shared shift c [-]","description":"e^c overflows for c ≥ 710.","min":-1000,"max":1000,"step":100,"value":800}
+//|   logit_gap: {"type":"range","label":"Logarithm difference d [-]","description":"The second logarithm is c + d.","min":-8,"max":8,"step":0.5,"value":2}
+//|   include_mask: {"type":"checkbox","label":"Add mask -∞ as a third term","description":"-∞ contributes an exactly zero term.","value":false}
+//| cases:
+//|   - {"id":"no-shift","label":"c = 0","description":"Direct exponential summation remains finite and agrees with log-sum-exp.","inputs":{"common_shift":0}}
+//|   - {"id":"underflow","label":"c = −1000, d = 8","description":"All exponentials round to zero, so the direct sum's logarithm is −∞.","inputs":{"common_shift":-1000,"logit_gap":8}}
+//|   - {"id":"masked","label":"With mask","description":"The mask has exact probability +0 and log probability −∞; other values are unchanged.","inputs":{"include_mask":true}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"values","path":"/rows/0/1","approx":{"value":802.1269280110429,"rtol":1e-14}}
+//|       - {"artifact":"values","path":"/rows/1/1","approx":{"value":0.11920292202211755,"rtol":1e-13}}
+//|       - {"artifact":"values","path":"/rows/3/1","approx":{"value":-2.1269280110429727,"rtol":1e-13}}
+//|       - {"artifact":"values","path":"/rows/0/3","range":{"min":0,"max":16}}
+//|       - {"artifact":"values","path":"/rows/4/3","range":{"min":0,"max":16}}
+//|       - {"artifact":"direct","path":"/rows/0/0","equals":null}
+//|   - case: no-shift
+//|     expect:
+//|       - {"artifact":"values","path":"/rows/0/1","approx":{"value":2.1269280110429727,"rtol":1e-13}}
+//|       - {"artifact":"direct","path":"/rows/0/0","approx":{"value":2.1269280110429727,"rtol":1e-13}}
+//|   - case: underflow
+//|     expect:
+//|       - {"artifact":"values","path":"/rows/0/1","approx":{"value":-991.9996645936272,"rtol":1e-14}}
+//|       - {"artifact":"values","path":"/rows/3/1","approx":{"value":-8.000335406372896,"rtol":1e-13}}
+//|       - {"artifact":"direct","path":"/rows/0/0","equals":null}
+//|   - case: masked
+//|     expect:
+//|       - {"artifact":"values","path":"/rows/0/1","approx":{"value":802.1269280110429,"rtol":1e-14}}
+//|       - {"artifact":"direct","path":"/rows/0/1","equals":0}
+//|       - {"artifact":"direct","path":"/rows/0/2","equals":"Yes"}
+use scioxide_core::{RealScalar, log_softmax_into, logsumexp, softmax_into};
+
+let mut logits = vec![common_shift, common_shift + logit_gap];
+if include_mask {
+    logits.push(f64::NEG_INFINITY);
+}
+let total = logsumexp(&logits).map_err(|e| e.to_string())?;
+// Borrowed forms use workspace at least as long as input, reused for both calls.
+let mut scratch = vec![0.0; logits.len()];
+let mut probabilities = vec![0.0; logits.len()];
+let mut log_probabilities = vec![0.0; logits.len()];
+softmax_into(&logits, &mut probabilities, &mut scratch).map_err(|e| e.to_string())?;
+log_softmax_into(&logits, &mut log_probabilities, &mut scratch).map_err(|e| e.to_string())?;
+
+// Analytical references from intrinsic f64 methods. softplus(t) = ln(1 + e^t).
+// Compute p₁ and ln p₁ from softplus(−d) to avoid cancellation.
+let softplus = |t: f64| t.exp().ln_1p();
+let expected = [
+    ("LSE", total, common_shift + softplus(logit_gap)),
+    ("p₀", probabilities[0], 1.0 / (1.0 + logit_gap.exp())),
+    ("p₁", probabilities[1], 1.0 / (1.0 + (-logit_gap).exp())),
+    ("ln p₀", log_probabilities[0], -softplus(logit_gap)),
+    ("ln p₁", log_probabilities[1], -softplus(-logit_gap)),
+];
+let rows: Vec<(&str, f64, f64, f64)> = expected
+    .iter()
+    .map(|&(name, value, reference)| {
+        let error = (value - reference).abs() / (f64::EPSILON * reference.abs());
+        (name, value, reference, error)
+    })
+    .collect();
+let digits = serde_json::json!({ "significantDigits": 16 });
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let value_columns = serde_json::json!([
+    { "key": "0", "label": "Quantity" },
+    { "key": "1", "label": "SciOxide [-]", "type": "number", "format": digits },
+    { "key": "2", "label": "Analytical value [-]", "type": "number", "format": digits },
+    { "key": "3", "label": "Relative error / ε [-]", "type": "number", "format": fixed2 }
+]);
+emit_table_with_columns!(
+    value_columns,
+    rows,
+    metadata = serde_json::json!({ "id": "values" })
+);
+
+// Comparison: sum exponentials directly with intrinsic f64 methods; non-finite values become None.
+let direct: f64 = logits.iter().map(|x| x.exp()).sum::<f64>().ln();
+let direct = RealScalar::is_finite(direct).then_some(direct);
+// Mask probability is +0 and log probability −∞; absent masks give None.
+let mask_probability = include_mask.then(|| probabilities[2]);
+let mask_log = match log_probabilities.get(2) {
+    Some(&value) if value == f64::NEG_INFINITY => "Yes",
+    Some(_) => "No",
+    None => "No mask",
+};
+let direct_columns = serde_json::json!([
+    {
+        "key": "0",
+        "label": "Direct exponential sum ln Σ e^x [-]",
+        "type": "number",
+        "format": digits,
+        "nullText": "Non-finite"
+    },
+    { "key": "1", "label": "Mask probability p₂ [-]", "type": "number", "nullText": "No mask" },
+    { "key": "2", "label": "Mask log probability is −∞" }
+]);
+emit_table_with_columns!(
+    direct_columns,
+    vec![(direct, mask_probability, mask_log)],
+    metadata = serde_json::json!({ "id": "direct" })
+);
+```
+
+At the defaults ($c = 800$, $d = 2$), direct exponentials become non-finite, while `logsumexp` agrees with analytical $802.1269\ldots$ to the displayed digits.
+At $c = 0$, direct summation is also finite, giving $2.1269\ldots$ like log-sum-exp.
+At $c = -1000$ and $d = 8$, exponentials all round to zero, making the direct sum's logarithm $-\infty$; log-sum-exp is $-991.9997$, and $\ln p_0 \approx -8.0003$ is obtained without taking probability logarithms.
+Adding a mask leaves the sum, $p_0$, and $p_1$ unchanged, with exact mask probability $+0$ and log probability $-\infty$.
+
+## Signed and complex weighted sums and conditioning
+
+Negative or complex weights in $Z = \sum_i w_i e^{x_i}$ can cause cancellation.
+The condition number
+
+$$
+\kappa = \frac{\sum_i |w_i| e^{x_i}}{\left| \sum_i w_i e^{x_i} \right|}
+$$
+
+measures cancellation; nonnegative weights give $\kappa = 1$.
+Relative term errors $\theta_i$ can amplify to sum relative error $\sum_i |w_i| e^{x_i} \theta_i / |Z| \le \kappa \max_i \theta_i$, so absolute error in $\ln |Z|$ also scales with $\kappa$.
+
+`weighted_logsumexp(values, weights)` takes real logarithms with real or complex weights, returning `LogValue` (sign or phase with $\ln |Z|$).
+Masked and zero-weight terms contribute nothing.
+Empty input, no contributing terms, or exact cancellation gives the zero state; `log_magnitude()` returns `None`.
+All weights must be finite, including masked and zero-weight terms.
+Non-finite weights and NaN or $+\infty$ logarithms produce `NonFinite`.
+Logarithm/weight length mismatch produces `DimensionMismatch`.
+
+With nonnegative weights, $\ln |Z|$ is within 16 ULP.
+Signed or complex weight error depends on conditioning.
+Inspect contributing logarithms in decreasing order, forming an interval of width 1200 below the largest, then another starting from the largest logarithm outside it.
+Let the resulting interval count be $k$ ($k \le n$).
+Within $32 k \varepsilon \kappa < 1/2$,
+
+$$
+\bigl| \widehat{\ln |Z|} - \ln |Z| \bigr| \le 64\, k\, \varepsilon\, \kappa\, (1 + |\ln |Z||) + 8\eta
+$$
+
+This bound holds, where $\varepsilon$ is machine epsilon and $\eta$ is the smallest positive subnormal.
+Beyond this condition-number range, no forward error upper bound applies.
+`logsumexp` for complex logarithms follows the same bound with terms $t_i = e^{x_i}$ and intervals counted by logarithm real parts.
+Work is usually $O(n)$ and at most $O(nk)$ ($O(n^2)$ when $k = n$).
+Storage is fixed-size without heap allocation.
+
+The following cell computes the weighted sum $Z = \delta\, e^{100}$ with $w_1 = 1$, $w_2 = -(1 - \delta)$, and $x_1 = x_2 = 100$.
+Input is exponent $q$ of cancellation remainder $\delta = 10^{q}$.
+Although $1 - \delta$ is rounded to double, Sterbenz's lemma makes $\delta_{\mathrm{eff}} = 1 + w_2$ exact, so use reference $100 + \ln \delta_{\mathrm{eff}}$.
+The first table shows computed/reference differences; the second shows condition number $\kappa = (2 - \delta_{\mathrm{eff}})/\delta_{\mathrm{eff}}$ and the bound above with $k = 1$.
+
+```rust
+//| id: core-weighted-cancellation
+//| ref: core-weighted-cancellation
+//| title: "Signed-weight cancellation and conditioning"
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   delta_exponent: {"type":"range","label":"Cancellation remainder exponent q (δ = 10^q)","description":"Set w₂ = -(1 - δ). Smaller δ increases the condition number.","min":-15,"max":-1,"step":1,"value":-8}
+//| cases:
+//|   - {"id":"mild","label":"δ = 10⁻¹","description":"Condition number is about 19; the error bound remains around 10⁻¹¹.","inputs":{"delta_exponent":-1}}
+//|   - {"id":"unresolved","label":"δ = 10⁻¹⁵","description":"32 ε κ exceeds 1/2, leaving the range where the error bound applies.","inputs":{"delta_exponent":-15}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"sum","path":"/rows/0/0","approx":{"value":81.5793192610724,"rtol":1e-13}}
+//|       - {"artifact":"sum","path":"/rows/0/2","range":{"min":0,"max":1e-9}}
+//|       - {"artifact":"sum","path":"/rows/0/3","equals":1}
+//|       - {"artifact":"bound","path":"/rows/0/1","approx":{"value":2e8,"rtol":1e-6}}
+//|       - {"artifact":"bound","path":"/rows/0/4","equals":"Yes"}
+//|   - case: mild
+//|     expect:
+//|       - {"artifact":"sum","path":"/rows/0/0","approx":{"value":97.69741490700595,"rtol":1e-13}}
+//|       - {"artifact":"bound","path":"/rows/0/1","approx":{"value":19,"rtol":1e-12}}
+//|       - {"artifact":"bound","path":"/rows/0/4","equals":"Yes"}
+//|   - case: unresolved
+//|     expect:
+//|       - {"artifact":"sum","path":"/rows/0/3","equals":1}
+//|       - {"artifact":"bound","path":"/rows/0/2","range":{"min":0.5}}
+//|       - {"artifact":"bound","path":"/rows/0/4","equals":"No"}
+use scioxide_core::{RealScalar, weighted_logsumexp};
+
+let delta = RealScalar::powi(10.0_f64, delta_exponent as i32);
+let values = [100.0, 100.0];
+let weights = [1.0, -(1.0 - delta)];
+let sum = weighted_logsumexp(&values, &weights).map_err(|e| e.to_string())?;
+let log_magnitude = sum.log_magnitude().ok_or("The sum became exactly zero")?;
+
+// 1 + w₂ is exact by Sterbenz's lemma (w₂ ∈ [-1, -1/2]).
+let delta_eff = 1.0 + weights[1];
+// Reference using intrinsic f64 methods.
+let reference = 100.0 + delta_eff.ln();
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let digits = serde_json::json!({ "significantDigits": 14 });
+let sum_columns = serde_json::json!([
+    { "key": "0", "label": "ln |Z|（weighted_logsumexp）[-]", "type": "number", "format": digits },
+    { "key": "1", "label": "Reference 100 + ln δ_eff [-]", "type": "number", "format": digits },
+    { "key": "2", "label": "Absolute difference [-]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "Sign [-]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    sum_columns,
+    vec![(
+        log_magnitude,
+        reference,
+        (log_magnitude - reference).abs(),
+        sum.sign() as i32,
+    )],
+    metadata = serde_json::json!({ "id": "sum" })
+);
+
+// κ = Σ|wᵢ|e^{xᵢ} / |Σ wᵢ e^{xᵢ}| = (1 + |w₂|) / δ_eff.
+let kappa = (1.0 + weights[1].abs()) / delta_eff;
+// Bound condition 32 k ε κ < 1/2 and error bound for k = 1 (8η is negligible).
+let regime = 32.0 * f64::EPSILON * kappa;
+let bound = 64.0 * f64::EPSILON * kappa * (1.0 + reference.abs());
+let resolved = if regime < 0.5 { "Yes" } else { "No" };
+let bound_columns = serde_json::json!([
+    { "key": "0", "label": "δ_eff = 1 + w₂ [-]", "type": "number", "format": sci3 },
+    { "key": "1", "label": "Condition number κ [-]", "type": "number", "format": sci3 },
+    { "key": "2", "label": "32 ε κ [-]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "Error bound 64 ε κ (1 + |ln|Z||) [-]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "Within the bound's range (32 ε κ < 1/2)" }
+]);
+emit_table_with_columns!(
+    bound_columns,
+    vec![(delta_eff, kappa, regime, bound, resolved)],
+    metadata = serde_json::json!({ "id": "bound" })
+);
+```
+
+At the default ($\delta = 10^{-8}$), $\kappa \approx 2 \times 10^{8}$, widening the error bound to about $2 \times 10^{-4}$.
+Actual differences are far smaller, but the bound grows proportionally to cancellation strength.
+At $\delta = 10^{-1}$, $\kappa \approx 19$, keeping the bound around $10^{-11}$.
+At $\delta = 10^{-15}$, $\kappa$ is about $2 \times 10^{15}$, making $32 \varepsilon \kappa$ exceed $1/2$ and leaving the bound's range.
+The sign is still returned as $+1$, but the formula above cannot estimate the error of $\ln |Z|$.
+
+## Summary
+
+Compute exponential sums with `logsumexp`, or `logaddexp` for two values; positive sums stay within 16 ULP.
+The a priori maximum-shift estimate permits large relative error for small $|y|$, but SciOxide checks each result's bound and increases precision, preserving the 16 ULP contract here too.
+$-\infty$ masks contribute exact zero, avoiding reconstruction of arrays to remove inactive terms.
+Receive signed or complex weighted sums through `weighted_logsumexp` as `LogValue`, interpreting errors as growing with condition number $\kappa$.
+
+## Further reading
+
+- [Axiswise normalization and logarithmic sums](../axis-reductions/): Check owned/borrowed lanewise forms and workspace lengths.
+- [Elementary functions and stable transformations](../stable-transforms/): Check stable transformations other than `logaddexp` and their accuracy contracts.
+- [Extended-range values and logarithmic and projective representations](../extended-range-values/): Check projection rules for `LogValue`.
+- [Molecular rotational partition functions](../../examples/rotational-partition-function/): Check partition functions and level populations through log-sum-exp.
+- [Arithmetic, stable transformation, and logarithmic sum APIs](../../api/arithmetic-and-reductions/): Look up every log-sum and normalization item.

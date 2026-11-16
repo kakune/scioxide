@@ -1,0 +1,460 @@
+---
+title: "Algebraic multigrid preconditioning"
+description: "Grid spacing and conditioning, damped-Jacobi smoothing and optimal damping, two-grid correction and Galerkin coarse operators, smoothed-aggregation algebraic multigrid (AMG), V/W cycles and operator complexity, hierarchy termination reasons, and conditions for using cycles as preconditioners."
+sidebar:
+  order: 340
+references:
+  sparse-amg-smoothed-aggregation: "smoothed-aggregation-algebraic-multigrid"
+  sparse-amg-as-preconditioner: "using-cycles-as-preconditioners"
+  sparse-amg-hierarchy-experiment: "amg-hierarchy-and-galerkin-coarse-operators"
+  sparse-amg-two-grid: "two-grid-correction-and-galerkin-coarse-operators"
+---
+
+A matrix discretizing a second-order elliptic equation in $d$ dimensions at grid spacing $h$ has condition number $\kappa = O(h^{-2})$, with CG iterations growing proportionally to $\sqrt{\kappa} = O(h^{-1})$.
+Doubling grid resolution multiplies unknowns by $2^d$ and iterations by about 2, so total work grows faster than unknown count.
+[Incomplete factorizations and iterative-method preconditioning](../incomplete-factorizations/) reduces iterations but does not change this $h^{-1}$ growth.
+Multigrid separates errors by frequency and aims to make iteration counts nearly independent of grid resolution.
+This page explains the roles of smoothing and coarse-grid correction, algebraic multigrid (AMG) constructing coarse grids from matrices alone, and using its cycles as preconditioners.
+[Overlapping Schwarz methods](../overlapping-schwarz/) covers preconditioning through local solves on overlapping subdomains.
+
+## Smoothing and high-frequency errors
+
+For damped Jacobi $\mathbf{x} \leftarrow \mathbf{x} + \omega\,\mathbf{D}^{-1}(\mathbf{b} - \mathbf{A}\mathbf{x})$ with damping factor $\omega$ ($\mathbf{D}$ is the diagonal of $\mathbf{A}$), error $\mathbf{e} = \mathbf{x} - \mathbf{x}^\ast$ changes as
+
+$$
+\mathbf{e} \leftarrow \mathbf{S}\,\mathbf{e}, \qquad \mathbf{S} = \mathbf{I} - \omega\,\mathbf{D}^{-1}\mathbf{A}
+$$
+
+shown above.
+For one-dimensional $\mathbf{A} = \mathrm{tridiag}(-1, 2, -1)$ ($n$ points), eigenvectors are sines with components $\sin(j\pi i/(n+1))$ and eigenvalues $\lambda_j = 2 - 2\cos\theta_j$, $\theta_j = j\pi/(n+1)$.
+Since $\mathbf{D} = 2\mathbf{I}$, one iteration multiplies mode-$j$ error by
+
+$$
+\mu_j = 1 - \omega\,(1 - \cos\theta_j)
+$$
+
+the factor above.
+For the lowest mode, $1 - \cos\theta_1 = O(h^2)$ gives $\mu_1 = 1 - O(h^2)$, so error barely decreases for any $\omega$.
+For the upper half of modes ($\theta_j \ge \pi/2$), $1 - \cos\theta_j$ lies between 1 inclusive and 2 exclusive, so the maximum $\lvert \mu_j \rvert$ is the larger endpoint value $\lvert 1 - \omega \rvert$ or $\lvert 1 - 2\omega \rvert$.
+Equalizing them with $1 - \omega = 2\omega - 1$, hence $\omega = 2/3$, minimizes the maximum to $1/3$, reducing every high-frequency mode to at most $1/3$ of its magnitude per iteration.
+Iterations rapidly reducing high-frequency errors, such as damped Jacobi, are called **smoothers**.
+Errors remaining after smoothing are smooth and representable on coarse grids.
+
+### Effectiveness of damped-Jacobi smoothing
+
+The following cell uses a mode-$j$ sine ($j = 1, \dots, 63$) as initial error for $n = 63$-point $\mathrm{tridiag}(-1, 2, -1)$, applies damped Jacobi $\nu$ times with `JacobiPreconditioner` and CSR products, and measures the error-norm ratio.
+Inputs are damping factor $\omega$ (0.2–1.0) and count $\nu$ (1–4).
+The table compares the lowest-mode ratio and maximum high-frequency ratio ($j \ge 32$, $\theta_j \ge \pi/2$) with theory $\lvert \mu_j \rvert^\nu$.
+The final row gives bound $\max(\lvert 1 - \omega \rvert, \lvert 1 - 2\omega \rvert)^\nu$ over the entire high-frequency half.
+The plot shows measured ratios with markers and theory dashed on a logarithmic vertical axis, marking $\theta = \pi/2$ with a vertical line.
+
+```rust
+//| id: sparse-amg-smoothing
+//| ref: sparse-amg-smoothing
+//| title: "Damped-Jacobi error decay by mode"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-sparse]
+//| inputs:
+//|   omega: {"type":"range","label":"Damping factor ω","description":"Factor applied to one update. ω = 1 is undamped Jacobi.","min":0.2,"max":1.0,"step":0.1,"value":0.7}
+//|   sweeps: {"type":"range","label":"Smoothing steps ν","description":"Number of successive damped-Jacobi applications.","min":1,"max":4,"step":1,"value":2}
+//| cases:
+//|   - {"id":"undamped","label":"ω = 1 (undamped)","description":"The highest-frequency μ approaches −1, so high-frequency errors also barely decrease.","inputs":{"omega":1.0}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"ratios","path":"/rows/0/1","approx":{"value":0.998314,"atol":1e-6}}
+//|       - {"artifact":"ratios","path":"/rows/0/2","approx":{"value":0.998314,"atol":1e-6}}
+//|       - {"artifact":"ratios","path":"/rows/1/1","approx":{"value":0.159326,"atol":1e-6}}
+//|       - {"artifact":"ratios","path":"/rows/1/2","approx":{"value":0.159326,"atol":1e-6}}
+//|       - {"artifact":"ratios","path":"/rows/2/2","approx":{"value":0.16,"atol":1e-12}}
+//|   - case: undamped
+//|     expect:
+//|       - {"artifact":"ratios","path":"/rows/1/1","approx":{"value":0.997592,"atol":1e-6}}
+//|       - {"artifact":"ratios","path":"/rows/2/2","approx":{"value":1.0,"atol":1e-12}}
+use scioxide_core::{ExecutionContext, LinearOperator, RealScalar};
+use scioxide_sparse::{JacobiPreconditioner, SparseSolveOptions, sparse_diagonals};
+
+let n = 63;
+let (main, off) = (vec![2.0_f64; n], vec![-1.0_f64; n - 1]);
+let a = sparse_diagonals(n, n, &[-1, 0, 1], &[&off[..], &main[..], &off[..]])
+    .map_err(|e| e.to_string())?;
+let jacobi = JacobiPreconditioner::new(&a).map_err(|e| e.to_string())?;
+let (options, scope) = (SparseSolveOptions::new(), ExecutionContext::sequential());
+let mut work = jacobi.workspace(1).map_err(|e| e.to_string())?;
+let mut scratch = vec![0.0_f64; a.apply_workspace_len().map_err(|e| e.to_string())?];
+let norm = |v: &[f64]| RealScalar::sqrt(v.iter().fold(0.0_f64, |s, x| s + x * x));
+let (mut measured, mut theory) = (Vec::new(), Vec::new());
+for j in 1..=n {
+    let theta = j as f64 * core::f64::consts::PI / (n + 1) as f64;
+    let mut e: Vec<f64> = (1..=n).map(|i| RealScalar::sin(theta * i as f64)).collect();
+    let start = norm(&e);
+    let (mut ae, mut z) = (vec![0.0_f64; n], vec![0.0_f64; n]);
+    for _ in 0..sweeps as usize {
+        // e ← e − ω D⁻¹ A e (one damped-Jacobi step with b = 0).
+        a.apply_into(&e, &mut ae, &mut scratch)
+            .map_err(|e| e.to_string())?;
+        jacobi
+            .apply_into(&ae, options, &mut z, &mut work, scope)
+            .map_err(|e| e.to_string())?;
+        e.iter_mut().zip(&z).for_each(|(ei, zi)| *ei -= omega * zi);
+    }
+    measured.push([j as f64, norm(&e) / start]);
+    // Theory |1 − ω(1 − cos θ)|^ν (abs and powi are intrinsic f64 methods).
+    let mu = (1.0 - omega * (1.0 - RealScalar::cos(theta))).abs();
+    theory.push([j as f64, mu.powi(sweeps as i32)]);
+}
+// High frequencies satisfy θ_j ≥ π/2, hence j ≥ (n + 1)/2 = 32.
+let high = |points: &[[f64; 2]]| {
+    points
+        .iter()
+        .filter(|p| p[0] >= 32.0)
+        .fold(0.0_f64, |m, p| m.max(p[1]))
+};
+let bound = (1.0 - omega).abs().max((1.0 - 2.0 * omega).abs());
+let rows = vec![
+    (
+        "Lowest-mode j = 1 ratio",
+        Some(measured[0][1]),
+        theory[0][1],
+    ),
+    (
+        "Maximum high-frequency (j ≥ 32) ratio",
+        Some(high(&measured)),
+        high(&theory),
+    ),
+    ("Bound for the high-frequency half", None, bound.powi(sweeps as i32)),
+];
+let fixed4 = serde_json::json!({ "fractionDigits": 4 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Quantity" },
+    { "key": "1", "label": "Measured ratio [-]", "type": "number", "format": fixed4, "nullText": "None" },
+    { "key": "2", "label": "Theory [-]", "type": "number", "format": fixed4 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "ratios" })
+);
+emit_chart!(serde_json::json!({
+    "kind": "xy",
+    "xLabel": "Mode index j [-]",
+    "yLabel": "Error ratio after ν steps [-]",
+    "yType": "log",
+    "dataZoom": true,
+    "tooltip": true,
+    "annotations": [
+        { "kind": "line", "axis": "x", "value": 32.0, "label": "θ = π/2" }
+    ],
+    "layers": [
+        {
+            "id": "theory",
+            "kind": "line",
+            "name": "Theory |μⱼ|^ν",
+            "points": theory,
+            "style": { "lineType": "dashed" }
+        },
+        {
+            "id": "measured",
+            "kind": "scatter",
+            "name": "Measured ratio",
+            "points": measured,
+            "style": { "symbol": "circle" }
+        }
+    ]
+}));
+```
+
+At the defaults $\omega = 0.7$, $\nu = 2$, the lowest-mode ratio is 0.9983, barely reduced, while the maximum high-frequency ratio is 0.1593.
+Measurements agree with theory within rounding error, with markers lying on dashed curves.
+The high-frequency maximum occurs at the highest-frequency mode $j = 63$, slightly below bound $\max(0.3, 0.4)^2 = 0.16$.
+At $\omega = 1$ (undamped Jacobi), highest-mode $\mu_{63}$ approaches $-1$ and the maximum high-frequency ratio is 0.9976, as for the lowest mode, with little reduction.
+Then $\mu_{32} = 0$ for $j = 32$, but rounding in the initial sine remains, leaving measured ratio $1.7 \times 10^{-15}$ and markers away from the dashed curve.
+At $\omega = 0.2$, maximum high-frequency ratio remains 0.64 at $j = 32$; overly small $\omega$ also fails to reduce high-frequency error quickly.
+
+## Two-grid correction and Galerkin coarse operators
+
+Let interpolation from coarse unknowns to fine unknowns be $\mathbf{P} \in \mathbb{R}^{n \times n_c}$ ($n_c < n$), and define the coarse operator by
+
+$$
+\mathbf{A}_c = \mathbf{P}^{\mathsf{H}}\mathbf{A}\mathbf{P}
+$$
+
+the expression above (Galerkin coarse operator).
+One two-grid step performs $\nu_1$ smoothing steps, coarse-grid correction, and $\nu_2$ smoothing steps in order, changing error as
+
+$$
+\mathbf{e} \leftarrow \mathbf{S}^{\nu_2}\bigl(\mathbf{I} - \mathbf{P}\mathbf{A}_c^{-1}\mathbf{P}^{\mathsf{H}}\mathbf{A}\bigr)\mathbf{S}^{\nu_1}\,\mathbf{e}
+$$
+
+shown above.
+For Hermitian positive-definite $\mathbf{A}$, the middle factor is the orthogonal projection onto the subspace orthogonal to $\mathrm{range}(\mathbf{P})$ in energy inner product $\langle \mathbf{u}, \mathbf{v} \rangle_{\mathbf{A}} = \mathbf{v}^{\mathsf{H}}\mathbf{A}\mathbf{u}$.
+Coarse correction therefore optimally removes interpolation-representable error components in energy norm $\lVert \mathbf{e} \rVert_{\mathbf{A}} = \sqrt{\langle \mathbf{e}, \mathbf{e} \rangle_{\mathbf{A}}}$.
+If smooth error left by smoothing is representable by $\mathbf{P}$, the two operations complement one another, reducing every error frequency by a fixed fraction.
+Recursively applying the same two-grid method to coarse system $\mathbf{A}_c$ gives multigrid.
+
+A **V-cycle** calls the next coarser correction once per level; a **W-cycle** calls it twice, starting the second call from the first result.
+If each coarse level has $1/c$ times as many unknowns ($c > 1$), level $\ell$ costs about $c^{-\ell}$ times the finest level.
+V-cycles visit every level once, bounding total work by $\sum_\ell c^{-\ell} < c/(c-1)$ times finest-level work.
+W-cycles visit level $\ell$ $2^\ell$ times, giving a factor $\sum_\ell (2/c)^\ell$, bounded by a constant times finest-level work only when $c > 2$.
+A guide to matrix sizes across levels is **operator complexity**,
+
+$$
+C_{\mathrm{op}} = \frac{\sum_{\ell} \mathrm{nnz}(\mathbf{A}_\ell)}{\mathrm{nnz}(\mathbf{A}_0)}
+$$
+
+the expression above.
+If a V-cycle performs the same number of matrix products at each level, their work is about $C_{\mathrm{op}}$ times finest-level-only work, with interpolation/restriction products added separately.
+
+## Smoothed-aggregation algebraic multigrid
+
+Geometric multigrid constructs $\mathbf{P}$ from a grid hierarchy, while AMG uses matrix entries alone.
+`AmgHierarchy::build(matrix, modes, setup, limits, options, scope)` performs the following at each level.
+
+1. Strength of connection: $i$ and $j$ are strongly connected when $a_{ij} \ne 0$ and $\lvert a_{ij} \rvert / \sqrt{a_{ii}a_{jj}} \ge \theta$ ($\theta$ is `with_strength` between 0 and 1 inclusive, default $1/16$).
+2. Aggregation: scan the strong-connection graph 3 times in row-index order to group vertices into aggregates.
+   The first pass selects vertices with strong neighbors when neither they nor their neighbors belong to aggregates, forming an aggregate from the vertex and its neighbors.
+   The second adds each remaining vertex to the aggregate of its first strong neighbor assigned during the first pass.
+   The third groups remaining vertices with unassigned strong neighbors; vertices without strong connections form singleton aggregates.
+   At default strength, a $n$-point one-dimensional Laplacian gives $\lceil n/3 \rceil$ aggregates.
+3. Tentative interpolation: restrict near-nullspace modes (`modes`, column-major `BlockVectorView`) to each aggregate and orthonormalize with 2 modified Gram–Schmidt passes to construct tentative interpolation $\mathbf{T}$.
+   Discard locally dependent modes, so $m$ modes create at most $m$ coarse unknowns per aggregate.
+   Form next-level modes from the orthonormalization coefficients.
+   Near-nullspace modes have $\lVert \mathbf{A}\mathbf{x} \rVert$ small relative to $\lVert \mathbf{A} \rVert\,\lVert \mathbf{x} \rVert$ and resist smoothing; $\mathbf{T}$ represents them on each aggregate (for next-level modes $\mathbf{B}_c$, $\mathbf{T}\mathbf{B}_c$ equals the original modes apart from rounding).
+   Supply one constant vector for Laplacians or rigid-body-motion vectors for elasticity.
+4. Smooth interpolation: set $\mathbf{P} = (\mathbf{I} - \omega\,\mathbf{D}^{-1}\mathbf{A})\,\mathbf{T}$.
+   Here $\omega = 4/(3\hat\rho)$, and $\hat\rho = \max(1, \max_i \sum_j \lvert a_{ij} \rvert/a_{ii})$ (sum includes $j = i$) is a Gershgorin upper bound for $\rho(\mathbf{D}^{-1}\mathbf{A})$.
+   For Hermitian positive-definite $\mathbf{A}$, this $\omega$ satisfies $0 < \omega < 2/\rho(\mathbf{D}^{-1}\mathbf{A})$.
+   For five-point Laplacians, $\hat\rho = 2$ and $\omega = 2/3$.
+5. Coarse operator: construct restriction $\mathbf{R} = \mathbf{P}^{\mathsf{H}}$ and compute $\mathbf{A}_c = \mathbf{R}(\mathbf{A}\mathbf{P})$ with sparse products.
+   Restore Hermitian symmetry disrupted by rounding in the two products by averaging paired entries and retaining only real diagonal parts.
+
+At each level, first stop with `CoarseSize` if the row count is at most `with_coarse_size` (default 16).
+Next, stop with `LevelLimit` if the level count has reached `max_levels` in `AmgLimits`.
+Otherwise construct aggregates and $\mathbf{T}$; stop with `Stagnation` if coarse unknown count does not decrease.
+`AmgDiagnostics::termination()` returns this reason in `AmgSetupTermination`.
+Termination other than `CoarseSize` may leave a large coarsest matrix, so inspect its size before factoring it.
+Automatic-hierarchy smoothing is damped Jacobi with $\omega$ above.
+
+`build` checks exact Hermitian symmetry and positive real diagonals but assumes positive definiteness from the caller without checking it.
+Nonsquare matrices or incompatible `modes` row count give `DimensionMismatch`; zero modes, zero `coarse_size`, out-of-range $\theta$, `max_levels` outside 1–64, non-Hermitian matrices, nonpositive/nonreal diagonals, or all-zero modes on an aggregate give `InvalidInput`; NaN/infinite modes give `NonFinite`.
+`max_levels` in limits `AmgLimits::new(max_levels, max_entries, max_setup_bytes)` bounds level count including finest and coarsest levels; reaching it stops with `LevelLimit` above.
+`max_entries` bounds fine-matrix entries, tentative interpolation (rows × modes) and interpolation entries at each level, and the sum of $\mathrm{nnz}(\mathbf{A}) + \mathrm{nnz}(\mathbf{B})$ and unsummed product-term counts for each product $\mathbf{A}\mathbf{B}$; `max_setup_bytes` bounds logical construction bytes including temporaries.
+Exceeding either gives `ResourceLimit`.
+`AmgLimits::default()` allows 64 levels without entry-count or byte limits.
+The `SparseSolveOptions` iteration limit counts once at entry and exit and once per row for diagonal preparation at every level.
+Coarsened levels additionally count once per row for each of 4 aggregation passes (diagonal square roots plus 3 aggregation passes) and smoothing $\mathbf{T}$, once per aggregate for constructing $\mathbf{T}$, and once per output row plus once at completion for each product $\mathbf{A}\mathbf{T}$, $\mathbf{A}\mathbf{P}$, $\mathbf{R}(\mathbf{A}\mathbf{P})$; exhaustion gives `ConvergenceFailure`.
+
+`levels()`, `total_rows()`, `operator_entries()`, `transfer_entries()`, `operator_complexity()`, `coarsening_ratio()`, and `setup_bytes_bound()` in `AmgDiagnostics` are observed quantities.
+`coarsening_ratio()` is the ratio of finest-level rows to second-level rows.
+These quantities describe cycle work but do not predict convergence rates.
+Read levels through `matrix(level)`, `aggregates(level)` (empty at the coarsest level), `tentative(level)`, `prolongation(level)`, `modes(level)`, and `coarse_matrix()`; `level(level)` returns a borrowed `AmgLevelView` with damped-Jacobi smoothing.
+
+### Using cycles as preconditioners
+
+- Single-call constructor `AmgPreconditioner::new(&a)` builds a hierarchy from the constant-vector mode with `AmgSetupOptions::new()` and `AmgLimits::default()`.
+  It factors the coarsest matrix with `SparseCholesky::new` and uses `AmgCycleOptions::new()` cycles as the preconditioner.
+- `AmgPreconditioner::build(hierarchy, cycle, limits, options, scope)` owns the hierarchy and factors its coarsest matrix with AMD-ordered `SparseCholesky`, making cycles usable as a preconditioner.
+  `limits` (`SparseSymmetricLimits`) applies only to coarse-matrix factorization; a non-positive-definite coarse matrix gives `NumericalInstability`.
+- `AmgHierarchy::cycle(coarse, options)` constructs `AmgCycle` borrowing a hierarchy with caller-provided coarsest inverse action `coarse`.
+- `AmgCycle::new(levels, coarse, options)` constructs cycles from a caller-built sequence of `AmgLevelView` (operators, interpolation, restriction, smoothing).
+  Supply 1–64 levels from finest to coarsest, each with more rows than its successor; only the coarsest has no interpolation or restriction.
+  Restriction is used as supplied, not constructed from $\mathbf{P}^{\mathsf{H}}$.
+  Smoothing `AmgSmootherView` can be `Jacobi { inverse_diagonal, weight }`, `GaussSeidel { matrix }` (forward before correction, backward afterward), or `Injected { pre, post }`.
+  `AmgCycle::new` checks only shapes and smoothing data, not Galerkin relations, symmetry, or convergence.
+- `AmgCycleOptions::new()` uses a V-cycle with one smoothing step before and after; change these with `with_kind(AmgCycleKind::W)`, `with_pre_sweeps`, and `with_post_sweeps`.
+
+Every form implements scioxide-core `Preconditioner`; each application performs one cycle from initial value 0.
+A cycle must be Hermitian positive definite for use with CG.
+The cycle is Hermitian when $\mathbf{A}$ is Hermitian positive definite, pre/post smoothers are adjoints (Jacobi on both sides, or forward/backward Gauss–Seidel), smoothing counts match, every level has $\mathbf{R} = \mathbf{P}^{\mathsf{H}}$, and the coarse solver is Hermitian positive definite.
+If every level's smoother $\mathbf{x} \leftarrow \mathbf{x} + \mathbf{M}\mathbf{r}$ also contracts in energy norm ($\lVert \mathbf{I} - \mathbf{M}\mathbf{A} \rVert_{\mathbf{A}} < 1$), the cycle is positive definite too.
+For damped Jacobi this requires $0 < \omega < 2/\rho(\mathbf{D}^{-1}\mathbf{A})$; Gauss–Seidel always satisfies it for Hermitian positive-definite $\mathbf{A}$ when `matrix` matches that level's operator.
+Smoothing `Injected` must be a fixed linear map.
+`AmgPreconditioner` uses damped Jacobi with $\omega = 4/(3\hat\rho)$, $\mathbf{R} = \mathbf{P}^{\mathsf{H}}$, and a Cholesky coarse solver; with Hermitian positive-definite $\mathbf{A}$, equal pre/post smoothing counts satisfy these conditions.
+No form checks that the cycle is Hermitian positive definite.
+
+### AMG hierarchy and Galerkin coarse operators
+
+The following cell supplies a constant near-nullspace mode for a five-point Laplacian on a $k \times k$ grid ($N = k^2$, diagonal 4, neighboring entries $-1$), constructing `AmgHierarchy`.
+Inputs are points per grid edge $k$ (8–32), coarse-size target `coarse_size` (4–64), level limit `max_levels` (1–8), and strong-connection threshold $\theta$.
+The table shows each level's rows, nonzeros, cumulative nonzeros divided by $\mathrm{nnz}(\mathbf{A}_0)$, and aggregates.
+The final cumulative ratio is operator complexity, independently comparable with diagnostic `operator_complexity()`.
+As a check, recompute $\mathbf{P}^{\mathsf{T}}\mathbf{A}_{\ell-1}\mathbf{P}$ from the preceding level's matrix $\mathbf{A}_{\ell-1}$ and interpolation $\mathbf{P}$ using allocating product `multiply`, reporting maximum difference from each level's matrix.
+The final outcome is satisfied for `AmgSetupTermination` equal to `CoarseSize` and partial for `LevelLimit` or `Stagnation`; diagnostics include level count, coarsest row count, `operator_complexity()`, and `coarsening_ratio()`.
+
+```rust
+//| id: sparse-amg-hierarchy
+//| ref: sparse-amg-hierarchy
+//| title: "Check a smoothed-aggregation AMG hierarchy and Galerkin coarse operators"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-sparse]
+//| inputs:
+//|   grid: {"type":"range","label":"Points per grid edge k","description":"There are N = k² unknowns.","min":8,"max":32,"step":4,"value":16}
+//|   coarse_limit: {"type":"range","label":"Coarse-size target coarse_size","description":"Stop coarsening at a level with at most this many rows.","min":4,"max":64,"step":4,"value":16}
+//|   level_limit: {"type":"range","label":"Level limit max_levels","description":"Maximum level count including finest and coarsest levels.","min":1,"max":8,"step":1,"value":8}
+//|   strength: {"type":"select","label":"Strong-connection threshold θ","description":"Five-point neighbor strength is |a_ij|/√(a_ii a_jj) = 1/4.","options":[{"label":"θ = 1/16 (default)","value":"0.0625"},{"label":"θ = 1/4","value":"0.25"},{"label":"θ = 1/2","value":"0.5"}],"value":"0.0625"}
+//| cases:
+//|   - {"id":"level-limit","label":"max_levels = 2","description":"Stops at the level limit, leaving 48 coarsest rows, above the target 16.","inputs":{"level_limit":2}}
+//|   - {"id":"weak","label":"θ = 1/4","description":"Finest neighbors exactly meet the threshold, but second-level connections are weaker than 1/4; aggregation fails to reduce dimension and stops with Stagnation.","inputs":{"strength":"0.25"}}
+//|   - {"id":"fine-grid","label":"k = 32, coarse_size 4","description":"Grid refinement and additional levels leave operator complexity nearly unchanged.","inputs":{"grid":32,"coarse_limit":4}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"levels","path":"/rows/0/1","equals":256}
+//|       - {"artifact":"levels","path":"/rows/1/1","equals":48}
+//|       - {"artifact":"levels","path":"/rows/2/1","equals":9}
+//|       - {"artifact":"levels","path":"/rows/0/4","equals":48}
+//|       - {"artifact":"levels","path":"/rows/2/3","approx":{"value":1.359375,"rtol":1e-12}}
+//|       - {"artifact":"levels","path":"/rows/1/5","range":{"max":1e-14}}
+//|       - {"artifact":"levels","path":"/rows/2/5","range":{"max":1e-14}}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+//|       - {"path":"/outputs/1/diagnostics/2/value","approx":{"value":1.359375,"rtol":1e-12}}
+//|   - case: level-limit
+//|     expect:
+//|       - {"artifact":"levels","path":"/rows/1/1","equals":48}
+//|       - {"path":"/outputs/1/state","equals":"partial"}
+//|       - {"path":"/outputs/1/status","equals":"LevelLimit"}
+//|   - case: weak
+//|     expect:
+//|       - {"artifact":"levels","path":"/rows/0/4","equals":48}
+//|       - {"artifact":"levels","path":"/rows/1/1","equals":48}
+//|       - {"path":"/outputs/1/state","equals":"partial"}
+//|       - {"path":"/outputs/1/status","equals":"Stagnation"}
+//|   - case: fine-grid
+//|     expect:
+//|       - {"artifact":"levels","path":"/rows/0/1","equals":1024}
+//|       - {"artifact":"levels","path":"/rows/4/1","equals":4}
+//|       - {"artifact":"levels","path":"/rows/4/3","range":{"min":1.3,"max":1.4}}
+//|       - {"artifact":"levels","path":"/rows/4/5","range":{"max":1e-13}}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+use scioxide_core::{BlockVectorView, ExecutionContext};
+use scioxide_sparse::{
+    AmgHierarchy, AmgLimits, AmgSetupOptions, AmgSetupTermination, DuplicatePolicy,
+    ExplicitZeroPolicy, SparseBuilder, SparseSolveOptions,
+};
+
+let k = grid as usize;
+let n = k * k;
+let mut builder = SparseBuilder::new(n, n);
+for p in 0..n {
+    builder.push(p, p, 4.0_f64).map_err(|e| e.to_string())?;
+    for q in [p.wrapping_sub(1), p + 1, p.wrapping_sub(k), p + k] {
+        if q < n && (q / k == p / k || q % k == p % k) {
+            builder.push(p, q, -1.0).map_err(|e| e.to_string())?;
+        }
+    }
+}
+let a = builder
+    .finish_csr(DuplicatePolicy::Reject, ExplicitZeroPolicy::Drop)
+    .map_err(|e| e.to_string())?;
+let theta: f64 = strength.parse().map_err(|_| "Cannot parse θ as a number")?;
+let ones = vec![1.0_f64; n];
+let modes = BlockVectorView::new(&ones, n, 1).map_err(|e| e.to_string())?;
+let setup = AmgSetupOptions::new()
+    .with_coarse_size(coarse_limit as usize)
+    .with_strength(theta);
+let limits = AmgLimits::new(level_limit as usize, 64 * n, 1 << 26);
+let (options, scope) = (SparseSolveOptions::new(), ExecutionContext::sequential());
+let hierarchy = AmgHierarchy::build(a.view(), modes, setup, limits, options, scope)
+    .map_err(|e| e.to_string())?;
+let d = hierarchy.diagnostics();
+
+let (mut rows, mut cumulative) = (Vec::new(), 0usize);
+for level in 0..d.levels() {
+    let matrix = hierarchy.matrix(level).ok_or("No levels")?;
+    // Independent check 1: sum nonzeros across levels; the final level gives operator complexity.
+    cumulative += matrix.nnz();
+    // Aggregate indices are consecutive from 0, so maximum + 1 is aggregate count (empty at the coarsest level).
+    let aggregates = hierarchy
+        .aggregates(level)
+        .and_then(|ids| ids.iter().max())
+        .map(|m| m + 1);
+    // Independent check 2: recompute PᵀAP from preceding A and P using allocating products and compare with this level's matrix.
+    let mut gap = None;
+    if let Some(up) = level.checked_sub(1) {
+        let fine = hierarchy.matrix(up).ok_or("No levels")?;
+        let p = hierarchy.prolongation(up).ok_or("No interpolation")?;
+        let ap = fine.multiply(p).map_err(|e| e.to_string())?;
+        let transposed = p.transpose().map_err(|e| e.to_string())?;
+        let pap = transposed
+            .to_csr()
+            .map_err(|e| e.to_string())?
+            .multiply(&ap)
+            .map_err(|e| e.to_string())?;
+        let mut max = 0.0_f64;
+        for (i, j, v) in matrix.iter() {
+            max = max.max((v - pap.get(i, j).map_err(|e| e.to_string())?).abs());
+        }
+        gap = Some(max);
+    }
+    let ratio = cumulative as f64 / a.nnz() as f64;
+    rows.push((level, matrix.rows(), matrix.nnz(), ratio, aggregates, gap));
+}
+let (fixed4, sci2) = (
+    serde_json::json!({ "fractionDigits": 4 }),
+    serde_json::json!({ "notation": "scientific", "significantDigits": 2 }),
+);
+let columns = serde_json::json!([
+    { "key": "0", "label": "Level ℓ", "type": "integer" },
+    { "key": "1", "label": "Rows [rows]", "type": "integer" },
+    { "key": "2", "label": "nnz(A_ℓ) [count]", "type": "integer" },
+    { "key": "3", "label": "Cumulative nnz through level ℓ / nnz(A₀) [-]", "type": "number", "format": fixed4 },
+    { "key": "4", "label": "Aggregates [count]", "type": "integer", "nullText": "Coarsest level" },
+    { "key": "5", "label": "max |A_ℓ − PᵀA_(ℓ−1)P| [-]", "type": "number", "format": sci2, "nullText": "Finest level" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "levels" })
+);
+let (outcome, status) = match d.termination() {
+    AmgSetupTermination::CoarseSize => (
+        Outcome::satisfied("Coarsest matrix meets size target"),
+        "CoarseSize",
+    ),
+    AmgSetupTermination::LevelLimit => {
+        (Outcome::partial("Stopped at level limit"), "LevelLimit")
+    }
+    AmgSetupTermination::Stagnation => {
+        (Outcome::partial("Aggregation no longer reduces dimension"), "Stagnation")
+    }
+};
+let coarse_rows = hierarchy.coarse_matrix().rows() as f64;
+let mut outcome = outcome
+    .status(status)
+    .diagnostic("Levels", d.levels() as f64, None)
+    .diagnostic("Coarsest matrix rows", coarse_rows, None);
+if let Some(complexity) = d.operator_complexity() {
+    outcome = outcome.diagnostic("operator_complexity()", complexity, None);
+}
+if let Some(ratio) = d.coarsening_ratio() {
+    outcome = outcome.diagnostic("coarsening_ratio()", ratio, None);
+}
+emit_outcome!(outcome);
+```
+
+At the defaults $k = 16$ ($N = 256$), `coarse_size` 16, the hierarchy has 3 levels with 256, 48, and 9 rows; the coarse-size target is met, so termination is `CoarseSize` and the outcome is satisfied.
+Aggregate count at each level is about 1/5 of row count, and `coarsening_ratio()` is $256/48 = 5.33$.
+Operator complexity is (1216 + 368 + 69)/1216 = 1.3594, matching `operator_complexity()`.
+Recomputed allocating-product $\mathbf{P}^{\mathsf{T}}\mathbf{A}_{\ell-1}\mathbf{P}$ differs from each level's matrix by at most $2.8 \times 10^{-17}$, checking that hierarchy coarse operators are Galerkin products.
+At $k = 32$, `coarse_size` 4, there are 5 levels with 1024, 176, 27, 8, and 4 rows, while operator complexity remains 1.36.
+At $k = 8$, `coarse_size` 64, the finest grid already meets the target, ending after one level without coarsening.
+
+Setting `max_levels` to 2 gives `LevelLimit` at the second level's 48 rows, with a partial outcome.
+At $\theta = 1/4$, finest neighbor strength is exactly $1/4$, retaining strong connections and producing 48 aggregates.
+But every second-level connection is weaker than $1/4$; the next aggregation does not reduce dimension and stops with `Stagnation`.
+At $\theta = 1/2$ even the finest level has no strong connections, giving `Stagnation` after one level.
+In these cases the coarsest matrix exceeds target 16 rows; using `AmgPreconditioner::build` means Cholesky-factoring that larger matrix.
+
+## Summary
+
+Smoothers such as damped Jacobi rapidly reduce high-frequency error; in one dimension $\omega = 2/3$ reduces every high-frequency mode to at most $1/3$ per step.
+Galerkin coarse correction with $\mathbf{P}^{\mathsf{H}}\mathbf{A}\mathbf{P}$ removes remaining smooth error; operator complexity roughly estimates V-cycle work.
+`AmgHierarchy` constructs aggregates and smoothed interpolation from matrix entries and near-nullspace modes alone; supply constant vectors for Laplacians or rigid-body motions for elasticity.
+Before using a preconditioner, inspect `AmgDiagnostics` for termination `CoarseSize` and operator complexity; for `LevelLimit` or `Stagnation`, check coarsest-matrix size and reconsider $\theta$ or `max_levels`.
+For CG, match pre/post smoothing counts; in custom levels choose $\mathbf{R} = \mathbf{P}^{\mathsf{H}}$ and contracting smoothers to keep cycles Hermitian positive definite.
+
+## Further reading
+
+- [Grid-independent convergence with algebraic multigrid](../../examples/amg-grid-independence/): compare Jacobi-, IC(0)-, and AMG-preconditioned CG iterations under grid refinement for a two-dimensional Poisson equation.
+- [Overlapping Schwarz methods](../overlapping-schwarz/): examine subdomain-local-solve preconditioning and the limits of one-level methods without coarse corrections.
+- [Preconditioners](../../api/preconditioners/): consult contracts for all AMG hierarchy, cycle, and preconditioner items.

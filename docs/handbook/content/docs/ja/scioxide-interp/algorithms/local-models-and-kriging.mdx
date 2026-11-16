@@ -1,0 +1,454 @@
+---
+title: 局所モデルと kriging の予測分散
+description: 固定近傍の局所多項式と局所 RBF、ランクと条件による次数と近傍の適応、固定共分散の Gauss 過程による単純・通常 kriging、潜在分散と観測分散。
+sidebar:
+  order: 350
+references:
+  interp-gp-prediction-cost: "予測の成分と計算量"
+  interp-kriging-prediction: "固定共分散からの条件付き予測"
+  interp-local-policy-report: "数値の方針とレポート"
+  interp-local-polynomial: "局所多項式"
+  interp-local-polynomial-reproduction: "局所多項式の再現性"
+  interp-local-rbf: "局所-rbf"
+  interp-local-samples: "標本と固定近傍"
+---
+
+多数の散在点から一つの密な大域モデルを作ると、準備のメモリが標本数の2乗、計算量が3乗で増える。
+局所モデルは選んだ中心の近傍の標本だけを使って小さい問題を解く。
+kriging（Gauss 過程による予測）は別の考え方で、値を確率場の実現とみなし、固定した共分散から予測の平均と分散を求める。
+このページでは局所多項式と局所 RBF の準備、固定共分散の Gauss 過程による予測、その分散の意味を順に説明する。
+近似の誤差と、仮定した確率モデルに条件付けた不確かさを混同しないことが全体の要点である。
+
+## 標本と固定近傍
+
+`LocalSamples::new(&points, &values)` は $D$ 次元の点とアフィン値の実数成分を写して所有する。
+`points()` は点の `PointSet`（$n\times D$）を、`values()` は `[標本, 実数成分]` の値のビュー（$n\times m$）を、どちらも借用で返す。
+複素数の値は実部と虚部の二つの成分として並ぶ。
+点が空なら `InvalidInput`、点と値の個数や値の形が合わなければ `DimensionMismatch`、非有限の座標や値があれば `NonFinite` になる。
+`LocalModelPlan::new(&points, values)` はこれらを借用して k-d 木の索引を $O(Dn\log n)$ の手間で一度だけ作る。
+
+`LocalPolynomialModel::new(&plan, center, options)` と `LocalRbfModel::new(&plan, center, options)` は、中心 `center` に Euclid 距離で最も近い標本を選んでモデルを準備する。
+距離が等しい標本は、添字の小さいほうを先に選ぶ。
+準備したモデルは近傍を固定し、問い合わせのたびに近傍を選び直さない。
+したがって、中心から離れた点を問い合わせても、別の近傍のモデルには切り替わらない。
+問い合わせ点ごとに近傍を選び直す移動最小二乗のような処理が必要なら、利用側で中心ごとにモデルを作る。
+別々の中心から作った局所モデルを並べたとき、その継ぎ目で値や導関数は一般に連続しない。
+局所モデルの外挿の判定に使う領域は、選んだ近傍の点を囲む座標軸に平行な箱である。
+局所モデルは `Interpolant` だけを実装し、導関数のトレイトは提供しない。
+所有値を返す API の `evaluate` は `LocalModelPlan::components` 個の成分を持つ `Vec` を返す。
+
+二つのモデルの設定 `LocalPolynomialOptions` と `LocalRbfOptions` は、モデルを決める量（次数と近傍数、近傍数と核）を `new` の引数に取り、`Default` を持たない。
+中立な既定値のない量を設定の既定に隠さないためである。
+
+### 局所多項式
+
+`LocalPolynomialOptions::new(degree, minimum_neighbors, maximum_neighbors)` は、最初に試す総次数と近傍数の範囲を指定する。
+`with_minimum_degree` は次数を下げる下限（既定 0）、`with_numerical` は数値の方針を与え、値は準備の最初に検査する。
+`LocalPolynomialModel` は、座標を中心で引いて最も遠い近傍までの距離 $\rho$ で割った $\boldsymbol\xi=(\boldsymbol x-\boldsymbol x_c)/\rho$ の単項式で、重みのない最小二乗の当てはめを行う。
+この中心化と尺度の調整により、設計行列の条件は座標の単位や原点の位置によらなくなる。
+$D$ 次元で総次数 $p$ の多項式の係数の数は $\binom{D+p}{p}$ である。
+近傍の数がこれ以上あるだけでは足りず、点の配置が多項式を決められること（幾何的なランク）も必要である。
+例えば一直線上に並んだ点では、2次元の1次多項式も決まらない。
+
+準備は要求した次数で、近傍数を `minimum_neighbors` から倍にしながら `maximum_neighbors` まで試す。
+各試行では列ピボット付き QR で数値ランクと逆条件数を確かめ、判定に通らなければ SVD で分解し直す。
+最大の近傍でもランクか条件が不足すると次数を一つ下げ、`with_minimum_degree` の次数まで繰り返す。
+どの組み合わせでも条件を満たさなければ `Singular` になる。
+`minimum_degree > degree`、近傍数の範囲の誤り、標本数を超える近傍数、`max_system_order` を超える項の数は、作業を始める前に `InvalidInput` になる。
+近傍の追加や次数の低下は数値的に解ける系を選ぶためであり、未知の関数に対する誤差を最小にする選択ではない。
+
+### 局所 RBF
+
+`LocalRbfOptions::new(neighbors, kernel)` は近傍の数と[核](oxref:interp-rbf-kernels)を固定する。
+核の形状係数を検査するので、`new` は `Result` を返し、正でなければ `InvalidInput`、非有限なら `NonFinite` になる。
+`LocalRbfModel` は選んだ $k$ 個の近傍で、核行列に多項式の項を加えた鞍点系
+
+$$
+\begin{bmatrix}K+\lambda I&P\\P^\mathsf T&0\end{bmatrix}
+\begin{bmatrix}\boldsymbol w\\\boldsymbol a\end{bmatrix}
+=\begin{bmatrix}\boldsymbol y\\\boldsymbol0\end{bmatrix}
+$$
+
+を一度だけ解く。
+$K_{ij}=\phi(\|\boldsymbol x_i-\boldsymbol x_j\|)$ は核行列、$P$ は標本点での多項式の基底の値、$\boldsymbol a$ は多項式の係数、$\lambda$ は正則化である。
+多項式の項は核で決まり、薄板スプラインでは1次多項式、Multiquadric では定数、正定値の Gaussian と逆 Multiquadric では項なしである。
+薄板スプラインの局所 RBF はこの項により1次関数を再現する。
+大域の `RbfInterpolator` は多項式の項を持たないので、この点で異なる。
+多項式の項がなければ Cholesky 分解、あれば部分ピボット付き LU 分解で解き、受け入れの判定に通らなければ SVD で分解し直す。
+多項式の項の数を $t$ とすると、準備は $O((k+t)^3)$、一回の問い合わせは成分ごとに $O(k+t)$ である。
+`with_regularization(RbfRegularization::Diagonal(λ))` は対角に $\lambda$ を加えて平滑化し、自動的な jitter は加えない。
+正則化なしで重複した近傍があるときや、多項式の項を決められない配置、条件の悪い系は `Singular` になる。
+
+### 数値の方針とレポート
+
+`LocalModelOptions` は、数値ランクの閾値（既定は `RankThreshold::default`）、受け入れる逆条件数の下限（既定 $\sqrt\varepsilon$）、密な系の次数の上限（既定 1024）、準備のメモリの上限（既定なし）を指定する。
+さらに、直接の分解が失敗したときの SVD の反復の上限（`with_factor_iterations`、既定なし）と、準備の計算回数の上限（`with_budgets`、既定は無制限）を指定する。
+準備は一つの求解として数えられ、分解する系ごとに提案1回を使うので、提案の上限は試せる系の数を制限する。
+`LocalFitReport` は `neighbors()`、`degree()`、`rank()`、`attempts()`、`factorization()`（`FitFactorization`）、`used_fallback()`、`condition_norm()`（`FitConditionNorm`）、`reciprocal_condition()`、`residual()` を返す。
+`degree()` は多項式の部分の総次数で、多項式の部分がなければ `None` である。
+`residual()` は解いた系の残差の最大で、局所多項式では標本での最小二乗の残差、RBF と Gauss 過程では正則化やノイズを対角に含む系の残差になる。
+直接の因子の逆条件数は1ノルムの推定、SVD の経路では特異値の比（2ノルム）であり、両者を同じ尺度として比べない。
+レポートの数値は解いた系の性質であり、予測の誤差の上界ではない。
+`sample_indices()` は選んだ近傍の元の添字を、距離と添字の順に返す。
+
+## 局所多項式の再現性
+
+次のセルは2次多項式 $f(x,y)=2+x^2+3y$ を $3\times3$ の格子（座標 $-1,0,1$）の9点で標本化し、原点を中心に局所多項式を準備する。
+入力は要求する次数と、問い合わせ点の $x$ 座標（$y=0.3$ に固定）である。
+近傍数の範囲は 6 から 9 とする。
+出力は採用された次数、近傍数、試行の回数、最小二乗の残差、問い合わせ点での値と解析値 $f$ との差である。
+要求した次数が2以上なら $f$ は多項式の空間に含まれるので、差は丸め誤差の程度になるはずである。
+次数1では $x^2$ を表せず、次数3では9点で係数10個を決められないので、準備は次数を下げる。
+
+```rust
+//| id: interp-local-polynomial-recovery
+//| ref: interp-local-polynomial-recovery
+//| title: 固定近傍の局所多項式の次数と誤差を確認する
+//| run: reactive
+//| crates: [scioxide-interp]
+//| inputs:
+//|   degree: {"type":"range","label":"要求する総次数","min":1,"max":3,"step":1,"value":2}
+//|   position: {"type":"range","label":"問い合わせ点の x 座標 [-]","min":-0.8,"max":0.8,"step":0.1,"value":0.2}
+//| cases:
+//|   - {"id":"linear","label":"次数 1","description":"x² の項を表せないので、残差と解析値との差が 10⁻¹ 程度になる。","inputs":{"degree":1}}
+//|   - {"id":"cubic","label":"次数 3","description":"9 点では 10 個の係数を決められず、次数 2 に下がって f を再現する。","inputs":{"degree":3}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"fit","path":"/rows/0/1","equals":2}
+//|       - {"artifact":"fit","path":"/rows/0/2","equals":6}
+//|       - {"artifact":"fit","path":"/rows/0/3","equals":1}
+//|       - {"artifact":"fit","path":"/rows/0/6","range":{"max":1e-14}}
+//|   - case: linear
+//|     expect:
+//|       - {"artifact":"fit","path":"/rows/0/1","equals":1}
+//|       - {"artifact":"fit","path":"/rows/0/6","approx":{"value":0.34636363636363665,"rtol":1e-9}}
+//|   - case: cubic
+//|     expect:
+//|       - {"artifact":"fit","path":"/rows/0/1","equals":2}
+//|       - {"artifact":"fit","path":"/rows/0/3","equals":3}
+//|       - {"artifact":"fit","path":"/rows/0/6","range":{"max":1e-14}}
+use scioxide_interp::{
+    ExtrapolationPolicy, Interpolant, LocalModelPlan, LocalPolynomialModel,
+    LocalPolynomialOptions, LocalSamples,
+};
+
+// 3 × 3 の格子の 9 点と f(x, y) = 2 + x² + 3y
+let f = |x: f64, y: f64| 2.0 + x * x + 3.0 * y;
+let sites: Vec<_> = [-1.0_f64, 0.0, 1.0]
+    .iter()
+    .flat_map(|&x| [-1.0, 0.0, 1.0].map(|y| [x, y]))
+    .collect();
+let values: Vec<_> = sites.iter().map(|p| f(p[0], p[1])).collect();
+let samples = LocalSamples::new(&sites, &values).map_err(|e| e.to_string())?;
+let points = samples.points().map_err(|e| e.to_string())?;
+let plan = LocalModelPlan::new(&points, samples.values().map_err(|e| e.to_string())?)
+    .map_err(|e| e.to_string())?;
+// 近傍数は 6 から 9 まで倍々に試し、だめなら次数を下げる
+let options = LocalPolynomialOptions::new(degree as usize, 6, 9);
+let model = LocalPolynomialModel::new(&plan, [0.0, 0.0], options).map_err(|e| e.to_string())?;
+let value = model
+    .evaluate([position, 0.3], ExtrapolationPolicy::Reject)
+    .map_err(|e| e.to_string())?;
+let report = model.fit_report();
+// 局所多項式のレポートは採用した次数を持つ
+let adopted = report.degree().ok_or("採用次数が示されない")?;
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed6 = serde_json::json!({ "fractionDigits": 6 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "要求次数", "type": "integer" },
+    { "key": "1", "label": "採用次数", "type": "integer" },
+    { "key": "2", "label": "近傍数", "type": "integer" },
+    { "key": "3", "label": "試行回数", "type": "integer" },
+    { "key": "4", "label": "最小二乗の残差 [-]", "type": "number", "format": sci3 },
+    { "key": "5", "label": "値 [-]", "type": "number", "format": fixed6 },
+    { "key": "6", "label": "解析値との差 [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    vec![(
+        degree as usize,
+        adopted,
+        report.neighbors(),
+        report.attempts(),
+        report.residual(),
+        value[0],
+        (value[0] - f(position, 0.3)).abs()
+    )],
+    metadata = serde_json::json!({ "id": "fit" })
+);
+```
+
+要求次数2では、最初の6近傍で2次の系がランク6を持ち、そのまま採用される。
+最小二乗の残差は $8.9\times10^{-16}$、解析値との差は 0 で、2次多項式は丸め誤差の範囲で再現される。
+要求次数3（`cubic`）では、9近傍でも係数10個に足りないので、6近傍と9近傍の2回の試行のあとで次数が2へ下がり、3回目の試行で採用される。
+$f$ は2次なので、差は丸め誤差の程度のままである。
+要求次数1（`linear`）では $x^2$ の項を表せないので、残差は 0.68、$x=0.2$ での解析値との差は 0.35 になる。
+採用次数と近傍数を読むと、要求した次数のまま構築されたかを判断できる。
+
+## 固定共分散からの条件付き予測
+
+`Covariance::new(kernel, variance, length_scales)` は `CovarianceKernel`、正の信号分散 $\sigma^2$（標準偏差ではなく分散）、各軸の正の長さ尺度 $\ell_a$ を持つ。
+距離は軸ごとに尺度で割った $r=\sqrt{\sum_a((a_a-b_a)/\ell_a)^2}$ で、共分散は $k(\boldsymbol a,\boldsymbol b)=\sigma^2\rho(r)$ である。
+相関関数 $\rho$ はどれも定常で、どの次元でも正定値で、$\rho(0)=1$ を満たす。
+
+| `CovarianceKernel` | $\rho(r)$ | 標本関数の滑らかさ |
+|---|---|---|
+| `SquaredExponential` | $\exp(-r^2/2)$ | 無限回微分可能 |
+| `Matern52` | $(1+\sqrt5r+5r^2/3)\exp(-\sqrt5r)$ | 2回微分可能 |
+| `Matern32` | $(1+\sqrt3r)\exp(-\sqrt3r)$ | 1回微分可能 |
+| `Matern12` | $\exp(-r)$ | 連続だが微分不能 |
+
+滑らかさ $\nu$ の Matérn 核の標本関数は $\lceil\nu\rceil-1$ 回微分可能である。
+長さ尺度は値が相関を保つ距離の目安であり、変えると曲線の形だけでなく共分散行列の条件数と分散の値も変わる。
+SciOxide の Gauss 過程は共分散のパラメータを推定しない。
+長さ尺度や分散は利用側が与え、選び方の妥当性は検証用の標本などで確かめる。
+
+学習点 $\boldsymbol x_1,\dots,\boldsymbol x_n$ の値 $\boldsymbol y$ が、平均 $m$、共分散 $k$ の Gauss 過程に、分散 $s_i$ の独立な Gauss ノイズを加えたものだと仮定する。
+$K=[k(\boldsymbol x_i,\boldsymbol x_j)]+\operatorname{diag}(s)$、問い合わせ点 $\boldsymbol x_*$ と学習点の共分散のベクトルを $\boldsymbol k_*$、$k_{**}=k(\boldsymbol x_*,\boldsymbol x_*)=\sigma^2$ とすると、単純 kriging の予測平均と潜在関数の分散は
+
+$$
+\mu_*=m+\boldsymbol k_*^\mathsf TK^{-1}(\boldsymbol y-m\mathbf1),\qquad
+v_*=k_{**}-\boldsymbol k_*^\mathsf TK^{-1}\boldsymbol k_*
+$$
+
+である。
+これは仮定した確率モデルのもとで、観測 $\boldsymbol y$ に条件付けた $f(\boldsymbol x_*)$ の平均と分散であり、$m=0$ では Rasmussen–Williams の §2.2 のノイズのある予測の式と同じ形である。
+ノイズがなければ、学習点 $\boldsymbol x_*=\boldsymbol x_i$ では $\boldsymbol k_*$ が $K$ の $i$ 列に等しいので $\mu_*=y_i$、$v_*=0$ になる。
+学習点から十分遠い点では $\boldsymbol k_*\to\mathbf0$ なので、$\mu_*\to m$、$v_*\to\sigma^2$ になる。
+逆行列は作らず、準備した Cholesky 因子で連立方程式を解く。
+
+`GaussianProcessModel::new(&points, values, covariance, &noise, mean)` は、学習点ごとの非負の観測ノイズの分散 `noise` を対角に加えて分解する。
+数値の方針は既定の `LocalModelOptions` で、変えるときは `with_options(.., mean, options)`、呼び出し側の実行スコープの中で準備するときは `build(.., options, scope)` を使う。
+Cholesky 分解が破綻すれば、$K$ が正定値でないとして `DomainError` になる。
+分解できてもランクか逆条件数の判定に通らなければ SVD で分解し直し、それでも通らなければ `Singular` になる。
+自動的に jitter を足して成功扱いにすることはない。
+負のノイズ分散は `InvalidInput`、ノイズや平均の個数の不一致は `DimensionMismatch` になる。
+
+`KrigingMean::Constant(&means)` は成分ごとの既知の平均を与える単純 kriging である。
+`KrigingMean::Ordinary` は、成分ごとの未知の定数の平均を一般化最小二乗 $\hat m=\mathbf1^\mathsf TK^{-1}\boldsymbol y/\mathbf1^\mathsf TK^{-1}\mathbf1$ で推定する通常 kriging である。
+この場合、平均の推定の不確かさとして
+
+$$
+\frac{(1-\mathbf1^\mathsf TK^{-1}\boldsymbol k_*)^2}{\mathbf1^\mathsf TK^{-1}\mathbf1}
+$$
+
+が潜在分散に加わる。
+これは Rasmussen–Williams の §2.7 で、基底関数 $h(\boldsymbol x)=1$ の係数の事前分布を平坦にした極限の追加項にあたる。
+学習点から十分遠い点では $\boldsymbol k_*\to\mathbf0$ なので、通常 kriging の分散は $\sigma^2+1/(\mathbf1^\mathsf TK^{-1}\mathbf1)$ に近づき、事前の分散 $\sigma^2$ より大きくなる。
+
+## 予測の成分と計算量
+
+`GaussianProcessModel::prediction(observation_noise)` は、新しい観測のノイズの分散を固定した `GaussianPrediction` を返し、負のノイズは `InvalidInput` になる。
+これは `Interpolant` であり、値の成分が $m$ 個なら一つの出力には $m+2$ 個の成分がある。
+並びは各成分の予測平均、潜在関数の分散、新しい観測の分散の順である。
+観測の分散は潜在分散に `observation_noise` を加えた量で、新しく測る値の散らばりを表す。
+潜在分散は学習点の近くで打ち消しにより小さな負の値になることがある。
+$64\varepsilon n(\sigma^2+|\boldsymbol k_*^\mathsf TK^{-1}\boldsymbol k_*|+|\text{通常 kriging の項}|)$ 以内の負の値は 0 に切り上げ、それを超えて負なら、モデルが矛盾しているとして `NumericalInstability` になる。
+`LocalPredictionWorkspace` を `prediction.workspace()` から作って `evaluate_into` に渡すと、問い合わせごとの確保をなくせる。
+多数の点の予測は `evaluate_many` か `BatchEvaluator` で一括して評価できる。
+
+標本数 $n$ の密な分解は $O(n^3)$ の処理と $O(n^2)$ のメモリを使う。
+一回の予測のうち平均の部分は $O(n)$ だが、分散のために $K^{-1}\boldsymbol k_*$ を解くので、全体では $O(n^2)$ になる。
+外挿の判定に使う領域は学習点を囲む座標軸に平行な箱である。
+`fit_report()` の `factorization()` は採用した因子、`condition_norm()` は逆条件数のノルムを示し、通常 kriging では `degree()` が `Some(0)` になる。
+
+`leave_one_out_into(index, out, workspace)` は、分解をやり直さずに一つ抜き予測の平均を `out` に書き、観測の分散を返す。
+精度行列 $P=K^{-1}$ に対して、平均は $y_i-(P\boldsymbol y)_i/P_{ii}$、分散は $1/P_{ii}$ である（Dubrule, 1983）。
+通常 kriging では、$\boldsymbol u=K^{-1}\mathbf1$ として平均の推定を除いた $P=K^{-1}-\boldsymbol u\boldsymbol u^\mathsf T/(\mathbf1^\mathsf T\boldsymbol u)$ を使い、2点以上が必要である。
+一回の手間は $O(n^2)$ で、$P_{ii}\le0$ なら `Singular` になる。
+長さ尺度などを全データで選んだあとの一つ抜き誤差には、その選択の影響が残る。
+
+予測の不確かさを次の評価点の選択に使う考え方は、[サロゲートモデルと獲得関数](oxref:optimize-surrogate-acquisition)で扱う。
+
+## ノイズのない点と遠方の分散
+
+次のセルは $x=-1,0,1$ の3点に値 $0.5,0,-0.5$ を与え、信号分散 1 の `SquaredExponential` で kriging を行う。
+平均は既知の 0 を与える単純 kriging と、定数の平均を推定する通常 kriging から選ぶ。
+学習点の観測ノイズは 0、新しい観測のノイズの分散は 0.1 とする。
+入力は長さ尺度 $\ell$ と平均の扱いで、$x\in[-5,5]$ の201点で予測する。
+学習点の範囲 $[-1,1]$ の外を問い合わせるので、ここでは意図して `MethodDefined` を指定する。
+図は予測平均と、潜在分散から作る $\pm2\sqrt{v_*}$ の帯で、表は1刻みの点の値である。
+最後の表は独立な検算で、$x=0.5$ での平均と潜在分散を、上の式を $3\times3$ の Cramer の公式で直接解いた値と比べる。
+検証する性質は三つある。
+ノイズのない学習点では潜在分散が 0、観測分散が 0.1 になる。
+学習点から十分遠い点では、単純 kriging の潜在分散が事前の分散 1 へ、予測平均が既知平均 0 へ近づき、通常 kriging の潜在分散は 1 より大きい値へ近づく。
+長さ尺度を大きくすると、学習点の影響がより遠くまで及ぶ。
+
+```rust
+//| id: interp-kriging-variance
+//| ref: interp-kriging-variance
+//| title: 潜在分散と新しい観測の分散を比較する
+//| run: reactive
+//| crates: [scioxide-core, scioxide-interp]
+//| inputs:
+//|   length: {"type":"range","label":"共分散の長さ尺度 ℓ [-]","min":0.2,"max":2.0,"step":0.1,"value":0.7}
+//|   mean_kind: {"type":"select","label":"平均の扱い","options":[{"label":"既知の平均 0（単純 kriging）","value":"simple"},{"label":"定数の平均を推定（通常 kriging）","value":"ordinary"}],"value":"simple"}
+//| cases:
+//|   - {"id":"long-scale","label":"ℓ = 2","description":"学習点の影響が遠くまで残り、x = ±5 でも潜在分散が 1 に届かない。","inputs":{"length":2}}
+//|   - {"id":"ordinary","label":"通常 kriging","description":"平均の推定の不確かさが加わり、遠方の潜在分散が 1 を超える。","inputs":{"mean_kind":"ordinary"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"profile","path":"/rows/4/2","range":{"max":1e-12}}
+//|       - {"artifact":"profile","path":"/rows/4/3","approx":{"value":0.1,"rtol":1e-12}}
+//|       - {"artifact":"profile","path":"/rows/0/2","approx":{"value":1,"atol":1e-9}}
+//|       - {"artifact":"check","path":"/rows/0/2","range":{"max":1e-14}}
+//|       - {"artifact":"check","path":"/rows/1/2","range":{"max":1e-14}}
+//|   - case: long-scale
+//|     expect:
+//|       - {"artifact":"profile","path":"/rows/0/2","approx":{"value":0.9299538675745854,"rtol":1e-9}}
+//|       - {"artifact":"check","path":"/rows/1/2","range":{"max":1e-13}}
+//|   - case: ordinary
+//|     expect:
+//|       - {"artifact":"profile","path":"/rows/0/2","approx":{"value":1.4806297889044597,"rtol":1e-9}}
+//|       - {"artifact":"profile","path":"/rows/4/2","range":{"max":1e-12}}
+//|       - {"artifact":"check","path":"/rows/1/2","range":{"max":1e-14}}
+use scioxide_core::RealScalar;
+use scioxide_interp::{
+    Covariance, CovarianceKernel, ExtrapolationPolicy, GaussianProcessModel, Interpolant,
+    KrigingMean, LocalSamples,
+};
+
+let sites = [-1.0_f64, 0.0, 1.0];
+let y = [0.5, 0.0, -0.5];
+let data = LocalSamples::new(&sites.map(|x| [x]), &y).map_err(|e| e.to_string())?;
+let points = data.points().map_err(|e| e.to_string())?;
+// 信号分散 1、長さ尺度 ℓ の k(r) = exp(-r²/2)
+let covariance = Covariance::new(CovarianceKernel::SquaredExponential, 1.0, [length])
+    .map_err(|e| e.to_string())?;
+let ordinary = mean_kind == "ordinary";
+let mean = if ordinary {
+    KrigingMean::Ordinary
+} else {
+    KrigingMean::Constant(&[0.0])
+};
+// 学習点の観測ノイズは 0
+let values = data.values().map_err(|e| e.to_string())?;
+let model = GaussianProcessModel::new(&points, values, covariance, &[0.0; 3], mean)
+    .map_err(|e| e.to_string())?;
+// 出力の成分は [予測平均, 潜在分散, 観測分散]
+let prediction = model.prediction(0.1).map_err(|e| e.to_string())?;
+let mut workspace = prediction.workspace().map_err(|e| e.to_string())?;
+let mut predict = |x: f64| -> Result<[f64; 3], String> {
+    let mut out = [0.0; 3];
+    prediction
+        .evaluate_into(
+            [x],
+            ExtrapolationPolicy::MethodDefined,
+            &mut out,
+            &mut workspace,
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(out)
+};
+let mut band = Vec::new();
+let mut rows = Vec::new();
+for i in 0..=200 {
+    let x = -5.0 + i as f64 / 20.0;
+    let out = predict(x)?;
+    let half = 2.0 * RealScalar::sqrt(out[1]);
+    band.push([x, out[0], out[0] - half, out[0] + half]);
+    if i % 20 == 0 {
+        rows.push((x, out[0], out[1], out[2]));
+    }
+}
+// 独立な検算: x = 0.5 で K⁻¹ を Cramer の公式で直接使う（f64 の exp による参照値）
+let k = |a: f64, b: f64| (-0.5 * ((a - b) / length).powi(2)).exp();
+let gram: [[f64; 3]; 3] = sites.map(|a| sites.map(|b| k(a, b)));
+let det = |m: [[f64; 3]; 3]| {
+    m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+};
+let solve = |b: [f64; 3]| -> [f64; 3] {
+    core::array::from_fn(|c| {
+        let mut m = gram;
+        for r in 0..3 {
+            m[r][c] = b[r];
+        }
+        det(m) / det(gram)
+    })
+};
+let dot = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+let kstar = sites.map(|b| k(0.5, b));
+let (u, w) = (solve([1.0; 3]), solve(kstar));
+let m_hat = if ordinary {
+    dot(u, y) / dot(u, [1.0; 3])
+} else {
+    0.0
+};
+let mean_check = m_hat + dot(w, y.map(|v| v - m_hat));
+let trend = if ordinary {
+    (1.0 - dot(u, kstar)).powi(2) / dot(u, [1.0; 3])
+} else {
+    0.0
+};
+let variance_check = 1.0 - dot(w, kstar) + trend;
+let at_half = predict(0.5)?;
+let observed: Vec<_> = sites.iter().zip(y).map(|(&x, v)| [x, v]).collect();
+emit_chart!(serde_json::json!({
+    "kind": "xy",
+    "xLabel": "座標 x [-]",
+    "yLabel": "値 [-]",
+    "yMin": -2.5,
+    "yMax": 2.5,
+    "dataZoom": true,
+    "tooltip": true,
+    "layers": [
+        { "id": "band", "kind": "band", "name": "予測平均 ± 2√(潜在分散)", "points": band },
+        { "id": "samples", "kind": "scatter", "name": "学習点", "points": observed }
+    ],
+    "annotations": [{ "kind": "line", "axis": "y", "value": 0.0, "label": "y = 0" }]
+}));
+let fixed4 = serde_json::json!({ "fractionDigits": 4 });
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "座標 x [-]", "type": "number", "format": { "fractionDigits": 0 } },
+    { "key": "1", "label": "予測平均 [-]", "type": "number", "format": fixed4 },
+    { "key": "2", "label": "潜在分散 [-]", "type": "number", "format": fixed4 },
+    { "key": "3", "label": "観測分散 [-]", "type": "number", "format": fixed4 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "profile" })
+);
+let check_columns = serde_json::json!([
+    { "key": "0", "label": "x = 0.5 での量" },
+    { "key": "1", "label": "SciOxide [-]", "type": "number", "format": { "significantDigits": 12 } },
+    { "key": "2", "label": "直接解との差 [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    check_columns,
+    vec![
+        ("予測平均", at_half[0], (at_half[0] - mean_check).abs()),
+        ("潜在分散", at_half[1], (at_half[1] - variance_check).abs()),
+    ],
+    metadata = serde_json::json!({ "id": "check" })
+);
+```
+
+学習点 $x=-1,0,1$ では潜在分散が 0、観測分散が 0.1 で、予測平均は学習値を再現する。
+$x=0.5$ での平均と潜在分散は、Cramer の公式による直接解と $10^{-16}$ 程度で一致する。
+既定の $\ell=0.7$ の単純 kriging では、$x=\pm3$ で潜在分散が 0.9997、$x=\pm5$ で 1 にほぼ等しく、予測平均も 0 へ戻る。
+$\ell=2$（`long-scale`）にすると $x=\pm5$ でも潜在分散は 0.930 で、学習点の影響が遠くまで残る。
+通常 kriging（`ordinary`）では、$x=\pm5$ の潜在分散が $1.4806=1+1/(\mathbf1^\mathsf TK^{-1}\mathbf1)$ に近づき、事前の分散 1 を超える。
+この例では学習値の平均が 0 なので、推定した平均も 0 になり、予測平均は単純 kriging と同じである。
+帯の幅は学習点で 0 になり、学習点から離れると単純 kriging では $\pm2$ へ広がる。
+観測ノイズを含む当てはめでは、学習点の潜在分散も一般には 0 にならない。
+分散は仮定した確率モデルのもとでの統計的な不確かさであり、誤った共分散や平均を選んだことによる偏りは含まない。
+
+## まとめ
+
+局所モデルは準備のときに近傍を固定し、問い合わせでは同じ因子を使うので、問い合わせ点ごとに近傍を選び直すには利用側で中心ごとにモデルを作る。
+局所多項式は重みのない最小二乗で、ランクや条件が足りなければ近傍を増やし次数を下げるので、`LocalFitReport` の採用次数と近傍数を確かめる。
+局所 RBF の多項式の項は核で決まり、薄板スプラインなら1次関数を再現する。
+kriging の分散は仮定した共分散と観測ノイズに条件付けた統計的な不確かさであり、近似誤差の上界ではない。
+既知平均と推定平均、潜在分散と観測分散を区別し、通常 kriging では遠方の分散が事前の分散より大きくなることに注意する。
+
+## 次に読むページ
+
+- [補間の導関数と積分](../derivatives-integrals-and-workspaces/)：各方式が導関数と積分を提供するかどうかと、その計算の誤差を確かめる。
+- [Franke 関数による RBF の交差検証](../../examples/station-cross-validation/)：一つ抜き誤差を真の誤差と比べ、kriging の一つ抜きの式が代替になる場面を確かめる。
+- [2 次元・散在点・局所モデルの API](../../api/multidimensional/)：局所モデルと Gauss 過程の構成時のエラーとレポートの項目を引く。

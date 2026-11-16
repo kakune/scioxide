@@ -1,0 +1,568 @@
+---
+title: 軌道計算で作業領域を再利用し保存量で検算する
+description: 平面の Kepler 問題を速度 Verlet 法で積分し、各段の力を位置エネルギーの勾配として FiniteDifference の gradient_into と使い回す作業領域で求め、既知の位置エネルギーを base に渡して評価を節約する。保存量、解析的な力、Kepler 方程式の解で検算し、離心近点角の導関数 dE/dM を作業領域を使わない derivative_into で求めて陰関数の微分と照合する。
+sidebar:
+  order: 440
+---
+
+時間発展の計算では同じ形の導関数を各段で何千回も求める。
+`scioxide-differentiate` の手法オブジェクトと作業領域を一度だけ用意して出力先を指定する API の `gradient_into` を繰り返せば、段ごとに作業領域を確保し直さずに済む。
+この例題では平面の Kepler 問題を速度 Verlet 法で積分し、各段の力を位置エネルギーの差分の勾配として求める。
+検算にはエネルギーと角運動量の保存、解析的な力、Kepler 方程式から求めた厳密な軌道を使い、差分の公式の違いが結果のどこに現れるかを確かめる。
+後半では軌道の上の離心近点角 $E$ を平均近点角 $M$ で微分し、陰関数の微分で求めた $\mathrm{d}E/\mathrm{d}M$ と照合する。
+
+軌道の要素は Kepler 方程式を六つの求根法で解く[求根の章の例題](../../../scioxide-rootfind/examples/kepler-equation/)とそろえる。
+長半径 $a = 1$、焦点を原点、近点の方向を $x$ 軸に取り、既定の離心率は $e = 0.6$ である。
+
+## モデルと積分法
+
+重力定数と中心天体の質量の積を $\mu = 1$ とする無次元の単位で、平面の位置 $\mathbf{x}$ にある単位質量の質点の位置エネルギーは $U(\mathbf{x}) = -\mu / \lvert \mathbf{x} \rvert$、力は $\mathbf{F} = -\nabla U = -\mu \mathbf{x} / \lvert \mathbf{x} \rvert^3$ である。
+エネルギー $E_{\mathrm{tot}} = \lvert \mathbf{v} \rvert^2 / 2 + U$ と角運動量 $L = x_1 v_2 - x_2 v_1$ は保存する。
+長半径 $a = 1$、離心率 $e$ の楕円軌道を、近点 $\mathbf{x}_0 = (1 - e, 0)$ から速度 $\mathbf{v}_0 = (0, \sqrt{(1 + e)/(1 - e)})$ で始めると、周期は $2\pi$、エネルギーは $E_{\mathrm{tot}} = -1/2$、角運動量は $L = \sqrt{1 - e^2}$ になる。
+
+厳密な軌道は Kepler 方程式で求まる。
+平均運動は $n = \sqrt{\mu / a^3} = 1$ なので、近点を通過してから時間 $t$ の平均近点角は $M = t$ である。
+離心近点角 $E$ を
+
+$$
+M = E - e \sin E
+$$
+
+の根として求めると、位置は
+
+$$
+x_1 = \cos E - e, \qquad x_2 = \sqrt{1 - e^2} \sin E
+$$
+
+になる（導出と根の一意性は求根の章の例題にある）。
+この厳密解を数値積分の誤差を測る基準に使う。
+
+速度 Verlet 法は時間刻み $\Delta t$ で次のように位置と速度を進める。
+
+$$
+\mathbf{x}_{n+1} = \mathbf{x}_n + \Delta t \, \mathbf{v}_n + \frac{\Delta t^2}{2} \mathbf{F}_n,
+\qquad
+\mathbf{v}_{n+1} = \mathbf{v}_n + \frac{\Delta t}{2} (\mathbf{F}_n + \mathbf{F}_{n+1}).
+$$
+
+ここで $\mathbf{F}_n = \mathbf{F}(\mathbf{x}_n)$ で、力の評価は 1 段に 1 回である。
+この方法はシンプレクティックで、力が保存力なら、エネルギーの誤差は長い時間がたっても $O(\Delta t^2)$ の幅で振動し、増え続けない。
+力が中心力なら、角運動量は丸め誤差を除いて保存される。
+一方、軌道上の位相誤差は時間に比例して増えるので、厳密な軌道との距離は周回とともに大きくなる。
+
+次のブロックは三つのセルが共有するモデルの定義である。
+`potential` は $U(\mathbf{x})$、`exact_force` は解析的な力 $\mathbf{F} = -\mathbf{x} / \lvert \mathbf{x} \rvert^3$、`verlet` は近点から始める速度 Verlet 法、`eccentric_anomaly` は Kepler 方程式の根 $E(M)$、`kepler_position` は時刻 $t$ の厳密な位置に対応する。
+`verlet` は力を返す関数を引数に取り、その関数に位置 $\mathbf{x}_{n+1}$ と、エネルギーの監視のために計算した $U(\mathbf{x}_{n+1})$ を渡す。
+$E(M)$ は $M$ を $[-\pi, \pi]$ に移し、$\lvert M \rvert$ について $E_0 = \pi$ から Newton 法で求める。
+$f(E) = E - e \sin E - \lvert M \rvert$ は $[0, \pi]$ で $f'' = e \sin E \ge 0$ の凸関数で、$f(\pi) \ge 0$ なので、この初期値からの反復は根を越えずに単調に減って収束する（求根の章の例題の「初期値の規則」）。
+
+```rust
+//| id: differentiate-kepler-model
+//| kind: definitions
+//| title: 位置エネルギー・速度 Verlet 法・Kepler 方程式の解
+//| crates: [scioxide-core]
+use scioxide_core::RealScalar;
+
+/// 位置エネルギー U(x) = −1/|x|（μ = 1）。
+pub(crate) fn potential(p: &[f64]) -> f64 {
+    -1.0 / RealScalar::sqrt(p[0] * p[0] + p[1] * p[1])
+}
+
+/// 解析的な力 F = −x/|x|³。
+pub(crate) fn exact_force(p: &[f64; 2]) -> [f64; 2] {
+    let r = RealScalar::sqrt(p[0] * p[0] + p[1] * p[1]);
+    [-p[0] / (r * r * r), -p[1] / (r * r * r)]
+}
+
+/// 近点 (1 − e, 0) から速度 Verlet 法で total 段進め、max |ΔE/E|、max |ΔL/L| と各段の位置を返す。
+/// force は位置 x と U(x) を受け取って力を返す。
+pub(crate) fn verlet(
+    e: f64,
+    dt: f64,
+    total: usize,
+    mut force: impl FnMut(&[f64; 2], f64) -> Result<[f64; 2], String>,
+) -> Result<(f64, f64, Vec<[f64; 2]>), String> {
+    let (mut x, mut v) = (
+        [1.0 - e, 0.0],
+        [0.0, RealScalar::sqrt((1.0 + e) / (1.0 - e))],
+    );
+    let mut u = potential(&x);
+    let mut f = force(&x, u)?;
+    let (e0, l0) = (
+        0.5 * (v[0] * v[0] + v[1] * v[1]) + u,
+        x[0] * v[1] - x[1] * v[0],
+    );
+    let (mut energy, mut momentum) = (0.0_f64, 0.0_f64);
+    let mut path = Vec::with_capacity(total);
+    for _ in 0..total {
+        x = [
+            x[0] + dt * (v[0] + 0.5 * dt * f[0]),
+            x[1] + dt * (v[1] + 0.5 * dt * f[1]),
+        ];
+        u = potential(&x);
+        let next = force(&x, u)?;
+        v = [
+            v[0] + 0.5 * dt * (f[0] + next[0]),
+            v[1] + 0.5 * dt * (f[1] + next[1]),
+        ];
+        f = next;
+        energy = energy.max(((0.5 * (v[0] * v[0] + v[1] * v[1]) + u - e0) / e0).abs());
+        momentum = momentum.max(((x[0] * v[1] - x[1] * v[0] - l0) / l0).abs());
+        path.push(x);
+    }
+    Ok((energy, momentum, path))
+}
+
+/// Kepler 方程式 M = E − e sin E の根 E(M)。|M| ≤ π に移して E₀ = π から Newton 法で解く。
+pub(crate) fn eccentric_anomaly(e: f64, mean: f64) -> f64 {
+    let tau = 2.0 * std::f64::consts::PI;
+    let turns = (mean / tau).round();
+    let reduced = mean - turns * tau;
+    let target = reduced.abs();
+    let mut anomaly = std::f64::consts::PI;
+    for _ in 0..64 {
+        let residual = anomaly - e * RealScalar::sin(anomaly) - target;
+        let step = residual / (1.0 - e * RealScalar::cos(anomaly));
+        anomaly -= step;
+        if step.abs() <= 4.0 * f64::EPSILON {
+            break;
+        }
+    }
+    turns * tau + anomaly.copysign(reduced)
+}
+
+/// 時刻 t（= 平均近点角 M）の厳密な位置 (cos E − e, √(1 − e²) sin E)。
+pub(crate) fn kepler_position(e: f64, time: f64) -> [f64; 2] {
+    let anomaly = eccentric_anomaly(e, time);
+    [
+        RealScalar::cos(anomaly) - e,
+        RealScalar::sqrt(1.0 - e * e) * RealScalar::sin(anomaly),
+    ]
+}
+```
+
+## 差分の力の偏り
+
+差分で求めた力は真の力から打ち切り誤差の分だけずれる。
+既定の刻み $h = c \max(1, \lvert x_i \rvert)$ では、中心差分（$c = \varepsilon^{1/3}$）の相対的な偏りは $\varepsilon^{2/3} \approx 4 \times 10^{-11}$ 程度、前進差分（$c = \varepsilon^{1/2}$）は $\varepsilon^{1/2} \approx 1.5 \times 10^{-8}$ 程度である（[Taylor 展開と刻み幅の選択](../../algorithms/taylor-and-step-size/)）。
+近点では $\lvert \mathbf{x} \rvert = 1 - e$ が小さく、刻みに比べた $U$ の変化が急なので、偏りはこの目安より大きくなる。
+
+偏りは時間刻みによる誤差（$\Delta t^2$、1 周 1000 段なら $4 \times 10^{-5}$ 程度）よりずっと小さいので、エネルギーの誤差にはほとんど現れない。
+一方、偏りは軌道を少しずつずらすので、同じ時間刻みで解析的な力で積分した軌道との差には現れ、時間とともに増える。
+差分の勾配は一般に厳密な保存力ではなく、中心力でもないので、角運動量の保存も偏りの大きさで崩れる。
+
+## 作業領域の使い回しと既知の位置エネルギー
+
+各段ではエネルギーの監視のために $U(\mathbf{x}_{n+1})$ を計算するので、その値を `gradient_into` の `base` に渡す（[Taylor 展開と刻み幅の選択](oxref:differentiate-base-argument)）。
+2 変数の勾配の評価回数は中心差分で $2 \cdot 2 + 1 = 5$ 回から 4 回に、前進差分で $2 + 1 = 3$ 回から 2 回に減る。
+手法オブジェクト `FiniteDifference` は差分の公式ごとに一度作り、作業領域は `FiniteDifferenceWorkspace::workspace(DerivativeRequest::new(&method, DerivativeShape::gradient(2)))` で一度だけ確保して、全段で使い回す（[Plan・要件・作業領域の再利用](oxref:differentiate-capacity-checks)）。
+評価のレポートが結果を出力に反映しなかったら、そこで計算を止める。
+
+次のセルは解析的な力、中心差分の力、前進差分の力の三つで同じ初期条件から積分する。
+入力は離心率 $e$、1 周の段数、周回数である。
+表はエネルギーと角運動量の相対誤差の最大値、各段の差分の力と解析的な力の相対誤差の最大値、終点での二つの基準（解析的な力で積分した軌道と Kepler 方程式の厳密解）との距離、1 段あたりの評価回数を示す。
+三つの軌道の位置は 1 周あたり 50 点に間引いて、次のセルに渡す。
+
+```rust
+//| id: differentiate-kepler-orbit
+//| ref: differentiate-kepler-orbit
+//| title: 差分の力による Kepler 軌道の保存量と軌道の差
+//| run: reactive
+//| uses: [differentiate-kepler-model]
+//| crates: [scioxide-core, scioxide-differentiate]
+//| exports: [eccentricity, paths]
+//| inputs:
+//|   eccentricity: {"type":"range","label":"離心率 e [-]","min":0.0,"max":0.8,"step":0.1,"value":0.6}
+//|   steps: {"type":"select","label":"1 周の段数 [-]","options":["250","1000","4000"],"value":"1000"}
+//|   orbits: {"type":"range","label":"周回数 [-]","min":1,"max":10,"step":1,"value":5}
+//| cases:
+//|   - {"id":"fine-steps","label":"1 周 4000 段","description":"エネルギーの誤差と厳密解との距離は約 1/16 に下がるが、差分の力による解析的な力の軌道との距離はほとんど変わらない。","inputs":{"steps":"4000"}}
+//|   - {"id":"circular","label":"円軌道 e = 0","description":"速度 Verlet 法のエネルギーの誤差が小さくなり、前進差分の力の偏りがエネルギーの誤差に現れる。","inputs":{"eccentricity":0.0}}
+//|   - {"id":"eccentric-long","label":"e = 0.8、10 周","description":"近点の半径 0.2 で力の偏りが大きくなり、前進差分の軌道の差が 10⁻⁴ の桁に達する。","inputs":{"eccentricity":0.8,"orbits":10}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"orbits","path":"/rows/0/1","approx":{"value":2.93e-4,"rtol":0.02}}
+//|       - {"artifact":"orbits","path":"/rows/1/1","approx":{"value":2.93e-4,"rtol":0.02}}
+//|       - {"artifact":"orbits","path":"/rows/0/2","range":{"max":1e-13}}
+//|       - {"artifact":"orbits","path":"/rows/1/3","range":{"min":1e-12,"max":1e-8}}
+//|       - {"artifact":"orbits","path":"/rows/2/3","range":{"min":1e-9,"max":1e-6}}
+//|       - {"artifact":"orbits","path":"/rows/1/4","range":{"min":1e-10,"max":1e-7}}
+//|       - {"artifact":"orbits","path":"/rows/2/4","range":{"min":1e-7,"max":1e-4}}
+//|       - {"artifact":"orbits","path":"/rows/1/6","equals":4}
+//|       - {"artifact":"orbits","path":"/rows/2/6","equals":2}
+//|   - case: fine-steps
+//|     expect:
+//|       - {"artifact":"orbits","path":"/rows/0/1","approx":{"value":1.83e-5,"rtol":0.05}}
+//|       - {"artifact":"orbits","path":"/rows/0/5","approx":{"value":1.69e-3,"rtol":0.05}}
+//|       - {"artifact":"orbits","path":"/rows/2/4","range":{"min":1e-7,"max":1e-4}}
+//|   - case: circular
+//|     expect:
+//|       - {"artifact":"orbits","path":"/rows/0/1","range":{"max":1e-9}}
+//|       - {"artifact":"orbits","path":"/rows/2/1","range":{"min":5e-9,"max":1e-7}}
+//|       - {"artifact":"orbits","path":"/rows/1/6","equals":4}
+//|   - case: eccentric-long
+//|     expect:
+//|       - {"artifact":"orbits","path":"/rows/2/4","range":{"min":1e-5,"max":1e-3}}
+use scioxide_core::{ExecutionContext, SciOxideError};
+use scioxide_differentiate::{
+    DerivativeRequest, DerivativeShape, DifferenceScheme, FiniteDifference,
+    FiniteDifferenceWorkspace,
+};
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed1 = serde_json::json!({ "fractionDigits": 1 });
+let steps: usize = steps.parse().map_err(|_| "段数を読めない")?;
+let (e, total) = (eccentricity, steps * orbits as usize);
+let dt = 2.0 * std::f64::consts::PI / steps as f64;
+let distance = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).hypot(a[1] - b[1]);
+// 次のセルに渡す点 (t, x₁, x₂) は 1 周 50 点で、終点を含む。
+let stride = steps / 50;
+let sample = |path: &[[f64; 2]]| -> Vec<[f64; 3]> {
+    (stride..=total)
+        .step_by(stride)
+        .map(|k| [k as f64 * dt, path[k - 1][0], path[k - 1][1]])
+        .collect()
+};
+// 基準 1: Kepler 方程式の厳密解。解析的な力の軌道との差は速度 Verlet 法そのものの誤差。
+let exact_end = kepler_position(e, total as f64 * dt);
+let (energy, momentum, analytic) = verlet(e, dt, total, |p, _| Ok(exact_force(p)))?;
+let analytic_end = analytic[total - 1];
+let mut rows = vec![(
+    "解析的な力",
+    energy,
+    momentum,
+    None,
+    None,
+    distance(analytic_end, exact_end),
+    None,
+)];
+let mut paths = vec![("解析的な力".to_string(), sample(&analytic))];
+for (name, scheme) in [
+    ("中心差分の力", DifferenceScheme::Central),
+    ("前進差分の力", DifferenceScheme::Forward),
+] {
+    let method = FiniteDifference::default().with_scheme(scheme);
+    let request = DerivativeRequest::new(&method, DerivativeShape::gradient(2));
+    let mut workspace =
+        FiniteDifferenceWorkspace::workspace(request).map_err(|e| e.to_string())?;
+    let (mut evaluations, mut force_error) = (0, 0.0_f64);
+    // 力 F = −∇U。base に U(x) を渡した gradient_into で ∇U を求め、解析的な力と比べる。
+    let force = |p: &[f64; 2], u: f64| -> Result<[f64; 2], String> {
+        let mut g = [0.0; 2];
+        let f = |q: &[f64], y: &mut [f64]| {
+            y[0] = potential(q);
+            Ok::<(), SciOxideError>(())
+        };
+        let scope = ExecutionContext::sequential();
+        let report = method
+            .gradient_into(f, p, None, Some(u), &mut g, &mut workspace, scope)
+            .map_err(|e| e.to_string())?;
+        if !report.output_available() {
+            return Err(format!("勾配が出力に反映されなかった: {}", report.termination()));
+        }
+        evaluations += report.evaluations();
+        let exact = exact_force(p);
+        let relative = (g[0] + exact[0]).hypot(g[1] + exact[1]) / exact[0].hypot(exact[1]);
+        force_error = force_error.max(relative);
+        Ok([-g[0], -g[1]])
+    };
+    let (energy, momentum, path) = verlet(e, dt, total, force)?;
+    // 基準 2: 同じ時間刻みで解析的な力で積分した軌道。差は差分の力の偏りだけから生じる。
+    let end = path[total - 1];
+    rows.push((
+        name,
+        energy,
+        momentum,
+        Some(force_error),
+        Some(distance(end, analytic_end)),
+        distance(end, exact_end),
+        Some(evaluations as f64 / (total + 1) as f64),
+    ));
+    paths.push((name.to_string(), sample(&path)));
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "力の求め方" },
+    { "key": "1", "label": "max |ΔE/E| [-]", "type": "number", "format": sci3 },
+    { "key": "2", "label": "max |ΔL/L| [-]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "力の最大相対誤差 [-]", "type": "number", "format": sci3, "nullText": "基準" },
+    { "key": "4", "label": "解析的な力の軌道との距離 [a]", "type": "number", "format": sci3, "nullText": "基準" },
+    { "key": "5", "label": "厳密解との距離 [a]", "type": "number", "format": sci3 },
+    { "key": "6", "label": "1 段の評価回数 [回]", "type": "number", "format": fixed1, "nullText": "—" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "orbits" })
+);
+export!(eccentricity, e);
+export!(paths, paths);
+```
+
+既定の $e = 0.6$、1 周 1000 段、5 周では、三つの方法のエネルギーの相対誤差の最大値はどれも $2.93 \times 10^{-4}$ で、表示した 3 桁では区別できない。
+これは時間刻みによる速度 Verlet 法の誤差で、差分の力の偏りはエネルギーの誤差に隠れる。
+角運動量の相対誤差は、解析的な力では $2.5 \times 10^{-15}$ の丸め誤差で、差分の力では中心差分で $4.7 \times 10^{-11}$、前進差分で $1.1 \times 10^{-8}$ と偏りの分だけ大きくなる。
+各段で比べた力の相対誤差の最大値は中心差分で $2.4 \times 10^{-10}$、前進差分で $4.7 \times 10^{-8}$ で、どちらも $\varepsilon^{2/3}$ と $\varepsilon^{1/2}$ の目安より数倍大きい。
+解析的な力の軌道との距離は、終点で中心差分が $7.3 \times 10^{-9}$、前進差分が $1.2 \times 10^{-5}$ で、前進差分の偏りによるずれは中心差分より 3 桁大きい。
+解析的な力で積分した軌道は、終点で厳密解から $2.7 \times 10^{-2}$ 離れている。
+これが速度 Verlet 法の位相の誤差で、差分の力の偏りはこの積分法の誤差に比べてずっと小さい。
+1 段の評価回数は `base` を渡しているので中心差分で 4 回、前進差分で 2 回である。
+
+1 周 4000 段にすると、エネルギーの誤差は $1.83 \times 10^{-5}$、厳密解との距離は $1.7 \times 10^{-3}$ と、どちらも約 1/16 に下がる。
+差分の力の軌道と解析的な力の軌道の距離はほとんど変わらないので、この距離は時間刻みではなく力の偏りで決まる。
+円軌道 $e = 0$ では、速度 Verlet 法のエネルギーの誤差が $3.9 \times 10^{-10}$ まで下がり、前進差分の力のエネルギーの誤差 $1.3 \times 10^{-8}$ との違いが見えるようになる。
+エネルギーの保存が差分の偏りを隠すのは、積分法の誤差のほうが大きいときに限る。
+離心率 0.8 で 10 周すると、近点の半径が 0.2 になって力の偏りが大きくなり、前進差分の力による軌道のずれは $1.3 \times 10^{-4}$ に達する。
+このとき 1 周 1000 段では、解析的な力の軌道も厳密解から $0.91$ 離れるので、軌道そのものの精度には段数を増やす必要がある。
+
+次のセルは上のセルが渡した位置から、選んだ基準と各軌道の距離を時間に対して描く。
+基準を解析的な力の軌道にすると、差分の力の偏りだけによるずれが見える。
+基準を Kepler 方程式の厳密解にすると、三つの軌道の距離はどれも速度 Verlet 法の位相の誤差で決まる。
+距離がちょうど 0 になる点は対数軸に描けないので除き、その数を図の説明に示す。
+
+```rust
+//| id: differentiate-kepler-orbit-gaps
+//| ref: differentiate-kepler-orbit-gaps
+//| title: 二つの基準から測った軌道の距離の時間変化
+//| run: reactive
+//| uses: [differentiate-kepler-model]
+//| crates: [scioxide-core]
+//| dependsOn:
+//|   orbits: differentiate-kepler-orbit
+//| inputs:
+//|   reference: {"type":"select","label":"基準","options":["解析的な力の軌道","Kepler 方程式の厳密解"],"value":"解析的な力の軌道"}
+//| cases:
+//|   - {"id":"exact-reference","label":"厳密解を基準","description":"三つの軌道の距離は重なって時間とともに増え、速度 Verlet 法の位相の誤差が差分の力の偏りを隠す。","inputs":{"reference":"Kepler 方程式の厳密解"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"gaps","path":"/spec/series/0/points/249/1","approx":{"value":7.28e-9,"rtol":0.05}}
+//|       - {"artifact":"gaps","path":"/spec/series/1/points/249/1","approx":{"value":1.19e-5,"rtol":0.02}}
+//|   - case: exact-reference
+//|     expect:
+//|       - {"artifact":"gaps","path":"/spec/series/0/points/249/1","approx":{"value":2.697e-2,"rtol":1e-3}}
+//|       - {"artifact":"gaps","path":"/spec/series/2/points/249/1","approx":{"value":2.698e-2,"rtol":1e-3}}
+// (力の求め方, 1 周 50 点の (t, x₁, x₂))
+type Path = (String, Vec<[f64; 3]>);
+
+let e = orbits["eccentricity"].as_f64().ok_or("離心率がない")?;
+let paths: Vec<Path> =
+    serde_json::from_value(orbits["paths"].clone()).map_err(|e| e.to_string())?;
+let to_analytic = reference == "解析的な力の軌道";
+let distance = |p: &[f64; 3], q: [f64; 2]| (p[1] - q[0]).hypot(p[2] - q[1]);
+let (mut series, mut dropped) = (Vec::new(), 0);
+// paths[0] は解析的な力の軌道。基準にするときは、それ自身を描かない。
+for (name, path) in paths.iter().skip(usize::from(to_analytic)) {
+    let gaps = path.iter().zip(&paths[0].1).map(|(p, a)| {
+        let base = if to_analytic {
+            [a[1], a[2]]
+        } else {
+            kepler_position(e, p[0])
+        };
+        [p[0], distance(p, base)]
+    });
+    let (points, zeros): (Vec<[f64; 2]>, Vec<[f64; 2]>) = gaps.partition(|g| g[1] > 0.0);
+    dropped += zeros.len();
+    series.push(serde_json::json!({ "name": format!("{name}の軌道"), "points": points }));
+}
+let caption = format!("距離が 0 で対数軸に描けない点: {dropped} 個");
+emit_chart!(
+    serde_json::json!({
+        "kind": "line",
+        "dataZoom": true,
+        "tooltip": true,
+        "xLabel": "時間 t [-]（1 周は 2π）",
+        "yLabel": format!("{reference}との距離 [a]"),
+        "yType": "log",
+        "series": series
+    }),
+    metadata = serde_json::json!({ "id": "gaps", "caption": caption })
+);
+```
+
+既定の基準（解析的な力の軌道）では、差分の力で積分した二つの軌道がどちらも時間とともに基準から離れ、終点の距離は中心差分で $7.3 \times 10^{-9}$、前進差分で $1.2 \times 10^{-5}$ になる。
+基準を厳密解にすると、三つの軌道の距離は重なり、終点で $2.7 \times 10^{-2}$ になる。
+差分の力の偏りによるずれは速度 Verlet 法の位相の誤差より 3 桁以上小さいので、この基準では見えない。
+
+## 離心近点角の導関数
+
+軌道の上の量の多くは平均近点角 $M$ で微分したものとして現れる。
+たとえば $\dot E = n \, \mathrm{d}E/\mathrm{d}M$ は、位置の時間微分 $\dot x_1 = -\sin E \, \dot E$、$\dot x_2 = \sqrt{1 - e^2} \cos E \, \dot E$ を通して速度を決める。
+$E(M)$ は Kepler 方程式の根として陰的に決まるが、$M = E - e \sin E$ の両辺を $M$ で微分すると $1 = (1 - e \cos E) \, \mathrm{d}E/\mathrm{d}M$ なので、
+
+$$
+\frac{\mathrm{d}E}{\mathrm{d}M} = \frac{1}{1 - e \cos E}
+$$
+
+が厳密に成り立つ。
+分母は Kepler 方程式の $f(E) = E - e \sin E - M$ の導関数 $f'(E)$ で、$\mathrm{d}E/\mathrm{d}M = 1/f'(E)$ は $M$ の変化に対する根の感度（絶対条件数）である。
+近点（$E = 0$）で最大値 $1/(1 - e)$、遠点（$E = \pi$）で最小値 $1/(1 + e)$ をとる。
+
+$E(M)$ の値は求根の結果なので、差分の基準値として $E(M)$ を `base` に渡せる。
+1 変数の一階導関数なので、作業領域を使わずスタックのメモリだけで計算する `FiniteDifference::derivative_into` を使う。
+1 点あたりの評価回数は中心差分で 2 回、前進差分で 1 回になる。
+
+次のセルは離心率 $e$ を入力として、1 周 $0 \le M \le 2\pi$ の 361 点で $\mathrm{d}E/\mathrm{d}M$ を中心差分と前進差分で求め、上の厳密な式と比べる。
+上の図は厳密な $\mathrm{d}E/\mathrm{d}M$（破線）と中心差分の値、下の図は二つの差分の相対誤差で、横軸の $M$ は二つの図で連動する。
+相対誤差がちょうど 0 になる点は対数軸に描けないので除き、その数を表に示す。
+
+```rust
+//| id: differentiate-kepler-anomaly
+//| ref: differentiate-kepler-anomaly
+//| title: 離心近点角の導関数 dE/dM と陰関数の微分
+//| run: reactive
+//| uses: [differentiate-kepler-model]
+//| crates: [scioxide-core, scioxide-differentiate]
+//| inputs:
+//|   eccentricity: {"type":"range","label":"離心率 e [-]","min":0,"max":0.99,"step":0.01,"value":0.6}
+//|   step: {"type":"select","label":"刻み","options":["相対（既定）","絶対"],"value":"相対（既定）"}
+//| cases:
+//|   - {"id":"absolute-step","label":"絶対刻み","description":"刻みが M によらなくなり、M = 2π の近点の中心差分の誤差が M = 0 と同じ 6×10⁻¹¹ 程度に下がる。","inputs":{"step":"絶対"}}
+//|   - {"id":"near-parabolic","label":"e = 0.99","description":"近点で dE/dM = 100 になり、導関数が M の幅 10⁻³ 程度で急に変わるので、相対刻みの中心差分の誤差は 10⁻⁴ の桁まで増える。","inputs":{"eccentricity":0.99}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"anomaly","path":"/rows/0/1","equals":2}
+//|       - {"artifact":"anomaly","path":"/rows/1/1","equals":1}
+//|       - {"artifact":"anomaly","path":"/rows/0/2","range":{"min":1e-10,"max":1e-8}}
+//|       - {"artifact":"anomaly","path":"/rows/0/3","approx":{"value":6.283185307179586,"atol":0.05}}
+//|       - {"artifact":"anomaly","path":"/rows/1/2","range":{"min":1e-9,"max":1e-6}}
+//|       - {"artifact":"anomaly","path":"/rows/0/4","approx":{"value":2.5,"rtol":1e-12}}
+//|   - case: absolute-step
+//|     expect:
+//|       - {"artifact":"anomaly","path":"/rows/0/2","range":{"min":1e-12,"max":1e-9}}
+//|       - {"artifact":"anomaly","path":"/rows/0/4","approx":{"value":2.5,"rtol":1e-12}}
+//|   - case: near-parabolic
+//|     expect:
+//|       - {"artifact":"anomaly","path":"/rows/0/4","approx":{"value":100,"rtol":1e-10}}
+//|       - {"artifact":"anomaly","path":"/rows/0/2","range":{"min":1e-5,"max":1e-3}}
+use scioxide_core::{ExecutionContext, ExtendedInterval, SciOxideError, RealScalar};
+use scioxide_differentiate::{DifferenceScheme, DifferenceStep, FiniteDifference};
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed3 = serde_json::json!({ "fractionDigits": 3 });
+let e = eccentricity;
+let grid: Vec<f64> = (0..=360)
+    .map(|k| 2.0 * std::f64::consts::PI * k as f64 / 360.0)
+    .collect();
+// 陰関数の微分による厳密な導関数 dE/dM = 1/(1 − e cos E)。
+let exact: Vec<f64> = grid
+    .iter()
+    .map(|&m| 1.0 / (1.0 - e * RealScalar::cos(eccentric_anomaly(e, m))))
+    .collect();
+// 絶対刻みの値は、|M| ≤ 1 での既定の刻みの係数 ε^(1/3) と ε^(1/2) にそろえる。
+let methods = [
+    ("中心差分", DifferenceScheme::Central, f64::EPSILON.cbrt()),
+    ("前進差分", DifferenceScheme::Forward, f64::EPSILON.sqrt()),
+];
+let (mut rows, mut errors, mut curve) = (Vec::new(), Vec::new(), Vec::new());
+for (name, scheme, c) in methods {
+    let mut method = FiniteDifference::default().with_scheme(scheme);
+    if step == "絶対" {
+        method = method.with_step(DifferenceStep::absolute(c).map_err(|e| e.to_string())?);
+    }
+    let (mut evaluations, mut worst, mut at, mut zeros) = (0, 0.0_f64, None, 0);
+    let mut points = Vec::new();
+    for (&m, &d) in grid.iter().zip(&exact) {
+        let mut slope = 0.0;
+        let f = |mean: f64| Ok::<f64, SciOxideError>(eccentric_anomaly(e, mean));
+        // 求根で得た E(M) を base に渡し、M での評価を省く。
+        let base = Some(eccentric_anomaly(e, m));
+        let scope = ExecutionContext::sequential();
+        let report = method
+            .derivative_into(f, m, ExtendedInterval::entire(), base, &mut slope, scope)
+            .map_err(|e| e.to_string())?;
+        if !report.output_available() {
+            return Err(format!(
+                "導関数が公開されなかった: {}",
+                report.termination()
+            ));
+        }
+        evaluations = evaluations.max(report.evaluations());
+        let relative = (slope - d).abs() / d;
+        if relative > worst {
+            (worst, at) = (relative, Some(m));
+        }
+        if relative > 0.0 {
+            points.push([m, relative]);
+        } else {
+            zeros += 1;
+        }
+        if scheme == DifferenceScheme::Central {
+            curve.push([m, slope]);
+        }
+    }
+    rows.push((name, evaluations, worst, at, exact[0], zeros));
+    errors.push(serde_json::json!({ "name": name, "points": points }));
+}
+let exact_curve: Vec<[f64; 2]> = grid.iter().zip(&exact).map(|(&m, &d)| [m, d]).collect();
+emit_chart!(serde_json::json!({
+    "kind": "line",
+    "dataZoom": true,
+    "tooltip": true,
+    "link": { "group": "kepler-mean-anomaly" },
+    "xLabel": "平均近点角 M [rad]",
+    "yLabel": "dE/dM [-]",
+    "series": [
+        {
+            "name": "厳密な式 1/(1 − e cos E)",
+            "points": exact_curve,
+            "style": { "lineType": "dashed" }
+        },
+        {
+            "name": "中心差分",
+            "points": curve,
+            "style": { "lineType": "dotted", "showSymbol": true }
+        }
+    ]
+}));
+emit_line_chart!(
+    &errors,
+    options = &serde_json::json!({
+        "link": { "group": "kepler-mean-anomaly" },
+        "xLabel": "平均近点角 M [rad]",
+        "yLabel": "dE/dM の相対誤差 [-]",
+        "yType": "log"
+    })
+);
+let columns = serde_json::json!([
+    { "key": "0", "label": "差分の公式" },
+    { "key": "1", "label": "1 点の評価回数 [回]", "type": "integer" },
+    { "key": "2", "label": "最大相対誤差 [-]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "最大となる M [rad]", "type": "number", "format": fixed3, "nullText": "なし" },
+    { "key": "4", "label": "近点の dE/dM = 1/(1 − e) [-]", "type": "number", "format": fixed3 },
+    { "key": "5", "label": "誤差 0 の点 [点]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "anomaly" })
+);
+```
+
+既定の $e = 0.6$ では、$\mathrm{d}E/\mathrm{d}M$ は近点の $2.5$ から遠点の $0.625$ まで 4 倍変わり、上の図で中心差分の点は厳密な式の破線に重なる。
+相対誤差の最大値は中心差分で $2.3 \times 10^{-9}$、前進差分で $6.1 \times 10^{-8}$ である。
+下の図で、中心差分の相対誤差は $M = 0$ の近点で $5.7 \times 10^{-11}$ なのに、同じ近点を表す $M = 2\pi$ では $2.3 \times 10^{-9}$ と約 40 倍になる。
+既定の刻みは $h = \varepsilon^{1/3} \max(1, \lvert M \rvert)$ なので、$M = 2\pi$ では刻みが $2\pi$ 倍になり、$h^2$ に比例する打ち切り誤差は $(2\pi)^2 \approx 39$ 倍になる。
+前進差分の相対誤差は近点と遠点（$M = 0$、$\pi$、$2\pi$）で最大値より 1 桁以上小さい。
+$M_0 = 0, \pi, 2\pi$ の周りでは $E(M_0 + \delta) - E(M_0) = -\{E(M_0 - \delta) - E(M_0)\}$ と奇関数になるので $E''(M_0) = 0$ で、前進差分の主な打ち切り誤差 $h E''/2$ が消えるからである。
+
+刻みを絶対刻み（中心差分は $\varepsilon^{1/3}$、前進差分は $\varepsilon^{1/2}$）にすると、$M = 2\pi$ の中心差分の誤差は $5.9 \times 10^{-11}$ と $M = 0$ と同じ大きさに下がり、最大値は $1.1 \times 10^{-10}$ になる。
+角度のように原点の取り方に意味のない座標では、相対刻みの $\max(1, \lvert x_i \rvert)$ が誤差を座標の値に依存させるので、絶対刻み `DifferenceStep::absolute` を選ぶ。
+$e = 0.99$ では近点の $\mathrm{d}E/\mathrm{d}M$ が 100 になり、導関数が $M$ の幅 $10^{-3}$ 程度で急に変わるので、相対刻みでは中心差分の誤差が $M = 2\pi$ で $2.4 \times 10^{-4}$ まで増える。
+どの場合も、誤差は陰関数の微分による厳密な式との差で測っている。
+
+## まとめ
+
+手法オブジェクトと作業領域を一度だけ用意して `gradient_into` を繰り返せば、時間発展の各段で勾配を、作業領域を確保し直さずに求められる。
+エネルギーの監視のために計算する位置エネルギーを `base` に渡すと、1 段の評価が 1 回減る。
+速度 Verlet 法のエネルギーの誤差は時間刻みの $O(\Delta t^2)$ で決まり、既定の刻みの差分の力の偏りはそれよりずっと小さいので、エネルギーの保存からは差分の公式の違いは見えない。
+差分の偏りは解析的な力の軌道との差と角運動量の誤差に現れ、前進差分は中心差分より 3 桁ほど大きくずれる。
+1 変数の導関数を繰り返し求めるなら、作業領域の要らない `derivative_into` で足り、陰的に決まる $E(M)$ の導関数も陰関数の微分で検算できる。
+
+## 次に読むページ
+
+- [Plan・要件・作業領域の再利用](../../algorithms/plans-workspaces-and-reports/)：作業領域の要件、事前確保、使い回しの条件と、作業領域を使わない `derivative_into` の位置づけを確かめる。
+- [評価回数の上限・レポート・結果の出力への反映](../../algorithms/budgets-reports-and-publication/)：力の評価に評価回数の上限を付けたときのレポートと、結果を出力に反映する規則を確かめる。
+- [Kepler 方程式と離心率](../../../scioxide-rootfind/examples/kepler-equation/)：この例題で使った $E(M)$ を六つの求根法で求め、評価回数と残差を比べる。
+- [数値微分の例題](../)：ほかの例題の題材と検算の方法を一覧で確かめる。

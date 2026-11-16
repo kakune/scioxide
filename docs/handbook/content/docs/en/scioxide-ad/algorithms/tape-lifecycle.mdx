@@ -1,0 +1,731 @@
+---
+title: "Tape lifecycle and reuse"
+description: "Examine Tape::default() and TapeOptions defaults, byte limits on retained storage, counting insufficient capacity, growing and rerecording deterministically, one-shot execution counts, preallocation with requirements, TapeRequirements, try_reserve, check and reserved_bytes, storage after growth for different recordings, allocation-free reuse, TapeReport, error classification and failed outputs, threads and Linearization borrowing."
+sidebar:
+  order: 320
+references:
+  ad-tape-options: "tape-settings"
+  ad-tape-capacity: "insufficient-capacity-and-second-recordings"
+  ad-tape-requirements: "checking-requirements-and-preallocating"
+  ad-tape-report: "transform-reports"
+  ad-tape-errors: "failure-classification-and-outputs"
+  ad-tape-threads: "threads-and-borrowing"
+---
+
+`Tape` is caller-owned recording storage holding one recording at a time.
+When differentiating the same function at many points, reusing one tape lets subsequent transforms avoid allocation and execute the function only once.
+This page explains tape settings, insufficient-capacity procedures, checking requirements and preallocating, transform reports, error classification and failed outputs, and thread and borrowing rules.
+[Reverse mode and tapes](../reverse-mode-and-replay/) covered statement-recording rules and reverse sweeps.
+See [Workspaces and reproducibility](../../../concepts/workspaces-and-reproducibility/) for the general procedure for checking and growing workspace capacity.
+
+## Tape settings
+
+`TapeOptions` determines tape-transform behavior and is fixed on the tape with `Tape::new(options)`.
+`Tape::default()` is equivalent to `Tape::new(TapeOptions::new())` and creates a tape with the defaults below.
+`TapeOptions::new()` and `TapeOptions::default()` return these defaults; change them individually with `with_*` methods.
+
+| Setting | Default | Setter | Determines |
+|---|---|---|---|
+| Nonfinite policy | `NonFinitePolicy::Propagate` | `with_non_finite_policy` | Whether to propagate nonfinite points and results or reject them with `NonFinite` |
+| Kink policy | `KinkPolicy::Midpoint` | `with_kink_policy` | Whether to use the midpoint of one-sided derivatives or return `DomainError` at kinks |
+| Jacobian direction | `JacobianMode::Auto` | `with_jacobian_mode` | Sweep direction for `jacobian_into` |
+| Byte limit | `None` (unlimited) | `with_byte_limit` | Limit on retained tape bytes `reserved_bytes()` |
+
+`with_byte_limit` takes `Option<usize>`; `None` removes the limit.
+Getters with the same names (`non_finite_policy()`, `kink_policy()`, `jacobian_mode()`, `byte_limit()`) return the values; `Tape::options()` returns tape settings.
+Tape settings cannot change after creation; create another tape for different settings.
+[Handling kinks and nonfinite values](../nonsmooth-and-nonfinite-policies/) covers the policies' mathematical meaning; [Reverse mode and tapes](../reverse-mode-and-replay/) covers Jacobian direction.
+
+## Insufficient capacity and second recordings
+
+A tape stores words, partial-derivative arrays, per-word adjoints, call tables and workspace, and variable storage as ordinary vectors.
+Recording writes into existing capacity and does not grow tape storage during the recording.
+Statements exceeding capacity are not saved, but word and partial-derivative counts continue.
+Before recording, a transform grows input/output variable storage to the input count plus the previous recording's output count (1 for the first recording).
+When a recording exceeds capacity, the transform follows these steps.
+
+1. Execute the function once, counting required words, partial derivatives, calls and workspace.
+2. Check that the bytes retained after growing each storage area to the counted size fit the byte limit and the word count fits its limit; grow each area to exactly that size.
+3. Execute the function again, recording into the expanded storage.
+
+Thus, a function executes up to twice per transform; `TapeReport::recorded_twice` indicates whether it recorded twice.
+A new tape without preallocation has no capacity, so its first transform always records twice.
+One-shot `grad`, `value_and_grad`, `vjp`, `jacobian` and `hvp` create new tapes on every call, executing the function twice each time; `hessian` records each direction on the same tape and executes $n + 1$ times for $n$ inputs.
+The second execution is assumed to record the same statements as the first, so the function must be deterministic.
+If the second execution still exceeds expanded capacity, the transform returns `InvalidInput` (argument `function`, reason `Inconsistent`).
+If the function returns `Err` during the first execution that exceeds capacity, the error propagates unchanged without executing the function again.
+A smaller second recording is not detected; do not pass functions whose recordings depend on changing state such as execution counts, time or a random sequence advancing on each call.
+
+Tapes do not shrink.
+Each storage area grows to exactly the maximum size required by prior recordings, and smaller recordings fit without changes.
+Consequently, a tape grown several times for different recording sizes retains the same byte count as a new tape recording only the largest of those recordings (verified in the next cell).
+Transforms on a tape that has recorded the same function do not allocate.
+Exceptions are structured operations allocating workspace (`solve_into`, `cholesky_into`, `qr_into`, `least_squares_into`, `implicit_solution_into`, `checkpointed_loop`), `Var::external` allocating evaluation workspace (on the first recording for differentiated inputs, on every call for passive inputs), and `Linearization::jacobian_into` allocating one matrix of workspace on its first call.
+
+Tape size has two limits.
+The `with_byte_limit` limit applies to retained bytes returned by `reserved_bytes()`.
+Whenever a tape grows storage (recording storage, variable storage, second-derivative seeds or intermediate `jacobian_into` results), it compares the resulting byte count to the limit; exceeding it returns `ResourceLimit` for quantity `tape_bytes` without growing.
+A tape denied growth retains its previous storage, so `reserved_bytes()` after the transform does not exceed the limit.
+The exception is when a function pushes more outputs into the output vector than the tape preallocated, causing the vector to grow itself.
+Even without a byte limit, word count is limited to $2^{28} = 268{,}435{,}456$ words; exceeding this returns `ResourceLimit` for quantity `tape_words`.
+Byte-count overflow in `usize` returns `SizeOverflow`; allocation failure while growing storage returns `AllocationFailure`.
+In every case the tape remains valid and usable for the next transform.
+
+## Checking requirements and preallocating
+
+`Tape::requirements()` returns requirements `TapeRequirements` of the last completed recording.
+Requirements consist of six counts, readable through accessors with the same names.
+
+| Accessor | Counted quantity |
+|---|---|
+| `words()` | Words, including constant and input words |
+| `partials()` | Partial derivatives stored with value type `V` |
+| `scalars()` | Constant partial derivatives stored with scalar `S` |
+| `calls()` | Call-table entries |
+| `scratch()` | Call-workspace values: the largest input-plus-output count among `Var::external`, `solve_into` and `checkpointed_loop` calls. The tape retains an additional twice this storage for sweeps |
+| `variables()` | Variables: the input count plus output count |
+
+`TapeRequirements::new(words, partials, scalars, calls, scratch, variables)` constructs requirements from these six counts.
+`Tape::try_reserve(&requirements)` grows each tape storage area to exactly the size satisfying the requirements.
+It returns `ResourceLimit` if the resulting byte count exceeds the byte limit or word count exceeds $2^{28}$, and `AllocationFailure` on allocation failure; the tape remains usable after failure.
+`Tape::check(&requirements)` does not allocate; it returns `Capacity::Sufficient` if retained capacity suffices and `Capacity::NeedsGrowth` if growth is required.
+After a completed recording, `check(&tape.requirements())` returns `Sufficient`.
+`check` also returns `ResourceLimit` if growing to the requirements would exceed the byte limit.
+`Tape::reserved_bytes()` returns the tape's current retained byte count.
+
+Copy requirements from a tape after recording, or derive them by counting the recording rules.
+Growing the tape with `try_reserve` before an allocation-free loop makes the function execute once starting with the first transform.
+Requirements include call workspace `scratch()`; even for functions containing `Var::external` or `solve_into`, another tape preallocated from the recorded tape's `requirements()` executes the function once from its first transform.
+
+The cells on this page differentiate the same extended Rosenbrock function as [Reverse mode and tapes](../reverse-mode-and-replay/) using a tape:
+
+$$
+f(\mathbf{x}) = \sum_{i=1}^{n-1} \Bigl[100\,(x_{i+1} - x_i^2)^2 + (1 - x_i)^2\Bigr]
+$$
+
+
+The next block's `rosenbrock` writes this $f$ for `R: Real` and is shared by three cells.
+
+```rust
+//| id: ad-tape-rosenbrock-model
+//| kind: definitions
+//| title: "Extended Rosenbrock function"
+//| crates: [scioxide-ad]
+use scioxide_ad::Real;
+
+/// Extended Rosenbrock function f(x) = Σᵢ [100 (xᵢ₊₁ − xᵢ²)² + (1 − xᵢ)²].
+pub(crate) fn rosenbrock<R: Real>(x: &[R]) -> R {
+    x.windows(2)
+        .map(|w| {
+            let a = w[1] - w[0] * w[0];
+            let b = -w[0] + 1.0;
+            a * a * 100.0 + b * b
+        })
+        .sum()
+}
+```
+
+The next cell computes the gradient of this function six times with one tape.
+The input is dimension $n$ (2–128); only the fifth call uses a $2n$-dimensional point, and the point changes on every call.
+Requirements derived from recording rules are $9n - 8$ words, $6(n - 1)$ value partial derivatives (two for each of three products per term), $n - 1$ constant partial derivatives (multiplication by 100 per term), 0 calls, 0 call workspace and $n + 1$ variables.
+For each call, the first table shows the pre-execution `check` result for these predicted requirements, function execution count, `recorded_twice()`, `words()` and `reserved_bytes()`.
+The last two rows show another tape preallocated with `try_reserve` using predicted requirements, and a new tape recording only the same $2n$-dimensional point as the fifth call.
+The second table compares `requirements()` of the sixth recording with predictions.
+Verify that function execution counts and `check` results follow the capacity procedure and that requirements match predictions.
+
+```rust
+//| id: ad-tape-reuse-requirements
+//| ref: ad-tape-reuse-requirements
+//| title: "Compute gradients at many points with one tape and read requirements and capacity"
+//| run: reactive
+//| crates: [scioxide-ad, scioxide-core]
+//| uses: [ad-tape-rosenbrock-model]
+//| inputs:
+//|   dimension: {"type":"range","label":"Input dimension n","description":"Number of variables in the extended Rosenbrock function. Only the fifth call uses dimension 2n.","min":2,"max":128,"step":1,"value":16}
+//| cases:
+//|   - {"id":"two","label":"n = 2","description":"One term, with 10 words; the fifth call uses 28 words.","inputs":{"dimension":2}}
+//|   - {"id":"large","label":"n = 100","description":"892 words; the fifth call uses 1,792 words.","inputs":{"dimension":100}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"calls","path":"/rows/0/2","equals":"NeedsGrowth"}
+//|       - {"artifact":"calls","path":"/rows/0/3","equals":2}
+//|       - {"artifact":"calls","path":"/rows/0/4","equals":"true"}
+//|       - {"artifact":"calls","path":"/rows/1/2","equals":"Sufficient"}
+//|       - {"artifact":"calls","path":"/rows/1/3","equals":1}
+//|       - {"artifact":"calls","path":"/rows/1/4","equals":"false"}
+//|       - {"artifact":"calls","path":"/rows/4/2","equals":"NeedsGrowth"}
+//|       - {"artifact":"calls","path":"/rows/4/3","equals":2}
+//|       - {"artifact":"calls","path":"/rows/4/5","equals":280}
+//|       - {"artifact":"calls","path":"/rows/5/2","equals":"Sufficient"}
+//|       - {"artifact":"calls","path":"/rows/5/3","equals":1}
+//|       - {"artifact":"calls","path":"/rows/5/5","equals":136}
+//|       - {"artifact":"calls","path":"/rows/6/2","equals":"Sufficient"}
+//|       - {"artifact":"calls","path":"/rows/6/3","equals":1}
+//|       - {"artifact":"calls","path":"/rows/7/2","equals":"NeedsGrowth"}
+//|       - {"artifact":"calls","path":"/rows/7/3","equals":2}
+//|       - {"artifact":"calls","path":"/rows/7/5","equals":280}
+//|       - {"artifact":"requirements","path":"/rows/0/1","equals":136}
+//|       - {"artifact":"requirements","path":"/rows/1/1","equals":90}
+//|       - {"artifact":"requirements","path":"/rows/2/1","equals":15}
+//|       - {"artifact":"requirements","path":"/rows/4/1","equals":0}
+//|       - {"artifact":"requirements","path":"/rows/5/1","equals":17}
+//|   - case: two
+//|     expect:
+//|       - {"artifact":"calls","path":"/rows/0/5","equals":10}
+//|       - {"artifact":"calls","path":"/rows/4/5","equals":28}
+//|       - {"artifact":"requirements","path":"/rows/1/1","equals":6}
+//|       - {"artifact":"requirements","path":"/rows/1/2","equals":6}
+//|   - case: large
+//|     expect:
+//|       - {"artifact":"calls","path":"/rows/4/5","equals":1792}
+//|       - {"artifact":"calls","path":"/rows/5/3","equals":1}
+//|       - {"artifact":"requirements","path":"/rows/0/1","equals":892}
+use core::cell::Cell;
+
+use scioxide_ad::{Tape, TapeRequirements};
+use scioxide_core::{Capacity, ExecutionContext, SciOxideError};
+
+/// Requirements counted from recording rules (words, value partial derivatives, constant partial derivatives, calls, call workspace, variables).
+fn predicted(n: usize) -> TapeRequirements {
+    TapeRequirements::new(9 * n - 8, 6 * (n - 1), n - 1, 0, 0, n + 1)
+}
+
+type Row = (
+    &'static str,
+    usize,
+    &'static str,
+    usize,
+    &'static str,
+    usize,
+    usize,
+);
+
+/// Compute one gradient at an n-dimensional point and form a row from the pre-execution check and transform report.
+fn differentiate(
+    tape: &mut Tape<f64>,
+    label: &'static str,
+    n: usize,
+    shift: usize,
+) -> Result<Row, SciOxideError> {
+    let point: Vec<f64> = (0..n)
+        .map(|i| 0.5 + 0.1 * ((i + shift) % 7) as f64)
+        .collect();
+    let before = match tape.check(&predicted(n))? {
+        Capacity::Sufficient => "Sufficient",
+        Capacity::NeedsGrowth => "NeedsGrowth",
+    };
+    let runs = Cell::new(0_usize);
+    let mut gradient = vec![0.0; n];
+    tape.gradient_into(
+        |x| {
+            runs.set(runs.get() + 1);
+            Ok(rosenbrock(x))
+        },
+        &point,
+        &mut gradient,
+        ExecutionContext::sequential(),
+    )?;
+    let report = tape.report();
+    let twice = if report.recorded_twice() {
+        "true"
+    } else {
+        "false"
+    };
+    Ok((
+        label,
+        n,
+        before,
+        runs.get(),
+        twice,
+        report.words(),
+        report.reserved_bytes(),
+    ))
+}
+
+let n = dimension as usize;
+let mut tape = Tape::<f64>::default();
+let mut rows = Vec::new();
+// Four points of the same dimension, one 2n-dimensional point, then one point of the original dimension.
+let calls = [
+    ("First call", n),
+    ("Second call", n),
+    ("Third call", n),
+    ("Fourth call", n),
+    ("Fifth call (2n)", 2 * n),
+    ("Sixth call", n),
+];
+for (shift, &(label, dim)) in calls.iter().enumerate() {
+    let row = differentiate(&mut tape, label, dim, shift).map_err(|e| e.to_string())?;
+    rows.push(row);
+}
+let last = tape.requirements();
+// Another tape preallocated using predicted requirements.
+let mut reserved = Tape::<f64>::default();
+reserved
+    .try_reserve(&predicted(n))
+    .map_err(|e| e.to_string())?;
+let row =
+    differentiate(&mut reserved, "Another preallocated tape", n, 0).map_err(|e| e.to_string())?;
+rows.push(row);
+// Comparison: a new tape recording only the same 2n-dimensional point as the fifth call.
+let mut fresh = Tape::<f64>::default();
+let row =
+    differentiate(&mut fresh, "New 2n-dimensional tape", 2 * n, 4).map_err(|e| e.to_string())?;
+rows.push(row);
+
+let columns = serde_json::json!([
+    { "key": "0", "label": "Call" },
+    { "key": "1", "label": "Dimension", "type": "integer" },
+    { "key": "2", "label": "Pre-execution check" },
+    { "key": "3", "label": "Function executions", "type": "integer" },
+    { "key": "4", "label": "recorded_twice()" },
+    { "key": "5", "label": "words() [words]", "type": "integer" },
+    { "key": "6", "label": "reserved_bytes() [B]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "calls", "title": "Capacity and report per call" })
+);
+let expected = predicted(n);
+let breakdown = vec![
+    ("words()", last.words(), expected.words()),
+    ("partials()", last.partials(), expected.partials()),
+    ("scalars()", last.scalars(), expected.scalars()),
+    ("calls()", last.calls(), expected.calls()),
+    ("scratch()", last.scratch(), expected.scratch()),
+    ("variables()", last.variables(), expected.variables()),
+];
+let columns = serde_json::json!([
+    { "key": "0", "label": "Accessor" },
+    { "key": "1", "label": "Sixth recording", "type": "integer" },
+    { "key": "2", "label": "Prediction from recording rules", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    breakdown,
+    metadata = serde_json::json!({ "id": "requirements", "title": "Last recording requirements" })
+);
+```
+
+With the default $n = 16$, `check` before the first call returns `NeedsGrowth`; the transform executes the function twice and `recorded_twice()` becomes `true`.
+On calls 2–4, `check` returns `Sufficient`, the function executes once, and word count and retained bytes remain at 136 and 3,764 B.
+The fifth call's 32-dimensional point requires 280 words, so the tape records twice again and grows to 7,668 B.
+Returning to 16 dimensions on the sixth call returns the word count to 136, but retained bytes stay at 7,668 B; the tape does not shrink.
+The other tape preallocated with predicted requirements executes the function once from the first transform and retains 3,764 B, matching the first call on the first tape.
+In the second table, the six counts in `requirements()` match predictions from the recording rules.
+
+The fifth call's 7,668 B matches the new tape recording only the same 32-dimensional point (last row).
+Each growth sets each storage area to exactly the larger of its prior capacity and the counted recording size, leaving no extra storage after regrowth.
+Recording the extended Rosenbrock function on the same tape while increasing dimension one at a time from 2 to 16 grows the tape and executes the function twice each time; final retained bytes are 3,764 B, matching a new 16-dimensional tape.
+One tape can be reused even when each recording grows, but each increase causes allocation and a second function execution.
+To avoid this, call `try_reserve` beforehand with the largest recording's requirements.
+A tape preallocated for 16 dimensions never grows during recordings from 2 through 16 dimensions, remaining at 3,764 B.
+
+At $n = 2$, the recording has one term and 10 words; the fifth call has 28 words.
+At $n = 100$, the recording has 892 words and the fifth call has 1,792 words; at both dimensions, function execution counts and `check` results follow the default sequence.
+Retained bytes depend on `usize` width and `Var` size; the figures above are for Wasm.
+On 64-bit native platforms, the default figures are 4,036 B and 8,196 B.
+
+## Transform reports
+
+`Tape::report()` returns the last transform's report `TapeReport`.
+
+- `words()` is the last recording's word count, indicating memory use and the cost of one sweep.
+- `reserved_bytes()` is the byte count retained when the transform finished recording.
+- `kinks()` counts active arguments at kinks in the last recording, once per operation and lane ([Handling kinks and nonfinite values](../nonsmooth-and-nonfinite-policies/)).
+- `recorded_twice()` reports whether the function recorded twice to grow the tape.
+
+If `recorded_twice()` becomes true on a reused tape, that point's recording exceeded capacity and the tape allocated.
+Functions whose branches or iteration counts vary by point also have point-dependent recording sizes.
+To avoid allocation inside a loop, call `try_reserve` beforehand with the largest recording's requirements.
+
+## Failure classification and outputs
+
+Recordings with `gradient_into` and `linearize` return the following errors.
+[Reverse mode and tapes](../reverse-mode-and-replay/) lists errors returned by `Linearization` products.
+
+| Classification `kind()` | Condition | Details available through `view()` |
+|---|---|---|
+| `DimensionMismatch` | `gradient` length differs from `point` | Expected and actual lengths |
+| Function error | Function returned `Err` | Unchanged from the function |
+| `NonFinite` | Under `NonFinitePolicy::Error`, a nonfinite point (before recording), or a nonfinite value or derivative (before writing) | Source `Input` or `Output` |
+| `DomainError` | Under `KinkPolicy::Error`, an active argument is at a kink | Argument `point`, reason `Undefined` |
+| `InvalidInput` | Second execution exceeds expanded capacity, or an operation mixes values from two recordings | Argument `function`, reason `Inconsistent` |
+| `ResourceLimit` | Resulting retained bytes exceed the byte limit, or word count exceeds $2^{28}$ | Quantity `tape_bytes` or `tape_words`, requirement (resulting retained bytes or words), limit |
+| `SizeOverflow`, `AllocationFailure` | Byte-count overflow or inability to grow storage | Quantity |
+| `ExecutionStopped` | Context stopped by cancellation or deadline | Stop reason |
+
+Code mixing values from two recordings normally fails to compile because of `Var`'s lifetime bound.
+Transforms also check this at runtime: the mixed operation returns an undifferentiated NaN value and the transform fails with `InvalidInput`.
+
+Failed transforms leave outputs such as `gradient` unchanged.
+The tape remains usable after failure, and the next transform records normally.
+Transforms (such as `gradient_into` and `linearize`) check stop requests once at the API boundary; reverse and tangent sweeps check with `context.check()` before and after each sweep and every 1,024 traversed words (including argument words in multi-argument and call statements; [Reverse mode and tapes](../reverse-mode-and-replay/)).
+A transform stopped at the API boundary does not execute the function.
+`Linearization` products (`vjp_into`, `jvp_into`, `jacobian_into`, `sparse_jacobian_into`) also check at the API boundary and before each sweep; even products with fewer than 1,024 words and `jacobian_into` repeating sweeps per row or column observe stop requests before the next sweep.
+See [Error classification and detail views](../../../scioxide-core/algorithms/errors-and-diagnostic-views/) for general guidance on reading `kind()` and `view()`.
+
+Two cells examine error classification: settings, and recording and stopping procedures.
+The next block's `describe` turns a transform or product result into a table row (situation, `kind()`, argument or quantity, reason or source, required amount, limit, retained bytes after the transform, gradient output).
+The gradient output is filled with 7 before the transform; if all entries remain 7 afterward, it is labeled “Unchanged”.
+Reasons and sources are shown by the variant names returned by `view()`.
+
+```rust
+//| id: ad-tape-error-row
+//| kind: definitions
+//| title: "Turn transform results into table rows"
+//| crates: [scioxide-core]
+use scioxide_core::{
+    DomainReason, ExecutionStopReason, SciOxideError, SciOxideErrorKind, SciOxideErrorView,
+    InvalidInputReason, NonFiniteOrigin,
+};
+
+/// (Situation, kind(), argument or quantity, reason or source, required [B], limit [B], retained [B], gradient output).
+pub(crate) type Row = (
+    &'static str,
+    &'static str,
+    Option<&'static str>,
+    Option<&'static str>,
+    Option<usize>,
+    Option<usize>,
+    Option<usize>,
+    &'static str,
+);
+
+/// Turn a transform or product result into one row. Fill gradient with 7 before the transform.
+/// held is the retained tape byte count after the transform, or None when not shown.
+pub(crate) fn describe<T>(
+    situation: &'static str,
+    result: Result<T, SciOxideError>,
+    gradient: &[f64],
+    held: Option<usize>,
+) -> Row {
+    let output = if gradient.iter().all(|&g| g == 7.0) {
+        "Unchanged"
+    } else {
+        "Written"
+    };
+    let Err(error) = result else {
+        return (situation, "Ok", None, None, None, None, held, output);
+    };
+    let kind = match error.kind() {
+        SciOxideErrorKind::ResourceLimit => "ResourceLimit",
+        SciOxideErrorKind::NonFinite => "NonFinite",
+        SciOxideErrorKind::DomainError => "DomainError",
+        SciOxideErrorKind::InvalidInput => "InvalidInput",
+        SciOxideErrorKind::ExecutionStopped => "ExecutionStopped",
+        _ => "Other",
+    };
+    let (name, reason, required, limit) = match error.view() {
+        SciOxideErrorView::ResourceLimit {
+            resource,
+            required,
+            limit,
+        } => (Some(resource.as_str()), None, Some(required), Some(limit)),
+        SciOxideErrorView::NonFinite { origin, .. } => {
+            let origin = match origin {
+                NonFiniteOrigin::Input => "Input",
+                NonFiniteOrigin::Output => "Output",
+                _ => "Other",
+            };
+            (None, Some(origin), None, None)
+        }
+        SciOxideErrorView::DomainError {
+            argument, reason, ..
+        } => {
+            let reason = match reason {
+                DomainReason::Undefined => "Undefined",
+                _ => "Other",
+            };
+            (Some(argument.as_str()), Some(reason), None, None)
+        }
+        SciOxideErrorView::InvalidInput {
+            argument, reason, ..
+        } => {
+            let reason = match reason {
+                InvalidInputReason::Inconsistent => "Inconsistent",
+                _ => "Other",
+            };
+            (Some(argument.as_str()), Some(reason), None, None)
+        }
+        SciOxideErrorView::ExecutionStopped { reason } => {
+            let reason = match reason {
+                ExecutionStopReason::Cancelled => "Cancelled",
+                _ => "Other",
+            };
+            (None, Some(reason), None, None)
+        }
+        _ => (None, None, None, None),
+    };
+    (situation, kind, name, reason, required, limit, held, output)
+}
+```
+
+The next cell classifies four errors arising from `TapeOptions` settings.
+The input is byte limit $L$ (0–8,192 B); the first row records the 16-dimensional extended Rosenbrock function (136 words) on a tape limited to $L$, also showing retained tape bytes after the transform.
+Rows 2–4 use a NaN point and evaluate $\sqrt{x}$ at $x = 0$ under `NonFinitePolicy::Error`, and evaluate $|x|$ at $x = 0$ under `KinkPolicy::Error`.
+Required and retained bytes depend on `usize` width and `Var` size, so native and Wasm values differ.
+Verify that each row's classification and details match the table above, failed transforms leave gradients unchanged, and retained tape bytes never exceed the limit after success or failure.
+
+```rust
+//| id: ad-tape-option-errors
+//| ref: ad-tape-option-errors
+//| title: "Classify errors arising from tape settings"
+//| run: reactive
+//| crates: [scioxide-ad, scioxide-core]
+//| uses: [ad-tape-rosenbrock-model, ad-tape-error-row]
+//| inputs:
+//|   byte_limit: {"type":"range","label":"Byte limit L [B]","description":"Byte limit of the tape recording the 16-dimensional extended Rosenbrock function.","min":0,"max":8192,"step":128,"value":2048}
+//| cases:
+//|   - {"id":"roomy","label":"L = 4096 B","description":"Required recording bytes fit the limit and the gradient is written.","inputs":{"byte_limit":4096}}
+//|   - {"id":"tight","label":"L = 3712 B","description":"A limit just below the retained bytes of a successful recording rejects growth for recording.","inputs":{"byte_limit":3712}}
+//|   - {"id":"zero","label":"L = 0 B","description":"Growth is rejected while expanding variable storage before recording.","inputs":{"byte_limit":0}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"errors","path":"/rows/0/1","equals":"ResourceLimit"}
+//|       - {"artifact":"errors","path":"/rows/0/2","equals":"tape_bytes"}
+//|       - {"artifact":"errors","path":"/rows/0/4","range":{"min":2049}}
+//|       - {"artifact":"errors","path":"/rows/0/5","equals":2048}
+//|       - {"artifact":"errors","path":"/rows/0/6","range":{"min":1,"max":2048}}
+//|       - {"artifact":"errors","path":"/rows/0/7","equals":"Unchanged"}
+//|       - {"artifact":"errors","path":"/rows/1/1","equals":"NonFinite"}
+//|       - {"artifact":"errors","path":"/rows/1/3","equals":"Input"}
+//|       - {"artifact":"errors","path":"/rows/2/1","equals":"NonFinite"}
+//|       - {"artifact":"errors","path":"/rows/2/3","equals":"Output"}
+//|       - {"artifact":"errors","path":"/rows/2/7","equals":"Unchanged"}
+//|       - {"artifact":"errors","path":"/rows/3/1","equals":"DomainError"}
+//|       - {"artifact":"errors","path":"/rows/3/2","equals":"point"}
+//|       - {"artifact":"errors","path":"/rows/3/3","equals":"Undefined"}
+//|   - case: roomy
+//|     expect:
+//|       - {"artifact":"errors","path":"/rows/0/1","equals":"Ok"}
+//|       - {"artifact":"errors","path":"/rows/0/6","range":{"min":3713,"max":4096}}
+//|       - {"artifact":"errors","path":"/rows/0/7","equals":"Written"}
+//|   - case: tight
+//|     expect:
+//|       - {"artifact":"errors","path":"/rows/0/1","equals":"ResourceLimit"}
+//|       - {"artifact":"errors","path":"/rows/0/4","range":{"min":3713}}
+//|       - {"artifact":"errors","path":"/rows/0/6","range":{"min":1,"max":3712}}
+//|       - {"artifact":"errors","path":"/rows/0/7","equals":"Unchanged"}
+//|   - case: zero
+//|     expect:
+//|       - {"artifact":"errors","path":"/rows/0/1","equals":"ResourceLimit"}
+//|       - {"artifact":"errors","path":"/rows/0/5","equals":0}
+//|       - {"artifact":"errors","path":"/rows/0/6","equals":0}
+use scioxide_ad::{KinkPolicy, NonFinitePolicy, Real, Tape, TapeOptions};
+use scioxide_core::ExecutionContext;
+
+let cx = ExecutionContext::sequential();
+let point: Vec<f64> = (0..16).map(|i| 0.5 + 0.1 * (i % 7) as f64).collect();
+let mut rows = Vec::new();
+
+// Record a 16-dimensional function on a tape with byte limit L.
+let limited = TapeOptions::new().with_byte_limit(Some(byte_limit as usize));
+let mut tape = Tape::<f64>::new(limited);
+let mut g = vec![7.0; 16];
+let result = tape.gradient_into(|x| Ok(rosenbrock(x)), &point, &mut g, cx);
+// Even after failure, compare retained tape bytes with the limit.
+let held = Some(tape.reserved_bytes());
+rows.push(describe("Byte limit L", result, &g, held));
+
+// NonFinitePolicy::Error: a NaN point and the infinite derivative of √x at x = 0.
+let strict = TapeOptions::new().with_non_finite_policy(NonFinitePolicy::Error);
+let mut g = [7.0];
+let result =
+    Tape::<f64>::new(strict).gradient_into(|x| Ok(x[0] * 2.0), &[f64::NAN], &mut g, cx);
+rows.push(describe("NaN point", result, &g, None));
+let mut g = [7.0];
+let result = Tape::<f64>::new(strict).gradient_into(|x| Ok(x[0].sqrt()), &[0.0], &mut g, cx);
+rows.push(describe("√x at x = 0", result, &g, None));
+
+// KinkPolicy::Error: the kink of |x| at x = 0.
+let kinks = TapeOptions::new().with_kink_policy(KinkPolicy::Error);
+let mut g = [7.0];
+let result = Tape::<f64>::new(kinks).gradient_into(|x| Ok(x[0].abs()), &[0.0], &mut g, cx);
+rows.push(describe("|x| at x = 0", result, &g, None));
+
+let columns = serde_json::json!([
+    { "key": "0", "label": "Situation" },
+    { "key": "1", "label": "kind()" },
+    { "key": "2", "label": "Argument / quantity", "nullText": "None" },
+    { "key": "3", "label": "Reason / source", "nullText": "None" },
+    { "key": "4", "label": "Required [B]", "type": "integer", "nullText": "None" },
+    { "key": "5", "label": "Limit [B]", "type": "integer", "nullText": "None" },
+    { "key": "6", "label": "Retained [B]", "type": "integer", "nullText": "None" },
+    { "key": "7", "label": "Gradient output" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "errors", "title": "Errors from settings" })
+);
+```
+
+With the default $L = 2{,}048$ B, the first row returns `ResourceLimit` for quantity `tape_bytes`; the required amount is 3,764 B in Wasm (4,036 B on 64-bit native platforms).
+This is exactly the byte count retained by a successfully recorded tape (the retained amount in the $L = 4{,}096$ B row).
+Before recording, the transform grows variable storage to 17 entries for 16 inputs and one output (748 B in Wasm); growth to the size counted during the first recording is then rejected.
+Rejected growth leaves storage unchanged, so the tape retains 748 B (1,020 B natively) and the gradient remains 7.
+The NaN point is rejected before recording with `NonFinite` and source `Input`.
+At $x = 0$, $\sqrt{x}$ has finite value 0 but derivative $+\infty$, so it is rejected before writing with `NonFinite` and source `Output`.
+Evaluating $|x|$ at $x = 0$ gives `DomainError` with argument `point` and reason `Undefined`.
+At $L = 4{,}096$ B, requirements fit the limit; the first row also writes the gradient and the tape retains 3,764 B.
+$L = 3{,}712$ B is only 52 B below 3,764 B, but growth for recording is still rejected.
+The limit is compared with the exact retained byte count after growth, so this recording succeeds when $L \ge 3{,}764$ B ($L \ge 4{,}036$ B natively).
+At $L = 0$ B, growth of variable storage before recording is rejected; required bytes are 748 B (1,020 B natively) and retained bytes are 0.
+To choose a limit, record the same function at the largest point on an unlimited tape and use its `reserved_bytes()` as a guide.
+
+The next cell examines recording and stopping errors and tape reuse after failure.
+The first row uses a nondeterministic function adding one more nested $\sin$ per execution; the second computes the gradient of $\sin x$ on the same tape.
+The third row computes the gradient of an $n$-dimensional extended Rosenbrock function ($9n - 8$ words) with a context requesting a stop.
+The fourth linearizes the same function on the same tape with a context not requesting a stop, then passes a stopping context only to `vjp_into`.
+The fifth row uses a context without a stop request on the same tape.
+The input is dimension $n$ (2–256) for rows 3–5.
+The table shows situation, classification, argument or quantity, reason or source, and gradient output; required, limit and retained columns are omitted because they are empty for these five rows.
+Every extended Rosenbrock statement occupies one word, so reverse-sweep traversed words equal recorded words.
+Verify that the nondeterministic function gives `InvalidInput`, gradient transforms and linearization products stop at the API boundary independently of $n$, and the tape computes gradients normally after failure.
+
+```rust
+//| id: ad-tape-protocol-errors
+//| ref: ad-tape-protocol-errors
+//| title: "Examine nondeterministic functions and stop requests"
+//| run: reactive
+//| crates: [scioxide-ad, scioxide-core]
+//| uses: [ad-tape-rosenbrock-model, ad-tape-error-row]
+//| inputs:
+//|   dimension: {"type":"range","label":"Dimension n for rows 3–5","description":"Number of variables in the extended Rosenbrock function differentiated with a stopping context. The recording uses 9n − 8 words.","min":2,"max":256,"step":1,"value":200}
+//| cases:
+//|   - {"id":"short","label":"n = 2","description":"The recording has 10 words, so no sweep reaches 1,024 words. Both transforms and products stop at the API boundary.","inputs":{"dimension":2}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"errors","path":"/rows/0/1","equals":"InvalidInput"}
+//|       - {"artifact":"errors","path":"/rows/0/2","equals":"function"}
+//|       - {"artifact":"errors","path":"/rows/0/3","equals":"Inconsistent"}
+//|       - {"artifact":"errors","path":"/rows/0/4","equals":"Unchanged"}
+//|       - {"artifact":"errors","path":"/rows/1/1","equals":"Ok"}
+//|       - {"artifact":"errors","path":"/rows/1/4","equals":"Written"}
+//|       - {"artifact":"errors","path":"/rows/2/1","equals":"ExecutionStopped"}
+//|       - {"artifact":"errors","path":"/rows/2/3","equals":"Cancelled"}
+//|       - {"artifact":"errors","path":"/rows/2/4","equals":"Unchanged"}
+//|       - {"artifact":"errors","path":"/rows/3/1","equals":"ExecutionStopped"}
+//|       - {"artifact":"errors","path":"/rows/3/3","equals":"Cancelled"}
+//|       - {"artifact":"errors","path":"/rows/3/4","equals":"Unchanged"}
+//|       - {"artifact":"errors","path":"/rows/4/1","equals":"Ok"}
+//|       - {"artifact":"errors","path":"/rows/4/4","equals":"Written"}
+//|   - case: short
+//|     expect:
+//|       - {"artifact":"errors","path":"/rows/2/1","equals":"ExecutionStopped"}
+//|       - {"artifact":"errors","path":"/rows/2/4","equals":"Unchanged"}
+//|       - {"artifact":"errors","path":"/rows/3/1","equals":"ExecutionStopped"}
+//|       - {"artifact":"errors","path":"/rows/3/4","equals":"Unchanged"}
+//|       - {"artifact":"errors","path":"/rows/4/1","equals":"Ok"}
+use core::cell::Cell;
+
+use scioxide_ad::{Real, Tape};
+use scioxide_core::{CancellationToken, ExecutionContext};
+
+let cx = ExecutionContext::sequential();
+let mut rows = Vec::new();
+
+// A nondeterministic function adding one more nested sin per execution.
+let runs = Cell::new(0_usize);
+let mut tape = Tape::<f64>::default();
+let mut g = [7.0];
+let result = tape.gradient_into(
+    |x| {
+        runs.set(runs.get() + 1);
+        let mut y = x[0];
+        for _ in 0..runs.get() {
+            y = y.sin();
+        }
+        Ok(y)
+    },
+    &[0.5],
+    &mut g,
+    cx,
+);
+rows.push(describe("Nondeterministic function", result, &g, None));
+// The failed tape records the next function normally.
+let mut g = [7.0];
+let result = tape.gradient_into(|x| Ok(x[0].sin()), &[0.5], &mut g, cx);
+rows.push(describe("sin x on the same tape", result, &g, None));
+
+// A stopping context. Transforms and products check at the API boundary; sweeps check every 1,024 words.
+let token = CancellationToken::new();
+token.cancel();
+let stopped = ExecutionContext::sequential().with_cancellation(&token);
+let n = dimension as usize;
+let point: Vec<f64> = (0..n).map(|i| 0.5 + 0.1 * (i % 7) as f64).collect();
+let mut tape = Tape::<f64>::default();
+let mut g = vec![7.0; n];
+let result = tape.gradient_into(|x| Ok(rosenbrock(x)), &point, &mut g, stopped);
+rows.push(describe("Stop requested for gradient transform", result, &g, None));
+// Linearize with a context without a stop request; pass a stopping context only to the product's reverse sweep.
+let mut g = vec![7.0; n];
+let result = tape
+    .linearize(
+        |x, outputs| {
+            outputs.push(rosenbrock(x));
+            Ok(())
+        },
+        &point,
+        cx,
+    )
+    .and_then(|mut linear| linear.vjp_into(&[1.0], &mut g, stopped));
+rows.push(describe("Stop requested for linearization product", result, &g, None));
+let mut g = vec![7.0; n];
+let result = tape.gradient_into(|x| Ok(rosenbrock(x)), &point, &mut g, cx);
+rows.push(describe("Same tape without a stop request", result, &g, None));
+
+let columns = serde_json::json!([
+    { "key": "0", "label": "Situation" },
+    { "key": "1", "label": "kind()" },
+    { "key": "2", "label": "Argument / quantity", "nullText": "None" },
+    { "key": "3", "label": "Reason / source", "nullText": "None" },
+    { "key": "7", "label": "Gradient output" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "errors", "title": "Procedural errors and reuse" })
+);
+```
+
+The nondeterministic function grows the tape to the 3 words counted in the first execution (constant, input and one $\sin$), then attempts to record 4 words in the second execution, giving `InvalidInput` with argument `function` and reason `Inconsistent`.
+The same tape records the next $\sin x$ normally and writes gradient $\cos 0.5$.
+The third row's `gradient_into` checks stopping at the API boundary and returns `ExecutionStopped` (reason `Cancelled`) without executing the function, leaving the gradient unchanged for every $n$.
+The fourth row's `vjp_into` also checks stopping before the reverse sweep, returning `ExecutionStopped` and leaving the gradient unchanged.
+The fifth row computes the gradient normally on the same tape.
+Even at $n = 2$, with a 10-word recording, rows 3 and 4 stop at the API boundary.
+
+## Threads and borrowing
+
+`Tape` implements `Send` and `Sync` and can move to another thread.
+Transforms take `&mut self`, so only one thread can use a tape at a time.
+For parallel differentiation, give each thread its own tape and call `try_reserve` with identical requirements if needed.
+`Var` is neither `Send` nor `Sync`; the recorded function executes on the thread calling the transform.
+The recorder is constructed on the transform's stack; there is no thread-local or global state outside the tape.
+
+The `Linearization<'a, V>` returned by `linearize` mutably borrows the tape.
+While a linearization lives, no other transform can use that tape; release it (leave its scope) before recording another function.
+Products of one linearization (`vjp_into`, `jvp_into`, `jacobian_into`) also take `&mut self` and use the same recording sequentially.
+For parallel gradients of sums or means of many independent items, `BatchPlan` from [Batch evaluation of many items](../batches/) is preferable to splitting tapes manually.
+
+## Summary
+
+`Tape` fixes policies, Jacobian direction and byte limit with `TapeOptions`; settings remain fixed after creation (the byte limit bounds retained bytes `reserved_bytes()`).
+Insufficient-capacity recordings are counted, the tape grows and the function runs again; write deterministic functions and expect two executions in a new tape's first transform.
+Reuse tapes for differentiation at many points; before allocation-free regions or loops with growing recordings, call `try_reserve` with the largest recording's requirements (from `requirements()` or recording rules).
+If `TapeReport::recorded_twice()` becomes true inside a loop, the recording grew and allocation occurred.
+Failed transforms leave outputs unchanged and the tape usable; inspect the cause with `kind()` and `view()`, then retry on the same tape.
+Give each thread its own tape and finish using `Linearization` before recording the next function.
+
+## Further reading
+
+- [Reverse mode and tapes](../reverse-mode-and-replay/): examine statement-recording rules, reverse-sweep accuracy, `Linearization` products and Jacobian direction.
+- [Handling kinks and nonfinite values](../nonsmooth-and-nonfinite-policies/): examine the mathematical meanings of `KinkPolicy` and `NonFinitePolicy` and counting `kinks()`.
+- [Batch evaluation of many items](../batches/): examine differentiating sums or means of independent items with forward mode or tape reverse mode, obtaining identical results regardless of worker count.
+- [Workspaces and reproducibility](../../../concepts/workspaces-and-reproducibility/): examine the shared crate contracts for `Capacity`, `try_reserve` and `ResourceLimit`.

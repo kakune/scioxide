@@ -1,0 +1,283 @@
+---
+title: QMC 点列の位置・ランダム化・誤差の推定
+description: 点列の種類と使えるランダム化、カーソルの位置と区画への分割、位置の保存と再開、ランダム化の種類と不偏性、独立な反復による標準誤差、QMC 点の多変量正規分布と多項分布への輸送。
+sidebar:
+  order: 365
+references:
+  random-qmc-families-and-cursor: "点列の種類とカーソルの位置"
+  random-qmc-replicate-error: "ランダム化と反復による誤差の推定"
+  random-qmc-transport: "qmc-点の分布への輸送"
+---
+
+[Halton・Sobol 点列の構成とディスクレパンシー](../quasi-random-and-brownian-bridges/)で見た点列は、添字 $n$ だけで決まる決定論的な列である。
+実際の計算では、長い列を区画に分けて別々に作り、途中で保存して再開し、ランダム化した複数の列から誤差を推定する。
+このページは `scioxide-random` の点列の種類とカーソルの位置、ランダム化の種類と不偏性、独立な反復による標準誤差、QMC の点を分布の標本に写す方法を説明する。
+
+## 点列の種類とカーソルの位置
+
+`QmcPlan` は検査を済ませた不変の準備で、点列の数学的な族を `family()` が `QmcFamily` として返す。
+`QmcFamily` は `Sobol`、`Halton`、`ReverseHalton`、`NiederreiterBase2` の四つで、判別値 32〜35 は保存した状態の族の識別子になる。
+族は使えるランダム化を決め、組合せの検査はランダム化を選ぶ関数で行う。
+
+| 族 | シードを指定したの `QmcScramble` | 生成器から作る `QmcRandomization` | `with_permutations` |
+|---|---|---|---|
+| `Sobol`、`NiederreiterBase2` | `DigitalShift` | `LinearMatrixShift` | 使えない |
+| `Halton` | `DigitPermutation` | `RandomShift` | 使える |
+| `ReverseHalton` | なし | なし | 使えない |
+
+表にない組合せは `InvalidInput` で、`with_randomization` は生成器からワードを読む前にこれを検査する。
+新しいランダム化を選ぶと、前のランダム化は置き換わる。
+
+`plan.sequence::<S>()` は Plan を借用するカーソル `QmcSequence` を作り、出力の精度 `S`（`f32` か `f64`）はここで選ぶ。
+カーソルの位置は `position()` が返す `QmcPosition` で、`next_index()` は次に作る点の添字を返す。
+点列は添字 $0, \dots, 2^{64} - 1$ の $2^{64}$ 点を持ち、最後の点を作った後は終端に達して `next_index()` が `None` になる。
+終端でさらに点を求めると `InvalidInput`（`OutOfRange`）である。
+位置は出力の精度を含まないので、同じ位置から `f32` と `f64` のどちらのカーソルでも続きを作れる。
+
+`skip_to(index)` は任意の `u64` の添字へ移り、後退も許す。
+デジタル点列では添字の Gray 符号の 1 のビットに対応する方向数を排他的論理和で足して状態を作り直すので、計算量は座標ごとに 1 のビットの数（高々 64）に比例し、点列を先頭から再生しない。
+Halton 点列は状態として添字だけを持ち、点を作るときに添字を各基数で展開する。
+`skip(n)` は相対的に進み、最後の点のちょうど次まで進めると終端に入り、それを越える前進はエラーで状態を変えない。
+
+位置の保存には二つの形がある。
+`QmcSequence` は `SnapshotGenerator` を実装し、スナップショットは `QmcPosition` そのものなので、`points_into` に `SamplingPolicy::rollback` を渡せば失敗した一括生成の後に位置を戻せる。
+バイト列に残すときは `export_state` で Plan と位置を書き、`QmcPlan::import_state` で `QmcCheckpoint` に戻す。
+バイト列はリトルエンディアンで CRC-32C の検査値を持ち、Plan を定める入力（多項式と初期方向数、基数、利用者の桁置換、ランダム化のシードとワード）だけを記録する。
+方向数の表は読み込むときに作り直し、Plan は直接構築したときと同じ検査を受ける。
+切れたバイト列、検査値の不一致、不正な Plan は `InvalidInput`（`Malformed`）、未知の形式や族は `InvalidInput`（`UnsupportedConfiguration`）である。
+`QmcCheckpoint` は `plan()` と `position()` を持ち、`sequence::<S>()` で保存した位置から続きを作るカーソルを返す。
+
+一つの添字の範囲を複数のカーソルで分担するときは、呼び出し側が互いに交わらない区画 $[s_c, e_c)$ を決め、各カーソルを `skip_to(s_c)` で区画の先頭に置く。
+カーソルは Plan を共有して借用し、それぞれが自分の位置を持つので、別のスレッドで動かしてもよい。
+`point_into(index, out)` はカーソルを使わずに一つの添字の点を書く。
+どの方法でも点は添字だけで決まり、一つのカーソルで順に作った点とビット単位で一致するので、結果は実行の順序に依存しない。
+
+次のセルは $N$ 点を $C$ 個のカーソルで分担し、一つのカーソルで順に作った点と比べる。
+入力は族、次元 $d$、点数 $N$、カーソルの数 $C$ である。
+区画は後ろから作り、作る順序が結果に影響しないことを確かめる。
+一つ目の表は区画ごとの添字の範囲、終了後の `next_index()`、基準との最大の差を示す。
+二つ目の表は中央の位置で書き出したバイト列から再開した点列と、`point_into` で作った最後の点の差を示す。
+
+```rust
+//| id: random-qmc-cursor-ranges
+//| ref: random-qmc-cursor-ranges
+//| title: 点列を区画に分けたカーソルと保存した位置から同じ点を作る
+//| run: reactive
+//| crates: [scioxide-random]
+//| inputs:
+//|   family: {"type":"select","label":"点列の種類","options":["Sobol（DigitalShift）","Halton（DigitPermutation）","Niederreiter 基数 2","逆 Halton"],"value":"Sobol（DigitalShift）"}
+//|   dimension: {"type":"range","label":"次元 d [-]","min":1,"max":8,"step":1,"value":3}
+//|   points: {"type":"range","label":"点数 N [点]","min":64,"max":1024,"step":64,"value":256}
+//|   cursors: {"type":"range","label":"カーソルの数 C [個]","description":"N 点を ⌈N/C⌉ 点ずつの区画に分ける。","min":1,"max":8,"step":1,"value":3}
+//| cases:
+//|   - {"id":"halton-eight","label":"Halton、C = 8","description":"Halton でも区画ごとの点は順に作った点と一致する。","inputs":{"family":"Halton（DigitPermutation）","cursors":8,"dimension":5}}
+//|   - {"id":"reverse-halton","label":"逆 Halton、N = 1024","description":"ランダム化しない族でも分割と再開は同じ点を返す。","inputs":{"family":"逆 Halton","points":1024}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"ranges","path":"/rows/2/1","range":{"min":172,"max":172}}
+//|       - {"artifact":"ranges","path":"/rows/2/3","range":{"min":256,"max":256}}
+//|       - {"artifact":"ranges","path":"/rows/0/4","range":{"min":0,"max":0}}
+//|       - {"artifact":"ranges","path":"/rows/2/4","range":{"min":0,"max":0}}
+//|       - {"artifact":"resume","path":"/rows/0/2","range":{"min":0,"max":0}}
+//|       - {"artifact":"resume","path":"/rows/0/3","range":{"min":42,"max":42}}
+//|       - {"artifact":"resume","path":"/rows/1/2","range":{"min":0,"max":0}}
+//|   - case: halton-eight
+//|     expect:
+//|       - {"artifact":"ranges","path":"/rows/7/4","range":{"min":0,"max":0}}
+//|       - {"artifact":"resume","path":"/rows/0/2","range":{"min":0,"max":0}}
+//|   - case: reverse-halton
+//|     expect:
+//|       - {"artifact":"ranges","path":"/rows/2/3","range":{"min":1024,"max":1024}}
+//|       - {"artifact":"resume","path":"/rows/0/1","range":{"min":512,"max":512}}
+//|       - {"artifact":"resume","path":"/rows/1/2","range":{"min":0,"max":0}}
+use scioxide_random::{QmcPlan, QmcScramble, QuasiRng};
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let (d, n, c) = (
+    dimension.round() as usize,
+    points.round() as usize,
+    cursors.round() as usize,
+);
+let plan = match family.as_str() {
+    "Sobol（DigitalShift）" => {
+        QmcPlan::sobol(d).and_then(|plan| plan.with_scramble(QmcScramble::DigitalShift(11)))
+    }
+    "Halton（DigitPermutation）" => QmcPlan::halton(d)
+        .and_then(|plan| plan.with_scramble(QmcScramble::DigitPermutation(11))),
+    "Niederreiter 基数 2" => QmcPlan::niederreiter_base2(d),
+    _ => QmcPlan::reverse_halton(d),
+}
+.map_err(|e| e.to_string())?;
+// 基準: 一つのカーソルで添字 0..N の点を順に作る（行優先、N 行 d 列）。
+let reference = plan
+    .sequence::<f64>()
+    .map_err(|e| e.to_string())?
+    .points(n)
+    .map_err(|e| e.to_string())?;
+let largest_gap = |part: &[f64], start: usize| {
+    part.iter()
+        .zip(&reference[start * d..])
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0_f64, f64::max)
+};
+// C 個のカーソルに連続する区画 [start, end) を割り当て、後ろの区画から作る。
+let chunk = n.div_ceil(c);
+let mut rows = Vec::new();
+for index in (0..c).rev() {
+    let (start, end) = (index * chunk, ((index + 1) * chunk).min(n));
+    let mut cursor = plan.sequence::<f64>().map_err(|e| e.to_string())?;
+    cursor.skip_to(start as u64).map_err(|e| e.to_string())?;
+    let part = cursor.points(end - start).map_err(|e| e.to_string())?;
+    let next = cursor.position().next_index();
+    rows.push((index, start, end, next, largest_gap(&part, start)));
+}
+rows.reverse();
+// 中央の位置で Plan と位置をバイト列に書き、別のカーソルとして続きを作る。
+let mut first = plan.sequence::<f64>().map_err(|e| e.to_string())?;
+first.skip((n / 2) as u64).map_err(|e| e.to_string())?;
+let bytes = first.export_state().map_err(|e| e.to_string())?;
+let checkpoint = QmcPlan::import_state(&bytes).map_err(|e| e.to_string())?;
+let saved = checkpoint.position().next_index();
+let mut resumed = checkpoint.sequence::<f64>().map_err(|e| e.to_string())?;
+let tail = resumed.points(n - n / 2).map_err(|e| e.to_string())?;
+// カーソルを使わずに最後の添字の点を書く。
+let mut last = vec![0.0_f64; d];
+plan.point_into((n - 1) as u64, &mut last)
+    .map_err(|e| e.to_string())?;
+let checks = vec![
+    (
+        "書き出したバイト列からの再開".to_string(),
+        saved,
+        largest_gap(&tail, n / 2),
+        Some(bytes.len()),
+    ),
+    (
+        "point_into による最後の点".to_string(),
+        Some((n - 1) as u64),
+        largest_gap(&last, n - 1),
+        None,
+    ),
+];
+let range_columns = serde_json::json!([
+    { "key": "0", "label": "カーソル", "type": "integer" },
+    { "key": "1", "label": "先頭の添字", "type": "integer" },
+    { "key": "2", "label": "末尾の次の添字", "type": "integer" },
+    { "key": "3", "label": "終了後の next_index()", "type": "integer", "nullText": "終端" },
+    { "key": "4", "label": "基準との最大の差 [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    range_columns,
+    rows,
+    metadata = serde_json::json!({ "id": "ranges" })
+);
+let check_columns = serde_json::json!([
+    { "key": "0", "label": "確認" },
+    { "key": "1", "label": "開始の添字", "type": "integer", "nullText": "終端" },
+    { "key": "2", "label": "基準との最大の差 [-]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "バイト列の長さ [バイト]", "type": "integer", "nullText": "対象外" }
+]);
+emit_table_with_columns!(
+    check_columns,
+    checks,
+    metadata = serde_json::json!({ "id": "resume" })
+);
+```
+
+既定の入力（`DigitalShift` でランダム化した Sobol、$d = 3$、$N = 256$、$C = 3$）では、区画は $[0, 86)$、$[86, 172)$、$[172, 256)$ になる。
+どの区画も終了後の `next_index()` は区画の右端 $e_c$ に等しく、基準との最大の差は 0 である。
+中央の添字 128 で書き出したバイト列は 42 バイトで、そこから再開した 128 点と `point_into` で作った添字 255 の点も、基準との差は 0 である。
+Halton の 5 次元を 8 個のカーソルで分けても、ランダム化しない逆 Halton の 1,024 点でも、差はすべて 0 になる。
+差が 0 であることは、区画の分け方と作る順序が点の値に影響しないことを示す。
+
+## ランダム化と反復による誤差の推定
+
+決定論的な点列の誤差は Koksma–Hlawka の上界でしか評価できず、統計的な推定が得られない。
+点列をランダム化し、独立にランダム化した複数の列の推定値のばらつきから標準誤差を求める。
+ランダム化には二つの型がある。
+`with_scramble(QmcScramble)` はシードだけで決まるランダム化を選び、`with_randomization(QmcRandomization, rng)` は生成器から一様乱数ワードを読んでランダム化を準備する。
+二つは別の型なので、取り違えるとコンパイルできない。
+
+### ランダム化の種類と不偏性
+
+Halton の `RandomShift`（Cranley–Patterson）は、座標ごとに一様乱数 $\Delta_j$ を一つ引き、$y_{nj} = (x_{nj} + \Delta_j) \bmod 1$ とする。
+固定した $x$ について、$\Delta$ が $[0, 1)$ 上で一様なら $(x + \Delta) \bmod 1$ も一様である。
+したがって座標ごとに独立なずらしでは各点が $[0, 1)^d$ 上で一様に分布し、平均 $\frac{1}{N}\sum_n f(\mathbf{y}_n)$ は $\int f$ の不偏推定量になる。
+点の間の相対的な位置は変わらないので、点集合の構造は保たれる。
+
+デジタル点列の `LinearMatrixShift`（Matoušek）は、座標ごとに対角が 1 で対角より下が無作為な $64 \times 64$ の 2 値の下三角行列 $M_j$ とずらし $\boldsymbol{\Delta}_j$ を引き、二進の桁に $y = M_j x \oplus \Delta_j$ を施す。
+$M_j$ は正則なので net の性質を保ち、ずらしによって各点は一様に分布する。
+座標ごとに 65 ワード（64 行と 1 ワードのずらし）を読み、`randomization_words()` で読み出せ、状態のバイト列にも保存される。
+行列は準備のときに方向数へ一度だけ掛けるので（$O(64^2 d)$ のワードの演算）、点を作る計算コストはランダム化しない点列と同じである。
+
+シードを指定したの `DigitalShift(seed)` は座標ごとの 64 ビットの排他的論理和 $\mathbf{y}_n = \mathbf{x}_n \oplus \boldsymbol{\Delta}$ で、各座標のずらし $\Delta_j$ はシードと座標の番号から作る。
+定数との排他的論理和は基本区間を基本区間に写すので、net の性質を保つ。
+シードが一様に無作為なら各座標は丸めた有限の格子の上で一様に分布するが、$d$ 個のずらしは一つの 64 ビットのシードから作るので、座標の間で独立とは言えない。
+各座標の周辺分布が一様でも、点の同時分布が $[0, 1)^d$ 上で一様であることは示せないので、不偏な反復には `LinearMatrixShift` か `RandomShift` を使う。
+
+0 を動かさない桁置換（`DigitPermutation` と `with_permutations`）は Halton 点列の縞を崩すためのもので、点が一様に分布することも推定が不偏であることも保証しない。
+どのランダム化でも実際の座標は有限の格子に丸めた値で、不偏性の議論は連続な一様分布を仮定したモデルの上で成り立つ。
+`f64` の出力では格子の間隔が $2^{-53}$ 程度なので、この離散化の影響は通常の標準誤差よりはるかに小さい。
+
+状態のバイト列に記録するアルゴリズムのバージョンは、Halton のシードを指定したの桁置換が 2、それ以外のランダム化が 1 である。
+`QmcPlan::import_state` は バージョン がランダム化と合わないバイト列を、異なる点列を黙って返さずに `InvalidInput`（`UnsupportedConfiguration`）で拒否する。
+そのため同じシードでも、バージョン の異なる規約で作った点列どうしが一致することは前提にしない。
+
+### 独立な反復による標準誤差
+
+`QmcReplicatePlan::new(&base, &root, options)` は `Philox4x64` の根から、反復ごとに独立なランダム化を施した $R$ 個の Plan を作る。
+`base` のランダム化は置き換わり、デジタル点列には `LinearMatrixShift`、Halton には `RandomShift` を使う。
+逆 Halton は反復に使えず、`InvalidInput` になる。
+反復 $r$ の生成器は根から領域の番号 `0x51` と $r$ の 4 バイト（ビッグエンディアン）で `fork` した節点なので、反復の総数を変えても反復 $r$ のランダム化は同じで、根も進まない。
+`QmcReplicateOptions` は反復の数 $R$（2 以上、既定 8）、反復あたりの点数 $N$（正、既定 1,024）、反復の並べ方（既定は逐次）を持つ。
+デジタル点列では $N$ は 2 の冪でなければならず、先頭の $2^m$ 点が net になる性質を反復ごとに保つ。
+
+`estimate(f)` は各反復の先頭 $N$ 点で $f$ の平均 $I_r$ を求め、
+
+$$
+\bar{I} = \frac{1}{R} \sum_{r=1}^R I_r, \qquad \widehat{\mathrm{SE}} = \sqrt{\frac{1}{R(R-1)} \sum_{r=1}^R (I_r - \bar{I})^2}
+$$
+
+を `QmcReplicateEstimate`（`mean`、`standard_error`、`replicate_means`、`points_per_replicate`）として返す。
+$I_r$ は互いに独立な不偏推定量なので、$\widehat{\mathrm{SE}}$ は $\bar{I}$ の標準誤差の推定値であり、証明付きの限界ではない。
+$R$ が小さいと $\widehat{\mathrm{SE}}$ 自体も揺らぎ、$I_r$ が正規分布に従うときの相対的な標準偏差は約 $1/\sqrt{2(R-1)}$（$R = 8$ で約 27%）である。
+$f$ が NaN か無限大を返すと `NonFinite` で、$f$ のエラーはそのまま返り、一部の反復が終わっていても推定は返さない。
+`estimate` は呼び出したスレッドで動く。
+
+`estimate_scoped(f, scope)` は同じ推定を実行の範囲（`ExecutionContext` か、外側の求解の `SolveContext`）の一つの段として行う。
+最初に $f$ を呼ぶ前に $RN$ 回の評価を範囲に計上し、外側の求解の評価回数の上限が足りなければ $f$ を一度も呼ばずに `ConvergenceFailure` を返す。
+各評価の前に取り消しと期限を確かめ、反復は範囲のエグゼキューターで `QmcReplicateOptions::with_execution_policy` の並べ方に従って走るが、結果は実行の順序に依存しない。
+多次元の数値求積でランダム化した反復を使う方法は `scioxide-integrate` の[疎格子と乱択準 Monte Carlo](../../../scioxide-integrate/algorithms/sparse-grids-and-qmc/)で、標準誤差と解析解の照合は[モンテカルロ法と Sobol 準モンテカルロ積分の比較](../../examples/monte-carlo-vs-sobol/)で扱う。
+
+## QMC 点の分布への輸送
+
+一様な点を他の分布の標本に写すとき、棄却法や Box–Muller 法は点の順序と座標の対応を崩し、低食い違いの構造が失われる。
+逆関数法は座標ごとの単調な変換なので、層化された構造をそのまま移す。
+
+`QmcMultivariateNormal` は `MultivariateNormal` の分布を借用し、点 $\mathbf{u} \in (0, 1)^r$ の各座標を標準正規分布の分位点 $z_k = \Phi^{-1}(u_k)$ に写して、分布の分解で $\mathbf{x} = \boldsymbol{\mu} + V \Lambda^{1/2} \mathbf{z}$ を返す。
+$r$ は共分散の階数で、点列の次元は `input_dimension()` が返す $r$ に合わせる。
+一標本の計算コストは分位点の評価 $r$ 回と $O(dr)$ の演算で、階数 0 の分布は点を使わずに $\boldsymbol{\mu}$ を返す。
+ランダム化しない Sobol 点列の最初の点は原点で、正規分位点が無限大になる（`DomainError`）ので、`skip(1)` で除くかランダム化した Plan を使う。
+
+`QmcMultinomial` は試行数 $n$、確率 $p_1, \dots, p_K$ の `Multinomial` について、$[0, 1)$ を長さ $p_k / \sum_j p_j$ の連続した区分に分ける。
+一つの点 $\mathbf{u} \in [0, 1)^n$ の座標 $u_t$ が入る区分を試行 $t$ の結果とするので、点列の次元は試行数 $n$ で、計数の和はちょうど $n$ になる。
+`QmcMultinomial::new(&law)` は区分の境界を `f64` で準備し、正の確率の区分がないときや、正の確率の区分の長さが `f64` で 0 になるときは `InvalidInput` を返す。
+座標が 1 に等しいときも `InvalidInput` である。
+
+どちらも `sample(sequence)` は次の点から標本を一つ返し、`sample_n(sequence, n)` は $n$ 個を行ごとに並べた所有の `Vec` で返す。
+`sample_n_into(sequence, policy, output, workspace)` は `QmcTransportWorkspace` を再利用して呼び出し側の出力に書き、出力とカーソルの位置は `policy` の方針に従う。
+点列の次元や作業領域が合わなければ、点を使う前に `DimensionMismatch` を返す。
+
+## まとめ
+
+`QmcFamily` が使えるランダム化を決め、表にない組合せは `InvalidInput` になる。
+点は添字だけで決まるので、`skip_to` と `point_into` で区画を分担しても、`export_state` から再開しても、一つのカーソルで順に作った点とビット単位で一致する。
+誤差の推定には `LinearMatrixShift` か `RandomShift` で独立にランダム化した `QmcReplicatePlan` を使い、`DigitalShift` のシードは座標の間の独立を与えないので反復には使わない。
+反復の標準誤差は経験的な推定値で、$R$ が小さいとそれ自体が揺らぐので、反復の数を増やすか解析解のある関数で確かめる。
+QMC の点を正規分布や多項分布の標本にするときは逆関数法の輸送を使い、ランダム化しない点列の原点は除く。
+
+## 次に読むページ
+
+- [Brownian 橋による経路の構成](../brownian-bridge-construction/)：正規座標の割り当ての順序で、先頭の座標に経路の分散を集める方法を確かめる。
+- [モンテカルロ法と Sobol 準モンテカルロ積分の比較](../../examples/monte-carlo-vs-sobol/)：ランダム化した Sobol 点列の誤差と `QmcReplicatePlan` の標準誤差を例題で確かめる。
+- [準乱数と標本設計の API](../../api/quasi-random-and-designs/)：点列、ランダム化、カーソル、輸送の仕様を引く。

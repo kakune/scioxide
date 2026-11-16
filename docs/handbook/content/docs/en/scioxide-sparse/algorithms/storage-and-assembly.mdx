@@ -1,0 +1,588 @@
+---
+title: "Sparse storage formats and assembly"
+description: "COO, CSR, CSC, BSR, and DIA arrays and memory use; exact summation of duplicate contributions and explicit-zero policies with SparseBuilder; structure-preserving value updates, pruning, construction from blocks and diagonals, and degree-of-freedom numbering effects on block-storage memory."
+sidebar:
+  order: 305
+references:
+  sparse-block-assembly-experiment: "coupled-block-assembly"
+  sparse-block-construction: "construction-from-blocks-and-diagonals"
+  sparse-bsr: "bsr-block-sparse-row-format"
+  sparse-coo: "coo-coordinate-format"
+  sparse-csr-csc: "csr-compressed-sparse-row-and-csc-compressed-sparse-column"
+  sparse-duplicate-policy: "duplicate-policy"
+  sparse-explicit-zero-policy: "explicit-zero-policy"
+  sparse-format-costs: "memory-use-and-suitable-operations"
+  sparse-pruning: "pruning-small-entries"
+  sparse-triplet-assembly: "assembly-from-triplets"
+  sparse-value-updates: "structure-preserving-value-updates"
+---
+
+When an $m \times n$ matrix $\mathbf{A}$ has only $\mathrm{nnz} \ll mn$ potentially nonzero positions, storing only positions and values reduces memory use to $O(m + n + \mathrm{nnz})$.
+However, the position representation determines which operations are inexpensive.
+Finite-element assembly must accept unordered additions to the same position; iterative solvers repeatedly multiply with one structure, while direct methods traverse rows or columns.
+This page explains the arrays and memory use of five storage formats, rules for assembling canonical matrices from triplets, updating values while preserving a fixed structure, and construction from blocks and diagonals.
+
+Separation of structure and values and the distinction between implicit and explicitly stored zeros are collected in [shared specifications and organization of sparse algorithms](../).
+
+## Canonical form and five storage formats
+
+Define a matrix's **nonzero pattern** (structure) as the set $\mathcal{S}(\mathbf{A}) \subseteq \{0, \dots, m-1\} \times \{0, \dots, n-1\}$ of positions whose values are stored.
+Every `scioxide-sparse` storage format is **canonical**.
+Each position appears once, positions follow a fixed sorted order, and all stored values are finite.
+Canonical matrices with identical structure and values always have identical arrays, so structural equality can be decided by array comparison.
+This property underlies symbolic-analysis reuse and value-only updates described later.
+
+### COO (coordinate format)
+
+COO stores a triplet $(i_k, j_k, a_k)$ for each stored position.
+Coordinates in `CooMatrix` are lexicographically sorted in row-major order without duplicates.
+Unsorted assembly triplets belong to `SparseBuilder` described later, not `CooMatrix`.
+`row_indices()`, `col_indices()`, and `values()` return the three arrays; `iter()` returns $(i, j, a_{ij})$ in storage order.
+Create `CooMatrix` with `SparseBuilder::finish_coo` and convert with `to_csr` or `to_csc` in $O(m + n + \mathrm{nnz})$ work.
+
+### CSR (compressed sparse row) and CSC (compressed sparse column)
+
+CSR compresses COO row indices into a length-$m + 1$ array `row_ptr` marking row starts.
+Row $i$ occupies positions $k = \mathrm{row\_ptr}[i], \dots, \mathrm{row\_ptr}[i+1] - 1$, with columns `col_indices()[k]` and values `values()[k]`; column indices increase strictly within each row.
+For example,
+
+$$
+\mathbf{A} = \begin{pmatrix} 4 & 0 & 1 \\ 0 & 3 & 0 \\ 2 & 0 & 5 \end{pmatrix}
+$$
+
+is represented by $\mathrm{row\_ptr} = [0, 2, 3, 5]$, $\mathrm{col\_indices} = [0, 2, 1, 0, 2]$, and $\mathrm{values} = [4, 1, 3, 2, 5]$.
+With these three arrays alone, extracting row $i$ costs $O(1 + \text{entries in that row})$, but extracting column $j$ requires scanning every entry.
+CSC reverses the roles of rows and columns, storing `col_ptr()`, `row_indices()`, and `values()` for fast column extraction.
+
+`CsrMatrix` and `CscMatrix` also build and retain reverse-traversal indices when finalized.
+For CSR, these store row indices by column and map each to its position in `values()`.
+`opposite_traversal()` lends these indices as `SparseTraversalView` without allocation; its `pattern()` returns the column-wise structure and `positions()` the value positions.
+Thus CSR also supports allocation-free column traversal, transpose products, and adjoint products.
+For a value-free structural transpose, `transpose_pattern` returns `SparseTraversal` with the same position mapping ($O(m + n + \mathrm{nnz})$ by counting sort).
+
+### BSR (block sparse row format)
+
+BSR divides the matrix into small $r \times c$ blocks and stores every block containing any stored entry as a dense $r \times c$ array.
+It is CSR at block level: `row_ptr()` and `col_indices()` are block-row and block-column indices, and `values()` contains $r c$ values per block in row-major order.
+Zeros inside blocks are also stored as values.
+With $b$ stored blocks there are $b r c$ values; a **block fill ratio** $\mathrm{nnz} / (b r c)$ near 1 means less waste.
+For elasticity or multicomponent fluids with $r$ degrees of freedom per node, node-wise numbering makes $r \times r$ blocks nearly dense, reducing the index count from $\mathrm{nnz}$ (one per entry) to $b \approx \mathrm{nnz}/(rc)$ (one per block) and allowing dense block products.
+`BsrMatrix::from_sparse(view, r, c)` returns `InvalidInput` if $r$ or $c$ is zero or fails to divide the row or column count.
+
+### DIA (diagonal format)
+
+DIA stores a value array for each diagonal offset $d = j - i$.
+`offsets()` gives offsets in ascending order; `values()` concatenates $n$ column-aligned slots per offset, with entry $a_{ij}$ on the diagonal at offset index $k$ stored at `values()[k · n + j]`.
+Slots outside the matrix are padding and must contain zero.
+With $q$ diagonals, it stores $q n$ values and only $q$ indices.
+It suits nearly full diagonals, such as constant-coefficient difference stencils; sparsity within diagonals increases zero slots.
+
+### Memory use and suitable operations
+
+Compare retained array sizes for an $m \times n$ matrix with $\mathrm{nnz}$ entries ($b$ blocks for BSR and $q$ diagonals for DIA).
+
+| Format | Type | Integer arrays | Value arrays | Suitable operations |
+|---|---|---|---|---|
+| COO | `CooMatrix` | $2\,\mathrm{nnz}$, traversal indices $m + n + 2 + \mathrm{nnz}$ | $\mathrm{nnz}$ | Format conversion, entry enumeration |
+| CSR | `CsrMatrix` | $m + 1 + \mathrm{nnz}$, reverse indices $n + 1 + 2\,\mathrm{nnz}$ | $\mathrm{nnz}$ | Row traversal, matrix–vector products, factorization and preconditioner input |
+| CSC | `CscMatrix` | $n + 1 + \mathrm{nnz}$, reverse indices $m + 1 + 2\,\mathrm{nnz}$ | $\mathrm{nnz}$ | Column traversal, column-wise elimination |
+| BSR | `BsrMatrix` | $m/r + 1 + b$, reverse indices $n/c + 1 + 2b$ | $b r c$ | Multiple-degree-of-freedom systems with dense blocks |
+| DIA | `DiaMatrix` | $q$ | $q n$ | Constant-coefficient difference stencils |
+
+Create BSR and DIA from their own arrays using `from_raw`, or convert from other formats using `from_sparse`.
+Before conversion, `BsrMatrix::conversion_requirements` and `DiaMatrix::conversion_requirements` return resulting array sizes as `SparseStorageRequirements` (counts of pointer, index, value, and traversal-index elements).
+These queries build temporary lists to count occupied blocks or diagonals but allocate no value array, allowing oversized conversions to be rejected before allocating values.
+Every format's `view()` returns the common borrowed view `SparseView` without allocation; product and graph algorithms accept this view.
+`SparseView::iter()` returns stored entries as `SparseEntries` in storage order, including explicit zeros and zeros within BSR blocks but excluding DIA padding.
+
+## Assembly from triplets
+
+Finite-element assembly adds element $e$'s local matrix $\mathbf{A}^{(e)}$ into global degree-of-freedom indices to construct
+
+$$
+\mathbf{A} = \sum_{e} \mathbf{P}_e^{\mathsf{T}} \mathbf{A}^{(e)} \mathbf{P}_e
+$$
+
+as the assembled matrix.
+Here $\mathbf{P}_e$ is the 0–1 matrix mapping local element indices to global indices.
+Adjacent elements share nodes, so multiple contributions reach the same position $(i, j)$.
+`SparseBuilder::new(m, n)` accepts these triplets in arbitrary order through `push(i, j, v)` or `extend(rows, cols, values)`, immediately rejecting out-of-range indices (`OutOfBounds`) and nonfinite values (`NonFinite`).
+Finalization with `finish_coo(duplicate, zeros)`, `finish_csr`, or `finish_csc` sorts triplets by $(i, j)$ ($O(T \log T)$ for $T$ triplets), handles duplicates and zeros according to argument policies, and constructs a canonical matrix in one operation.
+`finish_csr` and `finish_csc` do not create an intermediate COO matrix.
+For existing triplet arrays, `CsrMatrix::from_triplets(rows, cols, row_indices, col_indices, values)` creates CSR directly with `(DuplicatePolicy::Sum, ExplicitZeroPolicy::Preserve)` policies.
+
+### Duplicate policy
+
+`DuplicatePolicy::Sum` accumulates contributions at the same position exactly and rounds once at the end.
+The combined value is the true contribution sum rounded once, bitwise independent of contribution order.
+Sequential double-precision addition depends on intermediate rounding.
+For example, summing $10^{16} + 1 - 10^{16}$ left to right rounds $10^{16} + 1$ to $10^{16}$ and returns 0.
+With `Sum`, assembly is reproducible even when parallelization or mesh generation changes element-processing order.
+An exact sum too large for double precision returns `NumericalInstability`.
+
+`DuplicatePolicy::Reject` returns `InvalidInput` at the first duplicate position in sorted order.
+Use it to detect accidental duplicates in input intended to assign each position once.
+
+### Explicit-zero policy
+
+`ExplicitZeroPolicy` determines treatment of positions whose value is exactly zero after duplicate handling.
+`Preserve` retains the position in the structure; `Drop` removes it.
+This also applies to positions whose contributions cancel to zero.
+`Drop` reduces memory and arithmetic but makes structure depend on values.
+In repeated factorizations with changing coefficients, cancellation removing an entry in one solve changes the structure and prevents symbolic-analysis reuse.
+Choose `Preserve` to fix the structure or retain zero-weight graph edges.
+
+### Duplicate and zero policies and summation order
+
+The following cell finalizes $2 \times 2$ triplets with contributions 2 and $v$ at $(0, 0)$, exact zero at $(0, 1)$, and 4 at $(1, 1)$ under all four combinations of duplicate and zero policies.
+Input $v$ is an integer from $-4$ to $4$; at $v = -2$, contributions at $(0, 0)$ cancel.
+The first table shows the outcome, stored-entry count, and stored value at each position for each policy combination.
+“—” indicates an unstored position or a rejected matrix.
+The second table gives three contributions $10^{16}$, $1$, and $-10^{16}$ at the same position in three orders, comparing the `Sum` sum with a double-precision reference added in input order.
+The true sum is 1.
+
+```rust
+//| id: sparse-duplicate-zero-policies
+//| ref: sparse-duplicate-zero-policies
+//| title: "Duplicate contributions, explicit-zero policies, and summation order"
+//| run: reactive
+//| crates: [scioxide-sparse]
+//| inputs:
+//|   second_value: {"type":"range","label":"Second contribution v at (0, 0)","description":"2 + v is the combined value at (0, 0).","min":-4,"max":4,"step":1,"value":3}
+//| cases:
+//|   - {"id":"cancellation","label":"v = −2","description":"Contributions at (0, 0) cancel, reducing stored entries to 1 under Sum / Drop.","inputs":{"second_value":-2}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"policies","path":"/rows/0/3","equals":3}
+//|       - {"artifact":"policies","path":"/rows/0/4","approx":{"value":5.0,"atol":1e-15}}
+//|       - {"artifact":"policies","path":"/rows/0/5","approx":{"value":0.0,"atol":1e-15}}
+//|       - {"artifact":"policies","path":"/rows/1/3","equals":2}
+//|       - {"artifact":"policies","path":"/rows/1/5","equals":null}
+//|       - {"artifact":"policies","path":"/rows/2/2","equals":"InvalidInput"}
+//|       - {"artifact":"policies","path":"/rows/3/2","equals":"InvalidInput"}
+//|       - {"artifact":"orders","path":"/rows/0/1","approx":{"value":1.0,"atol":1e-15}}
+//|       - {"artifact":"orders","path":"/rows/0/2","approx":{"value":0.0,"atol":1e-15}}
+//|       - {"artifact":"orders","path":"/rows/1/2","approx":{"value":0.0,"atol":1e-15}}
+//|       - {"artifact":"orders","path":"/rows/2/1","approx":{"value":1.0,"atol":1e-15}}
+//|       - {"artifact":"orders","path":"/rows/2/2","approx":{"value":1.0,"atol":1e-15}}
+//|   - case: cancellation
+//|     expect:
+//|       - {"artifact":"policies","path":"/rows/0/3","equals":3}
+//|       - {"artifact":"policies","path":"/rows/0/4","approx":{"value":0.0,"atol":1e-15}}
+//|       - {"artifact":"policies","path":"/rows/1/3","equals":1}
+//|       - {"artifact":"policies","path":"/rows/1/4","equals":null}
+use scioxide_sparse::{DuplicatePolicy, ExplicitZeroPolicy, SparseBuilder};
+
+// Insert 2 and v at (0, 0), exact zero at (0, 1), and 4 at (1, 1) in arbitrary order.
+let triplets = [
+    (0, 0, 2.0_f64),
+    (1, 1, 4.0),
+    (0, 1, 0.0),
+    (0, 0, second_value),
+];
+let mut rows = Vec::new();
+for (duplicate_name, duplicate) in [
+    ("Sum", DuplicatePolicy::Sum),
+    ("Reject", DuplicatePolicy::Reject),
+] {
+    for (zero_name, zeros) in [
+        ("Preserve", ExplicitZeroPolicy::Preserve),
+        ("Drop", ExplicitZeroPolicy::Drop),
+    ] {
+        let mut builder = SparseBuilder::new(2, 2);
+        for &(i, j, v) in &triplets {
+            builder.push(i, j, v).map_err(|e| e.to_string())?;
+        }
+        let row = match builder.finish_csr(duplicate, zeros) {
+            // Use None for unstored positions (do not use get, which returns 0 for implicit zeros).
+            Ok(a) => {
+                let stored = |r: usize, c: usize| {
+                    a.iter()
+                        .find(|&(i, j, _)| (i, j) == (r, c))
+                        .map(|(_, _, v)| v)
+                };
+                let (a00, a01, a11) = (stored(0, 0), stored(0, 1), stored(1, 1));
+                ("Accepted".to_string(), Some(a.nnz()), a00, a01, a11)
+            }
+            // Display rejection using classification e.kind().
+            Err(e) => (format!("{:?}", e.kind()), None, None, None, None),
+        };
+        rows.push((duplicate_name, zero_name, row.0, row.1, row.2, row.3, row.4));
+    }
+}
+let plain = serde_json::json!({ "significantDigits": 6 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Duplicate policy" },
+    { "key": "1", "label": "Zero policy" },
+    { "key": "2", "label": "Result" },
+    { "key": "3", "label": "Stored entries nnz [count]", "type": "integer", "nullText": "—" },
+    { "key": "4", "label": "Value at (0, 0) [-]", "type": "number", "format": plain, "nullText": "—" },
+    { "key": "5", "label": "Value at (0, 1) [-]", "type": "number", "format": plain, "nullText": "—" },
+    { "key": "6", "label": "Value at (1, 1) [-]", "type": "number", "format": plain, "nullText": "—" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "policies" })
+);
+
+// Insert the same three contributions at one position in three orders. The true sum is 1.
+let parts = [1.0e16_f64, 1.0, -1.0e16];
+let labels = ["1e16", "1", "-1e16"];
+let mut order_rows = Vec::new();
+for order in [[0, 1, 2], [1, 0, 2], [0, 2, 1]] {
+    let mut builder = SparseBuilder::new(1, 1);
+    for &k in &order {
+        builder.push(0, 0, parts[k]).map_err(|e| e.to_string())?;
+    }
+    let a = builder
+        .finish_csr(DuplicatePolicy::Sum, ExplicitZeroPolicy::Preserve)
+        .map_err(|e| e.to_string())?;
+    // Reference: add sequentially in double precision in input order, with intermediate rounding.
+    let sequential = order.iter().fold(0.0_f64, |sum, &k| sum + parts[k]);
+    let names: Vec<&str> = order.iter().map(|&k| labels[k]).collect();
+    let summed = a.get(0, 0).map_err(|e| e.to_string())?;
+    order_rows.push((names.join(", "), summed, sequential));
+}
+let order_columns = serde_json::json!([
+    { "key": "0", "label": "Contribution order" },
+    { "key": "1", "label": "Sum combined value [-]", "type": "number", "format": plain },
+    { "key": "2", "label": "Sequential double-precision sum (reference) [-]", "type": "number", "format": plain }
+]);
+emit_table_with_columns!(
+    order_columns,
+    order_rows,
+    metadata = serde_json::json!({ "id": "orders" })
+);
+```
+
+At the default $v = 3$, both `Sum` rows accept $(0, 0) = 5$; `Preserve` retains explicit zero $(0, 1) = 0$ for 3 stored entries, while `Drop` removes it for 2.
+Both `Reject` rows are rejected with `InvalidInput` regardless of zero policy.
+At $v = -2$, `Sum / Drop` also removes the cancellation zero at $(0, 0)$, reducing stored entries to 1.
+With `Sum / Preserve`, $(0, 0) = 0$ remains an explicit zero and the stored count stays at 3.
+In the second table, `Sum` returns 1 in every order, while the sequential references vary as 0, 0, and 1.
+
+## Structure-preserving value updates
+
+Finalized matrices provide no method to insert or remove individual entries.
+For time evolution or Newton methods where only coefficients change, replace values without rebuilding the structure.
+`CooMatrix`, `CsrMatrix`, and `CscMatrix` provide the following three methods (`BsrMatrix` and `DiaMatrix` do not; update a canonical format and reconvert).
+
+- `set_value(position, value)` replaces one value at position `position` in the storage order of `values()`.
+  An out-of-range position returns `OutOfBounds` and a nonfinite value returns `NonFinite`, leaving the matrix unchanged.
+- `copy_values_from(values)` copies precomputed values after checking their count and finiteness.
+  It needs no workspace.
+- `update_values(fill, workspace)` passes old values `old` and candidate array `next` to closure `fill(old, next)`, which writes candidates in workspace; they replace matrix values only when all are finite.
+  `next` initially contains NaNs, so unwritten positions are detected as `NonFinite`.
+  A closure error or nonfinite candidate leaves the matrix unchanged.
+  Create workspace `SparseValueWorkspace` with `workspace(())`, or preallocate it using `try_reserve` for `SparseValueRequirements` returned by `workspace_requirements(())` (the number of stored values).
+  Updates allocate nothing after preallocation.
+
+To replace the entire structure, `CsrMatrix::try_assign_pattern(pattern, scratch)` reuses existing storage for a new shape and structure and sets all values to zero.
+`scratch` is an index array for building reverse indices; its length must equal exactly $n + 1 + 2\,\mathrm{nnz}$ for the new structure, otherwise `DimensionMismatch` is returned.
+Allocation occurs only if storage is insufficient; allocation failure leaves the matrix unchanged.
+Analysis and factors built for the old structure cannot be used with the replacement matrix.
+
+## Pruning small entries
+
+To discard small entries generated during iteration and thin the structure, construct a dropping threshold with `SparsePruning::new(tolerance, reference_scale)`.
+`tolerance` is scioxide-core's `Tolerance` (absolute term $\tau_{\mathrm{abs}}$ and relative term $\tau_{\mathrm{rel}}$), and `reference_scale` supplies scale $s \ge 0$ for the relative term; stored entries satisfying
+
+$$
+|a_{ij}| \le \tau_{\mathrm{abs}} + \tau_{\mathrm{rel}}\, s
+$$
+
+are removed.
+If $s$ is negative, NaN, or infinite, `SparsePruning::new` returns `InvalidInput`.
+Unlike `ExplicitZeroPolicy`, which handles only exact zeros, pruning also removes small nonzero values.
+The test applies to every stored entry including diagonals, and complex magnitudes and thresholds are compared with scaling.
+`SparseView::pruned` returns a new `CsrMatrix`, leaving the original unchanged.
+`BsrMatrix::pruned` and `DiaMatrix::pruned` return their own formats, removing a block or diagonal only when all its values are discarded; discarded values in retained blocks or diagonals become zero.
+
+## Construction from blocks and diagonals
+
+Coupled problems and domain decomposition build large systems by arranging smaller matrices.
+The following three functions return canonical `CsrMatrix` without dense intermediates.
+
+- `sparse_block_grid(row_sizes, col_sizes, blocks)` assembles a matrix from a row-major grid of blocks.
+  `None` in `blocks` represents a zero block of that position's dimensions.
+  Block counts or dimensions inconsistent with `row_sizes` and `col_sizes` return `DimensionMismatch`.
+- `sparse_block_diagonal(blocks)` arranges blocks, including rectangular and empty ones, along the diagonal.
+- `sparse_diagonals(rows, cols, offsets, diagonals)` builds a banded matrix from diagonal-value arrays at offsets $d$.
+  An offset-$d$ array must have length $\min(m, n - d)$ for $d \ge 0$ and $\min(m + d, n)$ for $d < 0$; otherwise `DimensionMismatch` is returned, while a diagonal outside the matrix returns `InvalidInput`.
+
+All three retain every supplied entry including explicit zeros; `sparse_diagonals` sums equal-offset values exactly (the `Sum` and `Preserve` policies).
+To remove zero-valued entries, reconvert the result with `view().to_csr(ExplicitZeroPolicy::Drop)`.
+
+### A chain of coupled nodes
+
+Consider two fields coupled at each node: two copies of one-dimensional stiffness $\mathbf{A} = \mathrm{tridiag}(-1, 2, -1)$ on $m$ nodes, joining same-node degrees of freedom with coefficient $-c$, giving
+
+$$
+\mathbf{K} = \begin{pmatrix} \mathbf{A} & -c\,\mathbf{I} \\ -c\,\mathbf{I} & \mathbf{A} \end{pmatrix} \in \mathbb{R}^{2m \times 2m}
+$$
+
+as the coupled system.
+With field-wise numbering, degree of freedom $i$ is node $i \bmod m$ of field $\lfloor i/m \rfloor$, and entries are
+
+$$
+K_{ij} = \begin{cases} 2 & \lfloor i/m \rfloor = \lfloor j/m \rfloor,\ i = j \\ -1 & \lfloor i/m \rfloor = \lfloor j/m \rfloor,\ \lvert (i \bmod m) - (j \bmod m) \rvert = 1 \\ -c & \lfloor i/m \rfloor \ne \lfloor j/m \rfloor,\ i \bmod m = j \bmod m \\ 0 & \text{otherwise} \end{cases}
+$$
+
+the expression above.
+With node-wise numbering, node $p$ has degrees of freedom $2p$ and $2p + 1$; degree of freedom $i$ corresponds to $(i \bmod 2)\,m + \lfloor i/2 \rfloor$ in field-wise numbering.
+The stored count is $2(3m - 2)$ for two copies of $\mathbf{A}$ plus $2m$ for two coupling diagonals, giving $\mathrm{nnz}(\mathbf{K}) = 2(3m - 2) + 2m$ when $c \ne 0$.
+
+The following block defines what the next two cells share.
+`coupled_entry` gives field-wise entries $K_{ij}$, and `node_to_field` maps node-wise to field-wise numbering.
+
+```rust
+//| id: sparse-coupled-chain-model
+//| kind: definitions
+//| title: "Coupled node-chain entries and index mapping"
+//| crates: []
+/// Entry K_ij of K in field-wise numbering (m is nodes per field; c is coupling strength).
+pub(crate) fn coupled_entry(m: usize, c: f64, i: usize, j: usize) -> f64 {
+    match (i / m == j / m, (i % m).abs_diff(j % m)) {
+        (true, 0) => 2.0,
+        (true, 1) => -1.0,
+        (false, 0) => -c,
+        _ => 0.0,
+    }
+}
+
+/// Map node-wise degree of freedom i (field i % 2 at node i / 2) to field-wise numbering.
+pub(crate) fn node_to_field(m: usize, i: usize) -> usize {
+    (i % 2) * m + i / 2
+}
+```
+
+### Coupled-block assembly
+
+The following cell builds $\mathbf{A}$ and $-c\,\mathbf{I}$ using `sparse_diagonals`, assembles $\mathbf{K}$ with `sparse_block_grid`, then removes zero-valued entries with `to_csr(ExplicitZeroPolicy::Drop)`.
+Inputs are node count $m$ (2–16) and coupling strength $c$ (0–2).
+As a check, it compares every entry densified with `to_dense_into` against defining formula $K_{ij}$, and the `apply_into` product for $\mathbf{x} = (1, 2, \dots, 2m)$ against a sequentially summed reference using that formula.
+The table's “stored-count formula” is $\mathrm{nnz}(\mathbf{K})$ from the formula above.
+
+```rust
+//| id: sparse-block-assembly
+//| ref: sparse-block-assembly
+//| title: "Coupled-block assembly checked against the defining formula"
+//| run: reactive
+//| uses: [sparse-coupled-chain-model]
+//| crates: [scioxide-core, scioxide-sparse]
+//| inputs:
+//|   nodes: {"type":"range","label":"Node count m","description":"Nodes per field. K has order 2m.","min":2,"max":16,"step":1,"value":6}
+//|   coupling: {"type":"range","label":"Coupling strength c","description":"Magnitude of coefficient −c joining two degrees of freedom at the same node.","min":0.0,"max":2.0,"step":0.2,"value":0.6}
+//| cases:
+//|   - {"id":"uncoupled","label":"c = 0","description":"Coupling entries become exactly zero and are removed by Drop, reducing the stored count to 2(3m − 2).","inputs":{"coupling":0.0}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"assembly","path":"/rows/0/0","equals":12}
+//|       - {"artifact":"assembly","path":"/rows/0/1","equals":44}
+//|       - {"artifact":"assembly","path":"/rows/0/2","equals":44}
+//|       - {"artifact":"assembly","path":"/rows/0/3","range":{"max":0}}
+//|       - {"artifact":"assembly","path":"/rows/0/4","range":{"max":1e-14}}
+//|   - case: uncoupled
+//|     expect:
+//|       - {"artifact":"assembly","path":"/rows/0/1","equals":32}
+//|       - {"artifact":"assembly","path":"/rows/0/2","equals":32}
+//|       - {"artifact":"assembly","path":"/rows/0/3","range":{"max":0}}
+use scioxide_core::LinearOperator;
+use scioxide_sparse::{ExplicitZeroPolicy, sparse_block_grid, sparse_diagonals};
+
+let m = nodes as usize;
+let n = 2 * m;
+let (main, off, link) = (vec![2.0_f64; m], vec![-1.0_f64; m - 1], vec![-coupling; m]);
+// Build A = tridiag(-1, 2, -1) from offsets -1, 0, 1 and -cI from offset 0.
+let a = sparse_diagonals(m, m, &[-1, 0, 1], &[&off[..], &main[..], &off[..]])
+    .map_err(|e| e.to_string())?;
+let c_block = sparse_diagonals(m, m, &[0], &[&link[..]]).map_err(|e| e.to_string())?;
+let blocks = [
+    Some(a.view()),
+    Some(c_block.view()),
+    Some(c_block.view()),
+    Some(a.view()),
+];
+// The grid retains every supplied entry, so remove zero-valued entries at c = 0 with to_csr.
+let k = sparse_block_grid(&[m, m], &[m, m], &blocks)
+    .and_then(|grid| grid.view().to_csr(ExplicitZeroPolicy::Drop))
+    .map_err(|e| e.to_string())?;
+
+// Independent check: compare every densified entry with K_ij and the product with a sequential sum using the defining entries.
+let mut dense = vec![0.0_f64; n * n];
+k.to_dense_into(&mut dense).map_err(|e| e.to_string())?;
+let x: Vec<f64> = (1..=n).map(|i| i as f64).collect();
+let mut y = vec![0.0_f64; n];
+let mut scratch = vec![0.0_f64; k.apply_workspace_len().map_err(|e| e.to_string())?];
+k.apply_into(&x, &mut y, &mut scratch)
+    .map_err(|e| e.to_string())?;
+let (mut entry_diff, mut product_diff) = (0.0_f64, 0.0_f64);
+for i in 0..n {
+    let reference: f64 = (0..n)
+        .map(|j| coupled_entry(m, coupling, i, j) * x[j])
+        .sum();
+    product_diff = product_diff.max((y[i] - reference).abs());
+    for j in 0..n {
+        entry_diff =
+            entry_diff.max((dense[i * n + j] - coupled_entry(m, coupling, i, j)).abs());
+    }
+}
+let formula = 2 * (3 * m - 2) + if coupling != 0.0 { 2 * m } else { 0 };
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Order 2m", "type": "integer" },
+    { "key": "1", "label": "Stored entries nnz(K) [count]", "type": "integer" },
+    { "key": "2", "label": "Stored-count formula [count]", "type": "integer" },
+    { "key": "3", "label": "Maximum entry difference from defining formula [-]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "Maximum product difference from reference [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    vec![(k.rows(), k.nnz(), formula, entry_diff, product_diff)],
+    metadata = serde_json::json!({ "id": "assembly" })
+);
+```
+
+At the defaults $m = 6$ and $c = 0.6$, $\mathbf{K}$ is $12 \times 12$ with the predicted stored count $2(3m - 2) + 2m = 44$.
+Entry difference is zero and product difference $8.9 \times 10^{-16}$ is on the rounding scale associated with summation-order differences.
+At $c = 0$, entries of $-c$ become exactly zero and are removed by `Drop`, reducing the stored count to $2(3m - 2) = 32$.
+All entries and $\mathbf{x}$ are then integers, so product difference also vanishes.
+
+### Numbering and block-storage memory use
+
+Even for the same operator, degree-of-freedom numbering changes BSR and DIA efficiency.
+The next cell assembles $\mathbf{K}$ from `SparseBuilder` with field-wise and node-wise numbering, then converts to CSR, BSR ($2 \times 2$), and DIA to compare value-array sizes.
+Inputs match the preceding cell.
+Subtracting CSR value counts from BSR and DIA value counts gives zeros stored inside blocks or diagonals.
+The two figures show positions stored by BSR under each numbering.
+Dark positions are stored entries of $\mathbf{K}$, light positions are zeros filling blocks, and blank positions are unstored.
+Row indices increase downward.
+
+```rust
+//| id: sparse-block-storage
+//| ref: sparse-block-storage
+//| title: "Numbering effects on BSR and DIA memory use"
+//| run: reactive
+//| uses: [sparse-coupled-chain-model]
+//| crates: [scioxide-sparse]
+//| inputs:
+//|   nodes: {"type":"range","label":"Node count m","description":"Nodes per field. K has order 2m.","min":2,"max":16,"step":1,"value":6}
+//|   coupling: {"type":"range","label":"Coupling strength c","description":"Magnitude of coefficient −c joining two degrees of freedom at the same node.","min":0.0,"max":2.0,"step":0.2,"value":0.6}
+//| cases:
+//|   - {"id":"odd-nodes","label":"m = 7","description":"The field boundary no longer aligns with 2×2 block boundaries, increasing field-wise BSR block count further.","inputs":{"nodes":7}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"storage","path":"/rows/0/1","equals":44}
+//|       - {"artifact":"storage","path":"/rows/0/2","equals":20}
+//|       - {"artifact":"storage","path":"/rows/0/3","equals":80}
+//|       - {"artifact":"storage","path":"/rows/0/5","equals":60}
+//|       - {"artifact":"storage","path":"/rows/1/1","equals":44}
+//|       - {"artifact":"storage","path":"/rows/1/2","equals":16}
+//|       - {"artifact":"storage","path":"/rows/1/3","equals":64}
+//|       - {"artifact":"storage","path":"/rows/1/5","equals":60}
+//|   - case: odd-nodes
+//|     expect:
+//|       - {"artifact":"storage","path":"/rows/0/2","equals":33}
+//|       - {"artifact":"storage","path":"/rows/1/2","equals":19}
+//|       - {"artifact":"storage","path":"/rows/1/3","equals":76}
+use scioxide_sparse::{BsrMatrix, DiaMatrix, DuplicatePolicy, ExplicitZeroPolicy, SparseBuilder};
+
+let m = nodes as usize;
+let n = 2 * m;
+// Reverse y-axis categories to place row 0 at the top.
+let x_names: Vec<String> = (0..n).map(|i| i.to_string()).collect();
+let y_names: Vec<String> = (0..n).rev().map(|i| i.to_string()).collect();
+let mut rows = Vec::new();
+for node_major in [false, true] {
+    let mut builder = SparseBuilder::new(n, n);
+    for (i, j) in (0..n).flat_map(|i| (0..n).map(move |j| (i, j))) {
+        let v = if node_major {
+            coupled_entry(m, coupling, node_to_field(m, i), node_to_field(m, j))
+        } else {
+            coupled_entry(m, coupling, i, j)
+        };
+        if v != 0.0 {
+            builder.push(i, j, v).map_err(|e| e.to_string())?;
+        }
+    }
+    let matrix = builder
+        .finish_csr(DuplicatePolicy::Reject, ExplicitZeroPolicy::Drop)
+        .map_err(|e| e.to_string())?;
+    let bsr = BsrMatrix::from_sparse(matrix.view(), 2, 2).map_err(|e| e.to_string())?;
+    let dia = DiaMatrix::from_sparse(matrix.view()).map_err(|e| e.to_string())?;
+    let name = if node_major {
+        "Node-wise"
+    } else {
+        "Field-wise"
+    };
+    rows.push((
+        name,
+        matrix.values().len(),
+        bsr.block_count(),
+        bsr.values().len(),
+        dia.offsets().len(),
+        dia.values().len(),
+    ));
+    // Positions stored by BSR: 1 marks stored K entries; 0 marks zeros filling blocks.
+    let cells: Vec<_> = bsr
+        .view()
+        .iter()
+        .map(|(i, j, v)| serde_json::json!([j.to_string(), i.to_string(), f64::from(v != 0.0)]))
+        .collect();
+    emit_chart!(
+        serde_json::json!({
+            "kind": "heatmap",
+            "data": cells,
+            "xCategories": x_names,
+            "yCategories": y_names,
+            "xLabel": "Column j [-]",
+            "yLabel": "Row i [-]",
+            "colorMin": 0.0,
+            "colorMax": 1.0,
+            "tooltip": true
+        }),
+        metadata =
+            serde_json::json!({ "title": format!("BSR 2×2 stored positions with {name} numbering") })
+    );
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "Numbering" },
+    { "key": "1", "label": "CSR value count [count]", "type": "integer" },
+    { "key": "2", "label": "BSR block count [count]", "type": "integer" },
+    { "key": "3", "label": "BSR 2×2 value count [count]", "type": "integer" },
+    { "key": "4", "label": "DIA diagonal count [count]", "type": "integer" },
+    { "key": "5", "label": "DIA value count [count]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "storage" })
+);
+```
+
+At the defaults $m = 6$ and $c = 0.6$, CSR stores 44 values under either numbering.
+Node-wise numbering makes each node's $2 \times 2$ block $\begin{pmatrix} 2 & -c \\ -c & 2 \end{pmatrix}$ dense; BSR needs $m$ diagonal blocks and $2(m - 1)$ blocks connecting neighboring nodes, totaling $3m - 2 = 16$ blocks and 64 values.
+The figure shows block-filling zeros only in the two off-diagonal positions of blocks connecting neighboring nodes.
+With field-wise numbering, off-diagonal blocks of the $\mathbf{A}$ band contain only one entry, and $-c\,\mathbf{I}$ blocks fill only two of four positions.
+For even $m$, each field's $\mathbf{A}$ occupies $m/2$ diagonal and $m - 2$ off-diagonal blocks, and the two $-c\,\mathbf{I}$ occupy $m$ blocks; BSR therefore has $4m - 4 = 20$ blocks and 80 values.
+DIA uses five offsets $0, \pm 1, \pm m$ for field-wise numbering and five offsets $0, \pm 1, \pm 2$ for node-wise numbering; both store $5 \cdot 2m = 60$ values.
+At $m = 7$, the field boundary is misaligned with $2 \times 2$ block boundaries, increasing field-wise storage to 33 blocks (132 values), compared with $3m - 2 = 19$ node-wise blocks.
+
+## Summary
+
+In canonical formats, each position appears once in sorted order, so structural comparison and reuse require only array comparisons.
+Choose CSR for row traversal and products, CSC for columns, BSR for systems with node-wise dense blocks, and DIA for difference stencils with a few filled diagonals; convert CSR or similar formats to BSR and DIA with `from_sparse`.
+Finite-element assembly with `SparseBuilder` and `DuplicatePolicy::Sum` gives the true sum rounded once regardless of contribution order.
+For repeated factorization with changing coefficients, fix structure with `ExplicitZeroPolicy::Preserve` and update values with `set_value`, `copy_values_from`, or `update_values`.
+For BSR, numbering degrees of freedom together by node makes blocks dense and reduces memory use.
+
+## Further reading
+
+- [Matrix–vector and sparse matrix products](../kernels-and-products/): examine product algorithms on finalized matrices, rounding contracts, and the two phases of sparse matrix multiplication.
+- [Shared specifications and organization of sparse algorithms](../): examine structure/value separation, output behavior on failure, limits, and workspace contracts.
+- [Storage, assembly, and products](../../api/storage-and-products/): look up specifications for every builder, storage format, view, and block-construction item.

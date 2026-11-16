@@ -1,0 +1,715 @@
+---
+title: "A rod with nonuniform thermal conductivity and Jacobi-preconditioned CG"
+description: "Solve steady heat conduction in a rod whose conductivity varies by orders of magnitude using conjugate gradients, comparing a smooth profile where Jacobi preconditioning greatly reduces conditioning with material layers where it only roughly halves it, using closed-form condition numbers, iteration bounds, and exact solutions from thermal resistances in series."
+sidebar:
+  order: 440
+---
+
+In walls made of insulation and metal layers, or materials whose thermal conductivity varies strongly with temperature, diffusion equation coefficients vary by many orders of magnitude in space.
+Matrices obtained by discretizing these equations have large condition numbers, increasing conjugate gradient (CG) iteration counts.
+Preconditioning chooses a symmetric positive definite matrix $M$ close to $A$ whose inverse action $M^{-1}r$ is inexpensive, replacing the condition number governing CG convergence from that of $A$ to that of $M^{-1/2}AM^{-1/2}$.
+The least expensive choice is Jacobi preconditioning $M = \operatorname{diag}(A)$, which uses only diagonal entries to cancel row and column scale differences.
+This example examines conductivity profiles where Jacobi preconditioning greatly reduces conditioning and profiles where it only roughly halves it, using closed-form condition numbers and CG iteration bounds.
+
+---
+
+## Discretizing steady heat conduction
+
+Consider a rod of length $L = 1$ m and cross-sectional area 1 m² with conductivity $k(x)$ [W/(m·K)], keeping the left endpoint at 0 K and the right at 1 K (differences from a reference temperature).
+Without internal heat sources, the steady temperature $u(x)$ [K] satisfies
+
+$$
+-\frac{d}{dx}\Bigl(k(x) \frac{du}{dx}\Bigr) = 0, \qquad u(0) = 0, \quad u(1) = 1
+$$
+
+
+Divide the interval into $N + 1$ equal parts, place temperatures $u_i$ at nodes $x_i = ih$ ($h = 1/(N+1)$ m), and define the thermal conductance between adjacent nodes as $c_{i+1/2} = k(x_{i+1/2})/h$ [W/K].
+Heat-flow balance [W] at interior node $i$ gives
+
+$$
+-c_{i-1/2}\, u_{i-1} + \bigl(c_{i-1/2} + c_{i+1/2}\bigr) u_i - c_{i+1/2}\, u_{i+1} = 0
+$$
+
+
+Moving boundary values $u_0 = 0$ and $u_{N+1} = 1$ to the right-hand side gives $Au = b$ with tridiagonal matrix $A$ [W/K].
+Only $b_N = c_{N+1/2}$ [W] is nonzero on the right-hand side.
+$A$ is symmetric with positive diagonal entries; the sum of absolute off-diagonal entries in each row is at most the diagonal, and strictly smaller in both endpoint rows.
+Gershgorin's theorem gives nonnegative eigenvalues of $A$.
+A tridiagonal matrix with nonzero off-diagonal entries is irreducible, so strict diagonal dominance in one row makes $A$ nonsingular (Taussky's theorem), hence $A$ is symmetric positive definite.
+
+### Exact solution from thermal resistances in series
+
+Without heat sources, the heat flow $q = c_{i+1/2}(u_{i+1} - u_i)$ is the same in every interval.
+The temperature is therefore determined by thermal resistances $1/c_{i+1/2}$ [K/W] in series, and the exact discrete solution is
+
+$$
+u_i = \frac{\sum_{j=0}^{i-1} 1/c_{j+1/2}}{\sum_{j=0}^{N} 1/c_{j+1/2}}
+$$
+
+
+This solves the discrete equations themselves without discretization error, directly measuring the CG solution error.
+
+### Two conductivity profiles
+
+Set the minimum conductivity to 1 W/(m·K) for both profiles and vary the number of decades $d$ in the maximum-to-minimum ratio $10^d$ to compare:
+
+- Exponential variation: $k(x) = 10^{dx}$.
+  It increases smoothly by $d$ orders of magnitude from left to right.
+- Two-material layers: divide the rod into 10 layers of thickness 0.1 m, alternating $k = 10^d$ and $k = 1$ from the left.
+
+The following block provides definitions shared by two cells.
+`bar` builds conductances $c_{j+1/2}$ and the diagonal and off-diagonal of $A$ from the profile and $d$; `exact` returns the exact solution from thermal resistances in series.
+`scaled_off_diagonal` returns the off-diagonal of the Jacobi-preconditioned matrix in the next section.
+`extremes` returns the smallest and largest eigenvalues of a symmetric tridiagonal matrix; `condition` returns their ratio, the condition number.
+Select the extreme eigenvalues individually using `EigenIndexRange` and specify `EigenvalueAccuracy::Relative` to compute each to relative accuracy in its own magnitude using Sturm-sequence bisection.
+The default `EigenvalueAccuracy::Absolute` (QL/QR or divide-and-conquer) stops at absolute accuracy relative to the whole spectral scale, so matrices with condition numbers near $10^{12}$ can have smallest-eigenvalue relative error of order $\varepsilon_{\mathrm{mach}}\kappa$.
+
+```rust
+//| id: linalg-preconditioned-cg-model
+//| kind: definitions
+//| title: "Tridiagonal matrix for a rod with nonuniform conductivity"
+//| crates: [scioxide-core, scioxide-linalg]
+use scioxide_core::SciOxideError;
+use scioxide_linalg::{
+    EigenIndexRange, EigenvalueAccuracy, HermitianEigenOptions, HermitianEigenvaluesResult,
+};
+
+/// Conductivity profile k(x) [W/(m·K)]. Both have minimum 1 W/(m·K).
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum Profile {
+    /// k(x) = 10^(d x).
+    Exponential,
+    /// Alternate k = 10^d and k = 1 in layers of thickness 0.1 m from the left.
+    Layered,
+}
+
+/// Rod matrix A [W/K] with N interior nodes.
+pub(crate) struct Bar {
+    /// Conductance c_{j+1/2} = k/h [W/K] for interval j (between nodes j and j + 1), j = 0, …, N.
+    pub(crate) conductance: Vec<f64>,
+    /// Diagonal of A: c_{i−1/2} + c_{i+1/2}.
+    pub(crate) diagonal: Vec<f64>,
+    /// Off-diagonal of A: −c_{i+1/2} (length N − 1).
+    pub(crate) off_diagonal: Vec<f64>,
+}
+
+/// Rod with nodes interior nodes and conductivity variation decades orders of magnitude (h = 1/(N + 1) m).
+pub(crate) fn bar(nodes: usize, decades: f64, profile: Profile) -> Bar {
+    let h = 1.0 / (nodes + 1) as f64;
+    let conductivity = |x: f64| match profile {
+        Profile::Exponential => 10.0_f64.powf(decades * x),
+        Profile::Layered if (x * 10.0).floor() as usize % 2 == 0 => 10.0_f64.powf(decades),
+        Profile::Layered => 1.0,
+    };
+    let conductance: Vec<f64> = (0..=nodes)
+        .map(|j| conductivity((j as f64 + 0.5) * h) / h)
+        .collect();
+    let diagonal = (0..nodes)
+        .map(|i| conductance[i] + conductance[i + 1])
+        .collect();
+    let off_diagonal = (1..nodes).map(|i| -conductance[i]).collect();
+    Bar {
+        conductance,
+        diagonal,
+        off_diagonal,
+    }
+}
+
+impl Bar {
+    /// Exact discrete solution u_i [K] from thermal resistances in series (reference for checking).
+    pub(crate) fn exact(&self) -> Vec<f64> {
+        let total: f64 = self.conductance.iter().map(|c| 1.0 / c).sum();
+        let mut partial = 0.0;
+        self.conductance[..self.diagonal.len()]
+            .iter()
+            .map(|c| {
+                partial += 1.0 / c;
+                partial / total
+            })
+            .collect()
+    }
+
+    /// Off-diagonal of Jacobi-preconditioned matrix D^{−1/2} A D^{−1/2} (all diagonal entries are 1).
+    pub(crate) fn scaled_off_diagonal(&self) -> Vec<f64> {
+        self.off_diagonal
+            .iter()
+            .enumerate()
+            .map(|(i, o)| o / (self.diagonal[i] * self.diagonal[i + 1]).sqrt())
+            .collect()
+    }
+}
+
+/// Smallest and largest eigenvalues (λ_min, λ_max) of a symmetric positive definite tridiagonal matrix.
+/// Compute only extreme eigenvalues by Sturm bisection with relative accuracy in each magnitude.
+pub(crate) fn extremes(diagonal: &[f64], off_diagonal: &[f64]) -> Result<(f64, f64), SciOxideError> {
+    let n = diagonal.len();
+    let options =
+        HermitianEigenOptions::default().with_eigenvalue_accuracy(EigenvalueAccuracy::Relative);
+    let eigenvalue = |index: usize| -> Result<f64, SciOxideError> {
+        let range = EigenIndexRange::new(index, index + 1)?;
+        let values = HermitianEigenvaluesResult::tridiagonal_with_options(
+            diagonal,
+            off_diagonal,
+            &options.with_index_range(range),
+        )?;
+        Ok(values.eigenvalues()[0])
+    };
+    Ok((eigenvalue(0)?, eigenvalue(n - 1)?))
+}
+
+/// Condition number κ = λ_max/λ_min.
+pub(crate) fn condition(diagonal: &[f64], off_diagonal: &[f64]) -> Result<f64, SciOxideError> {
+    let (lowest, highest) = extremes(diagonal, off_diagonal)?;
+    Ok(highest / lowest)
+}
+```
+
+## Conditioning and Jacobi preconditioning
+
+CG iteration counts depend on the condition number $\kappa = \lambda_{\max}/\lambda_{\min}$ of $M^{-1/2}AM^{-1/2}$ under preconditioner $M$ (next section).
+With Jacobi preconditioning $M = D = \operatorname{diag}(A)$, this is tridiagonal with all diagonal entries 1 and off-diagonal entries $a_{i,i+1}/\sqrt{a_{ii}a_{i+1,i+1}}$.
+Denote its condition number by $\kappa_J$ and that of unpreconditioned $A$ by $\kappa(A)$.
+
+For a uniform rod ($d = 0$), eigenvalues of $A = c\,\operatorname{tridiag}(-1, 2, -1)$ are $2c\,(1 - \cos(j\pi h))$ ($j = 1, \ldots, N$), giving condition number
+
+$$
+\kappa_0 = \cot^2\frac{\pi h}{2} \approx \frac{4}{\pi^2 h^2}
+$$
+
+
+The diagonal is constant $2c$, so Jacobi preconditioning only divides $A$ by a constant and $\kappa_J = \kappa(A) = \kappa_0$.
+
+For exponential variation, the conductance ratio between neighboring intervals is constant, $q = c_{i+3/2}/c_{i+1/2} = 10^{dh}$.
+All off-diagonal entries of the preconditioned matrix then equal $-s$ with $s = 1/(\sqrt q + 1/\sqrt q)$, making it exactly the Toeplitz matrix $\operatorname{tridiag}(-s, 1, -s)$.
+Its eigenvalues are $1 - 2s\cos(j\pi h)$, giving the closed-form condition number
+
+$$
+\kappa_J = \frac{1 + 2s\cos(\pi h)}{1 - 2s\cos(\pi h)}
+$$
+
+
+For $q > 1$, $s < 1/2$; increasing $d$ strengthens diagonal dominance and makes $\kappa_J$ smaller than $\kappa_0$.
+Meanwhile $\kappa(A)$ increases because diagonal magnitudes span a factor of $10^d$.
+
+In two-material layers, $k$ is constant within each layer, so the preconditioned matrix has the same form as a uniform rod within layers, differing only at layer boundaries.
+The similar matrix $D^{-1}A$ has diagonal 1 and absolute off-diagonal row sums at most 1; Gershgorin's theorem gives $\lambda_{\max} \le 2$, almost the uniform rod's $1 + \cos(\pi h)$.
+For the smooth temperature distribution associated with the smallest eigenvalue, $u^{\mathsf T}Au$ is determined by thermal resistances in series, or harmonic-mean conductivity $\bar k_h$, whereas $u^{\mathsf T}Du$ is determined by the diagonal, or arithmetic mean $\bar k_a$.
+This gives the following guide for equal-thickness layers:
+
+$$
+\kappa_J \approx \kappa_0\,\frac{\bar k_a}{\bar k_h}, \qquad \frac{\bar k_a}{\bar k_h} = \frac{(10^d + 1)^2}{4 \cdot 10^d} \approx \frac{10^d}{4}
+$$
+
+
+This is a homogenization estimate, not an upper bound.
+Diagonal scaling cannot cancel the ratio of arithmetic to harmonic mean.
+
+The next cell selects interior node count $N$ (50–400), computes $\kappa(A)$ and $\kappa_J$ from eigenvalues for both profiles over $d = 0, 1, \ldots, 8$, and compares them with closed forms and the estimate.
+The table columns give $\kappa(A)$, $\kappa_J$, and the closed form for exponential variation, and $\kappa(A)$, $\kappa_J$, and the estimate for two-material layers.
+The plot shows the same values on logarithmic axes, with closed forms and estimates dashed and uniform-rod $\kappa_0$ as a horizontal line.
+The closed form is computed independently of the eigensolver, so agreement checks the eigensolver.
+
+```rust
+//| id: linalg-preconditioned-cg-condition
+//| ref: linalg-preconditioned-cg-condition
+//| title: "Conductivity variation in decades and condition numbers"
+//| run: reactive
+//| uses: [linalg-preconditioned-cg-model]
+//| crates: [scioxide-core, scioxide-linalg]
+//| inputs:
+//|   nodes: {"type":"range","label":"Interior node count N","description":"Number of unknowns.","min":50,"max":400,"step":50,"value":200}
+//| cases:
+//|   - {"id":"coarse","label":"N = 50","description":"A coarser grid reduces the uniform rod condition number while leaving the layered ratio κ_J/κ₀ nearly unchanged.","inputs":{"nodes":50}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"condition","path":"/rows/0/1","approx":{"value":16373.24189874,"rtol":1e-10}}
+//|       - {"artifact":"condition","path":"/rows/4/2","approx":{"value":5200.326153419,"rtol":1e-10}}
+//|       - {"artifact":"condition","path":"/rows/8/2","approx":{"value":1707.01186356,"rtol":1e-10}}
+//|       - {"artifact":"condition","path":"/rows/8/4","approx":{"value":8.208e11,"rtol":1e-4}}
+//|       - {"artifact":"condition","path":"/rows/8/5","approx":{"value":4.0932092395e11,"rtol":0.05}}
+//|   - case: coarse
+//|     expect:
+//|       - {"artifact":"condition","path":"/rows/0/1","approx":{"value":1053.4789912,"rtol":1e-10}}
+//|       - {"artifact":"condition","path":"/rows/8/2","approx":{"value":110.3913692556,"rtol":1e-10}}
+//|       - {"artifact":"condition","path":"/rows/8/5","approx":{"value":2.6326849596e10,"rtol":0.05}}
+let n = nodes.round() as usize;
+let h = 1.0 / (n + 1) as f64;
+let pi_h = std::f64::consts::PI * h;
+// Uniform rod condition number κ₀ = cot²(πh/2) (closed form).
+let uniform = (1.0 / (0.5 * pi_h).tan()).powi(2);
+let mut rows = Vec::new();
+let mut series = vec![Vec::new(); 6];
+for d in 0..=8 {
+    let decades = f64::from(d);
+    let smooth = bar(n, decades, Profile::Exponential);
+    let layered = bar(n, decades, Profile::Layered);
+    let smooth_plain =
+        condition(&smooth.diagonal, &smooth.off_diagonal).map_err(|e| e.to_string())?;
+    let smooth_jacobi =
+        condition(&vec![1.0; n], &smooth.scaled_off_diagonal()).map_err(|e| e.to_string())?;
+    let layered_plain =
+        condition(&layered.diagonal, &layered.off_diagonal).map_err(|e| e.to_string())?;
+    let layered_jacobi =
+        condition(&vec![1.0; n], &layered.scaled_off_diagonal()).map_err(|e| e.to_string())?;
+    // Exponential variation: preconditioning gives tridiag(−s, 1, −s), s = 1/(√q + 1/√q), q = 10^(dh) (closed form).
+    let q = 10.0_f64.powf(decades * h);
+    let s = 1.0 / (q.sqrt() + 1.0 / q.sqrt());
+    let smooth_formula = (1.0 + 2.0 * s * pi_h.cos()) / (1.0 - 2.0 * s * pi_h.cos());
+    // Layers: estimate from κ₀ times the arithmetic-to-harmonic conductivity mean ratio.
+    let k: Vec<f64> = layered.conductance.iter().map(|c| c * h).collect();
+    let arithmetic = k.iter().sum::<f64>() / k.len() as f64;
+    let harmonic = k.len() as f64 / k.iter().map(|v| 1.0 / v).sum::<f64>();
+    let layered_estimate = uniform * arithmetic / harmonic;
+    for (points, value) in series.iter_mut().zip([
+        smooth_plain,
+        smooth_jacobi,
+        smooth_formula,
+        layered_plain,
+        layered_jacobi,
+        layered_estimate,
+    ]) {
+        points.push([decades, value]);
+    }
+    rows.push((
+        d,
+        smooth_plain,
+        smooth_jacobi,
+        smooth_formula,
+        layered_plain,
+        layered_jacobi,
+        layered_estimate,
+    ));
+}
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "d [decades]", "type": "integer" },
+    { "key": "1", "label": "Exponential: κ(A) [-]", "type": "number", "format": sci3 },
+    { "key": "2", "label": "Exponential: κ_J [-]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "Exponential: closed-form κ_J [-]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "Layers: κ(A) [-]", "type": "number", "format": sci3 },
+    { "key": "5", "label": "Layers: κ_J [-]", "type": "number", "format": sci3 },
+    { "key": "6", "label": "Layers: κ_J estimate κ₀k̄_a/k̄_h [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "condition" })
+);
+let names = [
+    "Exponential: unpreconditioned",
+    "Exponential: Jacobi",
+    "Exponential: closed-form Jacobi",
+    "Layers: unpreconditioned",
+    "Layers: Jacobi",
+    "Layers: Jacobi estimate",
+];
+let styled: Vec<serde_json::Value> = names
+    .iter()
+    .zip(series)
+    .enumerate()
+    .map(|(i, (name, points))| {
+        let style = if i % 3 == 2 {
+            serde_json::json!({ "lineType": "dashed" })
+        } else {
+            serde_json::json!({ "symbol": "circle" })
+        };
+        serde_json::json!({ "name": name, "points": points, "style": style })
+    })
+    .collect();
+emit_line_chart!(
+    &styled,
+    options = &serde_json::json!({
+        "xLabel": "Conductivity variation d [decades]",
+        "yLabel": "Condition number κ [-]",
+        "yType": "log",
+        "annotations": [
+            { "kind": "line", "axis": "y", "value": uniform, "label": "Uniform rod κ₀ = cot²(πh/2)" }
+        ]
+    })
+);
+```
+
+Default $N = 200$ gives $\kappa_0 = 1.64 \times 10^4$.
+For exponential variation, $\kappa_J$ decreases from $1.64 \times 10^4$ at $d = 0$ to $1.71 \times 10^3$ at $d = 8$, agreeing with the closed form to relative difference at most $5 \times 10^{-13}$ for every $d$.
+Over the same range, $\kappa(A)$ increases to $9.60 \times 10^9$, so at $d = 8$ Jacobi preconditioning reduces the condition number by a factor of $5.6 \times 10^6$.
+For two-material layers, $\kappa(A)$ reaches $8.21 \times 10^{11}$ at $d = 8$, and $\kappa_J$ only decreases to about half that, $4.19 \times 10^{11}$.
+The estimate $\kappa_0\bar k_a/\bar k_h$ underestimates $\kappa_J$ by up to 2.3 %, but matches its growth with $d$.
+At $N = 50$ it decreases to $\kappa_0 = 1.05 \times 10^3$, and the estimate overestimates $\kappa_J$ by at most 1 %.
+The layered ratio $\kappa_J/\kappa_0$ is $2.5 \times 10^7$ at $d = 8$, almost the same as at $N = 200$ and close to $10^8/4$.
+
+## Iteration bounds and preconditioned CG
+
+The $k$th CG iterate $x_k$ minimizes the $A$-norm $\lVert e_k \rVert_A = \sqrt{e_k^{\mathsf T}Ae_k}$ of error $e_k = x_k - x^\ast$ in Krylov subspace $x_0 + \mathcal K_k(M^{-1}A, M^{-1}r_0)$ (unpreconditioned: $M = I$).
+A Chebyshev polynomial bound gives, with $\rho = (\sqrt\kappa - 1)/(\sqrt\kappa + 1)$,
+
+$$
+\lVert e_k \rVert_A \le 2\rho^k\,\lVert e_0 \rVert_A
+$$
+
+Here $\kappa$ is the condition number of $M^{-1/2}AM^{-1/2}$.
+However, `CgSolver` tests the true residual rather than the error's $A$-norm, stopping when $\lVert b - Ax_k \rVert_2 \le \mathrm{atol} + \mathrm{rtol}\,\lVert b \rVert_2$ for `ResidualTolerance::new(atol, rtol)`.
+This page uses $\mathrm{atol} = 0$ and $\mathrm{rtol} = \varepsilon = 10^{-10}$.
+Using $\lambda_{\min}(A)\lVert e \rVert_A^2 \le \lVert Ae \rVert_2^2 \le \lambda_{\max}(A)\lVert e \rVert_A^2$ to transfer the error bound to the residual gives, from $x_0 = 0$ ($r_0 = b$),
+
+$$
+\frac{\lVert r_k \rVert_2}{\lVert b \rVert_2} \le 2\sqrt{\kappa(A)}\,\rho^k
+$$
+
+
+Define the iteration upper bound as the smallest $k$ for which the right-hand side is at most $\varepsilon$:
+
+$$
+k_\kappa = \left\lceil \frac{\ln\bigl(2\sqrt{\kappa(A)}/\varepsilon\bigr)}{\ln(1/\rho)} \right\rceil \approx \frac{\sqrt\kappa}{2}\,\ln\frac{2\sqrt{\kappa(A)}}{\varepsilon}
+$$
+
+
+In exact arithmetic, CG reaches the exact solution in at most $N$ iterations (at most the number of distinct eigenvalues of $M^{-1}A$), giving iteration count at most $\min(k_\kappa, N)$.
+Floating-point CG loses orthogonality of residuals and search directions through rounding, so termination in $N$ iterations is not guaranteed.
+The upper bound $k_\kappa$ is known to remain approximately valid as a guide under rounding errors (Greenbaum, 1989).
+For a one-dimensional problem, $\kappa_0 \approx 0.4N^2$, so $k_\kappa$ is roughly 10 times $N$.
+If rounding does not destroy finite termination, $N$ determines the iteration count.
+
+### Calling CgSolver and supplying preconditioning
+
+`CgSolver::new(tolerance, max_iterations)` is a method object taking tolerance `ResidualTolerance` and iteration limit `Budget`; it holds only settings and reads dimensions at each call.
+Each iteration performs one product with $A$ and one application of $M^{-1}$; workspace consists of six vectors of length $N$.
+The recursively updated residual is replaced with the true residual $b - Ax$ every 50 iterations, and convergence is accepted only after recomputing the true residual.
+Adding `with_history(true)` records the residual norm at every iteration.
+The first value is the initial true residual and the last is the returned solution's true residual; between them, only every 50th value and convergence candidates use true residuals, with the others recursively updated.
+There are two calling forms (defined in [Workspaces, execution contexts, and trial records](oxref:linalg-execution-forms)).
+
+- The standard form `solver.solve(&a, &b)` solves from initial guess 0 without preconditioning and returns the solution vector.
+  Stopping before tolerance gives a `ConvergenceFailure` error.
+- The form with options `solver.solve_with_options(&a, &b, preconditioning, x0)` takes preconditioning and an initial guess (0 for `None`), returning `IterativeSolveResult` (solution, report, and residual history).
+  Nonconvergence still returns `Ok`, with the solution being the iterate with smallest verified true residual at checkpoints ([Cancellation, budget stops, and interpreting accepted iterates](../accepted-state-and-cancellation/)).
+
+Pass preconditioning through `Preconditioning`.
+`Preconditioning::None` means $M = I$; `Preconditioning::Inverse(&p)` uses the action of a value `p` implementing scioxide-core's `Preconditioner`.
+`p` applies $M^{-1}$ rather than $M$.
+CG applies $M^{-1}$ symmetrically, so $M^{-1}$ must be symmetric positive definite.
+The solver stops with `Breakdown(Preconditioner)` if it detects $r^{\mathsf T}M^{-1}r \le 0$ and with `Breakdown(NonPositiveCurvature)` if it detects search-direction curvature $p^{\mathsf T}Ap \le 0$.
+
+The preconditioners on this page come from scioxide-sparse.
+`JacobiPreconditioner::new(&a)` computes $D^{-1}$ once from the CSR matrix diagonal and returns a `Singular` error for a zero diagonal entry.
+`IncompleteFactor::ic0(&a)` builds an incomplete Cholesky factorization IC(0) with the same nonzero pattern as the lower triangle of $A$ ([Incomplete factorizations and iterative preconditioning](../../../scioxide-sparse/algorithms/incomplete-factorizations/)).
+Tridiagonal Cholesky produces no fill, so IC(0) here is complete Cholesky factorization and $M = A$.
+In exact arithmetic $\kappa = 1$, and CG finishes in one iteration.
+Assemble the matrix in CSR form from three diagonals using `sparse_diagonals`.
+`CsrMatrix` implements `LinearOperator` and can be passed directly to CG.
+
+### Residual floor from rounding errors
+
+Computing residual $b - Ax$ for a floating-point solution $x$ introduces errors of order $\varepsilon_{\mathrm{mach}}\lVert A \rVert_2\lVert x \rVert_2$ from matrix–vector product rounding alone.
+Thus no method can be expected to reduce relative residual $\lVert b - Ax \rVert_2/\lVert b \rVert_2$ far below the guide $\varepsilon_{\mathrm{mach}}\lVert A \rVert_2\lVert x \rVert_2/\lVert b \rVert_2$.
+When this guide exceeds tolerance $\varepsilon$, even a solution with backward error of order $\varepsilon_{\mathrm{mach}}$ is not judged converged.
+Backward error $\eta = \lVert b - Ax \rVert_2/(\lVert A \rVert_2\lVert x \rVert_2 + \lVert b \rVert_2)$ is the smallest relative change in $A$ and $b$ that makes computed $x$ an exact solution.
+The ratio of relative residual to $\eta$ is $(\lVert A \rVert_2\lVert x \rVert_2 + \lVert b \rVert_2)/\lVert b \rVert_2$, so the two table columns reveal $\lVert A \rVert_2\lVert x \rVert_2/\lVert b \rVert_2$.
+`CgSolver` uses this floor to detect stagnation.
+When a checkpoint's true residual does not improve on the previous minimum, the solver compares the smallest residual $\lVert r_{\mathrm{best}} \rVert_2$ with the rounding-error floor
+
+$$
+16\,\varepsilon_{\mathrm{mach}}\bigl(\lVert b \rVert_2 + \lVert A(s \circ x) \rVert_2\bigr)
+$$
+
+If it is at most the floor, the solver stops with `Stagnation`.
+$x$ is the iterate with smallest verified true residual, not the latest iterate.
+$s$ is a fixed sign sequence with components $\pm 1$, and $s \circ x$ changes the signs of entries of $x$ accordingly.
+Near the solution, products $a_{ij}x_j$ cancel, reducing $\lVert Ax \rVert_2$; $\lVert A(s \circ x) \rVert_2$ estimates the magnitude $\lVert \lvert A \rvert \lvert x \rvert \rVert_2$ without that cancellation using one product with $A$.
+This product also counts as an operator evaluation.
+Since $\lVert A(s \circ x) \rVert_2 \le \lVert A \rVert_2\lVert x \rVert_2$, when $\lVert A \rVert_2\lVert x \rVert_2$ is much larger than $\lVert b \rVert_2$, the floor divided by $\lVert b \rVert_2$ is at most roughly 16 times the guide.
+The check is skipped at checkpoints where residuals continue decreasing, so an overestimated floor does not stop a progressing solve.
+The floor does not change the tolerance.
+
+The next cell selects interior node count $N$ (50–400), conductivity variation $d$ (0–8 decades), and profile, then solves without preconditioning, with Jacobi, and with IC(0) using the form with options.
+The iteration limit is $20N$.
+The table shows eigenvalue-based condition number $\kappa$ (not computed for IC(0)), bound $k_\kappa$, iteration count, termination reason, true relative residual, backward error $\eta$ ($\lVert A \rVert_2 = \lambda_{\max}(A)$), maximum difference from the exact solution, and the return from standard unpreconditioned `solve`.
+The plot shows relative residual history on a logarithmic axis, with horizontal lines for tolerance and rounding guide $\varepsilon_{\mathrm{mach}}\lVert A \rVert_2\lVert x \rVert_2/\lVert b \rVert_2$ computed from the exact solution, and a vertical line at $k = N$.
+The final outcome uses the Jacobi row's termination reason: satisfied for `Converged`, partial for a budget stop or stagnation, and failed for breakdown; diagnostics include the rounding guide.
+
+```rust
+//| id: linalg-preconditioned-cg
+//| ref: linalg-preconditioned-cg
+//| title: "CG and preconditioning for a rod with nonuniform conductivity"
+//| run: button
+//| uses: [linalg-preconditioned-cg-model]
+//| crates: [scioxide-core, scioxide-linalg, scioxide-sparse]
+//| inputs:
+//|   nodes: {"type":"range","label":"Interior node count N","description":"Number of unknowns.","min":50,"max":400,"step":50,"value":200}
+//|   decades: {"type":"range","label":"Conductivity variation d [decades]","description":"Maximum-to-minimum conductivity ratio is 10^d.","min":0,"max":8,"step":1,"value":4}
+//|   profile: {"type":"select","label":"Conductivity profile","description":"Smooth variation or layers of two materials.","options":["Exponential variation","Two-material layers"],"value":"Exponential variation"}
+//| cases:
+//|   - {"id":"smooth-8","label":"d = 8 decades","description":"Unpreconditioned solving stops at the limit and the standard form errors; Jacobi conditioning decreases further.","inputs":{"decades":8}}
+//|   - {"id":"layers","label":"Two-material layers, d = 4 decades","description":"Jacobi only halves the condition number; IC(0) is complete factorization and converges in one iteration.","inputs":{"profile":"Two-material layers"}}
+//|   - {"id":"layers-8","label":"Two-material layers, d = 8 decades","description":"The rounding guide exceeds tolerance, which no preconditioner can satisfy.","inputs":{"profile":"Two-material layers","decades":8}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/0/1","approx":{"value":4.2911814982e6,"rtol":1e-8}}
+//|       - {"artifact":"methods","path":"/rows/0/3","range":{"min":201,"max":32477}}
+//|       - {"artifact":"methods","path":"/rows/0/8","equals":"Ok (solution)"}
+//|       - {"artifact":"methods","path":"/rows/1/1","approx":{"value":5200.326153419,"rtol":1e-10}}
+//|       - {"artifact":"methods","path":"/rows/1/2","equals":1131}
+//|       - {"artifact":"methods","path":"/rows/1/3","range":{"max":1131}}
+//|       - {"artifact":"methods","path":"/rows/1/7","range":{"max":1e-12}}
+//|       - {"artifact":"methods","path":"/rows/2/3","equals":1}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+//|   - case: smooth-8
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/0/4","equals":"IterationLimit"}
+//|       - {"artifact":"methods","path":"/rows/0/7","range":{"min":0.5}}
+//|       - {"artifact":"methods","path":"/rows/0/8","equals":"Err(ConvergenceFailure)"}
+//|       - {"artifact":"methods","path":"/rows/1/1","approx":{"value":1707.01186356,"rtol":1e-10}}
+//|       - {"artifact":"methods","path":"/rows/1/7","range":{"max":1e-12}}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+//|   - case: layers
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/1/1","approx":{"value":4.0940278809e7,"rtol":0.05}}
+//|       - {"artifact":"methods","path":"/rows/1/4","equals":"Converged"}
+//|       - {"artifact":"methods","path":"/rows/1/7","range":{"max":1e-10}}
+//|       - {"artifact":"methods","path":"/rows/2/3","equals":1}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+//|       - {"path":"/outputs/2/diagnostics/2/value","approx":{"value":6.68276e-11,"rtol":1e-4}}
+//|   - case: layers-8
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/1/6","range":{"max":1e-15}}
+//|       - {"artifact":"methods","path":"/rows/2/6","range":{"max":1e-15}}
+//|       - {"artifact":"methods","path":"/rows/2/4","equals":"Stagnation"}
+//|       - {"artifact":"methods","path":"/rows/1/7","range":{"max":1e-5}}
+//|       - {"path":"/outputs/2/state","equals":"partial"}
+//|       - {"path":"/outputs/2/diagnostics/2/value","approx":{"value":6.68266e-7,"rtol":1e-4}}
+use scioxide_core::{Budget, ResidualTolerance};
+use scioxide_linalg::{CgSolver, LinearSolveTermination, Preconditioning, Vector, VectorView};
+use scioxide_sparse::{IncompleteFactor, JacobiPreconditioner, sparse_diagonals};
+
+let n = nodes.round() as usize;
+let profile = if profile == "Two-material layers" {
+    Profile::Layered
+} else {
+    Profile::Exponential
+};
+let model = bar(n, decades, profile);
+let a = sparse_diagonals(
+    n,
+    n,
+    &[-1, 0, 1],
+    &[&model.off_diagonal, &model.diagonal, &model.off_diagonal],
+)
+.map_err(|e| e.to_string())?;
+// b_N = c_{N+1/2} [W] from moving the right endpoint temperature 1 K to the right-hand side.
+let mut rhs = vec![0.0_f64; n];
+rhs[n - 1] = model.conductance[n];
+let b = Vector::from_vec(rhs);
+let exact = model.exact();
+// Stopping condition ‖b − Ax‖₂ ≤ ε‖b‖₂ (ε = 10⁻¹⁰). Iteration limit 20N.
+let epsilon = 1e-10;
+let tolerance = ResidualTolerance::new(0.0, epsilon).map_err(|e| e.to_string())?;
+let budget = Budget::try_from(20 * n).map_err(|e| e.to_string())?;
+let solver = CgSolver::new(tolerance, budget).with_history(true);
+// Condition number (eigenvalues) and iteration bound from ‖r_k‖/‖b‖ ≤ 2√κ(A)·ρ^k, ρ = (√κ − 1)/(√κ + 1).
+let (lowest, highest) =
+    extremes(&model.diagonal, &model.off_diagonal).map_err(|e| e.to_string())?;
+let kappa_a = highest / lowest;
+let kappa_j =
+    condition(&vec![1.0; n], &model.scaled_off_diagonal()).map_err(|e| e.to_string())?;
+// Relative residual rounding guide ε_mach‖A‖₂‖x‖₂/‖b‖₂ (x is exact solution, ‖A‖₂ = λ_max(A)).
+let exact_norm = VectorView::from(exact.as_slice())
+    .norm2()
+    .map_err(|e| e.to_string())?;
+let floor = f64::EPSILON * highest * exact_norm / model.conductance[n];
+let bound = |kappa: f64| {
+    let rate = (kappa.sqrt() + 1.0) / (kappa.sqrt() - 1.0);
+    ((2.0 * kappa_a.sqrt() / epsilon).ln() / rate.ln()).ceil() as u64
+};
+// scioxide-sparse preconditioners. Both apply M⁻¹.
+let jacobi = JacobiPreconditioner::new(&a).map_err(|e| e.to_string())?;
+let cholesky = IncompleteFactor::ic0(&a).map_err(|e| e.to_string())?;
+// Standard form: initial guess 0, no preconditioning. Errors if tolerance is not reached.
+let plain = match solver.solve(&a, &b) {
+    Ok(_) => "Ok (solution)".to_string(),
+    Err(e) => format!("Err({:?})", e.kind()),
+};
+// Show termination reasons by variant name.
+let name_of = |t: LinearSolveTermination| match t {
+    LinearSolveTermination::Converged => "Converged".to_string(),
+    LinearSolveTermination::LeastSquaresConverged => "LeastSquaresConverged".to_string(),
+    LinearSolveTermination::ConditionLimit => "ConditionLimit".to_string(),
+    LinearSolveTermination::IterationLimit => "IterationLimit".to_string(),
+    LinearSolveTermination::EvaluationLimit => "EvaluationLimit".to_string(),
+    LinearSolveTermination::Stagnation => "Stagnation".to_string(),
+    LinearSolveTermination::Breakdown(cause) => format!("Breakdown({cause:?})"),
+    LinearSolveTermination::ExecutionStopped(reason) => format!("ExecutionStopped({reason:?})"),
+};
+let methods = [
+    (
+        "None",
+        Preconditioning::None,
+        Some(kappa_a),
+        Some(plain),
+    ),
+    (
+        "Jacobi",
+        Preconditioning::Inverse(&jacobi),
+        Some(kappa_j),
+        None,
+    ),
+    ("IC(0)", Preconditioning::Inverse(&cholesky), None, None),
+];
+let mut rows = Vec::new();
+let mut series = Vec::new();
+let mut jacobi_report = None;
+for (name, preconditioning, kappa, plain) in methods {
+    // Form with options: pass preconditioning and initial guess (None means 0), receive solution and report.
+    let result = solver
+        .solve_with_options(&a, &b, preconditioning, None)
+        .map_err(|e| e.to_string())?;
+    let report = result.report();
+    let error = result
+        .solution()
+        .as_slice()
+        .iter()
+        .zip(&exact)
+        .fold(0.0_f64, |m, (p, q)| m.max((p - q).abs()));
+    let residual = report.true_residual().map(|r| r.scaled_norm());
+    // Normwise backward error η = ‖b − Ax‖₂ / (‖A‖₂‖x‖₂ + ‖b‖₂), ‖A‖₂ = λ_max(A).
+    let x_norm = result
+        .solution()
+        .view()
+        .norm2()
+        .map_err(|e| e.to_string())?;
+    let backward = report
+        .true_residual()
+        .map(|r| r.raw_norm() / (highest * x_norm + model.conductance[n]));
+    rows.push((
+        name,
+        kappa,
+        kappa.map(bound),
+        report.iterations(),
+        name_of(report.termination()),
+        residual,
+        backward,
+        error,
+        plain,
+    ));
+    // Omit residuals exactly 0 because they cannot be plotted on a logarithmic axis.
+    let points: Vec<[f64; 2]> = result
+        .history()
+        .unwrap_or(&[])
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| **r > 0.0)
+        .map(|(k, r)| [k as f64, r / model.conductance[n]])
+        .collect();
+    series.push(serde_json::json!({ "name": name, "points": points }));
+    if name == "Jacobi" {
+        jacobi_report = Some((report, error));
+    }
+}
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Preconditioner" },
+    { "key": "1", "label": "Condition number κ [-]", "type": "number", "format": sci2, "nullText": "Not computed" },
+    { "key": "2", "label": "Iteration upper bound k_κ [count]", "type": "integer", "nullText": "Not computed" },
+    { "key": "3", "label": "Iterations [count]", "type": "integer" },
+    { "key": "4", "label": "Termination reason" },
+    { "key": "5", "label": "Relative residual [-]", "type": "number", "format": sci2, "nullText": "None" },
+    { "key": "6", "label": "Backward error η [-]", "type": "number", "format": sci2, "nullText": "None" },
+    { "key": "7", "label": "Maximum difference from exact solution [K]", "type": "number", "format": sci2 },
+    { "key": "8", "label": "Standard form solve", "nullText": "Takes no preconditioner" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "methods" })
+);
+emit_line_chart!(
+    &series,
+    options = &serde_json::json!({
+        "xLabel": "Iteration k [count]",
+        "yLabel": "Relative residual ‖r_k‖/‖b‖ [-]",
+        "yType": "log",
+        "annotations": [
+            { "kind": "line", "axis": "y", "value": epsilon, "label": "Tolerance 10⁻¹⁰" },
+            { "kind": "line", "axis": "y", "value": floor, "label": "Rounding guide" },
+            { "kind": "line", "axis": "x", "value": n as f64, "label": "Number of unknowns N" }
+        ]
+    })
+);
+let (report, error) = jacobi_report.ok_or("Jacobi row is missing")?;
+let termination = report.termination();
+let outcome = if termination.is_success() {
+    Outcome::satisfied("Jacobi-preconditioned CG satisfied tolerance")
+} else if matches!(termination, LinearSolveTermination::Breakdown(_)) {
+    Outcome::failed("Jacobi-preconditioned CG broke down")
+} else {
+    Outcome::partial("Jacobi-preconditioned CG stopped before satisfying tolerance").explanation(
+        "The returned solution has the smallest residual among iterates whose true residual was checked at checkpoints.",
+    )
+};
+let mut outcome = outcome
+    .status(name_of(termination))
+    .diagnostic("Iteration count", report.iterations() as f64, None)
+    .diagnostic("Maximum difference from exact solution", error, Some("K"))
+    .diagnostic("Rounding guide ε‖A‖‖x‖/‖b‖", floor, None);
+if let Some(residual) = report.true_residual() {
+    outcome = outcome.diagnostic("Relative residual", residual.scaled_norm(), None);
+}
+emit_outcome!(outcome);
+```
+
+With default exponential variation $N = 200$ and $d = 4$, the unpreconditioned $\kappa(A) = 4.3 \times 10^6$ gives an upper bound of $k_\kappa = 32477$ iterations, and CG reaches `Converged` in 2069 iterations.
+The iteration count is below the bound but exceeds 10 times $N$, with exact-solution difference $1.5 \times 10^{-9}$ K.
+The plotted residual oscillates between $10^{-3}$ and $10^{-5}$ while slowly decreasing from iterations 300 to 1800, then falls below tolerance in about 270 more iterations.
+With Jacobi, $\kappa_J = 5.2 \times 10^3$ gives a bound of 1131 iterations, and solving finishes in 200 iterations, equal to $N$.
+The residual drops abruptly from $4.9 \times 10^{-6}$ at iteration 199 to $2.3 \times 10^{-15}$ at iteration 200, showing exact-arithmetic finite termination persisting under rounding.
+IC(0) reaches `Converged` in one iteration, with exact-solution difference of order $10^{-14}$ K, the same as Jacobi.
+Standard `solve` performs the same computation as the unpreconditioned form with options and returns a solution here.
+
+With $d = 8$, the unpreconditioned case has $\kappa(A) = 9.6 \times 10^9$, reaches the 4000-iteration limit, and stops with `IterationLimit`.
+Its relative residual is $5.8 \times 10^{-7}$, but backward error $1.6 \times 10^{-8}$ is 8 orders above the rounding level, and exact-solution difference 0.99 K makes the solution unusable.
+The rounding guide is $9.3 \times 10^{-15}$, so this failure is due to too few iterations rather than rounding.
+For the same problem, standard `solve` returns `Err(ConvergenceFailure)`.
+With Jacobi, the condition number decreases further to $1.7 \times 10^3$, and CG still converges in 200 iterations.
+
+For two-material layers at $d = 4$, $\kappa_J = 4.2 \times 10^7$ is only half $\kappa(A) = 8.2 \times 10^7$.
+Even so, iteration counts decrease from 693 without preconditioning to 221 with Jacobi, and both converge.
+IC(0) converges in one iteration, but its exact-solution difference $5.0 \times 10^{-10}$ K exceeds Jacobi's $1.5 \times 10^{-11}$ K.
+All backward errors are at most $3 \times 10^{-16}$, and all exact-solution differences lie within the forward-error bound $2\kappa(A)\eta\lVert x \rVert_2$ (at most $4 \times 10^{-7}$ K), so their relative sizes do not measure preconditioner quality.
+The rounding guide is $6.7 \times 10^{-11}$, slightly below tolerance $10^{-10}$.
+
+For two-material layers at $d = 8$, none of the three methods reaches tolerance.
+The unpreconditioned case reaches `Stagnation` in 1950 iterations, Jacobi in 300, and IC(0) in 14; the outcome indicates a partial result.
+Relative residuals are $5.1 \times 10^{-7}$, $4.0 \times 10^{-7}$, and $7.9 \times 10^{-8}$, but all backward errors are at most $2 \times 10^{-16}$ and exact-solution differences at most $5 \times 10^{-7}$ K.
+The ratio of relative residual to backward error reveals $\lVert A \rVert_2\lVert x \rVert_2/\lVert b \rVert_2 = 3.0 \times 10^9$, and rounding guide $6.7 \times 10^{-7}$ exceeds tolerance by nearly 4 orders, so even complete Cholesky cannot satisfy tolerance.
+In the plot, the guide line lies above the tolerance line.
+True residuals of the three returned solutions are 0.1–0.8 times the guide; only recursively updated residuals between checkpoints fall far below it.
+The IC(0) residual falls to $8.2 \times 10^{-8}$ on the first iteration.
+On iteration 2, the recursive residual satisfies tolerance and triggers a checkpoint, but the true residual remains $7.9 \times 10^{-8}$.
+After replacing the residual with its true value at the checkpoint, the recursive residual decreases again to $1.3 \times 10^{-10}$ at iteration 13 and satisfies tolerance again on iteration 14.
+The true residual on iteration 14 does not improve on iteration 2, and the smallest residual $7.9 \times 10^{-8}$ lies below the rounding floor, so the solver stops with `Stagnation`.
+The returned solution is the second iterate rather than the last, so the final history point returns to $7.9 \times 10^{-8}$.
+The unpreconditioned and Jacobi cases stop by the same test when checkpoint true residuals cease improving (iterations 1950 and 300).
+The guide increases tenfold with each increment of $d$; at $d = 5$ it exceeds tolerance at $6.7 \times 10^{-10}$, and the unpreconditioned and Jacobi cases stop with `Stagnation` while only IC(0) converges on iteration 3 with relative residual $9.1 \times 10^{-11}$.
+
+At $N = 50$, Jacobi converges in 50 iterations and the unpreconditioned case in 169; at $N = 400$ the counts are 400 and 5684.
+Across these three grids including default $N = 200$, Jacobi iteration counts all equal $N$.
+At $d = 0$, Jacobi only divides $A$ by a constant, so both rows have the same 200 iterations.
+
+For two- and three-dimensional diffusion, IC(0) discards fill, giving $M \ne A$, and conditioning continues worsening as the grid is refined.
+[Algebraic multigrid preconditioning](../../../scioxide-sparse/algorithms/algebraic-multigrid/) covers preconditioners addressing both coefficient jumps and grid refinement.
+
+---
+
+## Summary
+
+For smoothly varying diffusion coefficients, Jacobi alone reduces the condition number to at most the uniform-rod value; for coefficient jumps such as material layers, the arithmetic-to-harmonic mean ratio (about $10^d/4$) remains, so choose a preconditioner using off-diagonal information.
+Use the smaller of condition-based bound $k_\kappa$ and unknown count $N$ as an iteration-limit guide; for ill-conditioned unpreconditioned problems, allow for rounding to exceed $N$ manyfold.
+Use the form with options `solve_with_options` to supply preconditioning or use an unconverged solution, and check the report's termination reason and true residual.
+When specifying tolerance relative to $\lVert b \rVert$, choose it above rounding guide $\varepsilon_{\mathrm{mach}}\lVert A \rVert\lVert x \rVert/\lVert b \rVert$.
+A tolerance below the guide causes stopping with `Stagnation` or `IterationLimit`, so judge the returned solution using backward error and comparison with a known solution.
+
+## Further reading
+
+- [Krylov subspace methods and preconditioning](../../algorithms/krylov-and-preconditioning/): examine the derivation of the CG convergence bound and preconditioning directions for MINRES and GMRES.
+- [Incomplete factorizations and iterative preconditioning](../../../scioxide-sparse/algorithms/incomplete-factorizations/): examine how much incomplete factorizations that discard fill reduce iterations in a two-dimensional problem.
+- [Controllability Gramians and LQR stabilization of an inverted pendulum](../lqr-control/): continue to the next example using matrix equations for control design.

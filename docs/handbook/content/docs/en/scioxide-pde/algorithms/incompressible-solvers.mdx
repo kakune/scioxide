@@ -1,0 +1,334 @@
+---
+title: "Solving incompressible-flow saddle-point systems"
+description: "Block LDU preconditioning and GMRES for Stokes saddle-point systems, velocity-block inverse choices, solve workspaces, conservative Newton–Krylov for Navier–Stokes, and termination reasons."
+sidebar:
+  order: 362
+references:
+  pde-saddle-preconditioner: "block-preconditioning-of-saddle-point-systems"
+  pde-incompressible-solve-calls: "solve-calls-and-workspaces"
+  pde-navier-stokes-newton: "newtons-method-for-navierstokes"
+---
+
+This page explains how to solve the saddle-point system assembled in [Mixed finite elements for incompressible flow](../incompressible-flow/).
+Steady Stokes uses block-preconditioned GMRES, while steady Navier–Stokes uses Newton–Krylov.
+Both share the same `StokesPlan` spaces, boundaries, and pressure gauges.
+The cell counts GMRES and Newton iterations under grid refinement.
+Time evolution using a velocity-mass saddle-point system is covered in [Time-dependent incompressible flow](../incompressible-time-stepping/).
+
+---
+
+## Block preconditioning of saddle-point systems
+
+The [saddle-point system](oxref:pde-incompressible-weak-form) $K=\begin{pmatrix}A&B^{\mathsf T}\\B&0\end{pmatrix}$ is symmetric indefinite, so conjugate gradients, which requires a positive-definite matrix, cannot be used.
+$K$ has the block LDU factorization
+
+$$
+K=\begin{pmatrix}I&0\\BA^{-1}&I\end{pmatrix}\begin{pmatrix}A&0\\0&-S\end{pmatrix}\begin{pmatrix}I&A^{-1}B^{\mathsf T}\\0&I\end{pmatrix},\qquad S=BA^{-1}B^{\mathsf T}
+$$
+
+where $S$ is called the Schur complement.
+For right-hand side $(\mathbf{f},\mathbf{g})$, the inverse acts in three stages.
+
+1. Predict velocity $\mathbf{u}_0=A^{-1}\mathbf{f}$.
+2. Compute pressure $\mathbf{p}=-S^{-1}(\mathbf{g}-B\mathbf{u}_0)$.
+3. Correct velocity $\mathbf{u}=\mathbf{u}_0-A^{-1}B^{\mathsf T}\mathbf{p}$.
+
+Because $S$ is dense, `IncompressiblePreconditioner` uses the inverse with $S$ replaced by an approximation $\hat S$ as a preconditioner.
+For steady viscous problems, use $\hat S=M_p/\mu$ ($M_p$ is the P1 pressure mass matrix).
+Under a uniform inf-sup condition, $BA^{-1}B^{\mathsf T}$ and $M_p/\mu$ are spectrally equivalent, placing preconditioned eigenvalues in an interval independent of $h$ (Elman–Silvester–Wathen 2014).
+Thus, with an accurate $A^{-1}$ action, GMRES iteration counts remain nearly constant under refinement.
+Gauge multipliers on closed components are handled exactly through an augmented Schur complement, computing $\hat S^{-1}w$ once during preparation.
+
+This inverse is generally indefinite and can be nonsymmetric, so combine it with GMRES rather than methods requiring positive-definite preconditioning.
+Select the velocity-block $A^{-1}$ construction with `IncompressibleVelocityInverse`.
+
+- `SparseCholesky` (default) factors the coupled velocity block by sparse Cholesky and solves it accurately.
+  Factor size follows the limits in `IncompressiblePreconditionerOptions::with_factor_limits`.
+- `Amg` applies algebraic multigrid (AMG) cycles to componentwise velocity blocks.
+  Korn's inequality makes inverses of the componentwise diagonal blocks spectrally equivalent to the coupled $A$ inverse; componentwise constants (translations) supply AMG's near nullspace.
+
+`IncompressiblePreconditionerOptions::new()` defaults to sparse Cholesky, AMG cycles with two pre- and two post-smoothing steps, and a limit of 4,000,000 entries per assembled block.
+Change these through `with_velocity`, `with_amg_setup`, `with_amg_cycle`, `with_amg_limits`, `with_factor_limits`, and `with_max_entries`.
+If the plan's estimated matrix entry count (`entry_bound`) exceeds the limit, preparation returns `ResourceLimit`.
+`IncompressiblePreconditioner::new(plan, saddle, options)` prepares sequentially, and `build(…, scope)` prepares as an epoch of the caller's context.
+Preparation allocates memory; application does not, and failure leaves output unchanged.
+
+`IncompressibleSaddle` selects the saddle-point system to approximate.
+`Viscous` is the steady Stokes system above, also kept frozen as a preconditioner for Newton corrections in Navier–Stokes.
+`VelocityMass` is the velocity-mass saddle-point system $\begin{pmatrix}M&B^{\mathsf T}\\B&0\end{pmatrix}$ used to compute acceleration in [time evolution](oxref:pde-incompressible-time) ($M$ is the density-weighted P2 mass matrix).
+Its velocity block uses the diagonal of $M$; the Schur approximation assembles $\hat S=B\,\mathrm{diag}(M)^{-1}B^{\mathsf T}$ and approximates it with AMG.
+A temporarily fixed vertex removes the constant pressure mode, and gauge conditions are restored exactly.
+This fixing changes only the preconditioner, not the physical operator.
+
+## Solve calls and workspaces
+
+`StokesPlan` has three calling patterns.
+
+- `solve()` solves from zero with defaults and returns velocity, pressure, and gauge multipliers in unknown order as a `Vec`.
+  Unsuccessful termination returns an error: `ExecutionStopped` for cancellation or deadlines, `ConvergenceFailure` otherwise.
+- `solve_with_options(&options)` solves from zero and returns an `IterativeSolveResult`, including incomplete termination.
+  Read `is_success()` and `termination()` on the result's `report()`.
+- Pass the `StokesWorkspace` created by `workspace(&options)` to `solve_into(solution, &mut workspace, scope)` to solve using `solution` as the initial guess and reuse the workspace for subsequent solves.
+  Read termination, including incomplete results, in the returned `IterativeSolveReport`.
+  Errors leave `solution` unchanged.
+
+`StokesWorkspace` holds solver, preconditioner, and Krylov storage; `with_linear_solver` and `with_preconditioner` replace the solver and preconditioner for subsequent solves.
+Injected solvers must accept nonsymmetric indefinite systems.
+`linear()` returns an `IterativeWorkspace` including the latest trial.
+
+`IncompressibleSolveOptions::new()` defaults to true-residual tolerances $\sqrt{\varepsilon}$ (absolute and relative), 1,000 GMRES(50) iterations, the default preconditioner, and default Newton–Krylov settings.
+Change these with `with_residual`, `with_iterations`, `with_restart`, `with_preconditioner`, and `with_nonlinear`.
+True-residual tolerances, iteration limits, and restart length apply to the Stokes saddle-point solve and the velocity-mass saddle-point solve in [time evolution](oxref:pde-incompressible-time).
+Navier–Stokes Newton corrections follow `NewtonKrylovOptions` in `with_nonlinear` and do not use these values.
+Relative tolerance is measured against right-hand-side norm $\|\mathbf{b}\|_2$, so tighten it until algebraic error is below discretization differences when comparing refined grids ([Stokes driven cavity](../../examples/stokes-cavity/)).
+
+`IncompressibleOperator` borrows a mixed operator whose main block is viscous $A$ or velocity-mass $M$; divergence, gauges, and Dirichlet rows are shared.
+`StokesPlan::mass_system()` returns the velocity-mass form, which can be passed to custom solvers as `LinearOperator` and `AdjointOperator`.
+`assemble_csr` assembles CSR; `assembly_workspace` with `assemble_csr_into(output, workspace, scope)` rewrites an existing CSR of the same structure without allocation.
+
+## Newton's method for Navier–Stokes
+
+`NavierStokesPlan::new(stokes)` reuses the Stokes plan's spaces, viscosity, density, loads, and gauges, adding advection through the conservative weak form
+
+$$
+c(u;v)=-\int_\Omega\rho\,(u\otimes u):\nabla v\,dx+\int_{\partial\Omega}\rho\,(u\cdot n)(u\cdot v)\,ds
+$$
+
+
+Undoing integration by parts gives $c(u;v)=\int_\Omega\rho\,\nabla\cdot(u\otimes u)\cdot v\,dx$, so the natural condition remains the same traction $\sigma n$ as Stokes.
+The plan supports real values only, providing residual $\mathbf{F}(\mathbf{x})=K\mathbf{x}-\mathbf{b}+\mathbf{c}(\mathbf{x})$ as `ResidualOperator` and analytical Jacobian products as `JacobianOperator`.
+The derivative in direction $w$ is $-\int\rho\,(w\otimes u+u\otimes w):\nabla v\,dx+\int\rho\left((w\cdot n)(u\cdot v)+(u\cdot n)(w\cdot v)\right)ds$.
+
+`solve_with_options(initial, &options)` solves with Newton–Krylov from `scioxide-rootfind` and returns `NewtonKrylovResult`.
+Newton correction equations are solved approximately by GMRES (by default, up to 200 GMRES(30) iterations per correction), always using the frozen `Viscous` Stokes preconditioner.
+The default Newton iteration limit is 100.
+Globalization (line search), forcing terms, nonlinear tolerances, and termination reasons follow the same `NewtonKrylovOptions` specification as [Nonlinear steady problems](oxref:pde-nonlinear-residual).
+For advection-dominated flow, the frozen Stokes preconditioner departs from the tangent, so convergence independent of Reynolds number is not promised.
+Picard iteration (Oseen linearization) is not provided; at high Reynolds numbers, start from a lower-Reynolds solution and increase Reynolds number gradually (continuation).
+The default residual tolerance is relative $\sqrt{\varepsilon}$ and absolute 0; the relative value is measured against the initial residual.
+With a good initial guess, failure to supply an absolute threshold through `with_residual_tolerance` can cause termination with `Stagnation`.
+
+`solve(initial)` uses defaults and converts unsuccessful termination into errors of the same classifications.
+Passing the `NavierStokesWorkspace` from `workspace(&options)` to `solve_into(initial, &mut output, &mut workspace, scope)` reuses Newton–Krylov storage and preconditioning, leaving `output` unchanged on error.
+`with_linear_solver` solves Newton corrections with an injected iterative method; choose its tolerance to satisfy the nonlinear forcing-term check.
+For repeated tangent use at a fixed state, evaluate it once with `linearize(point, &mut workspace, scope)` into the `NavierStokesLinearizationWorkspace` from `linearization_workspace()` and borrow it as CSR ([Three Jacobian representations](oxref:pde-jacobian-modes)).
+
+The following definitions construct a plan for a closed channel $[0,2]\times[0,1]$ m, prescribing Poiseuille velocity on every boundary ($U=1$ m/s, $\rho=1$ kg/m³).
+
+```rust
+//| id: pde-incompressible-closed-channel
+//| kind: definitions
+//| title: "Stokes plan for a closed channel"
+//| crates: [scioxide-pde, scioxide-spatial, scioxide-core]
+use scioxide_pde::{
+    BoundaryData, BoundaryKind, BoundaryPoint, IncompressibleOptions, SimplexFemGeometry,
+    StokesPlan, TaggedBoundaries,
+};
+use scioxide_spatial::{Point, TriangleMesh};
+
+/// Poiseuille velocity u(y) = 4U y (H − y) / H² [m/s] (U = 1 m/s, H = 1 m).
+pub(crate) fn poiseuille(y: f64) -> f64 {
+    4.0 * y * (1.0 - y)
+}
+
+/// Stokes plan for channel [0, 2]×[0, 1] [m], divided into 2n × n squares split diagonally into triangles.
+/// Because u(y) = 0 at walls, one Dirichlet condition prescribes inlet, outlet, and wall velocities.
+pub(crate) fn closed_channel(
+    cells: usize,
+    viscosity: f64,
+) -> Result<StokesPlan<f64, f64, 2>, String> {
+    let (nx, ny) = (2 * cells, cells);
+    let mut points = Vec::new();
+    for j in 0..=ny {
+        for i in 0..=nx {
+            let point = [2.0 * i as f64 / nx as f64, j as f64 / ny as f64];
+            points.push(Point::new(point).map_err(|e| e.to_string())?);
+        }
+    }
+    let mut triangles = Vec::new();
+    for j in 0..ny {
+        for i in 0..nx {
+            let a = j * (nx + 1) + i;
+            triangles.push([a, a + 1, a + nx + 2]);
+            triangles.push([a, a + nx + 2, a + nx + 1]);
+        }
+    }
+    let mesh = TriangleMesh::new(points, triangles).map_err(|e| e.to_string())?;
+    let data = BoundaryData::time_invariant(|p: BoundaryPoint<f64, 2>| {
+        Ok(if p.component == 0 {
+            poiseuille(p.point[1])
+        } else {
+            0.0
+        })
+    });
+    let boundaries = TaggedBoundaries::uniform(&mesh, 2, BoundaryKind::Dirichlet, data)
+        .map_err(|e| e.to_string())?;
+    StokesPlan::with_options(
+        mesh,
+        SimplexFemGeometry::Affine,
+        1.0,
+        viscosity,
+        &boundaries,
+        &|_| Ok([0.0; 2]),
+        IncompressibleOptions::new(),
+    )
+    .map_err(|e| e.to_string())
+}
+```
+
+The next cell solves the same flow at $n=2,4,8$ and lists iteration counts and maximum nodal errors against Poiseuille flow.
+It counts GMRES iterations for Stokes and Newton iterations for Navier–Stokes.
+Default tolerances are retained, so nodal errors show algebraic error levels.
+
+```rust
+//| id: pde-incompressible-iterations
+//| ref: pde-incompressible-iterations
+//| title: "Count GMRES and Newton iterations under grid refinement"
+//| run: button
+//| timeoutMs: 300000
+//| uses: [pde-incompressible-closed-channel]
+//| crates: [scioxide-pde, scioxide-spatial, scioxide-core, scioxide-linalg, scioxide-rootfind]
+//| inputs:
+//|   inverse: {"type":"select","label":"Velocity-block inverse action","description":"Construct the viscous velocity-block A inverse with sparse Cholesky or componentwise AMG.","options":["Sparse Cholesky","AMG"],"value":"Sparse Cholesky"}
+//|   equation: {"type":"select","label":"Equation","description":"Navier–Stokes uses Newton–Krylov with frozen Stokes preconditioning for every Newton correction.","options":["Stokes","Navier–Stokes"],"value":"Stokes"}
+//|   reynolds: {"type":"range","label":"Reynolds number Re = ρUH/μ [-]","description":"Vary viscosity μ = 1/Re Pa·s with ρ = 1 kg/m³, U = 1 m/s, H = 1 m fixed.","min":1,"max":100,"step":1,"value":10}
+//| cases:
+//|   - {"id":"amg","label":"AMG velocity inverse","description":"AMG only approximates A⁻¹, so GMRES counts increase slowly: 22, 30, 35.","inputs":{"inverse":"AMG"}}
+//|   - {"id":"navier-stokes","label":"Navier–Stokes, Re = 10","description":"Newton reaches ResidualTolerance in six iterations on every grid.","inputs":{"equation":"Navier–Stokes"}}
+//|   - {"id":"navier-stokes-re100","label":"Navier–Stokes, Re = 100","description":"Starting from zero makes correction GMRES stop at its iteration limit, producing LinearFailure(IterationLimit).","inputs":{"equation":"Navier–Stokes","reynolds":100}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"iterations","path":"/rows/2/1","equals":1276}
+//|       - {"artifact":"iterations","path":"/rows/2/2","range":{"min":8,"max":16}}
+//|       - {"artifact":"iterations","path":"/rows/2/3","range":{"min":0,"max":1e-6}}
+//|       - {"artifact":"iterations","path":"/rows/2/4","equals":"Converged"}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+//|   - case: amg
+//|     expect:
+//|       - {"artifact":"iterations","path":"/rows/2/2","range":{"min":20,"max":50}}
+//|       - {"artifact":"iterations","path":"/rows/2/4","equals":"Converged"}
+//|   - case: navier-stokes
+//|     expect:
+//|       - {"artifact":"iterations","path":"/rows/2/4","equals":"ResidualTolerance"}
+//|       - {"artifact":"iterations","path":"/rows/2/3","range":{"min":0,"max":1e-8}}
+//|   - case: navier-stokes-re100
+//|     expect:
+//|       - {"artifact":"iterations","path":"/rows/2/4","equals":"LinearFailure(IterationLimit)"}
+//|       - {"path":"/outputs/1/state","equals":"failed"}
+use scioxide_linalg::LinearSolveTermination;
+use scioxide_pde::{
+    IncompressiblePreconditionerOptions, IncompressibleSolveOptions,
+    IncompressibleVelocityInverse, NavierStokesPlan,
+};
+use scioxide_rootfind::RootTermination;
+
+let velocity = if inverse == "AMG" {
+    IncompressibleVelocityInverse::Amg
+} else {
+    IncompressibleVelocityInverse::SparseCholesky
+};
+let preconditioner = IncompressiblePreconditionerOptions::new().with_velocity(velocity);
+let options = IncompressibleSolveOptions::new().with_preconditioner(preconditioner);
+let mut rows = Vec::new();
+// (termination reason, breakdown flag) for the first unsuccessful grid. Limits give partial; breakdown gives failed.
+let mut first_failure: Option<(String, bool)> = None;
+for cells in [2_usize, 4, 8] {
+    let plan = closed_channel(cells, 1.0 / reynolds)?;
+    let unknowns = plan.unknowns();
+    let (state, iterations, status, success, broken) = if equation == "Stokes" {
+        let result = plan
+            .solve_with_options(&options)
+            .map_err(|e| e.to_string())?;
+        let report = result.report();
+        let broken = matches!(report.termination(), LinearSolveTermination::Breakdown(_));
+        let status = format!("{:?}", report.termination());
+        let state = result.solution().as_slice().to_vec();
+        (
+            state,
+            report.iterations(),
+            status,
+            report.is_success(),
+            broken,
+        )
+    } else {
+        let flow = NavierStokesPlan::new(plan.clone());
+        let initial = vec![0.0; unknowns];
+        let result = flow
+            .solve_with_options(&initial, &options)
+            .map_err(|e| e.to_string())?;
+        let broken = matches!(
+            result.termination(),
+            RootTermination::LinearFailure(_)
+                | RootTermination::GlobalizationFailure
+                | RootTermination::NumericalFailure(_)
+        );
+        let status = result.termination().to_string();
+        let success = result.is_success();
+        (
+            result.point().to_vec(),
+            result.iterations(),
+            status,
+            success,
+            broken,
+        )
+    };
+    if !success && first_failure.is_none() {
+        first_failure = Some((status.clone(), broken));
+    }
+    let mut error = 0.0_f64;
+    for i in 0..plan.velocity_nodes() {
+        let y = plan.node_point(i).map_err(|e| e.to_string())?[1];
+        error = error.max((state[i] - poiseuille(y)).abs());
+    }
+    rows.push((cells, unknowns, iterations, error, status));
+}
+let last_status = rows[rows.len() - 1].4.clone();
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "n [-]", "type": "integer" },
+    { "key": "1", "label": "Unknowns [-]", "type": "integer" },
+    { "key": "2", "label": "Iterations [-]", "type": "integer" },
+    { "key": "3", "label": "Maximum nodal velocity error [m/s]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "Termination reason" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "iterations" })
+);
+let outcome = match first_failure {
+    None => Outcome::satisfied("Iteration reached tolerance on every grid").status(last_status),
+    Some((status, true)) => Outcome::failed("Inner linear solves or globalization broke down on some grid")
+        .explanation("Increase Reynolds number gradually, using the previous solution as the initial guess.")
+        .status(status),
+    Some((status, false)) => Outcome::partial("Some grid stopped at a limit").status(status),
+};
+emit_outcome!(outcome);
+```
+
+At the defaults (sparse Cholesky, Stokes), GMRES needs 8, 12, and 12 iterations as unknowns increase from 106 to 1,276, showing little grid dependence.
+Maximum nodal error at $n=8$ is $3.3\times10^{-8}$ m/s, the algebraic error from stopping at the default tolerance $\sqrt{\varepsilon}$.
+AMG approximates $A^{-1}$, so iterations increase slowly to 22, 30, and 35.
+In exchange, AMG can avoid sparse Cholesky factor fill for large three-dimensional problems.
+
+For Navier–Stokes ($\mathrm{Re}=10$), Newton reaches `ResidualTolerance` in six iterations on every grid, with error at most $10^{-9}$ m/s.
+Poiseuille flow is an exact solution with vanishing advection, and Newton converges to it.
+Starting from zero at $\mathrm{Re}=100$ makes correction GMRES stop at its 200-iteration limit on every grid.
+The checked linear residual also fails forcing-term bound $\eta_{\max}=0.9$, so Newton stops with `LinearFailure(IterationLimit)`.
+The returned point is the last accepted iterate, retaining error 0.023 m/s even at $n=8$.
+The frozen Stokes preconditioner can no longer approximate the advection-dominated tangent; improve the initial guess by continuation or supply a tangent-appropriate preconditioner through `NavierStokesWorkspace::with_preconditioner`.
+
+## Summary
+
+Solve the indefinite Stokes saddle-point system with GMRES and preconditioning approximating the block LDU inverse.
+An accurate sparse Cholesky velocity solve and pressure-mass Schur approximation give nearly grid-independent iteration counts.
+Navier–Stokes passes a conservative residual and analytical tangent to Newton–Krylov; because frozen Stokes preconditioning loses accuracy at high Reynolds numbers, prepare initial guesses by continuation.
+When Navier–Stokes solves fail, distinguish limit termination from inner breakdown in the termination column, then revise the initial guess or preconditioner.
+
+## Further reading
+
+- [Mixed finite elements for incompressible flow](../incompressible-flow/): examine weak forms, inf-sup conditions, and pressure gauges.
+- [Time-dependent incompressible flow](../incompressible-time-stepping/): compute acceleration and pressure with a velocity-mass saddle-point system and advance the constrained-velocity ODE explicitly.
+- [Stokes driven cavity](../../examples/stokes-cavity/): refine with tighter tolerances to distinguish algebraic and discretization errors.
+- [Nonlinear steady problems](../nonlinear-steady-problems/): inspect Newton–Krylov termination and Jacobian representations.

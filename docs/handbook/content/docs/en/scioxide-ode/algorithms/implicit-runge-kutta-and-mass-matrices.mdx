@@ -1,0 +1,580 @@
+---
+title: "Implicit Runge–Kutta methods and mass matrices"
+description: "Implicit stage equations and iteration matrices, simplified and full Newton, Gauss and Radau IIA collocation, SDIRK, fixed-step and adaptive implicit methods, nonsingular mass matrices M y' = f, and replacement linear and nonlinear stage solvers."
+sidebar:
+  order: 320
+references:
+  ode-implicit-stage-equations: "stage-equations-and-iteration-matrices"
+  ode-newton-modes: "simplified-and-full-newton"
+  ode-collocation-methods: "gauss-and-radau-iia-collocation"
+  ode-radau-iia: "radau-iia"
+  ode-sdirk: "sdirk"
+  ode-mass-matrices: "equations-with-mass-matrices"
+  ode-stage-solver-injection: "replacing-stage-solvers"
+---
+
+For stiff systems arising in chemical reactions (combustion, Oregonator), circuit transients, and spatially semidiscrete PDEs (method of lines), explicit methods require small steps for stability ([Stiffness](../error-order-and-stability/)).
+Implicit Runge–Kutta trades coupled stage solves at each step for stable integration with larger steps.
+
+The crate `scioxide-ode` provides implicit Runge–Kutta methods `BackwardEuler`, `ImplicitTrapezoid`, `Sdirk`, `GaussRk`, and `RadauIia`, all handling $M y' = f(t, y)$ with constant nonsingular mass matrices.
+Only `RadauIia` is adaptive, with error estimation, dense output, and event detection.
+The other four use the fixed step supplied through `OdeOptions::with_initial_step` (or an estimated initial step if absent), without error estimates, dense output, or event detection.
+This page explains stage equations and Newton iteration, factorization reuse, collocation construction, SDIRK, mass matrices, and replacing stage solvers.
+[Jacobians and linear stage equations](../jacobians-and-linear-stages/) covers Jacobian evaluation and linear-solver selection.
+Other adaptive stiff methods are `Bdf` ([Linear multistep methods](../multistep-methods/)) and `RosenbrockW` ([Rosenbrock methods and automatic stiffness switching](../rosenbrock-and-stiffness-switching/)).
+
+## Stage equations and iteration matrices
+
+An $s$-stage Runge–Kutta method is implicit when coefficient matrix $A = (a_{ij})$ has nonzero entries on or above the diagonal.
+With mass matrix $M$, stage values $Y_i \in \mathbb{R}^d$ satisfy
+
+$$
+M\,(Y_i - y_n) = h \sum_{j=1}^s a_{ij}\, f(t_n + c_j h,\, Y_j), \qquad i = 1, \dots, s
+$$
+
+
+Combining stages gives the $sd$-dimensional nonlinear system $\mathcal{R}(Y) = 0$ with Jacobian
+
+$$
+\frac{\partial \mathcal{R}_i}{\partial Y_j} = \delta_{ij} M - h\, a_{ij}\, J_j, \qquad J_j = \frac{\partial f}{\partial y}(t_n + c_j h,\, Y_j)
+$$
+
+
+Using the same $J$ for all stages gives the Newton iteration matrix in Kronecker-product form
+
+$$
+E = I_s \otimes M - h\, A \otimes J
+$$
+
+
+For fully implicit methods (`GaussRk`, `RadauIia`), dense LU of this $sd \times sd$ matrix costs $O((sd)^3)$ per factorization.
+The method `GaussRk` solves both stages as one $2d \times 2d$ system.
+The method `RadauIia` transforms stage variables using eigenvalues of $A$, separating one real $d \times d$ system $M - h\gamma J$ and one complex $d \times d$ system, reducing factorization cost to about one-fifth of a $3d \times 3d$ system (three complex systems for complex states).
+
+### Newton convergence checks
+
+Let the Newton correction at iteration $k$ be $\Delta_k$ and the contraction factor $\theta = \|\Delta_k\| / \|\Delta_{k-1}\|$.
+The norm is normalized by tolerance scale $s_i = \mathrm{atol}_i + \mathrm{rtol} \cdot \max(|x_i|, |y_{n,i}|)$, then measured in units of one-tenth of tolerance.
+The iteration is considered divergent if $\theta \ge 1$ and converged if $\theta/(1 - \theta) \cdot \|\Delta_k\| \le 1$ (Hairer and Wanner II §IV.8).
+This estimates the remaining error after convergence as $\theta/(1-\theta)\,\|\Delta_k\|$, requiring at most one-tenth of the local error tolerance.
+
+On stage-iteration failure or a singular iteration matrix, adaptive `RadauIia` rejects the step and retries at half size.
+Fixed-step methods cannot change size, so they stop and return the error (such as `ConvergenceFailure` or `Singular`).
+Tolerances near rounding-error magnitude can make stage residuals rounding-limited and prevent convergence checks from passing, causing fixed-step methods to return `ConvergenceFailure`.
+
+### Simplified and full Newton
+
+The policy `NewtonMode` selects when to rebuild the Jacobian and iteration-matrix factorization.
+
+| `NewtonMode` | Contents |
+|---|---|
+| `Simplified` (default) | Retain and reuse Jacobians and factorizations across iterations and steps |
+| `Full` | Recompute the Jacobian and factor the iteration matrix for every correction |
+
+The methods `BackwardEuler`, `ImplicitTrapezoid`, `Sdirk`, and `GaussRk` select either through `with_newton_mode`.
+The method `RadauIia` always uses simplified Newton, as do iterations with replacement stage solvers.
+
+Simplified Newton rebuilds the Jacobian when:
+
+- Time or any state component $x$ moves by more than $0.5 \max(1, |x_{\text{old}}|, |x_{\text{new}}|)$ from the previous Jacobian evaluation point.
+  This check is skipped for systems with true `OdeSystem::jacobian_is_constant`.
+- More than two corrections are needed with the current factorization and the contraction factor exceeds 0.3.
+- Iteration fails.
+  First rebuild only the factorization; if failure persists, rebuild the Jacobian before rejecting the step.
+
+Coupled systems of at least two stages reuse factorizations after step changes when the effective step ratio lies in $[0.8, 1.2]$; residuals always use the current step's equations.
+The factorization and error estimate of `RadauIia` are always rebuilt for the current step.
+Reuse is confined to one `advance` call and assumes the same differentiation policy (`DerivativeStrategy`).
+With an analytical constant Jacobian and a current direct-solver factorization, fixed-step methods solve each stage with one correction.
+
+Full Newton converges quadratically, reducing iteration counts for strongly nonlinear problems but requiring Jacobian evaluation and factorization per correction.
+The [Replacing stage solvers](#replacing-stage-solvers) cell compares their evaluation and factorization counts.
+
+## Gauss and Radau IIA collocation
+
+Collocation determines a degree-$s$ polynomial $u(t)$ on $[t_n, t_{n+1}]$ satisfying differential equation $u'(t_n + c_i h) = f(t_n + c_i h, u(t_n + c_i h))$ at $s$ collocation points $t_n + c_i h$ and initial condition $u(t_n) = y_n$.
+With Lagrange basis polynomials $\ell_j(\tau)$ at points $c_1, \dots, c_s$, the Butcher coefficients are
+
+$$
+a_{ij} = \int_0^{c_i} \ell_j(\tau)\, d\tau, \qquad b_j = \int_0^1 \ell_j(\tau)\, d\tau
+$$
+
+
+Method order follows the quadrature rule at those points; stage order, the approximation order of stage values $Y_i$, is $s$.
+
+### Gauss methods
+
+Gauss methods choose Gauss–Legendre quadrature nodes on $(0, 1)$ as collocation points.
+The method `GaussRk` has two stages, points $c_{1,2} = 1/2 \mp \sqrt{3}/6$, and order $2s = 4$ (the highest attainable by an $s$-stage Runge–Kutta method).
+It is A-stable but not L-stable because $R(-\infty) = 1$.
+Gauss methods are symplectic; fixed-step integration with converged stage equations preserves the symplectic structure of Hamiltonian flows.
+Nonquadratic invariants such as energy are not preserved exactly, but their errors oscillate within bounded ranges rather than growing continually over long times.
+Quadratic invariants, such as harmonic-oscillator energy, are preserved to stage-solve accuracy.
+[Geometric integrators](../geometric-integrators/) covers long-term Hamiltonian integration.
+
+### Radau IIA
+
+Radau IIA chooses Radau quadrature nodes including endpoint $c_s = 1$ as collocation points.
+The method `RadauIia` has three stages, points $c_1 = (4 - \sqrt{6})/10$, $c_2 = (4 + \sqrt{6})/10$, and $c_3 = 1$, order $2s - 1 = 5$, and stage order 3.
+With $c_3 = 1$, the final stage equals new state $y_{n+1} = Y_3$ (stiffly accurate), giving $R(-\infty) = 0$ and L-stability.
+
+The method `RadauIia` advances steps as follows.
+
+- Solve stage equations with simplified Newton using a shared Jacobian for all stages.
+  Each iteration evaluates $f$ at all three stages, with at most seven iterations per step.
+- Estimate local error from the difference with a third-order embedded formula, filtering through the real iteration matrix $M - h\gamma J$ to remain bounded for stiff components.
+  The estimate scales as $h^4$ and does not bound fifth-order solution error.
+  On the first step or immediately after rejection, filter estimates exceeding tolerance again, requiring one extra $f$ evaluation.
+- Select step size with Gustafsson predictive control, also using Newton iteration counts ([Radau IIA predictive control](oxref:ode-step-controllers)).
+- Use the accepted-step cubic collocation polynomial for dense output, event detection, and initial stage predictions for the next step.
+
+The method `RadauIia` cannot solve DAEs with singular mass matrices; use `DaeBdf` from [Index-1 DAEs](../dae-index-one/).
+
+## SDIRK
+
+To avoid the coupled $sd$-dimensional system of fully implicit methods, singly diagonally implicit Runge–Kutta (SDIRK) makes $A$ lower triangular with shared diagonal value $a_{ii} = \gamma$.
+Each stage can be solved sequentially as an $d$-dimensional system, with the same iteration matrix for all stages,
+
+$$
+M - h\gamma J
+$$
+
+
+The method `Sdirk` is Alexander's three-stage third-order L-stable method; $\gamma \approx 0.435866521508459$ is the root of $6\gamma^3 - 18\gamma^2 + 9\gamma - 1 = 0$ giving L-stability.
+Its stiffly accurate coefficients make the final stage equal the solution; simplified Newton reuses one factorization of $d \times d$ for all three stages.
+Stage order is 1, so strongly stiff problems can reduce observed order ([Observed order by step halving](oxref:ode-step-halving)).
+
+The method `BackwardEuler` is single-stage, first-order, and L-stable; `ImplicitTrapezoid` (Crank–Nicolson) is second-order and A-stable but not L-stable.
+Since implicit trapezoidal has $R(-\infty) = -1$, stiff components alternate sign each step without damping.
+
+## Method overview
+
+| Method | Stages | Order | Step | Stability | Dense output and events | Choice of `NewtonMode` |
+|---|---|---|---|---|---|---|
+| `BackwardEuler` | 1 | 1 | Fixed | L-stable | None | Supported |
+| `ImplicitTrapezoid` | 1 (implicit) | 2 | Fixed | A-stable | None | Supported |
+| `Sdirk` | 3 | 3 | Fixed | L-stable | None | Supported |
+| `GaussRk` | 2 | 4 | Fixed | A-stable, symplectic | None | Supported |
+| `RadauIia` | 3 | 5 (estimate 3) | Adaptive | L-stable | Cubic collocation polynomial | Simplified Newton only |
+
+Every method selects stage linear solvers (`OdeStageBackend`) through `with_backend` and Jacobian evaluation through `with_derivative_strategy`.
+Mass matrices require the default dense LU solver.
+
+## Equations with mass matrices
+
+Finite-element and electrical circuit models produce systems $M y' = f(t, y)$ with constant mass matrices $M \in \mathbb{R}^{d \times d}$.
+Computing $M^{-1}$ and reformulating as $y' = M^{-1} f$ destroys sparsity and increases rounding error when $M$ is ill-conditioned.
+
+Implicit methods construct iteration matrices directly as $M - h\gamma J$ (a matrix pencil), without forming $M^{-1}$.
+Supply a mass matrix through the revision returned by `OdeSystem::mass_matrix_revision` and through `OdeSystem::mass_matrix`.
+Revision `None` (default) means identity; the same matrix must be written while `Some(r)`.
+A changed revision causes implicit methods to read the new matrix at the next step.
+Calls to `mass_matrix` count as `LinearOperator` evaluations.
+Mass matrices must be nonsingular; sparse LU and Krylov solvers permit only identity (otherwise `InvalidInput` is returned when reading the matrix at the first step).
+Handle singular $M$ through residual-form DAEs (`DaeSystem`).
+Explicit methods do not support mass matrices; a system returning a revision gives `InvalidInput` (`UnsupportedConfiguration`).
+
+The next cell solves $m\,y' = -100\,y$, $y(0) = 1$ through $60h$ with supplied mass matrix $M = [m]$ using four implicit methods.
+Inputs are mass coefficient $m$ (timescale $m/100$ s) and step $h$, together determining $z = -100h/m$.
+The method `RadauIia` starts with $h$ and adjusts steps to tolerances; the other three use fixed steps.
+The table shows first accepted step $\Delta t$ and its amplification $y_1/y_0$, comparing with exact value $\exp(-100\,\Delta t/m)$ over the same interval.
+
+```rust
+//| id: ode-mass-stiff-decay
+//| ref: ode-mass-stiff-decay
+//| title: "Vary mass coefficients and steps to compare damping of four implicit methods"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-linalg, scioxide-ode]
+//| inputs:
+//|   mass_coefficient: {"type":"range","label":"Mass coefficient m [-]","description":"Vary timescale m/100 [s].","min":0.2,"max":10,"step":0.2,"value":2}
+//|   step_size: {"type":"range","label":"Time step h [s]","description":"Vary z = −100h/m.","min":0.005,"max":0.3,"step":0.005,"value":0.08}
+//| cases:
+//|   - {"id":"mild","label":"h = 0.01 s","description":"At |z| = 0.5, the three fixed-step methods also approximate exact decay closely.","inputs":{"step_size":0.01}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"decay","path":"/rows/1/2","approx":{"value":-0.0761,"atol":5e-4}}
+//|       - {"artifact":"decay","path":"/rows/2/2","approx":{"value":0.07692,"atol":5e-5}}
+//|       - {"artifact":"decay","path":"/rows/3/2","approx":{"value":-0.3333333,"atol":1e-6}}
+//|       - {"artifact":"decay","path":"/rows/0/5","equals":"ReachedEnd"}
+//|   - case: mild
+//|     expect:
+//|       - {"artifact":"decay","path":"/rows/3/2","approx":{"value":0.6,"atol":1e-6}}
+use scioxide_core::{ExecutionContext, SciOxideError, SolveContext};
+use scioxide_linalg::{MatrixViewMut, Vector};
+use scioxide_ode::{
+    GaussRk, ImplicitTrapezoid, OdeMethod, OdeOptions, OdeOutputSchedule, OdeProblem, OdeState,
+    OdeSystem, OdeTermination, OdeTrajectory, RadauIia, Sdirk,
+};
+
+// m y' = −100 y. Supply mass matrix M = [m] with a revision, without forming its inverse.
+struct MassDecay(f64);
+impl OdeSystem<f64> for MassDecay {
+    fn dimension(&self) -> usize {
+        1
+    }
+    fn rhs(
+        &self,
+        _: f64,
+        y: &[f64],
+        out: &mut [f64],
+        _: &mut SolveContext<'_, '_>,
+    ) -> Result<(), SciOxideError> {
+        out[0] = -100.0 * y[0];
+        Ok(())
+    }
+    fn jacobian(
+        &self,
+        _: f64,
+        _: &[f64],
+        j: &mut MatrixViewMut<'_, f64>,
+        _: &mut SolveContext<'_, '_>,
+    ) -> Result<Option<()>, SciOxideError> {
+        j.set(0, 0, -100.0)?;
+        Ok(Some(()))
+    }
+    fn jacobian_is_constant(&self) -> bool {
+        true
+    }
+    fn mass_matrix_revision(&self) -> Option<u64> {
+        Some(1)
+    }
+    fn mass_matrix(
+        &self,
+        mass: &mut MatrixViewMut<'_, f64>,
+        _: &mut SolveContext<'_, '_>,
+    ) -> Result<(), SciOxideError> {
+        mass.set(0, 0, self.0)
+    }
+}
+
+// Integrate with step h through 60h, returning accepted (t, y) points and termination status.
+fn trajectory<M: OdeMethod<f64> + Clone>(
+    method: M,
+    system: &MassDecay,
+    h: f64,
+) -> Result<(Vec<[f64; 2]>, Option<OdeTermination>), String> {
+    let options = OdeOptions::new()
+        .with_initial_step(h)
+        .with_output_schedule(OdeOutputSchedule::AcceptedSteps);
+    let problem = OdeProblem::new(system, 60.0 * h);
+    let mut workspace = method
+        .workspace(&problem, &options)
+        .map_err(|e| e.to_string())?;
+    let mut state = OdeState::new(0.0, Vector::from_vec(vec![1.0]));
+    let mut path = OdeTrajectory::new();
+    let report = method
+        .advance(
+            &problem,
+            &options,
+            &mut state,
+            &mut path,
+            &mut workspace,
+            ExecutionContext::sequential(),
+        )
+        .map_err(|e| e.to_string())?;
+    let points = path
+        .times()
+        .iter()
+        .zip(path.states())
+        .map(|(&t, y)| [t, y.as_slice()[0]])
+        .collect();
+    Ok((points, report.termination()))
+}
+
+let fixed4 = serde_json::json!({ "fractionDigits": 4 });
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let system = MassDecay(mass_coefficient);
+let h = step_size;
+let results = [
+    (
+        "RadauIia (L-stable)",
+        trajectory(RadauIia::new(), &system, h)?,
+    ),
+    ("Sdirk (L-stable)", trajectory(Sdirk::new(), &system, h)?),
+    ("GaussRk (A-stable)", trajectory(GaussRk::new(), &system, h)?),
+    (
+        "Implicit trapezoidal (A-stable)",
+        trajectory(ImplicitTrapezoid::new(), &system, h)?,
+    ),
+];
+// Plot exact solution y = exp(−100 t / m) (f64 standard-function reference) dashed.
+let exact: Vec<[f64; 2]> = (0..=60)
+    .map(|i| f64::from(i) * h)
+    .map(|t| [t, (-100.0 * t / mass_coefficient).exp()])
+    .collect();
+let dashed = serde_json::json!({ "lineType": "dashed" });
+let mut series =
+    vec![serde_json::json!({ "name": "Exact solution", "points": exact, "style": dashed })];
+let mut rows = Vec::new();
+for (name, (points, termination)) in results {
+    let first_step = points[1][0] - points[0][0];
+    rows.push((
+        name,
+        first_step,
+        points[1][1],
+        (-100.0 * first_step / mass_coefficient).exp(),
+        points.len() - 1,
+        termination.map_or_else(String::new, |t| t.to_string()),
+    ));
+    series.push(serde_json::json!({ "name": name, "points": points }));
+}
+// Fix the vertical axis at ±1 to reveal sign oscillations.
+emit_line_chart!(
+    &series,
+    options = &serde_json::json!({
+        "xLabel": "Time t [s]",
+        "yLabel": "State y(t) [-]",
+        "yMin": -1.0,
+        "yMax": 1.0,
+        "annotations": [{ "kind": "line", "axis": "y", "value": 0.0 }]
+    })
+);
+let columns = serde_json::json!([
+    { "key": "0", "label": "Method" },
+    { "key": "1", "label": "First accepted step Δt [s]", "type": "number", "format": sci3 },
+    { "key": "2", "label": "Amplification y₁/y₀ [-]", "type": "number", "format": fixed4 },
+    { "key": "3", "label": "Exact value over the same Δt [-]", "type": "number", "format": fixed4 },
+    { "key": "4", "label": "Accepted steps [count]", "type": "integer" },
+    { "key": "5", "label": "Termination" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "decay" })
+);
+```
+
+For default $m = 2$ and $h = 0.08$ s ($z = -4$), fixed-step amplification is $-0.0761$ for `Sdirk`, $0.0769$ for `GaussRk`, and $-0.333$ for implicit trapezoidal, differing from exact $e^{-4} = 0.0183$.
+Negative amplification in `Sdirk` and implicit trapezoidal appears as alternating step signs in the plot.
+The method `RadauIia` reduces its initial 0.08 s step and accepts at $\Delta t = 0.0163$ s; its amplification 0.44219 agrees to four digits with exact 0.44217 over the same $\Delta t$.
+At $m = 0.2$ ($z = -40$), amplifications of `GaussRk` and implicit trapezoidal become $0.741$ and $-0.905$, barely damping fast components.
+The amplification of `Sdirk` is $-0.059$, approaching zero through L-stability.
+At $h = 0.01$ s ($z = -0.5$), all three fixed-step amplifications agree with exact 0.6065 within 0.007.
+The four methods' first outputs occur at different times; interpret table $\Delta t$ alongside exact values rather than comparing outputs as simultaneous.
+
+## Replacing stage solvers
+
+With a suitable linear or nonlinear solver, pass `OdeStageSolver` through `OdeProblem::with_stage_solver` to replace implicit Runge–Kutta stage solving.
+Only `BackwardEuler`, `ImplicitTrapezoid`, `Sdirk`, `GaussRk`, and `RadauIia` accept replacement; other methods return `InvalidInput` (`UnsupportedConfiguration`).
+
+| `OdeStageSolver` | Contents |
+|---|---|
+| `Native` (default) | Use the method's own Newton iteration and linear solver |
+| `Linear(&solver)` | Solve only the simplified-Newton linear system $E c = r$ with `StageLinearSolver` |
+| `Nonlinear(&solver)` | Solve the entire nonlinear stage iteration with `NonlinearStageSolver` |
+
+The solver `StageLinearSolver::solve_into(operator, state, residual, correction, accuracy, cx)` receives iteration matrix $E$ as matrix-free operator `operator`, writing correction $c$ into `correction`.
+Apply `operator` with `LinearOperator::apply_into_scoped` under `cx`.
+Replacement solvers count their own work: call `StageAccuracy::admit_iteration` before each iteration and `StageAccuracy::admit_provider` before each operator application (with roles such as `EvaluationRole::LinearOperator`).
+Returning `Ok(())` claims convergence; the integrator applies the operator once per correction to check residuals, rejecting corrections exceeding stage linear-system tolerance.
+If inner iteration fails, return an error such as `ConvergenceFailure` or `Singular`; the integrator propagates it unchanged.
+Prepare workspace before integration; one application of `operator` needs `apply_workspace_len()` workspace values.
+
+The solver `NonlinearStageSolver::solve_in_place(residual_fn, operator, state, residual, correction, accuracy, cx)` solves stage equations from initial values `state`, writing the solution to `state`.
+The callback `residual_fn` evaluates stage residuals; `operator` is iteration matrix $E$.
+Use `StageAccuracy::correction_norm` for convergence (correction norm in units of one-tenth of tolerance; at most 1 is the integrator's own Newton stopping test).
+The returned `NonlinearStageReport::new(iterations, linear_solves, factorizations)` gives iteration, linear-solve, and factorization counts, added to the integrator's totals.
+Returning `Ok` claims convergence to requested accuracy; the integrator checks only finite states.
+A zero-iteration report requires an exactly zero residual.
+Errors from replacement solvers do not cause even `RadauIia` to retry with smaller steps.
+
+The value `StageAccuracy` holds the step-start state, tolerances, and iteration limit for one stage solve.
+The method `component_scale(index, candidate)` returns component scale $s_i = \mathrm{atol}_i + \mathrm{rtol} \cdot \max(|y_{n,i}|, |\mathrm{candidate}|)$; `iteration_limit()` returns the iteration limit.
+For coupled methods with at least two stages, vectors concatenate one state vector per stage; `correction_norm` returns the maximum separately normalized stage norm.
+With replacement solvers, the integrator forms no stage factorizations (`RadauIia` still factorizes the real matrix for error estimation).
+
+The following cell solves the $d = 8$-component nonlinear stiff system with diagonal Jacobian,
+
+$$
+y_i' = -k_i\, y_i - y_i^3, \qquad y_i(0) = 1, \qquad k_i = 10^{K i/7} \quad (i = 0, \dots, 7)
+$$
+
+using `Sdirk` over $[0, 1]$.
+The exact solution is $y_i(t) = \bigl((1 + 1/k_i)\, e^{2k_i t} - 1/k_i\bigr)^{-1/2}$.
+Compare simplified Newton, full Newton, and `StageLinearSolver` exploiting the diagonal iteration matrix.
+The replacement solver applies $E$ once to an all-ones vector to extract its diagonal, then computes corrections with $c_i = r_i / E_{ii}$ (unsuitable for nondiagonal $E$).
+Inputs are step $h$ and stiffness exponent $K$; the table gives terminal error and counts of Jacobian evaluations, factorizations, Newton corrections (linear solves), operator applications, and right-hand-side evaluations.
+
+```rust
+//| id: ode-stage-solver-modes
+//| ref: ode-stage-solver-modes
+//| title: "Compare work for simplified Newton, full Newton, and a replacement linear solver"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-linalg, scioxide-ode]
+//| inputs:
+//|   step_size: {"type":"range","label":"Step h [-]","description":"Fixed Sdirk step size.","min":0.005,"max":0.05,"step":0.005,"value":0.01}
+//|   stiffness_exponent: {"type":"range","label":"Stiffness exponent K [-]","description":"Distribute decay rates k_i from 1 to 10^K.","min":1,"max":6,"step":1,"value":4}
+//| cases:
+//|   - {"id":"stiff","label":"K = 6","description":"All three solvers retain comparable errors as stiffness increases.","inputs":{"stiffness_exponent":6}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"work","path":"/rows/0/1","range":{"max":1e-6}}
+//|       - {"artifact":"work","path":"/rows/2/1","range":{"max":1e-6}}
+//|       - {"artifact":"work","path":"/rows/2/3","equals":0}
+//|       - {"artifact":"work","path":"/rows/1/2","range":{"min":100}}
+//|   - case: stiff
+//|     expect:
+//|       - {"artifact":"work","path":"/rows/0/1","range":{"max":1e-6}}
+use scioxide_core::{
+    ErrorTolerance, EvaluationRole, ExecutionContext, SciOxideError, Invocation, LinearOperator,
+    NormSelection, OperatorContext, SolveContext,
+};
+use scioxide_linalg::{MatrixViewMut, Vector};
+use scioxide_ode::{
+    NewtonMode, OdeFn, OdeMethod, OdeOptions, OdeProblem, OdeStageSolver, OdeState, Sdirk,
+    StageAccuracy, StageLinearSolver,
+};
+use std::cell::RefCell;
+
+// Apply diagonal iteration matrix E to an all-ones vector to obtain its diagonal, then solve E c = r.
+struct DiagonalSolver {
+    ones: Vec<f64>,
+    diagonal: RefCell<Vec<f64>>,
+}
+impl StageLinearSolver<f64> for DiagonalSolver {
+    fn solve_into(
+        &self,
+        operator: &dyn LinearOperator<f64>,
+        _: &[f64],
+        residual: &[f64],
+        correction: &mut [f64],
+        accuracy: StageAccuracy<'_, f64>,
+        cx: &mut SolveContext<'_, '_>,
+    ) -> Result<(), SciOxideError> {
+        let mut diagonal = self.diagonal.borrow_mut();
+        // Count operator applications yourself before applying them.
+        accuracy.admit_provider(EvaluationRole::LinearOperator, cx)?;
+        operator
+            .apply_into_scoped(
+                &self.ones,
+                &mut diagonal,
+                &mut [],
+                &mut OperatorContext::new(cx),
+            )
+            .and_then(Invocation::require)?;
+        for ((c, r), d) in correction.iter_mut().zip(residual).zip(diagonal.iter()) {
+            *c = r / d;
+        }
+        Ok(())
+    }
+}
+
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let n = 8_usize;
+let rates: Vec<f64> = (0..n)
+    .map(|i| 10.0_f64.powf(stiffness_exponent * i as f64 / 7.0))
+    .collect();
+let (k, kj) = (rates.clone(), rates.clone());
+let system = OdeFn::new(n, move |_: f64, y: &[f64], out: &mut [f64]| {
+    for ((out, &y), &k) in out.iter_mut().zip(y).zip(&k) {
+        *out = -k * y - y * y * y;
+    }
+    Ok(())
+})
+.map_err(|e| e.to_string())?
+.with_jacobian(move |_: f64, y: &[f64], j: &mut MatrixViewMut<'_, f64>| {
+    for row in 0..y.len() {
+        for col in 0..y.len() {
+            let value = if row == col {
+                -kj[row] - 3.0 * y[row] * y[row]
+            } else {
+                0.0
+            };
+            j.set(row, col, value)?;
+        }
+    }
+    Ok(())
+});
+let solver = DiagonalSolver {
+    ones: vec![1.0; n],
+    diagonal: RefCell::new(vec![0.0; n]),
+};
+let tolerance = ErrorTolerance::scalar(1e-8, 1e-8, NormSelection::RootMeanSquare)
+    .map_err(|e| e.to_string())?;
+// Increase the step by 4ε to avoid an extra short step from rounding.
+let options = OdeOptions::new()
+    .with_error_tolerance(tolerance)
+    .with_initial_step(step_size + 4.0 * f64::EPSILON);
+let native = OdeProblem::new(&system, 1.0);
+let injected = native.with_stage_solver(OdeStageSolver::Linear(&solver));
+let cases = [
+    ("Simplified Newton", NewtonMode::Simplified, &native),
+    ("Full Newton", NewtonMode::Full, &native),
+    (
+        "Replacement diagonal linear solver",
+        NewtonMode::Simplified,
+        &injected,
+    ),
+];
+let mut rows = Vec::new();
+for (name, mode, problem) in cases {
+    let method = Sdirk::new().with_newton_mode(mode);
+    let mut workspace = method
+        .workspace(problem, &options)
+        .map_err(|e| e.to_string())?;
+    let mut state = OdeState::new(0.0, Vector::from_vec(vec![1.0; n]));
+    let report = method
+        .advance(
+            problem,
+            &options,
+            &mut state,
+            &mut (),
+            &mut workspace,
+            ExecutionContext::sequential(),
+        )
+        .map_err(|e| e.to_string())?;
+    if !report.is_success() {
+        return Err(format!("{name}: {:?}", report.termination()));
+    }
+    // Independent check: maximum componentwise difference from the exact solution (f64 standard functions).
+    let error = state
+        .values()
+        .iter()
+        .zip(&rates)
+        .map(|(&y, &k)| (y - ((1.0 + 1.0 / k) * (2.0 * k).exp() - 1.0 / k).powf(-0.5)).abs())
+        .fold(0.0, f64::max);
+    let counts = report.accounting().total().map_err(|e| e.to_string())?;
+    rows.push((
+        name,
+        error,
+        counts.provider(EvaluationRole::Jacobian),
+        counts.provider(EvaluationRole::Factorization),
+        counts.provider(EvaluationRole::LinearSolve),
+        counts.provider(EvaluationRole::LinearOperator),
+        counts.provider(EvaluationRole::RightHandSide),
+    ));
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "Stage solver" },
+    { "key": "1", "label": "Terminal error [-]", "type": "number", "format": sci2 },
+    { "key": "2", "label": "Jacobians [count]", "type": "integer" },
+    { "key": "3", "label": "Factorizations [count]", "type": "integer" },
+    { "key": "4", "label": "Newton corrections [count]", "type": "integer" },
+    { "key": "5", "label": "Operator applications [count]", "type": "integer" },
+    { "key": "6", "label": "Right-hand-side evaluations [count]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "work" })
+);
+```
+
+With defaults ($h = 0.01$, $K = 4$), all three have terminal error $1.6 \times 10^{-7}$, and the replacement diagonal solver gives the same values as simplified Newton.
+Simplified Newton completes 100 steps (300 stage solves) with five Jacobian evaluations, five factorizations, and 827 corrections.
+Full Newton rebuilds the Jacobian and factorization for every correction, giving 607 of each.
+Its 607 corrections and 907 right-hand-side evaluations are fewer than simplified Newton's 827 and 1128, but per-factorization cost $O(d^3)$ dominates for large $d$.
+The replacement solver forms no factorizations and applies the operator 1654 times, twice per correction (once inside the solver and once for the integrator's residual check).
+Even at $K = 6$, all three errors lie between $9.1 \times 10^{-8}$ and $1.0 \times 10^{-7}$.
+
+## Summary
+
+Implicit Runge–Kutta solves stage equations with Newton; default simplified Newton reuses Jacobians and factorizations across iterations and steps.
+Only `RadauIia` is adaptive; other implicit Runge–Kutta methods use fixed steps without error estimates, dense output, or event detection.
+L-stable `RadauIia`, `Sdirk`, and `BackwardEuler` damp fast components at large $|z|$; A-stable `GaussRk` and implicit trapezoidal barely damp them.
+Supply nonsingular mass matrices with revisions and use dense LU.
+Structure-aware linear or nonlinear solvers can replace stages through `OdeStageSolver`, but the integrator cannot fully verify their claimed convergence; work counting and convergence checks must follow `StageAccuracy`.
+
+[Jacobians and linear stage equations](../jacobians-and-linear-stages/) covers Jacobians, sparse matrices, and Krylov stage solves; [Linear multistep methods](../multistep-methods/) covers adaptive stiff integration with multistep formulas; [Index-1 DAEs](../dae-index-one/) covers singular mass matrices.

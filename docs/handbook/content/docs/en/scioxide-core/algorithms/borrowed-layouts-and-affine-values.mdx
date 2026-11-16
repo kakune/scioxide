@@ -1,0 +1,485 @@
+---
+title: "Borrowed layouts and affine values"
+description: "Element count, span, and overlap checks with Shape and StridedLayout, row_major layouts, borrowing with NdView and NdViewMut, column-major block vectors, AffineValue component access, and single-rounding affine_combination_into with unchanged output on failure."
+sidebar:
+  order: 355
+references:
+  core-block-vectors: "column-major-block-vectors"
+  core-affine-components: "component-access-for-affine-values"
+  core-layout-injectivity: "proving-injectivity"
+  core-shape-and-size: "shapes-and-element-counts"
+  core-row-major-layout: "row-major-layouts"
+  core-views-and-coordinates: "views-and-coordinates"
+  core-affine-combination-rounding: "single-rounding-linear-combinations-with-affine_combination_into"
+---
+
+Separating data ownership from layout (shape and strides) lets multidimensional computations read the same storage as a transpose or broadcast without copying it.
+`scioxide-core` provides layout descriptions `Shape` and `StridedLayout`, `NdView` / `NdViewMut` associating them with storage, and column-major block vectors for passing multiple right-hand sides to operators.
+It also provides `AffineValue` for writing state-vector linear combinations independently of storage representation.
+
+## Strided layouts and overlap checks
+
+A layout with shape $(n_0, \ldots, n_{d-1})$ and strides $(s_0, \ldots, s_{d-1})$ maps logical coordinates $\mathbf{i} = (i_0, \ldots, i_{d-1})$ to storage position
+
+$$
+\mathrm{offset}(\mathbf{i}) = \sum_{k=0}^{d-1} i_k\, s_k, \qquad 0 \le i_k < n_k
+$$
+
+
+Here $d$ is the number of axes (rank), $n_k$ the length of axis $k$, and $s_k$ the number of elements advanced by incrementing the index of axis $k$.
+Strides count elements, not bytes.
+Strides are unsigned `usize` values, so reverse traversal cannot be represented.
+Pass a storage subslice to shift the origin.
+For an $m \times n$ matrix, row-major strides (last axis varying fastest) are $(n, 1)$, and column-major strides are $(1, m)$.
+Operations traversing logical element order (`offsets()`, `iter()`, `for_each_mut`) use row-major order regardless of strides.
+
+### Shapes and element counts
+
+`Shape::new(&extents)` borrows an axis-length array and computes element count $N = \prod_k n_k$ using checked products.
+Any zero-length axis identifies an empty shape ($N = 0$) before multiplication, preventing overflow regardless of other axis lengths.
+A shape with no axes (rank zero) represents one scalar ($N = 1$).
+A nonempty shape product exceeding `usize` returns `SizeOverflow`.
+`rank()` returns rank, `len()` element count, `is_empty()` emptiness, and `extents()` the axis-length array.
+`extent(k)` returns the length of axis $k$, returning `OutOfBounds` for out-of-range axes.
+
+`StridedLayout` holds only shape and strides, not element storage.
+Retrieve shape through `shape()` and the stride slice through `strides()`.
+With nonnegative strides, the largest reachable position is $\sum_k (n_k - 1) s_k$, obtained by setting each axis to $i_k = n_k - 1$.
+`required_span()` returns the required storage length, one plus that position,
+
+$$
+\mathrm{span} = 1 + \sum_{k=0}^{d-1} (n_k - 1)\, s_k
+$$
+
+as given above; empty layouts return zero.
+Construction computes this sum with checked arithmetic, returning `SizeOverflow` if it exceeds `usize`, or `DimensionMismatch` if shape and stride arrays differ in length.
+`offset(coords)` computes a position from coordinates in time proportional to rank, without heap allocation.
+A coordinate count different from rank produces `DimensionMismatch`; a component at least its axis length produces `OutOfBounds`.
+
+### Row-major layouts
+
+Unpadded row-major arrays are the most common layout, so they can be constructed without supplying a stride array.
+`StridedLayout::row_major(&shape)` borrows only the shape and derives strides
+
+$$
+s_k = \prod_{j > k} n_j
+$$
+
+
+The last axis has stride 1; elements fill storage $0, \ldots, N - 1$ in row-major order, so `required_span()` equals element count $N$.
+Positions correspond to row-major linear indices written in mixed radix with place weights $s_k$, so distinct coordinates map to distinct positions.
+Construction therefore takes time proportional to rank and skips the injectivity check described next.
+
+Derived strides are stored in a fixed-size array inside the layout.
+Thus `row_major` supports rank up to `StridedLayout::ROW_MAJOR_MAX_RANK` (8); higher-rank shapes are rejected as `InvalidInput` (reason `InvalidInputReason::OutOfRange`).
+A nonempty shape whose element count exceeds `usize` returns `SizeOverflow`.
+Use `StridedLayout::new` with explicit strides for padded arrays, transposes, or rank at least 9.
+
+`strides()` returns strides as a borrowed slice.
+For layouts constructed with `new` it refers to the caller's array; for `row_major` it refers to the first $d$ entries of the layout's own array.
+`Shape`, `StridedLayout`, and `NdView` are `Copy`, so they can be passed by value or used to construct several views of one layout.
+
+### Proving injectivity
+
+Writing requires distinct coordinates to map to distinct positions (injectivity).
+With overlapping coordinates, later writes overwrite earlier values, making results depend on traversal order.
+`StridedLayout::new` accepts only layouts whose injectivity can be proved, otherwise returning `InvalidInput` (reason `InvalidInputReason::Inconsistent`).
+`StridedLayout::new_broadcast` permits overlap and can represent broadcasting through zero strides.
+`is_proven_injective()` reports whether injectivity was proved.
+
+With at most two axes of length at least 2, injectivity is decided exactly.
+For one such axis, its stride must be nonzero.
+For two, coordinates collide when an index displacement satisfies $a s = b t$ ($|a| < n_0$, $|b| < n_1$, $(a, b) \ne (0, 0)$) for strides $s$ and $t$ with lengths $n_0$ and $n_1$.
+For nonzero strides, setting $g = \gcd(s, t)$ gives minimal displacements $a = t/g$ and $b = s/g$; injectivity therefore holds if and only if $n_0 \le t/g$ or $n_1 \le s/g$.
+This test is exposed as `backend::matrix_layout_is_injective` and uses Euclid's algorithm, taking $O(\log \max(s, t))$ time.
+A zero stride on an axis of length at least 2 prevents injectivity.
+
+With at least three axes of length at least 2, order axes by increasing stride and verify each stride is at least the span covered by lower-stride axes (the length corresponding to `required_span()` up to that point).
+This is a sufficient condition; some injective layouts do not satisfy it.
+The result is therefore treated as proved injectivity, and the check takes time quadratic in rank.
+Empty layouts contain no elements and are injective regardless of strides.
+
+### Views and coordinates
+
+`NdView::new(data, layout)` checks that storage is at least `required_span()` long; `NdViewMut::new(data, layout)` additionally requires proved injectivity.
+Short storage produces `DimensionMismatch`; supplying an unproved layout to `NdViewMut::new` produces `InvalidInput`.
+Extra trailing elements are allowed and are neither read nor modified by the view.
+`NdView::row_major(data, &shape)` and `NdViewMut::row_major(data, &shape)` construct a `StridedLayout::row_major` layout and view together.
+Since row-major layouts are injective, `NdViewMut::row_major` rejects only rank above 8, element-count overflow, and short storage.
+No constructor allocates on the heap.
+
+| View | Accepted layouts | Main methods |
+|---|---|---|
+| `NdView` | Injective or broadcast layouts | `get(coords)`, `iter()` in row-major logical order, `storage()`, `layout()` |
+| `NdViewMut` | Only layouts with proved injectivity | `get_mut(coords)`, row-major `for_each_mut`, `contiguous_mut()`, `as_view()`, `layout()` |
+
+`storage()` returns all storage, including padding and trailing elements.
+`contiguous_mut()` returns elements as one mutable slice only for an unpadded contiguous row-major layout.
+Other layouts return `None`.
+
+Coordinates for `StridedLayout::offset`, `NdView::get`, and `NdViewMut::get_mut` accept exact-length iterators as well as slices and arrays.
+No temporary array allocation is needed to reorder or compute coordinates.
+Rank and component bounds are checked identically for every input form.
+
+To obtain one-dimensional sequences (lanes) along an axis, construct `BatchLayout` through `layout.axis(k)`.
+`len()` returns lane count (the product of other axis lengths); `lane(b)` returns lane $b$ as `AxisLayout` (start `start()`, length `len()`, stride `stride()`).
+Lanes are indexed in row-major order of the other coordinates.
+`permuted(order, extents, strides)` returns an axis-permuted layout, such as a transpose.
+The caller supplies the reordered shape and strides so the result can borrow them; this method verifies that they permute the original axes.
+Axis permutation changes neither required storage length nor injectivity, so both are inherited from the original layout.
+
+### Column-major block vectors
+
+For iterative methods with multiple right-hand sides, place $r$ vectors of $m$ rows column-major, with column $j$ in storage `values[j·m .. (j+1)·m]`.
+This layout has shape $(m, r)$ and strides $(1, m)$; every column is contiguous.
+`BlockVectorView` (read-only) and `BlockVectorViewMut` (writable) are views specialized for this layout.
+
+`BlockVectorView::new(values, rows, right_hand_sides)` and `BlockVectorViewMut::new` return `SizeOverflow` if $m r$ exceeds `usize`, or `DimensionMismatch` unless `values` has length exactly $m r$.
+Unlike `NdView`, they do not permit extra trailing elements.
+`column(j)` and `column_mut(j)` return column $j$ as a contiguous slice, returning `OutOfBounds` when $j \ge r$.
+`as_slice()` and `as_mut_slice()` return all storage in column-major order.
+These views check only length, not whether storage actually contains column-major data.
+`BlockOperator::apply_block_into` and `Preconditioner::precondition_block_into` take these input and output types; default implementations write output only after all column computations succeed ([Operator protocols and closure operators](../operator-protocols-and-structure/)).
+
+The following cell chooses row count $n_0$, column count $n_1$, and stride kind, displaying layout properties and positions of all coordinates.
+Row and column inputs are integers from 2 to 4, with four stride choices.
+Row-major uses `StridedLayout::row_major`; the other three supply strides to overlap-permitting `new_broadcast`.
+The overlapping case uses strides $(1, 1)$, mapping $(0, 1)$ and $(1, 0)$ to the same position.
+Storage contains its own indices as values $0, 1, 2, \ldots$, so view values can be read as storage positions.
+
+The first table shows strides from `strides()`, element count, `required_span()`, proved injectivity, and results of `NdViewMut::new` and `BlockVectorView::new`.
+The second lists `offset` positions and `NdView::get` values per coordinate $(i, j)$.
+The final column shows component $i$ of column $j$ when the same storage is read as a block with $m = n_0$ and $r = n_1$.
+Check that positions equal $i s_0 + j s_1$ and `required_span()` agrees with $1 + (n_0 - 1) s_0 + (n_1 - 1) s_1$.
+
+```rust
+//| id: core-strided-views
+//| ref: core-strided-views
+//| title: "Strides and injectivity"
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   rows: {"type":"range","label":"Row count n₀","description":"Length of axis 0.","min":2,"max":4,"step":1,"value":3}
+//|   cols: {"type":"range","label":"Column count n₁","description":"Length of axis 1.","min":2,"max":4,"step":1,"value":3}
+//|   layout_mode: {"type":"select","label":"Strides","description":"Row-major, column-major, row broadcast, or overlapping layout.","options":["Row-major (cols, 1)","Column-major (1, rows)","Row broadcast (0, 1)","Overlap (1, 1)"],"value":"Column-major (1, rows)"}
+//| cases:
+//|   - {"id":"row-major","label":"Row-major","description":"row_major derives strides (n₁, 1). The block reads the same storage as a different matrix.","inputs":{"layout_mode":"Row-major (cols, 1)"}}
+//|   - {"id":"broadcast","label":"Row broadcast","description":"All rows read the same n₁ positions; no writable view can be constructed.","inputs":{"layout_mode":"Row broadcast (0, 1)"}}
+//|   - {"id":"overlap","label":"Overlapping 2 × 4","description":"With strides (1, 1), (0, 1) and (1, 0) map to the same position.","inputs":{"rows":2,"cols":4,"layout_mode":"Overlap (1, 1)"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":1}
+//|       - {"artifact":"summary","path":"/rows/0/1","equals":3}
+//|       - {"artifact":"summary","path":"/rows/0/3","equals":9}
+//|       - {"artifact":"summary","path":"/rows/0/4","equals":"Proved"}
+//|       - {"artifact":"summary","path":"/rows/0/5","equals":"Can construct"}
+//|       - {"artifact":"elements","path":"/rows/1/2","equals":3}
+//|       - {"artifact":"elements","path":"/rows/1/4","approx":{"value":3,"atol":1e-12}}
+//|       - {"artifact":"elements","path":"/rows/8/3","approx":{"value":8,"atol":1e-12}}
+//|   - case: row-major
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":3}
+//|       - {"artifact":"summary","path":"/rows/0/1","equals":1}
+//|       - {"artifact":"summary","path":"/rows/0/3","equals":9}
+//|       - {"artifact":"elements","path":"/rows/1/2","equals":1}
+//|       - {"artifact":"elements","path":"/rows/1/4","approx":{"value":3,"atol":1e-12}}
+//|   - case: broadcast
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/3","equals":3}
+//|       - {"artifact":"summary","path":"/rows/0/4","equals":"Not proved"}
+//|       - {"artifact":"summary","path":"/rows/0/5","equals":"InvalidInput"}
+//|       - {"artifact":"summary","path":"/rows/0/6","equals":"DimensionMismatch"}
+//|       - {"artifact":"elements","path":"/rows/3/2","equals":0}
+//|       - {"artifact":"elements","path":"/rows/3/4","equals":null}
+//|   - case: overlap
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/2","equals":8}
+//|       - {"artifact":"summary","path":"/rows/0/3","equals":5}
+//|       - {"artifact":"elements","path":"/rows/1/2","equals":1}
+//|       - {"artifact":"elements","path":"/rows/4/2","equals":1}
+use scioxide_core::{BlockVectorView, SciOxideErrorKind, NdView, NdViewMut, StridedLayout};
+
+let (r, c) = (rows as usize, cols as usize);
+let extents = [r, c];
+let explicit = match layout_mode.as_str() {
+    "Column-major (1, rows)" => Some([1, r]),
+    "Row broadcast (0, 1)" => Some([0, 1]),
+    "Overlap (1, 1)" => Some([1, 1]),
+    _ => None,
+};
+// For row-major, row_major derives strides (n₁, 1). Other layouts use overlap-permitting new_broadcast.
+let layout = match &explicit {
+    Some(strides) => StridedLayout::new_broadcast(&extents, strides),
+    None => StridedLayout::row_major(&extents),
+}
+.map_err(|e| e.to_string())?;
+let strides = layout.strides();
+let span = layout.required_span();
+// Set storage values equal to their positions.
+let mut storage: Vec<f64> = (0..span).map(|i| i as f64).collect();
+let kind_name = |kind: SciOxideErrorKind| match kind {
+    SciOxideErrorKind::InvalidInput => "InvalidInput",
+    SciOxideErrorKind::DimensionMismatch => "DimensionMismatch",
+    _ => "Other category",
+};
+
+// Writable views accept only layouts with proved injectivity. Layout is Copy, so pass it by value.
+let writable = match NdViewMut::new(&mut storage, layout) {
+    Ok(_) => "Can construct",
+    Err(error) => kind_name(error.kind()),
+};
+// Read-only views can be constructed even with overlap.
+let view = NdView::new(&storage, layout).map_err(|e| e.to_string())?;
+// Blocks check only length n₀·n₁ and read storage column-major.
+let block = BlockVectorView::new(&storage, r, c);
+let block_status = match &block {
+    Ok(_) => "Can construct",
+    Err(error) => kind_name(error.kind()),
+};
+let mut elements = Vec::with_capacity(r * c);
+for i in 0..r {
+    for j in 0..c {
+        let offset = layout.offset([i, j]).map_err(|e| e.to_string())?;
+        let value = *view.get([i, j]).map_err(|e| e.to_string())?;
+        let in_block = match &block {
+            Ok(block) => Some(block.column(j).map_err(|e| e.to_string())?[i]),
+            Err(_) => None,
+        };
+        elements.push((i, j, offset, value, in_block));
+    }
+}
+
+let proven = if layout.is_proven_injective() {
+    "Proved"
+} else {
+    "Not proved"
+};
+let summary_columns = serde_json::json!([
+    { "key": "0", "label": "Stride s₀ [elements]", "type": "integer" },
+    { "key": "1", "label": "Stride s₁ [elements]", "type": "integer" },
+    { "key": "2", "label": "Element count shape().len()", "type": "integer" },
+    { "key": "3", "label": "required_span() [elements]", "type": "integer" },
+    { "key": "4", "label": "Injectivity" },
+    { "key": "5", "label": "NdViewMut::new" },
+    { "key": "6", "label": "BlockVectorView::new" }
+]);
+emit_table_with_columns!(
+    summary_columns,
+    vec![(
+        strides[0],
+        strides[1],
+        layout.shape().len(),
+        span,
+        proven,
+        writable,
+        block_status
+    )],
+    metadata = serde_json::json!({ "id": "summary" })
+);
+let fixed0 = serde_json::json!({ "fractionDigits": 0 });
+let element_columns = serde_json::json!([
+    { "key": "0", "label": "Row i", "type": "integer" },
+    { "key": "1", "label": "Column j", "type": "integer" },
+    { "key": "2", "label": "Position offset(i, j)", "type": "integer" },
+    { "key": "3", "label": "NdView::get value", "type": "number", "format": fixed0 },
+    {
+        "key": "4",
+        "label": "Component i of block column j",
+        "type": "number",
+        "format": fixed0,
+        "nullText": "Cannot construct"
+    }
+]);
+emit_table_with_columns!(
+    element_columns,
+    elements,
+    metadata = serde_json::json!({ "id": "elements" })
+);
+```
+
+At the defaults ($3 \times 3$, column-major), strides are $(1, 3)$ and positions in row-major logical order are $0, 3, 6, 1, 4, 7, 2, 5, 8$.
+`required_span()` is $1 + 2 \cdot 1 + 2 \cdot 3 = 9$, equal to element count; injectivity is proved, so `NdViewMut` can be constructed.
+Only in this case do `NdView` and block values agree at every coordinate.
+
+For row-major, `row_major` derives strides $(3, 1)$ and positions $0, 1, \ldots, 8$.
+Storage length 9 also permits a block, but at coordinate $(0, 1)$, `NdView` reads position 1 while the block reads position 3.
+Block views do not inspect order, so supplying row-major data reads a different matrix.
+
+Row broadcasting gives `required_span()` equal to $n_1 = 3$, with every row reading the same three positions.
+For overlapping $2 \times 4$ with $(1, 1)$, eight elements map to $1 + 1 + 3 = 5$ positions, and both $(0, 1)$ and $(1, 0)$ read position 1.
+Neither layout proves injectivity, and `NdViewMut::new` returns `InvalidInput`.
+Storage is shorter than $n_0 n_1$, so the block is also rejected with `DimensionMismatch`.
+
+## Component access for affine values
+
+Linear combinations of vectors or complex values of the form
+
+$$
+\mathbf{y} = \sum_{j=1}^{m} \alpha_j\, \mathbf{x}_j
+$$
+
+recur in Runge–Kutta stage combinations, conjugate-gradient direction updates, and weighted interpolation sums.
+Here $\alpha_j$ are real coefficients, $\mathbf{x}_j$ values of the same shape, and $m$ the number of terms.
+The `AffineValue` trait reads values as sequences of real components, hiding their storage representation.
+It requires these three methods; `Scale` is the real type of components and coefficients, and `Owned` an owned mutable representation.
+
+```text
+fn dimension(&self) -> Result<usize, SciOxideError>;          // Number of real components (zero allowed)
+fn component(&self, index: usize) -> Result<Self::Scale, SciOxideError>;  // OutOfBounds for invalid indices
+fn try_to_owned(&self) -> Result<Self::Owned, SciOxideError>; // AllocationFailure on allocation failure
+```
+
+For one-component values, `try_to_scalar()` extracts that component.
+Other component counts return `DimensionMismatch`.
+`AffineValueMut` visits components once each through `for_each_component_mut` in the same order as reads, without reshaping or allocation.
+
+| Type | Component count | Component order |
+|---|---|---|
+| Real types implementing `RealScalar` (`f32`, `f64`) | 1 | The value itself |
+| `Complex<S>` | 2 | Real part, imaginary part |
+| `[V]`, `Vec<V>`, `[V; N]` | Sum of element component counts | Components of each element, in element order |
+
+Two values with equal component counts are treated as having the same shape.
+For example, one complex number can be written to an array of two real numbers.
+Components are not interpreted as coordinates and have no magnitude ordering.
+
+Use the following functions to validate shapes and values.
+
+- `check_value_shape(&value, dimension)` returns `DimensionMismatch` if component counts differ.
+- `validate_value(&value)` returns `NonFinite` for non-finite components.
+  It does not check which domain a value belongs to.
+- `write_value(&components, &mut output)` writes finite component sequences into output of the same shape.
+  Shape mismatches return `DimensionMismatch`, non-finite components return `NonFinite`, and failure leaves output unchanged.
+
+## Single-rounding linear combinations with `affine_combination_into`
+
+`affine_combination_into(&terms, &mut output, &mut workspace)` computes each component's linear combination from coefficient/value pairs `terms`.
+
+- Each product $\alpha_j x_{j,k}$ accumulates without rounding through `RangeAccumulator`; each component is then rounded once to nearest, ties to even.
+  Results are therefore correctly rounded and unchanged by term reordering.
+- `workspace` must have the same length as the output's component count.
+  Results are first formed in `workspace` and written to `output` only after every component succeeds.
+  On failure, `output` is unchanged and `workspace` contents are unspecified.
+- Empty term sequences write zero.
+  Work is proportional to component count times term count, with no heap allocation.
+
+There are three error cases.
+Any component-count mismatch among `output`, term values, or `workspace` returns `DimensionMismatch`.
+NaN or infinity in coefficients or components returns `NonFinite`.
+A result component exceeding the largest finite value returns `NumericalInstability` (kind `NumericalIssue::Overflow`).
+
+Ordinary floating-point sums round after every addition.
+Adding a small term to one of magnitude $M$ loses the part below the adjacent floating-point spacing near $M$; subtracting $M$ later does not recover it.
+Unrounded accumulation avoids this loss.
+
+The following cell computes $10^{p}\,\mathbf{x} + \mathbf{y} - 10^{p}\,\mathbf{x}$ for $\mathbf{x} = (1, 2, 3)$ and $\mathbf{y} = (1, 1, 1)$.
+The input is integer exponent $p$ (0–20).
+The mathematical result is $\mathbf{y}$.
+The first table compares left-to-right double-precision sums with `affine_combination_into` componentwise.
+Left-to-right addition loses $y_k = 1$ at $p$, where spacing near $10^{p} x_k$ becomes at least 2.
+The second table shows the error category for a NaN term and confirms that `output` is unchanged across failure.
+
+```rust
+//| id: core-affine-combination
+//| ref: core-affine-combination
+//| title: "Linear combinations with cancellation and unchanged output on failure"
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   scale_exponent: {"type":"range","label":"Large coefficient exponent p [-]","description":"Coefficients 10^p and -10^p cancel x.","min":0,"max":20,"step":1,"value":16}
+//| cases:
+//|   - {"id":"exact-range","label":"p = 15","description":"10^15 x_k + 1 is exactly representable in double precision, so left-to-right sums also equal 1.","inputs":{"scale_exponent":15}}
+//|   - {"id":"largest","label":"p = 20","description":"Spacing exceeds 10^4 and left-to-right sums become zero.","inputs":{"scale_exponent":20}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"combination","path":"/rows/0/1","approx":{"value":0,"atol":1e-12}}
+//|       - {"artifact":"combination","path":"/rows/0/2","approx":{"value":1,"atol":1e-12}}
+//|       - {"artifact":"combination","path":"/rows/2/2","approx":{"value":1,"atol":1e-12}}
+//|       - {"artifact":"failure","path":"/rows/0/0","equals":"NonFinite"}
+//|       - {"artifact":"failure","path":"/rows/0/2","approx":{"value":0,"atol":1e-12}}
+//|   - case: exact-range
+//|     expect:
+//|       - {"artifact":"combination","path":"/rows/2/1","approx":{"value":1,"atol":1e-12}}
+//|       - {"artifact":"combination","path":"/rows/2/2","approx":{"value":1,"atol":1e-12}}
+//|   - case: largest
+//|     expect:
+//|       - {"artifact":"combination","path":"/rows/1/1","approx":{"value":0,"atol":1e-12}}
+//|       - {"artifact":"combination","path":"/rows/1/2","approx":{"value":1,"atol":1e-12}}
+use scioxide_core::{SciOxideErrorKind, affine_combination_into};
+
+// Form 10^p by multiplying by 10. For p ≤ 22, all intermediates are exactly representable in double precision.
+let big = (0..scale_exponent as u32).fold(1.0_f64, |power, _| power * 10.0);
+let x = [1.0_f64, 2.0, 3.0];
+let y = [1.0_f64, 1.0, 1.0];
+let terms = [(big, &x[..]), (1.0, &y[..]), (-big, &x[..])];
+let mut output = [0.0_f64; 3];
+let mut workspace = [0.0_f64; 3];
+affine_combination_into(&terms, &mut output[..], &mut workspace).map_err(|e| e.to_string())?;
+
+let rows: Vec<(usize, f64, f64, f64)> = (0..3)
+    .map(|k| {
+        // Comparison: add left-to-right in double precision.
+        let naive = (big * x[k] + y[k]) + (-big) * x[k];
+        (k, naive, output[k], y[k])
+    })
+    .collect();
+let fixed1 = serde_json::json!({ "fractionDigits": 1 });
+let combination_columns = serde_json::json!([
+    { "key": "0", "label": "Component k", "type": "integer" },
+    { "key": "1", "label": "Left-to-right double-precision sum [-]", "type": "number", "format": fixed1 },
+    { "key": "2", "label": "affine_combination_into [-]", "type": "number", "format": fixed1 },
+    { "key": "3", "label": "Mathematical value y_k [-]", "type": "number", "format": fixed1 }
+]);
+emit_table_with_columns!(
+    combination_columns,
+    rows,
+    metadata = serde_json::json!({ "id": "combination" })
+);
+
+// A NaN term makes computation fail, leaving output at its previous value.
+let poisoned = [f64::NAN, 2.0, 3.0];
+let before = output;
+let failure = affine_combination_into(&[(1.0, &poisoned[..])], &mut output[..], &mut workspace)
+    .err()
+    .ok_or("NaN was not rejected")?;
+let kind = match failure.kind() {
+    SciOxideErrorKind::NonFinite => "NonFinite",
+    _ => "Other category",
+};
+// Maximum output difference across failure; zero means unchanged.
+let change = (0..3).fold(0.0_f64, |worst, k| worst.max((output[k] - before[k]).abs()));
+let failure_columns = serde_json::json!([
+    { "key": "0", "label": "Category kind()" },
+    { "key": "1", "label": "Message" },
+    { "key": "2", "label": "Maximum output difference across failure [-]", "type": "number", "format": fixed1 }
+]);
+emit_table_with_columns!(
+    failure_columns,
+    vec![(kind, failure.to_string(), change)],
+    metadata = serde_json::json!({ "id": "failure" })
+);
+```
+
+At the default $p = 16$, spacing near $10^{16} x_k$ is at least 2, so rounding loses $y_k = 1$ and left-to-right sums give zero in all three components.
+`affine_combination_into` returns $\mathbf{y} = (1, 1, 1)$.
+At $p = 15$, values through $3 \times 10^{15} + 1$ are exactly representable in double precision, so left-to-right sums also give 1.
+At $p = 20$, spacing exceeds $10^4$, but `affine_combination_into` still returns 1.
+A NaN term is rejected with `NonFinite`; the largest difference in `output` is zero, preserving the preceding $(1, 1, 1)$.
+
+## Summary
+
+`Shape` checks element counts, and `StridedLayout` checks required storage length $1 + \sum_k (n_k - 1) s_k$.
+Unpadded row-major arrays through rank 8 can be constructed from shape alone with `row_major`.
+`new` accepts only layouts with proved injectivity; `new_broadcast` permits read-only overlap.
+Writing is restricted to proved injective layouts, so using broadcast or overlapping output views is detected at construction as `InvalidInput`.
+Pass multiple right-hand sides column-major through `BlockVectorView` and `BlockVectorViewMut`, with length exactly rows times right-hand sides.
+For state-vector types implementing `AffineValue`, `affine_combination_into` rounds each component once and leaves output unchanged on failure.
+
+## Further reading
+
+- [Operator protocols and closure operators](../operator-protocols-and-structure/): Check operators using borrowed output and workspace, and batched application to block vectors.
+- [Elementary functions and stable transformations](../stable-transforms/): Check `transform_into` applying stable transformations to `NdView` in batches.
+- [Range-safe arithmetic](../range-safe-arithmetic/): Check the unrounded accumulation `RangeAccumulator` used by `affine_combination_into`.
+- [Layout, operator, and combinatorics APIs](../../api/layouts-operators-combinatorics/): Look up every layout and view method.

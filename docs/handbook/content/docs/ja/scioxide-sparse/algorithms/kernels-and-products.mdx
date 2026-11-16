@@ -1,0 +1,410 @@
+---
+title: 行列ベクトル積と疎行列の積
+description: 疎行列ベクトル積のアルゴリズムと計算量、転置積と随伴積、Standard と Exact の丸めの規約と誤差限界、疎行列と密行列の積、Gustavson 型の疎行列積（SpGEMM）の構造を求める段と値を求める段、Plan の再利用。
+sidebar:
+  order: 310
+references:
+  sparse-matrix-vector-product: "疎行列ベクトル積"
+  sparse-product-rounding: "丸めの規約と誤差限界"
+  sparse-sparse-dense-product: "疎行列と密行列の積"
+  sparse-spgemm-phases: "構造を求める段と値を求める段"
+  sparse-transpose-adjoint-product: "転置積と随伴積"
+  sparse-walk-count-experiment: "閉路グラフの歩道の数え上げ"
+---
+
+Krylov 部分空間法は反復のたびに $\mathbf{y} = \mathbf{A}\mathbf{x}$ を計算し、多重格子法の粗い格子の演算子は $\mathbf{P}^{\mathsf{T}}\mathbf{A}\mathbf{P}$ という疎行列どうしの積で作る。
+疎行列の計算の多くは、この二種類の積に時間の大半を使う。
+このページでは疎行列ベクトル積（SpMV）のアルゴリズムと計算量、転置と随伴、丸めの規約と誤差限界、疎行列と密行列の積を説明する。
+続いて、疎行列どうしの積（SpGEMM）を、構造を求める段と値を求める段に分ける理由と方法を説明する。
+
+## 疎行列ベクトル積
+
+CSR 形式の $m \times n$ 行列 $\mathbf{A}$ について、$\mathbf{y} = \mathbf{A}\mathbf{x}$ の第 $i$ 成分は第 $i$ 行の保存成分だけの和である。
+
+$$
+y_i = \sum_{k = \mathrm{row\_ptr}[i]}^{\mathrm{row\_ptr}[i+1] - 1} a_k \, x_{c_k}, \qquad a_k = \mathrm{values}[k], \quad c_k = \mathrm{col\_indices}[k]
+$$
+
+各行は独立なので、アルゴリズムは行を順にたどる二重ループで済み、積と和はそれぞれ $\mathrm{nnz}$ 回である。
+長さと有限性の検査と出力を含めた計算量は $O(m + n + \mathrm{nnz})$ で、密行列の $O(mn)$ と比べて保存成分の数だけに比例する。
+$\mathbf{x}$ の成分は列添字 $c_k$ を通して飛び飛びに読まれるので、実際の速さはメモリの参照の局所性にも左右される。
+帯幅を縮める並べ替え（[並べ替えと彩色](../orderings-and-coloring/)）には、この局所性を高める効果もある。
+行列そのものを並べ替える関数は提供しないので、`reverse_cuthill_mckee` の置換で番号を付け直して組み立て直す。
+
+`CsrMatrix`、`CscMatrix`、`BsrMatrix`、`DiaMatrix`、`SparseView`、`SparseOperator` は、scioxide-core の `LinearOperator`、`AdjointOperator`、`BlockOperator` を実装する（`CooMatrix` は `view()` を通して使う）。
+`apply(x)` と `apply_adjoint(x)` は積を新しい配列に返す（ビューは `apply_transpose(x)` も持つ）。
+`apply_into(x, y, workspace)` が $\mathbf{y} = \mathbf{A}\mathbf{x}$ を、`apply_adjoint_into` が $\mathbf{y} = \mathbf{A}^{\mathsf{H}}\mathbf{x}$ を、`apply_block_into` が複数の列をまとめた $\mathbf{Y} = \mathbf{A}\mathbf{X}$ を計算する。
+作業領域の長さは `apply_workspace_len()` などが返す値以上でなければならず、通常の積では行数、随伴積では列数である。
+どの積も長さと入力の有限性を検査してから計算を始め、結果を作業領域にすべて求めてから出力に写すので、表せない値で失敗したときも出力は変わらない。
+
+### 転置積と随伴積
+
+CSR のまま $\mathbf{y} = \mathbf{A}^{\mathsf{T}}\mathbf{x}$ を計算するには、行 $i$ の成分 $a_{ij}$ を $y_j$ に足し込めばよい。
+
+$$
+y_j = \sum_{i : (i, j) \in \mathcal{S}(\mathbf{A})} a_{ij}\, x_i
+$$
+
+`scioxide-sparse` の CSR と CSC は反対方向の走査の索引を保持しているので（[疎行列の格納形式と組立て](../storage-and-assembly/)）、この和も出力の成分ごとにまとめて計算でき、転置した行列を作る必要はない。
+複素数の行列では、共役を取る随伴積 $\mathbf{A}^{\mathsf{H}}\mathbf{x}$ と、取らない転置積 $\mathbf{A}^{\mathsf{T}}\mathbf{x}$ を区別する。
+随伴積は `AdjointOperator::apply_adjoint_into` で、共役を取らない転置積は `SparseView::apply_transpose_into` と `SparseOperator::apply_transpose_into` で計算する（作業領域は列数分）。
+実数の行列では二つは一致する。
+
+疎行列と密行列の積や分解の求解では、積の向きを `SparseOperation` の `Normal`（$\mathbf{A}$）、`Transpose`（$\mathbf{A}^{\mathsf{T}}$）、`Adjoint`（$\mathbf{A}^{\mathsf{H}}$）で引数として選ぶ。
+
+## 丸めの規約と誤差限界
+
+積の算術は scioxide-core の `Accuracy` で選び、既定は `Standard` である。
+`SparseView::with_accuracy(Accuracy::Exact)` は、精度を結び付けた借用の作用素 `SparseOperator` を返し、反復解法などにそのまま渡せる。
+scioxide-core の作用素のトレイトの実装は、`SparseOperator` を除いてどれも `Standard` で計算する。
+
+`Standard` は各行の積を通常の浮動小数点演算で足し合わせる。
+CSR、CSC、COO、DIA では積を 4 本の部分和に分けて足し、最後に部分和を足し合わせる。
+各行の内積を $k$ 個の積の和とすると、計算値 $\hat{y}_i$ の誤差は成分ごとに
+
+$$
+|\hat{y}_i - y_i| \le \gamma_{2k} \sum_{j} |a_{ij}\, x_j| + k\, u_{\mathrm{sub}}, \qquad \gamma_{2k} = \frac{2ku}{1 - 2ku} = \frac{k \varepsilon}{1 - k \varepsilon}
+$$
+
+で抑えられる。
+ここで $\varepsilon = 2^{-52}$ は倍精度の計算機イプシロン、$u = \varepsilon/2$ は単位丸め、$\gamma_k = ku/(1 - ku)$ は[記号](oxref:sparse-notation)の係数、$u_{\mathrm{sub}}$ は出力の型の最小の非正規化数に尺度の復元の係数を掛けた量で、限界は $k \varepsilon < 1$ のときに意味を持つ。
+scioxide-core の `Accuracy` が仕様として述べる限界は $\gamma_{2k}$ で、内積の標準的な限界 $\gamma_k$ より 2 倍ほど緩い。
+足す順序によらない限界なので、4 本の部分和に分けても同じ式が成り立つ。
+これは計算した内積の前進誤差の限界であり、相対誤差に直すと
+
+$$
+\frac{|\hat{y}_i - y_i|}{|y_i|} \lesssim \gamma_{2k}\, \kappa_i, \qquad \kappa_i = \frac{\sum_j |a_{ij} x_j|}{\left|\sum_j a_{ij} x_j\right|}
+$$
+
+となる。
+$\kappa_i$ は内積の条件数で、正と負の項が打ち消し合うほど大きくなる。
+`Standard` は、行の中のどれかの積がオーバーフローするか正規化数の範囲を下回ったとき、または和が有限でないとき、その行を厳密な累積でやり直す。
+そのため、途中の積や和が表せる範囲を一時的に外れても、最終の値が表せるなら結果を失わない。
+同じ設定と同じ実装の上では、`Standard` の結果はワーカーの数によらずビット単位で一致する。
+
+`Exact` は、各行の積の和を固定長の厳密な状態（`ProductSum`）に足し込み、最後に一度だけ丸める。
+結果は真の内積を一度丸めた値で、相対誤差は $\kappa_i$ によらず丸めの単位 $\varepsilon/2$ 以下に収まる（結果が非正規化数の範囲に入る場合を除く）。
+和の順序、ワーカーの数、命令セットにもよらない。
+代わりに一回の積の手間は `Standard` より大きいので、打ち消しの大きい残差の計算や、結果の再現性が必要な場面で選ぶ。
+
+## 疎行列と密行列の積
+
+`sparse_dense_into(matrix, operation, input, options, output, workspace, context)` は、疎行列のビュー `matrix` と列優先の密なブロック `input` から $\mathrm{op}(\mathbf{A})\mathbf{B}$ を `output` に計算する出力先を指定する API である。
+どの格納形式のビューも、実数と複素数のどちらのスカラーも受け付ける。
+作業領域 `SparseProductWorkspace` は `SparseProductRequirements::sparse_dense(matrix, operation, right_hand_sides)` が返す要件に対して `try_reserve` で事前確保し、計算の途中では大きくしない。
+足りない作業領域は `DimensionMismatch` で拒む。
+すべての列を作業領域に求めてからまとめて出力に写すので、失敗したときは出力が変わらない。
+`SparseProductOptions` の `with_execution_policy` で並列の方針を選ぶと、コンテキストが持つエグゼキューターのワーカーに列を分けて計算する。
+
+## 疎行列どうしの積
+
+$\mathbf{A} \in \mathbb{R}^{m \times p}$ と $\mathbf{B} \in \mathbb{R}^{p \times n}$ の積 $\mathbf{C} = \mathbf{A}\mathbf{B}$ を行ごとに書くと、$\mathbf{C}$ の第 $i$ 行は $\mathbf{B}$ の行の一次結合
+
+$$
+\mathbf{c}_{i,:} = \sum_{k : (i, k) \in \mathcal{S}(\mathbf{A})} a_{ik}\, \mathbf{b}_{k,:}
+$$
+
+である。
+Gustavson のアルゴリズムはこの式のとおりに、第 $i$ 行ごとに $\mathbf{A}$ の行の成分 $a_{ik}$ を取り、$\mathbf{B}$ の第 $k$ 行の成分を作業配列に足し込む。
+積の回数は、$\mathbf{A}$ の第 $i$ 行の成分 $(i, k)$ ごとに $\mathbf{B}$ の第 $k$ 行を一回たどるので、
+
+$$
+\mathrm{flops}(\mathbf{A}\mathbf{B}) = \sum_{i} \sum_{k : (i, k) \in \mathcal{S}(\mathbf{A})} \mathrm{nnz}(\mathbf{B}_{k,:}) = \sum_{k=0}^{p-1} \mathrm{nnz}(\mathbf{A}_{:,k})\, \mathrm{nnz}(\mathbf{B}_{k,:})
+$$
+
+となる。
+手間は入力の非零数ではなく、$\mathbf{A}$ の列と $\mathbf{B}$ の行の非零数の組合せで決まる。
+同じ $(i, j)$ に至る積が複数あると一つの成分に合算されるので、出力の非零数 $\mathrm{nnz}(\mathbf{C})$ はこの値以下だが、事前には分からない。
+
+### 構造を求める段と値を求める段
+
+$\mathbf{C}$ の構造は、値の打ち消しを無視すれば
+
+$$
+\mathcal{S}(\mathbf{C}) = \{(i, j) : \text{ある } k \text{ で } (i, k) \in \mathcal{S}(\mathbf{A}),\ (k, j) \in \mathcal{S}(\mathbf{B})\}
+$$
+
+であり、値によらず入力の構造だけで決まる。
+そこで `SparseProductPlan::new(&a, &b)` は最初に構造だけを求め、出力の行ポインタと各行で整列した列添字を保持する（構造を求める段）。
+各行で、すでに出力に加えた列を記録する長さ $n$ の配列を使うので、同じ $(i, j)$ に至る経路が何本あっても出力に使うメモリ領域は増えない。
+手間は $\mathrm{flops}(\mathbf{A}\mathbf{B})$ に、各行で列添字を整列する手間を加えた量である。
+保存された 0 も構造に含め、値の打ち消しで Plan の構造が変わることはない。
+Plan は $\mathbf{A}$、$\mathbf{B}$、$\mathbf{C}$ の構造の写しだけを持ち、値は持たない。
+オプション付き形式の `SparseProductPlan::with_options(&a, &b, SparseProductPlanOptions::new().with_max_output_entries(max_entries))` は出力の非零数の上限を課す。
+超えると必要な総数と上限を付けて `ResourceLimit` を返し、上限を超える分のメモリ領域は確保しない。
+
+値を求める段の出力先を指定する API `evaluate_into(&a, &b, options, &mut c, &mut workspace, context)` は、Plan と構造が厳密に一致する $\mathbf{A}$、$\mathbf{B}$、出力 $\mathbf{C}$ について値だけを計算する。
+出力は `create_output()` で、Plan の構造と 0 の値を持つ行列として作る。
+作業領域は `workspace(options)` で作るか `workspace_requirements(options)` に対して事前確保する。
+中身はワーカーごとの列から位置への対応表（長さ $n$）と一行分の和の配列、出力の値の候補である。
+作業領域は検査するだけで大きくしないので、事前確保したあとの値の計算は確保しない。
+`Standard` では各行を通常の演算で累積し、積がオーバーフローするか正規化数の範囲を下回った行と、和が有限でない行だけを厳密な累積でやり直す。
+`Exact` ではすべての成分を厳密に累積して一度だけ丸める。
+結果を作業領域にすべて求めてから出力に写し、形が違えば `DimensionMismatch`、構造が違えば `InvalidInput`、和が表せなければ `NumericalInstability` を、出力を変えずに返す。
+値だけが変わる問題では、一つの Plan と作業領域を何度でも使える。
+精度は `SparseProductOptions` の `with_accuracy` で `Standard` か `Exact` を選ぶ。
+`with_execution_policy` で並列の方針を選ぶと、出力の行をワーカーに分けて計算する。
+転置を含む積 $\mathbf{A}^{\mathsf{T}}\mathbf{B}$ には、`CsrMatrix::transpose` や `adjoint` の結果を CSR に変換して渡す。
+
+一度だけ積を求めればよい場合は、標準形式の `CsrMatrix::multiply(&b)` が Plan、出力、作業領域をその場で作り、`Standard` の算術で逐次に計算する。
+同じ型の `add`、`subtract`、`hadamard`（成分ごとの積）は、和と差では構造の和集合、成分ごとの積では共通部分を出力の構造とし、厳密に 0 になった位置も残す。
+`add_with_options` などのオプション付き形式は、`SparseArithmeticOptions::new()` の `with_zero_policy` で結果の値が厳密に 0 になった位置の扱いを、`with_accuracy` で精度を選ぶ。
+`SparseView::scaled(alpha)` はすべての保存成分に $\alpha$ を掛けた `CsrMatrix` を返し、$\alpha = 0$ でも保存成分は 0 の値として残る（`scaled_with_options` で零の方針を選べる）。
+
+### 閉路グラフの隣接行列
+
+次の二つの実験は $N$ 頂点の閉路グラフ $C_N$ の隣接行列 $\mathbf{A}$（辺 $\{i, i+1 \bmod N\}$ の両向きに 1）を使う。
+各行と各列に成分が 2 個ずつあり、$\mathrm{nnz}(\mathbf{A}) = 2N$ である。
+次のブロックは、二つのセルが共有する定義である。
+`cycle_adjacency` が $\mathbf{A}$ を `SparseBuilder` で組み立てる。
+
+```rust
+//| id: sparse-cycle-adjacency
+//| kind: definitions
+//| title: 閉路グラフの隣接行列
+//| crates: [scioxide-core, scioxide-sparse]
+use scioxide_core::SciOxideError;
+use scioxide_sparse::{CsrMatrix, DuplicatePolicy, ExplicitZeroPolicy, SparseBuilder};
+
+/// N 頂点（N ≥ 3）の閉路グラフ C_N の隣接行列。辺 {i, i + 1 mod N} の両向きに 1 を置く。
+pub(crate) fn cycle_adjacency(vertices: usize) -> Result<CsrMatrix<f64>, SciOxideError> {
+    let mut builder = SparseBuilder::new(vertices, vertices);
+    for i in 0..vertices {
+        builder.push(i, (i + 1) % vertices, 1.0)?;
+        builder.push((i + 1) % vertices, i, 1.0)?;
+    }
+    builder.finish_csr(DuplicatePolicy::Reject, ExplicitZeroPolicy::Drop)
+}
+```
+
+### 閉路グラフの歩道の数え上げ
+
+無向グラフの隣接行列 $\mathbf{A}$ について、$(\mathbf{A}^k)_{ij}$ は頂点 $i$ から $j$ への長さ $k$ の歩道の数である。
+$\mathbf{A}^k = \mathbf{A}\,\mathbf{A}^{k-1}$ の第 $(i, j)$ 成分は、$i$ の隣の頂点 $l$ から $j$ への長さ $k - 1$ の歩道の数を足したものになるからである。
+$C_N$ では各頂点から一歩ごとに $\pm 1$ 進むので、頂点 0 から $j$ への長さ $k$ の歩道の数は、$+1$ を $t$ 回、$-1$ を $k - t$ 回選んで $2t - k \equiv j \pmod N$ となる選び方の数
+
+$$
+(\mathbf{A}^k)_{0j} = \sum_{\substack{0 \le t \le k \\ 2t - k \,\equiv\, j \!\!\pmod N}} \binom{k}{t}
+$$
+
+に等しい。
+次のセルは $\mathbf{A}^j = \mathbf{A}\,\mathbf{A}^{j-1}$（$j = 2, \dots, k$）の Plan を `SparseProductPlan` で作って値を求める。
+1 つ目の表は各段の積の回数 $\mathrm{flops}$（上の式で数えたもの）、非零数 $\mathrm{nnz}(\mathbf{A}^j)$、素朴な三重ループで求めた密行列の累乗との差を示す。
+2 つ目の表は $\mathbf{A}^k$ の第 0 行を二項係数の和と比べる。
+入力は頂点の数 $N$（3〜16）と歩道の長さ $k$（2〜10）である。
+歩道の数は $2^{10}$ 以下の整数なので、`Standard` の算術でも丸めは生じない。
+
+```rust
+//| id: sparse-spgemm-walks
+//| ref: sparse-spgemm-walks
+//| title: 疎行列の積による閉路グラフの歩道の数え上げ
+//| run: reactive
+//| uses: [sparse-cycle-adjacency]
+//| crates: [scioxide-core, scioxide-sparse]
+//| inputs:
+//|   vertices: {"type":"range","label":"閉路の頂点の数 N","description":"閉路グラフ C_N の頂点の数。","min":3,"max":16,"step":1,"value":8}
+//|   walk_length: {"type":"range","label":"歩道の長さ k","description":"A の何乗まで求めるか。","min":2,"max":10,"step":1,"value":4}
+//| cases:
+//|   - {"id":"odd-cycle","label":"N = 3、k = 4","description":"奇数の閉路では偶奇の制約がなく、N = 3 では A² ですべての位置が埋まる。","inputs":{"vertices":3}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"powers","path":"/rows/0/1","equals":32}
+//|       - {"artifact":"powers","path":"/rows/0/2","equals":24}
+//|       - {"artifact":"powers","path":"/rows/1/2","equals":32}
+//|       - {"artifact":"powers","path":"/rows/2/1","equals":64}
+//|       - {"artifact":"powers","path":"/rows/2/2","equals":32}
+//|       - {"artifact":"powers","path":"/rows/2/3","range":{"max":0}}
+//|       - {"artifact":"row-zero","path":"/rows/0/1","approx":{"value":6.0,"atol":1e-12}}
+//|       - {"artifact":"row-zero","path":"/rows/0/2","approx":{"value":6.0,"atol":1e-12}}
+//|       - {"artifact":"row-zero","path":"/rows/4/1","approx":{"value":2.0,"atol":1e-12}}
+//|   - case: odd-cycle
+//|     expect:
+//|       - {"artifact":"powers","path":"/rows/0/2","equals":9}
+//|       - {"artifact":"powers","path":"/rows/2/3","range":{"max":0}}
+//|       - {"artifact":"row-zero","path":"/rows/0/1","approx":{"value":6.0,"atol":1e-12}}
+//|       - {"artifact":"row-zero","path":"/rows/1/1","approx":{"value":5.0,"atol":1e-12}}
+use scioxide_core::ExecutionContext;
+use scioxide_sparse::{SparseProductOptions, SparseProductPlan};
+
+let (n, k) = (vertices as usize, walk_length as usize);
+let a = cycle_adjacency(n).map_err(|e| e.to_string())?;
+// 独立検算用の密行列 A と、その累乗 D = A^j。
+let mut dense_a = vec![0.0_f64; n * n];
+a.to_dense_into(&mut dense_a).map_err(|e| e.to_string())?;
+let mut dense_power = dense_a.clone();
+let (product, scope) = (SparseProductOptions::new(), ExecutionContext::sequential());
+let (mut power, mut rows) = (a.clone(), Vec::new());
+for j in 2..=k {
+    // 積の回数: A の各成分 (i, l) が A^(j-1) の第 l 行を一回たどる。
+    let ptr = power.row_ptr();
+    let flops: usize = a.col_indices().iter().map(|&l| ptr[l + 1] - ptr[l]).sum();
+    // 構造を求める段: A と A^(j-1) の構造だけから A^j の構造を作る。
+    let plan = SparseProductPlan::new(&a, &power).map_err(|e| e.to_string())?;
+    let mut next = plan.create_output().map_err(|e| e.to_string())?;
+    let mut workspace = plan.workspace(product).map_err(|e| e.to_string())?;
+    // 値を求める段。
+    plan.evaluate_into(&a, &power, product, &mut next, &mut workspace, scope)
+        .map_err(|e| e.to_string())?;
+    // 独立検算: 密行列の素朴な三重ループで D ← A D。
+    let mut d = vec![0.0_f64; n * n];
+    for (r, c) in (0..n).flat_map(|r| (0..n).map(move |c| (r, c))) {
+        d[r * n + c] = (0..n).fold(0.0, |s, l| s + dense_a[r * n + l] * dense_power[l * n + c]);
+    }
+    dense_power = d;
+    let mut from_sparse = vec![0.0_f64; n * n];
+    next.to_dense_into(&mut from_sparse)
+        .map_err(|e| e.to_string())?;
+    let diff = from_sparse
+        .iter()
+        .zip(&dense_power)
+        .fold(0.0_f64, |m, (x, y)| m.max((x - y).abs()));
+    rows.push((j, flops, next.nnz(), diff));
+    power = next;
+}
+
+// 第 0 行を二項係数の和と比べる（2t − k ≡ j (mod N) となる t について C(k, t) を足す）。
+let binomial = |t: usize| (0..t).fold(1.0_f64, |c, s| c * (k - s) as f64 / (s + 1) as f64);
+let mut row_zero = Vec::new();
+for j in 0..n {
+    let count = (0..=k)
+        .filter(|&t| (2 * t + n * k - k) % n == j)
+        .fold(0.0_f64, |s, t| s + binomial(t));
+    row_zero.push((j, power.get(0, j).map_err(|e| e.to_string())?, count));
+}
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let count = serde_json::json!({ "fractionDigits": 0 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "長さ j", "type": "integer" },
+    { "key": "1", "label": "積の回数 flops [回]", "type": "integer" },
+    { "key": "2", "label": "nnz(A^j) [個]", "type": "integer" },
+    { "key": "3", "label": "密行列の累乗との差の最大 [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "powers" })
+);
+let row_columns = serde_json::json!([
+    { "key": "0", "label": "終点 j", "type": "integer" },
+    { "key": "1", "label": "(A^k)₀ⱼ（疎行列の積）[本]", "type": "number", "format": count },
+    { "key": "2", "label": "二項係数の和 [本]", "type": "number", "format": count }
+]);
+emit_table_with_columns!(
+    row_columns,
+    row_zero,
+    metadata = serde_json::json!({ "id": "row-zero" })
+);
+```
+
+既定の $N = 8$、$k = 4$ では、非零数は $j = 2, 3, 4$ で 24、32、32 となり、密行列の累乗との差はどれも 0 である。
+長さ $j$ の歩道は頂点 0 から $-j, -j + 2, \dots, j$ の $j + 1$ か所に届くので、$j < N/2$ の間は各行の非零数が $j + 1$ 個、全体で $N(j + 1)$ 個になる。
+$j = N/2 = 4$ では $+4$ と $-4$ が同じ頂点 4 に重なり、各行は 4 個のままである。
+積の回数は、$\mathbf{A}$ の各列に成分が 2 個あるので $2\,\mathrm{nnz}(\mathbf{A}^{j-1})$ で、$j = 2, 3, 4$ で 32、48、64 になる。
+非零数との差は同じ位置に至る複数の歩道を一つの成分に合算した数で、構造を求める段はすでに加えた列を記録する配列でこれを除く。
+第 0 行は二項係数の和と一致する。
+たとえば $(\mathbf{A}^4)_{00} = \binom{4}{2} = 6$、$(\mathbf{A}^4)_{02} = \binom{4}{3} = 4$ で、$(\mathbf{A}^4)_{04} = \binom{4}{4} + \binom{4}{0} = 2$ は閉路を両回りする 2 本の歩道を数えている。
+奇数の閉路では偶奇の制約がないので、$-j, -j + 2, \dots, j$ の $j + 1$ か所は $j \ge N - 1$ で $N$ 個の頂点をすべて覆う。
+$N = 3$ では $\mathbf{A}^2$ ですべての位置が埋まり、非零数は $N^2 = 9$ になる。
+
+### 値だけを変えた積の Plan の再利用
+
+Plan は構造だけに依存するので、値の異なる行列に同じ Plan と作業領域を使える。
+次のセルは上と同じ閉路について $\mathbf{A}^k$ の Plan の列を一度作り、すべての辺の重みを $w$ に変えた $w\mathbf{A}$ に同じ Plan と作業領域を使い直して $(w\mathbf{A})^k$ を求める。
+値の入れ替えには `copy_values_from` を使い、構造の解析はやり直さない。
+検算として、$(w\mathbf{A})^k = w^k \mathbf{A}^k$ との相対差の最大を示す。
+入力は $N$、$k$ と重み $w$（0.1〜2）である。
+
+```rust
+//| id: sparse-spgemm-plan-reuse
+//| ref: sparse-spgemm-plan-reuse
+//| title: 重みを変えた行列への積の Plan の再利用
+//| run: reactive
+//| uses: [sparse-cycle-adjacency]
+//| crates: [scioxide-core, scioxide-sparse]
+//| inputs:
+//|   vertices: {"type":"range","label":"閉路の頂点の数 N","description":"閉路グラフ C_N の頂点の数。","min":3,"max":16,"step":1,"value":8}
+//|   walk_length: {"type":"range","label":"歩道の長さ k","description":"A の何乗まで求めるか。","min":2,"max":10,"step":1,"value":4}
+//|   weight: {"type":"range","label":"辺の重み w","description":"すべての辺に共通の重み。","min":0.1,"max":2.0,"step":0.1,"value":1.3}
+//| cases:
+//|   - {"id":"power-of-two","label":"w = 0.5","description":"2 の冪の重みではすべての演算が正確になり、相対差が 0 になる。","inputs":{"weight":0.5}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"reuse","path":"/rows/0/0","equals":3}
+//|       - {"artifact":"reuse","path":"/rows/0/1","equals":32}
+//|       - {"artifact":"reuse","path":"/rows/0/2","range":{"max":1e-15}}
+//|   - case: power-of-two
+//|     expect:
+//|       - {"artifact":"reuse","path":"/rows/0/2","range":{"max":0}}
+use scioxide_core::ExecutionContext;
+use scioxide_sparse::{SparseProductOptions, SparseProductPlan};
+
+let (n, k) = (vertices as usize, walk_length as usize);
+let a = cycle_adjacency(n).map_err(|e| e.to_string())?;
+let (product, scope) = (SparseProductOptions::new(), ExecutionContext::sequential());
+
+// Plan の列を一度だけ作り、A^k を求める。
+let (mut stages, mut power) = (Vec::new(), a.clone());
+for _ in 2..=k {
+    let plan = SparseProductPlan::new(&a, &power).map_err(|e| e.to_string())?;
+    let (mut next, mut workspace) = (
+        plan.create_output().map_err(|e| e.to_string())?,
+        plan.workspace(product).map_err(|e| e.to_string())?,
+    );
+    plan.evaluate_into(&a, &power, product, &mut next, &mut workspace, scope)
+        .map_err(|e| e.to_string())?;
+    stages.push((plan, workspace));
+    power = next;
+}
+
+// 値だけを w に替え、同じ Plan と作業領域で (wA)^k を求める（構造の解析をやり直さない）。
+let mut aw = a.clone();
+aw.copy_values_from(&vec![weight; a.nnz()])
+    .map_err(|e| e.to_string())?;
+let mut weighted = aw.clone();
+for (plan, workspace) in &mut stages {
+    let mut next = plan.create_output().map_err(|e| e.to_string())?;
+    plan.evaluate_into(&aw, &weighted, product, &mut next, workspace, scope)
+        .map_err(|e| e.to_string())?;
+    weighted = next;
+}
+let scale = weight.powi(k as i32); // 参照値 w^k（f64 の固有メソッド）
+let relative = weighted
+    .values()
+    .iter()
+    .zip(power.values())
+    .fold(0.0_f64, |m, (x, y)| {
+        m.max((x - scale * y).abs() / (scale * y))
+    });
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "再利用した Plan [個]", "type": "integer" },
+    { "key": "1", "label": "nnz((wA)^k) [個]", "type": "integer" },
+    { "key": "2", "label": "(wA)^k と w^k A^k の相対差の最大 [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    vec![(stages.len(), weighted.nnz(), relative)],
+    metadata = serde_json::json!({ "id": "reuse" })
+);
+```
+
+既定の $N = 8$、$k = 4$、$w = 1.3$ では、3 つの Plan を使い直し、相対差は $2.1 \times 10^{-16}$ と丸めの単位の程度になる。
+$w = 1.3$ は 2 進数で正確に表せないので、$(w\mathbf{A})^k$ と $w^k\mathbf{A}^k$ はそれぞれ異なる順序で丸めを受け、その差が現れる。
+$w = 0.5$ や $w = 2$ のように 2 の冪にすると、すべての演算が正確になって差は 0 になる。
+
+## まとめ
+
+疎行列ベクトル積の手間は $O(m + n + \mathrm{nnz})$ で、`scioxide-sparse` の CSR と CSC は転置積と随伴積も転置した行列を作らずに計算する。
+`Standard` の誤差は内積の条件数 $\kappa_i$ に比例するので、打ち消しの大きい計算や再現性が必要な計算では、`with_accuracy(Accuracy::Exact)` で一度だけ丸める算術を選ぶ。
+疎行列どうしの積の手間は $\sum_k \mathrm{nnz}(\mathbf{A}_{:,k})\,\mathrm{nnz}(\mathbf{B}_{k,:})$ で決まり、出力の大きさは事前に分からないので、大きな積は `SparseProductPlan::with_options` に `with_max_output_entries` で構造の上限を付けて求める。
+値だけが変わる積は、Plan と作業領域を一度作って `evaluate_into` を繰り返し、構造の解析と確保を繰り返さない。
+
+## 次に読むページ
+
+- [疎三角代入と疎 LU 分解](../triangular-and-sparse-lu/)：行列ベクトル積と並ぶ基本演算である三角系の代入と、それを使う左向きの疎 LU 分解を確かめる。
+- [代数的多重格子による前処理](../algebraic-multigrid/)：粗い格子の演算子 $\mathbf{P}^{\mathsf{T}}\mathbf{A}\mathbf{P}$ を疎行列の積で作る多重格子の構成を確かめる。
+- [格納・組立て・積](../../api/storage-and-products/)：積のオプション、Plan、作業領域の全項目の仕様を引く。

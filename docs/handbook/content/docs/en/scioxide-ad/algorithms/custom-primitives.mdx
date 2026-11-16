@@ -1,0 +1,441 @@
+---
+title: "Differentiation rules for scalar functions"
+description: "Overview and selection of three ways for callers to supply derivatives; the mechanisms and accuracy limits of Real::map_scalar, try_map_scalar, and combine for all numeric types; rule invocation counts; and rules for the normal cumulative distribution function checked with finite differences."
+sidebar:
+  order: 380
+references:
+  ad-custom-rule-kinds: "three-ways-to-supply-derivatives"
+  ad-map-scalar: "scalar-function-rules-with-map_scalar"
+  ad-combine: "supplying-partial-derivatives-with-combine"
+  ad-custom-rule-choice: "choosing-a-method"
+---
+
+Automatic differentiation assumes that a function can be written using `Real` operations.
+However, callers are better placed to supply derivatives when values should be computed by library functions (such as special functions or eigensolvers), when closed-form derivatives are preferable to differentiating iterations, or when structure allows products to be computed without forming a matrix.
+This page surveys the three methods in `scioxide-ad` and how to choose between them, then explains the mechanisms and accuracy limits of `map_scalar`, `try_map_scalar`, and `combine`, which support all numeric types.
+The third method, `ExternalRule`, is tape-specific and covered in [External differentiation rules with ExternalRule](../external-rules/).
+Since `scioxide-ad` does not check the mathematical correctness of supplied derivatives, this page also shows how to check rules with finite differences, using the normal cumulative distribution function.
+
+## Three ways to supply derivatives
+
+| Method | What to supply | Supported numeric types | Accuracy |
+|---|---|---|---|
+| `Real::map_scalar`, `try_map_scalar` | Scalar-function $[f(x), f'(x), f''(x)]$ for each lane (one SIMD element) | All | Exact through total order 2; deeper components are NaN |
+| `Real::combine` | Value and partial derivatives with respect to multiple arguments (computed in `Primal` arithmetic) | All | Exact through the nesting order; `Jet` coefficients above $c_1$ are NaN |
+| `ExternalRule` and `Var::external` | Vector-function values, pullback, and optionally pushforward | Tapes (`Var`) only | As specified by the products in the rule |
+
+A pullback is the product $J^{\mathsf T} \bar y$ of the transpose of Jacobian $J$ and output adjoint $\bar y$ (the final output's partial derivative with respect to $y$); a pushforward is the product $J \dot x$ of $J$ and input tangent $\dot x$ (the direction of input motion).
+Total order is the sum of differentiation orders at each nesting level; the second derivative in `Dual<Dual<f64>>` and coefficient $c_2$ in `Jet` both have total order 2.
+`Primal` denotes a wrapper's value-part type (one level below): `f64` for `Dual<f64>` and `Dual<f64>` for `Dual<Dual<f64>>`.
+
+The first two are `Real` methods, so using them in a generic function works with `f64`, `Lanes`, `Dual`, `MultiDual`, `Jet`, or `Var`.
+The third is tape-specific and records one invocation as one statement (one tape record).
+
+## Scalar-function rules with map_scalar
+
+`x.map_scalar(rule)` supplies a scalar function $f$ through a rule `rule: FnMut(S) -> [S; 3]`.
+The rule takes one lane $t$ of the base value (the innermost value, such as `f64`) and returns $[f(t), f'(t), f''(t)]$.
+Each numeric type constructs its components from these three values.
+
+| Numeric type | Result |
+|---|---|
+| `f32`, `f64`, `Lanes` | $f(t)$ in each lane |
+| `Dual<V>` | Value $f(x)$, derivative $f'(x)\,\dot x$ |
+| `Dual<Dual<V>>` | Use $f''(x)$ for second derivatives |
+| `Var<V>` | Record one statement with partial derivative $f'(x)$. For `Var<Dual>`, use $f''(x)$ as the derivative of the partial derivative. When wrapped by a forward-mode type such as `Dual<Var>`, `MultiDual<Var>`, or `Jet<Var>`, also record derivative components $f'(x)$ and $f''(x)$ as separate statements |
+| `Jet<V, N>` | $c_0 = f$, $c_1 = f' x_1$, $c_2 = f' x_2 + \tfrac12 f'' x_1^2$; $c_3$ and above are NaN |
+
+$x_1, x_2$ are the argument's Taylor coefficients.
+Results are exact through total order 2: `Dual`, `MultiDual`, `Var`, `Var<Dual>`, `Dual<Var>`, `Dual<Dual>`, and `Jet` through $c_2$ use the rule's values directly.
+Deeper components (the third derivative in `Dual<Dual<Dual>>` or $c_3$ in `Jet`) become NaN.
+`Dual` and `MultiDual` use `azmul` for the product of $f'$ with the tangent ([Kinks and nonfinite-value policies](../nonsmooth-and-nonfinite-policies/)).
+
+The rule is called once per lane and must be deterministic.
+A tape transformation executes the function again when capacity is insufficient, so the rule can be called twice at the same point ([Tape lifecycle and reuse](../tape-lifecycle/)).
+The first execution only counts statements; the second builds the recording.
+If a rule returns different values on successive calls and branching on them changes recording size so that the second recording exceeds the expanded capacity, the transformation fails with `InvalidInput` (`Inconsistent`).
+The 14 stable transformations such as `softplus` also use this mechanism for wrapper types other than `Jet` (`Dual`, `MultiDual`, `Var`) ([Elementary function derivatives and accuracy](../elementary-functions/)).
+
+`try_map_scalar(rule)` is the form for a rule returning `Result<[S; 3], SciOxideError>`.
+If a rule returns an error in any lane, the first error is returned unchanged.
+Use this form for values computed by SciOxide functions returning `Result` (such as special functions in `scioxide_special`).
+
+## Supplying partial derivatives with combine
+
+`R::combine(arguments, value, partials)` constructs a result from the value `value` and partial derivatives `partials[k]` with respect to `arguments[k]`.
+`value` and `partials` are values of the type `Primal` one level below, computed by the caller with `Primal` operations.
+Different lengths for `arguments` and `partials` return `DimensionMismatch`.
+
+`Dual` sums the derivative as $\sum_k \operatorname{azmul}(\text{partials}_k, \dot x_k)$ in index order; `Var` records one statement holding every argument.
+If `Primal` itself carries derivatives (the `Primal` of `Dual<Dual<f64>>` is `Dual<f64>`), partial derivatives computed by the caller with `Primal` operations correctly retain their own derivatives.
+Nested types are therefore exact through the outer type's order.
+`Jet` constructs only the value and $c_1 = \sum_k \text{partials}_k\, x_{k,1}$; coefficients above $c_1$ become NaN.
+
+`map_scalar` gives up to second order for one variable; `combine` gives first order for multiple variables (through the outer order when nested).
+If a function's value and partial derivatives of $f$ can be written using `Primal` operations, `combine` separates value computation from derivative computation.
+
+## Choosing a method
+
+For a generic rule supporting all numeric types, use `map_scalar` (one variable, through second order) or `combine` (multiple variables, through first order).
+The same function works with `Dual`, `Jet`, or tapes, and can also be an item function in `BatchPlan`.
+Use `ExternalRule` for vector inputs and outputs when computing products without forming a Jacobian, or for external computations whose values cannot be computed generically (such as solvers accepting only floating-point types like `f64`) ([External differentiation rules with ExternalRule](../external-rules/)).
+`ExternalRule` works only on tapes and cannot be applied to forward-mode types.
+Linear-system solutions have the dedicated `solve_into` ([Differentiating linear solutions and factorizations](../linear-solutions/)); implicit functions have `implicit_solution_into` ([Differentiating implicit functions](../implicit-functions/)).
+
+## The normal cumulative distribution function
+
+The standard normal cumulative distribution function
+
+$$
+\Phi(x) = \frac{1}{\sqrt{2\pi}} \int_{-\infty}^{x} e^{-t^2/2}\,dt, \qquad
+\Phi'(x) = \varphi(x) = \frac{e^{-x^2/2}}{\sqrt{2\pi}}, \qquad
+\Phi''(x) = -x\,\varphi(x), \qquad
+\Phi'''(x) = (x^2 - 1)\,\varphi(x)
+$$
+
+cannot be expressed with elementary functions.
+Compute values with scioxide-special's `normal_cdf` (a `Result`-returning function covered in [Normal tails and Owen's T function](../../../scioxide-special/algorithms/normal-tails-and-faddeeva/)) and supply closed-form derivatives.
+scioxide-special is not a dependency of scioxide-ad, so add it to `Cargo.toml` when using it in your own code.
+
+The following definitions are shared by both cells.
+`density` evaluates $\varphi$ with operations of numeric type `V`.
+`cdf` supplies $\Phi$ with the `try_map_scalar` rule $[\Phi(t), \varphi(t), -t\varphi(t)]$, while `cdf_combined` supplies the same $\Phi$ with `combine`.
+The value for `cdf_combined` is `cdf` one level below; its partial derivative is `density` one level below.
+
+```rust
+//| id: ad-normal-cdf-model
+//| kind: definitions
+//| title: "Two rules for the normal cumulative distribution function"
+//| crates: [scioxide-ad, scioxide-core, scioxide-special]
+use scioxide_ad::Real;
+use scioxide_core::SciOxideError;
+use scioxide_special::normal_cdf;
+
+/// φ(t) = e^{−t²/2}/√(2π). Evaluate with operations of numeric type V.
+pub(crate) fn density<V: Real>(t: V) -> V {
+    (t * t * -0.5).exp() * 0.398_942_280_401_432_7
+}
+
+/// Supply Φ through the rule [Φ, φ, −tφ]. Values use normal_cdf from scioxide-special.
+pub(crate) fn cdf<R: Real>(x: R) -> Result<R, SciOxideError> {
+    x.try_map_scalar(|t| Ok([normal_cdf(t)?, density(t), -t * density(t)]))
+}
+
+/// Supply the same Φ with combine. Compute values and partial derivatives φ with operations of the type Primal one level below.
+pub(crate) fn cdf_combined<R: Real>(x: R) -> Result<R, SciOxideError> {
+    let p = x.primal();
+    R::combine(&[x], cdf(p)?, &[density(p)])
+}
+```
+
+The next cell evaluates `cdf` and `cdf_combined` with each numeric type and obtains first through third derivatives.
+The input is the evaluation point $x$ (dimensionless).
+The table compares each value with closed-form references $\varphi$, $-x\varphi$, and $(x^2 - 1)\varphi$ computed with inherent f64 methods; NaN values appear as “NaN”.
+Nesting `Dual::variable` gives tangent 1 at every level, so `.derivative().derivative()` of `Dual<Dual<f64>>` is the second derivative.
+
+```rust
+//| id: ad-normal-cdf-rules
+//| ref: ad-normal-cdf-rules
+//| title: "Derivatives of Φ supplied with map_scalar and combine for each numeric type"
+//| run: reactive
+//| crates: [scioxide-ad, scioxide-core]
+//| uses: [ad-normal-cdf-model]
+//| inputs:
+//|   x: {"type":"range","label":"Evaluation point x","description":"Point where the standard normal cumulative distribution function Φ is differentiated (dimensionless).","min":-4,"max":4,"step":0.25,"value":1.5}
+//| cases:
+//|   - {"id":"origin","label":"x = 0","description":"Point with Φ″(0) = 0.","inputs":{"x":0}}
+//|   - {"id":"lower-tail","label":"x = −3.5","description":"Lower tail. φ decreases to 8.7 × 10⁻⁴.","inputs":{"x":-3.5}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"derivatives","path":"/rows/0/2","approx":{"value":0.12951759566589174,"rtol":1e-14}}
+//|       - {"artifact":"derivatives","path":"/rows/1/4","range":{"max":1e-16}}
+//|       - {"artifact":"derivatives","path":"/rows/2/4","range":{"max":1e-16}}
+//|       - {"artifact":"derivatives","path":"/rows/3/2","approx":{"value":-0.19427639349883763,"rtol":1e-14}}
+//|       - {"artifact":"derivatives","path":"/rows/4/4","range":{"max":1e-16}}
+//|       - {"artifact":"derivatives","path":"/rows/5/4","range":{"max":1e-16}}
+//|       - {"artifact":"derivatives","path":"/rows/6/2","equals":null}
+//|       - {"artifact":"derivatives","path":"/rows/7/2","equals":null}
+//|       - {"artifact":"derivatives","path":"/rows/8/4","range":{"max":1e-15}}
+//|       - {"artifact":"derivatives","path":"/rows/9/2","equals":null}
+//|   - case: origin
+//|     expect:
+//|       - {"artifact":"derivatives","path":"/rows/0/2","approx":{"value":0.3989422804014327,"rtol":1e-14}}
+//|       - {"artifact":"derivatives","path":"/rows/3/2","approx":{"value":0,"atol":1e-17}}
+//|       - {"artifact":"derivatives","path":"/rows/6/2","equals":null}
+//|   - case: lower-tail
+//|     expect:
+//|       - {"artifact":"derivatives","path":"/rows/0/2","approx":{"value":0.0008726826950457602,"rtol":1e-13}}
+//|       - {"artifact":"derivatives","path":"/rows/4/2","approx":{"value":0.0030543894326601605,"rtol":1e-13}}
+//|       - {"artifact":"derivatives","path":"/rows/7/2","equals":null}
+use scioxide_ad::{Dual, Jet, Tape, TapeOptions, Var};
+use scioxide_core::ExecutionContext;
+
+let cx = ExecutionContext::sequential();
+let first = cdf(Dual::variable(x)).map_err(|e| e.to_string())?;
+let second = cdf(Dual::variable(Dual::variable(x))).map_err(|e| e.to_string())?;
+let third =
+    cdf(Dual::variable(Dual::variable(Dual::variable(x)))).map_err(|e| e.to_string())?;
+let c = cdf(Jet::<f64, 4>::variable(x))
+    .map_err(|e| e.to_string())?
+    .coefficients();
+let mut gradient = [0.0];
+Tape::<f64>::new(TapeOptions::new())
+    .gradient_into(|v| cdf(v[0]), &[x], &mut gradient, cx)
+    .map_err(|e| e.to_string())?;
+let mut curvature = [0.0];
+Tape::<Dual<f64>>::new(TapeOptions::new())
+    .hvp_into(
+        |v: &[Var<'_, Dual<f64>>]| cdf(v[0]),
+        &[x],
+        &[1.0],
+        &mut curvature,
+        cx,
+    )
+    .map_err(|e| e.to_string())?;
+let combined = cdf_combined(Dual::variable(Dual::variable(x))).map_err(|e| e.to_string())?;
+let combined_jet = cdf_combined(Jet::<f64, 3>::variable(x))
+    .map_err(|e| e.to_string())?
+    .coefficients();
+
+// References (inherent f64 methods): φ, −xφ, (x² − 1)φ.
+let phi = (-0.5 * x * x).exp() / (2.0 * core::f64::consts::PI).sqrt();
+let closed = [phi, -x * phi, (x * x - 1.0) * phi];
+// (Method and numeric type, quantity, value, closed form)
+let third_value = third.derivative().derivative().derivative();
+let rows: Vec<_> = [
+    ("map_scalar：Dual<f64>", "Φ′", first.derivative(), closed[0]),
+    (
+        "map_scalar: tape gradient_into",
+        "Φ′",
+        gradient[0],
+        closed[0],
+    ),
+    ("map_scalar: Jet<f64, 4> c₁", "Φ′", c[1], closed[0]),
+    (
+        "map_scalar：Dual<Dual<f64>>",
+        "Φ″",
+        second.derivative().derivative(),
+        closed[1],
+    ),
+    (
+        "map_scalar: Tape<Dual<f64>> hvp_into",
+        "Φ″",
+        curvature[0],
+        closed[1],
+    ),
+    (
+        "map_scalar: Jet<f64, 4> 2c₂",
+        "Φ″",
+        2.0 * c[2],
+        closed[1],
+    ),
+    (
+        "map_scalar：Dual<Dual<Dual<f64>>>",
+        "Φ‴",
+        third_value,
+        closed[2],
+    ),
+    (
+        "map_scalar: Jet<f64, 4> 6c₃",
+        "Φ‴",
+        6.0 * c[3],
+        closed[2],
+    ),
+    (
+        "combine：Dual<Dual<f64>>",
+        "Φ″",
+        combined.derivative().derivative(),
+        closed[1],
+    ),
+    (
+        "combine: Jet<f64, 3> 2c₂",
+        "Φ″",
+        2.0 * combined_jet[2],
+        closed[1],
+    ),
+]
+.iter()
+.map(|&(method, quantity, value, reference)| {
+    // NaN cannot go in a numeric column; use None and display “NaN” in the table.
+    let shown = |v: f64| (!v.is_nan()).then_some(v);
+    (
+        method,
+        quantity,
+        shown(value),
+        reference,
+        shown((value - reference).abs()),
+    )
+})
+.collect();
+
+let digits = serde_json::json!({ "significantDigits": 16 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Method and numeric type" },
+    { "key": "1", "label": "Quantity" },
+    { "key": "2", "label": "Value [-]", "type": "number", "format": digits, "nullText": "NaN" },
+    { "key": "3", "label": "Closed form [-]", "type": "number", "format": digits },
+    { "key": "4", "label": "Difference [-]", "type": "number", "format": sci2, "nullText": "NaN" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "derivatives" })
+);
+```
+
+At the default $x = 1.5$, `Dual`, the tape, and $c_1$ of `Jet` all return $\Phi'(1.5) = 0.12951759566589174$.
+`Dual<Dual<f64>>`, `hvp_into` of `Tape<Dual<f64>>`, and $2c_2$ of `Jet` return $\Phi''(1.5) = -0.19427639349883763$.
+These six results use the rule's $f'$ and $f''$ directly, so they agree bit for bit for each quantity; differences from the closed forms computed by inherent f64 methods are also zero at this point.
+The third derivative in `Dual<Dual<Dual<f64>>>` and $6c_3$ in `Jet` have total order 3 and become NaN (the closed form is $\Phi'''(1.5) = 0.16189699458236467$).
+
+$\Phi$ supplied with `combine` returns the correct $\Phi''$ even with `Dual<Dual<f64>>`, with a difference of $2.8 \times 10^{-17}$ from the closed form.
+Because the partial derivative $\varphi$ was computed with operations of `Dual<f64>` one level below, outer differentiation computes the derivative of $\varphi$ using the chain rule for `exp`.
+For `Jet`, `combine` constructs coefficients only through $c_1$, so $2c_2$ becomes NaN.
+At $x = 0$ it returns $\Phi''(0) = 0$, and in the tail at $x = -3.5$ it returns $\Phi'(-3.5) = 8.7 \times 10^{-4}$; both agree with the closed forms.
+
+`scioxide-ad` cannot determine whether a rule is correct.
+Comparing the rule's $f'$ and $f''$ with finite differences of its own $f$ and $f'$ detects inconsistencies within the rule (sign or coefficient errors).
+At evaluation point $x$, the next cell compares $f'$ with central differences of $f$ and $f''$ with central differences of $f'$.
+The step is $h = 2^{-13}$; central-difference truncation error is on the order of $h^2 |f'''|/6 \approx 2.5 \times 10^{-9}\,|f'''|$ and rounding error on the order of $\varepsilon/h \approx 2 \times 10^{-12}$.
+The second table counts rule invocations for four-lane `Lanes`, `Dual<Dual<f64>>`, and `gradient_into` on a new tape and the same tape, showing whether the function executed twice to grow the tape (`TapeReport::recorded_twice`).
+
+```rust
+//| id: ad-normal-cdf-rule-check
+//| ref: ad-normal-cdf-rule-check
+//| title: "Checking rules with finite differences and counting invocations"
+//| run: reactive
+//| crates: [scioxide-ad, scioxide-core, scioxide-special]
+//| uses: [ad-normal-cdf-model]
+//| inputs:
+//|   x: {"type":"range","label":"Evaluation point x","description":"Point at which to check the rule (dimensionless).","min":-4,"max":4,"step":0.25,"value":1.5}
+//| cases:
+//|   - {"id":"origin","label":"x = 0","description":"f″(0) = 0, so a sign error in −xφ does not appear in the finite-difference comparison.","inputs":{"x":0}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"rule-check","path":"/rows/0/3","range":{"max":1e-8}}
+//|       - {"artifact":"rule-check","path":"/rows/1/3","range":{"max":1e-8}}
+//|       - {"artifact":"calls","path":"/rows/0/1","equals":4}
+//|       - {"artifact":"calls","path":"/rows/1/1","equals":1}
+//|       - {"artifact":"calls","path":"/rows/2/1","equals":2}
+//|       - {"artifact":"calls","path":"/rows/2/2","equals":"Yes"}
+//|       - {"artifact":"calls","path":"/rows/3/1","equals":1}
+//|       - {"artifact":"calls","path":"/rows/3/2","equals":"No"}
+//|   - case: origin
+//|     expect:
+//|       - {"artifact":"rule-check","path":"/rows/0/3","range":{"max":1e-8}}
+//|       - {"artifact":"rule-check","path":"/rows/1/3","range":{"max":1e-12}}
+use core::cell::Cell;
+use scioxide_ad::{Dual, Lanes, Real, Tape, TapeOptions};
+use scioxide_core::ExecutionContext;
+use scioxide_special::normal_cdf;
+
+// Rule check: compare f′ and f″ with central differences of the rule's f and f′.
+let h = 2.0_f64.powi(-13);
+let value = |t: f64| normal_cdf(t).map_err(|e| e.to_string());
+let phi = density(x);
+let difference_first = (value(x + h)? - value(x - h)?) / (2.0 * h);
+let difference_second = (density(x + h) - density(x - h)) / (2.0 * h);
+let check = vec![
+    (
+        "f′ = φ",
+        phi,
+        difference_first,
+        (phi - difference_first).abs(),
+    ),
+    (
+        "f″ = −xφ",
+        -x * phi,
+        difference_second,
+        (-x * phi - difference_second).abs(),
+    ),
+];
+
+// Rule invocation counts. The rule is called once per lane per recording.
+let calls = Cell::new(0_u32);
+let counted = |t: f64| {
+    calls.set(calls.get() + 1);
+    [
+        normal_cdf(t).unwrap_or(f64::NAN),
+        density(t),
+        -t * density(t),
+    ]
+};
+let lanes = Lanes::<f64, 4>::from_array([x, x + 0.5, x + 1.0, x + 1.5]);
+let _ = lanes.map_scalar(&counted);
+let lane_calls = calls.replace(0);
+let _ = Dual::variable(Dual::variable(x)).map_scalar(&counted);
+let nested_calls = calls.replace(0);
+let cx = ExecutionContext::sequential();
+let mut tape = Tape::<f64>::new(TapeOptions::new());
+let mut gradient = [0.0];
+let mut record = || -> Result<(u32, &'static str), String> {
+    tape.gradient_into(|v| Ok(v[0].map_scalar(&counted)), &[x], &mut gradient, cx)
+        .map_err(|e| e.to_string())?;
+    let twice = if tape.report().recorded_twice() {
+        "Yes"
+    } else {
+        "No"
+    };
+    Ok((calls.replace(0), twice))
+};
+let fresh = record()?;
+let warm = record()?;
+let counts = vec![
+    ("map_scalar on Lanes<f64, 4>", lane_calls, None),
+    ("map_scalar on Dual<Dual<f64>>", nested_calls, None),
+    ("gradient_into on a new tape", fresh.0, Some(fresh.1)),
+    ("Second gradient_into on the same tape", warm.0, Some(warm.1)),
+];
+
+let digits = serde_json::json!({ "significantDigits": 16 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let check_columns = serde_json::json!([
+    { "key": "0", "label": "Rule component" },
+    { "key": "1", "label": "Rule value [-]", "type": "number", "format": digits },
+    { "key": "2", "label": "Central difference [-]", "type": "number", "format": digits },
+    { "key": "3", "label": "Difference [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    check_columns,
+    check,
+    metadata = serde_json::json!({ "id": "rule-check" })
+);
+let count_columns = serde_json::json!([
+    { "key": "0", "label": "Invocation" },
+    { "key": "1", "label": "Rule invocations [count]", "type": "integer" },
+    { "key": "2", "label": "Function executed twice", "nullText": "—" }
+]);
+emit_table_with_columns!(
+    count_columns,
+    counts,
+    metadata = serde_json::json!({ "id": "calls" })
+);
+```
+
+At the default $x = 1.5$, the difference between the rule's $f'$ and the central difference of $f$ is $4.0 \times 10^{-10}$, and that between $f''$ and the central difference of $f'$ is $3.6 \times 10^{-10}$.
+These agree with central-difference truncation errors $h^2 |f'''|/6$ and $h^2 |f''''|/6$ ($4.0 \times 10^{-10}$ and $3.6 \times 10^{-10}$ respectively from $\Phi'''(1.5) = 0.162$ and $\Phi''''(1.5) = 0.146$).
+A sign error making the rule's $f''$ equal to $+x\varphi$ would give a difference of $2|x\varphi(x)| = 0.39$ and be detected by this comparison.
+At $x = 0$, $f''(0) = 0$, so the sign error does not appear in this comparison.
+Checking a rule at one point is insufficient; use multiple points with nonzero derivatives.
+
+In the invocation-count table, the rule is called four times for four-lane `Lanes` and once for `Dual<Dual<f64>>`.
+`gradient_into` on a new tape counts statements and grows the tape on its first execution, then executes the function again to record it, so the rule is also called twice.
+The second call on the same tape executes the function once and calls the rule once.
+
+## Summary
+
+For a univariate function with known value and derivatives through second order, supply a rule with `map_scalar` (`try_map_scalar` if value computation can fail) to obtain exact behavior for `Dual`, `Var`, `Var<Dual>`, `Dual<Var>`, `Dual<Dual>`, and `Jet` through $c_2$; deeper components become NaN.
+Supply multivariate first-order rules with `combine`; computing partial derivatives in the type `Primal` one level below makes nested types exact too, but `Jet` coefficients above $c_1$ become NaN.
+Rules are called per lane and twice on a new tape to match two function executions, so write them as pure deterministic functions of their inputs.
+`scioxide-ad` does not check rule correctness; compare rule values with finite differences or closed forms at multiple points with nonzero derivatives.
+To supply products for vector functions yourself or wrap external computations accepting only floating-point types such as `f64`, use the tape-specific `ExternalRule`.
+
+## Further reading
+
+- [External differentiation rules with ExternalRule](../external-rules/): examine supplying vector-function pullbacks and pushforwards and differentiating them as one tape call statement.
+- [Tape lifecycle and reuse](../tape-lifecycle/): examine the conditions for two function executions and allocation-free reuse.
+- [Taylor jets and higher-order coefficients](../taylor-jets/): compare the coefficient limits of `map_scalar` and `combine` with recurrences for other functions.
+- [Greeks of the Black–Scholes formula](../../examples/black-scholes-greeks/): examine computing option-price sensitivities with a normal cumulative distribution function incorporated through `try_map_scalar`.

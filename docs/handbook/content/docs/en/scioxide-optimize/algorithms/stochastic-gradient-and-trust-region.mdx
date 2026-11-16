@@ -1,0 +1,522 @@
+---
+title: "Stochastic gradient descent and stochastic trust regions"
+description: "Explain sampled objective and gradient contracts, SGD step sizes and noise floors, and adaptive replication and acceptance in stochastic trust-region methods."
+sidebar:
+  order: 392
+references:
+  optimize-sampled-objective: "sampled-objectives-and-gradients"
+  optimize-sgd: "stochastic-gradient-descent"
+  optimize-stochastic-trust-region: "stochastic-trust-region-method"
+---
+
+Objective values or gradients may be available only through data subsets (minibatches) or simulation randomness.
+The quantity minimized is then expectation $f(x)=\mathrm E[F(x,\xi)]$, while the method receives only sample observations $F(x,\xi)$ and $\nabla_xF(x,\xi)$ ($\xi$ is the random variable representing a sample).
+Individual observations contain noise, so results have estimation variability and cannot use convergence criteria with the same meaning as deterministic optimization.
+This page explains sampled objective and gradient interfaces, stochastic gradient descent (SGD), and stochastic trust regions.
+Multiobjective [NSGA-II](../multiobjective-and-stochastic/) uses the same interface.
+
+## Sampled objectives and gradients
+
+`SampledObjective` receives point $x$ and an opaque 64-bit number (token) and writes observations of objective components.
+`SampledGradient` adds gradient observations to a single-component objective.
+SGD and stochastic trust regions require exactly one objective component.
+The method obtains a token from a sampler and passes it on; users interpret it as a data index, minibatch seed, or noise seed.
+Returning the same observation for the same token reproduces the entire run from its seed.
+A nonfinite observation stops the method with a `NonFinite` error.
+
+`NoiseModel` declares relationships between repeated observations at the same point.
+`NoiseModel::Deterministic` declares identical values at the same point and returns standard error 0.
+`NoiseModel::Independent` (default) declares observations from different tokens to be independent samples with a common mean and finite variance.
+The method assumes unbiased objective and gradient observations but does not check this.
+`DeterministicGradient(&smooth)` converts an implementation of `SmoothGradient` into a deterministic `SampledGradient` that ignores tokens.
+
+`StochasticProblem::new(&objective)` borrows the objective and creates tokens with default sampler `PhiloxSampler`.
+The sampler determines a token from the `OptimizationSampleKey` triple (root seed, purpose, sequence number).
+Purposes are 0 for random mutation, 1 for objective, 2 for gradient, 3 for trust-region base point, and 4 for trial point.
+The sequence number increases by 1 per sample and is stored in checkpoints, preventing sample reuse after resumption.
+`PhiloxSampler` takes a sequence-number substream from a Philox4x64-10 generator keyed by the root seed, branches by purpose, and uses the first output as token.
+The key is independent of executor count, so parallel evaluation does not change results.
+Each sampler call counts as one sample and one evaluation even if it fails.
+Replace the sampler by implementing `OptimizationSampler` and supplying it through `with_sampler`.
+`sample(key)` must return equal tokens for equal keys, and `configuration_token()` returns a value identifying sampler configuration.
+A checkpoint resumes only with a sampler having this same value.
+
+`ReplicationOptions` determines the number of replicate observations per estimate.
+`fixed(count)` fixes the count; `adaptive(minimum, maximum)` doubles it when a decision is inconclusive (maximum `maximum`, with `maximum < minimum` equal to `InvalidInput`).
+An estimate comprises sample mean $\bar g$ and standard error $\mathrm{SE}=s/\sqrt n$ ($s$ is sample standard deviation and $n$ observation count); decisions use margin $\kappa\,\mathrm{SE}$.
+$\kappa$ defaults to 2 and is changed by `with_error_multiplier`.
+$\kappa=2$ promises no confidence-interval coverage.
+A single `Independent` observation cannot determine standard error, so the result's `standard_error()` is `None`.
+
+## Noisy one-dimensional model
+
+The two cells on this page use a model adding independent normal noise to the objective and gradient of $f(x)=\tfrac12(x-x^\star)^2$.
+Objective observations are $\tfrac12(x-x^\star)^2+\sigma\xi$ and gradient observations $x-x^\star+\sigma\xi'$; $\xi,\xi'$ are standard normal variates from scioxide-random seeded by the token.
+Different tokens for each purpose make objective and gradient noise independent samples.
+The cells use $x^\star=1.7$ and $x_0=0$.
+The following definitions block shares this model between the two cells.
+
+```rust
+//| id: optimize-noisy-quadratic-model
+//| kind: definitions
+//| title: "One-dimensional quadratic with normal noise in objective and gradient observations"
+//| crates: [scioxide-core, scioxide-optimize, scioxide-random]
+use scioxide_core::SciOxideError;
+use scioxide_optimize::{NoiseModel, SampledGradient, SampledObjective};
+use scioxide_random::{Distribution, Normal, SeedableRng, SplitMix64};
+
+/// Objective observations ½(x − x*)² + σξ and gradient observations x − x* + σξ for f(x) = ½(x − x*)².
+/// ξ is a token-seeded standard normal variate; different tokens give independence.
+pub(crate) struct NoisyQuadratic {
+    pub(crate) target: f64,
+    pub(crate) noise: f64,
+    normal: Normal<f64>,
+}
+
+impl NoisyQuadratic {
+    /// Construct the model from minimizer x* and noise standard deviation σ.
+    pub(crate) fn new(target: f64, noise: f64) -> Result<Self, SciOxideError> {
+        Ok(Self {
+            target,
+            noise,
+            normal: Normal::new(0.0, 1.0)?,
+        })
+    }
+
+    /// Standard normal variate ξ seeded by the token.
+    fn draw(&self, token: u64) -> Result<f64, SciOxideError> {
+        self.normal.sample(&mut SplitMix64::from_seed(token))
+    }
+}
+
+impl SampledObjective<f64> for NoisyQuadratic {
+    fn dimension(&self) -> usize {
+        1
+    }
+    fn objectives(&self) -> usize {
+        1
+    }
+    fn noise_model(&self) -> NoiseModel {
+        NoiseModel::Independent
+    }
+    fn sample_into(&self, x: &[f64], token: u64, out: &mut [f64]) -> Result<(), SciOxideError> {
+        let residual = x[0] - self.target;
+        out[0] = 0.5 * residual * residual + self.noise * self.draw(token)?;
+        Ok(())
+    }
+}
+
+impl SampledGradient<f64> for NoisyQuadratic {
+    fn gradient_sample_into(
+        &self,
+        x: &[f64],
+        token: u64,
+        out: &mut [f64],
+    ) -> Result<(), SciOxideError> {
+        out[0] = x[0] - self.target + self.noise * self.draw(token)?;
+        Ok(())
+    }
+}
+```
+
+## Stochastic gradient descent
+
+`StochasticGradientDescent` updates by
+
+$$
+x_{k+1}=x_k-\alpha_k\bar g_k
+$$
+
+
+$\bar g_k$ is the minibatch mean of `batch` gradient observations from `SgdOptions::new(step, iterations, batch)`.
+Every update is accepted; at the new point, objective observations from a separate `batch`-sample batch are used only for reporting.
+Each iteration uses one gradient batch and one objective batch.
+
+Step size $\alpha_k$ is determined by `SgdStep`; $k$ counts completed updates.
+`SgdStep::Constant(α)` is a constant step; `SgdStep::Diminishing { initial, decay, power }` uses $\alpha_k=\alpha_0/(1+dk)^p$; if $p$ of `SgdStep::Diminishing` is outside $1/2<p\le1$, `new` returns `InvalidInput`.
+Together with assumptions such as unbiasedness, bounded variance, and smoothness, classical convergence conditions include $\sum\alpha_k=\infty$ and $\sum\alpha_k^2<\infty$ (Robbins and Monro, 1951).
+The diminishing step $1/2<p\le1$ meets these conditions, but constant steps do not and keep fluctuating around the minimizer.
+
+Check this difference by formula in the one-dimensional model.
+For a constant step, error $e_k=x_k-x^\star$ follows $e_{k+1}=(1-\alpha)e_k-\alpha\sigma\xi_k$.
+If $\xi_k$ are independent standard normal variates, the expected squared error is
+
+$$
+\mathrm E[e_k^2]=(1-\alpha)^{2k}e_0^2+\frac{\alpha\sigma^2}{2-\alpha}\bigl(1-(1-\alpha)^{2k}\bigr)
+$$
+
+
+The first term is a transient reducing initial error by ratio $(1-\alpha)^2$; as $k\to\infty$, the second approaches noise floor $\alpha\sigma^2/(2-\alpha)$.
+With diminishing steps $\alpha_k=1/(k+1)$, $x_K$ becomes $x^\star-\sigma\cdot(\xi_0+\dots+\xi_{K-1})/K$ from $K$ gradient observations, and its mean squared error tends to 0 as $\mathrm E[e_K^2]=\sigma^2/K$.
+
+Stopping occurs when the gradient estimate $\|\bar g\|+\kappa\|\mathrm{SE}\|$ falls to at most the `GradientTolerance` threshold (default absolute and relative parts $\sqrt{\varepsilon}$, scale 1).
+Deterministic objectives give `GradientSmall` (success); noisy objectives give `EstimatedStationarity` (an estimation status that is not success).
+With one `Independent` observation, standard error is unavailable, so this stopping criterion cannot occur and the iteration limit gives `IterationLimit`.
+Even at a limit, the method observes the gradient at the last point before stopping.
+If rounding prevents the step from moving the point, it stops with `StepSmall`.
+
+`StochasticResult` returns the last accepted point `x()` and its objective estimate `value()`, `standard_error()`, `sample_variance()`, and `value_replicates()`.
+Gradient estimates are in `gradient()`, `gradient_standard_errors()`, and `gradient_replicates()`; they are `None` if no gradient was observed at that point.
+It also returns `iterations()`, `termination()`, `counts()`, and `sample_cursor()` (next sample sequence number); `is_success()` is true only for `GradientSmall`.
+An empty or dimensionally incompatible `x0`, or an objective component count other than one, gives `InvalidInput`; stopping before the first objective estimate is an error.
+Passing `StochasticWorkspace` to `minimize_into` stores a stopped run through `checkpoint()` and continues it through `resume_into` without reusing samples.
+The `StochasticWorkspaceRequirements` returned by `workspace_requirements(n)` contains dimension, maximum samples per estimate `replicates()`, and approximate byte count `bytes()`.
+`StochasticWorkspace` records the last call; the `StochasticProgress` returned by `progress()` of `last_attempt()` exposes iterations `iterations()` up to the accepted point and its objective sample mean `value()`.
+
+## Noise floors of constant and diminishing steps
+
+The next cell solves the one-dimensional model using `StochasticGradientDescent` with minibatch size 1, doubling iteration limit $K$ from 1 to 512.
+For each $K$, $R=40$ runs differing only in seed estimate mean squared error $\overline{e_K^2}$ and its standard error for comparison with the theory above.
+Every $K$ uses the same 40 seeds, so a run at one $K$ matches the initial iterations of a run with larger $K$.
+Thus points at different $K$ are not independent.
+Inputs are noise standard deviation $\sigma$, constant step $\alpha$, and seed base.
+The first plot shows measured mean squared errors (markers) and theory (dashed curves) on logarithmic axes; the second shows measured/theoretical ratios with $\pm2\,\mathrm{SE}$ error bars.
+An error bar covering the line at ratio 1 indicates consistency with theory.
+The table shows measurements, standard errors, theoretical values, standardized differences $(\overline{e_K^2}-\mathrm E[e_K^2])/\mathrm{SE}$, and termination reasons at $K=512$.
+
+```rust
+//| id: optimize-sgd-noise-floor
+//| ref: optimize-sgd-noise-floor
+//| title: "Compare constant- and diminishing-step SGD mean squared errors with theory"
+//| run: button
+//| timeoutMs: 120000
+//| uses: [optimize-noisy-quadratic-model]
+//| crates: [scioxide-core, scioxide-optimize, scioxide-random]
+//| inputs:
+//|   noise: {"type":"range","label":"Gradient noise σ [-]","min":0.1,"max":2,"step":0.1,"value":1}
+//|   step: {"type":"range","label":"Constant step α [-]","min":0.02,"max":0.5,"step":0.02,"value":0.1}
+//|   seed: {"type":"range","label":"Seed base [-]","min":1,"max":100,"step":1,"value":1}
+//| cases:
+//|   - {"id":"small-step","label":"α = 0.02","description":"The noise floor falls to 0.0101, but approximately 140 iterations are needed for the transient to fall below it.","inputs":{"step":0.02}}
+//|   - {"id":"large-step","label":"α = 0.5","description":"The noise floor rises to 1/3, leaving error two orders of magnitude above diminishing steps.","inputs":{"step":0.5}}
+//|   - {"id":"seed-100","label":"Seed base 100","description":"With a different random sequence, measurements still scatter around theory on the standard-error scale.","inputs":{"seed":100}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"final","path":"/rows/0/1","equals":512}
+//|       - {"artifact":"final","path":"/rows/0/4","approx":{"value":0.0526316,"atol":1e-6}}
+//|       - {"artifact":"final","path":"/rows/0/5","range":{"min":-3,"max":3}}
+//|       - {"artifact":"final","path":"/rows/1/4","approx":{"value":0.001953125,"atol":1e-9}}
+//|       - {"artifact":"final","path":"/rows/1/5","range":{"min":-3,"max":3}}
+//|       - {"artifact":"final","path":"/rows/0/6","equals":"IterationLimit"}
+//|   - case: small-step
+//|     expect:
+//|       - {"artifact":"final","path":"/rows/0/4","approx":{"value":0.010101,"atol":1e-5}}
+//|       - {"artifact":"final","path":"/rows/0/5","range":{"min":-3,"max":3}}
+//|   - case: large-step
+//|     expect:
+//|       - {"artifact":"final","path":"/rows/0/4","approx":{"value":0.333333,"atol":1e-5}}
+//|       - {"artifact":"final","path":"/rows/0/5","range":{"min":-3,"max":3}}
+//|   - case: seed-100
+//|     expect:
+//|       - {"artifact":"final","path":"/rows/0/5","range":{"min":-3,"max":3}}
+//|       - {"artifact":"final","path":"/rows/1/5","range":{"min":-3,"max":3}}
+use scioxide_core::{Budget, RealScalar};
+use scioxide_optimize::{SgdOptions, SgdStep, StochasticGradientDescent, StochasticProblem};
+let model = NoisyQuadratic::new(1.7, noise).map_err(|e| e.to_string())?;
+let problem = StochasticProblem::new(&model);
+let schedules = [
+    ("Constant step", SgdStep::Constant(step)),
+    (
+        "Diminishing step 1/(k+1)",
+        SgdStep::Diminishing {
+            initial: 1.0,
+            decay: 1.0,
+            power: 1.0,
+        },
+    ),
+];
+let replicates = 40;
+let (mut series, mut ratios, mut rows) = (Vec::new(), Vec::new(), Vec::new());
+for (name, schedule) in schedules {
+    let (mut measured, mut theory, mut bars) = (Vec::new(), Vec::new(), Vec::new());
+    for level in 0..10 {
+        let iterations = 1_usize << level;
+        let budget = Budget::try_from(iterations).map_err(|e| e.to_string())?;
+        let mut squares = Vec::with_capacity(replicates);
+        let mut termination = String::new();
+        for r in 0..replicates {
+            // Independent runs differing only in seed. Each minibatch contains 1 sample.
+            let options = SgdOptions::new(schedule, budget, Budget::ONE)
+                .with_seed(seed as u64 * 1000 + r as u64);
+            let result = StochasticGradientDescent::new(options)
+                .map_err(|e| e.to_string())?
+                .minimize(&problem, &[0.0])
+                .map_err(|e| e.to_string())?;
+            squares.push((result.x()[0] - model.target).powi(2));
+            termination = result.termination().to_string();
+        }
+        let count = replicates as f64;
+        let mean = squares.iter().sum::<f64>() / count;
+        let spread = squares.iter().map(|s| (s - mean).powi(2)).sum::<f64>() / (count - 1.0);
+        let standard_error = RealScalar::sqrt(spread / count);
+        // Theory (independent formulas): transient plus noise floor for constant steps, σ²/K for diminishing steps.
+        let k = iterations as f64;
+        let expected = match schedule {
+            SgdStep::Constant(a) => {
+                let decay = RealScalar::powf(1.0 - a, 2.0 * k);
+                decay * model.target.powi(2) + a * noise * noise / (2.0 - a) * (1.0 - decay)
+            }
+            SgdStep::Diminishing { .. } => noise * noise / k,
+        };
+        measured.push([k, mean]);
+        theory.push([k, expected]);
+        let (low, high) = (mean - 2.0 * standard_error, mean + 2.0 * standard_error);
+        bars.push([k, mean / expected, low / expected, high / expected]);
+        if level == 9 {
+            let z = (mean - expected) / standard_error;
+            rows.push((
+                name,
+                iterations,
+                mean,
+                standard_error,
+                expected,
+                z,
+                termination,
+            ));
+        }
+    }
+    series.push(serde_json::json!({
+        "name": format!("{name} (measured)"),
+        "points": measured,
+        "style": { "showSymbol": true }
+    }));
+    series.push(serde_json::json!({
+        "name": format!("{name} (theory)"),
+        "points": theory,
+        "style": { "lineType": "dashed" }
+    }));
+    ratios.push(serde_json::json!({ "name": name, "points": bars }));
+}
+emit_line_chart!(
+    &series,
+    options = &serde_json::json!({
+        "link": { "group": "sgd-iterations" },
+        "xLabel": "Iteration limit K [count]",
+        "yLabel": "Mean squared error E[(x_K − x*)²] [-]",
+        "xType": "log",
+        "yType": "log"
+    })
+);
+emit_chart!(
+    serde_json::json!({
+        "kind": "errorbar",
+        "link": { "group": "sgd-iterations" },
+        "dataZoom": true,
+        "tooltip": true,
+        "xLabel": "Iteration limit K [count]",
+        "yLabel": "Measured / theoretical (± 2 SE) [-]",
+        "xType": "log",
+        "series": ratios,
+        "annotations": [{ "kind": "line", "axis": "y", "value": 1.0, "label": "Theory" }]
+    }),
+    metadata = serde_json::json!({ "id": "ratio" })
+);
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Step" },
+    { "key": "1", "label": "K [count]", "type": "integer" },
+    { "key": "2", "label": "Mean squared error [-]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "Its standard error [-]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "Theory [-]", "type": "number", "format": sci3 },
+    { "key": "5", "label": "(Measured − theoretical) / SE [-]", "type": "number", "format": fixed2 },
+    { "key": "6", "label": "Termination reason" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "final" })
+);
+```
+
+For constant step $\alpha=0.1$ and $\sigma=1$, mean squared error initially decreases by transient $(1-\alpha)^{2K}e_0^2$ until $K\approx19$, then levels off near noise floor $\alpha\sigma^2/(2-\alpha)=0.0526$.
+The measurement at $K=512$ is $0.0409\pm0.0093$ (mean ± standard error), differing from theory by $-1.26$ standard errors.
+Diminishing steps $1/(k+1)$ follow line $\sigma^2/K$ of slope $-1$ on logarithmic axes, reaching $0.00241\pm0.00042$ at $K=512$ (theory 0.00195, difference 1.09 standard errors).
+At the same iteration count, diminishing-step error is over one order of magnitude below constant steps with their noise floor.
+In the ratio plot, 19 of 20 error bars cover 1; only diminishing steps at $K=32$ miss it slightly with $[1.03,2.14]$.
+About 5% of $\pm2\,\mathrm{SE}$ error bars can be expected to miss 1; the distribution of $e_K^2$ is right-skewed and points at different $K$ are dependent, so this single miss does not establish inconsistency with theory.
+At $\alpha=0.02$ the floor falls to 0.0101, but the transient needs approximately 140 iterations to fall below it.
+At $\alpha=0.5$ the floor rises to $1/3$; the measurement $0.256\pm0.061$ at $K=512$ is two orders of magnitude above diminishing steps' 0.0024.
+Minibatches contain 1 sample, so gradient standard error is unavailable and every run stops with `IterationLimit`.
+
+## Stochastic trust-region method
+
+`StochasticTrustRegion` uses first-order model $m(s)=f(x)+\bar g^Ts$ within a ball of radius $\Delta$ and decides trial acceptance while increasing observations according to estimation error (Chen, Menickelly, and Scheinberg, 2018).
+Each iteration proceeds as follows.
+
+1. Observe the gradient the minimum number of times, doubling observations until margin $\kappa\|\mathrm{SE}(\bar g)\|$ is at most $\theta\Delta$.
+   If this still fails at the limit, stop with `NoiseLimit`.
+2. Take the model-minimizing step $s=-\Delta\,\bar g/\|\bar g\|$ within the ball, with predicted reduction $\Delta\|\bar g\|$.
+   If $\|\bar g\|<\beta\Delta$, reject without observing the objective.
+3. Observe objectives at the base and trial points equally often, obtaining estimated reduction $\hat r$ and $\mathrm{SE}=\sqrt{\mathrm{SE}_x^2+\mathrm{SE}_{x+s}^2}$ combining both standard errors.
+4. If $\hat r-\kappa\,\mathrm{SE}\ge\eta\,\Delta\|\bar g\|$, accept and multiply the radius by $\gamma$ (maximum $\Delta_{\max}$).
+   If $\hat r+\kappa\,\mathrm{SE}<\eta\,\Delta\|\bar g\|$, reject and multiply the radius by $1/\gamma$.
+   If neither decision is possible, double observations and return to step 3; at the limit, stop with `NoiseLimit`.
+5. If the radius falls below lower bound $\Delta_{\min}$, stop with `StepSmall`.
+
+Step 1 also applies the same stopping criterion as SGD and may stop with `GradientSmall` or `EstimatedStationarity`.
+Bounding the gradient margin by $\theta\Delta$ makes model error proportional to step size; smaller radii require more gradient observations.
+With standard error approximately $\sigma/\sqrt n$ from $n$ observations, limit $M$ restricts radii satisfying step 1 to $\Delta\ge\kappa\sigma/(\theta\sqrt M)$.
+
+Defaults of `StochasticTrustOptions::new(iterations, replication)` are initial radius $\Delta_0=1$, $\Delta_{\max}=10$, $\Delta_{\min}$ equal to machine epsilon, $\eta=0.1$, $\beta=0.001$, $\gamma=2$, and $\theta=1/4$.
+`with_radii(minimum, initial, maximum)` takes positive finite radii in increasing order; `with_model_policy(η, β, γ, θ)` takes values satisfying $0<\eta<1$, $\beta>0$, $\gamma>1$, and $\theta>0$.
+Rustdoc writes gradient accuracy $\theta$ as $\kappa$; this page uses $\kappa$ for the standard-error multiplier.
+For a `Independent` objective, a minimum count below 2 in `replication` gives `InvalidInput`.
+Result `iterations()` also counts rejected iterations, and `trust_radius()` returns the final radius.
+`SgdOptions` and `StochasticTrustOptions` configure seed (`with_seed`, default 42), gradient tolerance, execution policy, and time limit identically.
+
+## Replication limits and final error
+
+The next cell solves the one-dimensional model with `StochasticTrustRegion`, doubling replication limit $M$ from $8$ to $2048$ to compare termination and final-point errors.
+The minimum replication count is 4 and iteration limit 300; other settings use defaults.
+In one dimension the step is $\pm\Delta$; unless the radius reaches maximum 10, it is a power-of-two multiple of $\Delta_0=1$, placing iterates on a binary grid.
+A grid value such as $x^\star=2$ can give exactly zero error, so the model uses $x^\star=1.7$.
+Inputs are observation noise $\sigma$ and seed.
+The plot shows final-point error $|x-x^\star|$ and final radius $\Delta$ (markers), and the gradient-accuracy radius lower bound $\kappa\sigma/(\theta\sqrt M)$ (dashed curve), on logarithmic axes.
+The table lists termination, iterations, samples used, final point and error, final radius, radius lower bound, and final gradient standard error for each $M$.
+
+```rust
+//| id: optimize-stochastic-trust-replicates
+//| ref: optimize-stochastic-trust-replicates
+//| title: "Compare stochastic trust-region termination and error across replication limits"
+//| run: button
+//| timeoutMs: 120000
+//| uses: [optimize-noisy-quadratic-model]
+//| crates: [scioxide-core, scioxide-optimize, scioxide-random]
+//| inputs:
+//|   noise: {"type":"range","label":"Observation noise σ [-]","min":0,"max":2,"step":0.25,"value":1}
+//|   seed: {"type":"range","label":"Seed [-]","min":1,"max":100,"step":1,"value":1}
+//| cases:
+//|   - {"id":"noise-free","label":"σ = 0","description":"Observations are deterministic but the model declares Independent, so termination near the minimizer is EstimatedStationarity.","inputs":{"noise":0}}
+//|   - {"id":"noisy","label":"σ = 2","description":"The gradient-accuracy lower bound doubles and the first step needs 256 observations.","inputs":{"noise":2}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"replicates","path":"/rows/0/1","equals":"NoiseLimit"}
+//|       - {"artifact":"replicates","path":"/rows/0/2","equals":0}
+//|       - {"artifact":"replicates","path":"/rows/3/2","range":{"min":1,"max":300}}
+//|       - {"artifact":"replicates","path":"/rows/8/1","equals":"NoiseLimit"}
+//|       - {"artifact":"replicates","path":"/rows/8/5","range":{"min":0,"max":0.75}}
+//|   - case: noise-free
+//|     expect:
+//|       - {"artifact":"replicates","path":"/rows/0/1","equals":"EstimatedStationarity"}
+//|       - {"artifact":"replicates","path":"/rows/0/5","range":{"min":0,"max":1e-6}}
+//|   - case: noisy
+//|     expect:
+//|       - {"artifact":"replicates","path":"/rows/4/2","equals":0}
+//|       - {"artifact":"replicates","path":"/rows/5/2","range":{"min":1,"max":300}}
+use scioxide_core::{Budget, EvaluationRole, RealScalar};
+use scioxide_optimize::{
+    ReplicationOptions, StochasticProblem, StochasticTrustOptions, StochasticTrustRegion,
+};
+let model = NoisyQuadratic::new(1.7, noise).map_err(|e| e.to_string())?;
+let problem = StochasticProblem::new(&model);
+let minimum = Budget::try_from(4_usize).map_err(|e| e.to_string())?;
+let iterations = Budget::try_from(300_usize).map_err(|e| e.to_string())?;
+let (mut rows, mut errors, mut radii, mut reference) =
+    (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+for level in 3..=11 {
+    let maximum = 1_usize << level;
+    let replication = ReplicationOptions::adaptive(
+        minimum,
+        Budget::try_from(maximum).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    let options = StochasticTrustOptions::new(iterations, replication).with_seed(seed as u64);
+    let result = StochasticTrustRegion::new(options)
+        .map_err(|e| e.to_string())?
+        .minimize(&problem, &[0.0])
+        .map_err(|e| e.to_string())?;
+    let m = maximum as f64;
+    let error = (result.x()[0] - model.target).abs();
+    // Smallest radius meeting gradient accuracy κ·σ/√M ≤ θΔ with M observations (κ = 2, θ = 1/4).
+    let floor = 2.0 * noise / (0.25 * RealScalar::sqrt(m));
+    errors.push([m, error]);
+    radii.push([m, result.trust_radius()]);
+    if floor > 0.0 {
+        reference.push([m, floor]);
+    }
+    rows.push((
+        maximum,
+        result.termination().to_string(),
+        result.iterations(),
+        result.counts().own().provider(EvaluationRole::Sample),
+        result.x()[0],
+        error,
+        result.trust_radius(),
+        floor,
+        result.gradient_standard_errors().map(|e| e[0]),
+    ));
+}
+emit_line_chart!(
+    &vec![
+        serde_json::json!({ "name": "|x − x*|", "points": errors, "style": { "showSymbol": true } }),
+        serde_json::json!({ "name": "Final radius Δ", "points": radii, "style": { "showSymbol": true } }),
+        serde_json::json!({
+            "name": "κσ/(θ√M)",
+            "points": reference,
+            "style": { "lineType": "dashed" }
+        })
+    ],
+    options = &serde_json::json!({
+        "xLabel": "Replication limit M [count]",
+        "yLabel": "Error and radius [-]",
+        "xType": "log",
+        "yType": "log"
+    })
+);
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let general4 = serde_json::json!({ "significantDigits": 4 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Limit M [count]", "type": "integer" },
+    { "key": "1", "label": "Termination reason" },
+    { "key": "2", "label": "Iterations [count]", "type": "integer" },
+    { "key": "3", "label": "Samples [count]", "type": "integer" },
+    { "key": "4", "label": "Final point x [-]", "type": "number", "format": general4 },
+    { "key": "5", "label": "|x − x*| [-]", "type": "number", "format": sci3 },
+    { "key": "6", "label": "Final radius Δ [-]", "type": "number", "format": sci3 },
+    { "key": "7", "label": "κσ/(θ√M) [-]", "type": "number", "format": sci3 },
+    { "key": "8", "label": "Gradient SE [-]", "type": "number", "format": sci3, "nullText": "None" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "replicates" })
+);
+```
+
+At default $\sigma=1$ and seed 1, every run with $M\le32$ gives `NoiseLimit` after 0 iterations, retaining $x_0=0$ and error 1.7.
+The first gradient needs $n\ge64$ observations to meet $\kappa\sigma/\sqrt n\le\theta\Delta_0=0.25$; the table's radius lower bound $\kappa\sigma/(\theta\sqrt M)$ exceeds $\Delta_0=1$.
+At $M=64$ and $128$, the method advances to $x=1$; at $M\ge256$ it advances further to $x=2$ (error 0.3); all stop with `NoiseLimit`.
+Returning from $x=2$ after overshooting $x^\star=1.7$ requires accepting a shorter step with a smaller radius.
+At $M=512$ and above the final radius falls to 0.5, but error remains 0.3.
+
+Termination at $M\ge256$ is determined by acceptance noise rather than gradient accuracy.
+At $x=2$ and $\Delta=0.5$, $\|\bar g\|\approx0.3$ gives predicted reduction about $0.15$ and acceptance threshold $\eta\Delta\|\bar g\|$ about $0.015$.
+The true reduction at trial point $1.5$ is $f(2)-f(1.5)=0.045-0.02=0.025$, only about $0.01$ above the threshold.
+Deciding acceptance or rejection requires $\kappa\sigma\sqrt{2/n}<0.01$, hence $n>2(\kappa\sigma/0.01)^2=80000$ observations; limit 2048 is inconclusive.
+The gradient-accuracy lower bound (dashed curve) falls as $1/\sqrt M$ with $M$, but acceptance needs observations that distinguish objective differences, so error decreases more slowly than this curve.
+At $\sigma=0$ the observations are deterministic but the model declares `Independent`; even after 53 iterations reaching error $1.2\times10^{-8}$, it returns `EstimatedStationarity` and is not classified as success.
+At seed 100, $M=2048$ advances 10 times to error 0.05; the stopping point depends on seed.
+
+## References
+
+- Stochastic approximation and step-size conditions: H. Robbins and S. Monro, [A Stochastic Approximation Method](https://doi.org/10.1214/aoms/1177729586), Ann. Math. Statist. 22(3), 1951.
+- SGD convergence and noise: L. Bottou, F. E. Curtis and J. Nocedal, [Optimization Methods for Large-Scale Machine Learning](https://doi.org/10.1137/16M1080173), SIAM Rev. 60(2), 2018.
+- Trust regions with stochastic models: R. Chen, M. Menickelly and K. Scheinberg, [Stochastic Optimization Using a Trust-Region Method and Random Models](https://doi.org/10.1007/s10107-017-1141-8), Math. Program. 169(2), 2018.
+- Sampler generator: J. K. Salmon, M. A. Moraes, R. O. Dror and D. E. Shaw, [Parallel Random Numbers: As Easy as 1, 2, 3](https://doi.org/10.1145/2063384.2063405), Proc. SC11, 2011.
+
+## Summary
+
+For noisy objectives, declare observation relationships through `NoiseModel` and read results together with sample counts, standard errors, and termination reasons.
+Expect constant-step SGD to level off around noise floor $\alpha\sigma^2/(2-\alpha)$; use diminishing steps $1/2<p\le1$ to drive error toward 0.
+Stochastic trust regions increase observations until decisions become possible; replication limit $M$ determines attainable radii and acceptance-decision accuracy.
+After `NoiseLimit` termination, increase $M$ or check whether objective differences are hidden by noise.
+The best termination status for a noisy objective is `EstimatedStationarity`, which is not success; combine it with independent verification.
+
+## Further reading
+
+- [Multiobjective optimization and NSGA-II](../multiobjective-and-stochastic/): receive multiple objectives through the same `SampledObjective` and approximate a Pareto front with a population.
+- [Composite, stochastic, and multiobjective API](../../api/composite-stochastic-multiobjective/): examine fields and error conditions of `SgdOptions`, `StochasticTrustOptions`, `ReplicationOptions`, and `StochasticResult`.
+- [Differential evolution](../differential-evolution/): examine seed-dependent variability and interpretation of unsuccessful termination in global search.

@@ -1,0 +1,351 @@
+---
+title: "Surrogate-based search"
+description: "Derive search that fits kriging or RBF surrogates to expensive objective observations and next evaluates points maximizing acquisitions such as expected improvement; examine SurrogateSearch history, models, acquisitions, and feasibility on Branin's function."
+sidebar:
+  order: 386
+references:
+  optimize-surrogate-acquisition: "surrogate-models-and-acquisition-functions"
+  optimize-kriging-and-rbf: "kriging-and-rbf"
+  optimize-expected-improvement: "expected-improvement"
+  optimize-surrogate-loop: "closed-loop-search"
+---
+
+When one objective evaluation takes seconds to hours, evaluation count itself determines computational cost.
+Surrogate-based optimization builds a cheap objective approximation from observed points and selects the next evaluation on that model.
+If the model also reports predictive uncertainty, an acquisition function balances evaluating low predictions and uncertain points.
+Using a Gaussian process (kriging) with expected improvement is known as Jones et al.'s EGO (efficient global optimization), also called Bayesian optimization.
+This page derives models and acquisition functions, explains SciOxide's `SurrogateSearch` contracts, and examines evaluation counts and best observations on Branin's function.
+`SurrogateSearch` claims no global optimality; its termination `SearchBudgetCompleted` is not success.
+
+## Surrogate models and acquisition functions
+
+The surrogate search problem is `SurrogateHistory`, which stores observations.
+`SurrogateHistory::new(bounds, capacity)` accepts a box `FiniteBounds` and observation capacity, returning `InvalidInput` for zero dimension or capacity or a box dimension differing from type dimension `D`.
+`SurrogateObservation::new(point, value, noise_variance)` pairs a point, observed value, and known observation noise variance (0 for an exact value).
+`push` returns `InvalidInput` if history is full, the value or noise variance is NaN or infinite, noise variance is negative, or the point lies outside the box.
+Repeated observations at the same point are allowed, permitting noisy observations to accumulate.
+
+`SurrogateFitter` fits a `SurrogateModel` from history; the model's `predict(point, workspace)` returns `SurrogatePrediction`.
+In `SurrogatePrediction::new(mean, variance)`, `mean()` is the predicted mean and `variance()` the conditional variance of the latent function (objective without observation noise); models without variance return `None`.
+Model interpretation and numerical stability follow [local models and kriging](../../../scioxide-interp/algorithms/local-models-and-kriging/).
+
+### Kriging and RBF
+
+`KrigingSurrogateFitter::new(covariance, numerical)` is ordinary kriging (a Gaussian process with an unknown constant mean), using user-fixed covariance $k(\mathbf{a}, \mathbf{b}) = \sigma^2 \rho(r)$ and per-observation noise variance.
+$\sigma^2$ is signal variance, $\rho$ the correlation function, and $r$ distance divided by the length scale.
+Let $K$ be the training covariance matrix with diagonal noise variances, $\mathbf{k}_*$ the covariance vector between query $\mathbf{x}$ and training points, and $\mathbf{y}$ the observation vector; predicted mean and variance are
+
+$$
+\mu_* = \hat m + \mathbf{k}_*^T K^{-1} (\mathbf{y} - \hat m \mathbf{1}), \qquad
+s_*^2 = \sigma^2 - \mathbf{k}_*^T K^{-1} \mathbf{k}_* + \frac{(1 - \mathbf{1}^T K^{-1} \mathbf{k}_*)^2}{\mathbf{1}^T K^{-1} \mathbf{1}}
+$$
+
+
+$\hat m = \mathbf{1}^T K^{-1} \mathbf{y} / \mathbf{1}^T K^{-1} \mathbf{1}$ is the generalized least-squares mean estimate; the final term of $s_*^2$ adds uncertainty from its estimation.
+Covariance parameters are not estimated; users supply length scales and signal variance.
+`numerical` is scioxide-interp's `LocalModelOptions`, limiting dense fit order, memory, rank, and condition number.
+$K$ is factored by Cholesky; the method switches to singular value decomposition at rank or condition limits and never automatically adds a diagonal value.
+
+`RbfSurrogateFitter::new(kernel, regularization, numerical)` fits radial basis function (RBF) interpolation $s(\mathbf{x}) = \sum_i w_i \phi(\|\mathbf{x} - \mathbf{x}_i\|) + p(\mathbf{x})$ using every observation.
+The kernel type determines whether a low-degree polynomial $p$ is added.
+Diagonal smoothing uses only the amount explicitly specified by `regularization`.
+RBF predictions provide only a mean; `variance()` is `None`.
+
+A dense fit to $N$ observations uses $O(N^3)$ factorization and $O(N^2)$ memory; mean prediction costs $O(N)$ and kriging variance $O(N^2)$.
+Search refits the model each batch, making fitting more expensive as observations grow.
+The capacity of `SurrogateHistory` bounds observation count and therefore this computational cost.
+
+### Expected improvement
+
+`SurrogateAcquisition` computes a candidate score from its prediction; search proposes the highest-scoring point.
+In `score(prediction, incumbent)`, `incumbent` is current best value $f_*$, the smallest predicted mean at an observed point.
+
+Let $\mu$ be predicted mean, $s > 0$ predicted standard deviation ($s_*$ for kriging), and $\xi \ge 0$ the improvement margin; model the objective value as $Y \sim N(\mu, s^2)$.
+Set $a = f_* - \xi$ and $z = (a - \mu)/s$, and let $\Phi$ and $\phi$ denote the standard normal distribution function and density.
+Substituting $Y = \mu + s t$ gives the expectation of the improvement $I = \max(a - Y, 0)$ as
+
+$$
+\mathrm{E}[I] = \int_{-\infty}^{z} (a - \mu - s t)\,\phi(t)\,dt = (a - \mu)\,\Phi(z) + s\,\phi(z)
+$$
+
+using $\int_{-\infty}^{z} t\,\phi(t)\,dt = -\phi(z)$.
+This is expected improvement:
+
+$$
+\operatorname{EI} = (f_* - \xi - \mu)\,\Phi(z) + s\,\phi(z)
+$$
+
+
+The first term favors low predicted means, and the second favors high uncertainty; both contribute to candidate value.
+The limit as $s = 0$ is $\max(f_* - \xi - \mu, 0)$.
+
+`GaussianAcquisition` provides three built-in acquisitions based on Gaussian predictions.
+
+- `ExpectedImprovement { margin }`: EI above, with `margin` corresponding to $\xi$.
+- `ProbabilityOfImprovement { margin }`: probability of improvement $\Phi(z)$; at $s = 0$ it is 1 for an improvement and 0 otherwise.
+- `LowerConfidenceBound { weight }`: $\kappa s - \mu$, the negation of lower confidence bound $\mu - \kappa s$, with `weight` corresponding to $\kappa$.
+
+All require predictive variance; missing variance or negative $\xi$ or $\kappa$ returns `InvalidInput`.
+With RBF, implement your own `SurrogateAcquisition` using only the mean.
+Acquisition values rank candidates; model uncertainty is not a deterministic error bound for the original objective.
+
+### Closed-loop search
+
+`SurrogateFeasibility` checks candidate feasibility against known constraints; `Fn(&[S]) -> Result<bool, SciOxideError>` closures also implement it.
+The decision must depend only on the point; search proposes only feasible points.
+An infeasible point in history stops proposal with `InvalidInput`.
+
+`SurrogateSearch::new(options, fitter, acquisition, feasibility, design, factory)` constructs the inner `MultiStart` (starting design and local solver factory) for acquisition maximization.
+Zero type dimension `D` or NaN, infinite, or negative separation distance (described below) returns `InvalidInput`.
+A batch is a set of points selected and evaluated from one fit.
+`minimize(history, objective)` and `minimize_into(history, objective, workspace, scope)` repeat these steps for each batch.
+
+1. Fit the model to history once.
+2. Minimize the negated acquisition with inner `MultiStart`; among starting points and local solutions, select the highest-acquisition feasible point sufficiently separated from history and other proposals in the batch.
+   Repeat for the number of batch points.
+3. Append the (value, noise variance) returned by `objective` to history.
+
+`SurrogateSearchOptions::with_batch_size` sets points per batch and `with_batches` the batch count.
+Points in a batch use the same model; candidates must have Euclidean distance greater than separation `with_separation` from every history point and other batch point, after dividing coordinates by box widths.
+Defaults are 10 acquisition starts, seed 42, separation 0 (excluding only identical points), and one batch of one point.
+The final batch shrinks to remaining history capacity; full history stops further batches.
+`propose_batch(history, count)` and `propose_batch_into` only propose next points without modifying history.
+`SurrogateSearchWorkspace` stores inner search and proposal memory.
+
+`SurrogateSearchReport` returns termination reason `termination()` (`SearchBudgetCompleted` when all batches finish or history fills), objective evaluations in this call `objective_evaluations()`, completed batches `completed_batches()`, and index `best_observation()` of the lowest observed value in history.
+Observations added before an error remain in history.
+
+## Saving evaluations on Branin's function
+
+Search the same Branin function as [DIRECT and SHGO](oxref:optimize-direct-branin), treating it as an expensive objective.
+The box is $x \in [-5, 10]$ and $y \in [0, 15]$, the global minimum $5/(4\pi) \approx 0.397887$, and minimizers $(-\pi, 12.275)$, $(\pi, 2.275)$, and $(3\pi, 2.475)$.
+Initial observations are 8 Halton points (indices 1–8); covariance for `KrigingSurrogateFitter` uses a Matérn 5/2 kernel, common coordinate length scale $\ell$, and signal variance equal to the initial sample variance.
+Inner `MultiStart` uses 10 uniform starts and built-in `PowellLocalFactory`; separation 0.01 in the normalized box avoids singular $K$ from overly close points.
+Each batch evaluates one point.
+Inputs are batch count, acquisition function, and length scale $\ell$.
+Outputs are an observation scatter plot, the gap between best-so-far and known minimum by evaluation count (logarithmic axis), a summary, and outcome.
+The known minimum and minimizers provide independent checks.
+
+```rust
+//| id: optimize-surrogate-branin
+//| ref: optimize-surrogate-branin
+//| title: "Vary acquisition and length scale to examine surrogate search approaching Branin's minimum"
+//| run: button
+//| timeoutMs: 120000
+//| crates: [scioxide-core, scioxide-interp, scioxide-optimize, scioxide-random]
+//| inputs:
+//|   batches: {"type":"range","label":"Batches [count]","description":"Number of batches evaluating one point each.","min":4,"max":30,"step":1,"value":20}
+//|   acquisition: {"type":"select","label":"Acquisition function","options":["Expected improvement EI","Probability of improvement PI","Lower confidence bound κ = 2"],"value":"Expected improvement EI"}
+//|   length_scale: {"type":"range","label":"Length scale ℓ [-]","description":"Matérn 5/2 kernel length scale, common to x and y.","min":1,"max":8,"step":0.5,"value":5}
+//| cases:
+//|   - {"id":"lower-confidence-bound","label":"Lower confidence bound","description":"Switch to lower confidence bound with κ = 2 and compare its best value with expected improvement at the same 28 evaluations.","inputs":{"acquisition":"Lower confidence bound κ = 2"}}
+//|   - {"id":"short-length","label":"ℓ = 1","description":"Shortening the length scale to 1 leaves a gap of 0.17 from the known minimum after the same 28 evaluations.","inputs":{"length_scale":1}}
+//|   - {"id":"few-rounds","label":"4 batches","description":"Stop after the initial 8 points and 4 search batches, checking that the known-minimum gap still exceeds 1.","inputs":{"batches":4}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"surrogate","path":"/rows/0/0","equals":"SearchBudgetCompleted"}
+//|       - {"artifact":"surrogate","path":"/rows/0/1","equals":20}
+//|       - {"artifact":"surrogate","path":"/rows/0/5","range":{"min":0.005,"max":0.03}}
+//|       - {"artifact":"surrogate","path":"/rows/0/6","range":{"min":0,"max":0.1}}
+//|       - {"path":"/outputs/3/state","equals":"partial"}
+//|   - case: lower-confidence-bound
+//|     expect:
+//|       - {"artifact":"surrogate","path":"/rows/0/5","range":{"min":0.001,"max":0.01}}
+//|       - {"artifact":"surrogate","path":"/rows/0/6","range":{"min":0,"max":0.1}}
+//|   - case: short-length
+//|     expect:
+//|       - {"artifact":"surrogate","path":"/rows/0/5","range":{"min":0.1,"max":0.3}}
+//|   - case: few-rounds
+//|     expect:
+//|       - {"artifact":"surrogate","path":"/rows/0/5","range":{"min":3,"max":4}}
+use scioxide_core::{Budget, RealScalar};
+use scioxide_interp::{Covariance, CovarianceKernel, LocalModelOptions};
+use scioxide_optimize::{
+    FiniteBounds, GaussianAcquisition, KrigingSurrogateFitter, PowellLocalFactory,
+    SurrogateHistory, SurrogateObservation, SurrogateSearch, SurrogateSearchOptions,
+    UniformStartDesign,
+};
+use scioxide_random::QmcPlan;
+
+let pi = std::f64::consts::PI;
+let branin = |x: &[f64]| {
+    let bowl = x[1] - 5.1 * x[0] * x[0] / (4.0 * pi * pi) + 5.0 * x[0] / pi - 6.0;
+    bowl * bowl + 10.0 * (1.0 - 1.0 / (8.0 * pi)) * RealScalar::cos(x[0]) + 10.0
+};
+let initial = 8;
+let rounds = batches.round() as usize;
+let bounds = FiniteBounds::new(vec![(-5.0, 10.0), (0.0, 15.0)]).map_err(|e| e.to_string())?;
+let mut history =
+    SurrogateHistory::<f64, 2>::new(bounds, initial + rounds).map_err(|e| e.to_string())?;
+// Initial observations: map Halton points 1–8 into the box and evaluate. Noise variance is 0.
+let plan = QmcPlan::halton(2).map_err(|e| e.to_string())?;
+for index in 1..=initial {
+    let mut unit = [0.0; 2];
+    plan.point_into(index as u64, &mut unit)
+        .map_err(|e| e.to_string())?;
+    let point = [-5.0 + 15.0 * unit[0], 15.0 * unit[1]];
+    let observation = SurrogateObservation::new(point, branin(&point), 0.0);
+    history.push(observation).map_err(|e| e.to_string())?;
+}
+// Use the initial observations' sample variance as signal variance.
+let values: Vec<f64> = history.observations().iter().map(|o| o.value()).collect();
+let mean = values.iter().sum::<f64>() / initial as f64;
+let variance =
+    values.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / (initial - 1) as f64;
+let kernel = CovarianceKernel::Matern52;
+let covariance =
+    Covariance::new(kernel, variance, [length_scale; 2]).map_err(|e| e.to_string())?;
+let fitter = KrigingSurrogateFitter::new(covariance, LocalModelOptions::new());
+let rule = match acquisition.as_str() {
+    "Probability of improvement PI" => GaussianAcquisition::ProbabilityOfImprovement { margin: 0.0 },
+    "Lower confidence bound κ = 2" => GaussianAcquisition::LowerConfidenceBound { weight: 2.0 },
+    _ => GaussianAcquisition::ExpectedImprovement { margin: 0.0 },
+};
+let options = SurrogateSearchOptions::default()
+    .with_batches(rounds)
+    .with_batch_size(Budget::ONE)
+    .with_separation(0.01);
+let feasible = |_: &[f64]| Ok(true);
+let search = SurrogateSearch::new(
+    options,
+    fitter,
+    rule,
+    feasible,
+    UniformStartDesign,
+    PowellLocalFactory::default(),
+)
+.map_err(|e| e.to_string())?;
+let report = search
+    .minimize(&mut history, |x| Ok((branin(x), 0.0)))
+    .map_err(|e| e.to_string())?;
+
+// Independent check: known minimum 5/(4π) and three minimizers.
+let exact = 5.0 / (4.0 * pi);
+let observations = history.observations();
+let points: Vec<[f64; 2]> = observations.iter().map(|o| o.point()).collect();
+let minima = [[-pi, 12.275], [pi, 2.275], [3.0 * pi, 2.475]];
+emit_scatter_chart!(
+    &vec![
+        serde_json::json!({
+            "name": "Initial observations",
+            "points": &points[..initial],
+            "style": { "symbol": "circle" }
+        }),
+        serde_json::json!({
+            "name": "Search-selected points",
+            "points": &points[initial..],
+            "style": { "symbol": "diamond" }
+        }),
+        serde_json::json!({
+            "name": "Known minimizers",
+            "points": minima,
+            "style": { "symbol": "emptyCircle" }
+        })
+    ],
+    options = &serde_json::json!({
+        "xLabel": "x [-]",
+        "yLabel": "y [-]",
+        "xMin": -5.0,
+        "xMax": 10.0,
+        "yMin": 0.0,
+        "yMax": 15.0
+    })
+);
+// Gap between the best value so far and the known minimum by evaluation count.
+let mut best = f64::INFINITY;
+let gaps: Vec<[f64; 2]> = observations
+    .iter()
+    .enumerate()
+    .map(|(i, o)| {
+        best = best.min(o.value());
+        [(i + 1) as f64, best - exact]
+    })
+    .collect();
+emit_line_chart!(
+    &vec![
+        serde_json::json!({ "name": "Best value − minimum", "points": gaps, "style": { "step": "end" } })
+    ],
+    options = &serde_json::json!({
+        "xLabel": "Objective evaluations [count]",
+        "yLabel": "Best-value gap from known minimum [-]",
+        "yType": "log",
+        "annotations": [
+            { "kind": "line", "axis": "x", "value": initial as f64, "label": "End of initial observations" }
+        ]
+    })
+);
+let chosen = observations[report.best_observation()];
+let distance = minima
+    .iter()
+    .map(|m| (chosen.point()[0] - m[0]).hypot(chosen.point()[1] - m[1]))
+    .fold(f64::INFINITY, f64::min);
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let digits5 = serde_json::json!({ "significantDigits": 5 });
+emit_table_with_columns!(
+    serde_json::json!([
+        { "key": "0", "label": "Termination reason" },
+        { "key": "1", "label": "Search evaluations [count]", "type": "integer" },
+        { "key": "2", "label": "Completed batches [count]", "type": "integer" },
+        { "key": "3", "label": "Best observation index", "type": "integer" },
+        { "key": "4", "label": "Best observed value [-]", "type": "number", "format": digits5 },
+        { "key": "5", "label": "Known-minimum gap [-]", "type": "number", "format": sci3 },
+        { "key": "6", "label": "Distance to minimizer [-]", "type": "number", "format": sci3 },
+        { "key": "7", "label": "Signal variance σ² [-]", "type": "number", "format": digits5 }
+    ]),
+    vec![(
+        report.termination().to_string(),
+        report.objective_evaluations(),
+        report.completed_batches(),
+        report.best_observation(),
+        chosen.value(),
+        chosen.value() - exact,
+        distance,
+        variance
+    )],
+    metadata = serde_json::json!({ "id": "surrogate" })
+);
+emit_outcome!(
+    Outcome::partial("All batches completed. The best observation is a global minimizer candidate")
+        .status(report.termination().to_string())
+        .diagnostic("Known-minimum gap", chosen.value() - exact, None)
+        .diagnostic(
+            "Objective evaluations",
+            (initial + report.objective_evaluations()) as f64,
+            None
+        )
+);
+```
+
+“Gap from known minimum” subtracts the known minimum from the best of initial 8 and search observations; “distance to minimizer” is the distance from the best observation to its nearest minimizer.
+The initial sample variance 1191 is used as signal variance.
+The gap plot steps down whenever an observation improves the best-so-far value.
+A downward step to the right of the vertical line ending initial observations means the model-selected point found a lower value than the initial design.
+
+At the default expected improvement, $\ell = 5$, and 20 batches, the best initial point has gap 5.39 from the known minimum.
+Search reduces this gap to 0.41 at evaluation 17 and 0.014 at evaluation 25; the following 3 evaluations do not improve it.
+The best observation is $(9.371, 2.421)$ near $(3\pi, 2.475)$, at distance 0.076 from the minimizer.
+Increasing to 30 batches leaves gap 0.014 after 38 evaluations; model-selected points do not refine the neighborhood of the minimizer.
+Lower confidence bound $\kappa = 2$ selects a point near $(\pi, 2.275)$ at evaluation 28, giving gap $5.3 \times 10^{-3}$.
+Probability of improvement leaves gap 0.25; length scale 1 gives 0.17 and scale 8 gives 0.040.
+Stopping after 4 batches leaves gap 3.5 and only one point improving the initial observations.
+Fixed parameters and acquisition choices affect results at the same evaluation count.
+Selected points also depend on the inner acquisition-maximizing local solver (Powell here) and starting-point seed; interpret table values as one example of this configuration.
+
+On the same function, DIRECT with evaluation limit 100 (actually 97 evaluations) attained gap $1.4 \times 10^{-3}$ ([DIRECT evaluation counts](oxref:optimize-direct-branin)).
+Surrogate search selects a point within 0.1 of a minimizer in fewer than 30 evaluations, but precise minimum refinement requires local optimization, such as starting a local solver from the best observation.
+
+## Summary
+
+Surrogate search fits kriging or RBF models to observations and evaluates acquisition-maximizing points to seek low values with few evaluations.
+Expected improvement combines low predicted mean and high uncertainty in one score; probability of improvement and lower confidence bounds balance them differently.
+Kriging length scales and signal variance are not estimated; users choose them for the objective scale and examine result dependence on that choice.
+`SurrogateHistory` capacity bounds observations and fitting cost; `SearchBudgetCompleted` is not success.
+Check the best observation using known properties or another method and refine with a local solver if needed.
+
+## Further reading
+
+- [Local models and kriging](../../../scioxide-interp/algorithms/local-models-and-kriging/): examine covariance types, predictive variance calculation, and numerical stability for surrogate models.
+- [Global search with DIRECT and SHGO](../deterministic-and-surrogate-global/): compare evaluation counts for deterministic domain partitioning on the same Branin function.
+- [CMA-ES](../cma-es/): examine learning a search distribution's covariance for inexpensive continuous black-box functions.
+- [CMA-ES, DIRECT, SHGO, and surrogate model API](../../api/model-based-global-search/): examine contracts of `SurrogateHistory`, `SurrogateSearchOptions`, and acquisition traits.

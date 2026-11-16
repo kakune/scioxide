@@ -1,0 +1,653 @@
+---
+title: Sod の衝撃波管
+description: 理想気体の Euler 方程式の Riemann 問題（Sod・Lax・Toro の二重膨張）の厳密解を圧力関数の求根で求め、HLLC・HLLE・Rusanov の流束と MUSCL の有限体積法の解を密度の誤差、波の位置、保存量の収支で比べる。
+sidebar:
+  order: 445
+references:
+  pde-sod-exact-solution: "厳密な-riemann-解"
+  pde-sod-flux-comparison: "有限体積法の解と流束の比較"
+---
+
+衝撃波管は隔膜で仕切った管の両側に圧力の違う気体を入れ、隔膜を取り去った後の流れを調べる実験装置である。
+隔膜を取ると、高圧側へ膨張波が、低圧側へ衝撃波が進み、その間を元の 2 つの気体の境目（接触不連続）が動く。
+Sod（1978）が数値解法の比較に使った初期条件は、厳密解があり、膨張波・接触不連続・衝撃波を一度に含むので、Euler 方程式の解法の標準的な試験になっている。
+この例題では厳密な Riemann 解を圧力関数の求根で求め、`scioxide-pde` の有限体積法の解を流束と再構成ごとに比べる。
+
+## 衝撃波管の Euler 方程式
+
+管の軸を $x$ とする 1 次元の理想気体の Euler 方程式は
+
+$$
+\partial_t \begin{bmatrix} \rho \\ \rho u \\ E \end{bmatrix}
++ \partial_x \begin{bmatrix} \rho u \\ \rho u^2 + p \\ u(E + p) \end{bmatrix} = 0,\qquad
+p = (\gamma - 1)\Bigl(E - \tfrac12 \rho u^2\Bigr)
+$$
+
+である。
+$\rho$ は密度、$u$ は速度、$p$ は圧力、$E$ は単位体積あたりの全エネルギー、$\gamma$ は比熱比である。
+量はすべて無次元で、管の長さを 1、左の気体の密度と圧力を基準にとる。
+初期条件は $x_0 = 0.5$ の隔膜の左右で一定な基本変数 $(\rho, u, p)$ で、次の 3 つを使う。
+
+| 名前 | 左 $(\rho, u, p)$ | 右 $(\rho, u, p)$ | 終端時刻 $T$ |
+|---|---|---|---|
+| Sod | $(1, 0, 1)$ | $(0.125, 0, 0.1)$ | 0.2 |
+| Lax | $(0.445, 0.698, 3.528)$ | $(0.5, 0, 0.571)$ | 0.14 |
+| Toro の二重膨張 | $(1, -2, 0.4)$ | $(1, 2, 0.4)$ | 0.15 |
+
+どの組でも、終端時刻までに波は管の端に届かない。
+
+厳密解は 3 つの波からなる自己相似解 $w((x - x_0)/t)$ である（[保存則と数値流束](oxref:pde-conservation-riemann)）。
+中間状態の圧力 $p^*$ は左右の波の関数の和 $f(p) = f_L(p) + f_R(p) + u_R - u_L$ の根で、$f$ は単調増加なので、$f(10^{-12} \min(p_L, p_R)) < 0 < f(p_{\mathrm{hi}})$ を満たす区間を作って Brent 法で求める。
+$p_{\mathrm{hi}}$ は $\max(p_L, p_R)$ から $f > 0$ になるまで倍にした値である。
+$f(0) \ge 0$ なら 2 つの膨張波の間に真空ができるので、区間の下端で $f(10^{-12} \min(p_L, p_R)) \ge 0$ となる組は拒否する。
+中間状態の速度は $u^* = \tfrac12(u_L + u_R) + \tfrac12\bigl(f_R(p^*) - f_L(p^*)\bigr)$、接触不連続の左右の密度は、衝撃波なら Rankine–Hugoniot 条件、膨張波なら等エントロピー関係 $\rho^*_K = \rho_K (p^*/p_K)^{1/\gamma}$ から求まる。
+右へ進む衝撃波の速さは $S = u_R + c_R\sqrt{\frac{\gamma+1}{2\gamma}\frac{p^*}{p_R} + \frac{\gamma-1}{2\gamma}}$ である。
+
+次の定義のブロックはこの厳密解を 2 つのセルで共有する。
+`scioxide-pde` は厳密な Riemann 解法を提供しないので、このブロックは検算のための参照値である。
+
+```rust
+//| id: pde-sod-exact-model
+//| kind: definitions
+//| title: 理想気体の Riemann 問題の厳密解（Toro, 4 章）
+//| crates: [scioxide-core, scioxide-rootfind]
+use scioxide_core::{Interval, RealScalar};
+use scioxide_rootfind::{Brent, ScalarFn, ScalarRootOptions, ScalarRootSolver};
+
+/// 比熱比 γ、基本変数 (ρ, u, p) の左右の状態、隔膜の位置 x₀、終端時刻 T と、
+/// 中間状態の圧力 p*・速度 u*、求根の終了理由と関数の評価回数。
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ExactRiemann {
+    pub(crate) gamma: f64,
+    pub(crate) left: [f64; 3],
+    pub(crate) right: [f64; 3],
+    pub(crate) diaphragm: f64,
+    pub(crate) end: f64,
+    pub(crate) pressure: f64,
+    pub(crate) velocity: f64,
+    pub(crate) status: String,
+    pub(crate) evaluations: usize,
+}
+
+/// 厳密解のセルが渡す値。
+#[derive(serde::Deserialize)]
+pub(crate) struct ExactExports {
+    pub(crate) solution: ExactRiemann,
+}
+
+/// 有限体積法の計算の結果。values はセルごとに (ρ, ρu, E) を並べた最後の状態、
+/// before は初期の総量、boundary_flux は最後の状態の外部の面の外向きの流束。
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct FiniteVolumeRun {
+    pub(crate) values: Vec<f64>,
+    pub(crate) before: [f64; 3],
+    pub(crate) boundary_flux: [f64; 3],
+}
+
+/// 有限体積法のセルが渡す値。
+#[derive(serde::Deserialize)]
+pub(crate) struct RunExports {
+    pub(crate) run: FiniteVolumeRun,
+}
+
+/// 波の関数 f_K(p)。p > p_K は衝撃波（Rankine–Hugoniot）、p ≤ p_K は膨張波（等エントロピー）。
+fn wave(g: f64, state: [f64; 3], p: f64) -> f64 {
+    let [rho, _, pk] = state;
+    if p > pk {
+        let a = 2.0 / ((g + 1.0) * rho);
+        let b = (g - 1.0) / (g + 1.0) * pk;
+        (p - pk) * RealScalar::sqrt(a / (p + b))
+    } else {
+        let c = RealScalar::sqrt(g * pk / rho);
+        2.0 * c / (g - 1.0) * (RealScalar::powf(p / pk, (g - 1.0) / (2.0 * g)) - 1.0)
+    }
+}
+
+impl ExactRiemann {
+    /// 圧力関数 f(p) = f_L(p) + f_R(p) + u_R − u_L の根 p* を Brent 法で求める。
+    pub(crate) fn solve(
+        gamma: f64,
+        left: [f64; 3],
+        right: [f64; 3],
+        diaphragm: f64,
+        end: f64,
+    ) -> Result<Self, String> {
+        let f = |p: f64| wave(gamma, left, p) + wave(gamma, right, p) + right[1] - left[1];
+        let lower = 1e-12 * RealScalar::min(left[2], right[2]);
+        if f(lower) >= 0.0 {
+            return Err("この組は真空を生じる".into());
+        }
+        let mut upper = RealScalar::max(left[2], right[2]);
+        while f(upper) <= 0.0 {
+            upper *= 2.0;
+        }
+        let bracket = Interval::new(lower, upper).map_err(|e| e.to_string())?;
+        let function = ScalarFn::new(|p: f64| Ok(f(p)));
+        let root = Brent
+            .solve(&function, bracket, &ScalarRootOptions::default())
+            .map_err(|e| e.to_string())?;
+        if !root.termination().is_success() {
+            return Err(format!("p* の求根が {} で止まった", root.termination()));
+        }
+        let p = root.point();
+        let velocity =
+            0.5 * (left[1] + right[1]) + 0.5 * (wave(gamma, right, p) - wave(gamma, left, p));
+        let evaluations = root
+            .counts()
+            .provider(scioxide_core::EvaluationRole::Function);
+        let status = root.termination().to_string();
+        Ok(Self {
+            gamma,
+            left,
+            right,
+            diaphragm,
+            end,
+            pressure: p,
+            velocity,
+            status,
+            evaluations,
+        })
+    }
+
+    /// 右向きの衝撃波の速さ。右の波が膨張波なら None。
+    pub(crate) fn right_shock_speed(&self) -> Option<f64> {
+        let (g, [rho, u, p]) = (self.gamma, self.right);
+        let c = RealScalar::sqrt(g * p / rho);
+        let ratio = self.pressure / p;
+        (ratio > 1.0).then(|| {
+            u + c * RealScalar::sqrt((g + 1.0) / (2.0 * g) * ratio + (g - 1.0) / (2.0 * g))
+        })
+    }
+
+    /// 接触不連続の左右の密度 (ρ*_L, ρ*_R)。
+    pub(crate) fn star_densities(&self) -> (f64, f64) {
+        let left = self.sample(self.velocity - 1e-12);
+        let right = self.sample(self.velocity + 1e-12);
+        (left[0], right[0])
+    }
+
+    /// ξ = (x − x₀)/T での (ρ, u, p)。右側は x → −x の鏡像として左側と同じ式で求める。
+    pub(crate) fn sample(&self, xi: f64) -> [f64; 3] {
+        let (g, p) = (self.gamma, self.pressure);
+        let sign = if xi <= self.velocity { 1.0 } else { -1.0 };
+        let [rho, uk, pk] = if sign > 0.0 { self.left } else { self.right };
+        let (xi, uk, us) = (sign * xi, sign * uk, sign * self.velocity);
+        let c = RealScalar::sqrt(g * pk / rho);
+        let w = if p > pk {
+            let s =
+                uk - c * RealScalar::sqrt((g + 1.0) / (2.0 * g) * p / pk + (g - 1.0) / (2.0 * g));
+            let m = (g - 1.0) / (g + 1.0);
+            if xi <= s {
+                [rho, uk, pk]
+            } else {
+                [rho * (p / pk + m) / (m * p / pk + 1.0), us, p]
+            }
+        } else if xi <= uk - c {
+            [rho, uk, pk]
+        } else if xi >= us - c * RealScalar::powf(p / pk, (g - 1.0) / (2.0 * g)) {
+            [rho * RealScalar::powf(p / pk, 1.0 / g), us, p]
+        } else {
+            // 膨張波の中: Riemann 不変量と、特性曲線の傾き ξ = u − c から。
+            let cf = 2.0 / (g + 1.0) * (c + 0.5 * (g - 1.0) * (uk - xi));
+            let uf = 2.0 / (g + 1.0) * (c + 0.5 * (g - 1.0) * uk + xi);
+            let ratio = cf / c;
+            [
+                rho * RealScalar::powf(ratio, 2.0 / (g - 1.0)),
+                uf,
+                pk * RealScalar::powf(ratio, 2.0 * g / (g - 1.0)),
+            ]
+        };
+        [w[0], sign * w[1], w[2]]
+    }
+
+    /// 時刻 T の位置 x での保存量 (ρ, ρu, E)。
+    pub(crate) fn conserved_at(&self, x: f64) -> [f64; 3] {
+        let [rho, u, p] = self.sample((x - self.diaphragm) / self.end);
+        [rho, rho * u, p / (self.gamma - 1.0) + 0.5 * rho * u * u]
+    }
+}
+```
+
+## 厳密な Riemann 解
+
+次のセルは初期条件の組と比熱比 $\gamma$ を選び、中間状態と右の衝撃波の速さを表にし、時刻 $T$ の厳密な密度・速度・圧力の分布を描く。
+求めた解は次のセルに渡す。
+
+```rust
+//| id: pde-sod-exact
+//| ref: pde-sod-exact
+//| title: 衝撃波管の中間状態を圧力関数の求根で求め、厳密解の分布を描く
+//| run: reactive
+//| uses: [pde-sod-exact-model]
+//| crates: [scioxide-core, scioxide-rootfind]
+//| exports: [solution]
+//| inputs:
+//|   problem: {"type":"select","label":"初期条件","options":["Sod","Lax","Toro の二重膨張"],"value":"Sod"}
+//|   gamma: {"type":"range","label":"比熱比 γ [-]","description":"1.4 は 2 原子分子の気体、5/3 は単原子分子の気体。","min":1.2,"max":1.7,"step":0.05,"value":1.4}
+//| cases:
+//|   - {"id":"lax","label":"Lax の問題","description":"左の気体が右へ動き、圧力比が大きい。p* と u* が Sod より大きい。","inputs":{"problem":"Lax"}}
+//|   - {"id":"double-rarefaction","label":"Toro の二重膨張","description":"左右が離れていく。2 つの膨張波の間に圧力 0.0019 の低圧の領域ができる。","inputs":{"problem":"Toro の二重膨張"}}
+//|   - {"id":"monatomic","label":"Sod、γ = 1.65","description":"比熱比を単原子分子の気体に近づけると、p* と u* が変わる。","inputs":{"gamma":1.65}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"star","path":"/rows/0/0","approx":{"value":0.30313017805,"rtol":1e-9}}
+//|       - {"artifact":"star","path":"/rows/0/1","approx":{"value":0.92745262005,"rtol":1e-9}}
+//|       - {"artifact":"star","path":"/rows/0/2","approx":{"value":0.42631942818,"rtol":1e-9}}
+//|       - {"artifact":"star","path":"/rows/0/3","approx":{"value":0.26557371171,"rtol":1e-9}}
+//|       - {"artifact":"star","path":"/rows/0/4","approx":{"value":1.75215573203,"rtol":1e-9}}
+//|   - case: lax
+//|     expect:
+//|       - {"artifact":"star","path":"/rows/0/0","approx":{"value":2.46609791921,"rtol":1e-8}}
+//|       - {"artifact":"star","path":"/rows/0/1","approx":{"value":1.52872302663,"rtol":1e-8}}
+//|   - case: double-rarefaction
+//|     expect:
+//|       - {"artifact":"star","path":"/rows/0/0","approx":{"value":0.00189387342,"rtol":1e-7}}
+//|       - {"artifact":"star","path":"/rows/0/1","approx":{"value":0,"atol":1e-12}}
+//|       - {"artifact":"star","path":"/rows/0/4","equals":null}
+//|   - case: monatomic
+//|     expect:
+//|       - {"artifact":"star","path":"/rows/0/0","approx":{"value":0.29443053525,"rtol":1e-8}}
+let digits6 = serde_json::json!({ "significantDigits": 6 });
+let (left, right, end) = match problem.as_str() {
+    "Sod" => ([1.0, 0.0, 1.0], [0.125, 0.0, 0.1], 0.2),
+    "Lax" => ([0.445, 0.698, 3.528], [0.5, 0.0, 0.571], 0.14),
+    _ => ([1.0, -2.0, 0.4], [1.0, 2.0, 0.4], 0.15),
+};
+let exact = ExactRiemann::solve(gamma, left, right, 0.5, end)?;
+let (rho_left, rho_right) = exact.star_densities();
+let columns = serde_json::json!([
+    { "key": "0", "label": "p* [-]", "type": "number", "format": digits6 },
+    { "key": "1", "label": "u* [-]", "type": "number", "format": digits6 },
+    { "key": "2", "label": "ρ*_L [-]", "type": "number", "format": digits6 },
+    { "key": "3", "label": "ρ*_R [-]", "type": "number", "format": digits6 },
+    { "key": "4", "label": "右の衝撃波の速さ [-]", "type": "number", "format": digits6, "nullText": "膨張波" },
+    { "key": "5", "label": "求根の終了理由" },
+    { "key": "6", "label": "関数の評価 [回]", "type": "integer" }
+]);
+let row = (
+    exact.pressure,
+    exact.velocity,
+    rho_left,
+    rho_right,
+    exact.right_shock_speed(),
+    exact.status.clone(),
+    exact.evaluations,
+);
+emit_table_with_columns!(
+    columns,
+    vec![row],
+    metadata = serde_json::json!({ "id": "star" })
+);
+// 厳密解の分布を 801 点で描く（参照曲線）。
+let profile = |k: usize| {
+    let x = k as f64 / 800.0;
+    let w = exact.sample((x - 0.5) / end);
+    (x, w)
+};
+let series: Vec<serde_json::Value> = ["密度 ρ", "速度 u", "圧力 p"]
+    .iter()
+    .enumerate()
+    .map(|(j, name)| {
+        let points: Vec<[f64; 2]> = (0..=800)
+            .map(|k| profile(k))
+            .map(|(x, w)| [x, w[j]])
+            .collect();
+        serde_json::json!({ "name": name, "points": points, "style": { "showSymbol": false } })
+    })
+    .collect();
+emit_line_chart!(
+    &series,
+    options = &serde_json::json!({
+        "xLabel": "位置 x [-]",
+        "yLabel": "ρ, u, p（無次元）[-]",
+        "link": { "group": "sod-position" }
+    })
+);
+export!(solution, &exact);
+```
+
+Sod の組（$\gamma = 1.4$）では、Brent 法は 11 回の評価で `BracketTolerance` に達し、$p^* = 0.303130$、$u^* = 0.927453$ を得た。
+これは Toro（2009）の 4 章の試験問題 1 の値 $p^* = 0.30313$、$u^* = 0.92745$ と表示した桁まで一致する。
+接触不連続の左右の密度は $\rho^*_L = 0.426319$、$\rho^*_R = 0.265574$、右の衝撃波の速さは $1.752156$ で、時刻 0.2 の衝撃波は $x = 0.5 + 0.2 \times 1.752156 = 0.85043$ にある。
+左の膨張波は $\xi = u_L - c_L = -1.1832$ から $\xi = u^* - c^*_L = -0.0703$ に広がる。
+二重膨張の組では $p^* = 0.0018939$、$u^* = 0$ で、2 つの膨張波の間の密度は $0.02185$ まで下がり、衝撃波はない。
+$\gamma = 1.65$ にすると、同じ初期の圧力と密度でも $p^* = 0.294431$、$u^* = 0.845930$ に変わる。
+
+## 有限体積法の解と流束の比較
+
+次のセルは前のセルの解を受け取り、区間 $[0, 1]$ を $N$ 個のセルに分けた `StructuredConservationPlan`（両端は `Transmissive`）と `IdealGasEuler` で同じ初期条件を時刻 $T$ まで解く。
+入力は数値流束（`Hllc`、`Hlle`、`Rusanov`）、再構成、セル数である。
+時間積分は `Heun` で、各刻みを CFL の上限にそろえる。
+表は ODE の終了理由、受理と棄却の回数、最後の状態の `ConservationReport` の値で、最後の状態は次のセルに渡す。
+セル数 800 では debug ビルドの wasm で約 9 秒かかるので、ボタンで実行し、同じ入力の結果は再利用する。
+
+```rust
+//| id: pde-sod-finite-volume
+//| ref: pde-sod-finite-volume
+//| title: 衝撃波管を有限体積法で解き、厳密解と流束ごとの誤差を比べる
+//| run: button
+//| cache: inputs
+//| exports: [run]
+//| uses: [pde-sod-exact-model]
+//| crates: [scioxide-core, scioxide-linalg, scioxide-ode, scioxide-pde, scioxide-rootfind, scioxide-spatial]
+//| dependsOn:
+//|   exact: {cell: pde-sod-exact, type: ExactExports}
+//| inputs:
+//|   flux: {"type":"select","label":"数値流束","options":["HLLC","HLLE","Rusanov"],"value":"HLLC"}
+//|   reconstruction: {"type":"select","label":"再構成","options":["定数","minmod","MC"],"value":"MC"}
+//|   cells: {"type":"select","label":"セル数 N","options":["100","200","400","800"],"value":"200"}
+//| timeoutMs: 30000
+//| cases:
+//|   - {"id":"hlle","label":"HLLE","description":"流束を HLLE に替える。次のセルで接触不連続が 5 セルに広がる。","inputs":{"flux":"HLLE"}}
+//|   - {"id":"constant","label":"定数の再構成","description":"1 次の方法に替える。次のセルで接触不連続が 17 セルに広がる。","inputs":{"reconstruction":"定数"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"steps","path":"/rows/0/0","equals":"ReachedEnd"}
+//|       - {"artifact":"steps","path":"/rows/0/1","equals":390}
+//|       - {"artifact":"steps","path":"/rows/0/2","equals":0}
+//|       - {"artifact":"steps","path":"/rows/0/4","equals":0}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+//|   - case: hlle
+//|     expect:
+//|       - {"artifact":"steps","path":"/rows/0/1","equals":389}
+//|   - case: constant
+//|     expect:
+//|       - {"artifact":"steps","path":"/rows/0/1","equals":381}
+use scioxide_core::{ExecutionContext, SciOxideError};
+use scioxide_linalg::Vector;
+use scioxide_ode::{Heun, OdeMethod, OdeOptions, OdeProblem, OdeSolveReport, OdeState};
+use scioxide_pde::StructuredConservationPlan;
+use scioxide_pde::{ConservationBoundary, ConservationOptions, ConservationReconstruction};
+use scioxide_pde::{ConservationReport, Hllc, Hlle, IdealGasEuler, NumericalFlux, Rusanov};
+use scioxide_spatial::SegmentMesh;
+use scioxide_spatial::{AxisSide, AxisTopology, BoundarySet, CellField, CoordinateAxis, Grid1d};
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let solution = exact.solution;
+let n: usize = cells.parse().map_err(|_| "セル数が不正")?;
+let h = 1.0 / n as f64;
+let reconstruction = match reconstruction.as_str() {
+    "定数" => ConservationReconstruction::Constant,
+    "minmod" => ConservationReconstruction::Minmod,
+    _ => ConservationReconstruction::MonotonizedCentral,
+};
+let gas = IdealGasEuler::new(solution.gamma).map_err(|e| e.to_string())?;
+let axis = CoordinateAxis::uniform(0.0, 1.0, n + 1).map_err(|e| e.to_string())?;
+let grid = Grid1d::new([axis], [AxisTopology::Bounded]).map_err(|e| e.to_string())?;
+let mesh = SegmentMesh::new(grid).map_err(|e| e.to_string())?;
+let start = BoundarySet::axis_side(&mesh, 0, AxisSide::Start).map_err(|e| e.to_string())?;
+let finish = BoundarySet::axis_side(&mesh, 0, AxisSide::End).map_err(|e| e.to_string())?;
+let conditions = vec![
+    (start, ConservationBoundary::Transmissive),
+    (finish, ConservationBoundary::Transmissive),
+];
+let options = ConservationOptions::new().with_reconstruction(reconstruction);
+let plan = StructuredConservationPlan::with_options(mesh, conditions, options)
+    .map_err(|e| e.to_string())?;
+let values = plan
+    .centers()
+    .iter()
+    .map(|x| {
+        let [rho, u, p] = if x[0] < solution.diaphragm {
+            solution.left
+        } else {
+            solution.right
+        };
+        gas.conserved(rho, [u], p)
+    })
+    .collect::<Result<Vec<[f64; 3]>, _>>()
+    .map_err(|e| e.to_string())?;
+let initial = CellField::new(plan.mesh(), values).map_err(|e| e.to_string())?;
+let totals = |u: &[f64]| -> [f64; 3] {
+    core::array::from_fn(|j| u.as_chunks::<3>().0.iter().map(|c| c[j] * h).sum())
+};
+let vector = plan
+    .initial_state(&gas, initial.view())
+    .map_err(|e| e.to_string())?;
+let before = totals(vector.as_slice());
+// 流束の型ごとに系を作って Heun 法で進め、最後の状態とレポートを返す。
+fn run<F: NumericalFlux<f64, IdealGasEuler<f64>, 1, 3>>(
+    plan: &StructuredConservationPlan<f64, 1, 3>,
+    gas: &IdealGasEuler<f64>,
+    flux: &F,
+    initial: &Vector<f64>,
+    end: f64,
+) -> Result<(Vec<f64>, OdeSolveReport<f64>, ConservationReport<f64, 3>), SciOxideError> {
+    let mut workspace = plan.workspace()?;
+    let system = plan.bind(gas, flux, &mut workspace)?;
+    let problem = OdeProblem::new(&system, end);
+    // 固定刻みの Heun に大きな初期刻みを渡し、各刻みを CFL の上限にする。
+    let options = OdeOptions::new().with_initial_step(1.0);
+    let mut state = OdeState::new(0.0, initial.clone());
+    let method = Heun::new();
+    let mut ode_workspace = method.workspace(&problem, &options)?;
+    let execution = ExecutionContext::sequential();
+    let solve = method.advance(
+        &problem,
+        &options,
+        &mut state,
+        &mut (),
+        &mut ode_workspace,
+        execution,
+    )?;
+    let report = system.report(state.time(), state.values(), execution)?;
+    Ok((state.values().to_vec(), solve, report))
+}
+let (values, solve, report) = match flux.as_str() {
+    "HLLC" => run(&plan, &gas, &Hllc, &vector, solution.end),
+    "HLLE" => run(&plan, &gas, &Hlle, &vector, solution.end),
+    _ => run(&plan, &gas, &Rusanov, &vector, solution.end),
+}
+.map_err(|e| e.to_string())?;
+let status = solve
+    .termination()
+    .map_or("なし".to_string(), |t| t.to_string());
+let columns = serde_json::json!([
+    { "key": "0", "label": "終了理由" },
+    { "key": "1", "label": "受理した刻み [回]", "type": "integer" },
+    { "key": "2", "label": "棄却 [回]", "type": "integer" },
+    { "key": "3", "label": "最後の Δt_max [-]", "type": "number", "format": sci3, "nullText": "なし" },
+    { "key": "4", "label": "HLLE に切り替えた面 [個]", "type": "integer" }
+]);
+let row = (
+    status.clone(),
+    solve.accepted_steps(),
+    solve.rejected_steps(),
+    report.maximum_step(),
+    report.hlle_fallback_faces(),
+);
+emit_table_with_columns!(
+    columns,
+    vec![row],
+    metadata = serde_json::json!({ "id": "steps" })
+);
+let run = FiniteVolumeRun {
+    values,
+    before,
+    boundary_flux: report.boundary_flux(),
+};
+export!(run, &run);
+let outcome = if solve.is_success() {
+    Outcome::satisfied("終端時刻まで進んだ")
+        .explanation("ODE の終了理由の判定で、精度は次のセルの厳密解との L¹ 誤差で読む。")
+} else {
+    Outcome::partial("終端時刻の前に止まった").explanation("最後に受理した状態を示している。")
+};
+emit_outcome!(
+    outcome
+        .status(status)
+        .diagnostic("受理した刻み", solve.accepted_steps() as f64, None)
+        .diagnostic("棄却", solve.rejected_steps() as f64, None)
+);
+```
+
+既定値（`Hllc`、MC、$N = 200$）では、390 回の刻みを棄却なしで受理し、`ReachedEnd` で終端に達した。
+最後の状態で HLLE に切り替えた面は 0 だった。
+
+次のセルはこの計算の最後の状態を厳密解と比べる。
+表の量は次のとおりである。
+
+- $L^1$ 誤差: 保存量 $(\rho, \rho u, E)$ ごとの $\sum_i h|\bar u_i - \bar u_i^{\mathrm{exact}}|$。
+  厳密なセル平均は各セルを 16 等分した中点で厳密解を平均した参照値である。
+- 接触の幅: 接触不連続の $\pm 0.1$ の範囲で、密度が $\rho^*_R$ と $\rho^*_L$ の間の 10% から 90% にあるセルの数。
+- 衝撃波の位置: 右端から見て、密度が $(\rho^*_R + \rho_R)/2$ を最初に越える位置を線形補間した値。
+- 保存の残差: 3 成分の $|Q_j(T) - Q_j(0) + T\,F_j|$ の最大。
+  $Q_j$ は総量、$F_j$ は最後の状態の `boundary_flux` で、端の状態が初期値のままの間は一定である。
+
+グラフは密度のセル平均と厳密解（破線）で、縦線は厳密な接触不連続と衝撃波の位置である。
+横軸は厳密解のセルのグラフと連動する。
+
+```rust
+//| id: pde-sod-error-analysis
+//| ref: pde-sod-error-analysis
+//| title: 衝撃波管の数値解を厳密解と比べ、誤差・接触の幅・保存量の収支を測る
+//| run: reactive
+//| uses: [pde-sod-exact-model]
+//| crates: [scioxide-core, scioxide-rootfind]
+//| dependsOn:
+//|   exact: {cell: pde-sod-exact, type: ExactExports}
+//|   computed: {cell: pde-sod-finite-volume, type: RunExports}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"errors","path":"/rows/0/0","approx":{"value":0.0030196455,"rtol":1e-5}}
+//|       - {"artifact":"errors","path":"/rows/0/3","equals":4}
+//|       - {"artifact":"errors","path":"/rows/0/4","approx":{"value":0.85119,"atol":2e-4}}
+//|       - {"artifact":"errors","path":"/rows/0/5","approx":{"value":0.8504311464,"rtol":1e-9}}
+//|       - {"artifact":"errors","path":"/rows/0/6","range":{"max":1e-13}}
+use scioxide_core::{NumericScalar, RealScalar};
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed4 = serde_json::json!({ "fractionDigits": 4 });
+let (solution, run) = (exact.solution, computed.run);
+let cells = run.values.as_chunks::<3>().0;
+let h = 1.0 / cells.len() as f64;
+let centers: Vec<f64> = (0..cells.len()).map(|i| (i as f64 + 0.5) * h).collect();
+// 厳密なセル平均の参照値: 各セルを 16 等分した中点で厳密解の保存量を平均する。
+let mut errors = [0.0; 3];
+for (i, cell) in cells.iter().enumerate() {
+    for j in 0..3 {
+        let average = (0..16)
+            .map(|k| solution.conserved_at((i as f64 + (k as f64 + 0.5) / 16.0) * h)[j])
+            .sum::<f64>()
+            / 16.0;
+        errors[j] += h * NumericScalar::abs(cell[j] - average);
+    }
+}
+// 保存量の収支: 総量の変化 + T × 外部の面の外向きの流束（端の状態が初期値の間は一定）。
+let balance = (0..3)
+    .map(|j| {
+        let after: f64 = cells.iter().map(|c| c[j] * h).sum();
+        NumericScalar::abs(after - run.before[j] + solution.end * run.boundary_flux[j])
+    })
+    .fold(0.0, f64::max);
+// 接触の幅: 接触の ±0.1 の範囲で、密度が中間状態の跳びの 10 % から 90 % の間にあるセルの数。
+let (rho_left, rho_right) = solution.star_densities();
+let contact = solution.diaphragm + solution.velocity * solution.end;
+let jump = rho_left - rho_right;
+let (a, b) = (rho_right + 0.1 * jump, rho_right + 0.9 * jump);
+let (lo, hi) = (RealScalar::min(a, b), RealScalar::max(a, b));
+let width = (NumericScalar::abs(jump) > 1e-6).then(|| {
+    centers
+        .iter()
+        .zip(cells)
+        .filter(|(x, c)| NumericScalar::abs(**x - contact) < 0.1 && c[0] > lo && c[0] < hi)
+        .count()
+});
+// 衝撃波の位置: 右端から見て、密度が (ρ*_R + ρ_R)/2 を最初に越える位置（線形補間）。
+let shock = solution
+    .right_shock_speed()
+    .map(|s| solution.diaphragm + s * solution.end);
+let level = 0.5 * (rho_right + solution.right[0]);
+let crossing = shock.and_then(|_| {
+    (1..cells.len()).rev().find_map(|i| {
+        let (left, right) = (cells[i - 1][0], cells[i][0]);
+        (left >= level && right < level)
+            .then(|| centers[i - 1] + (left - level) / (left - right) * h)
+    })
+});
+let points: Vec<[f64; 2]> = centers.iter().zip(cells).map(|(&x, c)| [x, c[0]]).collect();
+let reference: Vec<[f64; 2]> = (0..=800)
+    .map(|k| k as f64 / 800.0)
+    .map(|x| [x, solution.conserved_at(x)[0]])
+    .collect();
+let mut annotations =
+    vec![serde_json::json!({ "kind": "line", "axis": "x", "value": contact, "label": "接触" })];
+if let Some(x) = shock {
+    annotations.push(
+        serde_json::json!({ "kind": "line", "axis": "x", "value": x, "label": "衝撃波" }),
+    );
+}
+emit_chart!(
+    serde_json::json!({
+        "kind": "xy",
+        "link": { "group": "sod-position" },
+        "xLabel": "位置 x [-]",
+        "yLabel": "密度 ρ [-]",
+        "dataZoom": true,
+        "tooltip": true,
+        "layers": [
+            { "id": "numerical", "kind": "scatter", "name": "セル平均", "points": points },
+            {
+                "id": "exact",
+                "kind": "line",
+                "name": "厳密解",
+                "points": reference,
+                "style": { "lineType": "dashed", "showSymbol": false }
+            }
+        ],
+        "annotations": annotations
+    }),
+    metadata = serde_json::json!({ "id": "density" })
+);
+let columns = serde_json::json!([
+    { "key": "0", "label": "ρ の L¹ 誤差 [-]", "type": "number", "format": sci3 },
+    { "key": "1", "label": "ρu の L¹ 誤差 [-]", "type": "number", "format": sci3 },
+    { "key": "2", "label": "E の L¹ 誤差 [-]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "接触の幅 [セル]", "type": "integer", "nullText": "接触なし" },
+    { "key": "4", "label": "衝撃波の位置 [-]", "type": "number", "format": fixed4, "nullText": "—" },
+    { "key": "5", "label": "厳密な位置 [-]", "type": "number", "format": fixed4, "nullText": "衝撃波なし" },
+    { "key": "6", "label": "保存の残差 [-]", "type": "number", "format": sci3 }
+]);
+let row = (
+    errors[0], errors[1], errors[2], width, crossing, shock, balance,
+);
+emit_table_with_columns!(
+    columns,
+    vec![row],
+    metadata = serde_json::json!({ "id": "errors" })
+);
+```
+
+既定値では、密度の $L^1$ 誤差は $3.02 \times 10^{-3}$ だった。
+衝撃波の位置は 0.85119 で、厳密な 0.85043 とはセル幅 0.005 の 15% 違う。
+接触不連続は 4 セルに広がり、保存の残差は $4.9 \times 10^{-15}$ で、質量・運動量・エネルギーは丸め誤差の範囲で境界の流束と釣り合っている。
+
+流束を替えると、密度の誤差と接触の幅は `Hlle` で $3.19 \times 10^{-3}$ と 5 セル、`Rusanov` で $3.84 \times 10^{-3}$ と 6 セルになる。
+HLLC は接触波を扇の中に持つので、3 つのうちで接触不連続を最も狭く保つ。
+定数の再構成では密度の誤差が $1.32 \times 10^{-2}$、接触の幅が 17 セルになる。
+このとき保存の残差が $2.6 \times 10^{-12}$ に増えるのは、1 次の方法の数値拡散が端のセルまで届き、境界の流束が時間とともにわずかに変わるためである。
+
+セル数を $N = 100, 200, 400, 800$ と増やすと、HLLC と MC の密度の誤差は $5.31 \times 10^{-3}$、$3.02 \times 10^{-3}$、$1.59 \times 10^{-3}$、$8.21 \times 10^{-4}$ になり、細分化ごとにほぼ半分になる（観測次数 0.8〜0.96）。
+誤差は不連続の近くの数セルで決まるので、滑らかな解の 2 次には届かない。
+線形の不連続（接触不連続）の誤差の次数は、[矩形波の移流の収束次数](oxref:pde-conservation-advection-refinement)で確かめられる。
+接触の幅は 4、4、5、7 セルと増え、物理的な幅（セル数 × $h$）は 0.04 から 0.009 に縮むが、セルの数では増える。
+接触不連続は特性曲線が平行で、衝撃波のように自ら切り立たないので、数値拡散の広がりが残る。
+
+厳密解のセルで二重膨張の組を選ぶと、接触の幅と衝撃波の位置の列は「接触なし」「—」「衝撃波なし」になり、HLLC の密度の誤差は $N = 200$ で $1.05 \times 10^{-2}$、$N = 800$ で $2.8 \times 10^{-3}$ である。
+最後の状態では HLLE に切り替えた面は 0 だが、初期の不連続の面では HLLC の接触の圧力が負になり、HLLE に切り替わる（[保存則と数値流束](oxref:pde-conservation-interface-fluxes)）。
+
+## まとめ
+
+Sod の衝撃波管の厳密解は圧力関数の根 $p^*$ から閉形式で求まり、Brent 法で $p^* = 0.30313$、$u^* = 0.92745$ が得られる。
+`IdealGasEuler` と `StructuredConservationPlan` の有限体積法はどの流束でも衝撃波の位置をセル幅の程度で再現し、保存量の収支を丸め誤差の範囲で保つ。
+接触不連続の幅は流束で変わり、`Hllc` が最も狭く、`Hlle`、`Rusanov` の順に広がるので、密度の境目を鋭く保ちたい計算では `Hllc` と MUSCL を選ぶ。
+不連続を含む解の $L^1$ 誤差は細分化ごとにほぼ半分にしか減らないので、精度の目標はこの次数を前提に格子の大きさを決める。
+
+## 次に読むページ
+
+- [保存則と数値流束](../../algorithms/conservation-laws/)では、HLLE と HLLC の導出と、HLLC が HLLE に切り替わる条件を確かめる。
+- [保存則の CFL 条件と時間積分](../../algorithms/conservation-time-integration/)では、この例題の刻みを決める CFL の上限と、許容されない段の棄却を確かめる。
+- [Burgers 方程式の衝撃波と Riemann 解](../burgers-riemann/)では、スカラーの保存則で衝撃波の形成と膨張波を確かめる。

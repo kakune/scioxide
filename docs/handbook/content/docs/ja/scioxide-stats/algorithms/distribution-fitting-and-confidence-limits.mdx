@@ -1,0 +1,743 @@
+---
+title: 分布の当てはめと観測情報行列
+description: 打ち切り・切断のある観測への最尤法、モーメント法、分位点の一致による分布の当てはめ、注入したソルバーと導関数の機能、当てはめのレポート、観測情報行列による漸近共分散と識別可能性の診断。
+sidebar:
+  order: 370
+references:
+  stats-fitting-censored-lifetimes: "打ち切りのある寿命データ"
+  stats-fitting-distribution-protocol: "分布フィッティングプロトコル"
+  stats-fitting-likelihood-moment-quantile-objectives: "尤度モーメント分位点の目的関数"
+  stats-fitting-model-types: "モデルの型"
+  stats-fitting-normal-three-methods: "正規分布を三つの方法で当てはめる"
+  stats-fitting-observations-censoring-truncation: "観測と打ち切り切断"
+  stats-fitting-observed-information-covariance: "観測情報行列と漸近共分散"
+  stats-fitting-prepared-objective: "準備した目的関数"
+  stats-fitting-request-and-fit-calls: "要求と当てはめの呼び出し"
+  stats-fitting-results-and-reporting: "結果とレポート"
+  stats-fitting-solver-derivative-capabilities: "ソルバーと導関数の機能"
+---
+
+母数を持つ確率分布の族を標本に合わせるとき、知りたいことは母数の推定値と、その推定値の統計的不確かさである。
+このページではまず分布の族を観測に当てはめる問題を目的関数の最小化として定式化し、`scioxide-stats` が目的関数を作り、呼び出し側が渡すソルバーがそれを最小化する仕組みを説明する。
+次に、最尤推定の不確かさを観測情報行列から求め、識別できない場合や上下限に張り付いた場合の診断を扱う。
+有限の標本でも名目の被覆確率を下回らない区間（Clopper–Pearson や Garwood の限界）と、裾確率を母数について解く逆算は、[裾確率による母数の逆算と正確な信頼限界](../parameter-inversion-and-confidence-limits/)で扱う。
+Box–Cox と Yeo–Johnson のべき変換と正規確率プロットは、同じソルバーの仕組みを使うが、[記述統計・標準化・べき変換の数理](../descriptive-statistics-and-transforms/)で扱う。
+呼び出しの形（ワンショット関数、オプション付き形式、出力先を指定する API、スコープ付き API）の定義は[呼び出しの形](oxref:stats-execution-forms)にある。
+
+## 観測と打ち切り・切断
+
+確率変数 $X$ の分布が母数ベクトル $\theta \in \mathbb{R}^d$ を持つ族 $\{P_\theta\}$ に属すると仮定する。
+連続分布なら密度 $f(x;\theta)$、計数の分布なら確率質量 $p(x;\theta)$ を持ち、分布関数を $F(x;\theta) = P_\theta(X \le x)$ と書く。
+観測 $o_1, \dots, o_n$ は互いに独立とする。
+
+実際のデータでは、値そのものではなく値の範囲しか分からない観測がある。
+寿命試験を時刻 $c$ で打ち切れば、それまでに故障しなかった個体については $X > c$ しか分からない。
+これを打ち切り（censoring）と呼ぶ。
+`FitObservation` は観測を次の四種類で表し、区間はどれも左を含まず右を含む半開区間 $(l, u]$ とする。
+
+| 列挙子 | 分かること | 尤度への寄与 |
+|---|---|---|
+| `Exact(x)` | $X = x$ | 連続分布は $f(x;\theta)$、計数の分布は $p(x;\theta)$ |
+| `LeftCensored(x)` | $X \le x$ | $F(x;\theta)$ |
+| `RightCensored(x)` | $X > x$ | $1 - F(x;\theta)$ |
+| `IntervalCensored { lower, upper }` | $l < X \le u$ | $F(u;\theta) - F(l;\theta)$ |
+
+打ち切りとは別に、ある範囲 $(a, b]$ の値しかそもそも記録されない場合がある。
+検出限界より小さい値を記録しない測定がその例で、これを切断（truncation）と呼ぶ。
+切断では観測されなかった個体の数も分からない。
+`FitTruncation { lower, upper }` は切断区間 $(a, b]$ を `Option` の端点で表し、`None` の側は有界でない。
+切断があると、各観測の尤度を区間の確率 $P_\theta(a < X \le b)$ で割る。
+
+打ち切りの観測の確率は `scioxide-random` の `log_interval_probability` で対数のまま求める。
+この関数は下側の裾 $\ln F$ と上側の裾 $\ln(1-F)$ のうち小さいほうから区間の確率を作るので、両端の累積確率がともに 1 に丸められる遠い裾でも、差 $F(u) - F(l)$ の桁落ちを避けて相対精度を保つ。
+
+## 尤度・モーメント・分位点の目的関数
+
+`FitMethod` は、当てはめで最小化する目的関数 $J(\theta)$ を三つから選ぶ。
+
+**最尤法**（`FitMethod::Likelihood`）は負の対数尤度を最小化する。
+
+$$
+J(\theta) = -\sum_{i=1}^{n} \Bigl[ \ln L_i(\theta) - \ln P_\theta(a < X \le b) \Bigr]
+$$
+
+ここで $L_i$ は上の表の寄与で、打ち切りの区間は切断区間との共通部分に縮めてから評価する。
+切断がなければ第 2 項は 0 である。
+和は補償付きの総和で取る。
+モデルが観測に確率 0 を与える母数（一様分布の範囲の外の観測、整数でない Poisson の観測など）では、目的関数の評価が `DomainError` を返す。
+
+**モーメント法**（`FitMethod::Moments { orders, scales }`）は、次数 $k$ の原点モーメント $\mu'_k(\theta) = E_\theta[X^k]$ を標本の原点モーメント $m'_k = n^{-1}\sum_i x_i^k$ に合わせる。
+**分位点の一致**（`FitMethod::Quantiles { probabilities, scales, convention }`）は、確率 $p_j$ での分位点 $Q(p_j;\theta)$ を、`QuantileMethod` の規約 `convention` で求めた標本分位点 $\hat q(p_j)$ に合わせる。
+どちらも正の尺度 $s_j$ で割った残差の 2 乗和を最小化する。
+
+$$
+J(\theta) = \sum_{j} r_j(\theta)^2, \qquad
+r_j(\theta) = \frac{(\text{モデルの値})_j - (\text{標本の値})_j}{s_j}
+$$
+
+係数 $\tfrac12$ は付けない。
+尺度 $s_j$ は残差の大きさをそろえる重みで、方程式の数と母数の数が等しく厳密に解ける場合は解を変えないが、方程式が多い分位点の一致では解を変える。
+標本の原点モーメントは指数の範囲を広げた補償付きの和で 1 回だけ計算し、標本分位点も準備のときに 1 回だけ計算する。
+二つの一致の方法は打ち切りと切断を扱わず、どちらかがあると準備の段階で `NotImplemented` を返す。
+
+三つの方法は異なる推定量を与える。
+最尤推定量は正則条件のもとで漸近有効（漸近分散が Cramér–Rao の下界に達する）で、打ち切りと切断を自然に扱える。
+モーメント法は閉形式で解けることが多いが、高次のモーメントは外れ値に敏感で、一般に最尤法より効率が低い。
+分位点の一致は中央付近の分位点を選べば少数の外れ値の影響を受けにくい。
+正規分布では 1 次と 2 次のモーメントの一致が $\hat\mu = \bar x$、$\hat\sigma^2 = n^{-1}\sum_i (x_i - \bar x)^2$ を与え、最尤推定量と一致する。
+
+### モデルの型
+
+分布の族は `FitModel` トレイトで表す。
+`parameter_count` は母数の数、`validate` は母数が族に属するか（$\sigma > 0$ のような結合した制約を含む）を検査する。
+`log_observation` は観測一つの対数密度・対数質量・区間の対数確率を返し、確率 0 の観測には $-\infty$ を返す。
+`moment` と `quantile` は既定で `NotImplemented` を返し、モーメント法と分位点の一致に必要なときだけ実装する。
+メソッドは引数だけで決まる純粋な関数でなければならず、複数のスレッドから呼ばれることがある。
+
+組み込みの族 `DistributionFitModel` は四つで、位置や尺度の母数を自動では加えない。
+
+| 列挙子 | 母数 | 注意 |
+|---|---|---|
+| `Normal` | $[\mu, \sigma]$、$\sigma > 0$ | |
+| `Exponential` | $[\lambda]$、率 $\lambda > 0$ | 台は $[0, \infty)$ |
+| `Uniform` | $[a, b]$、$a < b$ | $x = b$ の観測にも密度 $1/(b-a)$ を与えるので、最尤推定値 $[\min x_i, \max x_i]$ が存在する |
+| `Poisson` | $[\lambda]$、$\lambda \ge 0$ | 整数でない `Exact` の観測は確率 0。分位点は `NotImplemented` |
+
+組み込みの族の原点モーメントは平均と分散から作る 1 次と 2 次だけで、3 次以上は `NotImplemented` になる。
+ほかの連続分布は `LawFitModel::new(dimension, constructor)` で当てはめる。
+`constructor` は母数のスライスから `scioxide-random` の分布（または密度、分布関数、生存関数、平均、分散、分位点の各トレイトを実装する型）を作る関数で、評価のたびに呼ばれるので軽く、乱数を引かないものにする。
+`dimension` が 0 なら `InvalidInput` である。
+3 次以上のモーメントや、離散分布の分位点が必要なら、`FitModel` を自分で実装する。
+
+### 準備した目的関数
+
+`PreparedFit::new(model, observations, method, truncation, bounds, integer, options)` は、観測と方法を検査し、一致の目標（標本のモーメントか分位点）を計算して、最小化できる目的関数を作る。
+`bounds` は `scioxide-core` の `Bounds` で母数ごとの上下限を持ち、上下限が等しい母数は固定される。
+`integer` は母数ごとの整数制約のフラグである。
+観測、モデル、上下限は借用し、所有するのは一致の目標だけである。
+`bounds()`、`integrality()`、`method()` は準備した上下限、整数制約、方法を返す。
+`StatisticsOptions::max_bytes` は、一致の目標と標本の複製に使うメモリ使用量の上限である。
+
+準備は次の場合に失敗する。
+
+- `InvalidInput`：観測が空、モデルの母数が 0 個、`bounds` か `integer` の長さが母数の数と違う、整数の母数の上下限が整数を含まない、打ち切りか切断の区間が空、観測が切断区間の外にある、モーメントの次数が 0、分位点の確率が $(0, 1)$ の外、尺度が空・長さ違い・正でない。
+- `NonFinite`：観測か切断の端点が NaN か無限大。
+- `NotImplemented`：一致の方法で打ち切りか切断がある。
+- `ResourceLimit`：必要なメモリ使用量が `options.max_bytes()` を超える。
+
+`PreparedFit` は `FitObjective` トレイトを実装する。
+このトレイトは、母数の数 `dimension`、定義域の検査 `validate`、目的関数の値 `value`、2 乗和の目的関数なら残差の数 `residual_count` と残差 `residuals`、評価に使う作業領域の大きさ `workspace_bytes` と作成 `workspace` を持つ。
+`PreparedFit` の作業領域は `()` で、評価は確保を行わない。
+べき変換の `PreparedPowerFit` と `PreparedPpcc`、直交距離回帰の `PreparedOdr` も同じトレイトを実装するので、以下の当てはめの関数で最小化できる。
+目的関数は自分の評価回数を数えず、ソルバーが実行コンテキストに数える。
+
+`fit_objectives_into(objective, parameters, options, output, scratch, workers, context)` は、$m$ 本の母数ベクトルを並べた `parameters` で目的関数を一度に評価し、`output[i]` に値を書く。
+`workers` は実行 Plan のワーカーごとの作業領域（最大 64）で、値はワーカーの数によらない。
+個体群を使う最適化（差分進化や CMA-ES など）で `FitSolver` を実装するときの評価に使う。
+この評価は実行コンテキストに数えられないので、ソルバーが自分で数える。
+
+## 分布フィッティング・プロトコル
+
+`scioxide-stats` は最適化のアルゴリズムを持たない。
+目的関数の最小化は、呼び出し側が `FitSolver` トレイトを実装したソルバーを渡して行う。
+これにより、同じ目的関数を準 Newton 法でも非線形最小二乗でも制約付きの方法でも解ける。
+`scioxide-optimize` は次の実装を提供する。
+
+| 型 | 方法 | 上下限 | 整数 | 必要なもの |
+|---|---|---|---|---|
+| `LbfgsBFitSolver` | L-BFGS-B | 有限・片側・固定 | 扱わない | 勾配は任意（なければ `LbfgsB` の設定に従う数値微分） |
+| `LeastSquaresFitSolver` | Gauss–Newton・Levenberg–Marquardt | 扱わない | 扱わない | 残差（2 乗和の目的関数） |
+| `SqpFitSolver` | 逐次二次計画法 | 制約と同じ上下限 | 扱わない | 非線形の制約 |
+
+`LeastSquaresFitSolver` は $\tfrac12\sum r_j^2$ を最小化するが、最小点は $\sum r_j^2$ と同じである。
+整数の母数を当てはめるには、整数制約を扱うソルバーを自分で実装する。
+
+### ソルバーと導関数の機能
+
+`FitSolver::capabilities` は `FitSolverCapabilities` を返し、上下限を守るか（`bounds`）、整数制約を守るか（`integrality`）、残差が必要か（`requires_residuals`）、どの導関数が必要か（`derivatives`）を宣言する。
+導関数は `FitDerivatives` トレイトで目的関数と一緒に渡し、`capabilities` が返す `FitDerivativeCapabilities` に、勾配（`gradient`）、ヘッセ行列（`hessian`、行優先の $d \times d$）、残差のヤコビ行列（`jacobian`、残差ごとに 1 行）のどれを計算できるかを書く。
+各メソッドの既定は `NotImplemented` で、`scioxide-stats` は差分による近似を補わない。
+導関数は同じデータと同じ正規化で作った同じ目的関数のものでなければならず、食い違っても検出されない。
+
+当てはめは、要求した上下限・整数制約・残差・導関数をソルバーと導関数が満たすかを、求解の前に照合する。
+ソルバーが扱わない上下限（どれか一つでも端点があれば）や整数制約がある場合、ソルバーが要求する残差や導関数を渡していない場合は、`NotImplemented` を返す。
+上の `LeastSquaresFitSolver` に上下限のある要求を渡すと、この照合で止まる。
+
+`ExactFitDerivatives { model, samples }` は、打ち切りも切断もない `Exact` の標本 $x_1, \dots, x_n$ に対する組み込みの族の負の対数尤度 $\ell(\theta)$ の勾配とヘッセ行列を解析的に与える。
+
+```text
+正規 [μ, σ]:   ∂ℓ/∂μ = Σ (μ − xᵢ)/σ²,   ∂ℓ/∂σ = Σ (1 − zᵢ²)/σ,   zᵢ = (μ − xᵢ)/σ
+               ∂²ℓ/∂μ² = n/σ²,   ∂²ℓ/∂μ∂σ = −2 Σ zᵢ/σ²,   ∂²ℓ/∂σ² = Σ (3zᵢ² − 1)/σ²
+指数 [λ]:      ∂ℓ/∂λ = Σ (xᵢ − 1/λ),     ∂²ℓ/∂λ² = n/λ²
+Poisson [λ]:   ∂ℓ/∂λ = Σ (1 − xᵢ/λ),     ∂²ℓ/∂λ² = Σ xᵢ/λ²
+```
+
+一様分布は台が母数に依存する非正則な族なので、導関数を提供せず `NotImplemented` を返す。
+Poisson の率 0 では導関数が存在しないので `InvalidInput` を返す。
+`evaluate(p, gradient, hessian)` は両方を一度に書き、標本が空か出力の長さが合わなければ `InvalidInput` を返す。
+打ち切りや切断のある尤度には使えないので、その場合は `FitDerivatives` を自分で実装する（下の寿命データの例）。
+
+### 要求と当てはめの呼び出し
+
+`FitRequest { objective, derivatives, bounds, integrality, initial }` は、目的関数、任意の導関数、上下限、整数制約、出発点をまとめた要求である。
+出発点は有限で、上下限の中にあり、整数制約を満たさなければならない。
+当てはめの中心は出力先を指定する API `fit_into(request, solver, output, workspace, scope)` で、次の四段で進む。
+
+1. 形、出発点、ソルバーと導関数の機能を照合する。
+2. 出発点を `FitObjective::validate` で検査する（定義域の評価 1 回）。
+3. ソルバーを呼ぶ。
+4. ソルバーの結果が上下限と整数制約を満たすかを検査し、その点で目的関数を評価し直す（目的関数の評価 1 回）。
+
+`output` には 4 が成功してから書き込む。
+評価回数の上限か停止の要求のために 2 か 4 を実行できなければ、`output` を変えずに、目的関数の値のないレポートを `BudgetExhausted` か `Stopped` で返す。
+ソルバーは `Converged`、`BudgetExhausted`、`Stopped`、`NotConverged` のどれかを返す約束で、ほかの状態を返すと `InvalidInput` になる。
+ソルバーは各評価の前に停止の要求と共有の評価回数の上限を確かめ、反復の回数は自分に設定した上限で止める。
+
+作業領域 `FitWorkspace` は母数ベクトル 1 本と目的関数の作業領域を持ち、ソルバー自身の作業領域は含まない。
+`FitWorkspace::new(dimension, options)` は作業領域を持たない目的関数用、`FitWorkspace::for_objective(objective, options)` は目的関数の作業領域も含めて作る。
+`last_attempt()` は直前の当てはめの試行の記録を返す。
+
+ほかの呼び出しの形はこの出力先を指定する API にメモリの確保と既定値を加えたものである。
+
+| 形 | 呼び出し | 違い |
+|---|---|---|
+| ワンショット関数 | `fit(request, solver)` | 既定の `StatisticsOptions` を使う。成功以外の終了は `Err` にする（`BudgetExhausted` と `NotConverged` は `ConvergenceFailure`、`Stopped` は `ExecutionStopped`） |
+| オプション付き形式 | `fit_with_options(request, solver, options)` | 上限で止まってもレポートを `Ok` で返す |
+| スコープ付き API | `fit_scoped(request, solver, options, scope)` | 実行コンテキストか親の `SolveContext` を受け取り、評価を親の計算回数の上限に数える |
+| 出力先を指定する API | `fit_into(request, solver, output, workspace, scope)` | 事前確保した出力と作業領域に書き、確保しない |
+
+オプション付き形式とスコープ付き API は、出力と候補の 2 本の母数ベクトルと目的関数の作業領域を 1 回分確保し、その合計が `options.max_bytes()` を超えると `ResourceLimit` を返す。
+
+### 結果とレポート
+
+オプション付き形式とスコープ付き API が返す `FitResult` は、当てはめた母数 `parameters()`（最後の評価の前に止まったら `None`）とレポート `report()` を持ち、`into_parts()` で両方を取り出せる。
+`FitReport` は次の四つを持つ。
+
+- `termination()`：`StatsTermination`。
+  `is_success()` が真になるのは `Converged` だけである（当てはめは `Completed` と `ExactFit` を返さない）。
+- `objective()`：ソルバーが返した点で評価し直した目的関数の値。
+  最後の評価の前に止まったら `None`。
+- `active_bounds()`：上下限にちょうど一致した母数の数。
+  固定した母数も数える。
+- `counts()`：`scioxide-core` の `SolveCounts`。
+  ソルバーの反復と各役割の評価回数を、最後の評価を含めて数える。
+
+終了状態が成功でないときに出力に反映された母数は、上限で止まった時点の値で、収束の判定を満たしていない。
+母数を使う前に、必ず終了状態を確かめる。
+
+## 観測情報行列と漸近共分散
+
+最尤推定値 $\hat\theta$ での負の対数尤度 $\ell$ のヘッセ行列
+
+$$
+I(\hat\theta) = \nabla^2 \ell(\hat\theta)
+$$
+
+を観測情報行列と呼ぶ。
+真の母数が母数空間の内部にあり、モデルが識別可能で、対数尤度が十分に滑らかなどの正則条件のもとで、$\hat\theta$ は近似的に $N(\theta, I(\hat\theta)^{-1})$ に従う。
+したがって、$I^{-1}$ の対角成分の平方根が各母数の標準誤差 $\mathrm{SE}(\hat\theta_j)$ の推定値になり、$\hat\theta_j \pm z_{1-\alpha/2}\,\mathrm{SE}(\hat\theta_j)$ が Wald の近似信頼区間になる。
+これは漸近的な近似で、小標本や推定値が境界に近い場合には被覆確率が名目値から外れる。
+
+`fit_information(parameters, bounds, integrality, hessian, rank_tolerance, options)` は、呼び出し側が渡すヘッセ行列（行優先の $d \times d$）を解析し、`FitInformation` を返す。
+ヘッセ行列は `ExactFitDerivatives` から得るか、自分で導く。
+モーメント法や分位点の一致の目的関数のヘッセ行列は情報行列ではないので、渡しても意味のある共分散にならない。
+上下限が等しい固定の母数は除き、残りの自由な母数の小行列 $I_f$ の固有値 $\lambda_i$ を対称固有値分解で求める。
+`rank_tolerance`（`RankThreshold`）から最大の $|\lambda_i|$ を尺度にした閾値 $\tau$ を作り、$|\lambda_i| > \tau$ の固有値の数を数値ランクとする。
+既定の `RankThreshold` は絶対・相対とも $\sqrt{\varepsilon}$ で、絶対の部分があるため、母数の単位を変えるとランクの判定が変わりうる。
+分類 `FitIdentifiability` は次の順に決まる。
+
+| 分類 | 条件 | 共分散 |
+|---|---|---|
+| `Nonregular` | 自由な母数のどれかが整数か、上下限にちょうど一致する | `None` |
+| `Indefinite` | $-\tau$ より小さい固有値がある（推定値が局所最小でない） | `None` |
+| `RankDeficient` | 数値ランクが自由な母数の数より小さい | `None` |
+| `Identifiable` | 上のどれでもない | $I_f^{-1}$。固定の母数の行と列は 0 |
+
+`FitInformation` は分類 `identifiability()`、数値ランク `rank()`、条件数 $\lambda_{\max}/\lambda_{\min}$ の `condition()`（ランク落ちか不定なら `None`）、共分散 `covariance()` を持ち、`into_parts()` で取り出せる。
+分類はこの点での数値的な診断で、モデルが識別可能であることの証明ではない。
+計算量は対称固有値分解 1 回の $O(d^3)$ である。
+ヘッセ行列の自由な部分が厳密に対称でなければ `InvalidInput` を返し、母数かヘッセ行列が有限でない場合や上下限の外にある場合もエラーになる。
+
+`scioxide-stats` はプロファイル尤度による信頼区間を提供しない。
+境界の近くや歪んだ尤度で Wald の区間が不正確な場合は、母数を一つ固定して他の母数で当てはめ直す（上下限を等しくすれば固定できる）ことを繰り返し、尤度比 $2\{\ell(\theta_j) - \ell(\hat\theta)\} = \chi^2_{1,1-\alpha}$ の解を自分で求める。
+
+### 正規分布を三つの方法で当てはめる
+
+次のセルは部品の長さ [mm] を正規分布 $N(\mu, \sigma^2)$ に当てはめる。
+29 個は $N(10, 2^2)$ から引き、30 個目は外れ値の大きさの入力で決める。
+「なし」なら 30 個目も同じ分布から引き、「+5σ」「+20σ」なら $10 + 5 \times 2$、$10 + 20 \times 2$ [mm] の値を置く。
+最尤法は `ExactFitDerivatives` の勾配を渡した `LbfgsBFitSolver` で、$\mu \in [-100, 100]$、$\sigma \in [10^{-3}, 100]$ の上下限の中で解く。
+モーメント法（1 次と 2 次、尺度 1 と 10）と分位点の一致（確率 0.25、0.5、0.75、尺度 1、分位点の規約は型 7）は、残差を使う `LeastSquaresFitSolver` で上下限なしに解く。
+出発点はすべて $(\mu, \sigma) = (5, 1)$ である。
+
+最尤推定値では `ExactFitDerivatives::evaluate` のヘッセ行列を `fit_information` に渡して標準誤差を求める。
+最後の行は閉形式による検算で、$\bar x$ と $\hat\sigma = \sqrt{n^{-1}\sum_i (x_i - \bar x)^2}$、その標準誤差の理論式 $\hat\sigma/\sqrt n$ と $\hat\sigma/\sqrt{2n}$ を手計算で示す。
+三つの当てはめがすべて成功の終了状態なら判定を `satisfied` にする。
+
+```rust
+//| id: stats-distribution-fitting-and-confidence-limits-api-3
+//| ref: stats-distribution-fitting-and-confidence-limits-api-3
+//| title: 正規分布を尤度・モーメント・分位点で当てはめて外れ値の影響を比べる
+//| run: reactive
+//| crates: [scioxide-core, scioxide-linalg, scioxide-optimize, scioxide-random, scioxide-stats]
+//| inputs:
+//|   outlier: {"type":"select","label":"30 個目の値","options":[{"label":"なし（同じ分布から引く）","value":"0"},{"label":"+5σ","value":"5"},{"label":"+20σ","value":"20"}],"value":"20"}
+//|   seed: {"type":"range","label":"乱数のシード","min":1,"max":100,"step":1,"value":7}
+//| cases:
+//|   - {"id":"clean","label":"外れ値なし","description":"三つの方法の推定値が近い。","inputs":{"outlier":"0"}}
+//|   - {"id":"mild","label":"+5σ","description":"最尤法とモーメント法の σ が膨らみ始める。","inputs":{"outlier":"5"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"fits","path":"/rows/0/1","equals":"Converged"}
+//|       - {"artifact":"fits","path":"/rows/0/2","approx":{"value":11.55216944846,"rtol":1e-6}}
+//|       - {"artifact":"fits","path":"/rows/0/3","approx":{"value":7.47819941347,"rtol":1e-6}}
+//|       - {"artifact":"fits","path":"/rows/1/3","approx":{"value":7.47819941347,"rtol":1e-6}}
+//|       - {"artifact":"fits","path":"/rows/0/4","approx":{"value":1.36532616943,"rtol":1e-6}}
+//|       - {"artifact":"fits","path":"/rows/2/3","approx":{"value":2.24535884644,"rtol":1e-6}}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+//|   - case: clean
+//|     expect:
+//|       - {"artifact":"fits","path":"/rows/0/3","approx":{"value":2.23861990592,"rtol":1e-6}}
+//|       - {"artifact":"fits","path":"/rows/2/3","approx":{"value":2.04204270669,"rtol":1e-6}}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+//|   - case: mild
+//|     expect:
+//|       - {"artifact":"fits","path":"/rows/0/3","approx":{"value":2.83333820157,"rtol":1e-6}}
+//|       - {"artifact":"fits","path":"/rows/2/3","approx":{"value":2.24535884644,"rtol":1e-6}}
+use scioxide_core::{Bounds, RankThreshold, RealScalar};
+use scioxide_linalg::HermitianEigenOptions;
+use scioxide_optimize::{LbfgsB, LbfgsBFitSolver, LeastSquares, LeastSquaresFitSolver};
+use scioxide_random::{Distribution, Normal, SeedableRng, SplitMix64};
+use scioxide_stats::{
+    DistributionFitModel, ExactFitDerivatives, FitMethod, FitObjective, FitObservation,
+    FitRequest, FitSolver, PreparedFit, QuantileMethod, StatisticsOptions, fit_information,
+    fit_with_options,
+};
+
+let k: f64 = outlier
+    .parse()
+    .map_err(|_| format!("外れ値 {outlier} を数として読めない"))?;
+let mut rng = SplitMix64::from_seed(seed as u64);
+let law = Normal::new(10.0_f64, 2.0).map_err(|e| e.to_string())?;
+let mut samples = Vec::with_capacity(30);
+for _ in 0..29 {
+    samples.push(law.sample(&mut rng).map_err(|e| e.to_string())?);
+}
+let last = law.sample(&mut rng).map_err(|e| e.to_string())?;
+samples.push(if k == 0.0 { last } else { 10.0 + k * 2.0 });
+let observations: Vec<_> = samples.iter().map(|&x| FitObservation::Exact(x)).collect();
+let model = DistributionFitModel::Normal;
+let boxed = Bounds::new(vec![(Some(-100.0), Some(100.0)), (Some(1e-3), Some(100.0))])
+    .map_err(|e| e.to_string())?;
+let free = Bounds::new(vec![(None, None); 2]).map_err(|e| e.to_string())?;
+let integer = [false; 2];
+let derivatives = ExactFitDerivatives {
+    model,
+    samples: &samples,
+};
+let probabilities = [0.25, 0.5, 0.75];
+let methods = [
+    ("最尤法", FitMethod::Likelihood),
+    (
+        "モーメント法",
+        FitMethod::Moments {
+            orders: &[1, 2],
+            scales: &[1.0, 10.0],
+        },
+    ),
+    (
+        "分位点の一致",
+        FitMethod::Quantiles {
+            probabilities: &probabilities,
+            scales: &[1.0; 3],
+            convention: QuantileMethod::Linear,
+        },
+    ),
+];
+let mut rows = Vec::new();
+let mut all_success = true;
+let mut ml_estimate = [0.0; 2];
+for (name, method) in methods {
+    let likelihood = matches!(method, FitMethod::Likelihood);
+    let bounds = if likelihood { &boxed } else { &free };
+    let options = StatisticsOptions::new();
+    let objective = PreparedFit::new(
+        &model,
+        &observations,
+        method,
+        None,
+        bounds,
+        &integer,
+        options,
+    )
+    .map_err(|e| e.to_string())?;
+    let residuals = objective.residual_count().unwrap_or(1);
+    let mut quasi_newton =
+        LbfgsBFitSolver::new(LbfgsB::default(), 2).map_err(|e| e.to_string())?;
+    let mut least_squares = LeastSquaresFitSolver::new(LeastSquares::default(), 2, residuals)
+        .map_err(|e| e.to_string())?;
+    let solver: &mut dyn FitSolver<f64> = if likelihood {
+        &mut quasi_newton
+    } else {
+        &mut least_squares
+    };
+    let request = FitRequest {
+        objective: &objective,
+        derivatives: if likelihood { Some(&derivatives) } else { None },
+        bounds,
+        integrality: &integer,
+        initial: &[5.0, 1.0],
+    };
+    let result = fit_with_options(request, solver, options).map_err(|e| e.to_string())?;
+    let report = result.report();
+    let termination = report.termination();
+    all_success &= termination.is_success();
+    let p = result.parameters().ok_or("当てはめた母数がない")?;
+    let iterations = report
+        .counts()
+        .total()
+        .map_err(|e| e.to_string())?
+        .iterations();
+    // 最尤推定値でのヘッセ行列を観測情報行列として解析する
+    let (mut se_mu, mut se_sigma) = (None, None);
+    if likelihood {
+        ml_estimate.copy_from_slice(p);
+        let (mut gradient, mut hessian) = ([0.0; 2], [0.0; 4]);
+        derivatives
+            .evaluate(p, &mut gradient, &mut hessian)
+            .map_err(|e| e.to_string())?;
+        let eig = HermitianEigenOptions::default();
+        let info = fit_information(
+            p,
+            bounds,
+            &integer,
+            &hessian,
+            RankThreshold::default(),
+            &eig,
+        )
+        .map_err(|e| e.to_string())?;
+        if let Some(cov) = info.covariance() {
+            se_mu = Some(RealScalar::sqrt(cov[0]));
+            se_sigma = Some(RealScalar::sqrt(cov[3]));
+        }
+    }
+    let state = Some(format!("{termination:?}"));
+    rows.push((name, state, p[0], p[1], se_mu, se_sigma, Some(iterations)));
+}
+// 検算：閉形式の最尤推定値と標準誤差の理論式（手計算）
+let n = samples.len() as f64;
+let mean = samples.iter().sum::<f64>() / n;
+let scatter: f64 = samples.iter().map(|x| (x - mean) * (x - mean)).sum();
+let sigma = RealScalar::sqrt(scatter / n);
+let (se_mu, se_sigma) = (
+    sigma / RealScalar::sqrt(n),
+    sigma / RealScalar::sqrt(2.0 * n),
+);
+rows.push((
+    "閉形式（検算）",
+    None,
+    mean,
+    sigma,
+    Some(se_mu),
+    Some(se_sigma),
+    None,
+));
+let fixed4 = serde_json::json!({ "fractionDigits": 4 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "方法" },
+    { "key": "1", "label": "終了状態", "nullText": "－" },
+    { "key": "2", "label": "μ̂ [mm]", "type": "number", "format": fixed4 },
+    { "key": "3", "label": "σ̂ [mm]", "type": "number", "format": fixed4 },
+    { "key": "4", "label": "SE(μ̂) [mm]", "type": "number", "format": fixed4, "nullText": "－" },
+    { "key": "5", "label": "SE(σ̂) [mm]", "type": "number", "format": fixed4, "nullText": "－" },
+    { "key": "6", "label": "反復数", "type": "integer", "nullText": "－" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "fits" })
+);
+
+let gap = (ml_estimate[0] - mean)
+    .abs()
+    .max((ml_estimate[1] - sigma).abs());
+let outcome = if all_success {
+    Outcome::satisfied("三つの当てはめがすべて収束した")
+        .explanation("最尤法の推定値は閉形式と一致し、標準誤差は観測情報行列から求めた。")
+} else {
+    Outcome::partial("収束の判定を満たさずに止まった当てはめがある")
+        .explanation("終了状態が Converged でない行の推定値は、上限で止まった時点の値である。")
+};
+emit_outcome!(
+    outcome
+        .status(if all_success {
+            "Converged"
+        } else {
+            "NotConverged"
+        })
+        .diagnostic("最尤推定値と閉形式の差 [mm]", gap, Some("mm"))
+);
+```
+
+既定の「+20σ」では 30 個目が 50 mm で、最尤法とモーメント法はどちらも $\hat\mu = 11.552$、$\hat\sigma = 7.478$ mm を与え、閉形式と小数 4 桁まで一致する。
+外れ値 1 個のために、$\hat\sigma$ は真の値 2 mm の約 3.7 倍になり、$\hat\mu$ も真の値 10 mm から 1.55 mm ずれる。
+分位点の一致は四分位点しか見ないので、$\hat\mu = 10.544$、$\hat\sigma = 2.245$ mm にとどまる。
+観測情報行列から求めた $\mathrm{SE}(\hat\mu) = 1.3653$、$\mathrm{SE}(\hat\sigma) = 0.9654$ mm は理論式と一致するが、これは正規分布が正しいという仮定のもとでの値であり、外れ値による偏りは含まない。
+「なし」では三つの推定値が近く（$\hat\sigma$ は最尤法で 2.239、分位点の一致で 2.042 mm）、標準誤差は $\mathrm{SE}(\hat\mu) = 0.409$ mm まで小さくなる。
+「+5σ」では最尤法の $\hat\sigma$ が 2.833 mm に膨らむ一方、分位点の一致の推定値は「+20σ」と同じで、外れ値の大きさに影響されない。
+反復数は、L-BFGS-B の最尤法が 22、Gauss–Newton のモーメント法が 9、分位点の一致が 2 である。
+正規分布の分位点 $Q(p) = \mu + \sigma z_p$ は母数について線形なので、分位点の一致は線形最小二乗になり、Gauss–Newton 法はほぼ 1 歩で解に着く。
+分位点の一致は方程式が 3 本、母数が 2 個なので残差は 0 にならず、尺度 $s_j$ の選び方が解を変える。
+
+### 打ち切りのある寿命データ
+
+部品の寿命試験を $n$ 個で始め、時刻 $c$ に打ち切る（第 I 種の打ち切り）。
+寿命が平均 $1/\lambda$ の指数分布に従い、$d$ 個が $c$ までに故障して寿命 $t_i$ が分かり、残りの $n - d$ 個は $X > c$ だけが分かるとする。
+総試験時間を $T = \sum_{\text{故障}} t_i + (n - d)c$ と書くと、負の対数尤度とその導関数は
+
+$$
+\ell(\lambda) = -d \ln\lambda + \lambda T, \qquad
+\ell'(\lambda) = -\frac{d}{\lambda} + T, \qquad
+\ell''(\lambda) = \frac{d}{\lambda^2}
+$$
+
+で、$d > 0$ なら最尤推定値は $\hat\lambda = d/T$、観測情報は $I(\hat\lambda) = d/\hat\lambda^2$、標準誤差は $\hat\lambda/\sqrt d$ である。
+標準誤差を決めるのは標本の大きさ $n$ ではなく故障数 $d$ である。
+$d = 0$ では $\ell$ が $\lambda$ について単調に増加し、最尤推定値は存在しない（下限に張り付く）。
+
+次のセルは真の平均寿命 1000 h（$\lambda = 10^{-3}$ /h）の指数分布から $n$ 個の寿命を引き、打ち切り時刻 $c$ を平均寿命の倍数で選んで、三通りに当てはめる。
+「打ち切りを考慮」は `RightCensored(c)` を使う正しい尤度、「打ち切りを観測とみなす」は打ち切った個体の寿命を $c$ として `Exact(c)` にした誤った尤度、「打ち切りを捨てる」は故障した個体だけを使う誤った尤度である。
+後の二つはどれも $\lambda$ を過大に、平均寿命を過小に見積もる。
+打ち切りのある尤度には `ExactFitDerivatives` が使えないので、上の $\ell'$ と $\ell''$ を `FitDerivatives` として実装してソルバーと `fit_information` に渡す。
+表の $z$ は $(\hat\lambda - \lambda)/\mathrm{SE}(\hat\lambda)$ で、正しい尤度なら標準正規分布に近い値になる。
+
+```rust
+//| id: stats-fit-censored-lifetimes
+//| ref: stats-fit-censored-lifetimes
+//| title: 打ち切りのある寿命データを指数分布で当てはめ、打ち切りを無視した推定と比べる
+//| run: reactive
+//| crates: [scioxide-core, scioxide-linalg, scioxide-optimize, scioxide-random, scioxide-stats]
+//| inputs:
+//|   units: {"type":"range","label":"試験する個数 n","min":10,"max":200,"step":10,"value":40}
+//|   censor: {"type":"range","label":"打ち切り時刻 c（平均寿命の倍数）","min":0.05,"max":3,"step":0.05,"value":1}
+//|   seed: {"type":"range","label":"乱数のシード","min":1,"max":100,"step":1,"value":1}
+//| cases:
+//|   - {"id":"light","label":"c = 3、n = 200","description":"打ち切りが少なく、三つの推定が近い。","inputs":{"units":200,"censor":3}}
+//|   - {"id":"no-failure","label":"c = 0.05、n = 10、シード 4","description":"故障が一つもなく、正しい尤度の推定値は下限に張り付く。","inputs":{"units":10,"censor":0.05,"seed":4}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"lifetimes","path":"/rows/0/2","equals":27}
+//|       - {"artifact":"lifetimes","path":"/rows/0/4","approx":{"value":1.10971171372e-3,"rtol":1e-6}}
+//|       - {"artifact":"lifetimes","path":"/rows/0/5","approx":{"value":1.10971171372e-3,"rtol":1e-12}}
+//|       - {"artifact":"lifetimes","path":"/rows/0/7","approx":{"value":2.13564118880e-4,"rtol":1e-6}}
+//|       - {"artifact":"lifetimes","path":"/rows/1/4","approx":{"value":1.64401735366e-3,"rtol":1e-6}}
+//|       - {"artifact":"lifetimes","path":"/rows/2/4","approx":{"value":2.38291851672e-3,"rtol":1e-6}}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+//|   - case: light
+//|     expect:
+//|       - {"artifact":"lifetimes","path":"/rows/0/2","equals":191}
+//|       - {"artifact":"lifetimes","path":"/rows/0/6","approx":{"value":1023.6917325,"rtol":1e-6}}
+//|   - case: no-failure
+//|     expect:
+//|       - {"artifact":"lifetimes","path":"/rows/0/1","equals":"Converged / Nonregular"}
+//|       - {"artifact":"lifetimes","path":"/rows/0/2","equals":0}
+//|       - {"artifact":"lifetimes","path":"/rows/0/7","equals":null}
+//|       - {"artifact":"lifetimes","path":"/rows/1/4","approx":{"value":0.02,"rtol":1e-6}}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+use scioxide_core::{Bounds, SciOxideError, RankThreshold, RealScalar};
+use scioxide_linalg::HermitianEigenOptions;
+use scioxide_optimize::{LbfgsB, LbfgsBFitSolver};
+use scioxide_random::{Distribution, Exponential, SeedableRng, SplitMix64};
+use scioxide_stats::{
+    DistributionFitModel, FitDerivativeCapabilities, FitDerivatives, FitMethod, FitObservation,
+    FitRequest, PreparedFit, StatisticsOptions, fit_information, fit_with_options,
+};
+
+/// 指数分布の負の対数尤度 −d ln λ + λT の導関数（d は故障数、T は総試験時間）。
+struct TotalTimeDerivatives {
+    failures: f64,
+    exposure: f64,
+}
+impl FitDerivatives<f64> for TotalTimeDerivatives {
+    fn capabilities(&self) -> FitDerivativeCapabilities {
+        FitDerivativeCapabilities {
+            gradient: true,
+            hessian: true,
+            jacobian: false,
+        }
+    }
+    fn gradient(&self, p: &[f64], out: &mut [f64]) -> Result<(), SciOxideError> {
+        out[0] = -self.failures / p[0] + self.exposure;
+        Ok(())
+    }
+    fn hessian(&self, p: &[f64], out: &mut [f64]) -> Result<(), SciOxideError> {
+        out[0] = self.failures / (p[0] * p[0]);
+        Ok(())
+    }
+}
+
+let rate = 1e-3; // 真の故障率 [1/h]（平均寿命 1000 h）
+let limit = censor * 1000.0; // 打ち切り時刻 [h]
+let law = Exponential::new(rate).map_err(|e| e.to_string())?;
+let mut rng = SplitMix64::from_seed(seed as u64);
+let mut lifetimes = Vec::with_capacity(units as usize);
+for _ in 0..units as usize {
+    lifetimes.push(law.sample(&mut rng).map_err(|e| e.to_string())?);
+}
+let failed: Vec<f64> = lifetimes.iter().copied().filter(|&t| t <= limit).collect();
+let observed = |t: f64| {
+    if t <= limit {
+        FitObservation::Exact(t)
+    } else {
+        FitObservation::RightCensored(limit)
+    }
+};
+let designs = [
+    (
+        "打ち切りを考慮",
+        lifetimes.iter().map(|&t| observed(t)).collect::<Vec<_>>(),
+    ),
+    (
+        "打ち切りを観測とみなす",
+        lifetimes
+            .iter()
+            .map(|&t| FitObservation::Exact(t.min(limit)))
+            .collect(),
+    ),
+    (
+        "打ち切りを捨てる",
+        failed.iter().map(|&t| FitObservation::Exact(t)).collect(),
+    ),
+];
+let bounds = Bounds::new(vec![(Some(1e-7), Some(0.1))]).map_err(|e| e.to_string())?;
+let model = DistributionFitModel::Exponential;
+let mut rows = Vec::new();
+let mut primary = None;
+for (name, observations) in &designs {
+    if observations.is_empty() {
+        continue; // 故障が一つもなければ「捨てる」推定は作れない
+    }
+    // 尤度の十分統計量：故障数 d と総試験時間 T
+    let mut failures = 0.0;
+    let mut exposure = 0.0;
+    for o in observations {
+        match *o {
+            FitObservation::Exact(t) => (failures, exposure) = (failures + 1.0, exposure + t),
+            FitObservation::RightCensored(c) => exposure += c,
+            _ => return Err("想定しない観測".to_string()),
+        }
+    }
+    let derivatives = TotalTimeDerivatives { failures, exposure };
+    let options = StatisticsOptions::new();
+    let objective = PreparedFit::new(
+        &model,
+        observations,
+        FitMethod::Likelihood,
+        None,
+        &bounds,
+        &[false],
+        options,
+    )
+    .map_err(|e| e.to_string())?;
+    let mut solver = LbfgsBFitSolver::new(LbfgsB::default(), 1).map_err(|e| e.to_string())?;
+    let request = FitRequest {
+        objective: &objective,
+        derivatives: Some(&derivatives),
+        bounds: &bounds,
+        integrality: &[false],
+        initial: &[0.01],
+    };
+    let result = fit_with_options(request, &mut solver, options).map_err(|e| e.to_string())?;
+    let termination = result.report().termination();
+    let estimate = result.parameters().ok_or("当てはめた母数がない")?[0];
+    let mut hessian = [0.0];
+    derivatives
+        .hessian(&[estimate], &mut hessian)
+        .map_err(|e| e.to_string())?;
+    let eig = HermitianEigenOptions::default();
+    let info = fit_information(
+        &[estimate],
+        &bounds,
+        &[false],
+        &hessian,
+        RankThreshold::default(),
+        &eig,
+    )
+    .map_err(|e| e.to_string())?;
+    let se = info.covariance().map(|c| RealScalar::sqrt(c[0]));
+    let z = se.map(|s| (estimate - rate) / s);
+    let closed = (failures > 0.0).then(|| failures / exposure);
+    if primary.is_none() {
+        primary = Some((termination, info.identifiability(), estimate));
+    }
+    let state = format!("{termination:?} / {:?}", info.identifiability());
+    rows.push((
+        *name,
+        state,
+        failures as u32,
+        exposure,
+        estimate,
+        closed,
+        1.0 / estimate,
+        se,
+        z,
+    ));
+}
+let sci4 = serde_json::json!({ "notation": "scientific", "significantDigits": 4 });
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let fixed0 = serde_json::json!({ "fractionDigits": 0 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "尤度" },
+    { "key": "1", "label": "終了状態 / 情報行列" },
+    { "key": "2", "label": "故障数 d", "type": "integer" },
+    { "key": "3", "label": "総試験時間 T [h]", "type": "number", "format": fixed0 },
+    { "key": "4", "label": "λ̂ [1/h]", "type": "number", "format": sci4 },
+    { "key": "5", "label": "d/T [1/h]", "type": "number", "format": sci4, "nullText": "存在しない" },
+    { "key": "6", "label": "平均寿命 1/λ̂ [h]", "type": "number", "format": fixed0 },
+    { "key": "7", "label": "SE(λ̂) [1/h]", "type": "number", "format": sci4, "nullText": "非正則" },
+    { "key": "8", "label": "z [-]", "type": "number", "format": fixed2, "nullText": "－" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "lifetimes" })
+);
+
+let (termination, identifiability, estimate) = primary.ok_or("当てはめがない")?;
+let outcome = if termination.is_success() {
+    Outcome::satisfied("打ち切りを考慮した当てはめが収束した")
+        .explanation("情報行列が Nonregular なら推定値は下限にあり、標準誤差は使えない。")
+} else {
+    Outcome::partial("打ち切りを考慮した当てはめが上限で止まった")
+};
+emit_outcome!(
+    outcome
+        .status(format!("{termination:?} / {identifiability:?}"))
+        .diagnostic("λ̂", estimate, Some("1/h"))
+);
+```
+
+既定（$n = 40$、$c = 1000$ h、シード 1）では $d = 27$ 個が故障し、$T = 24331$ h である。
+打ち切りを考慮した推定値 $\hat\lambda = 1.1097 \times 10^{-3}$ /h（平均寿命 901 h）は $d/T$ と 12 桁一致し、$\mathrm{SE} = 2.14 \times 10^{-4}$ /h、$z = 0.51$ で真の値と矛盾しない。
+打ち切りを観測とみなすと平均寿命は 608 h、打ち切りを捨てると 420 h まで短くなり、それぞれの（誤ったモデルでの）標準誤差で測ると $z = 2.48$、$3.02$ の偏りである。
+「c = 3、n = 200」では 200 個中 191 個が故障し、正しい推定は 1024 h（$z = -0.33$）、観測とみなす推定は 978 h、捨てる推定は 882 h（$z = 1.63$）で、打ち切りが少ないほど誤りの影響は小さい。
+「c = 0.05、n = 10、シード 4」では故障が 0 件で、正しい尤度の推定値は下限 $10^{-7}$ /h に張り付き、情報行列は `Nonregular` で標準誤差は求まらない。
+故障が 0 件なので「打ち切りを捨てる」行は作れない。
+ソルバーの終了状態は `Converged` で、判定も `satisfied` になるが、これは最適化が上下限の中で収束したという意味で、推定値が有用だという意味ではない。
+故障が 0 件でも、総試験時間 $T$ の間の故障数を Poisson 分布とみなせば、信頼係数 $1-\beta$ の片側の上限 $\lambda_U = -\ln\beta/T$ は求まる（[裾確率による母数の逆算と正確な信頼限界](oxref:stats-inversion-closed-form-check)の Garwood の限界で $k = 0$ の場合）。
+
+## まとめ
+
+分布の当てはめは `PreparedFit` で観測と方法から目的関数を作り、`FitSolver` を実装したソルバー（`scioxide-optimize` の `LbfgsBFitSolver` など）で `fit_with_options` か `fit_into` を呼んで行う。
+打ち切りと切断は最尤法で `FitObservation` と `FitTruncation` を使って扱い、外れ値に強い推定が必要なら分位点の一致を選ぶ。
+ソルバーが要求する残差や導関数、扱える上下限と整数制約は、求解の前に照合されるので、`FitSolverCapabilities` と `FitDerivativeCapabilities` をそろえて渡す。
+推定値を使う前に `FitReport::termination` を確かめ、標準誤差は `fit_information` で観測情報行列を解析して求め、分類が `Identifiable` でなければ Wald の区間を使わない。
+打ち切りや切断のある尤度の導関数は `ExactFitDerivatives` では得られないので、`FitDerivatives` を自分で実装する。
+
+## 次に読むページ
+
+- [記述統計・標準化・べき変換の数理](../descriptive-statistics-and-transforms/)：同じソルバーの仕組みで Box–Cox と Yeo–Johnson の変換の母数を当てはめ、正規確率プロットで変換後の分布を確かめる。
+- [裾確率による母数の逆算と正確な信頼限界](../parameter-inversion-and-confidence-limits/)：漸近的な Wald の区間の代わりに、検定の反転で有限標本でも名目の被覆確率を保つ区間を求める。
+- [生存時間分析](../survival-analysis/)：打ち切りのある寿命データを、分布を仮定しない Kaplan–Meier 推定と比例ハザードモデルで扱う。

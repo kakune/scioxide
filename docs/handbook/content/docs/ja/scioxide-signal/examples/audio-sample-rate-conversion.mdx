@@ -1,0 +1,384 @@
+---
+title: 44.1 kHz と 48 kHz の変換とエイリアシング
+description: 音声の標本化周波数 44.1 kHz と 48 kHz を比 160/147 で変換し、既定の多相フィルタと急峻な Kaiser ウインドウのフィルタ、周期的な Fourier リサンプリングの通過域の誤差、折り返しの抑圧量、往復の誤差を測る。
+sidebar:
+  order: 435
+references:
+  signal-audio-rate-ratio: "比-160147-と高い標本化周波数"
+  signal-audio-rate-filters: "二つの低域通過フィルタ"
+---
+
+CD の音声は 44.1 kHz、映像や放送の音声は 48 kHz で標本化されることが多く、両者を混ぜて編集するには標本化周波数の変換が要る。
+この例では二つの周波数の間の変換を `scioxide-signal` の三つの方法で行う。
+既定の多相フィルタを使う `resample`、自分で設計した急峻な低域通過を渡す `PolyphasePlan::rational`、記録を一周期とみなす `resample_periodic` である。
+正弦波の振幅の誤差、Nyquist 周波数を越える成分の折り返し、往復の誤差を測り、どの方法がどの用途に向くかを判断する。
+
+## 比 160/147 と高い標本化周波数
+
+$48000 / 44100 = 160/147$ で、160 と 147 は互いに素なので、これ以上約分できない。
+44.1 kHz から 48 kHz への変換では $L = 160$ 倍に補間して $M = 147$ 分の 1 に間引き、逆向きでは $L = 147$、$M = 160$ になる。
+どちらの向きでも、補間した後の高い標本化周波数は $44100 \times 160 = 48000 \times 147 = 7.056$ MHz で、その Nyquist 周波数は 3.528 MHz である。
+多相の形はこの 7.056 MHz の列を実際には作らず、出力 1 標本あたり係数の数 $K$ の $1/L$ 程度の積だけを計算する（[多相分解と計算量](oxref:signal-polyphase)）。
+
+低域通過の遮断周波数は二つの Nyquist 周波数のうち低い方の 22.05 kHz に置く。
+44.1 kHz から 48 kHz への変換では、補間でできる像のうち周波数 $44.1\ \mathrm{kHz} - f$ の成分が、出力の Nyquist 周波数 24 kHz より下に入りうる。
+48 kHz から 44.1 kHz への変換では、22.05 kHz を越える入力の成分が $44.1\ \mathrm{kHz} - f$ に折り返す。
+どちらの向きでも、望まない成分は周波数 $44.1\ \mathrm{kHz} - f$ に現れ、その振幅は高い標本化周波数でのフィルタの利得 $\lvert H \rvert / L$ で決まる。
+人の可聴域の上限とされる 20 kHz までを通過域とすると、20 kHz から 22.05 kHz の狭い区間で遮断しなければならない。
+
+## 二つの低域通過フィルタ
+
+既定の `resample(x, 160, 147)` は、`rational_default` の Kaiser ウインドウ $\beta = 5$ の設計（[既定の低域通過フィルタ](oxref:signal-resampling-filter)）を使う。
+係数は $20 \times 160 + 1 = 3201$ 個で、遮断周波数は 22.05 kHz（$-6$ dB の点）にある。
+遷移帯は遮断周波数のおよそ 3 割の幅を持つので、20 kHz 付近の成分は弱まり、22.05 kHz の少し上の成分は十分に減衰しない。
+
+比べる急峻なフィルタは`design_fir_window` で同じ 7.056 MHz の列に対して設計する。
+係数は $2 \times 60 \times 160 + 1 = 19201$ 個、ウインドウは Kaiser ウインドウ $\beta = 8.6$、理想的な遮断周波数は 20 kHz と 22.05 kHz の中点の 21.025 kHz とする。
+Kaiser の経験式からは阻止域の減衰量 $A \approx 87$ dB と遷移帯の幅およそ 2 kHz が見込まれ、通過域を 20 kHz まで、阻止域を 22.05 kHz からに収める設計である。
+直流利得は補間の倍率 $L$ に正規化し、`PolyphasePlan::rational(&taps, up, down, ResampleAlignment::Centered)` に渡す。
+出力 1 標本あたりの積は約 $19201/160 \approx 120$ 回で、既定の約 20 回の 6 倍になる。
+
+次のブロックは、二つのセルが共有する定義である。
+`sharp_taps` は上の急峻なフィルタを設計し、`tone` は周波数 $f$ の正弦波を `scioxide_signal::waveform` で作る。
+`amplitude` は記録の両端の 100 標本を除き、Blackman–Harris ウインドウを掛けた DTFT を既知の周波数で評価して振幅を求める。
+ウインドウの最大サイドローブは $-92$ dB なので、500 Hz 以上離れた別の成分の漏れ込みは測る振幅に比べて無視できる。
+
+```rust
+//| id: signal-audio-rate-model
+//| kind: definitions
+//| title: 44.1 kHz と 48 kHz の変換に使う定義
+//| crates: [scioxide-core, scioxide-signal]
+use scioxide_core::RealScalar;
+use scioxide_signal::{
+    FirBand, FirNormalization, FirSymmetry, Waveform, WindowKind, WindowNormalization,
+    WindowSymmetry, design_fir_window, waveform, window,
+};
+
+/// 二つの標本化周波数 [Hz] と、0.1 s の記録の標本数
+pub(crate) const LOW_RATE: f64 = 44_100.0;
+pub(crate) const HIGH_RATE: f64 = 48_000.0;
+pub(crate) const DURATION: f64 = 0.1;
+
+/// 7.056 MHz の列に対する急峻な低域通過: 19201 個、Kaiser ウインドウ β = 8.6、遮断 21.025 kHz、直流利得 up
+pub(crate) fn sharp_taps(up: usize) -> Result<Vec<f64>, String> {
+    let nyquist = 0.5 * LOW_RATE * 160.0;
+    let band = [FirBand::new(0.0, 21_025.0 / nyquist, 1.0, 1.0)];
+    let gain = FirNormalization::At {
+        frequency: 0.0,
+        gain: up as f64,
+    };
+    let kaiser = WindowKind::Kaiser { beta: 8.6 };
+    let design = design_fir_window(19_201, FirSymmetry::Even, &band, kaiser, gain)
+        .map_err(|e| e.to_string())?;
+    Ok(design.coefficients().to_vec())
+}
+
+/// 標本化周波数 rate [Hz] で DURATION 秒の正弦波 a sin(2π f t)
+pub(crate) fn tone(frequency: f64, amplitude: f64, rate: f64) -> Result<Vec<f64>, String> {
+    let count = (DURATION * rate).round() as usize;
+    let times: Vec<f64> = (0..count).map(|n| n as f64 / rate).collect();
+    let sine = Waveform::Sine {
+        frequency,
+        phase: 0.0,
+    };
+    let values = waveform(sine, &times).map_err(|e| e.to_string())?;
+    Ok(values.iter().map(|v| amplitude * v).collect())
+}
+
+/// 両端の 100 標本を除き、Blackman–Harris ウインドウを掛けた DTFT から周波数 f [Hz] の振幅を求める
+pub(crate) fn amplitude(values: &[f64], frequency: f64, rate: f64) -> Result<f64, String> {
+    let interior = &values[100..values.len() - 100];
+    let taper = window::<f64>(
+        WindowKind::BlackmanHarris,
+        interior.len(),
+        WindowSymmetry::Symmetric,
+        WindowNormalization::Native,
+    )
+    .map_err(|e| e.to_string())?;
+    let omega = core::f64::consts::TAU * frequency / rate;
+    let (mut re, mut im) = (0.0, 0.0);
+    for (j, (y, w)) in interior.iter().zip(&taper).enumerate() {
+        re += w * y * RealScalar::cos(omega * j as f64);
+        im -= w * y * RealScalar::sin(omega * j as f64);
+    }
+    Ok(2.0 * RealScalar::sqrt(re * re + im * im) / taper.iter().sum::<f64>())
+}
+```
+
+## 通過域の利得と折り返し
+
+次のセルは変換の向きを選び、入力の Nyquist 周波数までの 90 個の周波数の正弦波（振幅 1）をそれぞれ二つのフィルタで変換する。
+各出力について、元の周波数 $f$ の成分の振幅（通過成分）と、周波数 $44.1\ \mathrm{kHz} - f$ に現れる望まない成分の振幅（像か折り返し）を測る。
+出力の Nyquist 周波数を越える周波数や、二つの周波数が 500 Hz 以内に近づく点は測らない。
+図は四つの振幅を対数軸で描き、20 kHz と 22.05 kHz に縦線を引く。
+表は二つのフィルタについて、係数の数、20 kHz 以下の通過成分の振幅の 1 からのずれ、20 kHz の正弦波の振幅、望まない成分の振幅の最大、係数の DTFT から計算した $\lvert H \rvert / L$ と測った通過成分の差（独立な検算）を示す。
+二つのフィルタで計 182 回の変換を行うので、ボタンで実行する。
+
+```rust
+//| id: signal-audio-rate-response
+//| ref: signal-audio-rate-response
+//| title: 二つのフィルタの通過成分と折り返しを正弦波で測る
+//| run: button
+//| uses: [signal-audio-rate-model]
+//| inputs:
+//|   direction: {"type":"select","label":"変換の向き","description":"補間の像か間引きの折り返しのどちらを測るかを決める。","options":["44.1 kHz → 48 kHz","48 kHz → 44.1 kHz"],"value":"48 kHz → 44.1 kHz"}
+//| cases:
+//|   - {"id":"upward","label":"44.1 kHz → 48 kHz","description":"20.1 kHz を越える入力の像が出力の帯域に入る。","inputs":{"direction":"44.1 kHz → 48 kHz"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"filters","path":"/rows/0/1","equals":3201}
+//|       - {"artifact":"filters","path":"/rows/1/1","equals":19201}
+//|       - {"artifact":"filters","path":"/rows/1/2","range":{"max":1e-3}}
+//|       - {"artifact":"filters","path":"/rows/1/6","range":{"max":1e-6}}
+//|   - case: upward
+//|     expect:
+//|       - {"artifact":"filters","path":"/rows/1/5","range":{"max":1e-3}}
+use scioxide_signal::{PolyphasePlan, ResampleAlignment};
+
+let upward = direction == "44.1 kHz → 48 kHz";
+let (input_rate, output_rate, up, down) = if upward {
+    (LOW_RATE, HIGH_RATE, 160, 147)
+} else {
+    (HIGH_RATE, LOW_RATE, 147, 160)
+};
+let default_plan =
+    PolyphasePlan::<f64>::rational_default(up, down, ResampleAlignment::Centered)
+        .map_err(|e| e.to_string())?;
+let sharp = sharp_taps(up)?;
+let sharp_plan = PolyphasePlan::rational(&sharp, up, down, ResampleAlignment::Centered)
+    .map_err(|e| e.to_string())?;
+let mut series = vec![Vec::new(); 4];
+let mut rows = Vec::new();
+for (index, plan) in [&default_plan, &sharp_plan].into_iter().enumerate() {
+    let taps = plan.coefficients();
+    let (mut ripple, mut leak, mut model) = (0.0_f64, 0.0_f64, 0.0_f64);
+    for i in 0..90 {
+        let f = 0.5 * input_rate * (i as f64 + 0.5) / 90.0;
+        let output = plan
+            .resample(&tone(f, 1.0, input_rate)?)
+            .map_err(|e| e.to_string())?;
+        let alias = LOW_RATE - f;
+        if f < 0.5 * output_rate && (alias - f).abs() > 500.0 {
+            let gain = amplitude(&output, f, output_rate)?;
+            series[index].push([f / 1000.0, gain]);
+            if f <= 20_000.0 {
+                ripple = ripple.max((gain - 1.0).abs());
+            }
+            // 独立な検算: 7.056 MHz の列での係数の DTFT |H| / L（f64 の cos・sin は参照値）
+            let theta = core::f64::consts::TAU * f / (input_rate * up as f64);
+            let (re, im) = taps
+                .iter()
+                .enumerate()
+                .fold((0.0, 0.0), |(re, im), (n, h)| {
+                    (
+                        re + h * (theta * n as f64).cos(),
+                        im - h * (theta * n as f64).sin(),
+                    )
+                });
+            model = model.max((gain - (re * re + im * im).sqrt() / up as f64).abs());
+        }
+        if alias > 0.0 && alias < 0.5 * output_rate && (alias - f).abs() > 500.0 {
+            let unwanted = amplitude(&output, alias, output_rate)?;
+            series[index + 2].push([f / 1000.0, unwanted]);
+            leak = leak.max(unwanted);
+        }
+    }
+    let edge_tone = plan
+        .resample(&tone(20_000.0, 1.0, input_rate)?)
+        .map_err(|e| e.to_string())?;
+    let at_edge = amplitude(&edge_tone, 20_000.0, output_rate)?;
+    let name = if index == 0 {
+        "既定（β = 5）"
+    } else {
+        "急峻（β = 8.6）"
+    };
+    rows.push((
+        name,
+        taps.len(),
+        ripple,
+        at_edge,
+        taps.len() as f64 / up as f64,
+        leak,
+        model,
+    ));
+}
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let fixed4 = serde_json::json!({ "fractionDigits": 4 });
+let fixed1 = serde_json::json!({ "fractionDigits": 1 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "フィルタ" },
+    { "key": "1", "label": "係数の数 K [-]", "type": "integer" },
+    { "key": "2", "label": "20 kHz 以下の |振幅 − 1| の最大 [-]", "type": "number", "format": sci2 },
+    { "key": "3", "label": "20 kHz の振幅 [-]", "type": "number", "format": fixed4 },
+    { "key": "4", "label": "出力あたりの積 K/L [回]", "type": "number", "format": fixed1 },
+    { "key": "5", "label": "望まない成分の最大 [-]", "type": "number", "format": sci2 },
+    { "key": "6", "label": "DTFT との差の最大 [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "filters" })
+);
+let names = [
+    "通過成分（既定）",
+    "通過成分（急峻）",
+    "望まない成分（既定）",
+    "望まない成分（急峻）",
+];
+emit_line_chart!(
+    &names
+        .iter()
+        .zip(&series)
+        .map(|(name, points)| {
+            serde_json::json!({
+                "name": name,
+                "points": points,
+                "style": { "symbol": "circle" }
+            })
+        })
+        .collect::<Vec<_>>(),
+    options = &serde_json::json!({
+        "xLabel": "入力の周波数 f [kHz]",
+        "yLabel": "出力の振幅 [-]",
+        "yType": "log",
+        "xMin": 0.0,
+        "xMax": 0.5 * input_rate / 1000.0,
+        "annotations": [
+            { "kind": "line", "axis": "x", "value": 20.0, "label": "20 kHz" },
+            { "kind": "line", "axis": "x", "value": 22.05, "label": "22.05 kHz" }
+        ]
+    })
+);
+```
+
+既定の 48 kHz から 44.1 kHz への変換では、既定のフィルタの通過成分は 18.3 kHz まで 1 に近いが、19.6 kHz で 0.950、20 kHz で 0.909（$-0.83$ dB）に下がる。
+22.53 kHz の入力は 21.57 kHz に折り返して振幅 0.38 で残り、これが望まない成分の最大である。
+急峻なフィルタでは 20 kHz 以下の振幅のずれが $2.1 \times 10^{-5}$ で、望まない成分は最大 $3.3 \times 10^{-5}$（約 $-90$ dB）まで抑えられる。
+その代わりに出力 1 標本あたりの積は 21.8 回から 130.6 回に増える。
+二つのフィルタとも、測った通過成分と係数の DTFT の差は $2.7 \times 10^{-6}$ 以下で、振幅の測り方が正しいことを確かめられる。
+44.1 kHz から 48 kHz への変換では、20.2 kHz から 21.7 kHz の入力の像が 22.4 kHz から 23.9 kHz に現れ、既定のフィルタでは振幅が 0.12 から 0.41 に達する。
+急峻なフィルタではこの像も $2.3 \times 10^{-5}$ 以下である。
+
+## 往復の誤差と Fourier リサンプリング
+
+次のセルは44.1 kHz の 0.1 s の記録（4410 標本）を 48 kHz（4800 標本）に変換し、さらに 44.1 kHz に戻す。
+記録は 1、5、10 kHz と、入力で選ぶ周波数 $f_{\max}$ の四つの正弦波（振幅 0.25）の和である。
+方法は既定の `resample`、急峻なフィルタの `PolyphasePlan::rational`、記録を一周期とみなす `resample_periodic`（4410 → 4800 → 4410）の三つである。
+48 kHz の中間結果を、同じ正弦波の和を 48 kHz の時刻で評価した真の値と比べ、往復した記録を元の記録と比べる。
+誤差は両端の 10 ms を除いた内部と全体の最大値で示す。
+周波数がすべて 10 Hz の倍数なら、0.1 s の記録にちょうど整数個の周期が入り、記録は周期的である。
+周波数を 3 Hz ずらすと周期的でなくなり、記録を一周期とみなす Fourier リサンプリングの仮定が成り立たない。
+
+```rust
+//| id: signal-audio-rate-round-trip
+//| ref: signal-audio-rate-round-trip
+//| title: 44.1 kHz と 48 kHz の往復を三つの方法で比べる
+//| run: button
+//| uses: [signal-audio-rate-model]
+//| inputs:
+//|   top: {"type":"range","label":"最も高い成分 f_max [kHz]","description":"通過域の端に近づけると多相フィルタの誤差が増える。","min":12,"max":21,"step":0.5,"value":15}
+//|   shifted: {"type":"checkbox","label":"周波数を 3 Hz ずらす（周期的でない記録）","description":"0.1 s に整数個の周期が入らなくなる。","value":false}
+//| cases:
+//|   - {"id":"shifted","label":"3 Hz ずらす","description":"resample_periodic の 48 kHz の値に端の誤差が出る。","inputs":{"shifted":true}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"round-trip","path":"/rows/2/2","range":{"max":1e-12}}
+//|       - {"artifact":"round-trip","path":"/rows/2/4","range":{"max":1e-12}}
+//|   - case: shifted
+//|     expect:
+//|       - {"artifact":"round-trip","path":"/rows/2/2","range":{"min":1e-3}}
+use scioxide_signal::{PolyphasePlan, ResampleAlignment, resample, resample_periodic};
+
+let offset = if shifted { 3.0 } else { 0.0 };
+let frequencies = [1000.0, 5000.0, 10_000.0, 1000.0 * top].map(|f| f + offset);
+let mixture = |rate: f64| -> Result<Vec<f64>, String> {
+    let mut total = tone(frequencies[0], 0.25, rate)?;
+    for &f in &frequencies[1..] {
+        total
+            .iter_mut()
+            .zip(tone(f, 0.25, rate)?)
+            .for_each(|(t, v)| *t += v);
+    }
+    Ok(total)
+};
+let original = mixture(LOW_RATE)?;
+// 48 kHz の時刻で評価した真の値（独立な参照値）
+let truth = mixture(HIGH_RATE)?;
+let upward = PolyphasePlan::rational(&sharp_taps(160)?, 160, 147, ResampleAlignment::Centered)
+    .map_err(|e| e.to_string())?;
+let downward =
+    PolyphasePlan::rational(&sharp_taps(147)?, 147, 160, ResampleAlignment::Centered)
+        .map_err(|e| e.to_string())?;
+
+let default_mid = resample(&original, 160, 147).map_err(|e| e.to_string())?;
+let default_back = resample(&default_mid, 147, 160).map_err(|e| e.to_string())?;
+let sharp_mid = upward.resample(&original).map_err(|e| e.to_string())?;
+let sharp_back = downward.resample(&sharp_mid).map_err(|e| e.to_string())?;
+let fourier_mid = resample_periodic(&original, truth.len()).map_err(|e| e.to_string())?;
+let fourier_back =
+    resample_periodic(&fourier_mid, original.len()).map_err(|e| e.to_string())?;
+
+// 両端の 10 ms を除いた内部と全体の最大誤差
+let errors = |values: &[f64], reference: &[f64], rate: f64| {
+    let margin = (0.01 * rate) as usize;
+    let (mut inner, mut all) = (0.0_f64, 0.0_f64);
+    for (j, (v, r)) in values.iter().zip(reference).enumerate() {
+        let e = (v - r).abs();
+        all = all.max(e);
+        if j >= margin && j + margin < reference.len() {
+            inner = inner.max(e);
+        }
+    }
+    (inner, all)
+};
+let rows: Vec<(&str, f64, f64, f64, f64)> = [
+    ("resample（既定）", &default_mid, &default_back),
+    ("PolyphasePlan::rational（急峻）", &sharp_mid, &sharp_back),
+    ("resample_periodic", &fourier_mid, &fourier_back),
+]
+.into_iter()
+.map(|(name, mid, back)| {
+    let (mid_inner, mid_all) = errors(mid, &truth, HIGH_RATE);
+    let (back_inner, back_all) = errors(back, &original, LOW_RATE);
+    (name, mid_inner, mid_all, back_inner, back_all)
+})
+.collect();
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "方法" },
+    { "key": "1", "label": "48 kHz の誤差（内部） [-]", "type": "number", "format": sci2 },
+    { "key": "2", "label": "48 kHz の誤差（全体） [-]", "type": "number", "format": sci2 },
+    { "key": "3", "label": "往復の誤差（内部） [-]", "type": "number", "format": sci2 },
+    { "key": "4", "label": "往復の誤差（全体） [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "round-trip" })
+);
+emit_text!(format!(
+    "記録の長さ: 44.1 kHz で {} 標本、48 kHz で {} 標本（resample の出力 {} 標本）",
+    original.len(),
+    truth.len(),
+    default_mid.len()
+));
+```
+
+既定の $f_{\max} = 15$ kHz では、すべての周波数が 10 Hz の倍数で、`resample_periodic` の 48 kHz の値は全体で $7.3 \times 10^{-13}$、往復の誤差は $9.4 \times 10^{-16}$ である。
+多相 FIR の 48 kHz の誤差は、内部で既定のフィルタが $1.0 \times 10^{-3}$、急峻なフィルタが $8.1 \times 10^{-6}$ で、往復ではそれぞれ約 2 倍の $2.1 \times 10^{-3}$ と $1.8 \times 10^{-5}$ になる。
+全体の誤差は 0.02 から 0.04 で、記録の外を 0 とみなすことによる端の過渡応答が占める。
+急峻なフィルタは係数が長いので、端の影響も長く続く。
+周波数を 3 Hz ずらすと、`resample_periodic` の 48 kHz の値は内部で $6.8 \times 10^{-4}$、全体で $0.093$ ずれるが、往復の誤差は $1.1 \times 10^{-15}$ のままである。
+Fourier リサンプリングの往復は DFT の補零と切り詰めなので、元の記録には必ず戻るが、中間の 48 kHz の値が正しいとは限らない。
+$f_{\max} = 21$ kHz では最も高い成分がどちらのフィルタでも遷移帯に入り、内部の誤差は既定で 0.13、急峻なフィルタで 0.12 になる。
+
+## まとめ
+
+44.1 kHz と 48 kHz の変換は既約な比 160/147 で、どちらの向きでも 22.05 kHz を遮断周波数とする 7.056 MHz の列の低域通過が誤差を決める。
+既定の `resample` は出力あたり約 20 回の積で済むが、20 kHz 付近の振幅が下がり、22.05 kHz を少し越える成分の折り返しを十分に抑えない。
+音声の帯域を 20 kHz まで保ち折り返しを強く抑えたいときは、`design_fir_window` で係数を設計して `PolyphasePlan::rational` に渡し、計算量の増加と引き換えにする。
+`resample_periodic` は記録に整数個の周期が入る場合に丸めの範囲で正確だが、一般の音声の記録では端に誤差が出るので、編集用の変換には多相 FIR を使う。
+
+リサンプリングのアルゴリズム、時刻原点と逐次処理は[リサンプリング](../../algorithms/resampling/)、Kaiser ウインドウによる FIR の設計は[FIR の設計と最小位相](../../algorithms/fir-design-and-minimum-phase/)で確かめられる。

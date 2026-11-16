@@ -1,0 +1,475 @@
+---
+title: "Field transfer between adaptive mesh revisions"
+description: "Conservative cell-average transfer, nodal interpolation and L² projection, and exterior-face label transfer across refinement and coarsening."
+sidebar:
+  order: 366
+references:
+  pde-amr-transfer: "revision-correspondence-and-transfer-types"
+  pde-amr-cell-transfer: "conservative-cell-average-transfer"
+  pde-amr-boundary-tags: "carrying-boundary-labels-forward"
+  pde-amr-l2-projection: "nodal-interpolation-and-l-projection"
+---
+
+Refining or coarsening an adaptive mesh creates a new mesh with different cell counts and numbering.
+Following the `scioxide-spatial` chapter, each mesh is called a revision.
+This page explains formulas for transferring fields from the previous to the new revision, conserved quantities, and failure classifications, and examines them in two cells.
+Nodal space `AmrSpace` and hanging-node constraints are explained in [Error-estimator-based adaptive refinement](../adaptive-mesh-refinement/).
+
+## Revision correspondence and transfer types
+
+After creating a new revision, fields from the previous revision (transient solutions, iteration initial guesses, and material quantities) must be transferred to it.
+`TopologyMap` contains only cell, face, edge, and vertex correspondences between revisions, without weights for transferring values ([Topology correspondence and generation tracking](oxref:spatial-adaptive-topology-relations)).
+`scioxide-pde` provides the following transfers for cellwise constant and nodal fields, and carries exterior-face labels to the new revision.
+
+| Field | Transfer | Preserves | Supported revision changes |
+|---|---|---|---|
+| Cell averages | `AmrCellTransfer` | Quantity $\sum_K u_K\vert K\vert$ (within rounding) | Refinement and coarsening |
+| Nodal field | `AmrNodalTransfer::interpolate_into` (interpolation) | The function itself | Refinement only |
+| Nodal field | `AmrNodalTransfer::project_into` ($L^2$ projection) | Integral $\int_\Omega u_h$ (within linear-system residual) | Refinement and coarsening |
+| Exterior-face labels | `AmrBoundaryTags::transfer` | Each face label | Refinement and coarsening (merging different labels rejected) |
+
+For both cells, the previous revision is the same kind used in the cell in [Error-estimator-based adaptive refinement](../adaptive-mesh-refinement/): a $4\times4$ triangular mesh of the unit square with its bottom-left corner refined twice.
+The new revision refines cells whose centroids are near the upper-right corner $(1,1)$ ($x_K+y_K>1.6$).
+“Refinement and coarsening” simultaneously coarsens every depth-2 cell family (the two at the corner).
+The definitions block contains `versions` to construct these two revisions and their map, the function $f(x,y)=1+\sin(3x)\cos(2y)$ to transfer, P1 field integral `p1_integral`, and mass-equation solver `mass_solve`.
+
+```rust
+//| id: pde-amr-transfer-model
+//| kind: definitions
+//| title: "Previous corner-refined revision, refined/coarsened new revision, P1 field integration, and mass-equation solver"
+//| crates: [scioxide-core, scioxide-spatial, scioxide-pde, scioxide-linalg]
+use scioxide_core::{Budget, SciOxideError, RealScalar, ResidualTolerance, SolveContext};
+use scioxide_linalg::{CgSolver, IterativeWorkspace, Preconditioning, Vector};
+use scioxide_pde::{AmrMap, AmrSpace};
+use scioxide_spatial::{
+    AdaptationLimits, AdaptationRequest, AdaptationResult, AdaptiveMesh, Point, TriangleMesh,
+};
+
+/// Function to transfer: f(x, y) = 1 + sin(3x) cos(2y).
+pub(crate) fn f(p: [f64; 2]) -> f64 {
+    1.0 + RealScalar::sin(3.0 * p[0]) * RealScalar::cos(2.0 * p[1])
+}
+
+/// Centroid of active cell cell.
+pub(crate) fn centroid(mesh: &AdaptiveMesh<f64, 2>, cell: usize) -> Result<[f64; 2], String> {
+    let mut c = [0.0; 2];
+    for vertex in mesh.cell_vertices(cell).map_err(|e| e.to_string())? {
+        let p = mesh.point(vertex).map_err(|e| e.to_string())?;
+        c[0] += p.as_array()[0] / 3.0;
+        c[1] += p.as_array()[1] / 3.0;
+    }
+    Ok(c)
+}
+
+/// Refine active cells whose centroids satisfy select and coarsen parents in coarsen.
+fn adapt(
+    mesh: &AdaptiveMesh<f64, 2>,
+    select: impl Fn([f64; 2]) -> bool,
+    coarsen: &[usize],
+) -> Result<AdaptationResult<f64, 2>, String> {
+    let mut refine = Vec::new();
+    for (cell, &id) in mesh.active_cells().iter().enumerate() {
+        if select(centroid(mesh, cell)?) {
+            refine.push(id);
+        }
+    }
+    let request = AdaptationRequest {
+        source: mesh.mesh_token(),
+        refine: &refine,
+        coarsen,
+    };
+    mesh.adapt(request).map_err(|e| e.to_string())
+}
+
+/// Previous revision (corner refined twice) and refinement result from previous to new revision.
+pub(crate) fn versions(
+    mixed: bool,
+) -> Result<(AdaptiveMesh<f64, 2>, AdaptationResult<f64, 2>), String> {
+    let n = 4;
+    let mut points = Vec::new();
+    for j in 0..=n {
+        for i in 0..=n {
+            let p = Point::new([i as f64 / n as f64, j as f64 / n as f64]);
+            points.push(p.map_err(|e| e.to_string())?);
+        }
+    }
+    let mut cells = Vec::new();
+    for j in 0..n {
+        for i in 0..n {
+            let a = j * (n + 1) + i;
+            cells.push([a, a + 1, a + n + 2]);
+            cells.push([a, a + n + 2, a + n + 1]);
+        }
+    }
+    let triangles = TriangleMesh::new(points, cells).map_err(|e| e.to_string())?;
+    let root = AdaptiveMesh::from_simplex(&triangles, AdaptationLimits::new())
+        .map_err(|e| e.to_string())?;
+    let near = |radius: f64| move |c: [f64; 2]| RealScalar::hypot(c[0], c[1]) < radius;
+    let once = adapt(&root, near(0.3), &[])?.mesh;
+    let source = adapt(&once, near(0.15), &[])?.mesh;
+    // “Refinement and coarsening” coarsens every parent of depth-2 cells (families whose children are all active).
+    let mut coarsen = Vec::new();
+    for &id in source.active_cells() {
+        if mixed && source.level(id).map_err(|e| e.to_string())? == 2 {
+            coarsen.extend(source.parent(id).map_err(|e| e.to_string())?);
+        }
+    }
+    coarsen.sort_unstable();
+    coarsen.dedup();
+    let next = adapt(&source, |c| c[0] + c[1] > 1.6, &coarsen)?;
+    Ok((source, next))
+}
+
+/// P1 field integral ∫ u_h = Σ_K |K| (u_1 + u_2 + u_3) / 3 (exact on triangles).
+pub(crate) fn p1_integral(space: &AmrSpace<f64, 2>, values: &[f64]) -> Result<f64, String> {
+    let mut sum = 0.0;
+    for cell in 0..space.mesh().cell_count() {
+        let nodes = space.cell_dofs(cell).map_err(|e| e.to_string())?;
+        let corners: f64 = nodes.iter().map(|&i| values[i]).sum();
+        sum += corners * space.mesh().cell_measure(cell).map_err(|e| e.to_string())? / 3.0;
+    }
+    Ok(sum)
+}
+
+/// Caller-supplied solver (`AmrMassSolve`): solve consistent mass equation M z = C u with CG from a zero initial guess.
+pub(crate) fn mass_solve(
+    mass: &AmrMap<f64>,
+    rhs: &[f64],
+    z: &mut [f64],
+    context: &mut SolveContext<'_, '_>,
+) -> Result<(), SciOxideError> {
+    let solver = CgSolver::new(
+        ResidualTolerance::new(1e-14, 1e-14)?,
+        Budget::try_from(500)?,
+    );
+    let rhs = Vector::from_vec(rhs.to_vec());
+    let mut x = Vector::zeros(rhs.len())?;
+    let mut work = IterativeWorkspace::new();
+    let unpreconditioned = Preconditioning::None;
+    let report = solver.solve_into(
+        mass,
+        &rhs,
+        unpreconditioned,
+        x.view_mut(),
+        &mut work,
+        &mut *context,
+    )?;
+    if !report.termination().is_success() {
+        return Err(SciOxideError::external("Mass-equation CG did not converge"));
+    }
+    z.copy_from_slice(x.as_slice());
+    Ok(())
+}
+```
+
+## Conservative cell-average transfer
+
+`AmrCellTransfer` transfers cellwise constant fields (cell averages), preserving quantity $\sum_K u_K\vert K\vert$.
+It assigns $u_{K_j}=u_K\,\vert K\vert/\sum_j\vert K_j\vert$ to children $K_j$ of refined parent $K$, $u_K=\sum_i u_{K_i}\vert K_i\vert/\vert K\vert$ to parent $K$ of coarsened children $K_i$, and copies unchanged cells.
+Volumes $\vert K\vert$ are computed from rounded vertex coordinates, so the sum of child volumes can differ from the parent volume by rounding.
+The weights have this form so the total quantity remains conserved within rounding even then.
+Preparation returns `InvalidInput` if the correspondence contains `Created` or `Removed` cells.
+
+`AmrCellTransfer::new(source, destination, topology, options)` prepares weights, using only limits and execution policy from `options`.
+`build(…, scope)` performs the same preparation as one solve-scoped operation, respecting that scope's evaluation limits and cancellation.
+All adaptive cell families and periodic cells are supported.
+`apply_into(input, output, scratch, execution)` writes into caller-owned storage, while `field(destination, input)` allocates and returns the new revision's field.
+An old-revision field, shape mismatch, or nonfinite value returns an error without changing output.
+`operator` returns the weights' `AmrMap`, `destination` the new revision token, and `preparation_storage_bound` the cumulative allocation limit admitted during preparation.
+`pullback_into` applies the fixed-geometry transfer adjoint to a cotangent vector.
+
+## Carrying boundary labels forward
+
+`AmrBoundaryTags::transfer(source, destination, map)` transfers labels to the new revision using face ancestry and descendant relationships.
+Coarsening faces with different labels into one face, or leaving a new exterior face unlabeled, gives `InvalidInput`.
+`transfer_with_options` takes limits `AmrLimits`, and `view` borrows labels as a face field.
+
+The next cell transfers the cell field $u_K=f(x_K,y_K)$ ($(x_K,y_K)$ is the centroid) to the new revision with `AmrCellTransfer`, comparing quantity $\sum_K u_K\vert K\vert$ before and after.
+It also transfers label 0 assigned to all exterior faces using `AmrBoundaryTags::transfer` and compares exterior-face and labeled-face counts.
+The input selects the revision change type.
+
+```rust
+//| id: pde-amr-cell-transfer-conservation
+//| ref: pde-amr-cell-transfer-conservation
+//| title: "Check quantity conservation under cell-average transfer and preservation of boundary labels"
+//| run: reactive
+//| uses: [pde-amr-transfer-model]
+//| crates: [scioxide-core, scioxide-spatial, scioxide-pde]
+//| inputs:
+//|   change: {"type":"select","label":"Revision change","options":["Refinement only","Refinement and coarsening"],"value":"Refinement only"}
+//| cases:
+//|   - {"id":"mixed","label":"Refinement and coarsening","description":"Coarsened parents receive summed child quantities, preserving the total within rounding.","inputs":{"change":"Refinement and coarsening"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"cell-amount","path":"/rows/0/3","range":{"min":-1e-14,"max":1e-14}}
+//|   - case: mixed
+//|     expect:
+//|       - {"artifact":"cell-amount","path":"/rows/0/3","range":{"min":-1e-14,"max":1e-14}}
+use scioxide_pde::{AmrBoundaryTags, AmrCellTransfer, AmrOptions};
+use scioxide_spatial::{AdaptiveMesh, Cell, Field};
+
+let (source, next) = versions(change == "Refinement and coarsening")?;
+let target = &next.mesh;
+// Cell field u_K = f(centroid) and quantity Σ u_K |K|.
+let amount = |mesh: &AdaptiveMesh<f64, 2>, values: &[f64]| -> Result<f64, String> {
+    let mut sum = 0.0;
+    for (cell, value) in values.iter().enumerate() {
+        sum += value * mesh.cell_measure(cell).map_err(|e| e.to_string())?;
+    }
+    Ok(sum)
+};
+let mut averages = Vec::new();
+for cell in 0..source.cell_count() {
+    averages.push(f(centroid(&source, cell)?));
+}
+let field = Field::<f64, Cell, 2>::new(&source, averages).map_err(|e| e.to_string())?;
+let transfer = AmrCellTransfer::new(&source, target, &next.map, AmrOptions::new())
+    .map_err(|e| e.to_string())?;
+let moved = transfer
+    .field(target, field.view())
+    .map_err(|e| e.to_string())?;
+let before = amount(&source, field.values())?;
+let after = amount(target, moved.values())?;
+
+// Assign label 0 to every exterior face and transfer to the new revision.
+let entries: Vec<(usize, u32)> = source
+    .interfaces()
+    .iter()
+    .filter(|interface| interface.right.is_none())
+    .map(|interface| (interface.left_face, 0))
+    .collect();
+let tags = AmrBoundaryTags::new(&source, &entries).map_err(|e| e.to_string())?;
+let moved_tags = tags
+    .transfer(&source, target, &next.map)
+    .map_err(|e| e.to_string())?;
+let labelled = |values: &[Option<u32>]| values.iter().filter(|tag| tag.is_some()).count();
+let exterior = |mesh: &AdaptiveMesh<f64, 2>| {
+    mesh.interfaces()
+        .iter()
+        .filter(|interface| interface.right.is_none())
+        .count()
+};
+
+let fixed12 = serde_json::json!({ "fractionDigits": 12 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Active cells (previous → new) [count]" },
+    { "key": "1", "label": "Previous revision Σ u_K |K| [-]", "type": "number", "format": fixed12 },
+    { "key": "2", "label": "New revision Σ u_K |K| [-]", "type": "number", "format": fixed12 },
+    { "key": "3", "label": "Relative difference [-]", "type": "number", "format": sci2 }
+]);
+let cells = format!("{} → {}", source.cell_count(), target.cell_count());
+let rows = vec![(cells, before, after, (after - before) / before)];
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "cell-amount" })
+);
+let columns = serde_json::json!([
+    { "key": "0", "label": "revision" },
+    { "key": "1", "label": "Exterior faces [count]", "type": "integer" },
+    { "key": "2", "label": "Labeled faces [count]", "type": "integer" }
+]);
+let rows = vec![
+    ("Previous revision", exterior(&source), labelled(tags.view().values())),
+    (
+        "New revision",
+        exterior(target),
+        labelled(moved_tags.view().values()),
+    ),
+];
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "labels" })
+);
+```
+
+With “Refinement only”, each of the two upper-right cells splits into four children, increasing active cells from 44 to 50.
+The quantity is $1.308358383929$ before and after, with relative difference $1.7\times10^{-16}$.
+With “Refinement and coarsening”, restoring two corner families to parents offsets upper-right refinement, leaving 44 active cells, but the quantity's relative difference remains $1.7\times10^{-16}$.
+Coarsened parent values are summed child quantities divided by parent volume, preserving the quantity within rounding.
+Labels reach every exterior face even when refinement increases exterior faces from 20 to 22.
+
+## Nodal interpolation and L² projection
+
+`AmrNodalTransfer::new(source, destination, map)` prepares nodal transfer between two `AmrSpace` spaces of the same degree.
+Different degrees give `InvalidInput`.
+Provide limits with `with_options(…, limits)` and scoped preparation with `build(…, limits, scope)`.
+For fixed degree and constraint extent, preparation takes $O(n\log n)$ work and $O(n)$ memory in the previous and new revision cell counts $n$.
+Interpolation and projection verify that the full-node input vector satisfies the previous space's constraints using `validate_field`, returning `InvalidInput` otherwise.
+
+Under refinement only, the old space is contained in the new (nested), so interpolation evaluating the old function at new nodes transfers it unchanged.
+`interpolation` returns this map, and `interpolate_into` applies it.
+With coarsening, the old function need not belong to the new space, so interpolation is unavailable (`interpolation` is `None` and `interpolate_into` returns `InvalidInput`).
+
+Use $L^2$ projection in the general case.
+For independent basis functions $\psi_i$ of the new space, projection $z_h$ satisfies
+
+$$
+\int_\Omega z_h\,\psi_i=\int_\Omega u_h\,\psi_i\quad(\text{all } i),\qquad
+M\mathbf{z}=C\mathbf{u}
+$$
+
+
+$M$ is the new space's consistent mass matrix ($P^{\mathsf T}M_{\text{full}}P$ reduced by constraints), and $C$ is the cross-mass matrix from old full nodes to new independent nodes.
+Each entry of $C$ is integrated on the finer of two ancestor-related cells.
+Both functions are polynomial on the finer cell, so sufficient quadrature degree computes $C$ exactly.
+The new space contains constants (constraint weights sum to 1), so taking the basis sum $\sum_i\psi_i=1$ as test function gives $\int_\Omega z_h=\int_\Omega u_h$.
+Thus $L^2$ projection preserves the field integral within the linear-system residual.
+
+`mass` returns $M$ (without row-sum lumping), and `cross_mass` returns $C$.
+`project_into(input, tolerance, solve, output, workspace, scope)` constructs $C\mathbf{u}$ and asks caller solver `solve` to solve $M\mathbf{z}=C\mathbf{u}$ from a zero initial guess.
+`solve` has type `AmrMassSolve`: a function receiving the mass operator, right-hand side, solution storage, and solve context, and returning solver failures as errors.
+It recomputes original-equation residual $\Vert M\mathbf{z}-C\mathbf{u}\Vert$ for the returned solution; if this exceeds the `tolerance` threshold, it returns `InvalidInput` without changing output.
+If the residual is within the threshold, it writes $P\mathbf{z}$ to full-node output and returns `residual_norm` and `rhs_norm` in `AmrProjectionReport`.
+This is an algebraic residual, not an upper bound on continuous-field error.
+Projection does not impose Dirichlet values; impose required boundary values during the next assembly.
+`interpolate_pullback_into` applies the fixed-geometry interpolation adjoint to cotangent $\bar{\mathbf{z}}$ and returns the result in old-revision full-node coordinates.
+`project_pullback_into` solves $M\boldsymbol{\mu}=P^{\mathsf T}\bar{\mathbf{z}}$ with caller-supplied solver at fixed geometry and returns $C^{\mathsf T}\boldsymbol{\mu}$.
+Allocate workspace `AmrTransferWorkspace` once using `workspace()` and share it across interpolation, projection, and both adjoints.
+Its size does not change after construction.
+The `solve` side owns storage for the projection's linear solver.
+[Differentiating field transfer](oxref:pde-transfer-derivatives) covers adjoints for gradients across refinement.
+
+The next cell samples $f$ at independent nodes and extends it through constraints to a full-node P1 field $u_h$, then transfers it to the new revision.
+$L^2$ projection solves the mass equation using the definitions block's `mass_solve` (CG from zero, absolute and relative tolerances both $10^{-14}$), with absolute and relative residual thresholds both $10^{-12}$.
+For refinement only it also interpolates, finding the maximum difference between results.
+The table shows integrals $\int_\Omega u_h$ before and after, relative differences, and projection relative residual $\Vert M\mathbf{z}-C\mathbf{u}\Vert/\Vert C\mathbf{u}\Vert$.
+
+```rust
+//| id: pde-amr-nodal-projection
+//| ref: pde-amr-nodal-projection
+//| title: "Transfer nodal fields with L² projection and interpolation, checking integral conservation and agreement"
+//| run: reactive
+//| uses: [pde-amr-transfer-model]
+//| crates: [scioxide-core, scioxide-spatial, scioxide-pde, scioxide-linalg]
+//| inputs:
+//|   change: {"type":"select","label":"Revision change","options":["Refinement only","Refinement and coarsening"],"value":"Refinement only"}
+//| cases:
+//|   - {"id":"mixed","label":"Refinement and coarsening","description":"Coarsening makes interpolation unavailable; only L² projection preserves the integral.","inputs":{"change":"Refinement and coarsening"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"nodal","path":"/rows/0/3","range":{"min":-1e-12,"max":1e-12}}
+//|       - {"artifact":"nodal","path":"/rows/0/4","range":{"min":0,"max":1e-12}}
+//|       - {"artifact":"nodal","path":"/rows/1/3","range":{"min":-1e-14,"max":1e-14}}
+//|   - case: mixed
+//|     expect:
+//|       - {"artifact":"nodal","path":"/rows/0/3","range":{"min":-1e-12,"max":1e-12}}
+//|       - {"artifact":"nodal","path":"/rows/1/2","equals":null}
+use scioxide_core::{ExecutionContext, LinearOperator, ResidualTolerance};
+use scioxide_pde::{AmrNodalTransfer, AmrOrder, AmrSpace};
+
+let (source, next) = versions(change == "Refinement and coarsening")?;
+let from = AmrSpace::new(&source, AmrOrder::P1).map_err(|e| e.to_string())?;
+let to = AmrSpace::new(&next.mesh, AmrOrder::P1).map_err(|e| e.to_string())?;
+// P1 field u: sample f at independent nodes and extend to all nodes with constraints P.
+let mut independent = Vec::new();
+for &node in from.independent_nodes() {
+    independent.push(f(from.node_point(node).map_err(|e| e.to_string())?));
+}
+let mut u = vec![0.0; from.full_dofs()];
+let mut scratch = u.clone();
+from.constraints()
+    .apply_into(&independent, &mut u, &mut scratch)
+    .map_err(|e| e.to_string())?;
+
+let transfer = AmrNodalTransfer::new(&from, &to, &next.map).map_err(|e| e.to_string())?;
+let mut workspace = transfer.workspace::<f64>().map_err(|e| e.to_string())?;
+let mut projected = vec![0.0; to.full_dofs()];
+let tolerance = ResidualTolerance::new(1e-12, 1e-12).map_err(|e| e.to_string())?;
+let projection = transfer
+    .project_into(
+        &u,
+        tolerance,
+        &mut mass_solve,
+        &mut projected,
+        &mut workspace,
+        ExecutionContext::sequential(),
+    )
+    .map_err(|e| e.to_string())?;
+// Interpolation is available only between refinement-only revisions.
+let mut interpolated = None;
+if transfer.interpolation().is_some() {
+    let mut values = vec![0.0; to.full_dofs()];
+    transfer
+        .interpolate_into(
+            &u,
+            &mut values,
+            &mut workspace,
+            ExecutionContext::sequential(),
+        )
+        .map_err(|e| e.to_string())?;
+    interpolated = Some(values);
+}
+
+let before = p1_integral(&from, &u)?;
+let after = p1_integral(&to, &projected)?;
+let interpolated_after = interpolated
+    .as_ref()
+    .map(|v| p1_integral(&to, v))
+    .transpose()?;
+let gap = interpolated.as_ref().map(|v| {
+    v.iter()
+        .zip(&projected)
+        .fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()))
+});
+let fixed12 = serde_json::json!({ "fractionDigits": 12 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Transfer" },
+    { "key": "1", "label": "Previous revision ∫u_h [-]", "type": "number", "format": fixed12 },
+    { "key": "2", "label": "New revision ∫ [-]", "type": "number", "format": fixed12, "nullText": "Unavailable" },
+    { "key": "3", "label": "Relative difference [-]", "type": "number", "format": sci2, "nullText": "—" },
+    { "key": "4", "label": "Relative residual [-]", "type": "number", "format": sci2, "nullText": "—" },
+    { "key": "5", "label": "Maximum difference from projection [-]", "type": "number", "format": sci2, "nullText": "—" }
+]);
+let residual = projection.residual_norm() / projection.rhs_norm();
+let rows = vec![
+    (
+        "L² projection",
+        before,
+        Some(after),
+        Some((after - before) / before),
+        Some(residual),
+        None,
+    ),
+    (
+        "Interpolant",
+        before,
+        interpolated_after,
+        interpolated_after.map(|value| (value - before) / before),
+        None,
+        gap,
+    ),
+];
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "nodal" })
+);
+```
+
+With “Refinement only”, projection's relative integral difference is $-2.6\times10^{-15}$ and relative residual is $1.0\times10^{-14}$.
+Interpolation's relative integral difference is $-3.5\times10^{-16}$, and the maximum interpolation–projection difference is $5.8\times10^{-14}$.
+In nested spaces the old function belongs to the new space, so projection and interpolation return the same function, differing only by the CG tolerance scale.
+With “Refinement and coarsening”, interpolation is unavailable and its table row reads “Unavailable”.
+Projection's relative integral difference is 0 within rounding and relative residual is $3.3\times10^{-14}$, so projection preserves the integral even on a coarsened revision.
+The integral is preserved, not nodal values; fine variation is lost in coarsened regions.
+
+## Summary
+
+Transferring cell-average fields with `AmrCellTransfer` preserves quantity $\sum_K u_K\vert K\vert$ within rounding under both refinement and coarsening.
+For nodal fields, refinement-only interpolation transfers the function unchanged, while $L^2$ projection preserves the integral within linear-system residuals when coarsening occurs.
+Projection accuracy depends on the caller's mass solver and residual threshold; the residual in `AmrProjectionReport` checks this but does not bound continuous error.
+Projection does not impose Dirichlet values; apply boundary conditions at the next assembly.
+Carry exterior-face labels forward with `AmrBoundaryTags::transfer`; coarsening that merges different labels is rejected.
+
+## Further reading
+
+- [Error-estimator-based adaptive refinement](../adaptive-mesh-refinement/): examine the estimators, marking, and hanging-node constraints preceding transfer.
+- [Corner singularities and adaptive refinement on an L-shaped domain](../../examples/l-shaped-amr/): examine a refinement cycle using the interpolated previous solution as CG's initial guess and its convergence rate.
+- [Discrete adjoints for time-dependent problems](../transient-adjoints/): examine how transfer-map adjoints combine in gradients across refinement.
+- [Adaptive refinement API](../../api/adaptive-refinement/): inspect specifications of all transfer items.

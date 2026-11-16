@@ -1,0 +1,291 @@
+---
+title: NSGA-II による効率的フロンティアの近似
+description: 平均分散の二目的を NSGA-II で解き、アーカイブの点を閉形式の効率的フロンティアと比べて、前線への近さと広がりを読む。
+sidebar:
+  order: 472
+---
+
+[平均分散モデルの効率的フロンティア](../efficient-frontier/)では、目標収益を固定して QP を解き、効率的フロンティアを一点ずつ求めた。
+このページでは同じ交換条件を、分散と期待収益の二目的を同時に小さくする多目的最適化として扱う。
+資産、期待収益 $\mu=(0.03,0.07,0.11)$、標準偏差 $\sigma=(0.08,0.14,0.20)$、共通相関 $\rho$ は前のページと同じ仮想値で、収益率と標準偏差は年率で表す。
+前線の基準には前のページで QP と $10^{-17}$ 程度まで一致した、等式を消去した閉形式を使う。
+
+## 二目的と非劣解
+
+配分 $w$ の二目的を $(w^\mathsf T\Sigma w,-\mu^\mathsf Tw)$ とし、両方を最小化する。
+ある候補が別の候補より、どちらの目的でも悪くなく、少なくとも一方で良いとき、前者は後者を支配するという。
+どの候補にも支配されない候補を非劣（Pareto 最適）と呼び、非劣な配分の目的値の集合を Pareto 前線と呼ぶ。
+空売りを許さない平均分散問題では、Pareto 前線は効率的フロンティアと一致する。
+
+NSGA-II（non-dominated sorting genetic algorithm II）は、候補の集団を交叉と突然変異で更新し、親と子を合わせた集団を非劣の順位で並べて次の集団を選ぶ。
+同じ順位の中では、目的空間で隣の候補との間隔を表す混雑距離が大きい候補を優先し、前線の上に候補を広げる。
+SciOxide の `Nsga2` は交叉に模擬二進交叉（SBX、確率 0.9、分布指数 15）、突然変異に多項式突然変異（確率 $1/n_v$、分布指数 20）を既定で使う。
+ここで $n_v$ は変数の数である。
+
+`Nsga2Result::archive` は、探索中に見つけた実行可能で互いに非劣な点を、容量を上限に保つアーカイブである。
+容量を超えると、混雑距離が最小の点を取り除き、前線の上に広がった点を残す。
+アーカイブは前線の有限な近似で、Pareto 最適な点を含むことは保証されない。
+予定した世代を終えると終了理由は `SearchBudgetCompleted` になり、NSGA-II が成功を返すことはない。
+ここでは集団 60、アーカイブの容量 100、80 世代を使い、アーカイブの点を評価する。
+一世代の目的評価は集団の大きさと同じ 60 回で、非劣の順位付けは集団の大きさの二乗に比例する手間とメモリを使う。
+
+## 単体の変数表示
+
+NSGA-II は箱 $[0,1]^{n-1}$ の上を探索するので、配分を箱の点で表す。
+二資産では $w=(1-u,u)$、三資産では $w=(1-u,u(1-v),uv)$ とし、$u,v\in[0,1]$ を変数にする。
+この変数表示で、全候補が重みの和 1 と非負性を満たすので、制約を NSGA-II に渡さなくてよい。
+境界で複数のパラメータが同じ配分を表す場合はあるが（$u=0$ では $v$ が配分に効かない）、実行可能な配分を除くことはない。
+
+次の定義は共分散行列、変数表示、平均と分散、空売りなしの閉形式、`Nsga2` に渡す二目的を Rust の項目にまとめる。
+二目的は `SampledObjective` の `sample_into` で書き、決定論的な目的なので `NoiseModel::Deterministic` を返して標本のシードは使わない。
+
+```rust
+//| id: optimize-efficient-frontier-nsga2-model
+//| kind: definitions
+//| title: 二目的の平均分散モデルと閉形式の前線
+//| crates: [scioxide-core, scioxide-optimize]
+use scioxide_core::SciOxideError;
+use scioxide_optimize::{NoiseModel, SampledObjective};
+pub(crate) struct Portfolio {
+    pub(crate) n: usize,
+    pub(crate) covariance: Vec<f64>,
+}
+impl Portfolio {
+    // 標準偏差 (0.08, 0.14, 0.20) と共通相関 ρ から Σᵢⱼ = σᵢσⱼ(ρ + (1 − ρ)δᵢⱼ) を作る。
+    pub(crate) fn new(n: usize, correlation: f64) -> Self {
+        let sd = [0.08, 0.14, 0.20];
+        let covariance = (0..n)
+            .flat_map(|i| {
+                (0..n).map(move |j| sd[i] * sd[j] * if i == j { 1.0 } else { correlation })
+            })
+            .collect();
+        Self { n, covariance }
+    }
+    // 単体の変数表示: 二資産は (1 − u, u)、三資産は (1 − u, u(1 − v), uv)。
+    pub(crate) fn weights(&self, x: &[f64]) -> Vec<f64> {
+        if self.n == 2 {
+            vec![1.0 - x[0], x[0]]
+        } else {
+            vec![1.0 - x[0], x[0] * (1.0 - x[1]), x[0] * x[1]]
+        }
+    }
+    pub(crate) fn variance(&self, w: &[f64]) -> f64 {
+        (0..self.n)
+            .map(|i| {
+                (0..self.n)
+                    .map(|j| w[i] * self.covariance[i * self.n + j] * w[j])
+                    .sum::<f64>()
+            })
+            .sum()
+    }
+    // 期待収益 μ = (0.03, 0.07, 0.11)。
+    pub(crate) fn mean(&self, w: &[f64]) -> f64 {
+        w.iter()
+            .enumerate()
+            .map(|(i, v)| (0.03 + 0.04 * i as f64) * v)
+            .sum()
+    }
+    // 独立検算: 等式を消去した一変数の二次式の最小値（空売りなし）。
+    // 三資産は w = b + t d、b = (1 − β, β, 0)、d = (1, −2, 1) で、頂点を区間へ射影する。
+    pub(crate) fn minimum_variance(&self, r: f64) -> f64 {
+        let b = (r - 0.03) / 0.04;
+        if self.n == 2 {
+            return self.variance(&[1.0 - b, b]);
+        }
+        let base = [1.0 - b, b, 0.0];
+        let direction = [1.0, -2.0, 1.0];
+        let linear: f64 = (0..3)
+            .map(|i| {
+                (0..3)
+                    .map(|j| direction[i] * self.covariance[i * 3 + j] * base[j])
+                    .sum::<f64>()
+            })
+            .sum();
+        let t = (-linear / self.variance(&direction)).clamp((b - 1.0).max(0.0), b / 2.0);
+        let w: Vec<_> = (0..3).map(|i| base[i] + t * direction[i]).collect();
+        self.variance(&w)
+    }
+}
+// NSGA-II に渡す二目的 (分散, −期待収益)。
+impl SampledObjective<f64> for Portfolio {
+    fn dimension(&self) -> usize {
+        self.n - 1
+    }
+    fn objectives(&self) -> usize {
+        2
+    }
+    fn noise_model(&self) -> NoiseModel {
+        NoiseModel::Deterministic
+    }
+    fn sample_into(&self, x: &[f64], _: u64, out: &mut [f64]) -> Result<(), SciOxideError> {
+        let w = self.weights(x);
+        out[0] = self.variance(&w);
+        out[1] = -self.mean(&w);
+        Ok(())
+    }
+}
+```
+
+## アーカイブと前線の比較
+
+次のセルは NSGA-II を実行し、アーカイブの点を閉形式の効率的フロンティアと比べる。
+入力は資産数、共通相関、乱数のシードである。
+各点の分散から、同じ期待収益での最小分散（空売りなしの閉形式）を引いた差を前線への近さとし、収益の範囲を前線上の広がりとする。
+この差は同じ期待収益での分散の差で、目的空間のユークリッド距離ではない。
+出力はアーカイブの点と前線の図、近さと広がりの表、探索の判定である。
+図の前線は閉形式の最小分散点から最大の収益までを 31 点で描く。
+
+```rust
+//| id: optimize-efficient-frontier-nsga2
+//| ref: optimize-efficient-frontier-nsga2
+//| title: NSGA-II のアーカイブを閉形式の前線と比べる
+//| run: button
+//| timeoutMs: 120000
+//| uses: [optimize-efficient-frontier-nsga2-model]
+//| crates: [scioxide-core, scioxide-optimize]
+//| inputs:
+//|   assets: {"type":"range","label":"資産数 n [資産]","min":2,"max":3,"step":1,"value":3}
+//|   correlation: {"type":"range","label":"共通相関 ρ [-]","min":-0.4,"max":0.8,"step":0.1,"value":0.2}
+//|   seed: {"type":"range","label":"乱数のシード [-]","min":1,"max":100,"step":1,"value":7}
+//| cases:
+//|   - {"id":"two-assets","label":"二資産","description":"変数がそのまま収益を決めるので、全ての点が前線上にあり、最小分散との差は 10⁻¹⁸ 程度の丸め誤差になる。","inputs":{"assets":2}}
+//|   - {"id":"negative-correlation","label":"共通相関 −0.4","description":"前線が左へ曲がり、最小分散点は収益 0.0562 に移る。アーカイブの収益の最小も 0.0562 になる。","inputs":{"correlation":-0.4}}
+//|   - {"id":"seed-42","label":"シード 42","description":"シードを変えても、差の最大と収益の範囲は同じ程度にとどまる。","inputs":{"seed":42}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"archive","path":"/rows/0/0","range":{"min":10,"max":100}}
+//|       - {"artifact":"archive","path":"/rows/0/3","range":{"min":0,"max":1e-4}}
+//|       - {"artifact":"archive","path":"/rows/0/4","range":{"min":0,"max":2e-3}}
+//|       - {"artifact":"archive","path":"/rows/0/6","equals":"SearchBudgetCompleted"}
+//|       - {"path":"/outputs/2/state","equals":"partial"}
+//|   - case: two-assets
+//|     expect:
+//|       - {"artifact":"archive","path":"/rows/0/4","range":{"min":-1e-12,"max":1e-12}}
+//|   - case: negative-correlation
+//|     expect:
+//|       - {"artifact":"archive","path":"/rows/0/1","range":{"min":0.0555,"max":0.06}}
+//|       - {"artifact":"archive","path":"/rows/0/4","range":{"min":0,"max":3e-3}}
+//|   - case: seed-42
+//|     expect:
+//|       - {"artifact":"archive","path":"/rows/0/4","range":{"min":0,"max":2e-3}}
+use scioxide_core::{Budget, RealScalar};
+use scioxide_optimize::{FiniteBounds, Nsga2, Nsga2Options, Nsga2Problem};
+let n = assets as usize;
+let model = Portfolio::new(n, correlation);
+// 閉形式の最小分散集合を 31 点で求め、最小分散点より上の枝を前線として描く。
+let curve: Vec<_> = (0..=30)
+    .map(|k| {
+        let r = 0.03 + 0.04 * (n - 1) as f64 * k as f64 / 30.0;
+        [RealScalar::sqrt(model.minimum_variance(r)), r]
+    })
+    .collect();
+let lowest = curve
+    .iter()
+    .copied()
+    .min_by(|a, b| a[0].total_cmp(&b[0]))
+    .ok_or("前線が空")?;
+let frontier: Vec<_> = curve.iter().filter(|p| p[1] >= lowest[1]).copied().collect();
+let bounds = FiniteBounds::new(vec![(0.0, 1.0); n - 1]).map_err(|e| e.to_string())?;
+let problem = Nsga2Problem::new(&model, &bounds).map_err(|e| e.to_string())?;
+let options = Nsga2Options::new(60, 100, Budget::try_from(80_usize).map_err(|e| e.to_string())?)
+    .with_seed(seed as u64);
+let result = Nsga2::new(options)
+    .map_err(|e| e.to_string())?
+    .solve(&problem)
+    .map_err(|e| e.to_string())?;
+// アーカイブの点の目的 (分散, −期待収益) を (分散, 期待収益) に直す。
+let entries: Vec<_> = result
+    .archive()
+    .entries()
+    .map(|p| (p.objectives()[0], -p.objectives()[1]))
+    .collect();
+let points: Vec<_> = entries
+    .iter()
+    .map(|&(v, r)| [RealScalar::sqrt(v), r])
+    .collect();
+emit_chart!(serde_json::json!({
+    "kind": "xy",
+    "xLabel": "収益の標準偏差 [年率]",
+    "yLabel": "期待収益 [年率]",
+    "xMin": 0,
+    "xMax": 0.22,
+    "yMin": 0.02,
+    "yMax": 0.12,
+    "dataZoom": true,
+    "tooltip": true,
+    "layers": [
+        {
+            "id": "frontier",
+            "kind": "line",
+            "name": "効率的フロンティア（閉形式）",
+            "points": frontier,
+            "style": { "lineType": "dashed" }
+        },
+        { "id": "archive", "kind": "scatter", "name": "NSGA-II のアーカイブ", "points": points }
+    ]
+}));
+// 独立検算: 各点の分散を、同じ収益での最小分散（空売りなしの閉形式）と比べる。
+let mut gaps: Vec<_> = entries
+    .iter()
+    .map(|&(v, r)| v - model.minimum_variance(r))
+    .collect();
+gaps.sort_by(f64::total_cmp);
+let returns: Vec<_> = entries.iter().map(|e| e.1).collect();
+let fixed4 = serde_json::json!({ "fractionDigits": 4 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "アーカイブの点 [個]", "type": "integer" },
+    { "key": "1", "label": "収益の最小 [年率]", "type": "number", "format": fixed4 },
+    { "key": "2", "label": "収益の最大 [年率]", "type": "number", "format": fixed4 },
+    { "key": "3", "label": "最小分散との差の中央値 [年率²]", "type": "number", "format": sci2 },
+    { "key": "4", "label": "最小分散との差の最大 [年率²]", "type": "number", "format": sci2 },
+    { "key": "5", "label": "世代 [回]", "type": "integer" },
+    { "key": "6", "label": "終了理由" }
+]);
+let summary = (
+    gaps.len(),
+    returns.iter().copied().fold(f64::INFINITY, f64::min),
+    returns.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+    gaps[gaps.len() / 2],
+    gaps[gaps.len() - 1],
+    result.generations(),
+    result.termination().to_string(),
+);
+emit_table_with_columns!(
+    columns,
+    vec![summary.clone()],
+    metadata = serde_json::json!({ "id": "archive" })
+);
+emit_outcome!(
+    Outcome::partial("NSGA-II は予定した世代を終えたが、前線への収束は主張しない")
+        .explanation("アーカイブは前線の有限な近似で、近さと広がりを閉形式の前線と比べて判断する。")
+        .status(summary.6)
+        .diagnostic("最小分散との差の最大", summary.4, None)
+        .diagnostic("収益の範囲", summary.2 - summary.1, None)
+);
+```
+
+既定の三資産、$\rho=0.2$、シード 7 では、アーカイブは容量いっぱいの 100 点を持ち、収益 0.0412〜0.110 に広がる。
+閉形式の最小分散点の収益は 0.0412（図の 31 点の格子では 0.0407）なので、アーカイブは効率的フロンティアのほぼ全体を覆う。
+同じ収益の最小分散との差は中央値 $8.7\times10^{-6}$、最大 $2.0\times10^{-4}$ である。
+シードを 42 にしても、差の最大は $2.9\times10^{-4}$、収益の範囲は 0.0412〜0.110 で、同じ程度にとどまる。
+QP の各点は凸問題の最適解であり、NSGA-II の点は有限の世代数で集団を探索した結果なので、この差が残る。
+
+二資産では変数表示の一変数がそのまま収益を決めるので、各点は自動的に前線上の配分になり、差は $10^{-18}$ 程度の丸め誤差まで下がる。
+この場合に NSGA-II の質を決めるのは前線上の広がりだけである。
+相関を $-0.4$ にすると閉形式の最小分散点は収益 0.0562 に移り、アーカイブの収益の最小も 0.0562 になる。
+差の最大はシードや相関で変わるので、近さは中央値と最大の両方で、広がりは収益の範囲で読む。
+
+## まとめ
+
+平均分散の交換条件は分散と負の期待収益の二目的として NSGA-II に渡せ、空売りなしの単体は変数表示で箱 $[0,1]^{n-1}$ に写せる。
+NSGA-II の結果はアーカイブの点で読み、同じ収益の最小分散との差で前線への近さを、収益の範囲で前線上の広がりを評価する。
+終了理由 `SearchBudgetCompleted` は予定した世代を終えたことだけを表すので、判定は `partial` にして近さと広がりの数値で結論を出す。
+閉形式がない規模では、目標収益を固定した QP の前線を基準にして同じ比較を行う。
+
+## 次に読むページ
+
+- [多目的最適化と NSGA-II](../../algorithms/multiobjective-and-stochastic/)：支配、混雑距離、アーカイブの扱いを確かめる。
+- [確率的勾配降下法と確率的信頼領域法](../../algorithms/stochastic-gradient-and-trust-region/)：`SampledObjective` で標本化した目的の仕様を確かめる。
+- [平均分散モデルの効率的フロンティア](../efficient-frontier/)：同じ前線を QP で求め、空売りを許す Markowitz の閉形式と比べる。

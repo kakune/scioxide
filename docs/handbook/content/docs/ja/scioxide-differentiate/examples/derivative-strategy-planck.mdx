@@ -1,0 +1,513 @@
+---
+title: 解析微分・自動微分・差分を方針で切り替える
+description: Planck の放射の式の温度微分を DerivativeStrategy で解析式・scioxide-ad の二重数・差分から選び、プロバイダーの有無による切り替えと候補が尽きたときのエラー、波長による差分の相対誤差の変化、Wien の変位則の極大での波長微分を確かめる。
+sidebar:
+  order: 430
+references:
+  differentiate-planck-strategy-candidates: "方針と候補"
+---
+
+Newton 法、準 Newton 法、陰的な常微分方程式の解法は、反復のたびに導関数を必要とする。
+導関数のプロバイダーには手で導いた解析式、自動微分、差分の三つがある。
+解析式があればそれを使い、なければ自動微分、それもなければ差分というように、優先順位を付けて切り替えたいことが多い。
+`scioxide-differentiate` の `DerivativeStrategy` はこの順序を値で表し、呼び出し側が渡す関数に候補を順に尋ねる。
+この例題では Planck の放射の式の温度微分を題材に、プロバイダーの有無による切り替え、候補が尽きたときのエラー、差分の相対誤差が波長でどう変わるかを確かめる。
+最後に、波長についての導関数が 0 になる点として Wien の変位則を検算する。
+
+## Planck の式と導関数
+
+波長 $\lambda$、温度 $T$ の黒体の分光放射輝度 $B_\lambda$ [W·sr⁻¹·m⁻³] は Planck の式で与えられる。
+
+$$
+B_\lambda(T) = \frac{2 h c^2}{\lambda^5} \frac{1}{e^{x} - 1}, \qquad x = \frac{h c}{\lambda k_B T}.
+$$
+
+$h = 6.62607015 \times 10^{-34}\,\mathrm{J \cdot s}$ は Planck 定数、$c = 299792458\,\mathrm{m/s}$ は光速、$k_B = 1.380649 \times 10^{-23}\,\mathrm{J/K}$ は Boltzmann 定数で、どれも SI の定義値である。
+無次元の量 $x$ は光子のエネルギー $hc/\lambda$ と熱エネルギー $k_B T$ の比である。
+
+$\ln B_\lambda = \ln(2hc^2) - 5 \ln \lambda - \ln(e^x - 1)$ と $\partial x / \partial T = -x/T$、$\partial x / \partial \lambda = -x/\lambda$ から、二つの対数微分が得られる。
+
+$$
+\frac{T}{B_\lambda} \frac{\partial B_\lambda}{\partial T} = \frac{x}{1 - e^{-x}},
+\qquad
+\frac{\lambda}{B_\lambda} \frac{\partial B_\lambda}{\partial \lambda} = -5 + \frac{x}{1 - e^{-x}}.
+$$
+
+右辺は $e^x$ どうしの割り算を含まず、$1 - e^{-x}$ を `exp_m1` で計算すれば $x$ の大小によらず桁落ちしないので、参照値の計算に使う。
+$x \gg 1$ の短波長の側（Wien の領域）では $B_\lambda \propto e^{-x}$ で、$\ln B_\lambda$ の温度微分は約 $x/T$ と大きくなる。
+$x \ll 1$ の長波長の側（Rayleigh–Jeans の領域）では $B_\lambda \propto T$ で、相対的な温度微分は $1/T$ に近づく。
+$T = 300\,\mathrm{K}$ では可視光の $\lambda = 0.5\,\mathrm{\mu m}$ で $x \approx 96$、$\lambda = 10\,\mathrm{\mu m}$ で $x \approx 4.8$、$\lambda = 100\,\mathrm{\mu m}$ で $x \approx 0.48$ である。
+
+波長の対数微分を 0 とおくと $x = 5(1 - e^{-x})$ になり、その正の根 $x_W$ で $B_\lambda$ は波長について最大になる。
+根は Lambert W 関数で $x_W = 5 + W_0(-5e^{-5}) = 4.965114231744276\ldots$ と書ける（[Wien の変位則と超越方程式の厳密解](oxref:special-example-wien-closed-form)）。
+極大の波長は $\lambda_{\max} T = hc/(k_B x_W) = 2.897771955 \times 10^{-3}\,\mathrm{m \cdot K}$ で、これが Wien の変位則である。
+$T = 300\,\mathrm{K}$ なら $\lambda_{\max} = 9.659\,\mathrm{\mu m}$、$T = 5800\,\mathrm{K}$ なら $0.4996\,\mathrm{\mu m}$ になる。
+
+次のブロックは三つのセルが共有するモデルである。
+`radiance` は $B_\lambda$ を波長 [μm] と温度 [K] の関数として計算し、`f64` でも scioxide-ad の二重数でも同じ式で評価できるように汎用の数値型 `Real` で書く。
+`exact_temperature_slope` は上の温度の対数微分から作る参照値で、`f64` の固有メソッド `exp_m1` を使う。
+`WIEN_X` は Lambert W で求めた $x_W$ の値である。
+
+```rust
+//| id: differentiate-planck-model
+//| kind: definitions
+//| title: Planck の式と温度微分の参照値
+//| crates: [scioxide-ad]
+use scioxide_ad::Real;
+
+/// SI の定義値: Planck 定数 h [J·s]、光速 c [m/s]、Boltzmann 定数 k_B [J/K]。
+pub(crate) const PLANCK: f64 = 6.62607015e-34;
+pub(crate) const LIGHT: f64 = 299792458.0;
+pub(crate) const BOLTZMANN: f64 = 1.380649e-23;
+/// hc/k_B [m·K]。
+pub(crate) const HC_OVER_K: f64 = PLANCK * LIGHT / BOLTZMANN;
+/// x = 5(1 − e^{−x}) の正の根 x_W = 5 + W₀(−5e^{−5})。
+pub(crate) const WIEN_X: f64 = 4.965114231744276;
+
+/// x = hc/(λ k_B T)。波長 λ は μm、温度 T は K で受け取る。
+pub(crate) fn photon_ratio(lambda_um: f64, temp: f64) -> f64 {
+    HC_OVER_K / (lambda_um * 1e-6 * temp)
+}
+
+/// 分光放射輝度 B_λ(T) [W·sr⁻¹·m⁻³]。f64 でも二重数でも同じ式で評価する。
+/// x は photon_ratio と同じ順序で丸めるので、参照値と同じ x の値を使う。
+pub(crate) fn radiance<V: Real>(lambda_um: V, temp: V) -> V {
+    let lambda = lambda_um * 1e-6;
+    let x = V::constant(HC_OVER_K) / (lambda * temp);
+    V::constant(2.0 * PLANCK * LIGHT * LIGHT) / lambda.powi(5) / (x.exp() - 1.0)
+}
+
+/// 参照値: ∂B/∂T = (B/T)·x/(1 − e^{−x})。e^x − 1 と 1 − e^{−x} を exp_m1 で計算する。
+pub(crate) fn exact_temperature_slope(lambda_um: f64, temp: f64) -> f64 {
+    let x = photon_ratio(lambda_um, temp);
+    let value = 2.0 * PLANCK * LIGHT * LIGHT / (lambda_um * 1e-6).powi(5) / x.exp_m1();
+    value / temp * x / -(-x).exp_m1()
+}
+```
+
+## 方針と候補
+
+[`DerivativeStrategy`](https://docs.rs/scioxide-differentiate/0.1.0/scioxide_differentiate/enum.DerivativeStrategy.html) の `select(provider)` は、方針が決める順に [`DerivativeCandidate`](https://docs.rs/scioxide-differentiate/0.1.0/scioxide_differentiate/enum.DerivativeCandidate.html) を `provider` に渡す。
+順序は方針の名前のとおりで、方針ごとに固定されている。
+
+| 方針 | 候補の順 |
+|---|---|
+| `Analytic` | `Analytic` |
+| `Automatic` | `AutomaticDifferentiation` |
+| `Forward` | `FiniteDifference(Forward)` |
+| `Central` | `FiniteDifference(Central)` |
+| `AnalyticOrForward`（既定） | `Analytic` → `FiniteDifference(Forward)` |
+| `AnalyticOrCentral` | `Analytic` → `FiniteDifference(Central)` |
+| `AnalyticOrAutomaticOrForward` | `Analytic` → `AutomaticDifferentiation` → `FiniteDifference(Forward)` |
+
+`provider` は候補を受け取り、その方法で導関数を計算できれば `Ok(Some(値))`、使えなければ `Ok(None)` を返す。
+`Ok(None)` のときだけ次の候補に進み、`Err` は種類を変えずにすぐ返される。
+どの候補でも値が得られなければ、`InvalidInput`（`UnsupportedConfiguration`、引数 `strategy`）になる。
+`select` は選んだ候補と、`provider` が返した値をそのまま組にして返す。
+`select` 自身は関数を評価せず、評価回数も数えないので、評価の回数の集計は `provider` の側で持つ。
+
+差分の候補は差分公式を `FiniteDifference(scheme)` の形で持つ。
+`provider` は受け取った `scheme` を手法オブジェクト `FiniteDifference` の `with_scheme` に渡す必要があり、渡さなければ方針の差分公式は守られない。
+中心差分を使うのは `Central` と `AnalyticOrCentral` の方針で、ほかの複合した方針の差分は前進差分である。
+複素ステップ法と適応差分は候補にないので、使うときは方針を介さずに `ComplexStep` や `AdaptiveDifference` を直接使う。
+`scioxide-differentiate` は自動微分を実装せず、`scioxide-ad` にも依存しない。
+`AutomaticDifferentiation` の候補で値を返すのは `provider` の役目で、この例題では `scioxide-ad` の二重数で計算するので、セルの `crates` に `scioxide-ad` を加えている。
+
+この型はソルバーの設定として使われる。
+scioxide-rootfind の `Newton` と `SafeguardedNewton` は `new(strategy)` で、scioxide-rootfind の非線形方程式系の解法の設定と scioxide-optimize の導関数を使う解法は `with_derivative_strategy` で方針を受け取る。
+既定は、scioxide-optimize の直線探索を使う局所法（`Bfgs`、`Lbfgs`、`GradientDescent`、`NonlinearCg`、`NewtonOptimizer`）が中心差分に進む `AnalyticOrCentral`、それ以外が `AnalyticOrForward` である。
+scioxide-ode の陰的な解法も `with_derivative_strategy` を持ち、既定は自動微分を挟む `AnalyticOrAutomaticOrForward` である。
+これらの解法の `provider` は、利用者の関数の型が解析的な導関数や自動微分を提供しないときに `Ok(None)` を返し、差分の候補ではすでに計算した $f(x)$ を差分の基準値に再利用してその評価を省く。
+
+## プロバイダーの有無による切り替え
+
+次のセルは $\lambda = 10\,\mathrm{\mu m}$、$T = 300\,\mathrm{K}$（$x \approx 4.8$）で、解析式と自動微分のプロバイダーを入力で有効または無効にし、七つの方針それぞれで `select` を呼ぶ。
+解析式の候補は教科書の形 $\partial B_\lambda / \partial T = B_\lambda\, x e^{x} / (T (e^{x} - 1))$ を SciOxide の `exp` で計算する。
+自動微分には scioxide-ad の二重数 `Dual` を使う。
+二重数は値と導関数の組 $a + b\epsilon$（$\epsilon^2 = 0$）で、演算のたびに導関数を連鎖律に従って伝播させる（[前進モードと二重数](../../../scioxide-ad/algorithms/forward-mode/)）。
+$T$ を `Dual::variable(T)` として同じ `radiance` を評価すれば、$\epsilon$ の係数が温度微分になる。
+差分の候補は渡された公式の `FiniteDifference` の既定の刻みで計算する。
+表には、`provider` が尋ねられた候補の順、選ばれた候補、`exp_m1` による参照値に対する相対誤差、エラーの分類を示す。
+
+```rust
+//| id: differentiate-planck-strategy
+//| ref: differentiate-planck-strategy
+//| title: プロバイダーの有無による DerivativeStrategy の候補の切り替え
+//| run: reactive
+//| uses: [differentiate-planck-model]
+//| crates: [scioxide-ad, scioxide-core, scioxide-differentiate]
+//| inputs:
+//|   analytic: {"type":"checkbox","label":"解析式を提供する","value":false}
+//|   automatic: {"type":"checkbox","label":"自動微分を提供する","value":true}
+//| cases:
+//|   - {"id":"analytic","label":"解析式あり","description":"解析式を最初に尋ねる方針は、どれも 1 回目の候補 Analytic で止まる。","inputs":{"analytic":true}}
+//|   - {"id":"differences-only","label":"差分だけ","description":"自動微分もないと Automatic の方針はエラーになり、AnalyticOrAutomaticOrForward は三つ目の候補の前進差分まで進む。","inputs":{"automatic":false}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"selection","path":"/rows/0/2","equals":null}
+//|       - {"artifact":"selection","path":"/rows/0/4","equals":"InvalidInput"}
+//|       - {"artifact":"selection","path":"/rows/1/2","equals":"AutomaticDifferentiation"}
+//|       - {"artifact":"selection","path":"/rows/1/3","range":{"max":1e-14}}
+//|       - {"artifact":"selection","path":"/rows/2/3","range":{"min":1.4e-8,"max":2.9e-8}}
+//|       - {"artifact":"selection","path":"/rows/3/3","range":{"max":2e-11}}
+//|       - {"artifact":"selection","path":"/rows/4/1","equals":"Analytic → FiniteDifference(Forward)"}
+//|       - {"artifact":"selection","path":"/rows/4/2","equals":"FiniteDifference(Forward)"}
+//|       - {"artifact":"selection","path":"/rows/5/2","equals":"FiniteDifference(Central)"}
+//|       - {"artifact":"selection","path":"/rows/6/1","equals":"Analytic → AutomaticDifferentiation"}
+//|   - case: analytic
+//|     expect:
+//|       - {"artifact":"selection","path":"/rows/0/3","range":{"max":1e-14}}
+//|       - {"artifact":"selection","path":"/rows/4/1","equals":"Analytic"}
+//|       - {"artifact":"selection","path":"/rows/6/2","equals":"Analytic"}
+//|       - {"artifact":"selection","path":"/rows/3/2","equals":"FiniteDifference(Central)"}
+//|   - case: differences-only
+//|     expect:
+//|       - {"artifact":"selection","path":"/rows/1/4","equals":"InvalidInput"}
+//|       - {"artifact":"selection","path":"/rows/6/1","equals":"Analytic → AutomaticDifferentiation → FiniteDifference(Forward)"}
+//|       - {"artifact":"selection","path":"/rows/6/2","equals":"FiniteDifference(Forward)"}
+use scioxide_ad::{Dual, Real};
+use scioxide_core::RealScalar;
+use scioxide_differentiate::{
+    DerivativeCandidate, DerivativeStrategy, DifferenceScheme, FiniteDifference,
+};
+
+let (lambda_um, temp) = (10.0_f64, 300.0_f64);
+let reference = exact_temperature_slope(lambda_um, temp);
+let name = |candidate: DerivativeCandidate| match candidate {
+    DerivativeCandidate::Analytic => "Analytic",
+    DerivativeCandidate::AutomaticDifferentiation => "AutomaticDifferentiation",
+    DerivativeCandidate::FiniteDifference(DifferenceScheme::Forward) => {
+        "FiniteDifference(Forward)"
+    }
+    DerivativeCandidate::FiniteDifference(DifferenceScheme::Central) => {
+        "FiniteDifference(Central)"
+    }
+};
+let strategies = [
+    ("Analytic", DerivativeStrategy::Analytic),
+    ("Automatic", DerivativeStrategy::Automatic),
+    ("Forward", DerivativeStrategy::Forward),
+    ("Central", DerivativeStrategy::Central),
+    ("AnalyticOrForward", DerivativeStrategy::AnalyticOrForward),
+    ("AnalyticOrCentral", DerivativeStrategy::AnalyticOrCentral),
+    (
+        "AnalyticOrAutomaticOrForward",
+        DerivativeStrategy::AnalyticOrAutomaticOrForward,
+    ),
+];
+let mut rows = Vec::new();
+for (label, strategy) in strategies {
+    let mut asked = Vec::new();
+    let selected = strategy.select(|candidate| {
+        asked.push(name(candidate));
+        match candidate {
+            DerivativeCandidate::Analytic if analytic => {
+                // 解析式: ∂B/∂T = B x e^x / (T (e^x − 1))。
+                let x = photon_ratio(lambda_um, temp);
+                let growth = RealScalar::exp(x);
+                let slope = radiance(lambda_um, temp) * x * growth / (temp * (growth - 1.0));
+                Ok(Some(slope))
+            }
+            DerivativeCandidate::AutomaticDifferentiation if automatic => {
+                // 温度だけを接ベクトル 1 の二重数にして、同じモデルを評価する。
+                let value = radiance(Dual::constant(lambda_um), Dual::variable(temp));
+                Ok(Some(value.derivative()))
+            }
+            DerivativeCandidate::FiniteDifference(scheme) => {
+                let method = FiniteDifference::default().with_scheme(scheme);
+                let result = method.derivative(|t: f64| Ok(radiance(lambda_um, t)), temp)?;
+                Ok(result.values().map(|values| values[0]))
+            }
+            _ => Ok(None),
+        }
+    });
+    let (chosen, error, kind) = match selected {
+        Ok((candidate, slope)) => (
+            Some(name(candidate)),
+            Some(((slope - reference) / reference).abs()),
+            None,
+        ),
+        Err(e) => (None, None, Some(format!("{:?}", e.kind()))),
+    };
+    rows.push((label, asked.join(" → "), chosen, error, kind));
+}
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "方針" },
+    { "key": "1", "label": "尋ねた候補" },
+    { "key": "2", "label": "選ばれた候補", "nullText": "なし" },
+    { "key": "3", "label": "参照値との相対誤差 [-]", "type": "number", "format": sci3, "nullText": "—" },
+    { "key": "4", "label": "エラーの分類", "nullText": "なし" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "selection" })
+);
+```
+
+既定では解析式がなく、自動微分がある。
+`AnalyticOrAutomaticOrForward` は `Analytic` を尋ねて `Ok(None)` を受け取り、次の `AutomaticDifferentiation` で値を得る。
+二重数の導関数は参照値と丸め誤差の範囲で一致する。
+`AnalyticOrForward` は自動微分を候補に含まないので前進差分に進み、相対誤差は $2.5 \times 10^{-8}$ になる。
+この値は、打ち切り誤差の主要項 $h B''/(2B')$ による $2.1 \times 10^{-8}$ に丸め誤差が加わった大きさである。
+`Central` と `AnalyticOrCentral` の方針の相対誤差は $1.5 \times 10^{-13}$ まで下がる。
+打ち切り誤差の主要項は $5.5 \times 10^{-12}$ で、相対誤差がそれより小さいのは、丸め誤差と打ち切り誤差がたまたま打ち消し合ったためである。
+既定の刻みの中心差分の誤差は典型的には $\varepsilon^{2/3} \approx 3.7 \times 10^{-11}$ の大きさになる。
+`Analytic` の方針は唯一の候補が `Ok(None)` を返すので、候補が尽きて `InvalidInput` を返す。
+
+解析式を有効にすると、解析式を最初に尋ねる四つの方針はどれも 1 回目の候補 `Analytic` で止まり、相対誤差は丸め誤差の大きさになる。
+`Forward` と `Central` の方針は解析式の有無によらず差分を使う。
+自動微分も無効にすると、`Automatic` の方針はエラーになり、`AnalyticOrAutomaticOrForward` は三つの候補をすべて尋ねて前進差分を選ぶ。
+既定の方針 `AnalyticOrForward` は自動微分を尋ねないので、二重数が使える関数でも前進差分の誤差 $10^{-8}$ の大きさのままである。
+
+## 波長による差分の相対誤差
+
+次のセルは波長 $\lambda$ を 0.3 μm から 300 μm まで 1 桁を 10 点に分けて変え、前進差分、中心差分、二重数による温度微分の相対誤差を参照値と比べる。
+差分の誤差は、$\ln B_\lambda$ の温度微分が大きい短波長の側で大きくなると予想できる。
+
+$x \gg 1$ では $a = hc/(\lambda k_B)$ とおいて $B_\lambda \approx (2hc^2/\lambda^5)\, g(T)$、$g(T) = e^{-a/T}$ と書ける。
+$x = a/T$ を使って $g$ を微分すると、$g''/g' = (x - 2)/T$、$g'''/g' = (x^2 - 6x + 6)/T^2$ になる。
+既定の刻みは $h = \eta T$ で、$\eta$ は前進差分で $\varepsilon^{1/2} \approx 1.5 \times 10^{-8}$、中心差分で $\varepsilon^{1/3} \approx 6.1 \times 10^{-6}$ である（[Taylor 展開と刻み幅の選択](oxref:differentiate-default-steps)）。
+打ち切り誤差の主要項 $h g''/(2g')$ と $h^2 g'''/(6g')$ から、相対誤差は前進差分で $\eta (x - 2)/2$、中心差分で $\eta^2 (x^2 - 6x + 6)/6$ になり、どちらも $x$ とともに増える。
+
+図は三つの方法の相対誤差を両対数で描き、縦の破線は選んだ温度での Wien の極大 $\lambda_{\max}$ である。
+相対誤差がちょうど 0 になった点は対数軸に描けないので図から除き、その数をセルの最後に示す。
+表は 1 桁ごとの値である。
+
+```rust
+//| id: differentiate-planck-wien
+//| ref: differentiate-planck-wien
+//| title: 波長による前進差分・中心差分・自動微分の相対誤差
+//| run: reactive
+//| uses: [differentiate-planck-model]
+//| crates: [scioxide-ad, scioxide-core, scioxide-differentiate]
+//| inputs:
+//|   temp: {"type":"select","label":"温度 T [K]","options":["300","1000","5800"],"value":"300"}
+//| cases:
+//|   - {"id":"sun","label":"T = 5800 K","description":"同じ波長で x が小さくなり、短波長の差分の誤差は下がり、長波長の桁落ちによる誤差は上がる。","inputs":{"temp":"5800"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"samples","path":"/rows/0/1","approx":{"value":159.86,"atol":0.01}}
+//|       - {"artifact":"samples","path":"/rows/0/2","approx":{"value":1.17618e-6,"rtol":1e-2}}
+//|       - {"artifact":"samples","path":"/rows/0/3","approx":{"value":1.50361e-7,"rtol":1e-3}}
+//|       - {"artifact":"samples","path":"/rows/2/3","range":{"max":1e-10}}
+//|       - {"artifact":"samples","path":"/rows/0/4","range":{"max":1e-14}}
+//|       - {"artifact":"samples","path":"/rows/1/4","range":{"max":1e-14}}
+//|       - {"artifact":"samples","path":"/rows/2/4","range":{"max":1e-14}}
+//|       - {"artifact":"samples","path":"/rows/3/4","range":{"max":1e-14}}
+//|   - case: sun
+//|     expect:
+//|       - {"artifact":"samples","path":"/rows/0/1","approx":{"value":8.2685,"atol":1e-3}}
+//|       - {"artifact":"samples","path":"/rows/0/2","range":{"max":1e-7}}
+//|       - {"artifact":"samples","path":"/rows/3/4","range":{"max":1e-13}}
+use scioxide_ad::{Dual, Real};
+use scioxide_differentiate::{DifferenceScheme, FiniteDifference};
+
+let temp: f64 = temp.parse().map_err(|_| "温度を読めない")?;
+let schemes = [DifferenceScheme::Forward, DifferenceScheme::Central];
+let mut points: [Vec<[f64; 2]>; 3] = Default::default();
+let mut dropped = 0;
+let mut rows = Vec::new();
+for k in 0..=30 {
+    // λ = 0.3 μm から 300 μm まで、1 桁を 10 点に分ける。
+    let lambda_um = 0.3 * 10.0_f64.powf(f64::from(k) / 10.0);
+    let reference = exact_temperature_slope(lambda_um, temp);
+    let mut errors = [0.0; 3];
+    for (error, scheme) in errors.iter_mut().zip(schemes) {
+        let result = FiniteDifference::default()
+            .with_scheme(scheme)
+            .derivative(|t: f64| Ok(radiance(lambda_um, t)), temp)
+            .map_err(|e| e.to_string())?;
+        let slope = result.values().ok_or("導関数が公開されない")?[0];
+        *error = ((slope - reference) / reference).abs();
+    }
+    let value = radiance(Dual::constant(lambda_um), Dual::variable(temp));
+    errors[2] = ((value.derivative() - reference) / reference).abs();
+    for (series, &error) in points.iter_mut().zip(&errors) {
+        // 誤差 0 の点は対数軸に描けないので除き、数を数える。
+        if error > 0.0 {
+            series.push([lambda_um, error]);
+        } else {
+            dropped += 1;
+        }
+    }
+    if k % 10 == 0 {
+        rows.push((
+            lambda_um,
+            photon_ratio(lambda_um, temp),
+            errors[0],
+            errors[1],
+            errors[2],
+        ));
+    }
+}
+// Wien の変位則 λ_max T = hc/(k_B x_W) [μm]。
+let peak_um = HC_OVER_K / (WIEN_X * temp) * 1e6;
+let names = ["前進差分", "中心差分", "自動微分（Dual）"];
+let series: Vec<_> = names
+    .iter()
+    .zip(&points)
+    .map(|(name, p)| {
+        serde_json::json!({
+            "name": name,
+            "points": p,
+            "style": { "showSymbol": true }
+        })
+    })
+    .collect();
+emit_chart!(
+    serde_json::json!({
+        "kind": "line",
+        "dataZoom": true,
+        "tooltip": true,
+        "series": series,
+        "xLabel": "波長 λ [μm]",
+        "yLabel": "∂B/∂T の相対誤差 [-]",
+        "xType": "log",
+        "yType": "log",
+        "xMin": 0.3,
+        "xMax": 300.0,
+        "yMin": 1e-17,
+        "yMax": 1e-5,
+        "annotations": [{
+            "kind": "line",
+            "axis": "x",
+            "value": peak_um,
+            "label": "λ_max（Wien）",
+            "style": { "lineType": "dashed" }
+        }]
+    }),
+    metadata = serde_json::json!({ "id": "errors" })
+);
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let digits3 = serde_json::json!({ "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "波長 λ [μm]", "type": "number", "format": digits3 },
+    { "key": "1", "label": "x = hc/(λk_BT) [-]", "type": "number", "format": digits3 },
+    { "key": "2", "label": "前進差分の相対誤差 [-]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "中心差分の相対誤差 [-]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "自動微分の相対誤差 [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "samples" })
+);
+emit_text!(format!("相対誤差が 0 で図から除いた点: {dropped} 個"));
+```
+
+既定の $T = 300\,\mathrm{K}$ では、短波長の 0.3 μm（$x \approx 160$）で前進差分の相対誤差は $1.18 \times 10^{-6}$、中心差分は $1.50 \times 10^{-7}$ になる。
+上の見積もりは $\eta(x - 2)/2 = 1.176 \times 10^{-6}$、$\eta^2(x^2 - 6x + 6)/6 = 1.504 \times 10^{-7}$ で、前進差分とは 0.3%、中心差分とは 0.01% 以内で合う。
+前進差分に残る 0.3% の差は丸め誤差である。
+波長が長くなって $x$ が下がると差分の誤差も小さくなり、中心差分は $x \approx 1.3$ の 38 μm で最小の $2.5 \times 10^{-12}$ になる。
+前進差分は 10 μm より先で丸め誤差が打ち切り誤差と同じ大きさになり、$10^{-10}$ から $10^{-7}$ の間を不規則に動く。
+さらに長波長で $x \ll 1$ になると、モデルの $e^x - 1$ の引き算で桁落ちが起き、関数値そのものの相対誤差が $\varepsilon / x$ 程度に増える。
+そのため 300 μm（$x \approx 0.16$）では中心差分の誤差が $4 \times 10^{-11}$ に戻る。
+二重数の相対誤差は全波長で $10^{-15}$ 以下で、7 点では参照値と一致した。
+温度を 5800 K にすると同じ波長で $x$ が約 1/19 倍になるので、0.3 μm（$x \approx 8.3$）の誤差は前進差分で $4.1 \times 10^{-8}$、中心差分で $1.6 \times 10^{-10}$ に下がる。
+反対に 300 μm（$x \approx 0.0083$）では桁落ちが強まり、前進差分は $9.8 \times 10^{-7}$、中心差分は $7.7 \times 10^{-10}$、二重数も $\varepsilon/x$ に近い $2.1 \times 10^{-14}$ まで増える。
+モデルの $e^x - 1$ を `exp_m1` で計算するように書けば、この桁落ちは避けられる。
+
+## Wien の極大での波長微分
+
+$B_\lambda$ の極大では $\partial B_\lambda / \partial \lambda = 0$ なので、導関数の相対誤差は定義できない。
+そこで無次元の対数微分 $\lambda \, \partial B_\lambda / \partial \lambda \,/\, B_\lambda = -5 + x/(1 - e^{-x})$ を比べる。
+次のセルは $T = 300\,\mathrm{K}$ で $\lambda = r \lambda_{\max}$ の点をとり、同じ `radiance` を波長について前進差分、中心差分、二重数で微分する。
+厳密な式の値は、$x_W$ が $x = 5(1 - e^{-x})$ の根であれば $r = 1$ で丸め誤差の大きさまで 0 になるので、Lambert W で求めた $x_W$ の独立な検算になる。
+
+```rust
+//| id: differentiate-planck-peak
+//| ref: differentiate-planck-peak
+//| title: Wien の極大の前後での波長の対数微分
+//| run: reactive
+//| uses: [differentiate-planck-model]
+//| crates: [scioxide-ad, scioxide-core, scioxide-differentiate]
+//| inputs:
+//|   ratio: {"type":"range","label":"波長の比 r = λ/λ_max [-]","min":0.9,"max":1.1,"step":0.01,"value":1.0}
+//| cases:
+//|   - {"id":"short-side","label":"r = 0.95","description":"極大より短波長の側では対数微分が正になり、B_λ は波長とともに増える。","inputs":{"ratio":0.95}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"peak","path":"/rows/3/1","range":{"min":-1e-14,"max":1e-14}}
+//|       - {"artifact":"peak","path":"/rows/0/2","range":{"max":1e-7}}
+//|       - {"artifact":"peak","path":"/rows/1/2","range":{"max":1e-9}}
+//|       - {"artifact":"peak","path":"/rows/2/2","range":{"max":1e-14}}
+//|   - case: short-side
+//|     expect:
+//|       - {"artifact":"peak","path":"/rows/3/1","approx":{"value":0.2546674654457526,"rtol":1e-12}}
+//|       - {"artifact":"peak","path":"/rows/1/1","approx":{"value":0.2546674654457526,"rtol":1e-8}}
+//|       - {"artifact":"peak","path":"/rows/2/1","approx":{"value":0.2546674654457526,"rtol":1e-13}}
+use scioxide_ad::{Dual, Real};
+use scioxide_differentiate::{DifferenceScheme, FiniteDifference};
+
+let temp = 300.0_f64;
+// Wien の変位則 λ_max T = hc/(k_B x_W) [μm]。
+let peak_um = HC_OVER_K / (WIEN_X * temp) * 1e6;
+let lambda_um = ratio * peak_um;
+let value = radiance(lambda_um, temp);
+// 参照値: λ ∂B/∂λ / B = −5 + x/(1 − e^{−x})（f64 の固有メソッド）。
+let x = photon_ratio(lambda_um, temp);
+let exact = -5.0 + x / -(-x).exp_m1();
+let mut rows = Vec::new();
+for (name, scheme) in [
+    ("前進差分", DifferenceScheme::Forward),
+    ("中心差分", DifferenceScheme::Central),
+] {
+    let result = FiniteDifference::default()
+        .with_scheme(scheme)
+        .derivative(|l: f64| Ok(radiance(l, temp)), lambda_um)
+        .map_err(|e| e.to_string())?;
+    let slope = result.values().ok_or("導関数が公開されない")?[0];
+    let logarithmic = lambda_um * slope / value;
+    rows.push((name, logarithmic, Some((logarithmic - exact).abs())));
+}
+// 波長だけを接ベクトル 1 の二重数にする。
+let dual = radiance(Dual::variable(lambda_um), Dual::constant(temp));
+let logarithmic = lambda_um * dual.derivative() / value;
+rows.push((
+    "自動微分（Dual）",
+    logarithmic,
+    Some((logarithmic - exact).abs()),
+));
+rows.push(("厳密な式 −5 + x/(1 − e^{−x})", exact, None));
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "方法" },
+    { "key": "1", "label": "λ∂B/∂λ / B [-]", "type": "number", "format": sci3 },
+    { "key": "2", "label": "厳密な式との差 [-]", "type": "number", "format": sci3, "nullText": "—" }
+]);
+let caption = format!("λ = {lambda_um:.4} μm、x = {x:.6}、T = 300 K");
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "peak", "caption": caption })
+);
+```
+
+$r = 1$ では $\lambda = 9.659\,\mathrm{\mu m}$ で、厳密な式の値は $8.9 \times 10^{-16}$ と丸め誤差の大きさで 0 になり、$x_W = 4.965114231744276$ が極大を与えることを確かめられる。
+差分は 0 の代わりに打ち切り誤差の大きさの値を返し、厳密な式との差は前進差分で $1.3 \times 10^{-8}$、中心差分で $1.7 \times 10^{-10}$ である。
+二重数の値は $9.0 \times 10^{-16}$ で、厳密な式と丸め誤差の範囲で一致する。
+$r$ を 1 より小さくすると対数微分は正、大きくすると負になり、極大の両側で $B_\lambda$ の増減が入れ替わる。
+$r = 0.95$ では厳密な値は 0.25467 で、厳密な式との差は前進差分で $7.3 \times 10^{-8}$、中心差分で $9.0 \times 10^{-11}$ と、$r = 1$ と同じく打ち切り誤差の大きさにとどまる。
+対数微分を $x$ の関数とみると、$x_W$ での傾きは $(1 - e^{-x} - x e^{-x})/(1 - e^{-x})^2 = 0.972$ である。
+したがって差分で求めた対数微分の零点は、差分の誤差を 0.972 で割った分だけ $x$ がずれ、中心差分なら約 $1.7 \times 10^{-10}$ になる。
+
+## まとめ
+
+`DerivativeStrategy::select` は方針の順に候補を尋ね、`Ok(None)` のときだけ次の候補に進み、候補が尽きると `InvalidInput` を返す。
+差分の候補は公式 `scheme` を持つので、`provider` は受け取った公式を `FiniteDifference` に設定する必要がある。
+既定の `AnalyticOrForward` は自動微分を尋ねないので、二重数が使えるソルバーでは `AnalyticOrAutomaticOrForward` を選ぶと前進差分の誤差 $10^{-8}$ を避けられる。
+Planck の式の温度微分では、差分の相対誤差は $\ln B_\lambda$ の傾き $x/T$ が大きい短波長の側で増え、$x \ll 1$ の長波長の側ではモデルの $e^x - 1$ の桁落ちで再び増える。
+二重数の誤差は 300 K では全波長で $10^{-15}$ 以下にとどまるが、モデル自身の $e^x - 1$ の桁落ちは自動微分でも差分でも取り除けないので、`exp_m1` などでモデルの書き方を変えて避ける。
+極値の近くでは導関数の相対誤差が意味を持たないので、対数微分のような無次元の量で比べる。
+
+## 次に読むページ
+
+- [数値微分の選び方](../../choosing/)：差分、複素ステップ法、自動微分の使い分けを、目的から判断する流れで確かめる。
+- [van der Waals 状態方程式の導関数と推定誤差](../van-der-waals-adaptive/)：誤差の見積もりを返す適応差分で、推定誤差の信頼性と最初の刻みの選び方を確かめる。
+- [Taylor 展開と刻み幅の選択](../../algorithms/taylor-and-step-size/)：前進差分と中心差分の打ち切り誤差の次数と既定の刻みの導出を確かめる。
+- [Lambert W による Wien の変位則とダイオード方程式](../../../scioxide-special/examples/lambert-w-wien-and-diode/)：$x_W$ を Lambert W 関数で閉じた形に書き、Wien の定数を求める過程を確かめる。

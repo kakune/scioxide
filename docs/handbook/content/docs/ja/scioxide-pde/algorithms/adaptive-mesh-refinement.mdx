@@ -1,0 +1,637 @@
+---
+title: 誤差推定に基づく適応細分化
+description: 宙づり節点を拘束した適合な節点空間、適応メッシュ上のスカラー拡散の組立、残差型の事後誤差推定子と有効性指数、Dörfler のマーキングと粗化の候補。
+sidebar:
+  order: 365
+references:
+  pde-amr-diffusion: "拡散問題の組立と求解"
+  pde-amr-hanging-constraints: "宙づり節点の拘束と適合な空間"
+  pde-amr-loop: "適応細分化の循環"
+  pde-amr-marking: "dörfler-のマーキング"
+  pde-amr-nodal-field: "延長行列と縮約した系"
+  pde-amr-residual-estimator: "残差型の誤差推定子"
+---
+
+角や材料の境目で解の導関数が発散する問題では、一様に細かくしたメッシュの誤差は自由度の数に対してゆっくりとしか減らない。
+適応細分化（AMR）は計算した解から誤差の分布を推定し、誤差の大きいセルだけを細かくする。
+細分のたびに、セルの数と番号が変わった新しいメッシュができる。
+`scioxide-spatial` の章に合わせて、このページでもそれぞれのメッシュを revisionと呼ぶ。
+
+このページは `scioxide-pde` の `Amr*` の項目のうち、節点空間、拡散問題の組立、誤差推定子、マーキングの数理を説明し、2 つのセルで確かめる。
+細分の前後で場を移す転送は[適応細分化の revision 間の場の転送](../adaptive-field-transfer/)で扱う。
+メッシュの階層、細分、2:1 平衡、revision 間のトポロジーの対応は `scioxide-spatial` の `AdaptiveMesh` が持ち、[適応メッシュの細分とトポロジーの対応](../../../scioxide-spatial/algorithms/adaptive-mesh-and-shared-tessellation/)で扱う。
+L 字領域の角特異性で収束率を測る例題は [L 字領域の角特異性と適応細分化](../../examples/l-shaped-amr/)にある。
+
+## 適応細分化の循環
+
+適応細分化は次の 4 段を繰り返す（solve–estimate–mark–refine）。
+
+1. 解く：今の revision のメッシュで離散解 $u_h$ を求める。
+2. 推定する：セル $K$ ごとに誤差の指標 $\eta_K$ を求める。
+3. マーカーを付ける：細かくするセル（と粗くするセルの族）を選ぶ。
+4. 細分する：マーカーに従ってメッシュの新しい revision を作り、場と境界のラベルを新しい revision へ移す。
+
+| 段 | 担当する型 | 所有するクレート |
+|---|---|---|
+| 節点空間と拘束 | `AmrSpace`、`AmrOrder`、`AmrOptions`、`AmrLimits`、`AmrMap` | `scioxide-pde` |
+| 組立 | `AmrDiffusionPlan`、`AmrDiffusionData`、`AmrBoundaryTags` | `scioxide-pde` |
+| 求解 | 共役勾配法（CG）、代数的多重格子法などの線形解法 | `scioxide-linalg`、`scioxide-sparse` |
+| 推定 | `AmrResidual`、`AmrEstimator`、`AmrEstimatorWorkspace`、`AmrIndicators` | `scioxide-pde` |
+| マーキング | `AmrMarking`、`AmrMarks` | `scioxide-pde` |
+| 細分 | `AdaptiveMesh::adapt`、`TopologyMap` | `scioxide-spatial` |
+| 転送 | `AmrCellTransfer`、`AmrNodalTransfer`、`AmrMassSolve`、`AmrProjectionReport`、`AmrTransferWorkspace` | `scioxide-pde` |
+
+各段は利用者が順に呼ぶ。
+ライブラリは循環を自動では回さず、いつ止めるか（推定子が許容誤差を下回った、自由度が上限に達した）も呼び出し側が決める。
+`AdaptiveMesh` は作った後は変更されない値なので、新しい revision、空間、ラベル、場がすべて作れてから古いものと置き換える。
+途中で失敗しても、古い revision の一式はそのまま使える。
+場とラベルの転送は[適応細分化の revision 間の場の転送](../adaptive-field-transfer/)で説明する。
+
+## 宙づり節点の拘束と適合な空間
+
+対象は領域 $\Omega\subset\mathbb{R}^D$（$D=1,2,3$）のスカラー拡散方程式である。
+
+$$
+-\nabla\cdot(k\nabla u)=f \quad\text{in }\Omega,\qquad k>0 \text{ はセルごとの定数}
+$$
+
+境界では Dirichlet、自然境界（流束の指定）、Robin のどれかを課す。
+弱形式と区分多項式の基底は[楕円問題の FDM・FEM・FVM](oxref:pde-fem-weak-form)と[単体メッシュの有限要素](../simplex-finite-elements/)で導いている。
+
+`AmrOrder` は節点の場の種類を選ぶ。
+`P1` は三角形・四面体の頂点の値による一次式、`P2` は頂点と辺の中点の値による二次式、`Q1` は線分・四角形・六面体の頂点の値による多重一次式である。
+単体のメッシュには `P1` か `P2`、格子のセルには `Q1` を使い、組み合わせが違うと `AmrSpace` の準備が `InvalidInput` を返す。
+
+### 宙づり節点
+
+細かさの違うセルが面を共有すると、細かい側のセルの頂点や辺の中点が、粗い側の面の内部に乗る。
+この節点を宙づり節点（hanging node）と呼ぶ（`scioxide-spatial` の章ではハンギング頂点と呼ぶ）。
+宙づり節点の値を自由にすると、粗いセルと細かいセルの境目で関数が連続でなくなり、$H^1$ に入らない。
+そこで宙づり節点の値を、粗い側の面の上の基底関数の値で決める。
+
+$$
+u_j=\sum_{i\in\mathcal{M}(j)} w_{ji}\,u_i,\qquad w_{ji}=\phi_i^{\text{粗}}(x_j)
+$$
+
+ここで $x_j$ は宙づり節点の位置、$\mathcal{M}(j)$ は粗い面の上の節点（親節点）、$\phi_i^{\text{粗}}$ は粗いセルの基底関数である。
+P1 で 2:1 平衡な 2 次元のメッシュなら、宙づり節点は粗い辺の中点にあり、値は辺の両端の値の平均になる。
+3 次元では辺だけを共有するセルの深さが 2 以上違うことがあるので、親節点がそれ自身宙づり節点になる連鎖が起こりうる（[ハンギング頂点・辺・面と界面](oxref:spatial-adaptive-hanging)）。
+
+`AmrSpace` は準備のときに、細かさの違う各界面で拘束を作る。
+重みは粗いセルの基底を節点の参照座標で評価した値で、$64\varepsilon$ 以下の値を落としてから和が 1 になるように正規化する（$\varepsilon$ は計算機イプシロン）。
+和が $1/2$ に届かないとき、拘束が循環するとき、複数の面から作った拘束が $1024\varepsilon$ を超えて食い違うときは `InvalidInput` を返す。
+連鎖は親節点の拘束を代入して展開するので、結果の重みはすべて独立な節点に掛かる。
+
+### 延長行列と縮約した系
+
+全節点（宙づり節点を含む）の値のベクトルを $\mathbf{u}$、独立な節点の値を $\mathbf{x}$ とすると、拘束は $\mathbf{u}=P\mathbf{x}$ と書ける。
+$P$ は独立な節点では単位行列の行、宙づり節点では重み $w_{ji}$ の行を持つ延長行列である。
+適合な空間は $P$ の値域で、剛性行列と荷重はそれぞれ $P^{\mathsf T}AP$ と $P^{\mathsf T}\mathbf{F}$ になる。
+$P^{\mathsf T}$ は宙づり節点に集まった荷重を親節点へ配る操作で、値を制限する操作ではない。
+
+`AmrSpace::constraints` は $P$ を `AmrMap` として返す。
+`AmrMap` は実数の重みの正準な CSR 行列（`matrix()`）を持ち、実数と複素数のベクトルに `LinearOperator`（$P\mathbf{x}$）と `AdjointOperator`（$P^{\mathsf T}\mathbf{y}$）として作用する。
+`full_dofs` は全節点の数、`independent_dofs` は独立な節点の数（Dirichlet の節点を含む）、`independent_nodes` は各独立な節点の全節点での番号を昇順に返す。
+全節点は頂点が先で、P2 では辺の中点がその後に続く。
+`node_point` は節点の座標、`cell_dofs` はセルの節点の番号、`evaluate(cell, reference, values)` はセルの参照座標での値と物理座標での勾配を、確保せずに返す。
+`validate_field` は全節点のベクトルが拘束を満たすかを、各行で $256\varepsilon$ に値の尺度を掛けた許容誤差で確かめる。
+これは拘束の整合を見る検査で、近似誤差の検査ではない。
+
+場の値を `scioxide-spatial` の場として持つときは、`AmrNodalField`（所有）と `AmrNodalFieldView`（借用）を使う。
+どちらも頂点の場と、P2 のときだけ辺の場を持ち、メッシュの revision と配置を識別するタグは `scioxide-spatial` の `Field` が持つ。
+`AmrSpace::pack_into` はビューを全節点のベクトルへ詰め、`AmrSpace::field` はその逆に全節点のベクトルから場を確保する。
+`AmrNodalField` の `view` は確保せずにビューを返し、`into_parts` は頂点の場と辺の場に分ける。
+
+### 準備の選択と上限
+
+`AmrSpace::new(mesh, order)` は既定の `AmrOptions` で準備する。
+既定は 6 次までの多項式を厳密に積分する求積、幾何の逆条件数の下限 $64\varepsilon$、逐次実行である。
+`AmrOptions::with_quadrature_degree` は求積の次数を選ぶ。
+単体のセルは適合な有限要素と同じ正の重みの単体則を使い、P1 では 2〜7 次、P2 では整合質量のために 4〜7 次を受け付ける。
+格子のセルは各軸 $\lceil(\text{次数}+1)/2\rceil$ 点の Gauss–Legendre 則の積で、2〜31 次を受け付ける。
+`with_minimum_reciprocal_condition` は幾何の逆条件数の下限（$0$ と $1$ の間）、`with_execution_policy` は行とセルの処理の並列度（最大 32 ワーカー）を選ぶ。
+周期的な継ぎ目を持つメッシュの節点空間は扱わず、`InvalidInput` を返す。
+セルは辺が直線のものとして写像し、曲がったセルの幾何は扱わない。
+
+`AmrLimits::new(max_dofs, max_entries, max_quadrature_nodes, max_work, max_storage_bytes)` は、一回の準備の上限を与える。
+順に、節点やセルの数、拘束や行列の要素の数（一時的な三つ組を含む）、一つの求積則の節点数、訪問・比較・縮約の回数、要求する確保の累積バイト数である。
+既定はすべて `usize::MAX` で、準備済みのものと呼び出し側の入力は数えない。
+上限を超えると、`ResourceLimit` のエラーが量の名前（`amr_dofs`、`amr_work` など）、必要な量、上限を伝える。
+`AmrSpace::build(…, scope)` は求解のスコープの一回分として準備し、スコープの節点数の上限、取り消し、期限に従う。
+スコープの節点や評価回数の上限に達すると、`ConvergenceFailure` のエラーが計算回数の上限のレポートとともに返る。
+`preparation_storage_bound` は、準備で実際に認めた確保の累積の上限を返す。
+
+## 拡散問題の組立と求解
+
+`AmrDiffusionData` は源項 $f$ を返すトレイトで、`source(cell, point)` が活性セル `cell` の物理座標 `point` での値を返す。
+境界の種類とデータは、他の離散化と同じ `BoundaryCondition` で書く。
+外部の面のラベルは `AmrBoundaryTags::new(mesh, entries)` で付ける。
+`entries` は（面の番号、ラベル）の組で、外部の面のすべてにちょうど 1 つずつラベルを付ける必要があり、重複、範囲外、内部の面は `InvalidInput` になる。
+`TaggedBoundaries::adaptive(mesh, tags, components, conditions)` が条件をラベルに結び付ける。
+
+`AmrDiffusionPlan::new(space, diffusion, boundaries, data)` は、セルごとの局所剛性と荷重、Robin の面の質量と荷重、Dirichlet の値を準備する。
+`diffusion` はセルの場で、正で有限な値でなければならない。
+扱うのはスカラーの方程式だけで、境界の成分数が 1 でないとき、Robin の係数が負か複素数のときは `InvalidInput` になる。
+Dirichlet の面の上の独立な節点には境界データの値を入れ、宙づり節点の値は拘束で決まる。
+組み立てる系は Dirichlet の行と列を単位行列に置き換え、既知の値の寄与を右辺へ移した対称な形である。
+
+$$
+\begin{pmatrix}A_{II}&0\\0&I\end{pmatrix}
+\begin{pmatrix}\mathbf{x}_I\\\mathbf{x}_D\end{pmatrix}
+=\begin{pmatrix}\mathbf{b}_I-A_{ID}\,\mathbf{g}\\\mathbf{g}\end{pmatrix}
+$$
+
+$A_{II}$ は $P^{\mathsf T}AP$ の Dirichlet でない行と列、$\mathbf{g}$ は Dirichlet の値である。
+$k>0$ で Dirichlet の面か正の Robin 係数の面があれば、この行列は対称正定値なので CG で解ける。
+
+`unknowns` は未知数（独立な節点の数）、`rhs` は右辺、`prescribed_values` は独立な節点ごとの Dirichlet の値（なければ `None`）を返す。
+Plan 自身が `LinearOperator` と `AdjointOperator` を実装し、行列を作らずに作用を計算する。
+`assemble_csr` は同じ局所形式から同じ行列を CSR で作るので、Jacobi 前処理や代数的多重格子法と組み合わせられる。
+収束の判定、前処理、ゲージは線形解法の側が持つ（[共役勾配法](oxref:linalg-conjugate-gradient)）。
+解いた $\mathbf{x}$ を `constraints().apply_into` で全節点へ延長すると、宙づり節点を含む $\mathbf{u}$ が得られる。
+
+## 残差型の誤差推定子
+
+推定子は、離散解 $u_h$ が方程式をどれだけ満たさないかを、セルの内部と面の上で測る。
+誤差 $e=u-u_h$ は任意の試験関数 $v$ について次の誤差方程式を満たす。
+
+$$
+\int_\Omega k\nabla e\cdot\nabla v
+=\sum_K\int_K R_K\,v-\sum_{F\,\text{内部}}\int_F J_F\,v+\sum_{F\subset\Gamma_N}\int_F\bigl(g-k\nabla u_h\cdot n\bigr)v
+$$
+
+$R_K=f+\nabla\cdot(k\nabla u_h)$ はセルの残差、$J_F$ は面 $F$ の両側の流束 $k\nabla u_h\cdot n_F$ の差（跳び）、$\Gamma_N$ は自然境界と Robin の境界である。
+Robin の境界では $g$ を $g-\alpha u_h$ に読み替える。
+これは要素ごとに部分積分すれば得られる。
+Dirichlet データが離散空間で表せるとき、Galerkin 直交性で $v$ から準補間 $I_hv$ を引き、$\Vert v-I_hv\Vert_K\le Ch_K\Vert\nabla v\Vert$ と $\Vert v-I_hv\Vert_F\le Ch_F^{1/2}\Vert\nabla v\Vert$ を使うと、エネルギーノルムの誤差の上界
+
+$$
+\Vert k^{1/2}\nabla e\Vert\le C_{\mathrm{rel}}\,\eta,\qquad
+\eta^2=\sum_K\eta_K^2
+$$
+
+が得られる（Verfürth 2013）。
+逆向きに、気泡関数を使うと $\eta_K$ が $K$ の近くの誤差とデータの振動で上から抑えられる。
+定数 $C_{\mathrm{rel}}$ はメッシュの形状正則性に依存し、実装はその値を計算しない。
+そのため $\eta$ は誤差の上界ではなく、誤差の分布と減り方を見るための指標である。
+比 $\eta/\Vert k^{1/2}\nabla e\Vert$ を有効性指数（effectivity index）と呼ぶ。
+L 字領域の例題の P1 では、既定の入力でこの値は 2.47〜3.98 の範囲にあり、自由度の上限を 5000 にすると 4.21 まで上がった。
+
+`AmrEstimator` は次の指標を計算する。
+
+$$
+\eta_K^2=\frac{h_K^2}{k_K}\Vert R_K\Vert_K^2
++\frac12\sum_{F\subset\partial K,\ \text{内部}}\frac{h_F}{k_F}\Vert J_F\Vert_F^2
++\sum_{F\subset\partial K\cap\Gamma_N}\frac{h_K}{k_K}\Vert g-k\nabla u_h\cdot n\Vert_F^2
+$$
+
+$h_K$ はセルの直径（頂点間の距離の最大）、$h_F$ は面の両側のセルの直径の小さいほう、$k_F$ は両側の拡散係数の大きいほうである。
+内部の面の寄与は両側のセルに半分ずつ配り、Dirichlet の面は寄与しない。
+細かさの違う面は細かい側の断片ごとに一度だけ評価する。
+P1 と Q1（軸に沿った箱）の基底は調和関数なので、$\nabla\cdot(k\nabla u_h)$ は $0$ で、セルの残差は $f$ だけになる。
+推定子は形状正則なスカラー楕円問題を対象とし、係数の比に依らない上界、求積の誤差の保証、連立系への適用は主張しない。
+
+`AmrResidual` は推定子が読む量を返すトレイトである。
+`volume(cell, point)` は $R_K$、`flux(cell, point, normal)` は指定したセルの側の $k\nabla u_h\cdot n$、`boundary_flux(face, point, normal)` は外部の面の指定流束（Dirichlet では `None`、Robin では $g-\alpha u_h$）を返す。
+`AmrDiffusionPlan::residual(values)` は、拘束を満たす全節点のベクトルからこのトレイトの実装を作る。
+他の方程式の推定子はこのトレイトを実装するか、自分で求めたセルごとの二乗の値を `AmrIndicators::from_squared(mesh, values)` で取り込む。
+
+`AmrEstimator::new(space, diffusion)` は重み $h_K^2/k_K$ と $h_F/k_F$ を準備する（上限を与えるときは `with_options(…, limits)`）。
+`workspace` が作業領域 `AmrEstimatorWorkspace` を明示して確保し、その後の `estimate_into(provider, output, workspace, scope)` はライブラリの中で確保しない。
+計算量はセルと面の数に比例する。
+セルと面に配る計算回数の上限はワーカー数に依らず決まり、失敗したときは `output` を変えない。
+`AmrIndicators::new(mesh)` は revision に結び付いた零の結果を確保する。
+`volume`、`interior`、`boundary` は 3 種類の二乗の寄与、`squared` はセルごとのその和、`global` は和の平方根 $\eta$ を返す。
+`mesh_token` が revision を照合し、古い revision の指標を新しい revision のマーキングに渡すと拒否される。
+
+## Dörfler のマーキング
+
+マーキングは指標の大きいセルを選ぶ規則である。
+`AmrMarking` は Dörfler のバルク条件を実装する。
+割合 $\theta\in(0,1]$ に対して、
+
+$$
+\sum_{K\in\mathcal{M}}\eta_K^2\ge\theta\sum_{K}\eta_K^2
+$$
+
+を満たすセルの集合 $\mathcal{M}$ のうち要素数が最小のものを選ぶ。
+指標を大きい順に並べて先頭から足し、和が $\theta$ 倍に届いたところで止めれば最小になる。
+同じ値は階層の ID の小さい順に並べるので、結果は決まっている。
+計算量はセル数 $n$ について $O(n\log n)$ である。
+
+$\theta$ が小さいと一回に細かくするセルが少なく、循環の回数が増える。
+$\theta=1$ では和が総和に届くまでセルを足すので、ほとんどのセルにマーカーが付き、一様な細分に近くなる。
+Dörfler の条件でマーカーを付け、最新頂点二分割（newest vertex bisection）で細分する方法では、エネルギー誤差と推定子の重み付き和が毎回一定の割合で減ることが証明されている（Cascón–Kreuzer–Nochetto–Siebert 2008）。
+さらに $\theta$ が十分小さければ、自由度あたり最適な率で収束する（Stevenson 2007、Cascón–Kreuzer–Nochetto–Siebert 2008）。
+`scioxide-spatial` の細分は辺の中点による正則な分割と宙づり節点なので、その証明はそのままは当てはまらない。
+例題では収束率を測って確かめる。
+
+`AmrMarking::new(theta)` が規則を作り、`mark(mesh, indicators)` が `AmrMarks` を返す。
+上限を与えるときは `mark_with_options(…, limits)`、スコープの中で呼ぶときは `mark_scoped(…, limits, scope)` を使う。
+$\theta$ と粗化の閾値はマーキングのときに検査し、$\theta$ が $(0,1]$ の外のとき、閾値が負か有限でないときは `InvalidInput` になる。
+指標の総和が正確に 0 のときは何もマーカーを付けない。
+丸めの程度の指標でも正ならマーカーは付くので、細分を止める判断は呼び出し側が $\eta$ と許容誤差を比べて行う。
+
+`with_coarsen_threshold(threshold)` を付けると、子がすべて活性で、細分化マーカーがなく、子の指標の二乗和の平方根が `threshold` 以下の親を粗くする候補に加える。
+粗化が 2:1 平衡を壊すかどうかは `scioxide-spatial` が検査し、平衡のために細分が必要な親を含む要求は全体が拒否される（[局所細分と 2:1 平衡化](oxref:spatial-adaptive-balance)）。
+`AmrMarks` の `refine` は細かくする葉の階層の ID、`coarsen` は粗くする親の ID で、`request()` が同じ revision の `AdaptationRequest` を借用して返す。
+最大値の割合で選ぶ方法や固定割合で選ぶ方法は提供しない。
+そうした規則は、`AmrIndicators::squared` の値から呼び出し側が ID を選び、`AdaptationRequest` を直接作って使う。
+
+次の 2 つのセルは単位正方形の $4\times4$ の三角形メッシュの左下の隅を 2 回細分し、宙づり節点を含む revision で確かめる。
+定義のブロックには、このメッシュを作る関数と外部の面にラベルを付ける関数を置く。
+
+```rust
+//| id: pde-amr-unit-square-model
+//| kind: definitions
+//| title: 単位正方形の三角形メッシュと隅に向けた細分
+//| crates: [scioxide-core, scioxide-spatial, scioxide-pde]
+use scioxide_core::RealScalar;
+use scioxide_pde::AmrBoundaryTags;
+use scioxide_spatial::{AdaptationLimits, AdaptationRequest, AdaptiveMesh, Point, TriangleMesh};
+
+/// 単位正方形を n × n の正方形に分け、各正方形を対角線で 2 つの三角形にした適応メッシュ。
+pub(crate) fn unit_square_mesh(n: usize) -> Result<AdaptiveMesh<f64, 2>, String> {
+    let mut points = Vec::new();
+    for j in 0..=n {
+        for i in 0..=n {
+            let p = Point::new([i as f64 / n as f64, j as f64 / n as f64]);
+            points.push(p.map_err(|e| e.to_string())?);
+        }
+    }
+    let mut cells = Vec::new();
+    for j in 0..n {
+        for i in 0..n {
+            let a = j * (n + 1) + i;
+            cells.push([a, a + 1, a + n + 2]);
+            cells.push([a, a + n + 2, a + n + 1]);
+        }
+    }
+    let mesh = TriangleMesh::new(points, cells).map_err(|e| e.to_string())?;
+    AdaptiveMesh::from_simplex(&mesh, AdaptationLimits::new()).map_err(|e| e.to_string())
+}
+
+/// 重心が原点から radius 未満の活性セルをすべて 1 段細分した新しい revision。
+fn refine_corner(mesh: &AdaptiveMesh<f64, 2>, radius: f64) -> Result<AdaptiveMesh<f64, 2>, String> {
+    let mut refine = Vec::new();
+    for (cell, &id) in mesh.active_cells().iter().enumerate() {
+        let mut centroid = [0.0; 2];
+        for vertex in mesh.cell_vertices(cell).map_err(|e| e.to_string())? {
+            let p = mesh.point(vertex).map_err(|e| e.to_string())?;
+            centroid[0] += p.as_array()[0] / 3.0;
+            centroid[1] += p.as_array()[1] / 3.0;
+        }
+        if RealScalar::hypot(centroid[0], centroid[1]) < radius {
+            refine.push(id);
+        }
+    }
+    let request = AdaptationRequest {
+        source: mesh.mesh_token(),
+        refine: &refine,
+        coarsen: &[],
+    };
+    let result = mesh.adapt(request).map_err(|e| e.to_string())?;
+    Ok(result.mesh)
+}
+
+/// 4 × 4 のメッシュの隅 (0, 0) を半径 0.3、0.15 の順に 2 回細分した revision。
+pub(crate) fn corner_mesh() -> Result<AdaptiveMesh<f64, 2>, String> {
+    refine_corner(&refine_corner(&unit_square_mesh(4)?, 0.3)?, 0.15)
+}
+
+/// 外部の面すべてにラベル 0 を付ける。
+pub(crate) fn exterior_tags(mesh: &AdaptiveMesh<f64, 2>) -> Result<AmrBoundaryTags<2>, String> {
+    let entries: Vec<(usize, u32)> = mesh
+        .interfaces()
+        .iter()
+        .filter(|interface| interface.right.is_none())
+        .map(|interface| (interface.left_face, 0))
+        .collect();
+    AmrBoundaryTags::new(mesh, &entries).map_err(|e| e.to_string())
+}
+
+/// 最初のセルが渡す、活性セルの順の二乗の指標 η_K²。
+#[derive(serde::Deserialize)]
+pub(crate) struct Estimate {
+    pub(crate) squared: Vec<f64>,
+}
+```
+
+最初のセルは多項式の厳密解を Dirichlet データとして $-\Delta u=0$ を解き、節点での誤差と推定子 $\eta$ を示す。
+厳密解が節点空間に入っていれば、拘束の重みが正しい限り離散解は丸めの範囲で厳密解に一致し、$\eta$ も丸めの程度になる。
+二次式 $x^2-y^2$ は P2 の空間に入るが P1 の空間には入らないので、既定の P1 では誤差と $\eta$ が残る。
+入力は節点の次数と厳密解で、セルごとの $\eta_K^2$ を次のセルに渡す。
+
+```rust
+//| id: pde-amr-hanging-reproduction
+//| ref: pde-amr-hanging-reproduction
+//| title: 宙づり節点を含むメッシュで多項式の解を再現し、推定子を求める
+//| run: reactive
+//| uses: [pde-amr-unit-square-model]
+//| crates: [scioxide-core, scioxide-spatial, scioxide-pde, scioxide-linalg]
+//| exports: [squared]
+//| inputs:
+//|   order: {"type":"select","label":"節点の次数","options":["P1","P2"],"value":"P1"}
+//|   solution: {"type":"select","label":"厳密解 u","options":["x² − y²","1 + 2x − y"],"value":"x² − y²"}
+//| cases:
+//|   - {"id":"p1-linear","label":"P1 と 1 + 2x − y","description":"一次式は P1 の空間に入るので、宙づり節点を含めて丸めの範囲で再現する。","inputs":{"solution":"1 + 2x − y"}}
+//|   - {"id":"p2-quadratic","label":"P2 と x² − y²","description":"P2 の空間は二次式を含み、辺の中点の宙づり節点を含めて再現する。","inputs":{"order":"P2"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"reproduction","path":"/rows/0/1","equals":35}
+//|       - {"artifact":"reproduction","path":"/rows/0/2","equals":31}
+//|       - {"artifact":"reproduction","path":"/rows/0/5","range":{"min":0,"max":1e-12}}
+//|       - {"artifact":"reproduction","path":"/rows/0/6","approx":{"value":1.5625e-2,"rtol":1e-9}}
+//|       - {"artifact":"reproduction","path":"/rows/0/7","approx":{"value":0.71167,"rtol":1e-4}}
+//|   - case: p1-linear
+//|     expect:
+//|       - {"artifact":"reproduction","path":"/rows/0/6","range":{"min":0,"max":1e-12}}
+//|       - {"artifact":"reproduction","path":"/rows/0/7","range":{"min":0,"max":1e-12}}
+//|   - case: p2-quadratic
+//|     expect:
+//|       - {"artifact":"reproduction","path":"/rows/0/1","equals":117}
+//|       - {"artifact":"reproduction","path":"/rows/0/2","equals":105}
+//|       - {"artifact":"reproduction","path":"/rows/0/6","range":{"min":0,"max":1e-12}}
+//|       - {"artifact":"reproduction","path":"/rows/0/7","range":{"min":0,"max":1e-12}}
+use scioxide_core::{Budget, ExecutionContext, SciOxideError, LinearOperator, ResidualTolerance};
+use scioxide_linalg::{CgSolver, IterativeWorkspace, Preconditioning, Vector};
+use scioxide_pde::{
+    AmrDiffusionData, AmrDiffusionPlan, AmrEstimator, AmrIndicators, AmrOrder, AmrSpace,
+    BoundaryCondition, BoundaryData, BoundaryPoint, TaggedBoundaries,
+};
+use scioxide_spatial::{Cell, Field};
+
+// 源項 f = 0（どちらの厳密解も調和関数）。
+struct Harmonic;
+impl AmrDiffusionData<f64, f64, 2> for Harmonic {
+    fn source(&self, _cell: usize, _point: [f64; 2]) -> Result<f64, SciOxideError> {
+        Ok(0.0)
+    }
+}
+
+let mesh = corner_mesh()?;
+let order = if order == "P2" {
+    AmrOrder::P2
+} else {
+    AmrOrder::P1
+};
+let quadratic = solution.starts_with('x');
+let exact = move |p: [f64; 2]| {
+    if quadratic {
+        p[0] * p[0] - p[1] * p[1]
+    } else {
+        1.0 + 2.0 * p[0] - p[1]
+    }
+};
+let space = AmrSpace::new(&mesh, order).map_err(|e| e.to_string())?;
+let data = BoundaryData::time_invariant(move |p: BoundaryPoint<f64, 2>| Ok(exact(p.point)));
+let conditions = vec![BoundaryCondition::dirichlet(0, data)];
+let tags = exterior_tags(&mesh)?;
+let boundaries =
+    TaggedBoundaries::adaptive(&mesh, &tags, 1, conditions).map_err(|e| e.to_string())?;
+let diffusion = Field::<f64, Cell, 2>::new(&mesh, vec![1.0; mesh.cell_count()])
+    .map_err(|e| e.to_string())?;
+let plan = AmrDiffusionPlan::new(&space, diffusion.view(), &boundaries, &Harmonic)
+    .map_err(|e| e.to_string())?;
+
+// Plan を行列なしの作用素として CG に渡す（Dirichlet を消去した系は対称正定値）。
+let rhs = Vector::from_vec(plan.rhs().to_vec());
+let mut x = Vector::zeros(rhs.len()).map_err(|e| e.to_string())?;
+let tolerance = ResidualTolerance::new(1e-13, 1e-13).map_err(|e| e.to_string())?;
+let solver = CgSolver::new(
+    tolerance,
+    Budget::try_from(2000).map_err(|e| e.to_string())?,
+);
+let mut work = IterativeWorkspace::new();
+let report = solver
+    .solve_into(
+        &plan,
+        &rhs,
+        Preconditioning::None,
+        x.view_mut(),
+        &mut work,
+        ExecutionContext::sequential(),
+    )
+    .map_err(|e| e.to_string())?;
+
+// 独立な節点の値を全節点へ延長し（宙づり節点は拘束で決まる）、節点で厳密解と比べる。
+let mut full = vec![0.0; space.full_dofs()];
+let mut scratch = full.clone();
+space
+    .constraints()
+    .apply_into(x.as_slice(), &mut full, &mut scratch)
+    .map_err(|e| e.to_string())?;
+// 誤差の最大を、独立な節点と宙づり節点に分けて求める。
+let (mut independent_error, mut hanging_error) = (0.0_f64, 0.0_f64);
+for (node, value) in full.iter().enumerate() {
+    let point = space.node_point(node).map_err(|e| e.to_string())?;
+    let error = (value - exact(point)).abs();
+    if space.independent_nodes().binary_search(&node).is_ok() {
+        independent_error = independent_error.max(error);
+    } else {
+        hanging_error = hanging_error.max(error);
+    }
+}
+
+// 残差型の推定子。
+let mut indicators = AmrIndicators::new(&mesh).map_err(|e| e.to_string())?;
+let residual = plan.residual(&full).map_err(|e| e.to_string())?;
+let estimator = AmrEstimator::new(&space, diffusion.view()).map_err(|e| e.to_string())?;
+let mut workspace = estimator.workspace().map_err(|e| e.to_string())?;
+estimator
+    .estimate_into(
+        &residual,
+        &mut indicators,
+        &mut workspace,
+        ExecutionContext::sequential(),
+    )
+    .map_err(|e| e.to_string())?;
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "活性セル [個]", "type": "integer" },
+    { "key": "1", "label": "全節点 [個]", "type": "integer" },
+    { "key": "2", "label": "独立な節点 [個]", "type": "integer" },
+    { "key": "3", "label": "CG の反復 [回]", "type": "integer" },
+    { "key": "4", "label": "CG の終了理由" },
+    { "key": "5", "label": "独立な節点の誤差の最大 [-]", "type": "number", "format": sci3 },
+    { "key": "6", "label": "宙づり節点の誤差の最大 [-]", "type": "number", "format": sci3 },
+    { "key": "7", "label": "推定子 η [-]", "type": "number", "format": sci3 }
+]);
+let rows = vec![(
+    mesh.cell_count(),
+    space.full_dofs(),
+    space.independent_dofs(),
+    report.iterations(),
+    format!("{:?}", report.termination()),
+    independent_error,
+    hanging_error,
+    indicators.global(),
+)];
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "reproduction" })
+);
+let squared: Vec<f64> = indicators.squared().collect();
+export!(squared, &squared);
+```
+
+既定の P1 と $x^2-y^2$ では、全節点 35 個のうち独立な節点は 31 個で、残る 4 個が宙づり節点である。
+CG は 4 回の反復で `Converged` になった。
+独立な節点の誤差は $1.1\times10^{-16}$ で、誤差は宙づり節点だけに $1.5625\times10^{-2}=1/64$ 残る。
+この値は長さ $h=1/4$ の粗い辺の中点で二次式を両端の一次補間で置き換えた誤差 $h^2/4$ に等しい。
+推定子は $\eta=0.712$ で、面の流束の跳びから誤差が残っていることを示す。
+
+一次式 $1+2x-y$ に変えると、宙づり節点を含むすべての節点の誤差が $4.4\times10^{-16}$ 以下になり、$\eta$ も $5.3\times10^{-15}$ まで下がる。
+P2 と $x^2-y^2$ では全節点 117 個のうち 12 個が宙づり節点（頂点 4 個と辺の中点 8 個）で、誤差は $2.2\times10^{-15}$ 以下、$\eta$ は $6.2\times10^{-14}$ である。
+厳密解が空間に入る 2 つの場合に宙づり節点の誤差が丸めの程度になることが、拘束の重みが正しいことの確認になる。
+
+次のセルは前のセルの $\eta_K^2$ を `AmrIndicators::from_squared` で同じ形のメッシュに取り込み、Dörfler のマーカーを付けて細分する。
+入力は割合 $\theta$ と粗化の閾値である。
+図は指標を大きい順に並べたときの累積の割合で、$\theta$ の線と交わるところまでのセルにマーカーが付く。
+表はマーカーの数、マーカーを付けたセルが占める割合、粗化の候補、`adapt` の結果を示す。
+
+```rust
+//| id: pde-amr-dorfler-marking
+//| ref: pde-amr-dorfler-marking
+//| title: Dörfler の割合でマーカーを付け、新しい revision を作る
+//| run: reactive
+//| uses: [pde-amr-unit-square-model]
+//| crates: [scioxide-core, scioxide-spatial, scioxide-pde]
+//| dependsOn:
+//|   estimate: {cell: pde-amr-hanging-reproduction, type: Estimate}
+//| inputs:
+//|   theta: {"type":"range","label":"割合 θ [-]","min":0.1,"max":1.0,"step":0.1,"value":0.5}
+//|   coarsen: {"type":"select","label":"粗化の閾値","options":["なし","0.01","0.1"],"value":"なし"}
+//| cases:
+//|   - {"id":"theta-one","label":"θ = 1","description":"和が総和に届くまで足すので、丸めの程度の 2 個を除く 42 個にマーカーが付く。","inputs":{"theta":1.0}}
+//|   - {"id":"coarsen","label":"粗化の閾値 0.1","description":"子の族 2 つが粗化の候補になり、細分化マーカーと合わせて新しい revision を作る。","inputs":{"coarsen":"0.1"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"marking","path":"/rows/0/1","equals":12}
+//|       - {"artifact":"marking","path":"/rows/0/2","approx":{"value":0.5236,"atol":1e-4}}
+//|       - {"artifact":"marking","path":"/rows/0/6","equals":80}
+//|   - case: theta-one
+//|     expect:
+//|       - {"artifact":"marking","path":"/rows/0/1","equals":42}
+//|   - case: coarsen
+//|     expect:
+//|       - {"artifact":"marking","path":"/rows/0/3","equals":2}
+//|       - {"artifact":"marking","path":"/rows/0/6","equals":74}
+use scioxide_pde::{AmrIndicators, AmrMarking};
+
+let mesh = corner_mesh()?;
+let indicators =
+    AmrIndicators::from_squared(&mesh, &estimate.squared).map_err(|e| e.to_string())?;
+let mut marking = AmrMarking::new(theta);
+if let Ok(threshold) = coarsen.parse::<f64>() {
+    marking = marking.with_coarsen_threshold(threshold);
+}
+let marks = marking
+    .mark(&mesh, &indicators)
+    .map_err(|e| e.to_string())?;
+
+// マーカーを付けたセルの指標が総和に占める割合（活性セルの番号は階層の ID から引く）。
+let total: f64 = estimate.squared.iter().sum();
+let mut selected = 0.0;
+for (cell, id) in mesh.active_cells().iter().enumerate() {
+    if marks.refine().binary_search(id).is_ok() {
+        selected += estimate.squared[cell];
+    }
+}
+
+// 大きい順に並べた指標の累積の割合。
+let mut sorted = estimate.squared.clone();
+sorted.sort_by(|a, b| b.total_cmp(a));
+let mut running = 0.0;
+let mut curve = Vec::new();
+for (k, value) in sorted.iter().enumerate() {
+    running += value;
+    curve.push([(k + 1) as f64, running / total]);
+}
+emit_line_chart!(
+    &vec![
+        serde_json::json!({ "name": "累積の割合", "points": curve, "style": { "step": "end" } })
+    ],
+    options = &serde_json::json!({
+        "xLabel": "大きい順に数えたセル k [個]",
+        "yLabel": "上位 k 個の η_K² の和 / Σ η_K² [-]",
+        "yMin": 0.0,
+        "yMax": 1.0,
+        "annotations": [
+            { "kind": "line", "axis": "y", "value": theta, "label": "θ" },
+            { "kind": "line", "axis": "x", "value": marks.refine().len() as f64, "label": "マーカーの数" }
+        ]
+    })
+);
+
+// spatial が 2:1 平衡を回復して新しい revision を作る。粗化が平衡と両立しなければ要求全体が拒否される。
+let adapted = mesh.adapt(marks.request());
+let (cells, induced, result) = match &adapted {
+    Ok(next) => (
+        Some(next.mesh.cell_count()),
+        Some(next.induced_refinements.len()),
+        "受理".to_string(),
+    ),
+    Err(error) => (None, None, format!("{:?}", error.kind())),
+};
+let fixed3 = serde_json::json!({ "fractionDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "活性セル [個]", "type": "integer" },
+    { "key": "1", "label": "細分化マーカー [個]", "type": "integer" },
+    { "key": "2", "label": "マーカーのセルの割合 [-]", "type": "number", "format": fixed3 },
+    { "key": "3", "label": "粗化のマーカー [個]", "type": "integer" },
+    { "key": "4", "label": "adapt の結果" },
+    { "key": "5", "label": "平衡のための細分 [個]", "type": "integer", "nullText": "—" },
+    { "key": "6", "label": "新しい revision の活性セル [個]", "type": "integer", "nullText": "—" }
+]);
+let rows = vec![(
+    mesh.cell_count(),
+    marks.refine().len(),
+    selected / total,
+    marks.coarsen().len(),
+    result,
+    induced,
+    cells,
+)];
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "marking" })
+);
+```
+
+既定の $\theta=0.5$ では、44 個のセルのうち指標の大きい 12 個にマーカーが付き、その 12 個が $\eta^2$ の 52.4 % を占める。
+上位の 16 個の $\eta_K^2$ は丸めの範囲で等しく（どれも $0.0221$）、図の累積の割合はそこまで一定の傾きで増える。
+その 16 個のうちどの 12 個にマーカーが付くかは、丸めの程度の差で決まる。
+`adapt` は平衡のための細分を加えずに要求を受理し、新しい revision の活性セルは 80 個になる。
+
+$\theta=1$ では 42 個にマーカーが付く。
+残る 2 個のセルの $\eta_K^2$ は $10^{-31}$ 程度で、その 2 個を足す前に和が丸めの範囲で総和に届くので、マーカーは付かない。
+粗化の閾値を 0.1 にすると、子の族 2 つが粗化の候補になり、細分化マーカーと合わせて 74 個のセルの revision ができる。
+閾値 0.01 では条件を満たす族がなく、粗化の候補はない。
+
+## 参考文献
+
+- W. Dörfler, "A convergent adaptive algorithm for Poisson's equation", *SIAM J. Numer. Anal.* 33 (1996), 1106–1124.
+- R. Verfürth, *A Posteriori Error Estimation Techniques for Finite Element Methods*, Oxford University Press, 2013.
+- J. M. Cascón, C. Kreuzer, R. H. Nochetto, K. G. Siebert, "Quasi-optimal convergence rate for an adaptive finite element method", *SIAM J. Numer. Anal.* 46 (2008), 2524–2550.
+- R. Stevenson, "Optimality of a standard adaptive finite element method", *Found. Comput. Math.* 7 (2007), 245–269.
+
+## まとめ
+
+`AmrSpace` は宙づり節点を延長行列 $P$ で拘束し、$P^{\mathsf T}AP$ の形の対称な系を作るので、適応メッシュでも CG などの既存の線形解法をそのまま使える。
+厳密解を含む空間で丸めの範囲まで再現されるかを見れば、拘束の重みと境界の扱いを確かめられる。
+推定子 $\eta$ は定数を含まない指標で、誤差の上界ではないので、許容誤差との比較には有効性指数の大きさを見込む。
+Dörfler の割合 $\theta$ は一回の細分の量と周回の数の釣り合いを決め、細分を止める判断は呼び出し側が行う。
+粗化の候補は `scioxide-spatial` の 2:1 平衡の検査を通ったときだけ受理される。
+
+## 次に読むページ
+
+- [適応細分化の revision 間の場の転送](../adaptive-field-transfer/)：細分と粗化の前後でセル平均と節点の場を移し、保存される量を確かめる。
+- [L 字領域の角特異性と適応細分化](../../examples/l-shaped-amr/)：再入隅の特異性で、一様な細分と適応細分の収束率と有効性指数を比べる。
+- [適応メッシュの細分とトポロジーの対応](../../../scioxide-spatial/algorithms/adaptive-mesh-and-shared-tessellation/)：階層、2:1 平衡、宙づり実体、revision の写像の定義を確かめる。
+- [適応細分化の API](../../api/adaptive-refinement/)：`Amr*` の各項目の仕様を一覧で確かめる。

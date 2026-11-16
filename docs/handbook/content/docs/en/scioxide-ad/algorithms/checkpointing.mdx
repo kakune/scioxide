@@ -1,0 +1,636 @@
+---
+title: "Loops and checkpointing"
+description: "Memory use when reverse-mode differentiation is applied to recurrence loops; checkpointed_loop and LoopBody for recording a loop as one call statement; the forward-step formula for binomial checkpointing (revolve) and its verification by dynamic programming; constructing CheckpointSchedule and the visit actions; and comparisons with ordinary loops in gradients, Hessian–vector products, and memory use."
+sidebar:
+  order: 355
+references:
+  ad-checkpointed-loop: "checkpointed_loop-and-loopbody"
+  ad-binomial-checkpoint-cost: "forward-step-counts-for-binomial-checkpointing"
+  ad-checkpoint-schedule: "constructing-checkpointschedule-and-using-visit"
+  ad-checkpointed-vs-plain-loop: "checkpointed-loops-and-ordinary-loops"
+---
+
+Reverse-mode differentiation of time evolution or iterative loops uses each step's state in reverse order, requiring either memory proportional to the step count or recomputation to recreate states.
+This page covers memory requirements for reversing loops, `checkpointed_loop` for recording a loop as one statement, `CheckpointSchedule` for specifying recomputation actions, and forward-step counts for binomial checkpointing.
+[Reverse mode and tapes](../reverse-mode-and-replay/) defines tape, statement, and sweep.
+Branches inside loops follow the rules in [Branches, masks, and table lookup](../control-flow/).
+
+## Reversing loops and memory use
+
+Time evolution and iterative methods can be written as a recurrence updating state $u_k$ with maps of the same form:
+
+$$
+u_{k+1} = \Phi_k(u_k, p), \qquad k = 0, 1, \dots, l - 1
+$$
+
+
+$p$ denotes parameters shared by every step and $l$ the number of steps.
+For a scalar objective $L = g(u_l)$, reverse mode computes state adjoints $\bar u_k = \partial L / \partial u_k$ from the end in the order
+
+$$
+\bar u_k = \Bigl(\frac{\partial \Phi_k}{\partial u}(u_k, p)\Bigr)^{\!\top} \bar u_{k+1}, \qquad
+\bar p \leftarrow \bar p + \Bigl(\frac{\partial \Phi_k}{\partial p}(u_k, p)\Bigr)^{\!\top} \bar u_{k+1}
+$$
+
+
+Every stage $k = l - 1, \dots, 0$ requires the local Jacobian at state $u_k$, so states visited in the forward pass must be retrievable in reverse order.
+
+Running an ordinary Rust loop over `Var` leaves every step's statements on the tape.
+This stores local information for all steps (full storage); tape length is proportional to the step count times the number of statements per step.
+Another approach stores only some states (snapshots) and reruns forward from a nearby snapshot when needed (checkpointing), trading memory for forward recomputation.
+
+## `checkpointed_loop` and `LoopBody`
+
+`LoopBody<S>` is a trait for writing one step $u \leftarrow \Phi_k(u, p)$ once for every numeric type.
+`step<R: Real<S>>(&self, index, state, parameters)` advances `state` one step in place and returns errors from the body unchanged.
+`index` is the step index $k$ and can be used for time-dependent external forces, for example.
+Store data that varies by step in the body's struct.
+
+`checkpointed_loop(body, steps, state, parameters, schedule)` applies `body` `steps` times, updating `state` to the final state.
+Pass `body` as `Arc<B>`; `B` requires `Send + Sync + 'static` because the tape retains the `Arc`.
+It returns `DimensionMismatch` if `schedule.steps()` differs from `steps`.
+It returns `SizeOverflow` if the snapshot size does not fit in `usize` and `AllocationFailure` if workspace or the copy of the schedule retained by the tape cannot be allocated; errors from `body` are returned unchanged.
+For `schedule`, use a schedule constructed with `CheckpointSchedule::binomial` or `CheckpointSchedule::explicit` (see [Constructing `CheckpointSchedule` and using `visit`](#constructing-checkpointschedule-and-using-visit)).
+
+Behavior by numeric type is as follows.
+
+- `f32`, `f64`, `Lanes`, `Dual`, `MultiDual`, and `Jet` execute an ordinary loop on a copy of the state (workspace of length $n$), without using `schedule`.
+  The copy is written back to `state` only on success, so no component of `state` changes on a body error or allocation failure.
+  `Dual` retains forward-mode derivatives directly.
+- For `Var`, it executes the loop on values and records one call statement from the initial state and parameters to the final state.
+  If there are no active inputs, it records no statement and returns the final state as passive values.
+  Because the body operates on values, kinks inside it are neither counted by the outer tape's `kinks()` nor detected by `KinkPolicy::Error`.
+- The reverse sweep (pullback) follows the actions of `schedule` (`CheckpointSchedule::visit`).
+  State restoration, forward steps, and saving operate on values; only the single step being reversed is recorded and swept on an inner tape.
+  Memory consists of $(\text{slots} + 1) \times n$ snapshot values ($n$ is the state length) and a tape for one step.
+- A tangent sweep (pushforward, such as `Linearization::jvp_into`) executes the loop from the initial state with `Dual`.
+- For `Tape<Dual<f64>>`, the reverse sweep uses `Dual` arithmetic, allowing Hessian–vector products through the loop.
+
+The reverse sweep recomputes the same values as at recording, so `step` must be deterministic, returning the same result for the same arguments.
+
+`checkpointed_loop` allocates a state copy on each call for types other than `Var`; on tapes it allocates copies of state and parameter values on each recording, and snapshots, control storage, and an inner tape on each reverse sweep.
+A tangent sweep also allocates a `Dual` state.
+These allocations remain even on a warm tape recording the same function (an exception to the allocation-free reuse described in [Tape lifecycle and reuse](../tape-lifecycle/)).
+
+## Forward-step counts for binomial checkpointing
+
+Consider reversing a chain of uniform steps using a limited number of snapshots.
+There are three assumptions.
+
+1. Every step has the same forward computational cost and the same state size for restarting.
+2. Up to $c$ snapshots can be stored, including the initial state, together with one additional working frame.
+3. Immediately before reversing a step, execute it forward from its input state to produce its local information.
+
+If each step may be executed forward at most $r$ times excluding the forward execution in assumption 3, the maximum number of steps reversible with $c$ snapshots is
+
+$$
+\beta(c, r) = \binom{c + r}{c}
+$$
+
+
+$r$ is called the repetition number.
+For $r$ satisfying $\beta(c, r - 1) < l \le \beta(c, r)$, the minimum forward-step count excluding the forward executions in assumption 3 is
+
+$$
+t(l, c) = r\,l - \beta(c + 1, r - 1) = r\,l - \binom{c + r}{c + 1}
+$$
+
+(Griewank and Walther's revolve).
+
+A minimizing schedule splits the chain at the first snapshot position $k$ and recursively reverses the latter part with $c - 1$ snapshots and the former part with $c$ snapshots.
+The minimum forward-step count $T(n, s)$ ($s$ is the number of snapshot slots) can therefore also be obtained by dynamic programming:
+
+$$
+T(n, s) = \min_{1 \le k < n} \bigl\{ k + T(k, s) + T(n - k, s - 1) \bigr\}, \qquad
+T(n, 0) = \frac{n(n + 1)}{2}, \quad T(1, s) = 1
+$$
+
+
+$T$ includes the forward executions in assumption 3 and equals $t(l, c) + l$.
+For $c = 1$ (initial state only), $r = l - 1$ and $t + l = (l - 1)l - \binom{l}{2} + l = l(l + 1)/2$, agreeing with the sum of advancing $i + 1$ steps from the initial state every time step $i$ is reversed.
+
+Increasing $c$ rapidly reduces $r$.
+Since $\beta(c, c) = \binom{2c}{c}$ grows roughly as $4^c / \sqrt{\pi c}$, both $c$ and $r$ can be chosen on the order of $\log l$.
+Even for $l = 10^6$, choosing $c = 12$ gives $r = 11$ and a forward-step count of $t + l = 12\,l - \binom{23}{13} \approx 10.86\,l$.
+
+## Constructing `CheckpointSchedule` and using `visit`
+
+`CheckpointSchedule::binomial(steps, slots)` constructs a binomial schedule minimizing forward-step count under assumptions 1–3.
+`slots` is the snapshot count excluding the initial state and working frame, so $c = \text{slots} + 1$.
+Since `slots` greater than `steps` − 1 cannot be used, it is capped at `steps` − 1; `checkpoint_slots()` returns the capped value.
+However, if `slots` exceeds 64, it returns `InvalidInput` (argument `slots`, `OutOfRange`) before capping.
+It returns `SizeOverflow` if the forward-step count does not fit in `usize`.
+
+`CheckpointSchedule::explicit(steps, boundaries)` places snapshots at step boundaries chosen by the caller.
+`boundaries` must start at zero, be strictly increasing, and remain below `steps` (`[0]` when `steps = 0`).
+A violation returns `InvalidInput` (argument `boundaries`, `Inconsistent`).
+Each step is restored from its nearest preceding boundary, advanced forward to that step, and then reversed.
+An interval of length $m$ therefore requires $m(m + 1)/2$ forward steps, and `forward_steps()` returns their total.
+Callers wishing to bound forward-step count compare this value with their own limit.
+The user of `visit` must save the boundary states.
+`visit` for `explicit` emits no `Save` actions.
+
+Given an `explicit` schedule, `checkpointed_loop` begins the reverse sweep by advancing from the initial state to the last boundary and saving each boundary state, then follows the actions from `visit`.
+The forward-step count is therefore `forward_steps()` plus `boundaries.last()` steps to the last boundary.
+An `explicit` with only boundary `[0]` restarts forward from the initial state alone, just like `binomial(steps, 0)`.
+
+The schedule returns the following values.
+
+- `forward_steps()` is the forward-step count for reversing the entire chain; for binomial schedules it is $t(l, c) + l = (r + 1)\,l - \binom{c + r}{c + 1}$.
+  It excludes executing the loop on values when recording the function (twice on a new tape, since the function executes twice).
+- `forward_steps_for(realized_steps)` is the forward-step count for reversing only the first `realized_steps` steps.
+  If `realized_steps` exceeds `steps()`, it returns `InvalidInput` (`OutOfRange`).
+- `steps()`, `checkpoint_slots()`, and `boundaries()` (`None` for binomial schedules) return the values from construction.
+- `control_slots()` is the length of control storage passed to `visit`, in $5(\min(\text{slots}, 64) + 1)$ words.
+
+`visit(realized_steps, control, visitor)` passes reversal actions to `visitor` one at a time as `CheckpointAction`.
+`control` is `u64` workspace of length at least `control_slots()`; a shorter workspace returns `DimensionMismatch`.
+If `realized_steps` exceeds `steps()`, it returns `InvalidInput` (`OutOfRange`) before passing the first action.
+Actions are generated without recursion or allocation, and steps are reversed from last to first.
+Errors from `visitor` are returned unchanged.
+
+There are four kinds of `CheckpointAction`.
+
+| Variant | Meaning |
+|---|---|
+| `Restore { slot, step }` | Restore the state in slot `slot` (0 is the initial state) as the state at boundary `step` |
+| `Advance { start, end }` | Advance the state through steps in the half-open interval `start..end` |
+| `Save { slot, step }` | Save the current state, advanced to boundary `step`, in slot `slot` |
+| `Reverse { step }` | Reverse the just-advanced step `step` |
+
+For step count $l$, the next cell compares binomial schedule forward-step counts with `slots` varied from 0 to 16 against three independent methods.
+The first sums the lengths of `Advance` intervals passed by `visit`, the second uses the closed form above (`u128` integer arithmetic), and the third uses dynamic programming $T(l, s)$ ($s \le 8$).
+For comparison, it also lists `forward_steps()` for `explicit` with the same number of uniformly spaced snapshots.
+This column excludes the forward steps that save boundary states.
+The chart plots forward steps per step $\text{forward\_steps}/l$ on a logarithmic vertical axis for snapshot count $c = 1, \dots, 32$.
+
+```rust
+//| id: ad-binomial-checkpoint
+//| ref: ad-binomial-checkpoint
+//| title: "Verify binomial checkpoint forward-step counts with the closed form and dynamic programming"
+//| run: reactive
+//| crates: [scioxide-ad, scioxide-core]
+//| inputs:
+//|   total_steps: {"type":"range","label":"Step count l","description":"Number of steps in the loop to reverse.","min":2,"max":400,"step":1,"value":64}
+//| cases:
+//|   - {"id":"long","label":"l = 400","description":"The gap between uniformly spaced explicit and binomial schedules grows.","inputs":{"total_steps":400}}
+//|   - {"id":"short","label":"l = 3","description":"slots is capped at l − 1 = 2.","inputs":{"total_steps":3}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"schedules","path":"/rows/0/4","equals":2080}
+//|       - {"artifact":"schedules","path":"/rows/2/4","equals":322}
+//|       - {"artifact":"schedules","path":"/rows/5/4","equals":211}
+//|       - {"artifact":"schedules","path":"/rows/5/5","equals":211}
+//|       - {"artifact":"schedules","path":"/rows/5/6","equals":211}
+//|       - {"artifact":"schedules","path":"/rows/5/7","equals":211}
+//|       - {"artifact":"schedules","path":"/rows/2/8","equals":715}
+//|   - case: long
+//|     expect:
+//|       - {"artifact":"schedules","path":"/rows/0/4","equals":80200}
+//|       - {"artifact":"schedules","path":"/rows/6/6","equals":1714}
+//|       - {"artifact":"schedules","path":"/rows/6/7","equals":1714}
+//|       - {"artifact":"schedules","path":"/rows/6/8","equals":9090}
+//|   - case: short
+//|     expect:
+//|       - {"artifact":"schedules","path":"/rows/7/1","equals":2}
+//|       - {"artifact":"schedules","path":"/rows/7/4","equals":5}
+//|       - {"artifact":"schedules","path":"/rows/7/8","equals":3}
+use scioxide_ad::{CheckpointAction, CheckpointSchedule};
+use scioxide_core::SciOxideError;
+
+let l = total_steps as usize;
+// Independent check 1: Griewank–Walther closed form. C(n, i+1) = C(n, i)(n − i)/(i + 1) divides exactly.
+let binom = |n: u128, k: u128| (0..k).fold(1_u128, |b, i| b * (n - i) / (i + 1));
+let closed = |c: u128| {
+    let r = (0_u128..)
+        .find(|&r| binom(c + r, c) >= l as u128)
+        .unwrap_or(0);
+    (r, (r + 1) * l as u128 - binom(c + r, c + 1))
+};
+// Independent check 2: dynamic programming T(n, s) over the first snapshot position k.
+const MAX_DP: usize = 8;
+let mut best = vec![[0_usize; MAX_DP + 1]; l + 1];
+for n in 1..=l {
+    best[n][0] = n * (n + 1) / 2;
+    for s in 1..=MAX_DP {
+        best[n][s] = (1..n)
+            .map(|k| k + best[k][s] + best[n - k][s - 1])
+            .min()
+            .unwrap_or(1);
+    }
+}
+// Forward-step count for explicit with c uniformly spaced boundaries.
+let uniform = |c: usize| -> Result<usize, SciOxideError> {
+    let boundaries: Vec<usize> = (0..c).map(|i| i * l / c).collect();
+    Ok(CheckpointSchedule::explicit(l, &boundaries)?.forward_steps())
+};
+let mut rows = Vec::new();
+for slots in [0, 1, 2, 3, 4, 6, 8, 16] {
+    let schedule = CheckpointSchedule::binomial(l, slots).map_err(|e| e.to_string())?;
+    let used = schedule.checkpoint_slots();
+    // Count lengths of Advance intervals passed by visit.
+    let mut control = vec![0_u64; schedule.control_slots()];
+    let mut advanced = 0;
+    schedule
+        .visit(l, &mut control, |action| {
+            if let CheckpointAction::Advance { start, end } = action {
+                advanced += end - start;
+            }
+            Ok(())
+        })
+        .map_err(|e| e.to_string())?;
+    let (r, formula) = closed(used as u128 + 1);
+    let dp = (slots <= MAX_DP).then(|| best[l][slots]);
+    let explicit = uniform(used + 1).map_err(|e| e.to_string())?;
+    let forward = schedule.forward_steps();
+    rows.push((
+        slots,
+        used,
+        used + 1,
+        r as u64,
+        forward,
+        advanced,
+        formula as u64,
+        dp,
+        explicit,
+    ));
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "Requested slots", "type": "integer" },
+    { "key": "1", "label": "Used slots", "type": "integer" },
+    { "key": "2", "label": "Snapshots c", "type": "integer" },
+    { "key": "3", "label": "Repetition number r", "type": "integer" },
+    { "key": "4", "label": "forward_steps() [count]", "type": "integer" },
+    { "key": "5", "label": "Total Advance steps from visit [count]", "type": "integer" },
+    { "key": "6", "label": "Closed form (r+1)l − C(c+r, c+1) [count]", "type": "integer" },
+    { "key": "7", "label": "Dynamic programming T(l, s) [count]", "type": "integer", "nullText": "Omitted for s > 8" },
+    { "key": "8", "label": "forward_steps() for uniformly spaced explicit [count]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "schedules" })
+);
+
+// Forward steps per step for each snapshot count c.
+let (mut binomial_curve, mut explicit_curve) = (Vec::new(), Vec::new());
+for c in 1..=32.min(l) {
+    let forward = CheckpointSchedule::binomial(l, c - 1)
+        .map_err(|e| e.to_string())?
+        .forward_steps();
+    binomial_curve.push([c as f64, forward as f64 / l as f64]);
+    let explicit = uniform(c).map_err(|e| e.to_string())?;
+    explicit_curve.push([c as f64, explicit as f64 / l as f64]);
+}
+emit_line_chart!(
+    &vec![
+        serde_json::json!({
+            "name": "binomial",
+            "points": binomial_curve,
+            "style": { "showSymbol": true }
+        }),
+        serde_json::json!({
+            "name": "Uniformly spaced explicit",
+            "points": explicit_curve,
+            "style": { "lineType": "dashed" }
+        })
+    ],
+    options = &serde_json::json!({
+        "xLabel": "Snapshot count c (including the initial state)",
+        "yLabel": "Forward steps per step [count]",
+        "yType": "log"
+    })
+);
+```
+
+At the default $l = 64$, `forward_steps()`, the sum of `Advance` steps from `visit`, the closed form, and the dynamic-programming minimum agree in every row.
+With only the initial state ($c = 1$), the count is $l(l + 1)/2 = 2080$, decreasing to 322 for $c = 3$, 211 for $c = 7$, and 173 for $c = 17$.
+The repetition number for $c = 17$ is $r = 2$, giving 2.7 forward steps per step.
+The binomial-schedule curve in the chart falls rapidly from $(l + 1)/2 = 32.5$ at $c = 1$ to 2.8 at $c = 10$, then decreases slowly.
+
+The uniformly spaced `explicit` column counts forward steps excluding those that save boundary states.
+Each interval of length $l/c$ incurs quadratic computational cost, so counts exceed those of binomial schedules when $c$ is small (715 versus 322 at $c = 3$).
+Binomial schedule counts also include advancing from the initial state to snapshot positions.
+Thus, as $c$ approaches $l$, `forward_steps()` for `explicit` becomes smaller (154 versus 173 at $c = 17$).
+When used with `checkpointed_loop`, forward steps for saving boundaries are added (60 steps to the last boundary 60 when $c = 17$).
+Forward steps per step for uniformly spaced `explicit` are approximately $(l/c + 1)/2$, decreasing inversely with $c$.
+
+At $l = 400$, the gap grows: with $c = 9$, the binomial schedule takes 1714 forward steps ($r = 4$), versus 9090 for uniformly spaced `explicit`.
+At $l = 3$, `slots` is capped at $l - 1 = 2$; all rows with `slots` at least 2 have $c = 3$ and $(l - 1) + l = 5$ forward steps.
+
+## Checkpointed loops and ordinary loops
+
+The next two cells advance the logistic equation $\dot y = r y (1 - y)$ over $[0, 10]$ with the explicit Euler method below,
+
+$$
+y_{k+1} = y_k + \Delta t\, r\, y_k (1 - y_k), \qquad \Delta t = 10/N
+$$
+
+using $N$ steps, then differentiate the final value $y_N$ at $y_0 = 0.1$ and $r = 0.8$.
+The following definitions provide a one-step `LoopBody` and `final_value`, which computes $y_N$ from the point $(y_0, r)$ with either an ordinary loop or `checkpointed_loop`.
+
+```rust
+//| id: ad-logistic-euler-model
+//| kind: definitions
+//| title: "Explicit Euler loop for the logistic equation"
+//| crates: [scioxide-ad, scioxide-core]
+use scioxide_ad::{CheckpointSchedule, LoopBody, Real, checkpointed_loop};
+use scioxide_core::SciOxideError;
+use std::sync::Arc;
+
+/// One explicit Euler step for ẏ = r·y·(1 − y). State: [y]; parameters: [r].
+pub(crate) struct Logistic {
+    pub(crate) dt: f64,
+}
+
+impl LoopBody for Logistic {
+    fn step<R: Real>(
+        &self,
+        _: usize,
+        state: &mut [R],
+        parameters: &[R],
+    ) -> Result<(), SciOxideError> {
+        let y = state[0];
+        state[0] = y + parameters[0] * y * (-y + 1.0) * self.dt;
+        Ok(())
+    }
+}
+
+/// y_N after steps steps from point x = [y₀, r].
+/// Advance with checkpointed_loop if schedule is present, or an ordinary loop otherwise.
+pub(crate) fn final_value<R: Real>(
+    body: &Arc<Logistic>,
+    steps: usize,
+    x: &[R],
+    schedule: Option<&CheckpointSchedule>,
+) -> Result<R, SciOxideError> {
+    let mut y = [x[0]];
+    match schedule {
+        Some(schedule) => checkpointed_loop(body, steps, &mut y, &x[1..], schedule)?,
+        None => (0..steps).try_for_each(|k| body.step(k, &mut y, &x[1..]))?,
+    }
+    Ok(y[0])
+}
+```
+
+The first cell computes the gradient $(\partial y_N / \partial y_0, \partial y_N / \partial r)$ using an ordinary loop on a tape, `checkpointed_loop` (`binomial(N, s)`), and forward-mode `MultiDual<f64, 2>`.
+`MultiDual` executes an ordinary loop inside `checkpointed_loop`, providing a check independent of the tape.
+The first table shows the gradient, outer tape word count and preallocated bytes, and reverse-sweep forward-step count (`forward_steps()`); the second shows maximum relative differences from the ordinary-loop tape.
+
+```rust
+//| id: ad-checkpointed-logistic
+//| ref: ad-checkpointed-logistic
+//| title: "Compute the gradient of logistic-equation Euler integration with a checkpointed loop"
+//| run: reactive
+//| uses: [ad-logistic-euler-model]
+//| crates: [scioxide-ad, scioxide-core]
+//| inputs:
+//|   steps: {"type":"range","label":"Step count N","description":"Number of explicit Euler steps dividing [0, 10] into N equal parts.","min":10,"max":2000,"step":10,"value":1000}
+//|   slots: {"type":"range","label":"Slot count s","description":"s in CheckpointSchedule::binomial(N, s) (snapshots excluding the initial state).","min":0,"max":16,"step":1,"value":4}
+//| cases:
+//|   - {"id":"no-slots","label":"s = 0","description":"Restarting from the initial state alone gives N(N + 1)/2 forward steps.","inputs":{"slots":0}}
+//|   - {"id":"short","label":"N = 50, s = 16","description":"More slots are available, and forward-step count approaches 2N.","inputs":{"steps":50,"slots":16}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/1/1","approx":{"value":0.03313161610555647,"rtol":1e-12}}
+//|       - {"artifact":"methods","path":"/rows/1/2","approx":{"value":0.02977426183409466,"rtol":1e-12}}
+//|       - {"artifact":"methods","path":"/rows/0/3","equals":5003}
+//|       - {"artifact":"methods","path":"/rows/1/3","equals":8}
+//|       - {"artifact":"methods","path":"/rows/1/5","equals":7284}
+//|       - {"artifact":"agreement","path":"/rows/0/1","range":{"max":1e-14}}
+//|       - {"artifact":"agreement","path":"/rows/1/1","range":{"max":1e-13}}
+//|   - case: no-slots
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/1/5","equals":500500}
+//|       - {"artifact":"agreement","path":"/rows/0/1","range":{"max":1e-14}}
+//|   - case: short
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/0/3","equals":253}
+//|       - {"artifact":"methods","path":"/rows/1/5","equals":131}
+//|       - {"artifact":"agreement","path":"/rows/0/1","range":{"max":1e-14}}
+use scioxide_ad::{CheckpointSchedule, MultiDual, Tape, TapeOptions};
+use scioxide_core::ExecutionContext;
+use std::sync::Arc;
+
+let n = steps as usize;
+let body = Arc::new(Logistic {
+    dt: 10.0 / n as f64,
+});
+let schedule = CheckpointSchedule::binomial(n, slots as usize).map_err(|e| e.to_string())?;
+let cx = ExecutionContext::sequential();
+let point = [0.1, 0.8]; // [y₀, r]
+let mut rows = Vec::new();
+let mut gradients = Vec::new();
+for checkpoint in [None, Some(&schedule)] {
+    // An ordinary loop leaves every step's statements on the outer tape.
+    let mut tape = Tape::<f64>::new(TapeOptions::new());
+    let mut gradient = [0.0; 2];
+    tape.gradient_into(
+        |x| final_value(&body, n, x, checkpoint),
+        &point,
+        &mut gradient,
+        cx,
+    )
+    .map_err(|e| e.to_string())?;
+    let report = tape.report();
+    let name = match checkpoint {
+        Some(_) => "checkpointed_loop（Tape<f64>）",
+        None => "Ordinary loop (Tape<f64>)",
+    };
+    rows.push((
+        name,
+        gradient[0],
+        gradient[1],
+        Some(report.words()),
+        Some(report.reserved_bytes()),
+        checkpoint.map(|s| s.forward_steps()),
+    ));
+    gradients.push(gradient);
+}
+// Independent check: MultiDual executes an ordinary loop inside checkpointed_loop.
+let seeded = [
+    MultiDual::new(point[0], [1.0, 0.0]),
+    MultiDual::new(point[1], [0.0, 1.0]),
+];
+let tangent = final_value(&body, n, &seeded, Some(&schedule))
+    .map_err(|e| e.to_string())?
+    .gradient();
+rows.push((
+    "checkpointed_loop（MultiDual<f64, 2>）",
+    tangent[0],
+    tangent[1],
+    None,
+    None,
+    None,
+));
+let sci6 = serde_json::json!({ "notation": "scientific", "significantDigits": 6 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Method" },
+    { "key": "1", "label": "∂y_N/∂y₀ [-]", "type": "number", "format": sci6 },
+    { "key": "2", "label": "∂y_N/∂r [-]", "type": "number", "format": sci6 },
+    { "key": "3", "label": "Tape word count [words]", "type": "integer", "nullText": "No tape" },
+    { "key": "4", "label": "Preallocated bytes [B]", "type": "integer", "nullText": "No tape" },
+    { "key": "5", "label": "Reverse-sweep forward steps [count]", "type": "integer", "nullText": "None" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "methods" })
+);
+
+// Maximum relative difference against the ordinary-loop tape.
+let plain = gradients[0];
+let gap = |g: [f64; 2]| {
+    (0..2)
+        .map(|i| (g[i] - plain[i]).abs() / plain[i].abs())
+        .fold(0.0, f64::max)
+};
+let agreement = vec![
+    ("checkpointed_loop（Tape<f64>）", gap(gradients[1])),
+    ("checkpointed_loop（MultiDual<f64, 2>）", gap(tangent)),
+];
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let agreement_columns = serde_json::json!([
+    { "key": "0", "label": "Method" },
+    { "key": "1", "label": "Maximum relative difference from ordinary loop [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    agreement_columns,
+    agreement,
+    metadata = serde_json::json!({ "id": "agreement" })
+);
+```
+
+At the defaults $N = 1000$ and $s = 4$, the `checkpointed_loop` gradient has the same bits as the ordinary loop (relative difference zero).
+In this example, parameter $r$ is used only once per step, so the adjoints are also added in the same order as in the ordinary loop.
+In general, addition order can differ, so agreement should be understood as being within rounding.
+The relative difference from the `MultiDual` gradient is $2.0 \times 10^{-15}$.
+
+The outer tape has 5003 words for the ordinary loop (5 words per step) and 8 words for `checkpointed_loop`.
+Those 8 words consist of the constant and two input words, the call statement header and two arguments and a copy of the header, and the final-state output word.
+Preallocated sizes are 120180 B and 404 B; the reverse sweep's inner tape is constructed each time and is excluded from this column.
+In exchange, the reverse sweep recomputes 7284 ($7.3N$) forward steps on values.
+Here $c = 5$ and $r = 8$, agreeing with the closed form $9N - \binom{13}{6} = 7284$.
+
+Setting $s = 0$ changes the forward-step count to $N(N + 1)/2 = 500500$ without changing the gradient.
+At $N = 50$ and $s = 16$, the forward-step count is 131 ($2.6N$), using 8 tape words compared with 253 for the ordinary loop.
+
+The second cell supplies $(y_0, r)$ and the tangent $(0, 1)$ in direction $r$ to `Tape<Dual<f64>>` and computes the gradient's derivative in direction $r$, that is, the Hessian–vector product $(\partial^2 y_N / \partial y_0 \partial r, \partial^2 y_N / \partial r^2)$, with an ordinary loop and `checkpointed_loop`.
+The independent check uses two tapeless forward-over-forward evaluations with `Dual<Dual<f64>>`, setting the inner direction to $y_0$ or $r$ and the outer direction to $r$.
+The table shows both components, outer tape word count, and the maximum relative difference of the two components against the `Dual<Dual<f64>>` row.
+
+```rust
+//| id: ad-checkpointed-logistic-hvp
+//| ref: ad-checkpointed-logistic-hvp
+//| title: "Hessian–vector product through a checkpointed loop"
+//| run: reactive
+//| uses: [ad-logistic-euler-model]
+//| crates: [scioxide-ad, scioxide-core]
+//| inputs:
+//|   steps: {"type":"range","label":"Step count N","description":"Number of explicit Euler steps dividing [0, 10] into N equal parts.","min":10,"max":2000,"step":10,"value":1000}
+//|   slots: {"type":"range","label":"Slot count s","description":"s in CheckpointSchedule::binomial(N, s) (snapshots excluding the initial state).","min":0,"max":16,"step":1,"value":4}
+//| cases:
+//|   - {"id":"short","label":"N = 50, s = 16","description":"Fewer steps also change the magnitudes of the second derivatives.","inputs":{"steps":50,"slots":16}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"products","path":"/rows/1/2","approx":{"value":-0.29736070186236746,"rtol":1e-12}}
+//|       - {"artifact":"products","path":"/rows/0/3","equals":5003}
+//|       - {"artifact":"products","path":"/rows/1/3","equals":8}
+//|       - {"artifact":"products","path":"/rows/0/4","range":{"max":1e-12}}
+//|       - {"artifact":"products","path":"/rows/1/4","range":{"max":1e-12}}
+//|   - case: short
+//|     expect:
+//|       - {"artifact":"products","path":"/rows/1/2","approx":{"value":-0.27702146777241593,"rtol":1e-12}}
+//|       - {"artifact":"products","path":"/rows/1/4","range":{"max":1e-12}}
+use scioxide_ad::{CheckpointSchedule, Dual, Tape, TapeOptions, Var};
+use scioxide_core::ExecutionContext;
+use std::sync::Arc;
+
+let n = steps as usize;
+let body = Arc::new(Logistic {
+    dt: 10.0 / n as f64,
+});
+let schedule = CheckpointSchedule::binomial(n, slots as usize).map_err(|e| e.to_string())?;
+let cx = ExecutionContext::sequential();
+let point = [0.1, 0.8]; // [y₀, r]
+
+// Independent check: set the inner direction of Dual<Dual<f64>> to y₀ or r and the outer direction to r.
+let nested = |inner: usize| -> Result<f64, String> {
+    let x: Vec<Dual<Dual<f64>>> = (0..2)
+        .map(|i| {
+            let tangent = if i == inner { 1.0 } else { 0.0 };
+            let outer = if i == 1 { 1.0 } else { 0.0 };
+            Dual::new(Dual::new(point[i], tangent), Dual::new(outer, 0.0))
+        })
+        .collect();
+    let y = final_value(&body, n, &x, None).map_err(|e| e.to_string())?;
+    Ok(y.derivative().derivative())
+};
+let reference = [nested(0)?, nested(1)?];
+
+let mut rows = Vec::new();
+for checkpoint in [None, Some(&schedule)] {
+    // The derivative part of the tape gradient seeded with tangent (0, 1) in direction r is H·(0, 1).
+    let mut tape = Tape::<Dual<f64>>::new(TapeOptions::new());
+    let mut product = [Dual::new(0.0, 0.0); 2];
+    tape.gradient_into(
+        |x: &[Var<'_, Dual<f64>>]| final_value(&body, n, x, checkpoint),
+        &[Dual::new(point[0], 0.0), Dual::new(point[1], 1.0)],
+        &mut product,
+        cx,
+    )
+    .map_err(|e| e.to_string())?;
+    let hv = [product[0].derivative(), product[1].derivative()];
+    let gap = (0..2)
+        .map(|i| (hv[i] - reference[i]).abs() / reference[i].abs())
+        .fold(0.0, f64::max);
+    let name = match checkpoint {
+        Some(_) => "checkpointed_loop（Tape<Dual<f64>>）",
+        None => "Ordinary loop (Tape<Dual<f64>>)",
+    };
+    rows.push((name, hv[0], hv[1], Some(tape.report().words()), Some(gap)));
+}
+rows.push((
+    "Forward-over-forward (Dual<Dual<f64>>)",
+    reference[0],
+    reference[1],
+    None,
+    None,
+));
+let sci6 = serde_json::json!({ "notation": "scientific", "significantDigits": 6 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Method" },
+    { "key": "1", "label": "∂²y_N/∂y₀∂r [-]", "type": "number", "format": sci6 },
+    { "key": "2", "label": "∂²y_N/∂r² [-]", "type": "number", "format": sci6 },
+    { "key": "3", "label": "Tape word count [words]", "type": "integer", "nullText": "No tape" },
+    { "key": "4", "label": "Relative difference [-]", "type": "number", "format": sci2, "nullText": "Reference row" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "products" })
+);
+```
+
+At the defaults $N = 1000$ and $s = 4$, the `checkpointed_loop` Hessian–vector product $(-0.330925, -0.297361)$ has the same bits as the ordinary loop and a maximum relative difference of $1.9 \times 10^{-15}$ from `Dual<Dual<f64>>`.
+Outer tape word counts are 5003 and 8, as for first derivatives; even with `Tape<Dual<f64>>`, `checkpointed_loop` needs just one call statement.
+At $N = 50$ and $s = 16$, the result is $(-0.316257, -0.277021)$ and the maximum relative difference is $5.3 \times 10^{-16}$.
+
+## Summary
+
+When differentiating long loops with `Var`, choose between a fully stored ordinary loop and `checkpointed_loop`, which limits memory to snapshots and a one-step tape, by comparing the recomputation indicated by `forward_steps()`.
+The binomial schedule's forward-step count is the Griewank–Walther minimum plus one forward execution per step, $(r + 1)\,l - \binom{c + r}{c + 1}$; adding just a few snapshots reduces it from $l(l + 1)/2$ to a few multiples of $l$.
+The gradient from `checkpointed_loop` agrees with an ordinary loop within rounding, and `Tape<Dual<f64>>` also gives Hessian–vector products through loops.
+Pass `explicit` to choose the interval partition yourself.
+Its forward-step count is `forward_steps()` plus forward steps to the last boundary.
+`checkpointed_loop` allocates workspace on every recording and sweep, so compare it with ordinary loops when allocation-free repetition is needed.
+
+## Further reading
+
+- [Kinks and nonfinite-value policies](../nonsmooth-and-nonfinite-policies/): examine the midpoint convention for `abs` and `max` inside loops and how `KinkPolicy` detects kinks in ordinary loops.
+- [Differentiating implicit functions](../implicit-functions/): examine how to obtain solution sensitivities using the implicit function theorem without recording the iteration history.
+- [Tape lifecycle and reuse](../tape-lifecycle/): examine outer tape capacity and the conditions for allocation-free reuse.

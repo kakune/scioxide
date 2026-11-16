@@ -1,0 +1,421 @@
+---
+title: "Second derivatives and Hessian operators"
+description: "Derive Hessian-vector products as directional derivatives of gradients with forward-over-reverse; examine hvp_into and one-shot hvp and hessian costs and function execution counts, nested forward mode, and matrix-free HessianOperator and JacobianOperator through symmetry and adjoint relations."
+sidebar:
+  order: 335
+references:
+  ad-hessian-vector-products: "hvp_into-and-one-shot-hvp-and-hessian"
+  ad-nested-forward-second-order: "nesting-forward-mode"
+  ad-matrix-free-operators: "matrix-free-operators"
+  ad-hessian-operator: "hessianoperator"
+  ad-jacobian-operator: "jacobianoperator"
+  ad-operator-symmetry-checks: "checking-symmetry-and-adjoints"
+---
+
+Newton methods, trust-region methods and equilibrium stability analysis require the Hessian $H = \nabla^2 f$ of a scalar function $f: \mathbb{R}^n \to \mathbb{R}$.
+A dense $H$ has $n^2$ entries and requires $n$ directional derivatives of the gradient.
+Iterative solvers such as Krylov subspace methods often use only product $Hv$ or products $Jv$ and $J^{\mathsf T} w$ with Jacobian $J$ of a map $F: \mathbb{R}^n \to \mathbb{R}^m$.
+This page derives Hessian-vector products as directional derivatives of gradients and explains `scioxide-ad` functions computing them and operators computing only products without assembling matrices.
+[Reverse mode and tapes](../reverse-mode-and-replay/) explains recording, reverse sweeps and tangent sweeps (traversing the recording forward to write tangents); [Forward mode and dual numbers](../forward-mode/) explains dual numbers.
+[Structural patterns and sparse derivative recovery](../sparse-derivatives/) covers recovering sparse $H$ or $J$ from fewer directional derivatives.
+
+The derivation assumes $f$ is twice continuously differentiable near the evaluation point.
+Then $H$ is symmetric.
+See [Handling kinks and nonfinite values](../nonsmooth-and-nonfinite-policies/) for conventions at kinks (points with unequal one-sided derivatives).
+
+## Deriving Hessian-vector products
+
+Writing the gradient as $g(x) = \nabla f(x)$, a Hessian-vector product (HVP) is the directional derivative of that gradient.
+
+$$
+H(x)\,v = \left.\frac{d}{dt}\, g(x + t v)\right|_{t=0}
+$$
+
+A reverse-mode gradient records the function on a tape and performs one reverse sweep, giving $g$ as a function of $x$.
+Evaluating a differentiable map $G$ at $x + v\,\varepsilon$ with dual-number $a + \dot a\,\varepsilon$ ($\varepsilon^2 = 0$) arithmetic gives $G(x) + G'(x)\,v\,\varepsilon$.
+Treating recording and reverse sweep together as $G = g$, use dual-number inputs $x_i + v_i\,\varepsilon$ and perform the same computation with dual-number arithmetic: the value component gives $\nabla f(x)$ and the derivative component $H(x)\,v$.
+This nesting of forward mode outside reverse mode is called forward-over-reverse.
+
+At the level of each statement (one tape record), it works as follows.
+Partial derivative $\partial\phi_i/\partial u_j$ of statement $u_i = \phi_i(u_j, \dots)$ is recorded as a dual number, whose derivative component is the change $\sum_k (\partial^2\phi_i/\partial u_j\,\partial u_k)\,\dot u_k$ along direction $v$.
+Here $\dot u_k$ is a tangent component of $u_k$; at the inputs, $\dot x = v$.
+The reverse sweep carries adjoint $\bar u$ as dual number $\bar u + \dot{\bar u}\,\varepsilon$, starts with output $\bar u_L = 1$ and $\dot{\bar u}_L = 0$, and updates each statement as follows:
+
+$$
+\bar u_j \mathrel{+}= \bar u_i\,\frac{\partial \phi_i}{\partial u_j}, \qquad
+\dot{\bar u}_j \mathrel{+}= \dot{\bar u}_i\,\frac{\partial \phi_i}{\partial u_j} + \bar u_i \sum_k \frac{\partial^2 \phi_i}{\partial u_j\,\partial u_k}\,\dot u_k
+$$
+
+
+The second formula is the coefficient of $\varepsilon$ when evaluating the first with dual-number multiplication.
+At the inputs, $\bar x = \nabla f(x)$ and $\dot{\bar x} = H(x)\,v$.
+Each statement needs only local first and second partial derivatives; no $n \times n$ matrix is constructed.
+
+Cost is one dual-number recording and one reverse sweep, a small constant multiple of one gradient.
+The constant depends on operation types and is independent of $n$.
+Since recorded partial derivatives (except constant partials) and adjoints are dual numbers, the tape uses more storage than `Tape<f64>` for the same function.
+Comparisons use innermost nested values, so branches are selected at point $x$ and $Hv$ differentiates the selected branch expression.
+There is no finite-difference truncation error; errors arise from rounding partial derivatives and accumulation in each statement.
+
+## hvp_into and one-shot hvp and hessian
+
+`hvp_into(function, point, direction, product, context)` of `Tape<Dual<S>>` records the function with seed `Dual::new(xᵢ, vᵢ)`, performs one reverse sweep, writes $Hv$ to `product` and returns value $f(x)$.
+`function` returns one scalar and takes `&[Var<'_, Dual<f64>>]` as its argument.
+When passing a closure, annotate the argument type as `|x: &[Var<'_, Dual<f64>>]|` and call a generic `R: Real` model inside the closure.
+If `direction` or `product` length differs from `point`, it returns `DimensionMismatch`.
+Other failures match `Tape::gradient_into` recording failures.
+For example, under `NonFinitePolicy::Error`, a nonfinite dual-number value or derivative component gives `NonFinite`; under `KinkPolicy::Error`, encountering a kink gives `DomainError`.
+On failure, `product` remains unchanged.
+The tape owns the seed array; subsequent calls with the same function and tape do not allocate.
+
+One-shot `hvp(function, point, direction)` and `hessian(function, point)` use a new tape and `ExecutionContext::sequential_native()` and return allocated results.
+`hvp` returns `scioxide_linalg::Vector`; `hessian` returns a row-major $n \times n$ `scioxide_linalg::Matrix`.
+`hessian` records once per unit direction $e_j$ and writes $H e_j$ to column $j$, requiring $n$ recordings.
+On a new tape, the first execution only counts statements, then the tape grows and the function executes again to record ([Tape lifecycle and reuse](../tape-lifecycle/)).
+Thus, function executions are 2 for `hvp` and $n + 1$ for `hessian`.
+Even with no inputs ($n = 0$), `hessian` executes the function twice to check function errors before returning a $0 \times 0$ matrix.
+If $n \times n$ does not fit `usize`, it returns `SizeOverflow` before executing the function; failed result allocation returns `AllocationFailure`.
+Since $H_{ij}$ and $H_{ji}$ come from separate recordings, the result of `hessian` is symmetric within rounding error and is not symmetrized.
+For many directions at the same point, repeating `hvp_into` on one tape avoids both allocation and executions to count statements.
+Use dense $H$ when $n$ is small or for independent checks.
+
+## Nesting forward mode
+
+Nested forward-mode number types also compute second-order quantities without tapes.
+For `Dual<Dual<f64>>` input $x_i = (p_i + v_i\,\varepsilon_1) + (u_i + 0\,\varepsilon_1)\,\varepsilon_2$, the output coefficient of $\varepsilon_1\varepsilon_2$, namely `f.derivative().derivative()`, is $u^{\mathsf T} H v$.
+One evaluation gives one number: a second derivative in two directions.
+
+For `Dual<MultiDual<f64, n>>` input `Dual::new(MultiDual::variable(pᵢ, i)?, MultiDual::constant(vᵢ))`, `f.value().gradient()` is $\nabla f$ and `f.derivative().gradient()` is $\nabla(\nabla f \cdot v) = Hv$.
+This gives $n$ components of one $Hv$.
+Each operation retains $2(n + 1)$ values, so cost is a multiple of one evaluation proportional to $n$, suitable for few inputs.
+Operation order differs from forward-over-reverse, so results agree with `hvp_into` within rounding error but need not agree bit for bit.
+
+For $K$ directions, nest `MultiDual<f64, K>` outside reverse mode.
+Passing seed `MultiDual::new(pᵢ, [v₁ᵢ, …, v_Kᵢ])` to `gradient_into` of `Tape<MultiDual<f64, K>>` makes gradient component $i$ a `MultiDual` with value component $\partial f/\partial x_i$ and derivative component $((Hv_1)_i, \dots, (Hv_K)_i)$.
+One recording and one reverse sweep give $K$ HVPs; each operation's derivative component retains $K$ values.
+Each `MultiDual` component uses the same rules as `Dual`, so for the function in the later cell, each direction agrees bit for bit with `hvp_into`.
+
+## A chain of nonlinear springs
+
+The cells use a chain of $n$ variables $x_0, \dots, x_{n-1}$ arranged on a line and joined by nonlinear springs.
+Connect pairs $(i, i + d)$ ($1 \le d \le b$) up to interaction distance $b$; a spring with extension $u = x_{i+d} - x_i$ has energy $\varphi(u) = u^2 + u^4$.
+The total energy and map of spring tensions are
+
+$$
+E(x) = \sum_{d=1}^{b} \sum_{i=0}^{n-1-d} \varphi(x_{i+d} - x_i), \qquad
+F_k(x) = \varphi'(u_k) = 2u_k + 4u_k^3
+$$
+
+
+Spring indices $k$ follow ascending $d$, then ascending $i$ for equal $d$; the spring count is $m = \sum_{d=1}^{b}(n - d)$.
+Let $D$ be the $m \times n$ difference matrix collecting extensions (spring $k = (i, i + d)$'s row has $-1$ in column $i$ and $+1$ in column $i + d$); then $u = Dx$ and
+
+$$
+\nabla E = D^{\mathsf T} F(x), \qquad
+J_F = \operatorname{diag}(\varphi''(u))\,D, \qquad
+H_E = D^{\mathsf T} \operatorname{diag}(\varphi''(u))\,D = D^{\mathsf T} J_F
+$$
+
+where $\varphi''(u) = 2 + 12u^2$.
+The evaluation point is $x_i = 0.3 \sin(1.7\,i)$.
+
+The next definitions block writes $E$ as `chain_energy`, $F$ as `bond_tensions` and evaluation points as `chain_point` in generic functions working with all number types.
+
+```rust
+//| id: ad-spring-chain-model
+//| kind: definitions
+//| title: "Nonlinear spring-chain energy and tension"
+//| crates: [scioxide-ad, scioxide-core]
+use scioxide_ad::Real;
+use scioxide_core::RealScalar;
+
+/// Evaluation points xᵢ = 0.3 sin(1.7 i) (input data).
+pub(crate) fn chain_point(n: usize) -> Vec<f64> {
+    (0..n)
+        .map(|i| 0.3 * RealScalar::sin(1.7 * i as f64))
+        .collect()
+}
+
+/// E(x) = Σ_{d=1}^{b} Σ_i φ(x_{i+d} − x_i), φ(u) = u² + u⁴.
+pub(crate) fn chain_energy<R: Real>(x: &[R], reach: usize) -> R {
+    let n = x.len();
+    let mut total = R::zero();
+    for d in 1..=reach {
+        for i in 0..n.saturating_sub(d) {
+            let u = x[i + d] - x[i];
+            let u2 = u * u;
+            total = total + u2 + u2 * u2;
+        }
+    }
+    total
+}
+
+/// Append tensions F_k = φ′(u_k) = 2u_k + 4u_k³ in ascending d, then ascending i for equal d.
+pub(crate) fn bond_tensions<R: Real>(x: &[R], reach: usize, out: &mut Vec<R>) {
+    let n = x.len();
+    for d in 1..=reach {
+        for i in 0..n.saturating_sub(d) {
+            let u = x[i + d] - x[i];
+            out.push(u * 2.0 + u * u * u * 4.0);
+        }
+    }
+}
+```
+
+## Matrix-free operators
+
+To pass $H$ or $J$ to iterative solvers, use operators computing products without assembling matrices.
+`scioxide-core` defines `LinearOperator` applying a size-`rows() × cols()` operator as `output = A · input`, and `AdjointOperator` additionally applying $A^{\mathsf T}$ ($A^{\mathsf H}$ for complex numbers) ([Operator protocols and closure operators](../../../scioxide-core/algorithms/operator-protocols-and-structure/)).
+Both take caller-supplied workspace, whose lengths are returned by `apply_workspace_len()` and `apply_adjoint_workspace_len()`.
+The two `scioxide-ad` operators implement these traits and can be passed directly to solvers accepting `&dyn LinearOperator<f64>`.
+
+| Operator | Construction | Implemented traits | Size | One application | Workspace length |
+|---|---|---|---|---|---|
+| `HessianOperator` | `hessian_operator` of `Tape<Dual<S>>` | `LinearOperator` | $n \times n$ | $Hv$ with one function recording and one reverse sweep | 0 |
+| `JacobianOperator` | `jacobian_operator` of `Linearization` | `LinearOperator`, `AdjointOperator` | $m \times n$ | Reuses the recording: one tangent sweep for $Jv$, one reverse sweep for $J^{\mathsf T} w$ | Statement count plus twice the call-statement temporary storage |
+
+`scioxide-core` also has trait `scioxide_core::JacobianOperator` obtaining $J(x)\,v$ of a nonlinear map at changing points; that is a separate item and `scioxide_ad::JacobianOperator` does not implement it.
+`scioxide_ad::JacobianOperator` is a linear operator fixed to a recording at one point.
+
+### HessianOperator
+
+`hessian_operator` takes a function, point and execution context (`ExecutionContext`), returning a Hessian operator at point $x$.
+The operator mutably borrows the tape into a cell (`Cell`); each application takes the tape, records with the direction as seed, performs one reverse sweep, then returns the tape.
+In $Hv$ recordings, dual-number partial derivatives contain direction $v$, so the recording must be recreated per direction.
+Construction records once with direction 0 to set capacity; on a new tape it executes the function twice, followed by one execution per application.
+Branches depend only on the point, independently of direction, so this capacity suffices for later recordings and application does not allocate.
+Each application performs its reverse sweep with the context supplied during construction.
+
+No workspace is used, so `apply_workspace_len()` is 0 and `apply_into` takes an empty slice.
+Nonfinite inputs return `NonFinite` (source `Input`); nonfinite results return `NonFinite` (source `Output`); neither changes the output.
+This is an operator-protocol requirement independent of the tape's `NonFinitePolicy`.
+Although $H$ is symmetric, the operator does not implement `AdjointOperator`, so it cannot be passed to solvers requiring adjoint application.
+Construction failures match `hvp_into` recording with direction 0.
+
+### JacobianOperator
+
+`jacobian_operator()` of the `Linearization` returned by `Tape<S>::linearize` exposes $J$ on that recording as an operator.
+`apply_into` obtains $Jv$ with one tangent sweep; `apply_adjoint_into` obtains $J^{\mathsf T} w$ with one reverse sweep, without reexecuting the function.
+The operator immutably borrows the tape and places sweep working values in caller-supplied workspace.
+Workspace length is the recording's statement count plus twice the temporary storage of call statements (single statements recorded by operations such as `solve_into`); application does not allocate.
+Application takes no context, so sweeps run to completion without interruption checks.
+
+Inputs and results must be finite; otherwise it returns `NonFinite` without changing outputs.
+If a recording contains `checkpointed_loop`, its products require a tape, so `jacobian_operator()` returns `CapabilityUnavailable` ([Loops and checkpointing](../checkpointing/)).
+While the operator lives, `Linearization` cannot be mutably borrowed; release the operator before calling products such as `vjp_into`.
+
+### Checking symmetry and adjoints
+
+The next cell applies spring-chain $H_E$ and $J_F$ as operators, checking four relations.
+
+- Symmetry $\langle u, H v\rangle = \langle H u, v\rangle$.
+- Adjoint relation $\langle J v, w\rangle = \langle v, J^{\mathsf T} w\rangle$.
+- $Hv = D^{\mathsf T}(Jv)$ from $H_E = D^{\mathsf T} J_F$.
+  $D^{\mathsf T}$ is applied manually as the transpose of a difference matrix for an independent check.
+- Agreement between $Hv$ of `HessianOperator` and the second HVP from computing two directions $(u, v)$ together with `Tape<MultiDual<f64, 2>>`.
+
+Inputs are variable count $n$ (4 to 40) and spring interaction distance $b$ (1 to 3).
+Directions are fixed as $u_i = \sin(0.9 i + 0.3)$, $v_i = \cos(0.4 i)$ and $w_k = \cos(0.7 k + 0.2)$.
+The first table shows both sides and differences for the four relations; the second shows operator dimensions and workspace lengths.
+
+```rust
+//| id: ad-derivative-operators
+//| ref: ad-derivative-operators
+//| title: "Check symmetry and adjoints of Hessian and Jacobian operators"
+//| run: reactive
+//| uses: [ad-spring-chain-model]
+//| crates: [scioxide-ad, scioxide-core]
+//| inputs:
+//|   masses: {"type":"range","label":"Variable count n","min":4,"max":40,"step":1,"value":12}
+//|   reach: {"type":"range","label":"Spring interaction distance b","description":"Connect x_i and x_{i+d} (1 ≤ d ≤ b) with a spring.","min":1,"max":3,"step":1,"value":2}
+//| cases:
+//|   - {"id":"long-chain","label":"n = 40, b = 3","description":"A long chain with 114 springs.","inputs":{"masses":40,"reach":3}}
+//|   - {"id":"shortest","label":"n = 4, b = 1","description":"The smallest chain, with 3 springs.","inputs":{"masses":4,"reach":1}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"checks","path":"/rows/0/3","approx":{"value":0,"atol":1e-12}}
+//|       - {"artifact":"checks","path":"/rows/1/3","approx":{"value":0,"atol":1e-12}}
+//|       - {"artifact":"checks","path":"/rows/2/3","approx":{"value":0,"atol":1e-12}}
+//|       - {"artifact":"checks","path":"/rows/3/3","equals":0}
+//|       - {"artifact":"shapes","path":"/rows/0/1","equals":21}
+//|       - {"artifact":"shapes","path":"/rows/1/1","equals":12}
+//|       - {"artifact":"shapes","path":"/rows/4/1","equals":0}
+//|   - case: long-chain
+//|     expect:
+//|       - {"artifact":"checks","path":"/rows/0/3","approx":{"value":0,"atol":1e-11}}
+//|       - {"artifact":"checks","path":"/rows/1/3","approx":{"value":0,"atol":1e-11}}
+//|       - {"artifact":"checks","path":"/rows/2/3","approx":{"value":0,"atol":1e-11}}
+//|       - {"artifact":"shapes","path":"/rows/0/1","equals":114}
+//|   - case: shortest
+//|     expect:
+//|       - {"artifact":"checks","path":"/rows/0/3","approx":{"value":0,"atol":1e-13}}
+//|       - {"artifact":"checks","path":"/rows/1/3","approx":{"value":0,"atol":1e-13}}
+//|       - {"artifact":"shapes","path":"/rows/0/1","equals":3}
+use scioxide_ad::{Dual, MultiDual, Tape, TapeOptions, Var};
+use scioxide_core::{AdjointOperator, ExecutionContext, LinearOperator, RealScalar};
+
+let (n, b) = (masses as usize, reach as usize);
+let cx = ExecutionContext::sequential();
+let point = chain_point(n);
+// Directions applied to operators (input data).
+let u: Vec<f64> = (0..n)
+    .map(|i| RealScalar::sin(0.9 * i as f64 + 0.3))
+    .collect();
+let v: Vec<f64> = (0..n).map(|i| RealScalar::cos(0.4 * i as f64)).collect();
+let dot = |a: &[f64], c: &[f64]| a.iter().zip(c).map(|(x, y)| x * y).sum::<f64>();
+let norm = |a: &[f64]| a.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
+let gap = |a: &[f64], c: &[f64]| {
+    a.iter()
+        .zip(c)
+        .fold(0.0_f64, |m, (x, y)| m.max((x - y).abs()))
+};
+
+// H_E operator. Rerecord on Tape<Dual<f64>> for every application, with empty workspace.
+let mut second = Tape::<Dual<f64>>::new(TapeOptions::new());
+let hessian = second
+    .hessian_operator(
+        |x: &[Var<'_, Dual<f64>>]| Ok(chain_energy(x, b)),
+        &point,
+        cx,
+    )
+    .map_err(|e| e.to_string())?;
+let (mut hu, mut hv) = (vec![0.0; n], vec![0.0; n]);
+hessian
+    .apply_into(&u, &mut hu, &mut [])
+    .map_err(|e| e.to_string())?;
+hessian
+    .apply_into(&v, &mut hv, &mut [])
+    .map_err(|e| e.to_string())?;
+let h_workspace = hessian.apply_workspace_len().map_err(|e| e.to_string())?;
+
+// Two directions in one recording: derivative components of the gradient seeded with MultiDual(xᵢ, [uᵢ, vᵢ]) are [Hu, Hv].
+let seeds: Vec<MultiDual<f64, 2>> = (0..n)
+    .map(|i| MultiDual::new(point[i], [u[i], v[i]]))
+    .collect();
+let mut pair = Tape::<MultiDual<f64, 2>>::new(TapeOptions::new());
+let mut both = vec![MultiDual::new(0.0, [0.0; 2]); n];
+pair.gradient_into(|x| Ok(chain_energy(x, b)), &seeds, &mut both, cx)
+    .map_err(|e| e.to_string())?;
+let hv_pair: Vec<f64> = both.iter().map(|g| g.gradient()[1]).collect();
+
+// J_F operator. Perform tangent and reverse sweeps on one recording.
+let mut tape = Tape::<f64>::new(TapeOptions::new());
+let linear = tape
+    .linearize(
+        |x, y| {
+            bond_tensions(x, b, y);
+            Ok(())
+        },
+        &point,
+        cx,
+    )
+    .map_err(|e| e.to_string())?;
+let jacobian = linear.jacobian_operator().map_err(|e| e.to_string())?;
+let (m, cols) = (jacobian.rows(), jacobian.cols());
+let j_workspace = jacobian.apply_workspace_len().map_err(|e| e.to_string())?;
+let w: Vec<f64> = (0..m)
+    .map(|k| RealScalar::cos(0.7 * k as f64 + 0.2))
+    .collect();
+let (mut work, mut jv, mut jtw) = (vec![0.0; j_workspace], vec![0.0; m], vec![0.0; n]);
+jacobian
+    .apply_into(&v, &mut jv, &mut work)
+    .map_err(|e| e.to_string())?;
+jacobian
+    .apply_adjoint_into(&w, &mut jtw, &mut work)
+    .map_err(|e| e.to_string())?;
+let words = tape.report().words();
+
+// Independent check: H_E = Dᵀ J_F, so Hv = Dᵀ(Jv). Apply Dᵀ manually for each spring (i, i + d).
+let mut dt_jv = vec![0.0; n];
+let mut k = 0;
+for d in 1..=b {
+    for i in 0..n - d {
+        dt_jv[i + d] += jv[k];
+        dt_jv[i] -= jv[k];
+        k += 1;
+    }
+}
+let sig6 = serde_json::json!({ "significantDigits": 6 });
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let check_columns = serde_json::json!([
+    { "key": "0", "label": "Relation" },
+    { "key": "1", "label": "Left side A [-]", "type": "number", "format": sig6 },
+    { "key": "2", "label": "Right side B [-]", "type": "number", "format": sig6 },
+    { "key": "3", "label": "Maximum difference [-]", "type": "number", "format": sci3 }
+]);
+let checks = vec![
+    (
+        "⟨u, Hv⟩ = ⟨Hu, v⟩",
+        dot(&u, &hv),
+        dot(&hu, &v),
+        (dot(&u, &hv) - dot(&hu, &v)).abs(),
+    ),
+    (
+        "⟨Jv, w⟩ = ⟨v, Jᵀw⟩",
+        dot(&jv, &w),
+        dot(&v, &jtw),
+        (dot(&jv, &w) - dot(&v, &jtw)).abs(),
+    ),
+    (
+        "Hv = Dᵀ(Jv) (both sides in maximum norm)",
+        norm(&hv),
+        norm(&dt_jv),
+        gap(&hv, &dt_jv),
+    ),
+    (
+        "Operator Hv = second MultiDual direction",
+        norm(&hv),
+        norm(&hv_pair),
+        gap(&hv, &hv_pair),
+    ),
+];
+emit_table_with_columns!(
+    check_columns,
+    checks,
+    metadata = serde_json::json!({ "id": "checks" })
+);
+let shape_columns = serde_json::json!([
+    { "key": "0", "label": "Quantity" },
+    { "key": "1", "label": "Value", "type": "integer" }
+]);
+let shapes = vec![
+    ("J rows() (spring count m)", m),
+    ("J cols() (variable count n)", cols),
+    ("J apply_workspace_len()", j_workspace),
+    ("Recorded statement count TapeReport::words()", words),
+    ("H apply_workspace_len()", h_workspace),
+];
+emit_table_with_columns!(
+    shape_columns,
+    shapes,
+    metadata = serde_json::json!({ "id": "shapes" })
+);
+```
+
+With defaults $n = 12$ and $b = 2$, there are $m = 21$ springs.
+The symmetry difference is $2.4 \times 10^{-15}$; relative difference $3.6 \times 10^{-15}$ against dot product $\langle u, Hv\rangle \approx 0.676$ is at rounding level.
+Both sides of the adjoint relation agree bit for bit.
+The difference between $Hv$ and $D^{\mathsf T}(Jv)$ is $6.7 \times 10^{-16}$.
+These evaluate $H_E = D^{\mathsf T} J_F$ through different paths (forward-over-reverse, and a recording's tangent sweep followed by manually applying $D^{\mathsf T}$), showing that the two operators differentiate the same function.
+$Hv$ from two directions computed together with `Tape<MultiDual<f64, 2>>` agrees bit for bit with the operator's $Hv$.
+Workspace length for $J$ equals the recorded statement count 139, consistent with this recording having no call statements.
+Workspace length for $H$ is 0.
+
+At $n = 40$ and $b = 3$ (114 springs), the symmetry difference increases to $9.3 \times 10^{-15}$, but relative difference against dot product 2.33 is $4 \times 10^{-15}$, at the rounding level for more accumulated terms.
+At $n = 4$ and $b = 1$, every difference is at most $1.1 \times 10^{-16}$.
+For defaults, both cases and input endpoints, dot-product differences remain at rounding level, and $J$ workspace length equals recorded statement count.
+
+## Summary
+
+For many $H$ products in different directions at one point, repeat `hvp_into` on one `Tape<Dual<f64>>` or pass `hessian_operator` to an iterative solver to obtain $Hv$ at a constant multiple of gradient cost per application, without $n^2$ storage.
+One-shot `hvp` executes the function twice and `hessian` executes it $n + 1$ times; reuse the same tape when function evaluation is expensive.
+For $K$ directions together, use `gradient_into` of `Tape<MultiDual<f64, K>>`; for few inputs, forward mode with `Dual<MultiDual<f64, n>>` is also available.
+For repeated $J$ products, use `Linearization::jacobian_operator()` and prepare workspace of length `apply_workspace_len()` once; applications then only sweep the recording and do not allocate.
+Solvers requiring adjoint application accept `JacobianOperator`; they cannot accept `HessianOperator` because it does not implement `AdjointOperator`.
+
+## Further reading
+
+- [Structural patterns and sparse derivative recovery](../sparse-derivatives/): examine extracting nonzero positions of $H$ and $J$ from recordings and recovering sparse matrices with fewer sweeps through column coloring.
+- [Taylor jets and higher-order coefficients](../taylor-jets/): examine Taylor arithmetic for directional derivatives above second order and mixed coefficients in two variables.
+- [Hessians and Hessian-vector products](../../examples/hessian-vector-product/): examine passing `HessianOperator` to the inner iterations of Newton–CG.

@@ -1,0 +1,485 @@
+---
+title: 借用レイアウトとアフィン値
+description: Shape と StridedLayout による要素数・範囲・重なりの検査、行優先の配置 row_major、NdView と NdViewMut による借用、列優先のブロックベクトル、AffineValue の成分アクセス、および affine_combination_into の一回丸めと失敗時の不変性。
+sidebar:
+  order: 355
+references:
+  core-block-vectors: "列優先のブロックベクトル"
+  core-affine-components: "アフィン値の成分アクセス"
+  core-layout-injectivity: "単射性の証明"
+  core-shape-and-size: "形と要素数"
+  core-row-major-layout: "行優先の配置"
+  core-views-and-coordinates: "ビューと座標"
+  core-affine-combination-rounding: "一回丸めの線形結合-affine_combination_into"
+---
+
+多次元配列を扱う計算では、データの所有と並べ方（形とストライド）を分けておくと、メモリ領域をコピーせずに同じデータを転置やブロードキャストとして読める。
+`scioxide-core` は、並べ方を表す `Shape` と `StridedLayout`、それをメモリ領域に結び付ける `NdView` / `NdViewMut`、作用素に複数の右辺を渡すための列優先のブロックベクトルを提供する。
+また、状態ベクトルの線形結合をメモリ形式によらず書くための `AffineValue` を提供する。
+
+## ストライドによる配置と重なりの検査
+
+形 $(n_0, \ldots, n_{d-1})$ とストライド $(s_0, \ldots, s_{d-1})$ を持つ配置は、論理座標 $\mathbf{i} = (i_0, \ldots, i_{d-1})$ をメモリ領域の位置
+
+$$
+\mathrm{offset}(\mathbf{i}) = \sum_{k=0}^{d-1} i_k\, s_k, \qquad 0 \le i_k < n_k
+$$
+
+に写す。
+ここで $d$ は軸の数（階数）、$n_k$ は軸 $k$ の長さ、$s_k$ は軸 $k$ の添字を 1 増やしたときに進む要素数である。
+ストライドはバイト数ではなく要素数で数える。
+ストライドは符号なしの `usize` なので、メモリ領域を逆向きにたどる配置は表せない。
+原点をずらしたいときは、メモリ領域の部分スライスを渡す。
+$m \times n$ の行列では、行優先（最後の軸が最も速く動く並び）のストライドは $(n, 1)$、列優先のストライドは $(1, m)$ である。
+要素を論理順に並べる操作（`offsets()`、`iter()`、`for_each_mut`）は、ストライドによらず行優先の順でたどる。
+
+### 形と要素数
+
+`Shape::new(&extents)` は軸の長さの配列を借用し、要素数 $N = \prod_k n_k$ を検査付きの積で求める。
+どれかの軸の長さが 0 なら、掛け算の前に空の形（$N = 0$）と判定するので、ほかの軸がどれほど長くても桁あふれにはならない。
+軸を 1 本も持たない形（階数 0）は、スカラー 1 個を表す（$N = 1$）。
+空でない形の積が `usize` に収まらないときは `SizeOverflow` を返す。
+`rank()` は軸の数、`len()` は要素数、`is_empty()` は空かどうか、`extents()` は軸の長さの配列を返す。
+`extent(k)` は軸 $k$ の長さを返し、範囲外の軸番号には `OutOfBounds` を返す。
+
+`StridedLayout` は形とストライドを持つだけで、要素のメモリ領域を持たない。
+`shape()` で形を、`strides()` でストライドのスライスを取り出せる。
+ストライドが 0 以上なので、到達する最大の位置は各軸で $i_k = n_k - 1$ としたときの $\sum_k (n_k - 1) s_k$ である。
+`required_span()` はこれに 1 を足した必要なメモリ領域の長さ
+
+$$
+\mathrm{span} = 1 + \sum_{k=0}^{d-1} (n_k - 1)\, s_k
+$$
+
+を返し、空の配置では 0 を返す。
+構築時にこの和を検査付きで計算し、`usize` に収まらなければ `SizeOverflow` を、形とストライドの配列の長さが違えば `DimensionMismatch` を返す。
+1 つの座標から位置を求める `offset(coords)` は階数に比例する時間で済み、ヒープを確保しない。
+座標の数が階数と違えば `DimensionMismatch`、成分が軸の長さ以上なら `OutOfBounds` を返す。
+
+### 行優先の配置
+
+パディングのない行優先の配列は最もよく使う配置なので、ストライドの配列を用意せずに作れる。
+`StridedLayout::row_major(&shape)` は、形だけを借用してストライド
+
+$$
+s_k = \prod_{j > k} n_j
+$$
+
+を導く。
+最後の軸のストライドは 1 で、要素はメモリ領域の $0, \ldots, N - 1$ を行優先の順に埋めるので、`required_span()` は要素数 $N$ に等しい。
+このとき位置は、行優先の通し番号を桁の重みが $s_k$ の混合基数で書いたものにあたるので、異なる座標は異なる位置に写る。
+そのため構築は階数に比例する時間で済み、次の節の単射性の検査を行わない。
+
+導いたストライドは配置の中に固定長で保存される。
+このため `row_major` が受け付ける階数は `StridedLayout::ROW_MAJOR_MAX_RANK`（8）までで、それを超える形は `InvalidInput`（理由は `InvalidInputReason::OutOfRange`）で拒否される。
+空でない形の要素数が `usize` に収まらなければ `SizeOverflow` を返す。
+パディングのある配列、転置、階数が 9 以上の配列には、ストライドを明示する `StridedLayout::new` を使う。
+
+`strides()` はストライドを借用したスライスで返す。
+`new` で作った配置では呼び出し側の配列を、`row_major` で作った配置では配置が持つ配列の先頭 $d$ 個を指す。
+`Shape`、`StridedLayout`、`NdView` は `Copy` なので、値のまま関数に渡したり、同じ配置から複数のビューを作ったりできる。
+
+### 単射性の証明
+
+書き込みのためには、異なる座標が異なる位置に写ること（単射性）が必要である。
+2 つの座標が同じ位置に写る配置に書き込むと、後の書き込みが前の値を上書きし、結果が要素をたどる順序に依存する。
+`StridedLayout::new` は単射性を証明できた配置だけを受け付け、証明できなければ `InvalidInput`（理由は `InvalidInputReason::Inconsistent`）を返す。
+`StridedLayout::new_broadcast` は重なりを許し、ストライド 0 によるブロードキャストを表せる。
+単射性を証明できたかどうかは `is_proven_injective()` で確かめられる。
+
+長さ 2 以上の軸が 2 本以下なら、単射性は厳密に判定される。
+長さ 2 以上の軸が 1 本なら、そのストライドが 0 でないことが条件になる。
+2 本の場合、2 つの座標が同じ位置に写るのは、ストライド $s$ の軸（長さ $n_0$）とストライド $t$ の軸（長さ $n_1$）について $a s = b t$（$|a| < n_0$、$|b| < n_1$、$(a, b) \ne (0, 0)$）となる移動があるときである。
+ストライドが 0 でなければ、$g = \gcd(s, t)$ として最小の移動は $a = t/g$、$b = s/g$ なので、$n_0 \le t/g$ か $n_1 \le s/g$ のとき、そしてそのときに限り配置は単射である。
+この判定は `backend::matrix_layout_is_injective` として出力に反映されており、Euclid の互除法を使うので $O(\log \max(s, t))$ の時間で済む。
+長さ 2 以上の軸のストライドが 0 なら単射ではない。
+
+長さ 2 以上の軸が 3 本以上あるときは、ストライドの小さい順に軸を並べ、各ストライドが、それより小さいストライドの軸が覆う範囲（その時点までの `required_span()` にあたる長さ）以上であることを確かめる。
+この条件は十分条件で、満たさない単射な配置もある。
+そのため結果は「証明できた単射性」として扱われ、検査には階数の 2 乗に比例する時間がかかる。
+空の配置は要素を持たないので、ストライドによらず単射と判定される。
+
+### ビューと座標
+
+`NdView::new(data, layout)` はメモリ領域が `required_span()` 以上であることを確かめ、`NdViewMut::new(data, layout)` はさらに単射性が証明されていることを要求する。
+メモリ領域が短い場合は `DimensionMismatch`、単射性が証明されていない配置を `NdViewMut::new` に渡した場合は `InvalidInput` になる。
+末尾に余った要素は許され、ビューはそれを読まず、書き換えない。
+`NdView::row_major(data, &shape)` と `NdViewMut::row_major(data, &shape)` は、`StridedLayout::row_major` の配置とビューを一度に作る。
+行優先の配置は単射なので、`NdViewMut::row_major` が拒否するのは、階数が 8 を超える形、要素数の桁あふれ、短いメモリ領域だけである。
+どの構築もヒープを確保しない。
+
+| ビュー | 受け付ける配置 | 主なメソッド |
+|---|---|---|
+| `NdView` | 単射でもブロードキャストでもよい | `get(coords)`、行優先の論理順の `iter()`、`storage()`、`layout()` |
+| `NdViewMut` | 単射性が証明された配置だけ | `get_mut(coords)`、行優先の `for_each_mut`、`contiguous_mut()`、`as_view()`、`layout()` |
+
+`storage()` はパディングや末尾の要素を含むメモリ領域全体を返す。
+`contiguous_mut()` は、配置がパディングのない行優先の連続領域であるときだけ、要素を 1 本の可変スライスとして返す。
+それ以外の配置では `None` を返す。
+
+`StridedLayout::offset`、`NdView::get`、`NdViewMut::get_mut` の座標には、スライスと配列に加え、長さが正確に分かる反復子も渡せる。
+座標の並べ替えや計算のために一時の配列を確保する必要はない。
+階数と成分の範囲は、どの形で渡しても同じように検査される。
+
+1 つの軸に沿った 1 次元の列（レーン）を取り出すには、`layout.axis(k)` で `BatchLayout` を作る。
+`len()` はレーンの数（ほかの軸の長さの積）を返し、`lane(b)` は $b$ 番目のレーンを `AxisLayout`（始点 `start()`、長さ `len()`、ストライド `stride()`）として返す。
+レーンは、ほかの座標の行優先の順に番号が付く。
+`permuted(order, extents, strides)` は軸を置換した配置（転置など）を返す。
+結果が借用できるように、並べ替えた形とストライドは呼び出し側が渡し、このメソッドはそれらが元の配置の軸の置換になっているかを確かめる。
+軸の置換は必要なメモリ領域の長さも単射性も変えないので、どちらも元の配置の値を引き継ぐ。
+
+### 列優先のブロックベクトル
+
+反復解法で複数の右辺を一度に扱うとき、$m$ 行のベクトル $r$ 本を列優先に並べ、列 $j$ をメモリ領域の `values[j·m .. (j+1)·m]` に置く。
+これは形 $(m, r)$、ストライド $(1, m)$ の配置で、どの列も連続した領域になる。
+`BlockVectorView`（読み取り）と `BlockVectorViewMut`（書き込み）はこの配置専用のビューである。
+
+`BlockVectorView::new(values, rows, right_hand_sides)` と `BlockVectorViewMut::new` は、$m r$ が `usize` に収まらなければ `SizeOverflow` を、`values` の長さがちょうど $m r$ でなければ `DimensionMismatch` を返す。
+`NdView` と違って、余分な末尾の要素は許されない。
+`column(j)` と `column_mut(j)` は列 $j$ を連続したスライスとして返し、$j \ge r$ なら `OutOfBounds` を返す。
+`as_slice()` と `as_mut_slice()` はメモリ領域全体を列優先の順で返す。
+これらのビューは長さだけを検査し、メモリ領域が実際に列優先で書かれているかは確かめない。
+`BlockOperator::apply_block_into` と `Preconditioner::precondition_block_into` は入力と出力をこれらの型で受け取り、既定の実装はすべての列の計算が成功してから出力に書き込む（[作用素プロトコルとクロージャ作用素](../operator-protocols-and-structure/)）。
+
+次のセルは行数 $n_0$、列数 $n_1$ とストライドの種類を選び、配置の性質と各座標の位置を示す。
+入力の行数と列数は 2 から 4 の整数で、ストライドは 4 種類から選ぶ。
+「行優先」は `StridedLayout::row_major` で作り、ほかの 3 つは重なりを許す `new_broadcast` にストライドを渡して作る。
+「重なり」はストライド $(1, 1)$ で、$(0, 1)$ と $(1, 0)$ が同じ位置に写る。
+メモリ領域には位置と同じ値 $0, 1, 2, \ldots$ を入れてあるので、ビューが返す値はメモリ領域の位置として読める。
+
+1 つ目の表は `strides()` が返すストライド、要素数、`required_span()`、単射性を証明できたか、`NdViewMut::new` と `BlockVectorView::new` の結果を示す。
+2 つ目の表は座標 $(i, j)$ ごとに `offset` の位置と `NdView::get` の値を並べる。
+最後の列は同じメモリ領域を $m = n_0$、$r = n_1$ のブロックとして読んだときの列 $j$ の第 $i$ 成分である。
+検証するのは、位置が $i s_0 + j s_1$ に一致することと、`required_span()` が $1 + (n_0 - 1) s_0 + (n_1 - 1) s_1$ に一致することである。
+
+```rust
+//| id: core-strided-views
+//| ref: core-strided-views
+//| title: ストライドと単射性
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   rows: {"type":"range","label":"行数 n₀","description":"第 0 軸の長さ。","min":2,"max":4,"step":1,"value":3}
+//|   cols: {"type":"range","label":"列数 n₁","description":"第 1 軸の長さ。","min":2,"max":4,"step":1,"value":3}
+//|   layout_mode: {"type":"select","label":"ストライド","description":"行優先、列優先、行のブロードキャスト、重なりのある配置。","options":["行優先 (cols, 1)","列優先 (1, rows)","行のブロードキャスト (0, 1)","重なり (1, 1)"],"value":"列優先 (1, rows)"}
+//| cases:
+//|   - {"id":"row-major","label":"行優先","description":"row_major がストライド (n₁, 1) を導く。ブロックは同じメモリ領域を別の行列として解釈する。","inputs":{"layout_mode":"行優先 (cols, 1)"}}
+//|   - {"id":"broadcast","label":"行のブロードキャスト","description":"全行が同じ n₁ 個の位置を読み、書き込みビューは作れない。","inputs":{"layout_mode":"行のブロードキャスト (0, 1)"}}
+//|   - {"id":"overlap","label":"重なり 2 × 4","description":"ストライド (1, 1) では (0, 1) と (1, 0) が同じ位置に写る。","inputs":{"rows":2,"cols":4,"layout_mode":"重なり (1, 1)"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":1}
+//|       - {"artifact":"summary","path":"/rows/0/1","equals":3}
+//|       - {"artifact":"summary","path":"/rows/0/3","equals":9}
+//|       - {"artifact":"summary","path":"/rows/0/4","equals":"証明できた"}
+//|       - {"artifact":"summary","path":"/rows/0/5","equals":"作成できる"}
+//|       - {"artifact":"elements","path":"/rows/1/2","equals":3}
+//|       - {"artifact":"elements","path":"/rows/1/4","approx":{"value":3,"atol":1e-12}}
+//|       - {"artifact":"elements","path":"/rows/8/3","approx":{"value":8,"atol":1e-12}}
+//|   - case: row-major
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":3}
+//|       - {"artifact":"summary","path":"/rows/0/1","equals":1}
+//|       - {"artifact":"summary","path":"/rows/0/3","equals":9}
+//|       - {"artifact":"elements","path":"/rows/1/2","equals":1}
+//|       - {"artifact":"elements","path":"/rows/1/4","approx":{"value":3,"atol":1e-12}}
+//|   - case: broadcast
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/3","equals":3}
+//|       - {"artifact":"summary","path":"/rows/0/4","equals":"証明できない"}
+//|       - {"artifact":"summary","path":"/rows/0/5","equals":"InvalidInput"}
+//|       - {"artifact":"summary","path":"/rows/0/6","equals":"DimensionMismatch"}
+//|       - {"artifact":"elements","path":"/rows/3/2","equals":0}
+//|       - {"artifact":"elements","path":"/rows/3/4","equals":null}
+//|   - case: overlap
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/2","equals":8}
+//|       - {"artifact":"summary","path":"/rows/0/3","equals":5}
+//|       - {"artifact":"elements","path":"/rows/1/2","equals":1}
+//|       - {"artifact":"elements","path":"/rows/4/2","equals":1}
+use scioxide_core::{BlockVectorView, SciOxideErrorKind, NdView, NdViewMut, StridedLayout};
+
+let (r, c) = (rows as usize, cols as usize);
+let extents = [r, c];
+let explicit = match layout_mode.as_str() {
+    "列優先 (1, rows)" => Some([1, r]),
+    "行のブロードキャスト (0, 1)" => Some([0, 1]),
+    "重なり (1, 1)" => Some([1, 1]),
+    _ => None,
+};
+// 行優先は row_major がストライド (n₁, 1) を導く。ほかは重なりを許す new_broadcast で作る。
+let layout = match &explicit {
+    Some(strides) => StridedLayout::new_broadcast(&extents, strides),
+    None => StridedLayout::row_major(&extents),
+}
+.map_err(|e| e.to_string())?;
+let strides = layout.strides();
+let span = layout.required_span();
+// メモリ領域の値を位置そのものにしておく。
+let mut storage: Vec<f64> = (0..span).map(|i| i as f64).collect();
+let kind_name = |kind: SciOxideErrorKind| match kind {
+    SciOxideErrorKind::InvalidInput => "InvalidInput",
+    SciOxideErrorKind::DimensionMismatch => "DimensionMismatch",
+    _ => "その他の分類",
+};
+
+// 書き込みビューは単射性が証明された配置だけを受け付ける。配置は Copy なので値で渡す。
+let writable = match NdViewMut::new(&mut storage, layout) {
+    Ok(_) => "作成できる",
+    Err(error) => kind_name(error.kind()),
+};
+// 読み取りビューは重なりがあっても作れる。
+let view = NdView::new(&storage, layout).map_err(|e| e.to_string())?;
+// ブロックは長さ n₀·n₁ だけを検査し、メモリ領域を列優先として解釈する。
+let block = BlockVectorView::new(&storage, r, c);
+let block_status = match &block {
+    Ok(_) => "作成できる",
+    Err(error) => kind_name(error.kind()),
+};
+let mut elements = Vec::with_capacity(r * c);
+for i in 0..r {
+    for j in 0..c {
+        let offset = layout.offset([i, j]).map_err(|e| e.to_string())?;
+        let value = *view.get([i, j]).map_err(|e| e.to_string())?;
+        let in_block = match &block {
+            Ok(block) => Some(block.column(j).map_err(|e| e.to_string())?[i]),
+            Err(_) => None,
+        };
+        elements.push((i, j, offset, value, in_block));
+    }
+}
+
+let proven = if layout.is_proven_injective() {
+    "証明できた"
+} else {
+    "証明できない"
+};
+let summary_columns = serde_json::json!([
+    { "key": "0", "label": "ストライド s₀ [要素]", "type": "integer" },
+    { "key": "1", "label": "ストライド s₁ [要素]", "type": "integer" },
+    { "key": "2", "label": "要素数 shape().len()", "type": "integer" },
+    { "key": "3", "label": "required_span() [要素]", "type": "integer" },
+    { "key": "4", "label": "単射性" },
+    { "key": "5", "label": "NdViewMut::new" },
+    { "key": "6", "label": "BlockVectorView::new" }
+]);
+emit_table_with_columns!(
+    summary_columns,
+    vec![(
+        strides[0],
+        strides[1],
+        layout.shape().len(),
+        span,
+        proven,
+        writable,
+        block_status
+    )],
+    metadata = serde_json::json!({ "id": "summary" })
+);
+let fixed0 = serde_json::json!({ "fractionDigits": 0 });
+let element_columns = serde_json::json!([
+    { "key": "0", "label": "行 i", "type": "integer" },
+    { "key": "1", "label": "列 j", "type": "integer" },
+    { "key": "2", "label": "位置 offset(i, j)", "type": "integer" },
+    { "key": "3", "label": "NdView::get の値", "type": "number", "format": fixed0 },
+    {
+        "key": "4",
+        "label": "ブロックの列 j の第 i 成分",
+        "type": "number",
+        "format": fixed0,
+        "nullText": "作れない"
+    }
+]);
+emit_table_with_columns!(
+    element_columns,
+    elements,
+    metadata = serde_json::json!({ "id": "elements" })
+);
+```
+
+既定値（$3 \times 3$、列優先）では、ストライドは $(1, 3)$ で、位置は行優先の論理順に $0, 3, 6, 1, 4, 7, 2, 5, 8$ と並ぶ。
+`required_span()` は $1 + 2 \cdot 1 + 2 \cdot 3 = 9$ で要素数に等しく、単射性が証明されるので `NdViewMut` を作れる。
+このときだけ、`NdView` の値とブロックの値がすべての座標で一致する。
+
+行優先を選ぶと、`row_major` が導いたストライドは $(3, 1)$ になり、位置は $0, 1, \ldots, 8$ と並ぶ。
+メモリ領域の長さは 9 なのでブロックも作れるが、座標 $(0, 1)$ で `NdView` は位置 1 を、ブロックは位置 3 を読む。
+ブロックのビューは並び順を検査しないので、行優先のデータを渡すと別の行列として読まれる。
+
+行のブロードキャストでは `required_span()` が $n_1 = 3$ になり、全行が同じ 3 個の位置を読む。
+$2 \times 4$ の重なり $(1, 1)$ では、8 個の要素が $1 + 1 + 3 = 5$ 個の位置に写り、$(0, 1)$ と $(1, 0)$ がどちらも位置 1 を読む。
+どちらの配置でも単射性は証明できず、`NdViewMut::new` は `InvalidInput` を返す。
+メモリ領域の長さが $n_0 n_1$ に足りないので、ブロックも `DimensionMismatch` で拒否される。
+
+## アフィン値の成分アクセス
+
+Runge–Kutta 法の段の合成、共役勾配法の方向の更新、補間の重み付き和では、ベクトルや複素数の線形結合
+
+$$
+\mathbf{y} = \sum_{j=1}^{m} \alpha_j\, \mathbf{x}_j
+$$
+
+が繰り返し現れる。
+ここで $\alpha_j$ は実数の係数、$\mathbf{x}_j$ は同じ形の値、$m$ は項の数である。
+`AffineValue` トレイトは値を実数の成分の列として解釈する機能を表し、メモリの形式を隠す。
+要求するメソッドは次の 3 つで、`Scale` は成分と係数の実数型、`Owned` は所有する可変の表現である。
+
+```text
+fn dimension(&self) -> Result<usize, SciOxideError>;          // 実数成分の数（0 も可）
+fn component(&self, index: usize) -> Result<Self::Scale, SciOxideError>;  // 範囲外は OutOfBounds
+fn try_to_owned(&self) -> Result<Self::Owned, SciOxideError>; // 確保の失敗は AllocationFailure
+```
+
+成分の数が 1 の値からは、`try_to_scalar()` でその成分を取り出せる。
+成分の数が 1 でなければ `DimensionMismatch` を返す。
+`AffineValueMut` は `for_each_component_mut` で成分を読み出しと同じ順に 1 回ずつ訪れ、形を変えず確保もしない。
+
+| 型 | 成分の数 | 成分の順序 |
+|---|---|---|
+| `RealScalar` を実装する実数型（`f32`、`f64`） | 1 | その値 |
+| `Complex<S>` | 2 | 実部、虚部 |
+| `[V]`、`Vec<V>`、`[V; N]` | 要素の成分の数の和 | 要素の順に、各要素の成分を並べる |
+
+成分の数が等しい 2 つの値は、同じ形として扱われる。
+例えば複素数 1 個は実数 2 個の配列に書き込める。
+成分は座標として解釈されず、大小の順序も持たない。
+
+形と値の検査には次の関数を使う。
+
+- `check_value_shape(&value, dimension)` は、成分の数が違えば `DimensionMismatch` を返す。
+- `validate_value(&value)` は、非有限な成分があれば `NonFinite` を返す。
+  値がどの定義域に属するかは検査しない。
+- `write_value(&components, &mut output)` は、有限な成分の列を同じ形の出力に書き込む。
+  形が違えば `DimensionMismatch`、非有限な成分があれば `NonFinite` を返し、失敗時は出力を変えない。
+
+## 一回丸めの線形結合 `affine_combination_into`
+
+`affine_combination_into(&terms, &mut output, &mut workspace)` は、係数と値の組の列 `terms` から各成分の線形結合を計算する。
+
+- 各成分の積 $\alpha_j x_{j,k}$ を `RangeAccumulator` で丸めなしに足し合わせ、成分ごとに 1 回だけ最近接偶数丸めで丸める。
+  そのため結果は正しく丸められた値で、項の順序を入れ替えても変わらない。
+- `workspace` の長さは出力の成分数と等しくなければならない。
+  結果はいったん `workspace` に作られ、すべての成分の計算が成功してから `output` に書き込まれる。
+  失敗した場合 `output` は変わらず、`workspace` の内容は不定である。
+- 項の列が空なら 0 を書き込む。
+  計算量は成分数と項数の積に比例し、ヒープを確保しない。
+
+エラーは 3 種類である。
+`output`、項の値、`workspace` のどれかの成分数が違えば `DimensionMismatch` を返す。
+係数か成分に NaN か無限大があれば `NonFinite` を返す。
+結果の成分が有限の最大値を超えれば `NumericalInstability`（種類は `NumericalIssue::Overflow`）を返す。
+
+通常の浮動小数点の和は加算のたびに丸める。
+大きさ $M$ の項に小さい項を足すと、$M$ の近くの浮動小数点数の間隔より小さい部分が丸めで失われ、あとで $M$ を引いても戻らない。
+丸めなしの累積では、この損失が起きない。
+
+次のセルは $10^{p}\,\mathbf{x} + \mathbf{y} - 10^{p}\,\mathbf{x}$ を、$\mathbf{x} = (1, 2, 3)$、$\mathbf{y} = (1, 1, 1)$ について計算する。
+入力は指数 $p$（0 から 20 の整数）である。
+数学的な結果は $\mathbf{y}$ である。
+1 つ目の表は左から倍精度で足した値と `affine_combination_into` の値を成分ごとに並べる。
+左から足すと、$10^{p} x_k$ の近くの浮動小数点数の間隔が 2 以上になる $p$ で $y_k = 1$ が失われる。
+2 つ目の表は項の値に NaN を入れたときのエラーの分類と、`output` が失敗の前後で変わらないことを示す。
+
+```rust
+//| id: core-affine-combination
+//| ref: core-affine-combination
+//| title: 打ち消しを含む線形結合と失敗時の不変性
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   scale_exponent: {"type":"range","label":"大きな係数の指数 p [-]","description":"係数 10^p と -10^p で x を打ち消す。","min":0,"max":20,"step":1,"value":16}
+//| cases:
+//|   - {"id":"exact-range","label":"p = 15","description":"10^15 x_k + 1 が倍精度で正確に表せ、左からの和も 1 になる。","inputs":{"scale_exponent":15}}
+//|   - {"id":"largest","label":"p = 20","description":"間隔が 10^4 を超え、左からの和は 0 になる。","inputs":{"scale_exponent":20}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"combination","path":"/rows/0/1","approx":{"value":0,"atol":1e-12}}
+//|       - {"artifact":"combination","path":"/rows/0/2","approx":{"value":1,"atol":1e-12}}
+//|       - {"artifact":"combination","path":"/rows/2/2","approx":{"value":1,"atol":1e-12}}
+//|       - {"artifact":"failure","path":"/rows/0/0","equals":"NonFinite"}
+//|       - {"artifact":"failure","path":"/rows/0/2","approx":{"value":0,"atol":1e-12}}
+//|   - case: exact-range
+//|     expect:
+//|       - {"artifact":"combination","path":"/rows/2/1","approx":{"value":1,"atol":1e-12}}
+//|       - {"artifact":"combination","path":"/rows/2/2","approx":{"value":1,"atol":1e-12}}
+//|   - case: largest
+//|     expect:
+//|       - {"artifact":"combination","path":"/rows/1/1","approx":{"value":0,"atol":1e-12}}
+//|       - {"artifact":"combination","path":"/rows/1/2","approx":{"value":1,"atol":1e-12}}
+use scioxide_core::{SciOxideErrorKind, affine_combination_into};
+
+// 10^p を 10 の乗算で作る。p ≤ 22 では途中の値がすべて倍精度で正確に表せる。
+let big = (0..scale_exponent as u32).fold(1.0_f64, |power, _| power * 10.0);
+let x = [1.0_f64, 2.0, 3.0];
+let y = [1.0_f64, 1.0, 1.0];
+let terms = [(big, &x[..]), (1.0, &y[..]), (-big, &x[..])];
+let mut output = [0.0_f64; 3];
+let mut workspace = [0.0_f64; 3];
+affine_combination_into(&terms, &mut output[..], &mut workspace).map_err(|e| e.to_string())?;
+
+let rows: Vec<(usize, f64, f64, f64)> = (0..3)
+    .map(|k| {
+        // 比較用: 左から倍精度で足す。
+        let naive = (big * x[k] + y[k]) + (-big) * x[k];
+        (k, naive, output[k], y[k])
+    })
+    .collect();
+let fixed1 = serde_json::json!({ "fractionDigits": 1 });
+let combination_columns = serde_json::json!([
+    { "key": "0", "label": "成分 k", "type": "integer" },
+    { "key": "1", "label": "左から倍精度で足した値 [-]", "type": "number", "format": fixed1 },
+    { "key": "2", "label": "affine_combination_into [-]", "type": "number", "format": fixed1 },
+    { "key": "3", "label": "数学的な値 y_k [-]", "type": "number", "format": fixed1 }
+]);
+emit_table_with_columns!(
+    combination_columns,
+    rows,
+    metadata = serde_json::json!({ "id": "combination" })
+);
+
+// NaN を含む項では計算が失敗し、output は直前の値のまま残る。
+let poisoned = [f64::NAN, 2.0, 3.0];
+let before = output;
+let failure = affine_combination_into(&[(1.0, &poisoned[..])], &mut output[..], &mut workspace)
+    .err()
+    .ok_or("NaN が拒否されなかった")?;
+let kind = match failure.kind() {
+    SciOxideErrorKind::NonFinite => "NonFinite",
+    _ => "その他の分類",
+};
+// 失敗の前後の output の差の最大値。0 なら変わっていない。
+let change = (0..3).fold(0.0_f64, |worst, k| worst.max((output[k] - before[k]).abs()));
+let failure_columns = serde_json::json!([
+    { "key": "0", "label": "分類 kind()" },
+    { "key": "1", "label": "メッセージ" },
+    { "key": "2", "label": "失敗の前後の output の差の最大値 [-]", "type": "number", "format": fixed1 }
+]);
+emit_table_with_columns!(
+    failure_columns,
+    vec![(kind, failure.to_string(), change)],
+    metadata = serde_json::json!({ "id": "failure" })
+);
+```
+
+既定値 $p = 16$ では、$10^{16} x_k$ の近くの間隔が 2 以上になり、$y_k = 1$ が丸めで失われて左からの和は 3 成分とも 0 になる。
+`affine_combination_into` は $\mathbf{y} = (1, 1, 1)$ を返す。
+$p = 15$ では $3 \times 10^{15} + 1$ まで倍精度で正確に表せるので、左からの和も 1 になる。
+$p = 20$ では間隔が $10^4$ を超えるが、`affine_combination_into` の結果は 1 のままである。
+NaN を含む項は `NonFinite` で拒否され、`output` の差の最大値は 0 で、直前の $(1, 1, 1)$ が残る。
+
+## まとめ
+
+`Shape` は要素数を検査付きで数え、`StridedLayout` は必要なメモリ領域の長さ $1 + \sum_k (n_k - 1) s_k$ を検査する。
+パディングのない行優先の配列は、階数 8 までなら `row_major` で形だけから作れる。
+`new` は単射性を証明できた配置だけを受け付け、`new_broadcast` は読み取り用の重なりを許す。
+書き込みは単射性が証明された配置に限られるので、ブロードキャストや重なりのあるビューを出力に使う誤りは、構築時に `InvalidInput` として見つかる。
+複数の右辺は `BlockVectorView` と `BlockVectorViewMut` で列優先に渡し、長さはちょうど行数と右辺の数の積にする。
+状態ベクトルの線形結合は `AffineValue` を実装した型に対して `affine_combination_into` で書けば、各成分は 1 回だけ丸められ、失敗時は出力が変わらない。
+
+## 次に読むページ
+
+- [作用素プロトコルとクロージャ作用素](../operator-protocols-and-structure/)：借用した出力と作業領域を使う作用素の規則と、ブロックベクトルへの一括適用を確かめる。
+- [初等関数と安定変換](../stable-transforms/)：`NdView` に安定変換を一括適用する `transform_into` を確かめる。
+- [範囲安全な算術](../range-safe-arithmetic/)：`affine_combination_into` が使う丸めなしの累積 `RangeAccumulator` の仕組みを確かめる。
+- [レイアウト・作用素・組合せの API](../../api/layouts-operators-combinatorics/)：配置とビューの全メソッドを引く。

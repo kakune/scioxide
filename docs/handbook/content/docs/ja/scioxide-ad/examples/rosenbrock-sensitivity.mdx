@@ -1,0 +1,586 @@
+---
+title: Rosenbrock 関数の勾配と曲率
+description: 多次元の Rosenbrock 関数の勾配を Dual の前進評価、value_and_grad、呼び出し側が持つテープの 3 通りで求めて閉形式と照合し、谷底のヘッセ行列を hessian で求めて、固有値・条件数・谷に沿う曲率を閉形式と比べる。
+sidebar:
+  order: 405
+references:
+  ad-rosenbrock-gradient-methods: "勾配を求める-3-つの方法"
+  ad-rosenbrock-valley-hessian: "谷底のヘッセ行列と曲率"
+---
+
+Rosenbrock 関数は H. H. Rosenbrock が 1960 年に最適化法の試験に用いた関数で、曲がった細い谷の底に最小点を持つ。
+谷を横切る向きの曲率が谷に沿う向きの曲率より桁違いに大きいので、勾配だけを使う方法は谷の壁の間を往復し、谷に沿ってなかなか進まない。
+
+この例題では勾配を前進モードの二重数 `Dual`、逆モードのワンショット呼び出し `value_and_grad`、呼び出し側が持つテープの `Tape::gradient_into` の 3 通りで求め、閉形式と照合する。
+次に谷底の点のヘッセ行列を `hessian` で求め、scioxide-linalg の対称固有値ソルバーで固有値と条件数を求めて、谷に沿う向きと谷を横切る向きの曲率を閉形式と比べる。
+
+## 一般化 Rosenbrock 関数
+
+次元 $n \ge 2$、係数 $a > 0$、$b > 0$ に対して
+
+$$
+f(\mathbf{x}) = \sum_{i=0}^{n-2} \left[ (a - x_i)^2 + b\,(x_{i+1} - x_i^2)^2 \right]
+$$
+
+を考える。
+成分の番号は 0 から数え、$\mathbf{x}$、$a$、$b$、$f$ は無次元である。
+第 1 項は各成分を $a$ に引き寄せ、第 2 項は隣り合う成分の組を放物線 $x_{i+1} = x_i^2$（谷底）に引き寄せる。
+$b$ は谷の壁の急さを決め、標準の値は $a = 1$、$b = 100$ である。
+
+$n = 2$ では最小点は $(a, a^2)$ で、最小値は 0 である。
+$a = 1$ では任意の $n$ で $(1, \dots, 1)$ が最小点になる。
+$n \ge 3$ で $a \ne 1$ のときは、すべての $x_i = a$ と $x_{i+1} = x_i^2$ を同時には満たせないので、最小値は正になる。
+
+勾配の第 $j$ 成分は、$x_j$ を含む二つの項から
+
+$$
+\frac{\partial f}{\partial x_j}
+= \underbrace{-2(a - x_j) - 4b\,x_j\,(x_{j+1} - x_j^2)}_{j \le n-2 \text{ のとき}}
++ \underbrace{2b\,(x_j - x_{j-1}^2)}_{j \ge 1 \text{ のとき}}
+$$
+
+である。
+各成分は隣の成分にしか依存しないので、ヘッセ行列 $\mathbf{H}$ は三重対角で、
+
+$$
+H_{jj} = \underbrace{2 + 12b\,x_j^2 - 4b\,x_{j+1}}_{j \le n-2 \text{ のとき}} + \underbrace{2b}_{j \ge 1 \text{ のとき}}, \qquad
+H_{j,j+1} = H_{j+1,j} = -4b\,x_j
+$$
+
+となる。
+$a$ はヘッセ行列に現れない。
+$(a - x_j)^2$ の 2 階微分は $a$ によらず 2 だからである。
+
+次のブロックは二つのセルが共有する定義で、`rosenbrock` が $f$ に対応する。
+関数は `R: Real` に対して一度だけ書き、呼び出し側が `f64`、`Dual<f64>`、テープ上の `Var` などの数値型を選ぶ。
+汎用コードではスカラーを演算子の右に置く（`-w[0] + a`、`… * b`）。
+
+```rust
+//| id: ad-rosenbrock-model
+//| kind: definitions
+//| title: 一般化 Rosenbrock 関数
+//| crates: [scioxide-ad]
+use scioxide_ad::Real;
+
+/// f(x) = Σᵢ [(a − xᵢ)² + b (xᵢ₊₁ − xᵢ²)²]（i = 0, …, n − 2）。
+pub(crate) fn rosenbrock<R: Real>(x: &[R], a: f64, b: f64) -> R {
+    x.windows(2)
+        .map(|w| (-w[0] + a).powi(2) + (w[1] - w[0] * w[0]).powi(2) * b)
+        .sum()
+}
+```
+
+## 勾配を求める 3 つの方法
+
+前進モード（forward mode）は値と同時に 1 方向の微分係数を保持する。
+二重数（dual number）$x + \dot x\,\varepsilon$（$\varepsilon^2 = 0$）の `Dual<f64>` に入力 $x_k + \delta_{kj}\varepsilon$ を入れて評価すると、結果の $\varepsilon$ の係数が $\partial f/\partial x_j$ になる。
+$\delta_{kj}$ は $k = j$ のとき 1、それ以外で 0 である。
+この単位ベクトル $\mathbf{e}_j$ をシード（seed）と呼ぶ。
+勾配の全成分には $n$ 回の評価が要り、この $f$ では 1 回の評価が $O(n)$ の演算なので、全体は $O(n^2)$ になる。
+
+逆モード（reverse mode）は、演算をテープ（tape）に記録し、記録の逆順に随伴（adjoint）$\bar v = \partial f/\partial v$ を累積して、1 回の逆走査（reverse sweep）で勾配の全成分を返す。
+計算コストは関数の評価 1 回の小さな定数倍で、この倍率は入力の数 $n$ によらない。
+`value_and_grad(function, point)` は新しいテープを作って関数を記録し、逆走査を 1 回行って、値と `scioxide_linalg::Vector` の勾配を返す。
+呼び出しのたびにテープと結果を確保し、実行コンテキストは `ExecutionContext::sequential_native()` に固定される。
+
+同じ関数を多数の点で微分するなら、呼び出し側が `Tape::<f64>::new(TapeOptions::new())` でテープを作り、`gradient_into(function, point, gradient, cx)` を繰り返す。
+値を返し、勾配を呼び出し側の配列 `gradient` に書く。
+`gradient.len() != point.len()` は `DimensionMismatch` で、失敗したときは `gradient` を書き換えない。
+空のテープへの最初の記録は容量に収まらないが、文の数は数えられる。
+テープは数えた大きさまで広がり、関数をもう一度実行するので、1 回の呼び出しで関数は最大 2 回実行される。
+ワンショット呼び出しの `value_and_grad` は毎回新しいテープを使うので、呼び出しのたびに関数を 2 回実行する。
+関数は同じ点で同じ記録を作る（決定論的である）必要がある。
+2 回目の実行が 1 回目に数えた大きさに収まらないと `InvalidInput`（`Inconsistent`）になる。
+同じ関数を記録したことのあるテープでは、以後の呼び出しは記録と逆走査を 1 回ずつ行い、メモリを確保しない。
+`report()` が返す `TapeReport` の `words()` は直前の記録のワード（statement word）の数で、定数と入力のワードを含む。
+この関数では、どの演算の文も 1 ワードを占める。
+`recorded_twice()` は直前の呼び出しがテープを広げて記録し直したかを表す。
+
+テープに渡す関数は `for<'t> Fn(&[Var<'t, f64>]) -> Result<Var<'t, f64>, SciOxideError>` を満たすクロージャで、呼び出しの引数の位置に直接書く。
+`let` で束縛してから渡すと、この高階のライフタイムの境界を推論できずにコンパイルが失敗する。
+
+どのラッパー型も値をその内側の型（`Primal`）から取るので、$f$ の値は `f64`、`Dual`、テープのどれで評価してもビット単位で等しい。
+1 つの演算の逆モードの微分は `Dual` の微分とビット単位で等しい。
+例外は、厳密な 0 が $+0$ になる場合と、IEEE の積を使う規則で無限大の偏導関数が 0 の接ベクトルに掛かる場合（`Dual` は NaN、テープは有限の値）である。
+長い記録では随伴への寄与を足す順序が前進評価と異なるので、両者は丸め誤差の範囲で一致する。
+どの方式にも打ち切り誤差はなく、閉形式との差は各成分の数回の丸めで決まる。
+前進モードと逆モードの規則は[前進モードと二重数](../../algorithms/forward-mode/)と[逆モードとテープ](../../algorithms/reverse-mode-and-replay/)、テープの容量と再利用は[テープのライフサイクルと再利用](../../algorithms/tape-lifecycle/)で扱う。
+
+次のセルは評価点 $\mathbf{x} = (p, q, p, q, \dots)$ の勾配を 3 通りで求め、閉形式の勾配と比べる。
+入力は次元 $n$（2〜64）、係数 $a$、$b$、評価点の成分 $p$、$q$ である。
+既定値の $n = 2$、$(p, q) = (-1.2, 1)$ は、Rosenbrock 関数の標準の初期点である。
+関数の実行回数を `counted` で数え、方法ごとに表の 2 列目に出す。
+グラフは 2 回目以降のテープを使い回し、偶数番目の成分を $p \in [-2, 2]$ の 161 点で動かした断面の $\lVert\nabla f\rVert_\infty$ を対数軸で描く。
+1 つ目の表は方法ごとの実行回数、値 $f$、閉形式との差 $\lVert\Delta\nabla f\rVert_\infty$ を示す。
+2 つ目の表は勾配の大きさ、テープのワード数、1 回目の呼び出しが記録し直したか、断面の 161 点の間にテープが事前確保したバイト数の増加、図から除いた勾配 0 の点の数を示す。
+検証するのは、閉形式との差が丸め誤差の水準にあること、$f$ の値が方式によらないこと、2 回目以降の呼び出しが関数を 1 回だけ実行して事前確保を増やさないことである。
+
+```rust
+//| id: ad-rosenbrock-gradient
+//| ref: ad-rosenbrock-gradient
+//| title: 3 通りの勾配と閉形式
+//| run: reactive
+//| uses: [ad-rosenbrock-model]
+//| crates: [scioxide-ad, scioxide-core]
+//| inputs:
+//|   dimension: {"type":"range","label":"次元 n","description":"入力の個数。Dual の評価回数は n に比例する。","min":2,"max":64,"step":1,"value":2}
+//|   shift: {"type":"range","label":"係数 a [-]","description":"第 1 項 (a − xᵢ)² の中心。","min":0.5,"max":2,"step":0.1,"value":1}
+//|   valley: {"type":"range","label":"谷の係数 b [-]","description":"谷の壁の急さ。","min":1,"max":1000,"step":1,"value":100}
+//|   even_component: {"type":"range","label":"評価点の偶数番目の成分 p [-]","description":"x = (p, q, p, q, …) の p。","min":-2,"max":2,"step":0.05,"value":-1.2}
+//|   odd_component: {"type":"range","label":"評価点の奇数番目の成分 q [-]","description":"x = (p, q, p, q, …) の q。","min":-1,"max":4,"step":0.05,"value":1}
+//| cases:
+//|   - {"id":"fifty-inputs","label":"n = 50","description":"Dual は 50 回の評価が要り、逆モードは 1 回の記録と 1 回の逆走査のまま。","inputs":{"dimension":50}}
+//|   - {"id":"shifted-minimum","label":"a = 2、(p, q) = (2, 4)","description":"n = 2 の最小点 (a, a²) では勾配が厳密に 0 になる。","inputs":{"shift":2,"even_component":2,"odd_component":4}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/0/2","approx":{"value":24.2,"rtol":1e-15}}
+//|       - {"artifact":"methods","path":"/rows/1/1","equals":2}
+//|       - {"artifact":"methods","path":"/rows/1/3","range":{"max":1e-13}}
+//|       - {"artifact":"methods","path":"/rows/2/3","range":{"max":1e-13}}
+//|       - {"artifact":"methods","path":"/rows/3/1","equals":2}
+//|       - {"artifact":"methods","path":"/rows/4/1","equals":1}
+//|       - {"artifact":"methods","path":"/rows/4/2","approx":{"value":24.2,"rtol":1e-15}}
+//|       - {"artifact":"methods","path":"/rows/4/3","range":{"max":1e-13}}
+//|       - {"artifact":"summary","path":"/rows/0/0","approx":{"value":215.6,"rtol":1e-14}}
+//|       - {"artifact":"summary","path":"/rows/0/3","equals":0}
+//|   - case: fifty-inputs
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/1/1","equals":50}
+//|       - {"artifact":"methods","path":"/rows/1/3","range":{"max":1e-12}}
+//|       - {"artifact":"methods","path":"/rows/4/1","equals":1}
+//|       - {"artifact":"methods","path":"/rows/4/3","range":{"max":1e-12}}
+//|       - {"artifact":"summary","path":"/rows/0/3","equals":0}
+//|   - case: shifted-minimum
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/2/2","equals":0}
+//|       - {"artifact":"methods","path":"/rows/2/3","equals":0}
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":0}
+use std::cell::Cell;
+
+use scioxide_ad::{Dual, Real, Tape, TapeOptions, value_and_grad};
+use scioxide_core::ExecutionContext;
+
+// 関数が実行された回数を runs に数える。
+fn counted<R: Real>(runs: &Cell<usize>, x: &[R], a: f64, b: f64) -> R {
+    runs.set(runs.get() + 1);
+    rosenbrock(x, a, b)
+}
+
+let n = dimension as usize;
+let (a, b) = (shift, valley);
+let point: Vec<f64> = (0..n)
+    .map(|i| {
+        if i % 2 == 0 {
+            even_component
+        } else {
+            odd_component
+        }
+    })
+    .collect();
+
+// 独立検算: 手で導いた閉形式の勾配（f64 の演算）。
+let closed: Vec<f64> = (0..n)
+    .map(|j| {
+        let x = &point;
+        let mut g = 0.0;
+        if j + 1 < n {
+            g += -2.0 * (a - x[j]) - 4.0 * b * x[j] * (x[j + 1] - x[j] * x[j]);
+        }
+        if j > 0 {
+            g += 2.0 * b * (x[j] - x[j - 1] * x[j - 1]);
+        }
+        g
+    })
+    .collect();
+let max_abs = |v: &[f64]| v.iter().fold(0.0_f64, |m, g| m.max(g.abs()));
+let error = |v: &[f64]| {
+    let d: Vec<f64> = v.iter().zip(&closed).map(|(g, c)| g - c).collect();
+    Some(max_abs(&d))
+};
+let runs = Cell::new(0_usize);
+let plain = counted(&runs, &point, a, b);
+let plain_runs = runs.replace(0);
+
+// 前進モード: シード e_j の Dual で 1 回評価すると ∂f/∂x_j が出る。n 回評価する。
+let mut forward = vec![0.0; n];
+let mut forward_value = 0.0;
+for j in 0..n {
+    let seeded: Vec<Dual<f64>> = point
+        .iter()
+        .enumerate()
+        .map(|(k, &x)| Dual::new(x, if k == j { 1.0 } else { 0.0 }))
+        .collect();
+    let result = counted(&runs, &seeded, a, b);
+    forward[j] = result.derivative();
+    forward_value = result.value();
+}
+let forward_runs = runs.replace(0);
+
+// 逆モードのワンショット呼び出し: 新しいテープに記録し、逆走査を 1 回行う。
+let (one_shot_value, reverse) =
+    value_and_grad(|x| Ok(counted(&runs, x, a, b)), &point).map_err(|e| e.to_string())?;
+let one_shot_runs = runs.replace(0);
+
+// 呼び出し側が持つテープ: 1 回目で容量を決め、2 回目からは記録 1 回と逆走査 1 回。
+let cx = ExecutionContext::sequential();
+let mut tape = Tape::<f64>::new(TapeOptions::new());
+let mut first = vec![0.0; n];
+let first_value = tape
+    .gradient_into(|x| Ok(counted(&runs, x, a, b)), &point, &mut first, cx)
+    .map_err(|e| e.to_string())?;
+let first_runs = runs.replace(0);
+let first_twice = tape.report().recorded_twice();
+let mut warm = vec![0.0; n];
+let warm_value = tape
+    .gradient_into(|x| Ok(counted(&runs, x, a, b)), &point, &mut warm, cx)
+    .map_err(|e| e.to_string())?;
+let warm_runs = runs.replace(0);
+let words = tape.report().words();
+
+// 同じテープで断面 x = (s, q, s, q, …) の 161 点の勾配を求める。
+let reserved = tape.reserved_bytes();
+let mut section = Vec::new();
+let mut omitted = 0_usize;
+let mut gradient = vec![0.0; n];
+let mut moving = point.clone();
+for i in 0..=160 {
+    let s = -2.0 + 4.0 * f64::from(i) / 160.0;
+    for k in (0..n).step_by(2) {
+        moving[k] = s;
+    }
+    tape.gradient_into(|x| Ok(rosenbrock(x, a, b)), &moving, &mut gradient, cx)
+        .map_err(|e| e.to_string())?;
+    let size = max_abs(&gradient);
+    // 対数軸に描けない勾配 0 の点は除き、件数を表に出す。
+    if size > 0.0 {
+        section.push([s, size]);
+    } else {
+        omitted += 1;
+    }
+}
+let growth = tape.reserved_bytes() - reserved;
+emit_line_chart!(
+    &vec![serde_json::json!({ "name": "‖∇f‖∞（gradient_into）", "points": section })],
+    options = &serde_json::json!({
+        "xLabel": "断面の座標 p [-]（q は入力の値）",
+        "yLabel": "勾配の大きさ ‖∇f‖∞ [-]",
+        "yType": "log",
+        "xMin": -2.0,
+        "xMax": 2.0,
+        "annotations": [
+            { "kind": "line", "axis": "x", "value": even_component, "label": "選んだ p" }
+        ]
+    })
+);
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let digits = serde_json::json!({ "significantDigits": 12 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "方法" },
+    { "key": "1", "label": "関数の実行 [回]", "type": "integer" },
+    { "key": "2", "label": "値 f [-]", "type": "number", "format": digits },
+    {
+        "key": "3",
+        "label": "閉形式との差 ‖Δ∇f‖∞ [-]",
+        "type": "number",
+        "format": sci3,
+        "nullText": "勾配なし"
+    }
+]);
+emit_table_with_columns!(
+    columns,
+    vec![
+        ("f64（微分なし）", plain_runs, plain, None),
+        (
+            "Dual（シード e_j で n 回）",
+            forward_runs,
+            forward_value,
+            error(&forward)
+        ),
+        (
+            "value_and_grad",
+            one_shot_runs,
+            one_shot_value,
+            error(reverse.as_slice())
+        ),
+        (
+            "Tape::gradient_into（1 回目）",
+            first_runs,
+            first_value,
+            error(&first)
+        ),
+        (
+            "Tape::gradient_into（2 回目）",
+            warm_runs,
+            warm_value,
+            error(&warm)
+        ),
+    ],
+    metadata = serde_json::json!({ "id": "methods" })
+);
+let summary_columns = serde_json::json!([
+    { "key": "0", "label": "‖∇f‖∞（閉形式）[-]", "type": "number", "format": digits },
+    { "key": "1", "label": "テープのワード数 [ワード]", "type": "integer" },
+    { "key": "2", "label": "1 回目に記録し直したか" },
+    { "key": "3", "label": "断面 161 点での事前確保の増加 [B]", "type": "integer" },
+    { "key": "4", "label": "図から除いた勾配 0 の点 [個]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    summary_columns,
+    vec![(
+        max_abs(&closed),
+        words,
+        if first_twice { "はい" } else { "いいえ" },
+        growth,
+        omitted,
+    )],
+    metadata = serde_json::json!({ "id": "summary" })
+);
+```
+
+既定値では $f = 24.2$、勾配は閉形式で $(-215.6, -88)$ である。
+5 行とも $f$ の値は同じ `24.199999999999996` で、値は微分の方式によらない。
+4 つの方式の勾配は閉形式と $2.8 \times 10^{-14}$ の差で一致し、これは最大の成分 215.6 の 1 ulp（$2^{-45}$）にあたる。
+実行回数は、`Dual` が $n = 2$ 回、`value_and_grad` と空のテープへの最初の `gradient_into` が 2 回、2 回目の `gradient_into` が 1 回である。
+空のテープで 2 回になるのは、1 回目の実行で文の数を数え、テープを広げてから 2 回目の実行で記録するからである（2 つ目の表の「1 回目に記録し直したか」が「はい」）。
+テープは 10 ワード（定数と 2 つの入力の 3 ワードを含む）で、断面の 161 点を同じテープで計算する間、事前確保したバイト数は増えなかった。
+
+グラフの $\lVert\nabla f\rVert_\infty$ は壁の上の $p = \pm 2$ で約 2400、選んだ $p = -1.2$ で 215.6 である。
+断面が谷底 $q = p^2$ を横切る $p = -1$ では 4 まで下がり、最小点 $(1, 1)$ にあたる $p = 1$ では勾配が厳密に 0 になるので、その 1 点は対数軸の図から除いた。
+最小点から $p$ を 0.025 動かしただけの $p = 0.975$ でも約 19 あり、谷の細さが勾配の大きさの急な変化として現れる。
+
+$n = 50$ では `Dual` の実行回数が 50 回に増えるが、逆モードは記録 1 回（空のテープでは 2 回）と逆走査 1 回のままである。
+テープは 442 ワードで、$n$ にほぼ比例する（1 項あたり約 9 ワード）。
+閉形式との差は $2.8 \times 10^{-14}$ のままで、$\lVert\nabla f\rVert_\infty = 792$ に対して丸め誤差の水準にある。
+$a = 2$、$(p, q) = (2, 4)$ は $n = 2$ の最小点 $(a, a^2)$ で、すべての方式が勾配を厳密に 0 で返し、$f = 0$ である。
+
+## 谷底のヘッセ行列と曲率
+
+ここからは $n = 2$ の $f(x, y) = (a - x)^2 + b\,(y - x^2)^2$ に絞り、谷底 $y = x^2$ の点 $(t, t^2)$ の曲率を調べる。
+上の三重対角の式で $n = 2$、$y = x^2$ とすると
+
+$$
+\mathbf{H}(t, t^2) = \begin{bmatrix} 2 + 8b\,t^2 & -4b\,t \\ -4b\,t & 2b \end{bmatrix}, \qquad
+\det\mathbf{H} = 4b, \qquad
+\tau = \operatorname{tr}\mathbf{H} = 2 + 2b + 8b\,t^2
+$$
+
+となり、行列式は谷底のどこでも $4b$ である。
+固有値は
+
+$$
+\lambda_\pm = \frac{\tau \pm \sqrt{\tau^2 - 16b}}{2}, \qquad \lambda_- = \frac{4b}{\lambda_+}
+$$
+
+で、小さい方は打ち消しを避けて右の形で計算する。
+条件数 $\kappa = \lambda_+/\lambda_-$ は、$b$ が大きいとき $\lambda_+ \approx \tau$、$\lambda_- \approx 4b/\tau$ から $\kappa \approx \tau^2/(4b) \approx b\,(1 + 4t^2)^2$ と近似できる。
+
+谷底の接線の単位ベクトル $\mathbf{d} = (1, 2t)/\sqrt{1 + 4t^2}$ と法線の単位ベクトル $\mathbf{m} = (-2t, 1)/\sqrt{1 + 4t^2}$ の向きの曲率（2 階の方向微分）は、上の $\mathbf{H}$ から
+
+$$
+\mathbf{d}^\mathsf{T}\mathbf{H}\,\mathbf{d} = \frac{2}{1 + 4t^2}, \qquad
+\mathbf{m}^\mathsf{T}\mathbf{H}\,\mathbf{m} = \frac{8t^2}{1 + 4t^2} + 2b\,(1 + 4t^2)
+$$
+
+と計算できる。
+谷に沿う曲率は $b$ によらず、谷を横切る曲率は $b$ に比例して大きくなる。
+単位ベクトル $\mathbf{u}$ の Rayleigh 商 $\mathbf{u}^\mathsf{T}\mathbf{H}\mathbf{u}$ は対称行列の最小と最大の固有値の間にあるので、$\lambda_- \le \mathbf{d}^\mathsf{T}\mathbf{H}\mathbf{d}$、$\mathbf{m}^\mathsf{T}\mathbf{H}\mathbf{m} \le \lambda_+$ である。
+$\mathbf{d}$ と $\mathbf{m}$ は正規直交なので、二つの曲率の和は $\operatorname{tr}\mathbf{H} = \lambda_+ + \lambda_-$ に等しい。
+二つの曲率の積は $4b + 16t^2/(1 + 4t^2)^2$ で、$b$ が大きいとき $\lambda_+\lambda_- = \det\mathbf{H} = 4b$ に近い。
+和が等しく積が近いので、$b$ が大きいと $\lambda_- \approx \mathbf{d}^\mathsf{T}\mathbf{H}\mathbf{d}$、$\lambda_+ \approx \mathbf{m}^\mathsf{T}\mathbf{H}\mathbf{m}$ で、固有ベクトルはほぼ谷の接線と法線の向きになる。
+
+条件数は勾配法の遅さを表す。
+最小点の近くで $f$ を二次式で近似し、正確な直線探索を伴う最急降下法を使うと、1 回の反復で $f - f^*$ が縮む比は最悪の場合 $\bigl((\kappa - 1)/(\kappa + 1)\bigr)^2$ である。
+最小点 $t = 1$、$b = 100$ の $\kappa \approx 2508$ ではこの比が約 $0.9984$ で、$f - f^*$ を 1 桁下げるのに約 1440 回の反復がかかる。
+
+`hessian(function, point)` は密なヘッセ行列を行優先の `scioxide_linalg::Matrix` で返す。
+関数を二重数のテープ `Tape<Dual<f64>>` の上で単位方向 $\mathbf{e}_j$ ごとに 1 回記録し、逆走査で第 $j$ 列 $\mathbf{H}\mathbf{e}_j$ を得る（前進モードを逆モードに重ねる forward-over-reverse）。
+計算コストは勾配の小さな定数倍の $n$ 回分である。
+毎回新しいテープを使うので、関数は最初に文を数える 1 回を加えた $n + 1$ 回実行される。
+関数の型は `for<'t> Fn(&[Var<'t, Dual<f64>>]) -> Result<Var<'t, Dual<f64>>, SciOxideError>` で、汎用の `rosenbrock` をそのまま使える。
+ヘッセ行列とベクトルの積の詳細は[ヘッセ行列とヘッセ行列・ベクトル積](../hessian-vector-product/)と[二階微分とヘッセ行列の作用素](../../algorithms/second-order-derivatives/)で扱う。
+
+$H_{01}$ と $H_{10}$ は別々の記録から得るので、一般には丸めの分だけ異なりうる。
+固有値は scioxide-linalg の `HermitianEigenvaluesResult::compute` で求め、入力の解釈を `HermitianInput::Projected(HermitianProjectionPolicy::Always)` にして $(\mathbf{H} + \mathbf{H}^\mathsf{T})/2$ を使う。
+固有値は昇順に並ぶ。
+後退安定な対称固有値のアルゴリズムの誤差は $\varepsilon\lVert\mathbf{H}\rVert_2 = \varepsilon\lambda_+$ 程度なので、$\lambda_-$ の相対誤差は $\varepsilon\kappa$ 程度まで大きくなりうる。
+これは AD の誤差ではなく、小さい固有値の条件の悪さである（[浮動小数点数と条件数](../../../concepts/floating-point-and-conditioning/)）。
+
+次のセルは谷の係数 $b$ と谷底の位置 $t$ を選び、点 $(t, t^2)$ のヘッセ行列を `hessian` で求めて、固有値、条件数、谷に沿う曲率と横切る曲率を閉形式と比べる。
+グラフは $t \in [-1.5, 1.5]$ の 61 点で、AD のヘッセ行列から求めた $\lambda_+$、$\lambda_-$（記号）と、閉形式の二つの方向曲率（破線）を対数軸で描く。
+表は選んだ $t$ での各量と相対差を示す。
+方向曲率の AD の側は AD の成分と接線 $(1, 2t)$・法線 $(-2t, 1)$ から計算する。
+検証するのは、成分と方向曲率が閉形式と一致すること、$\lambda_-$ の相対差が $\varepsilon\kappa$ の範囲にあることである。
+
+```rust
+//| id: ad-rosenbrock-valley-curvature
+//| ref: ad-rosenbrock-valley-curvature
+//| title: 谷底のヘッセ行列、固有値、方向曲率
+//| run: reactive
+//| uses: [ad-rosenbrock-model]
+//| crates: [scioxide-ad, scioxide-linalg]
+//| inputs:
+//|   valley: {"type":"range","label":"谷の係数 b [-]","description":"谷の壁の急さ。","min":1,"max":1000,"step":1,"value":100}
+//|   position: {"type":"range","label":"谷底の位置 t [-]","description":"評価点 (t, t²)。t = 1 は a = 1 の最小点。","min":-1.5,"max":1.5,"step":0.05,"value":1}
+//| cases:
+//|   - {"id":"valley-origin","label":"t = 0","description":"H = diag(2, 2b) で、条件数は b に等しい。","inputs":{"position":0}}
+//|   - {"id":"narrow-valley","label":"b = 1000、t = 1.5","description":"条件数が約 10⁵ になり、λ₋ の相対差が増える。","inputs":{"valley":1000,"position":1.5}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"curvature","path":"/rows/0/1","approx":{"value":802,"rtol":1e-15}}
+//|       - {"artifact":"curvature","path":"/rows/1/1","approx":{"value":-400,"rtol":1e-15}}
+//|       - {"artifact":"curvature","path":"/rows/3/1","approx":{"value":200,"rtol":1e-15}}
+//|       - {"artifact":"curvature","path":"/rows/6/1","approx":{"value":2508.0096,"rtol":1e-8}}
+//|       - {"artifact":"curvature","path":"/rows/5/3","range":{"max":6e-13}}
+//|       - {"artifact":"curvature","path":"/rows/7/1","approx":{"value":0.4,"rtol":1e-14}}
+//|       - {"artifact":"curvature","path":"/rows/8/1","approx":{"value":1001.6,"rtol":1e-14}}
+//|   - case: valley-origin
+//|     expect:
+//|       - {"artifact":"curvature","path":"/rows/6/1","approx":{"value":100,"rtol":1e-13}}
+//|       - {"artifact":"curvature","path":"/rows/1/3","equals":null}
+//|   - case: narrow-valley
+//|     expect:
+//|       - {"artifact":"curvature","path":"/rows/6/1","approx":{"value":100018.001,"rtol":1e-8}}
+//|       - {"artifact":"curvature","path":"/rows/5/3","range":{"max":2.2e-11}}
+//|       - {"artifact":"curvature","path":"/rows/7/3","range":{"max":1e-14}}
+use scioxide_ad::hessian;
+use scioxide_linalg::{HermitianEigenvaluesResult, HermitianInput, HermitianProjectionPolicy};
+
+let b = valley;
+// AD のヘッセ行列（行優先）と scioxide-linalg の固有値 λ₋ ≤ λ₊。a はヘッセ行列に現れないので 1 とする。
+let curvature = |t: f64| -> Result<([f64; 4], f64, f64), String> {
+    let h = hessian(|x| Ok(rosenbrock(x, 1.0, b)), &[t, t * t]).map_err(|e| e.to_string())?;
+    let values = HermitianEigenvaluesResult::compute(
+        &h,
+        HermitianInput::Projected(HermitianProjectionPolicy::Always),
+    )
+    .map_err(|e| e.to_string())?;
+    let entries = <[f64; 4]>::try_from(h.as_slice()).map_err(|_| "2×2 ではない".to_string())?;
+    Ok((entries, values.eigenvalues()[0], values.eigenvalues()[1]))
+};
+// 独立検算: 谷底の閉形式（f64 の演算と固有メソッド sqrt）。τ = 2 + 2b + 8bt²、det H = 4b。
+let along = |t: f64| 2.0 / (1.0 + 4.0 * t * t);
+let across = |t: f64| 8.0 * t * t / (1.0 + 4.0 * t * t) + 2.0 * b * (1.0 + 4.0 * t * t);
+let eigen = |t: f64| {
+    let trace = 2.0 + 2.0 * b + 8.0 * b * t * t;
+    let large = 0.5 * (trace + (trace * trace - 16.0 * b).sqrt());
+    (4.0 * b / large, large)
+};
+
+let mut large_points = Vec::new();
+let mut small_points = Vec::new();
+let mut along_curve = Vec::new();
+let mut across_curve = Vec::new();
+for i in 0..=60 {
+    let t = -1.5 + 3.0 * f64::from(i) / 60.0;
+    let (_, small, large) = curvature(t)?;
+    large_points.push([t, large]);
+    small_points.push([t, small]);
+    along_curve.push([t, along(t)]);
+    across_curve.push([t, across(t)]);
+}
+let scatter = |id: &str, name: &str, points: &Vec<[f64; 2]>, symbol: &str| {
+    serde_json::json!({
+        "id": id,
+        "kind": "scatter",
+        "name": name,
+        "points": points,
+        "style": { "symbol": symbol }
+    })
+};
+let dashed = |id: &str, name: &str, points: &Vec<[f64; 2]>| {
+    serde_json::json!({
+        "id": id,
+        "kind": "line",
+        "name": name,
+        "points": points,
+        "style": { "lineType": "dashed", "showSymbol": false }
+    })
+};
+emit_chart!(serde_json::json!({
+    "kind": "xy",
+    "dataZoom": true,
+    "tooltip": true,
+    "xLabel": "谷底の位置 t [-]",
+    "yLabel": "曲率 [-]",
+    "yType": "log",
+    "xMin": -1.5,
+    "xMax": 1.5,
+    "layers": [
+        scatter("large", "λ₊（hessian と固有値）", &large_points, "circle"),
+        scatter("small", "λ₋（hessian と固有値）", &small_points, "diamond"),
+        dashed("across", "谷を横切る曲率 mᵀHm（閉形式）", &across_curve),
+        dashed("along", "谷に沿う曲率 dᵀHd（閉形式）", &along_curve)
+    ],
+    "annotations": [{ "kind": "line", "axis": "x", "value": position, "label": "選んだ t" }]
+}));
+
+let t = position;
+let (h, small, large) = curvature(t)?;
+let (exact_small, exact_large) = eigen(t);
+let exact_h = [2.0 + 8.0 * b * t * t, -4.0 * b * t, -4.0 * b * t, 2.0 * b];
+// 接線 (1, 2t) と法線 (−2t, 1) の向きの曲率を AD の成分から求め、長さ² 1 + 4t² で割る。
+let stretch = 1.0 + 4.0 * t * t;
+let off = 0.5 * (h[1] + h[2]);
+let along_ad = (h[0] + 4.0 * t * off + 4.0 * t * t * h[3]) / stretch;
+let across_ad = (4.0 * t * t * h[0] - 4.0 * t * off + h[3]) / stretch;
+let relative = |ad: f64, exact: f64| (exact != 0.0).then(|| (ad - exact).abs() / exact.abs());
+let rows: Vec<(&str, f64, f64, Option<f64>)> = [
+    ("H₀₀", h[0], exact_h[0]),
+    ("H₀₁", h[1], exact_h[1]),
+    ("H₁₀", h[2], exact_h[2]),
+    ("H₁₁", h[3], exact_h[3]),
+    ("λ₊", large, exact_large),
+    ("λ₋", small, exact_small),
+    ("κ = λ₊/λ₋", large / small, exact_large / exact_small),
+    ("谷に沿う曲率 dᵀHd", along_ad, along(t)),
+    ("谷を横切る曲率 mᵀHm", across_ad, across(t)),
+]
+.into_iter()
+.map(|(name, ad, exact)| (name, ad, exact, relative(ad, exact)))
+.collect();
+let digits = serde_json::json!({ "significantDigits": 10 });
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "量" },
+    { "key": "1", "label": "AD と scioxide-linalg [-]", "type": "number", "format": digits },
+    { "key": "2", "label": "閉形式 [-]", "type": "number", "format": digits },
+    { "key": "3", "label": "相対差 [-]", "type": "number", "format": sci3, "nullText": "閉形式が 0" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "curvature" })
+);
+```
+
+既定値 $b = 100$、$t = 1$ では、`hessian` の成分は閉形式の $H_{00} = 802$、$H_{01} = H_{10} = -400$、$H_{11} = 200$ と一致し、二つの非対角成分もビット単位で等しい。
+固有値は $\lambda_+ = 1001.6006$、$\lambda_- = 0.39936$、条件数は $\kappa = 2508.0$ である。
+$\lambda_-$ の相対差は $4.0 \times 10^{-14}$ で、$\varepsilon\kappa = 5.6 \times 10^{-13}$ の範囲にある。
+谷に沿う曲率は $0.4$、谷を横切る曲率は $1001.6$ で、それぞれ $\lambda_-$ と $\lambda_+$ に近く、Rayleigh 商の不等式 $\lambda_- \le 0.4$、$1001.6 \le \lambda_+$ を満たす。
+
+グラフでは $\lambda_+$ の記号が横切る曲率の破線に、$\lambda_-$ の記号が沿う曲率の破線にほぼ重なる。
+$t = \pm 1.5$ では $\lambda_+ = 2001.8$、$\lambda_- = 0.1998$ で、谷底の位置によって条件数が $t = 0$ の 100 から約 $10^4$ まで変わる。
+$t = 0$ では $\mathbf{H} = \operatorname{diag}(2, 2b)$ なので、固有値は二つの方向曲率に等しく、$\kappa = b = 100$ になる。
+この点の非対角成分は 0 なので、表の相対差は定義しない。
+
+$b = 1000$、$t = 1.5$ では $\kappa = 1.0002 \times 10^5$ で、近似 $b(1 + 4t^2)^2 = 10^5$ に近い。
+成分と方向曲率は閉形式と一致したままだが、$\lambda_-$ の相対差は $6.3 \times 10^{-13}$ に増え、$\varepsilon\kappa = 2.2 \times 10^{-11}$ の範囲にある。
+成分は閉形式と一致しているので、この差は小さい固有値を $\lVert\mathbf{H}\rVert_2$ の尺度で計算することから生じる。
+
+## まとめ
+
+`Dual` はシード $\mathbf{e}_j$ の前進評価 1 回で 1 つの偏微分を返すので、勾配には $n$ 回の評価が要る。
+逆モードは $n$ によらず記録 1 回と逆走査 1 回で勾配を返し、既定値では 3 通りとも閉形式と最大成分の 1 ulp の差で一致した。
+同じ関数を多数の点で微分するなら、テープを一度作って `gradient_into` を繰り返すと、2 回目以降は関数を 1 回だけ実行し、メモリを確保しない。
+谷底のヘッセ行列は `hessian` で閉形式どおりに求まり、谷に沿う曲率 $2/(1 + 4t^2)$ と横切る曲率 $\approx 2b(1 + 4t^2)$ の比が条件数 $\kappa \approx b(1 + 4t^2)^2$ を決める。
+小さい固有値の相対誤差は $\varepsilon\kappa$ 程度まで増えるので、AD の精度とは分けて読む。
+
+## 次に読むページ
+
+- [JVP と VJP の双対性](../jvp-vjp-duality/)：前進モードの積と逆モードの積が同じヤコビ行列の列と行を与えることと、ヤコビ行列を組む走査の回数を確かめる。
+- [ヘッセ行列とヘッセ行列・ベクトル積](../hessian-vector-product/)：密なヘッセ行列を作らずに曲率を使う Newton–CG 法を確かめる。
+- [疎なヘッセ行列の彩色による復元](../sparse-hessian-chain/)：三重対角のような疎なヘッセ行列を、$n$ より少ない記録で復元する方法を確かめる。
+- [テープのライフサイクルと再利用](../../algorithms/tape-lifecycle/)：テープの容量、記録し直し、確保しない再利用の手順を確かめる。

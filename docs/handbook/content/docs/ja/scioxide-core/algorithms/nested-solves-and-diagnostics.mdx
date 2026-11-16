@@ -1,0 +1,510 @@
+---
+title: 入れ子の求解・回数の集計・診断
+description: SolveScope による子の求解の始め方、上限を共有する項目の実行回数と回数を階層ごとに記録する規則、_scoped 関数の規約、並列に走る子への求解間で共有する上限の分配、集計の完全性、BudgetLimit と effective_budget_report、内側の上限で止まった求解の診断の読み方。
+sidebar:
+  order: 315
+references:
+  core-nested-diagnostics: "入れ子の上限と診断"
+  core-nested-accounting: "入れ子の求解と回数の集計"
+  core-parallel-child-budgets: "並列に走る子への分配"
+  core-accounting-integrity: "集計の完全性"
+---
+
+反復解法は内側で別の反復解法を呼ぶことが多い。
+そのとき呼び出し側は内側が使った関数評価を外側の上限に含めたいが、内側の反復を外側の反復と混ぜて数えたくはない。
+`scioxide-core` は内側の求解を `SolveScope` を通して外側の求解の子として始め、上限を共有する項目の実行回数を外側のすべての求解に記録し、回数を階層ごとに分けて保持する。
+このページは子の求解の始め方と記録の規則、`_scoped` 関数の規約、並列に走る子への求解間で共有する上限の分配、内側の上限で止まった求解の診断の読み方を扱う。
+求解の状態 `SolveState`、コンテキスト `SolveContext`、エポックは[求解の同一性とエポック](oxref:core-solve-identity)で、上限 `Budget` と `SolveBudgets`、求解ごとの上限と求解間で共有する上限の区別、許可の操作は[求解ごとの上限と求解間で共有する上限](oxref:core-local-and-shared-budgets)で説明してあり、このページはそれらを前提にする。
+
+## 入れ子の求解と回数の集計
+
+非線形方程式の Newton 法が各反復で線形方程式の反復解法を呼ぶ場合のように、複合的なアルゴリズムは親の求解の中で子の求解を実行する。
+`SolveScope` は求解をどこで始めるかを表す。
+`SolveScope::from(execution)`（`ExecutionContext` から）は親を持たない最上位の求解を、`SolveScope::from(&mut context)`（`&mut SolveContext` から）は子の求解を始める。
+`scope.run(&mut child_state, identity, allowance, |child| { ... })` は `child_state` に新しいエポックを始め、次の規則で記録する。
+
+- 子のエポック、受理状態、求解ごとの上限（`allowance`）は子の `SolveState` に属し、親の受理状態は進まない。
+- 子は親の実行コンテキストを引き継ぐので、親と同じエグゼキューター、取り消し、期限のもとで動く。
+  子だけに期限を足す方法は[取り消しの確認](oxref:core-cancellation-checks)にある。
+- 子が上限を共有する操作を実行すると、その回数を外側のすべての求解にも加算する。
+  記録の前に外側の求解の連鎖全体で上限と計数の表現範囲を確かめ、一つでも拒否されればどの階層の記録済みの回数も変えない。
+  コールバックがエラーを返した評価も、外側の求解の評価回数に加算される。
+- 親の `counts()` は `SolveCounts` を返し、親自身の作業 `own()` と子孫の作業 `nested()` を重ねずに保持する。
+  どちらも `EvaluationCounts` で、反復、提案、受理、棄却、キャッシュの参照、役割ごとの評価の回数を持つ。
+  子が数えた回数は、反復や受理のように上限を共有しないものも含めて、外側のすべての求解の `nested()` に加わる。
+  `total()?` は二つの和を桁あふれを検査して求める。
+
+子の求解を始めるほどではない内側の計算は、`record_nested_iterations(amount)` と `record_nested_providers(role, amount)` で `nested()` の側に直接数えられる。
+この場合も評価回数は共有の上限の対象となるが、反復回数は自分自身の反復回数には加算しない。
+
+### `_scoped` 関数の規約
+
+SciOxide の各クレートでは、名前が `_scoped` で終わる関数は、呼び出し側のスコープかコンテキストを最後の引数に取り、その中で動く。
+たとえば scioxide-rootfind の `find_bracket_scoped` は最後の引数の型が `impl Into<SolveScope<'_, '_>>` で、`ExecutionContext` と `&mut SolveContext` のどちらも渡せる。
+
+- `&mut SolveContext` を渡すと、関数は呼び出し側の求解の子として動く。
+  呼び出し側の取り消し要求と期限を確認し、評価などの上限を共有する項目は呼び出し側にも回数を加算する。
+- `ExecutionContext` を渡すと、関数は最上位の求解として動き、渡したコンテキストのエグゼキューター、取り消し、期限を使う。
+- 接尾辞のない形は同じ計算を単独で実行する。
+  `find_bracket` は `find_bracket_scoped` に `ExecutionContext::sequential_native()` を渡すので、取り消しも期限も持たず、呼び出し元の回数の集計にも数えられない。
+
+自分の反復解法の中から SciOxide の解法を呼ぶときは、`_scoped` の形に自分の `&mut SolveContext` を渡す。
+接尾辞のない形を呼ぶと、内側の評価回数が自分の集計に含まれず、取り消しも内側に届かない。
+
+次のセルの `inner_scoped` はこの形で書いた内側の求解で、指定した回数の反復と 1 回の関数評価を試みる。
+セルは反復の上限が 1 回、評価の上限が入力（1〜3 回）の親を作り、`inner_scoped` を親の子として 1 回、最上位の求解として 1 回呼ぶ。
+子として呼んだ後に、親自身も反復と関数評価を 1 回ずつ試みる。
+1 つ目の表は各操作の試行と許可の回数、2 つ目の表は評価回数の上限のレポート、3 つ目の表は 3 つの `SolveState` の回数と集計の完全性（[集計の完全性](#集計の完全性)）を示す。
+検証するのは、子の反復が親自身の反復回数に含まれないこと、子の評価が親の評価回数に含まれること、根として呼んだ求解が親の記録を変えないことである。
+
+```rust
+//| id: core-nested-scope-budgets
+//| ref: core-nested-scope-budgets
+//| title: 入れ子の求解で求解ごとの上限と求解間で共有する上限を分ける
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   child_iterations: {"type":"range","label":"内側の反復回数 [回]","description":"内側の求解が試みる反復の回数。内側に反復の上限は設けない。","min":1,"max":5,"step":1,"value":2}
+//|   evaluation_limit: {"type":"range","label":"親の評価の上限 [回]","description":"親の BudgetKind::Evaluation の上限。子の評価回数もこの上限の対象になる。","min":1,"max":3,"step":1,"value":1}
+//| cases:
+//|   - {"id":"long-child","label":"内側の反復 5 回","description":"子の反復が 5 回に増えても、親の反復は許可される。","inputs":{"child_iterations":5}}
+//|   - {"id":"two-evaluations","label":"評価の上限 2 回","description":"子が 1 回使った残りの 1 回で、親の関数評価も許可される。","inputs":{"evaluation_limit":2}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"admissions","path":"/rows/0/3","equals":2}
+//|       - {"artifact":"admissions","path":"/rows/2/3","equals":1}
+//|       - {"artifact":"admissions","path":"/rows/3/3","equals":0}
+//|       - {"artifact":"budgets","path":"/rows/0/2","equals":1}
+//|       - {"artifact":"budgets","path":"/rows/1/2","equals":null}
+//|       - {"artifact":"counts","path":"/rows/0/1","equals":1}
+//|       - {"artifact":"counts","path":"/rows/0/2","equals":2}
+//|       - {"artifact":"counts","path":"/rows/0/3","equals":0}
+//|       - {"artifact":"counts","path":"/rows/0/4","equals":1}
+//|       - {"artifact":"counts","path":"/rows/0/6","equals":"Exact"}
+//|   - case: long-child
+//|     expect:
+//|       - {"artifact":"admissions","path":"/rows/0/3","equals":5}
+//|       - {"artifact":"admissions","path":"/rows/2/3","equals":1}
+//|       - {"artifact":"counts","path":"/rows/0/2","equals":5}
+//|   - case: two-evaluations
+//|     expect:
+//|       - {"artifact":"admissions","path":"/rows/3/3","equals":1}
+//|       - {"artifact":"budgets","path":"/rows/2/1","equals":2}
+//|       - {"artifact":"budgets","path":"/rows/2/2","equals":0}
+//|       - {"artifact":"counts","path":"/rows/0/5","equals":2}
+use scioxide_core::{
+    AccountingIntegrity, AlgorithmId, Budget, BudgetKind, BudgetReport, EvaluationRole,
+    ExecutionContext, SciOxideError, ProblemToken, SolveBudgets, SolveCounts, SolveIdentity,
+    SolveScope, SolveState, algorithm_id, budget,
+};
+
+const OUTER: AlgorithmId = algorithm_id!("handbook", "outer", 1);
+const INNER: AlgorithmId = algorithm_id!("handbook", "inner", 1);
+
+/// 内側の求解。呼び出し側のスコープを最後の引数に取る `_scoped` の形で書く。
+/// 反復を `iterations` 回と関数評価を 1 回試み、
+/// (許可された反復, 許可された評価, 評価の前に見えた評価回数の上限) を返す。
+fn inner_scoped<'scope, 'capability>(
+    iterations: usize,
+    state: &mut SolveState,
+    scope: impl Into<SolveScope<'scope, 'capability>>,
+) -> Result<(usize, usize, BudgetReport), SciOxideError> {
+    let identity = SolveIdentity::new(ProblemToken::new(1), INNER, 0, 0);
+    // 内側の allowance には上限がない。共有リソースの上限は外側の求解のものが効く。
+    let allowance = SolveBudgets::unbounded();
+    scope.into().run(state, identity, allowance, |child| {
+        let mut granted = 0;
+        for _ in 0..iterations {
+            granted += usize::from(child.record_iteration()?.is_granted());
+        }
+        let visible = child.effective_budget_report(BudgetKind::Evaluation);
+        let evaluation = child.invoke_provider(EvaluationRole::Function, || Ok(42.0))?;
+        Ok((granted, usize::from(evaluation.is_evaluated()), visible))
+    })
+}
+
+let function = EvaluationRole::Function;
+let iterations = child_iterations as usize;
+let evaluations = Budget::try_from(evaluation_limit as usize).map_err(|e| e.to_string())?;
+let mut budgets = SolveBudgets::unbounded()
+    .with_limit(BudgetKind::Iteration, budget!(1))
+    .with_limit(BudgetKind::Evaluation, evaluations);
+let mut state = SolveState::new();
+let identity = SolveIdentity::new(ProblemToken::new(1), OUTER, 0, 0);
+let mut parent = state
+    .begin_solve(ExecutionContext::sequential(), identity, &mut budgets)
+    .map_err(|e| e.to_string())?;
+
+// 子として呼ぶ: &mut SolveContext を渡すと、共有リソースの消費が親にも記録される。
+let mut child_state = SolveState::new();
+let (child_granted, child_evaluated, child_visible) =
+    inner_scoped(iterations, &mut child_state, &mut parent).map_err(|e| e.to_string())?;
+
+// 親自身の作業: 反復は局所の上限 1 回、関数評価は共有の上限の残りで判定される。
+let parent_granted = usize::from(
+    parent
+        .record_iteration()
+        .map_err(|e| e.to_string())?
+        .is_granted(),
+);
+let parent_evaluated = usize::from(
+    parent
+        .invoke_provider(function, || Ok(0.0))
+        .map_err(|e| e.to_string())?
+        .is_evaluated(),
+);
+
+// 根として呼ぶ: ExecutionContext を渡すと単独の求解になり、親の記録は変わらない。
+let mut root_state = SolveState::new();
+let (root_granted, root_evaluated, root_visible) =
+    inner_scoped(iterations, &mut root_state, ExecutionContext::sequential())
+        .map_err(|e| e.to_string())?;
+let parent_budget = parent.budget_report(BudgetKind::Evaluation);
+let parent_counts = parent.counts();
+
+let admission_columns = serde_json::json!([
+    { "key": "0", "label": "求解" },
+    { "key": "1", "label": "操作" },
+    { "key": "2", "label": "試行 [回]", "type": "integer" },
+    { "key": "3", "label": "許可 [回]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    admission_columns,
+    vec![
+        ("内側（親の子）", "反復", iterations, child_granted),
+        ("内側（親の子）", "関数評価", 1, child_evaluated),
+        ("親", "反復", 1, parent_granted),
+        ("親", "関数評価", 1, parent_evaluated),
+        ("内側（根）", "反復", iterations, root_granted),
+        ("内側（根）", "関数評価", 1, root_evaluated),
+    ],
+    metadata = serde_json::json!({ "id": "admissions", "title": "試行と許可" })
+);
+
+let budget_columns = serde_json::json!([
+    { "key": "0", "label": "評価回数の上限のレポート" },
+    { "key": "1", "label": "消費 consumed() [回]", "type": "integer" },
+    { "key": "2", "label": "残り remaining() [回]", "type": "integer", "nullText": "上限なし" }
+]);
+let budget_row =
+    |label: &'static str, report: BudgetReport| (label, report.consumed(), report.remaining());
+emit_table_with_columns!(
+    budget_columns,
+    vec![
+        budget_row(
+            "内側（親の子）: 評価の前の effective_budget_report",
+            child_visible
+        ),
+        budget_row(
+            "内側（根）: 評価の前の effective_budget_report",
+            root_visible
+        ),
+        budget_row("親: 最後の budget_report", parent_budget),
+    ],
+    metadata = serde_json::json!({ "id": "budgets", "title": "評価回数の上限" })
+);
+
+let count_columns = serde_json::json!([
+    { "key": "0", "label": "SolveState" },
+    { "key": "1", "label": "反復 own [回]", "type": "integer" },
+    { "key": "2", "label": "反復 nested [回]", "type": "integer" },
+    { "key": "3", "label": "関数評価 own [回]", "type": "integer" },
+    { "key": "4", "label": "関数評価 nested [回]", "type": "integer" },
+    { "key": "5", "label": "関数評価 total [回]", "type": "integer" },
+    { "key": "6", "label": "集計の完全性 integrity()" }
+]);
+let count_row = |label: &'static str, counts: SolveCounts| {
+    let total = counts.total()?;
+    let integrity = match counts.integrity() {
+        AccountingIntegrity::Exact => "Exact",
+        AccountingIntegrity::Invalid => "Invalid",
+    };
+    Ok::<_, SciOxideError>((
+        label,
+        counts.own().iterations(),
+        counts.nested().iterations(),
+        counts.own().provider(function),
+        counts.nested().provider(function),
+        total.provider(function),
+        integrity,
+    ))
+};
+emit_table_with_columns!(
+    count_columns,
+    vec![
+        count_row("親", parent_counts).map_err(|e| e.to_string())?,
+        count_row("内側（親の子）", child_state.counts()).map_err(|e| e.to_string())?,
+        count_row("内側（根）", root_state.counts()).map_err(|e| e.to_string())?,
+    ],
+    metadata = serde_json::json!({ "id": "counts", "title": "回数の記録" })
+);
+```
+
+既定値（内側の反復 2 回、評価の上限 1 回）では、子の反復 2 回と関数評価 1 回がすべて許可される。
+子から見えた評価回数の上限は、子自身に上限がないので親の上限で、残りは 1 回である。
+子の評価が共有の上限に達するので、親の関数評価は拒否され、親の反復は局所の上限 1 回の範囲で許可される。
+親の記録は、反復が `own` 1 回と `nested` 2 回、関数評価が `own` 0 回と `nested` 1 回になる。
+根として呼んだ内側の求解は評価の上限を持たず（残りは「上限なし」）、その作業は親の記録に現れない。
+
+内側の反復を 5 回に増やしても親の反復は許可され、`nested` の反復数だけが 5 回に増える。
+評価の上限を 2 回にすると、子が 1 回使った残りの 1 回で親の関数評価も許可され、関数評価の `total` は 2 回、親の評価の残りは 0 回になる。
+
+### 並列に走る子への分配
+
+`SolveScope::run` の子は親を可変借用して記録するので、一度に一つしか走らない。
+エグゼキューターの分割ごとに子を並列に走らせる `backend::with_partitioned_solves` では、子が親を借用できないため、始める前に共有リソースの残りを子に分けておく。
+共有上限を管理する項目ごとに、親を含む外側の求解の中で最も少ない残りを $R$、子の数を $c$ とすると、番号 $i$（$0 \le i < c$）の子の上限は
+
+$$
+R_i = \lfloor R / c \rfloor + [\, i < R \bmod c \,], \qquad \sum_{i=0}^{c-1} R_i = R
+$$
+
+で、前の $R \bmod c$ 個の子が 1 ずつ多く受け取る。
+角括弧は、中の条件が成り立つとき 1、成り立たないとき 0 を表す。
+`allowance` がそのリソースに $R_i$ より小さい上限を持つ場合は、小さい方が子の上限になる。
+親を含む外側のどの求解にも上限がないリソースは分けず、`allowance` の上限をそのまま使う。
+計数が `usize` で表せる残りの回数も同じ式で分ける。
+子が使わなかった分は兄弟に回さないので、各子の上限は実行の順序や速さによらない。
+すべての子が終わると、エラーで終わった子も含めて番号順に記録を親へマージしる。
+準備とマージにかかる時間は子の数に比例する。
+
+### 集計の完全性
+
+`SolveCounts::integrity()` は、記録がエポックの作業をすべて表しているかを `AccountingIntegrity` で示す。
+通常は `Exact` で、並列の子の記録を親にマージできなかったときに、その親を含む外側の求解が `Invalid` になる。
+マージできた他の子の記録は親に入り、エラーは失敗した子のうち最も小さい番号を返す。
+`Invalid` のエポックでは `total()`、チェックポイントの作成、以後のリソースの許可が `AccountingInvariant` エラーになり、新しいエポックを始めるまで戻らない。
+`own()` と `nested()` は診断には読めるが、作業の総量としては扱えない。
+
+## 入れ子の上限と診断
+
+設定に使う `Budget` は正の整数だが、レポートには 0 も表せる `BudgetLimit` を使う。
+`BudgetLimit::Finite(n)` は有限の上限で、並列の子の取り分では $R < c$ のとき番号が $R$ 以上の子で 0 になる。
+`BudgetLimit::Unbounded` は上限を設定していないことを表す。
+`BudgetReport::remaining()` は `Unbounded` なら `None` を返し、`exhausted()` は有限の上限に達したときだけ真になる。
+
+子のコンテキストの `budget_report(kind)` はそのコンテキスト自身の上限と消費を返す。
+`effective_budget_report(kind)` は、共有リソースなら自分と外側の求解の中で残りが最も少ない上限（同じなら近い方）のレポートを、局所リソースなら自分のレポートを返す。
+子があと何回評価できるかは後者で読む。
+拒否のときに返る `BudgetReport` は拒否した上限のレポートなので、子の評価が外側の求解の上限で拒否された場合は、その外側の求解の消費と上限を示す。
+
+内側の求解が上限で止まり外側も続けられなくなると、外側は各階層の診断を `ConvergenceFailure` のエラーに入れて返す。
+`ConvergenceDiagnostics` はアルゴリズム、回数、求解を止めた計算回数の上限のレポート、残差、最後の受理状態を持つ。
+`with_nested(algorithm, inner)` は、内側の診断とその子孫を外側から内側の順に平らな列として加える。
+読む側は `error.view()` の `SciOxideErrorView::ConvergenceFailure` から理由 `ConvergenceReason` と `ConvergenceDiagnosticsView` を受け取り、`nested_levels()` で `NestedLevel` を外側から順に読む。
+各 `NestedLevel` はアルゴリズム `algorithm()`、回数 `counts()`、終了の原因となった計算回数の上限のレポート `budget()`、残差 `residual()`、最後の受理状態 `partial_result()` を持ち、入れ子が深くても一つのループですべての階層を読める。
+
+次のセルは部分結果を返せない内側の求解を題材にする。
+内側は反復と関数評価を 1 回ずつ行う単位を 3 回繰り返し、拒否を `.require()?` でエラーにする。
+入力は内側の反復の上限（1〜4 回、内側の求解ごとの上限）と、親に設定する共有の評価の上限（1〜4 回）である。
+外側は内側のエラーを受け取ると、自分の回数と内側の診断を入れた `ConvergenceFailure`（理由は `NestedSolver`）を返す。
+表はこのエラーの `view()` から読んだ各階層のアルゴリズム、回数、止めた計算回数の上限のレポートで、検証するのは、止めた計算回数の上限の種類と消費が入力の上限から決まる値に一致することである。
+内側が 3 単位を終えた場合は表を出さず、判定だけを示す。
+
+```rust
+//| id: core-nested-failure-diagnostics
+//| ref: core-nested-failure-diagnostics
+//| title: 内側の上限で止まった求解の診断を読む
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   inner_iteration_limit: {"type":"range","label":"内側の反復の上限 [回]","description":"内側の求解の求解ごとの上限。3 回未満なら内側は反復の上限で止まる。","min":1,"max":4,"step":1,"value":2}
+//|   evaluation_limit: {"type":"range","label":"共有の評価の上限 [回]","description":"親に設定する評価の上限。3 回未満なら内側は親の上限で止まる。","min":1,"max":4,"step":1,"value":4}
+//| cases:
+//|   - {"id":"shared-evaluation-limit","label":"評価の上限 1 回","description":"内側の 2 回目の関数評価が親の上限で拒否される。","inputs":{"inner_iteration_limit":4,"evaluation_limit":1}}
+//|   - {"id":"within-limits","label":"どちらの上限も 4 回","description":"内側が 3 単位を終え、エラーは返らない。","inputs":{"inner_iteration_limit":4,"evaluation_limit":4}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"levels","path":"/rows/0/1","equals":"handbook/outer@1"}
+//|       - {"artifact":"levels","path":"/rows/0/2","equals":1}
+//|       - {"artifact":"levels","path":"/rows/0/4","equals":null}
+//|       - {"artifact":"levels","path":"/rows/1/1","equals":"handbook/inner@1"}
+//|       - {"artifact":"levels","path":"/rows/1/2","equals":2}
+//|       - {"artifact":"levels","path":"/rows/1/3","equals":2}
+//|       - {"artifact":"levels","path":"/rows/1/4","equals":"iteration"}
+//|       - {"artifact":"levels","path":"/rows/1/5","equals":2}
+//|       - {"artifact":"levels","path":"/rows/1/6","equals":2}
+//|       - {"path":"/outputs/1/state","equals":"failed"}
+//|   - case: shared-evaluation-limit
+//|     expect:
+//|       - {"artifact":"levels","path":"/rows/1/2","equals":2}
+//|       - {"artifact":"levels","path":"/rows/1/3","equals":1}
+//|       - {"artifact":"levels","path":"/rows/1/4","equals":"evaluation"}
+//|       - {"artifact":"levels","path":"/rows/1/5","equals":1}
+//|       - {"artifact":"levels","path":"/rows/1/6","equals":1}
+//|       - {"path":"/outputs/1/state","equals":"failed"}
+//|   - case: within-limits
+//|     expect:
+//|       - {"path":"/outputs/0/state","equals":"satisfied"}
+//|       - {"path":"/outputs/0/diagnostics/0/value","approx":{"value":3,"atol":1e-12}}
+use scioxide_core::{
+    AlgorithmId, Budget, BudgetKind, BudgetLimit, BudgetReport, ConvergenceDiagnostics,
+    ConvergenceReason, EvaluationRole, ExecutionContext, SciOxideError, SciOxideErrorView,
+    ProblemToken, SolveBudgets, SolveContext, SolveCounts, SolveIdentity, SolveScope,
+    SolveState, algorithm_id,
+};
+
+const OUTER: AlgorithmId = algorithm_id!("handbook", "outer", 1);
+const INNER: AlgorithmId = algorithm_id!("handbook", "inner", 1);
+/// 内側の求解が行う単位（反復 1 回と関数評価 1 回）の数。
+const UNITS: usize = 3;
+
+/// 内側の求解。部分結果を返さないので、拒否は require() で ConvergenceFailure にする。
+fn inner(child: &mut SolveContext<'_, '_>) -> Result<(), SciOxideError> {
+    for _ in 0..UNITS {
+        child.record_iteration()?.require()?;
+        child
+            .invoke_provider(EvaluationRole::Function, || Ok(()))?
+            .require()?;
+    }
+    Ok(())
+}
+
+/// 外側の求解。反復を 1 回数えて内側を呼び、内側の ConvergenceFailure に各階層の診断を付ける。
+fn outer(
+    parent: &mut SolveContext<'_, '_>,
+    child_state: &mut SolveState,
+    inner_limit: Budget,
+) -> Result<(), SciOxideError> {
+    parent.record_iteration()?.require()?;
+    let identity = SolveIdentity::new(ProblemToken::new(1), INNER, 0, 0);
+    let allowance = SolveBudgets::unbounded().with_limit(BudgetKind::Iteration, inner_limit);
+    let result = SolveScope::from(&mut *parent).run(child_state, identity, allowance, inner);
+    let Err(error) = result else {
+        return Ok(());
+    };
+    let stopped_by = match error.view() {
+        SciOxideErrorView::ConvergenceFailure { diagnostics, .. } => diagnostics.budget(),
+        // 収束の失敗でないエラーは、そのまま返す。
+        _ => return Err(error),
+    };
+    // 内側の階層: 内側の SolveState の回数と、内側を止めた計算回数の上限のレポート。
+    let mut nested = ConvergenceDiagnostics::new().with_counts(child_state.counts());
+    if let Some(report) = stopped_by {
+        nested = nested.with_budget(report);
+    }
+    let diagnostics = ConvergenceDiagnostics::new()
+        .with_algorithm(OUTER)
+        .with_counts(parent.counts())
+        .with_nested(INNER, nested);
+    Err(SciOxideError::convergence_failure(
+        ConvergenceReason::NestedSolver,
+        diagnostics,
+        "inner solve did not converge",
+    ))
+}
+
+let limit = |count: f64| Budget::try_from(count as usize).map_err(|e| e.to_string());
+let mut budgets =
+    SolveBudgets::unbounded().with_limit(BudgetKind::Evaluation, limit(evaluation_limit)?);
+let mut state = SolveState::new();
+let mut child_state = SolveState::new();
+let identity = SolveIdentity::new(ProblemToken::new(1), OUTER, 0, 0);
+let mut parent = state
+    .begin_solve(ExecutionContext::sequential(), identity, &mut budgets)
+    .map_err(|e| e.to_string())?;
+let result = outer(&mut parent, &mut child_state, limit(inner_iteration_limit)?);
+let nested_evaluations = parent.counts().nested().provider(EvaluationRole::Function);
+
+let outcome = match result {
+    Ok(()) => Outcome::satisfied("内側の求解は上限の範囲で 3 単位を終えた").status("Ok"),
+    Err(error) => {
+        let SciOxideErrorView::ConvergenceFailure {
+            reason,
+            diagnostics,
+            ..
+        } = error.view()
+        else {
+            return Err(error.to_string());
+        };
+        // 0 行目は外側、1 行目以降は nested_levels() が外側から順に返す内側の階層。
+        let finite = |limit: BudgetLimit| match limit {
+            BudgetLimit::Finite(count) => Some(count),
+            BudgetLimit::Unbounded => None,
+        };
+        let row =
+            |depth: usize, algorithm: Option<AlgorithmId>, counts: SolveCounts, budget| {
+                let budget: Option<BudgetReport> = budget;
+                (
+                    depth,
+                    algorithm.map(|id| id.to_string()),
+                    counts.own().iterations(),
+                    counts.own().provider(EvaluationRole::Function),
+                    budget.map(|report| report.kind().name()),
+                    budget.map(|report| report.consumed()),
+                    budget.and_then(|report| finite(report.limit())),
+                )
+            };
+        let mut rows = vec![row(
+            0,
+            diagnostics.algorithm(),
+            diagnostics.counts(),
+            diagnostics.budget(),
+        )];
+        rows.extend(
+            diagnostics
+                .nested_levels()
+                .enumerate()
+                .map(|(index, nested)| {
+                    row(
+                        index + 1,
+                        Some(nested.algorithm()),
+                        nested.counts(),
+                        nested.budget(),
+                    )
+                }),
+        );
+        let columns = serde_json::json!([
+            { "key": "0", "label": "階層（0 が外側）", "type": "integer" },
+            { "key": "1", "label": "アルゴリズム algorithm()", "nullText": "なし" },
+            { "key": "2", "label": "反復 own [回]", "type": "integer" },
+            { "key": "3", "label": "関数評価 own [回]", "type": "integer" },
+            { "key": "4", "label": "止めた計算回数の上限の種類 budget().kind()", "nullText": "なし" },
+            { "key": "5", "label": "その消費 [回]", "type": "integer", "nullText": "なし" },
+            { "key": "6", "label": "その上限 [回]", "type": "integer", "nullText": "なし" }
+        ]);
+        emit_table_with_columns!(
+            columns,
+            rows,
+            metadata = serde_json::json!({ "id": "levels", "title": "エラーの診断の階層" })
+        );
+        Outcome::failed("内側の求解が上限で止まり、外側は結果を返せない")
+            .status(format!("ConvergenceFailure: {reason}"))
+            .explanation("止めた計算回数の上限は表の内側の階層に記録されている。")
+    }
+};
+emit_outcome!(outcome.diagnostic(
+    "内側の関数評価（親の nested）",
+    nested_evaluations as f64,
+    None
+));
+```
+
+既定値（内側の反復の上限 2 回、評価の上限 4 回）では、内側は 2 単位を終えた後の 3 回目の反復を拒否される。
+内側の階層は反復 2 回と関数評価 2 回を記録し、止めた計算回数の上限は内側自身の `iteration` で、消費 2 回、上限 2 回である。
+外側の階層 `handbook/outer@1` は自分の反復 1 回だけを持ち、止めた計算回数の上限を持たない。
+エラーの理由の表示は `nested solver failure`（`ConvergenceReason::NestedSolver`）になる。
+
+評価の上限を 1 回、内側の反復の上限を 4 回にすると、内側は 2 回目の反復を数えた後で関数評価を拒否される。
+止めた計算回数の上限の種類は `evaluation` で、消費 1 回と上限 1 回は内側ではなく親の評価回数の上限のものである。
+内側の反復は 2 回、関数評価は 1 回で、反復を数えた後に評価が拒否された 2 回目の単位は反復だけが記録に残る。
+どちらの上限も 4 回にすると内側は 3 単位を終え、エラーは返らず、親の `nested` には関数評価 3 回が記録される。
+
+## まとめ
+
+自分の解法の中から別の求解を始めるときは `SolveScope::from(&mut context)` を使い、SciOxide の解法を呼ぶときは `_scoped` の形に自分の `&mut SolveContext` を渡す。
+こうすると内側の評価回数は自分と外側の求解の両方に加算され、内側の反復は内側の `allowance` だけで制限される。
+どの階層がどれだけ作業したかは、親の `counts()` の `own()` と `nested()` を分けて読んで確かめる。
+子があと何回評価できるかは `effective_budget_report` で読み、拒否のときに返る `BudgetReport` でどの階層の上限が止めたかを確かめる。
+入れ子の失敗を返すときは `with_nested` で内側の診断を加え、受け取る側は `nested_levels()` で外側から順に読む。
+`integrity()` が `Invalid` の記録は作業の総量として使わず、新しいエポックを始める。
+
+## 次に読むページ
+
+- [求解のライフサイクルと計算回数の管理](../solve-lifecycle-and-accounting/)：取り消しを反復の境界で確かめる方法と、打ち切られた結果の信頼区分を確かめる。
+- [Kepler 方程式と求解の回数の集計](../../examples/kepler-solve-accounting/)：不動点反復の中から Newton 法を子として呼ぶ例で、親子の回数と共有の評価の上限の読み方を確かめる。
+- [作用素プロトコルとクロージャ作用素](../operator-protocols-and-structure/)：作用素の `_scoped` の付いたメソッドが `OperatorContext` を通して `SolveContext` を借用する方法を確かめる。
+- [エラーの分類と詳細ビュー](../errors-and-diagnostic-views/)：`ConvergenceFailure` 以外の分類と、`view()` で読める詳細を確かめる。
+- [求解の回数の集計と実行の API](../../api/solve-and-execution/)：`SolveScope` と `SolveCounts` の全メソッドとエラー条件を引く。

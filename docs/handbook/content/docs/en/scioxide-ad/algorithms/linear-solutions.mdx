@@ -1,0 +1,711 @@
+---
+title: "Differentiating linear solutions and factorizations"
+description: "Derive JVPs, VJPs, and Taylor coefficients for linear-system solutions X = A⁻¹B; examine the algorithm and cost of solve_into, which factors the base matrix once and reuses it for every derivative component; choose between cholesky_into, qr_into, and least_squares_into, which differentiate their algorithms directly; compare stiffness sensitivities and recording sizes for series springs; and examine sensitivities of least-squares fitting coefficients to measurements and results for design matrices with proportional columns."
+sidebar:
+  order: 365
+references:
+  ad-solve-into: "algorithm-and-cost-of-solve_into"
+  ad-differentiated-factorizations: "factorizations-differentiated-directly-through-their-algorithms"
+  ad-series-springs-sensitivity: "compliance-sensitivity-of-series-springs"
+  ad-least-squares-sensitivity: "resistance-calibration-lines-and-least-squares-sensitivity"
+---
+
+Many quantities, such as structural displacements, circuit voltages, and least-squares fitting coefficients, are defined indirectly as solutions of linear systems $AX = B$.
+There are two ways to obtain solution derivatives.
+One differentiates solver operations (factorization elimination and forward and backward substitution) directly; tape size grows in proportion to the solver's work.
+The other differentiates the relation $AX = B$ satisfied by the solution, obtaining derivatives from the solution values and the coefficient-matrix factorization constructed during primal evaluation.
+
+This page covers `solve_into`, which obtains solution derivatives by differentiating the relation, and `cholesky_into`, `qr_into`, and `least_squares_into`, which differentiate algorithm operations directly.
+All matrices are passed as row-major one-dimensional slices.
+[Numeric types, lanes, and generic code](../number-types-and-lanes/) defines base values (the innermost values of nested numeric types) and lanes (one SIMD element).
+[Reverse mode and tapes](../reverse-mode-and-replay/) defines tape statements (one recording unit) and words (64-bit recording units representing statement information).
+[Differentiating implicit functions](../implicit-functions/) covers derivatives of nonlinear-equation solutions $F(y, p) = 0$.
+
+## Derivatives of linear-system solutions
+
+For nonsingular $A \in \mathbb{R}^{n \times n}$ and $B \in \mathbb{R}^{n \times k}$, regard the solution $X = A^{-1} B$ as a function of $A$ and $B$.
+Differentiating $AX = B$ gives
+
+$$
+\dot A\,X + A\,\dot X = \dot B
+\quad\Longrightarrow\quad
+\dot X = A^{-1}\bigl(\dot B - \dot A\,X\bigr)
+$$
+
+so the tangent (JVP) requires one more linear solve with the same $A$.
+
+The cotangent (VJP) is the adjoint under the Frobenius inner product $\langle P, Q \rangle = \operatorname{tr}(P^\top Q)$.
+For output cotangent $\bar X$, $\langle \bar X, \dot X \rangle = \langle A^{-\top} \bar X, \dot B - \dot A X \rangle$, giving
+
+$$
+\Lambda = A^{-\top} \bar X, \qquad \bar B \mathrel{+}= \Lambda, \qquad \bar A \mathrel{-}= \Lambda X^\top
+$$
+
+
+Taylor coefficients have the same form.
+Write the solution for $A(t) = \sum_j A_j t^j$ and $B(t) = \sum_j B_j t^j$ as $X(t) = \sum_k X_k t^k$; equating coefficients of $t^k$ in $A(t)X(t) = B(t)$ gives
+
+$$
+X_k = A_0^{-1}\Bigl(B_k - \sum_{j=1}^{k} A_j X_{k-j}\Bigr)
+$$
+
+so every order gives a linear system with $A_0$.
+
+In every expression, the coefficient matrix is only the primal value $A$ ($A_0$).
+Factoring $A$ once by LU during primal evaluation lets every tangent component and cotangent be obtained by forward and backward substitution with those factors.
+Since $\dot X$ solves a linear system with coefficient matrix $A$, a backward-stable factorization gives a relative error on the order of the product of the condition number $\kappa(A) = \|A\|\,\|A^{-1}\|$ and unit roundoff $u$, as for primal values ([Floating-point numbers and conditioning](../../../concepts/floating-point-and-conditioning/)).
+There is no truncation error from a finite-difference step.
+
+## Algorithm and cost of `solve_into`
+
+`solve_into(matrix, order, rhs, columns, out)` writes the solution of $AX = B$ to `out` for the $n \times n$ ($n$ = `order`) matrix $A$ and $n \times k$ ($k$ = `columns`) right-hand side $B$.
+It factors the base matrix once per lane by LU factorization with partial pivoting $PA = LU$ and applies those factors to every derivative component.
+The elimination operations themselves are not differentiated.
+
+Rules for each numeric type are as follows.
+
+- `f64` and `Lanes` perform forward and backward substitution with each lane's factors.
+- `Dual` solves $\dot x = A^{-1}(\dot b - \dot A x)$ with the same factors.
+  `MultiDual` solves the same expression per direction; nested types such as `Dual<Dual<f64>>` apply the same rule again in the inner type.
+- `Jet` solves the recurrence $X_k = A_0^{-1}(B_k - \sum_j A_j X_{k-j})$ above in order of degree.
+- `Var` solves on values and records one call statement.
+  The statement retains the values of $A$, $B$, and $X$ and the factors, using those factors to compute $\Lambda = A^{-\top}\bar X$, $\bar B \mathrel{+}= \Lambda$, and $\bar A \mathrel{-}= \Lambda X^\top$ in reverse sweeps, and $\dot X = A^{-1}(\dot B - \dot A X)$ in tangent sweeps.
+  `Tape<Dual<f64>>` applies the factors to `Dual` components and also gives Hessian–vector products through the solution.
+  A reverse sweep allocates workspace for solving $\Lambda$ each time it traverses the call statement, so this sweep allocation remains even on a warm tape that has recorded the same function.
+
+Measured in floating-point operations, factorization costs approximately $\tfrac{2}{3}n^3$ per lane and forward and backward substitution approximately $2n^2$ per right-hand-side column and derivative component.
+For derivative components, forming the right-hand side $\dot B - \dot A X$ also costs about $2n^2$ operations per right-hand-side column (the product subtracting $\Lambda X^\top$ from $\bar A$ in reverse sweeps); this product costs $k$ times as much for the coefficient of order $k$ in `Jet`.
+Even for `MultiDual` with $m$ components, factorization occurs once, costing $O(n^3 + mn^2k)$ rather than $O(mn^3)$ for repeated refactorization.
+Every call allocates factors ($n^2$ scalars per lane) and pivots; depending on numeric type, it also allocates workspace separating values and derivative components.
+The solution is computed in workspace before being copied to `out`, so a failed call leaves `out` unchanged.
+The tape call statement uses one word per component of $A$ and $B$, one per output, and two surrounding words, totaling $n^2 + 2nk + 2$ words.
+
+Errors are as follows.
+
+- Slice lengths inconsistent with `order` and `columns` return `DimensionMismatch`.
+- If a base-matrix pivot (the maximum absolute remaining entry in its column) is zero or nonfinite in any lane, it returns `Singular` carrying the pivot index.
+  No condition number is estimated, so nearly singular matrices return large values without an error.
+- Failure to allocate workspace returns `AllocationFailure`; a size not fitting in `usize` returns `SizeOverflow`.
+
+## Factorizations differentiated directly through their algorithms
+
+`cholesky_into`, `qr_into`, and `least_squares_into` express textbook algorithms in `R` arithmetic.
+Every differentiation mode differentiates the evaluated operations themselves, yielding derivatives of the algorithm's output.
+On a tape they record $O(n^3)$ statements.
+
+There is no need to differentiate a factorization if only solution derivatives are required.
+`solve_into` differentiates only the relation $AX = B$, independent of how the solution was computed (such as pivot order), and leaves just one tape statement.
+Differentiate the factorization when the factorization itself is output (for example, $\log\det A = 2\sum_i \ln L_{ii}$ or $L$ in normal samples $\mu + Lz$).
+Where the factorization is a smooth function of the input, algorithm derivatives agree with derivatives of the factorization map within rounding.
+
+- `cholesky_into(matrix, order, out)` writes the lower-triangular factor $L$ with positive diagonal ($A = LL^\top$) of a symmetric positive-definite matrix to `out`, setting the strict upper triangle to zero.
+  `matrix` reads only the lower triangle, so derivatives with respect to upper-triangle entries are zero.
+  For a symmetric perturbation $\dot A$, the derivative satisfies $L^{-1}\dot L = \Phi(L^{-1}\dot A L^{-\top})$ ($\Phi$ takes the lower triangle and halves the diagonal).
+  It costs approximately $n^3/3$ floating-point operations ($n^3/6$ multiply-adds) and allocates one $n \times n$ working matrix.
+  The factor is constructed in that working matrix before copying to `out`, so a failed call leaves `out` unchanged.
+  Inconsistent lengths return `DimensionMismatch`.
+  A nonpositive pivot (the diagonal after elimination, including NaN) in any lane returns `DomainError` (argument `matrix`, `OutsideDomain`).
+- `qr_into(matrix, rows, cols, q, r)` writes the thin QR factorization $A = QR$ of a matrix with `rows ≥ cols` ($Q$ is `rows × cols` with orthonormal columns; $R$ is upper triangular with nonnegative diagonal).
+  Householder reflection signs are chosen by base-value comparisons and `select`; the diagonal of $R$ is then made nonnegative.
+  At points with linearly independent columns, the positive-diagonal factorization is unique, so the derivative is that of this factorization map.
+  Floating-point cost is $2\,\text{rows}\cdot\text{cols}^2 - \tfrac{2}{3}\text{cols}^3$ operations for $R$ and a similar amount for $Q$; two `rows × cols` working matrices are allocated.
+  Inconsistent lengths or `rows < cols` return `DimensionMismatch`.
+  For a rank-deficient column whose reflection length is zero, the reflection is set to zero and computation continues without an error.
+- `least_squares_into(matrix, rows, cols, rhs, columns, out)` writes the solution of $\min \|AX - B\|_2$ for a `rows × cols` matrix $A$ with linearly independent columns as $X = R^{-1} Q^\top B$ through thin QR.
+  In addition to the two working matrices of `qr_into`, it allocates storage for $Q$ and $R$ (`rows·cols + cols²` entries) and the solution (`cols·columns` entries).
+  Since `qr_into` makes the diagonal of $R$ nonnegative, `Singular` is returned only if a diagonal entry of $R$ is exactly zero, NaN, or infinite in some lane; numerical rank is not determined.
+  The solution is computed in workspace before copying to `out`, so a failed call leaves `out` unchanged.
+  A matrix with proportional columns can have a nonzero diagonal due to rounding and return a meaningless solution without an error (the last cell in [Resistance calibration lines and least-squares sensitivity](#resistance-calibration-lines-and-least-squares-sensitivity)).
+  For problems with large residuals, least-squares solution sensitivity includes a term proportional to $\kappa(A)^2$ (Golub and Van Loan, §5.3), inherited by the derivatives.
+
+All three allocate workspace, returning `AllocationFailure` if allocation fails and `SizeOverflow` if matrix sizes do not fit in `usize`.
+
+scioxide-ad provides no rules for determinants, matrix inverses, eigendecompositions, or singular value decompositions.
+If $A^{-1}$ is needed, obtain it with `solve_into` and $B = I$.
+For derivatives of other factorizations, supply rules yourself ([Differentiation rules for scalar functions](../custom-primitives/), [External differentiation rules with ExternalRule](../external-rules/)) or differentiate the equations defining the factorization with [implicit differentiation](../implicit-functions/).
+
+## Compliance sensitivity of series springs
+
+Apply load $P = 10$ N to the tip of $n$ springs in series (stiffness $k_i$ [N/m]) fixed at the base; solve the stiffness-matrix equation $K(k)\,u = f$ with `solve_into` and `cholesky_into` and compare gradients and tape sizes.
+$K$ is tridiagonal and symmetric positive definite, with $K_{jj} = k_j + k_{j+1}$ ($k_n$ in the last row) and $K_{j,j+1} = K_{j+1,j} = -k_{j+1}$.
+The desired quantity is compliance $C = f^\top u = P u_n$ [J] and its gradient with respect to stiffness.
+
+Unit cotangent for $C$ gives $\bar u = f$; symmetry of $K$ gives $\Lambda = K^{-1} f = u$ and $\bar K = -u u^\top$, hence $\partial C / \partial k_i = -u^\top (\partial K / \partial k_i)\, u = -(u_i - u_{i-1})^2$ ($u_0 = 0$).
+Every spring transmits force $P$, so the independent closed-form checks are $u_i = P \sum_{j \le i} 1/k_j$ and $\partial C / \partial k_i = -(P / k_i)^2$.
+Also, scaling all stiffnesses by $(1 + t)$ scales $C$ by $1/(1 + t)$, so the directional derivative $dC/dt$ along $k(t) = (1 + t)k$ equals $-C$.
+
+The next definitions provide the stiffness matrix `stiffness`, `by_solve` solving with `solve_into`, and `by_cholesky` using `cholesky_into` and forward and backward substitution in `R` arithmetic.
+Both solvers return the same $C$ but leave different tape statements.
+
+```rust
+//| id: ad-series-springs-model
+//| kind: definitions
+//| title: "Stiffness matrix of series springs and two solvers"
+//| crates: [scioxide-ad, scioxide-core]
+use scioxide_ad::{Real, cholesky_into, solve_into};
+use scioxide_core::SciOxideError;
+
+pub(crate) const LOAD: f64 = 10.0; // Tip load P [N]
+
+/// Stiffness matrix K(k) (row-major).
+pub(crate) fn stiffness<R: Real>(k: &[R]) -> Vec<R> {
+    let n = k.len();
+    let mut a = vec![R::zero(); n * n];
+    for j in 0..n {
+        a[j * n + j] = if j + 1 < n { k[j] + k[j + 1] } else { k[j] };
+        if j + 1 < n {
+            a[j * n + j + 1] = -k[j + 1];
+            a[(j + 1) * n + j] = -k[j + 1];
+        }
+    }
+    a
+}
+/// Solve K u = f with solve_into and return (C = P u_n, u).
+pub(crate) fn by_solve<R: Real>(k: &[R]) -> Result<(R, Vec<R>), SciOxideError> {
+    let n = k.len();
+    let mut f = vec![R::zero(); n];
+    f[n - 1] = R::constant(LOAD);
+    let mut u = vec![R::zero(); n];
+    solve_into(&stiffness(k), n, &f, 1, &mut u)?;
+    Ok((u[n - 1] * LOAD, u))
+}
+/// Factor K = L Lᵀ and solve L z = f and Lᵀ u = z in R arithmetic to return C.
+pub(crate) fn by_cholesky<R: Real>(k: &[R]) -> Result<R, SciOxideError> {
+    let n = k.len();
+    let mut l = vec![R::zero(); n * n];
+    cholesky_into(&stiffness(k), n, &mut l)?;
+    let mut u = vec![R::zero(); n];
+    for i in 0..n {
+        let mut s = if i + 1 == n {
+            R::constant(LOAD)
+        } else {
+            R::zero()
+        };
+        for j in 0..i {
+            s -= l[i * n + j] * u[j];
+        }
+        u[i] = s / l[i * n + i];
+    }
+    for i in (0..n).rev() {
+        let mut s = u[i];
+        for j in i + 1..n {
+            s -= l[j * n + i] * u[j];
+        }
+        u[i] = s / l[i * n + i];
+    }
+    Ok(u[n - 1] * LOAD)
+}
+```
+
+The first cell computes the gradient of $C$ on a tape with `by_solve` and `by_cholesky`, and differentiates `by_solve` with `Dual` in direction $k(t) = (1 + t)k$.
+The first table compares each spring's displacement and gradient with closed forms; the second shows each method's maximum relative difference from the closed form, tape word count (`TapeReport::words`, including constant and input words), and preallocated bytes.
+
+```rust
+//| id: ad-linear-solve-adjoint
+//| ref: ad-linear-solve-adjoint
+//| title: "Stiffness sensitivity of series-spring compliance with solve_into and cholesky_into"
+//| run: reactive
+//| uses: [ad-series-springs-model]
+//| crates: [scioxide-ad, scioxide-core]
+//| inputs:
+//|   springs: {"type":"range","label":"Spring count n","description":"Series springs fixed at the base and loaded with P = 10 N at the tip.","min":2,"max":32,"step":1,"value":6}
+//|   ratio: {"type":"range","label":"Stiffness ratio k_n / k_1","description":"k_i = 1000·ρ^((i−1)/(n−1)) N/m (ρ is this ratio).","min":0.1,"max":10,"step":0.1,"value":3}
+//| cases:
+//|   - {"id":"long-soft","label":"n = 32, k_n / k_1 = 0.1","description":"Springs nearer the tip are softer; gradient magnitudes span a factor of 100.","inputs":{"springs":32,"ratio":0.1}}
+//|   - {"id":"two","label":"n = 2, k_n / k_1 = 10","description":"A 2 × 2 system.","inputs":{"springs":2,"ratio":10}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/0/1","range":{"max":1e-13}}
+//|       - {"artifact":"methods","path":"/rows/1/1","range":{"max":1e-13}}
+//|       - {"artifact":"methods","path":"/rows/2/1","range":{"max":1e-13}}
+//|       - {"artifact":"springs","path":"/rows/0/5","approx":{"value":-0.0001,"rtol":1e-13}}
+//|   - case: long-soft
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/0/1","range":{"max":1e-12}}
+//|       - {"artifact":"methods","path":"/rows/1/1","range":{"max":1e-12}}
+//|       - {"artifact":"methods","path":"/rows/2/1","range":{"max":1e-12}}
+//|   - case: two
+//|     expect:
+//|       - {"artifact":"springs","path":"/rows/1/3","approx":{"value":0.011,"rtol":1e-14}}
+//|       - {"artifact":"springs","path":"/rows/1/5","approx":{"value":-1e-6,"rtol":1e-13}}
+use scioxide_ad::{Dual, Real, Tape, TapeOptions};
+use scioxide_core::ExecutionContext;
+
+let n = springs as usize;
+let k: Vec<f64> = (0..n)
+    .map(|i| Real::powf(ratio, i as f64 / (n - 1) as f64) * 1000.0)
+    .collect();
+let cx = ExecutionContext::sequential();
+let mut solve_tape = Tape::<f64>::new(TapeOptions::new());
+let mut factor_tape = Tape::<f64>::new(TapeOptions::new());
+let (mut by_lu, mut by_factor) = (vec![0.0; n], vec![0.0; n]);
+let compliance = solve_tape
+    .gradient_into(|k| Ok(by_solve(k)?.0), &k, &mut by_lu, cx)
+    .map_err(|e| e.to_string())?;
+factor_tape
+    .gradient_into(|k| by_cholesky(k), &k, &mut by_factor, cx)
+    .map_err(|e| e.to_string())?;
+// Dual in direction k(t) = (1 + t) k. Gives dC/dt = −C.
+let scaled: Vec<Dual<f64>> = k.iter().map(|&ki| Dual::new(ki, ki)).collect();
+let (along, u) = by_solve(&scaled).map_err(|e| e.to_string())?;
+
+// Independent check: u_i = P Σ_{j≤i} 1/k_j and ∂C/∂k_i = −(P/k_i)².
+let mut rows = Vec::new();
+let (mut sum, mut lu_error, mut factor_error) = (0.0, 0.0_f64, 0.0_f64);
+for i in 0..n {
+    sum += 1.0 / k[i];
+    let exact = -(LOAD / k[i]) * (LOAD / k[i]);
+    lu_error = lu_error.max(((by_lu[i] - exact) / exact).abs());
+    factor_error = factor_error.max(((by_factor[i] - exact) / exact).abs());
+    rows.push((
+        i + 1,
+        k[i],
+        u[i].value(),
+        LOAD * sum,
+        by_lu[i],
+        exact,
+        by_factor[i],
+    ));
+}
+let sci6 = serde_json::json!({ "notation": "scientific", "significantDigits": 6 });
+let fixed1 = serde_json::json!({ "fractionDigits": 1 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Spring i", "type": "integer" },
+    { "key": "1", "label": "k_i [N/m]", "type": "number", "format": fixed1 },
+    { "key": "2", "label": "u_i（solve_into）[m]", "type": "number", "format": sci6 },
+    { "key": "3", "label": "u_i (closed form) [m]", "type": "number", "format": sci6 },
+    { "key": "4", "label": "∂C/∂k_i（solve_into）[m²]", "type": "number", "format": sci6 },
+    { "key": "5", "label": "−(P/k_i)² [m²]", "type": "number", "format": sci6 },
+    { "key": "6", "label": "∂C/∂k_i（cholesky_into）[m²]", "type": "number", "format": sci6 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "springs" })
+);
+
+let (solve_report, factor_report) = (solve_tape.report(), factor_tape.report());
+let methods = vec![
+    (
+        "solve_into (tape)",
+        lu_error,
+        Some(solve_report.words()),
+        Some(solve_report.reserved_bytes()),
+    ),
+    (
+        "cholesky_into and substitution (tape)",
+        factor_error,
+        Some(factor_report.words()),
+        Some(factor_report.reserved_bytes()),
+    ),
+    (
+        "solve_into (Dual, dC/dt and −C)",
+        ((along.derivative() + compliance) / compliance).abs(),
+        None,
+        None,
+    ),
+];
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let method_columns = serde_json::json!([
+    { "key": "0", "label": "Method" },
+    { "key": "1", "label": "Maximum relative difference from closed form [-]", "type": "number", "format": sci2 },
+    { "key": "2", "label": "Tape word count [words]", "type": "integer", "nullText": "No tape" },
+    { "key": "3", "label": "Preallocated bytes [B]", "type": "integer", "nullText": "No tape" }
+]);
+emit_table_with_columns!(
+    method_columns,
+    methods,
+    metadata = serde_json::json!({ "id": "methods" })
+);
+```
+
+At the defaults $n = 6$ and $k_n/k_1 = 3$, gradients from `solve_into` and `cholesky_into` both agree with the closed form $-(P/k_i)^2$, with maximum relative differences $6.3 \times 10^{-15}$ and $1.3 \times 10^{-14}$ respectively.
+The relative difference between $dC/dt$ obtained with `Dual` and $-C$ is $6.0 \times 10^{-16}$, also showing that the tangent rule $\dot u = K^{-1}(\dot f - \dot K u)$ gives $\dot u = -u$.
+Tape word counts are 73 for `solve_into` and 186 for `cholesky_into` and substitution, with preallocated sizes 3068 B and 4772 B.
+
+At $n = 32$ and $k_n/k_1 = 0.1$, word counts become 1217 and 13615, with preallocated sizes 55796 B and 331436 B.
+Maximum relative differences for the three methods remain between $4.5 \times 10^{-15}$ and $4.1 \times 10^{-14}$.
+Softer springs have larger $|\partial C / \partial k_i|$, with gradients spanning $10^{-4}$ to $10^{-2}$ m².
+
+The second cell counts tape words for both solvers at $n = 2, \dots, 48$ and plots them on log–log axes.
+For the selected $n$, the table shows word counts and their ratios to $n^2$ and $n^3$.
+Stiffnesses are $k_i = 1000 + 10(i - 1)$ N/m for every $n$, with a new tape recorded for each size.
+
+```rust
+//| id: ad-solve-statement-count
+//| ref: ad-solve-statement-count
+//| title: "Compare tape word counts for solve_into and cholesky_into"
+//| run: reactive
+//| uses: [ad-series-springs-model]
+//| crates: [scioxide-ad, scioxide-core]
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"counts","path":"/rows/3/0","equals":32}
+//|       - {"artifact":"counts","path":"/rows/3/1","equals":1217}
+//|       - {"artifact":"counts","path":"/rows/3/3","equals":13615}
+use scioxide_ad::{Tape, TapeOptions};
+use scioxide_core::ExecutionContext;
+
+let cx = ExecutionContext::sequential();
+let (mut lu_words, mut factor_words, mut rows) = (Vec::new(), Vec::new(), Vec::new());
+for size in 2..=48_usize {
+    let stiff: Vec<f64> = (0..size).map(|i| 1000.0 + 10.0 * i as f64).collect();
+    let mut gradient = vec![0.0; size];
+    let mut tape = Tape::<f64>::new(TapeOptions::new());
+    tape.gradient_into(|k| Ok(by_solve(k)?.0), &stiff, &mut gradient, cx)
+        .map_err(|e| e.to_string())?;
+    let lu = tape.report().words();
+    let mut tape = Tape::<f64>::new(TapeOptions::new());
+    tape.gradient_into(|k| by_cholesky(k), &stiff, &mut gradient, cx)
+        .map_err(|e| e.to_string())?;
+    let factor = tape.report().words();
+    lu_words.push([size as f64, lu as f64]);
+    factor_words.push([size as f64, factor as f64]);
+    if [4, 8, 16, 32, 48].contains(&size) {
+        let n = size as f64;
+        rows.push((
+            size,
+            lu,
+            lu as f64 / (n * n),
+            factor,
+            factor as f64 / (n * n * n),
+        ));
+    }
+}
+let fixed3 = serde_json::json!({ "fractionDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Spring count n", "type": "integer" },
+    { "key": "1", "label": "solve_into word count [words]", "type": "integer" },
+    { "key": "2", "label": "solve_into word count / n²", "type": "number", "format": fixed3 },
+    { "key": "3", "label": "cholesky_into and substitution word count [words]", "type": "integer" },
+    { "key": "4", "label": "cholesky_into and substitution word count / n³", "type": "number", "format": fixed3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "counts" })
+);
+emit_line_chart!(
+    &vec![
+        serde_json::json!({
+            "name": "solve_into",
+            "points": lu_words,
+            "style": { "showSymbol": true }
+        }),
+        serde_json::json!({
+            "name": "cholesky_into and substitution",
+            "points": factor_words,
+            "style": { "showSymbol": true }
+        })
+    ],
+    options = &serde_json::json!({
+        "xLabel": "Spring count n",
+        "yLabel": "Tape word count [words]",
+        "xType": "log",
+        "yType": "log"
+    })
+);
+```
+
+The word count for `solve_into` divided by $n^2$ approaches 1, from 2.56 at $n = 4$ to 1.13 at $n = 48$.
+The $n^2$ term is the number of matrix entries recorded as one-word arguments in the call statement.
+The word count for `cholesky_into` and substitution divided by $n^3$ decreases to 0.39, approaching 1/3.
+This is because inner multiply-adds in Cholesky factorization (about $n^3/6$) each leave two statements, a product and a subtraction.
+On the chart's log–log axes, `solve_into` grows with slope 2 and `cholesky_into` and substitution with slope 3; at $n = 48$ the counts are 2593 and 42823, a factor of 16.5 apart.
+
+## Resistance calibration lines and least-squares sensitivity
+
+Use resistance calibration to examine values from `qr_into` and `least_squares_into` and sensitivities of fitted coefficients to measurements.
+Pass currents $I_i = 0.1(i + 1)$ A ($i = 0, \dots, m - 1$), measure voltages $V_i$ [V], and fit the line $V = V_0 + R I$ by least squares to obtain resistance $\hat R$ [Ω] and offset $\hat V_0$ [V].
+Set measurements to $V_i = 0.05 + 4.7 I_i + \delta_i$, adding a deterministic perturbation $\delta_i = \sigma \sin(1.7 i + 0.3)$ in place of measurement error.
+The design matrix $A$ is $m \times 2$, with row $i$ equal to $[1, I_i]$.
+`design` in the next definitions constructs row-major $A$ from the current column.
+Passing currents as `Dual` or `Var` makes entries of $A$ use that same numeric type.
+
+```rust
+//| id: ad-calibration-design
+//| kind: definitions
+//| title: "Design matrix for resistance calibration"
+//| crates: [scioxide-ad]
+use scioxide_ad::Real;
+
+/// Design matrix A (m × 2, row-major). Row i is [1, I_i].
+pub(crate) fn design<R: Real>(current: &[R]) -> Vec<R> {
+    current.iter().flat_map(|&c| [R::one(), c]).collect()
+}
+```
+
+The independent check uses closed forms from the normal equations.
+Let $\bar I$ and $\bar V$ be means and $S = \sum_i (I_i - \bar I)^2$; then $\hat R = \sum_i (I_i - \bar I)(V_i - \bar V)/S$ and $\hat V_0 = \bar V - \hat R \bar I$, and $R$ in thin QR is
+
+$$
+R = \begin{pmatrix} \sqrt m & \sqrt m\,\bar I \\ 0 & \sqrt S \end{pmatrix}
+$$
+
+
+With residual $r_i = V_i - \hat V_0 - \hat R I_i$, sensitivities of $\hat R$ to measurements are
+
+$$
+\frac{\partial \hat R}{\partial V_i} = \frac{I_i - \bar I}{S}, \qquad
+\frac{\partial \hat R}{\partial I_i} = \frac{r_i - \hat R\,(I_i - \bar I)}{S}
+$$
+
+
+The term $r_i/S$ in $\partial \hat R / \partial I_i$ appears only in derivatives with respect to matrix entries and has a stronger effect for larger residuals.
+This is a one-dimensional example of the residual-proportional term in least-squares solution sensitivity.
+If an ammeter gain error of factor $1 + t$ makes $I_i$ read as $(1 + t) I_i$, then $\hat R$ scales by $1/(1 + t)$ and $\hat V_0$ is unchanged, so $d\hat R/dt = -\hat R$ and $d\hat V_0/dt = 0$.
+
+The next cell factors $A$ with `qr_into` and obtains $\hat V_0$ and $\hat R$ with `least_squares_into`.
+It also computes the gradient of $\hat R$ with respect to measurements $(I_0, \dots, I_{m-1}, V_0, \dots, V_{m-1})$ on a tape, and derivatives with respect to gain error $t$ with `Dual`.
+The first table compares entries of $R$ from `qr_into` and orthogonality of the columns of $Q$ with closed forms.
+The second compares coefficients from `least_squares_into`, the $2m$ sensitivities obtained on a tape, and derivatives with respect to $t$ obtained with `Dual` against closed forms.
+Relative differences in sensitivity rows are the maximum difference from the closed form divided by the maximum closed-form magnitude.
+
+```rust
+//| id: ad-least-squares-fit
+//| ref: ad-least-squares-fit
+//| title: "Fit a resistance calibration line with qr_into and least_squares_into and examine measurement sensitivities"
+//| run: reactive
+//| uses: [ad-calibration-design]
+//| crates: [scioxide-ad, scioxide-core]
+//| inputs:
+//|   points: {"type":"range","label":"Measurement count m","description":"Measure voltages at currents I_i = 0.1(i + 1) A (i = 0, …, m − 1).","min":3,"max":40,"step":1,"value":10}
+//|   noise: {"type":"range","label":"Perturbation amplitude σ [V]","description":"Amplitude of the deterministic perturbation δ_i = σ sin(1.7i + 0.3) added to voltages.","min":0,"max":0.5,"step":0.05,"value":0.1}
+//| cases:
+//|   - {"id":"exact","label":"σ = 0","description":"Residuals become zero; ∂R̂/∂I_i is only −R̂(I_i − Ī)/S.","inputs":{"noise":0}}
+//|   - {"id":"few","label":"m = 3, σ = 0.5","description":"With fewer points, the residual term strongly affects sensitivity to current.","inputs":{"points":3,"noise":0.5}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"factor","path":"/rows/0/3","range":{"max":1e-14}}
+//|       - {"artifact":"factor","path":"/rows/2/3","range":{"max":1e-14}}
+//|       - {"artifact":"factor","path":"/rows/3/1","approx":{"value":0,"atol":1e-300}}
+//|       - {"artifact":"factor","path":"/rows/4/1","range":{"max":1e-14}}
+//|       - {"artifact":"fit","path":"/rows/1/1","approx":{"value":4.694801576737002,"rtol":1e-13}}
+//|       - {"artifact":"fit","path":"/rows/2/3","range":{"max":1e-13}}
+//|       - {"artifact":"fit","path":"/rows/3/3","range":{"max":1e-13}}
+//|       - {"artifact":"fit","path":"/rows/5/3","range":{"max":1e-13}}
+//|   - case: exact
+//|     expect:
+//|       - {"artifact":"fit","path":"/rows/3/2","approx":{"value":2.5636363636363653,"rtol":1e-12}}
+//|       - {"artifact":"fit","path":"/rows/4/2","range":{"max":1e-12}}
+//|       - {"artifact":"fit","path":"/rows/3/3","range":{"max":1e-13}}
+//|   - case: few
+//|     expect:
+//|       - {"artifact":"fit","path":"/rows/4/2","range":{"min":10}}
+//|       - {"artifact":"fit","path":"/rows/3/3","range":{"max":1e-13}}
+use scioxide_ad::{Dual, Real, Tape, TapeOptions, least_squares_into, qr_into};
+use scioxide_core::ExecutionContext;
+
+let m = points as usize;
+let current: Vec<f64> = (0..m).map(|i| 0.1 * (i + 1) as f64).collect();
+let voltage: Vec<f64> = (0..m)
+    .map(|i| 0.05 + 4.7 * current[i] + noise * Real::sin(1.7 * i as f64 + 0.3))
+    .collect();
+let a = design(&current);
+let (mut q, mut r) = (vec![0.0; 2 * m], [0.0; 4]);
+qr_into(&a, m, 2, &mut q, &mut r).map_err(|e| e.to_string())?;
+let mut fit = [0.0; 2]; // [V̂₀, R̂]
+least_squares_into(&a, m, 2, &voltage, 1, &mut fit).map_err(|e| e.to_string())?;
+
+// Gradient of R̂ with respect to measurements x = [I_0, …, I_{m−1}, V_0, …, V_{m−1}] (tape).
+let cx = ExecutionContext::sequential();
+let mut tape = Tape::<f64>::new(TapeOptions::new());
+let mut gradient = vec![0.0; 2 * m];
+let measured = [current.as_slice(), voltage.as_slice()].concat();
+tape.gradient_into(
+    |x| {
+        let (i, v) = x.split_at(m);
+        let mut coefficients = [v[0]; 2]; // Overwritten by least_squares_into
+        least_squares_into(&design(i), m, 2, v, 1, &mut coefficients)?;
+        Ok(coefficients[1])
+    },
+    &measured,
+    &mut gradient,
+    cx,
+)
+.map_err(|e| e.to_string())?;
+// Dual in the ammeter-gain-error direction I_i → (1 + t)I_i. R̂ scales by 1/(1 + t); V̂₀ is unchanged.
+let gained: Vec<Dual<f64>> = current.iter().map(|&c| Dual::new(c, c)).collect();
+let fixed: Vec<Dual<f64>> = voltage.iter().map(|&v| Dual::constant(v)).collect();
+let mut along = [Dual::constant(0.0); 2];
+least_squares_into(&design(&gained), m, 2, &fixed, 1, &mut along).map_err(|e| e.to_string())?;
+
+// Independent check: closed forms of normal equations. Ī, V̄, S = Σ(I_i − Ī)², residual r_i. Use inherent f64 methods for reference values.
+let mean_i = current.iter().sum::<f64>() / m as f64;
+let mean_v = voltage.iter().sum::<f64>() / m as f64;
+let s: f64 = current.iter().map(|c| (c - mean_i) * (c - mean_i)).sum();
+let slope = (0..m)
+    .map(|i| (current[i] - mean_i) * (voltage[i] - mean_v))
+    .sum::<f64>()
+    / s;
+let offset = mean_v - slope * mean_i;
+let (mut dv, mut di, mut gap_v, mut gap_i, mut residual) =
+    (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
+for k in 0..m {
+    let d = current[k] - mean_i;
+    let r_k = voltage[k] - offset - slope * current[k];
+    // ∂R̂/∂V_k = (I_k − Ī)/S, ∂R̂/∂I_k = (r_k − R̂(I_k − Ī))/S.
+    let (exact_v, exact_i) = (d / s, (r_k - slope * d) / s);
+    gap_v = gap_v.max((gradient[m + k] - exact_v).abs());
+    gap_i = gap_i.max((gradient[k] - exact_i).abs());
+    dv = dv.max(exact_v.abs());
+    di = di.max(exact_i.abs());
+    residual = residual.max((r_k / s).abs());
+}
+let largest = |g: &[f64]| g.iter().fold(0.0_f64, |a, b| a.max(b.abs()));
+let (sens_i, sens_v) = (largest(&gradient[..m]), largest(&gradient[m..]));
+let orthogonality = [(0, 0, 1.0), (0, 1, 0.0), (1, 1, 1.0)]
+    .iter()
+    .map(|&(j, k, target)| {
+        let dot: f64 = (0..m).map(|i| q[2 * i + j] * q[2 * i + k]).sum();
+        (dot - target).abs()
+    })
+    .fold(0.0, f64::max);
+let root = (m as f64).sqrt();
+let relative = |value: f64, exact: f64| Some((value - exact).abs() / exact.abs());
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let digits = serde_json::json!({ "significantDigits": 12 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Quantity" },
+    { "key": "1", "label": "SciOxide value", "type": "number", "format": digits, "nullText": "−" },
+    { "key": "2", "label": "Closed-form or identity value", "type": "number", "format": digits },
+    { "key": "3", "label": "Relative difference [-]", "type": "number", "format": sci3, "nullText": "−" }
+]);
+let factor = vec![
+    ("R₁₁ and √m", Some(r[0]), root, relative(r[0], root)),
+    (
+        "R₁₂ and √m·Ī [A]",
+        Some(r[1]),
+        root * mean_i,
+        relative(r[1], root * mean_i),
+    ),
+    (
+        "R₂₂ and √S [A]",
+        Some(r[3]),
+        s.sqrt(),
+        relative(r[3], s.sqrt()),
+    ),
+    ("R₂₁ [A]", Some(r[2]), 0.0, None),
+    ("max|QᵀQ − I|", Some(orthogonality), 0.0, None),
+];
+emit_table_with_columns!(
+    columns.clone(),
+    factor,
+    metadata = serde_json::json!({ "id": "factor" })
+);
+let slope_rate = along[1].derivative();
+let fits = vec![
+    ("V̂₀ [V]", Some(fit[0]), offset, relative(fit[0], offset)),
+    ("R̂ [Ω]", Some(fit[1]), slope, relative(fit[1], slope)),
+    (
+        "Maximum magnitude of ∂R̂/∂V_i [1/A]",
+        Some(sens_v),
+        dv,
+        Some(gap_v / dv),
+    ),
+    (
+        "Maximum magnitude of ∂R̂/∂I_i [Ω/A]",
+        Some(sens_i),
+        di,
+        Some(gap_i / di),
+    ),
+    ("Maximum residual term |r_i|/S [Ω/A]", None, residual, None),
+    (
+        "dR̂/dt (Dual) and −R̂ [Ω]",
+        Some(slope_rate),
+        -slope,
+        relative(slope_rate, -slope),
+    ),
+    ("dV̂₀/dt（Dual）[V]", Some(along[0].derivative()), 0.0, None),
+];
+emit_table_with_columns!(columns, fits, metadata = serde_json::json!({ "id": "fit" }));
+```
+
+At the defaults $m = 10$ and $\sigma = 0.1$, $\hat R = 4.6948$ Ω and $\hat V_0 = 0.0634$ V; entries of $R$, $\hat R$, sensitivities, and derivatives with respect to $t$ agree with closed forms to relative differences below $10^{-15}$.
+Only $\hat V_0$ has a larger relative difference of $1.6 \times 10^{-14}$, because $\hat V_0$ is a small difference between $\bar V \approx 2.65$ V and $\hat R \bar I \approx 2.58$ V, amplifying relative error about 40-fold.
+The orthogonality error of columns of $Q$ is $5.6 \times 10^{-16}$ and $R_{21}$ is exactly zero.
+The magnitude of $\partial \hat R / \partial V_i$ reaches its maximum $0.545$ A⁻¹ at endpoints; of the maximum $2.58$ Ω/A for $\partial \hat R / \partial I_i$, the residual term contributes $0.12$ Ω/A.
+
+At $\sigma = 0$, the residual term falls to $1.1 \times 10^{-15}$ Ω/A and the maximum of $\partial \hat R / \partial I_i$ becomes $\hat R \max_i |I_i - \bar I| / S = 2.5636$ Ω/A.
+At $m = 3$ and $\sigma = 0.5$, the residual term is $17.1$ Ω/A, accounting for most of the maximum $21.7$ Ω/A of $\partial \hat R / \partial I_i$, so current-reading errors strongly affect $\hat R$.
+
+Making every current equal makes the two columns of $A$ proportional, leaving the line undetermined.
+For this design matrix, the next cell shows $R_{22}$ from `qr_into` and results from `least_squares_into`.
+Three configurations use three points at 0 A, three at 0.3 A, and four at 0.3 A; voltages are unperturbed $V_i = 0.05 + 4.7 I_i$.
+There are no inputs; table rows correspond to the three experiments.
+
+```rust
+//| id: ad-least-squares-rank
+//| ref: ad-least-squares-rank
+//| title: "Examine qr_into R₂₂ and least_squares_into results for design matrices with proportional columns"
+//| run: reactive
+//| uses: [ad-calibration-design]
+//| crates: [scioxide-ad, scioxide-core]
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"degenerate","path":"/rows/0/2","approx":{"value":0,"atol":1e-300}}
+//|       - {"artifact":"degenerate","path":"/rows/0/3","equals":"Singular (pivot 1)"}
+//|       - {"artifact":"degenerate","path":"/rows/1/3","equals":"Singular (pivot 1)"}
+//|       - {"artifact":"degenerate","path":"/rows/2/2","range":{"min":1e-17,"max":1e-14}}
+//|       - {"artifact":"degenerate","path":"/rows/2/3","equals":"Returns a solution"}
+use scioxide_ad::{least_squares_into, qr_into};
+use scioxide_core::{SciOxideErrorKind, SciOxideErrorView};
+
+// Experiments with all currents equal: A has proportional columns and the line is undetermined.
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let digits = serde_json::json!({ "significantDigits": 12 });
+let mut degenerate = Vec::new();
+for (level, count) in [(0.0, 3), (0.3, 3), (0.3, 4)] {
+    let same = vec![level; count];
+    let v: Vec<f64> = same.iter().map(|c| 0.05 + 4.7 * c).collect();
+    let (mut q, mut r) = (vec![0.0; 2 * count], [0.0; 4]);
+    qr_into(&design(&same), count, 2, &mut q, &mut r).map_err(|e| e.to_string())?;
+    let mut x = [0.0; 2];
+    let (outcome, slope) = match least_squares_into(&design(&same), count, 2, &v, 1, &mut x) {
+        Ok(()) => ("Returns a solution".to_string(), Some(x[1])),
+        Err(e) => match (e.kind(), e.view()) {
+            (SciOxideErrorKind::Singular, SciOxideErrorView::Singular { pivot: Some(k) }) => {
+                (format!("Singular (pivot {k})"), None)
+            }
+            _ => (e.to_string(), None),
+        },
+    };
+    degenerate.push((level, count, r[3], outcome, slope));
+}
+let degenerate_columns = serde_json::json!([
+    { "key": "0", "label": "Current [A]", "type": "number", "format": digits },
+    { "key": "1", "label": "Measurement count", "type": "integer" },
+    { "key": "2", "label": "R₂₂（qr_into）[A]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "least_squares_into result" },
+    { "key": "4", "label": "R̂ [Ω]", "type": "number", "format": sci3, "nullText": "Not written" }
+]);
+emit_table_with_columns!(
+    degenerate_columns,
+    degenerate,
+    metadata = serde_json::json!({ "id": "degenerate" })
+);
+```
+
+For all-zero currents and three points all at 0.3 A, $R_{22}$ is exactly zero, returning `Singular` (pivot 1).
+Pivot indices start at zero, so 1 denotes the second diagonal entry $R_{22}$ of $R$.
+With four points all at 0.3 A, rounding gives $R_{22} = 1.9 \times 10^{-16}$ A, avoiding an error and returning $\hat R = 2.31$ Ω, unrelated to the true 4.7 Ω.
+`least_squares_into` does not determine numerical rank; the caller must check diagonal ratios such as $R_{22}/R_{11}$.
+
+## Summary
+
+Use `solve_into` for derivatives of linear-system solutions.
+`solve_into` factors the base matrix once per lane and reuses the factors for every derivative component, leaving just one call statement of $n^2 + 2nk + 2$ words on the tape.
+`cholesky_into`, `qr_into`, and `least_squares_into` differentiate algorithm operations directly and leave $O(n^3)$ tape statements; use them when the factorization itself is output, as in $\log\det A$ or $L$.
+`solve_into` returns `Singular` only for zero or nonfinite pivots, and `least_squares_into` only for exactly zero or nonfinite diagonal entries of $R$; the caller must detect ill conditioning or rank-deficient design matrices, for example with diagonal ratios of $R$ from `qr_into`.
+Sensitivities of least-squares coefficients to design-matrix entries include a residual-proportional term, so errors in explanatory-variable readings strongly affect coefficients in fits with large residuals.
+
+## Further reading
+
+- [Differentiating implicit functions](../implicit-functions/): examine obtaining nonlinear-equation solution derivatives with the implicit function theorem and solving the intermediate linear systems with `solve_into`.
+- [External differentiation rules with ExternalRule](../external-rules/): examine using external solvers for factorizations such as eigendecomposition, for which this crate provides no rules, and supplying derivatives as tape call statements.
+- [Reverse mode and tapes](../reverse-mode-and-replay/): examine reverse and tangent sweeps for recordings containing call statements and how words are counted.
+- [Second derivatives and Hessian operators](../second-order-derivatives/): examine computing Hessian–vector products through `solve_into` solutions on `Tape<Dual<f64>>`.

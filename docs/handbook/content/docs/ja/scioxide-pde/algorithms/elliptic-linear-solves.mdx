@@ -1,0 +1,272 @@
+---
+title: 楕円型の連立一次方程式の解き方
+description: EllipticProblem が行列の形から選ぶ三重対角・巡回三重対角・疎 LU の直接法、後退誤差による受理、三つの呼び方と作業領域、定常と時間発展の結果の型。
+sidebar:
+  order: 313
+references:
+  pde-elliptic-solver-selection: "既定の直接法"
+  pde-elliptic-acceptance: "解の受理の検査"
+  pde-elliptic-calls-and-workspaces: "三つの呼び方と作業領域"
+  pde-steady-and-transient-results: "定常と時間発展の結果の型"
+---
+
+[楕円問題の FDM・FEM・FVM](../elliptic-fdm-fem-fvm/)で導いた離散化は、どれも連立一次方程式 $\mathbf{A}\mathbf{u}=\mathbf{b}$ を作る。
+このページでは、`EllipticProblem` がその方程式をどの方法で解き、どの検査で解を受け入れ、何を返すかを説明する。
+零空間を持つ問題の扱いは[楕円問題の適合条件・ゲージ・保存的流束](../compatibility-gauges-and-fluxes/)で扱う。
+
+## 問題と設定
+
+`EllipticProblem::new(&plan, &source)` は、準備した Plan（`SpatialDiscretization` を実装した型）と源項 `FieldData` を借用で組にする。
+求解は時刻 0 の荷重 $\mathbf{b}=\mathbf{b}(0)$ を評価し、消去済みの行列 $\mathbf{A}$ を組み立てて解く。
+返す値は Dirichlet の値を含む全未知数の並びで、Plan の未知数の順に並ぶ。
+行列が特異で、その零空間の基底を利用者が与えるときは `with_nullspace(left, right)` を付ける。
+
+`EllipticOptions::new()` の既定値は次のとおりである。
+
+| 設定 | 既定値 | 変更 |
+|---|---|---|
+| 解の受理の許容誤差（絶対・相対） | $\sqrt{\varepsilon}$（`f64` では約 $1.5\times10^{-8}$） | `with_residual_tolerance` |
+| ゲージ | `EllipticGauge::Unspecified`（零空間があれば拒否） | `with_gauge` |
+| 荷重の適合条件 | `RequireCompatible`、許容誤差 $\sqrt{\varepsilon}$ | `with_compatibility` |
+| 注入した反復法の反復の上限 | 1,000 回 | `with_max_linear_iterations` |
+| 疎 LU 分解の因子の要素数の上限 | $64\,(\mathrm{nnz}+n)$（少なくとも 4096） | `with_direct_limits` |
+| 計算回数の上限 | 上限なし | `with_budgets` |
+
+ここで $\varepsilon$ はスカラー型の機械イプシロン、$\mathrm{nnz}$ は行列の非零要素の数、$n$ は未知数の数である。
+`with_budgets` に有限の反復回数の上限を与えると、反復法の反復の上限もその値で抑えられる。
+
+## 既定の直接法
+
+反復法を注入しない限り、`EllipticProblem` は組み立てた行列の非零の位置を見て直接法を選ぶ。
+
+- 三重対角：非零が対角とその隣だけにあれば、隣り合う行の間で部分ピボット選択をする Gauss の消去法で解く（`tridiagonal-direct`）。
+  分解も求解も $O(n)$ の演算で済む。
+  一次元の FDM、P1 FEM、FVM（構造格子と単体のメッシュ）の行列は、頂点とセルを左から順に番号付けていればこの形である。
+- 巡回三重対角：さらに右上と左下の隅だけに非零があれば、巡回三重対角の方法で解く（`cyclic-tridiagonal-direct`）。
+  反応か移流があって定数モードを持たない周期境界の FDM がこの形になる。
+- 疎 LU 分解：それ以外の行列はフィル（分解で新たに生じる非零）を抑える並べ替えを付けた疎 LU 分解で解く（`sparse-lu-direct`）。
+  一次元でも P2 FEM は頂点の値の後に中点の値を並べるので三重対角にならず、この方法を使う。
+  二次元以上の行列もすべてこの方法になる。
+
+構造から定数モードが分かる問題では、成分ごとに最初の未知数を 0 に固定した残りの系を同じ方法で解き、その後でゲージを課す。
+利用者が零空間の基底を与えた問題は、行列に基底を縁取りとして加えた拡大系を疎 LU 分解で解く（`bordered-sparse-lu`）。
+選んだ方法の名前は `PdeDiagnostics::method()` が返す。
+
+## 解の受理の検査
+
+直接法の結果は元の方程式の残差で独立に検査してから受け入れる。
+残差の無限大ノルムを、後退誤差の尺度と比べる。
+
+$$
+\|\mathbf{b}-\mathbf{A}\mathbf{u}\|_\infty\le\tau_a+\tau_r\bigl(\|\mathbf{A}\|_\infty\|\mathbf{u}\|_\infty+\|\mathbf{b}\|_\infty\bigr)
+$$
+
+$\tau_a$、$\tau_r$ は解の受理の絶対・相対の許容誤差で、既定ではどちらも $\sqrt{\varepsilon}$ である。
+満たさなければ、解を返さずに `NumericalInstability`（`Breakdown`）で失敗する。
+受け入れた解のレポートには、生の残差と尺度を `PdeDiagnostics::linear_residual_report()` が持ち、`scaled_norm()` が後退誤差を返す。
+この残差は代数的な方程式の誤差で、離散化誤差の推定ではない。
+
+## 三つの呼び方と作業領域
+
+求解には三つの呼び方がある。
+
+- `solve()` は既定の設定で解き、全未知数の値を `Vec` で返す。
+  零空間を持つ問題はゲージを指定できないので拒否し、完了しなかった求解はエラーにする。
+- `solve_with_options(&options)` は `EllipticSolution` を返す。
+  `values()` が全未知数の値、`report()` が `PdeSolveReport`（終了理由、診断、信頼度）で、`into_parts()` で二つに分けられる。
+- `solve_into(&options, &mut out, &mut workspace, scope)` は、利用者が用意した `out` に書き込み、`PdeSolveReport` を返す。
+  失敗したときは `out` を変えない。
+
+`EllipticWorkspace::new()` はメモリを確保しない。
+同じ作業領域を `solve_into` に渡し続けると、同じ大きさの三重対角の系では分解のメモリ領域をそのまま使って分解し直す。
+`EllipticWorkspace::with_linear_solver(solver)` は、`scioxide-linalg` の反復法をこの作業領域に注入し、以後の求解をその反復法で行う。
+反復の上限は反復法自身の上限と `EllipticOptions` の上限の小さいほうである。
+反復法が上限や停滞で止まったときは、収束していない近似解を書き込み、成功でない終了理由と信頼度 `DiagnosticOnly` を返す。
+直前の呼び出しの記録は `last_attempt()` で読める。
+
+終了理由 `PdeTermination` の判定は `is_success()` で行い、真になるのは `Completed` だけである。
+直接法の求解は受理の検査を通れば `Completed` で、信頼度は残差を検査したことを表す `ResidualChecked` になる。
+
+## 定常と時間発展の結果の型
+
+時間発展の問題（`ParabolicProblem`、`HyperbolicProblem`）は、定常の問題と対になる型で結果と作業領域を扱う。
+
+| 役割 | 定常 | 時間発展 |
+|---|---|---|
+| 所有する結果 | `EllipticSolution`：値とレポート | `PdeSolution`：最終の状態、値、レポート、軌跡 |
+| 作業領域 | `EllipticWorkspace`：分解のメモリ領域と注入した反復法 | `PdeWorkspace`：ODE のメモリ領域と直前の試行の記録 |
+| 状態 | なし | `PdeState`：時刻と ODE の座標 |
+
+`PdeState` は、時刻 `time()`、値を固定していない未知数の並び `coordinates()`（双曲型ではその後に速度が続く）、残っている Rannacher 起動の終了時刻 `startup_end()`、メッシュの revision `mesh_token()` を持つ。
+`advance` はこの状態を進め、途中で止まっても最後に受け入れた時点の状態を残す。
+`PdeSolution` の `values()` は最終の状態から Dirichlet の値を含む全未知数を組み立てた値で、`state()`、`report()`、`trajectory()` が状態、レポート、出力の記録を返す。
+`PdeWorkspace::new()` もメモリを確保せず、一つの作業領域を放物型と双曲型の Plan で使える。
+`last_accepted()` は直前の試行で受け入れた状態を返す。
+時間積分の方法と終了理由は[放物型方程式の時間積分](../parabolic-time-integration/)で扱う。
+
+## 解法の選択を確かめる
+
+下のセルは区間 $[0,1]$ を $N$ 個のセルに分け、五つの Plan で定常の問題を解いて、選ばれた方法、後退誤差、厳密解との誤差を並べる。
+Dirichlet 条件 $u(0)=u(1)=0$ の $-u''=1$ の厳密解は $u=x(1-x)/2$ である。
+二次式なので、FDM と P1 FEM の節点の値、P2 FEM の値は丸め誤差の範囲で厳密解に一致するはずである。
+FVM はセル中心の値で、$O(h^2)$ の離散化誤差が残る。
+周期境界の FDM は $-u''+u=1$ を解き、厳密解は $u=1$ である。
+FDM の行は `solve_into` に同じ作業領域を二度渡し、二度目の結果を表に入れる。
+
+```rust
+//| id: pde-elliptic-direct-solvers
+//| ref: pde-elliptic-direct-solvers
+//| title: 五つの Plan で既定の直接法と後退誤差を読む
+//| run: reactive
+//| crates: [scioxide-pde, scioxide-spatial, scioxide-core]
+//| inputs:
+//|   cells: {"type":"range","label":"セルの数 N [-]","min":4,"max":64,"step":4,"value":16}
+//| cases:
+//|   - {"id":"coarse","label":"N = 4","description":"FVM の誤差は N = 16 の 16 倍になり、他の行は丸め誤差の水準にとどまる。","inputs":{"cells":4}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"solvers","path":"/rows/0/1","equals":"tridiagonal-direct"}
+//|       - {"artifact":"solvers","path":"/rows/3/1","equals":"sparse-lu-direct"}
+//|       - {"artifact":"solvers","path":"/rows/4/1","equals":"cyclic-tridiagonal-direct"}
+//|       - {"artifact":"solvers","path":"/rows/0/4","range":{"min":0,"max":1e-13}}
+//|       - {"artifact":"solvers","path":"/rows/3/4","range":{"min":0,"max":1e-13}}
+//|       - {"artifact":"solvers","path":"/rows/1/4","range":{"min":1e-5,"max":1e-3}}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+//|   - case: coarse
+//|     expect:
+//|       - {"artifact":"solvers","path":"/rows/2/2","equals":5}
+//|       - {"artifact":"solvers","path":"/rows/3/2","equals":9}
+//|       - {"artifact":"solvers","path":"/rows/1/4","range":{"min":1e-3,"max":1e-1}}
+use scioxide_core::ExecutionContext;
+use scioxide_pde::{
+    BoundaryData, BoundaryKind, ConstantDiffusion, EllipticOptions, EllipticProblem,
+    EllipticWorkspace, FieldData, PdeSolveReport, SimplexFemGeometry, SimplexFemOrder,
+    SimplexFemPlan, SpatialDiscretization, StructuredBoundaries, StructuredFdmPlan,
+    StructuredFvmPlan, TaggedBoundaries,
+};
+use scioxide_spatial::{AxisTopology, CoordinateAxis, Grid1d, IntervalMesh, Point, SegmentMesh};
+
+type Row = (String, String, usize, f64, f64);
+// レポートから方法と後退誤差を読み、厳密解 exact との最大誤差を加える。
+fn row<P: SpatialDiscretization<f64, f64, 1>>(
+    name: &str,
+    plan: &P,
+    values: &[f64],
+    report: &PdeSolveReport<f64>,
+    exact: fn(f64) -> f64,
+) -> Result<Row, String> {
+    if !report.is_success() {
+        return Err(format!("{name}: {}", report.termination()));
+    }
+    let mut error = 0.0_f64;
+    for (i, u) in values.iter().enumerate() {
+        let x = plan.dof_point(i).map_err(|e| e.to_string())?.point[0];
+        error = error.max((u - exact(x)).abs());
+    }
+    let method = report.diagnostics().method().unwrap_or("-").to_owned();
+    let residual = report.diagnostics().linear_residual_report();
+    let backward = residual.ok_or("残差のレポートがない")?.scaled_norm();
+    Ok((name.to_owned(), method, values.len(), backward, error))
+}
+// 源項 f = 1 で既定の設定のまま解き、行を作る。
+fn solved<P: SpatialDiscretization<f64, f64, 1>>(
+    name: &str,
+    plan: &P,
+    exact: fn(f64) -> f64,
+) -> Result<Row, String> {
+    let source = FieldData::constant(1.0);
+    let solution = EllipticProblem::new(plan, &source)
+        .solve_with_options(&EllipticOptions::new())
+        .map_err(|e| e.to_string())?;
+    row(name, plan, solution.values(), solution.report(), exact)
+}
+let n = cells as usize;
+let parabola: fn(f64) -> f64 = |x| x * (1.0 - x) / 2.0;
+let k = ConstantDiffusion::new(1.0);
+let mesh = |topology| -> Result<SegmentMesh<f64>, String> {
+    let axis = CoordinateAxis::uniform(0.0, 1.0, n + 1).map_err(|e| e.to_string())?;
+    let grid = Grid1d::new([axis], [topology]).map_err(|e| e.to_string())?;
+    SegmentMesh::new(grid).map_err(|e| e.to_string())
+};
+let segment = mesh(AxisTopology::Bounded)?;
+let (dirichlet, zero) = (BoundaryKind::Dirichlet, BoundaryData::zero());
+let ends = StructuredBoundaries::uniform(&segment, 1, dirichlet, zero.clone())
+    .map_err(|e| e.to_string())?;
+// FDM: 同じ作業領域で二度解く。二度目は三重対角の分解のメモリ領域を再利用する。
+let fdm = StructuredFdmPlan::new(segment.clone(), &k, &ends).map_err(|e| e.to_string())?;
+let (one, options) = (FieldData::constant(1.0), EllipticOptions::new());
+let problem = EllipticProblem::new(&fdm, &one);
+let (mut out, mut workspace) = (vec![0.0; fdm.unknowns()], EllipticWorkspace::new());
+let mut solve_fdm = || {
+    let scope = ExecutionContext::sequential_native();
+    problem.solve_into(&options, &mut out, &mut workspace, scope)
+};
+drop(solve_fdm().map_err(|e| e.to_string())?);
+let report = solve_fdm().map_err(|e| e.to_string())?;
+let mut rows = vec![row("FDM（solve_into）", &fdm, &out, &report, parabola)?];
+let fvm = StructuredFvmPlan::new(segment, &k, &ends).map_err(|e| e.to_string())?;
+rows.push(solved("FVM", &fvm, parabola)?);
+let points = (0..=n)
+    .map(|i| Point::new([i as f64 / n as f64]))
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(|e| e.to_string())?;
+let interval = IntervalMesh::new(points, (0..n).map(|i| [i, i + 1]).collect())
+    .map_err(|e| e.to_string())?;
+let tagged =
+    TaggedBoundaries::uniform(&interval, 1, dirichlet, zero).map_err(|e| e.to_string())?;
+for (name, order) in [
+    ("FEM P1", SimplexFemOrder::P1),
+    ("FEM P2", SimplexFemOrder::P2),
+] {
+    let geometry = SimplexFemGeometry::Affine;
+    let fem = SimplexFemPlan::new(interval.clone(), geometry, order, &k, &tagged)
+        .map_err(|e| e.to_string())?;
+    rows.push(solved(name, &fem, parabola)?);
+}
+// 周期境界の FDM: 条件はなく、反応 c = 1 が定数モードを除く。厳密解は u = 1。
+let ring = mesh(AxisTopology::Periodic)?;
+let none = StructuredBoundaries::new(&ring, 1, vec![]).map_err(|e| e.to_string())?;
+let reactive = ConstantDiffusion::new(1.0).with_reaction(1.0);
+let periodic = StructuredFdmPlan::new(ring, &reactive, &none).map_err(|e| e.to_string())?;
+rows.push(solved("周期 FDM（c = 1）", &periodic, |_| 1.0)?);
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Plan" },
+    { "key": "1", "label": "選ばれた方法" },
+    { "key": "2", "label": "未知数 [-]", "type": "integer" },
+    { "key": "3", "label": "後退誤差 [-]", "type": "number", "format": sci2 },
+    { "key": "4", "label": "厳密解との最大誤差 [-]", "type": "number", "format": sci2 }
+]);
+let worst = rows.iter().map(|r| r.3).fold(0.0_f64, f64::max);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "solvers" })
+);
+emit_outcome!(
+    Outcome::satisfied("五つの直接法の求解がすべて後退誤差の検査を通った")
+        .status("Completed")
+        .diagnostic("最大の後退誤差", worst, None)
+);
+```
+
+既定の $N=16$ では、FDM・FVM・P1 FEM が `tridiagonal-direct`、P2 FEM が `sparse-lu-direct`、周期境界の FDM が `cyclic-tridiagonal-direct` で解かれた。
+後退誤差はどれも $1.2\times10^{-16}$ 以下で、受理の許容誤差 $\sqrt{\varepsilon}\approx1.5\times10^{-8}$ よりはるかに小さい。
+FDM、P1 FEM、P2 FEM、周期境界の FDM の厳密解との誤差は $1.4\times10^{-14}$ 以下で、丸め誤差の水準である。
+FVM の誤差は $4.9\times10^{-4}$ で、$h^2/8$（$h=1/16$）に等しく、$N=4$ では $7.8\times10^{-3}$ と 16 倍になる。
+FVM の後退誤差も他の行と同じ水準なので、後退誤差が小さいことは離散化誤差が小さいことを意味しない。
+FDM の行は同じ作業領域を渡した二度目の `solve_into` の結果で、分解のメモリ領域を再利用しても検査を通る。
+
+## まとめ
+
+`EllipticProblem` は、行列が三重対角なら $O(n)$ の三重対角の消去、巡回三重対角なら巡回の方法、それ以外は並べ替え付きの疎 LU 分解を選ぶ。
+一次元でも P2 FEM は疎 LU 分解になり、選んだ方法は `PdeDiagnostics::method()` で確かめられる。
+解は後退誤差の検査を通ったときだけ返り、その値は離散化誤差ではない。
+繰り返し解くときは `solve_into` に同じ `EllipticWorkspace` を渡し、時間発展の問題では `PdeState` と `PdeWorkspace` が同じ役割を持つ。
+
+## 次に読むページ
+
+- [楕円問題の適合条件・ゲージ・保存的流束](../compatibility-gauges-and-fluxes/)：定数モードを持つ問題で、固定した未知数の後に課すゲージと診断を確かめる。
+- [放物型方程式の時間積分](../parabolic-time-integration/)：`PdeState` を進める時間積分と、その終了理由を学ぶ。
+- [構造格子の多次元差分](../multidimensional-spatial-plans/)：二次元以上で疎 LU 分解になる行列の作り方を見る。

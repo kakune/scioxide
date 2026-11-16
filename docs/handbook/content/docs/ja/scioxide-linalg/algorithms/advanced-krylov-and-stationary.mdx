@@ -1,0 +1,474 @@
+---
+title: 双直交法・最小二乗 Krylov 法・定常反復
+description: BiCG・CGS・QMR・TFQMR の双直交漸化式と破綻、LSQR と LSMR による最小二乗問題と正規残差の判定、GMRES の柔軟な前処理、LGMRES・GCROT と再利用空間の作り直し、ブロック Krylov 法、Richardson・Jacobi・Gauss–Seidel・SOR と最適な緩和係数。
+sidebar:
+  order: 360
+references:
+  linalg-flexible-recycled-block: "柔軟な前処理再利用ブロック"
+  linalg-biorthogonal-recurrences: "双直交の短い漸化式"
+  linalg-least-squares-krylov: "最小二乗問題の-krylov-法"
+  linalg-stationary-iterations: "定常反復と緩和係数"
+---
+
+[前のページ](../krylov-and-preconditioning/)の CG・MINRES・GMRES・BiCGSTAB のほかに、`scioxide-linalg` はメモリを抑えた非対称系の解法、長方行列の最小二乗問題を解く Krylov 法、前処理が反復ごとに変わる場合や似た系を何度も解く場合の解法、古典的な定常反復を提供する。
+このページはそれぞれの考え方と使いどころをまとめる。
+標準形式・オプション付き形式・出力先を指定する API の三つの呼び出しの形、`IterativeWorkspace`、終了理由 `LinearSolveTermination` と止まったときに返る反復解の規約は、前のページの[反復の状態と停止したときの結果](oxref:linalg-iterative-status)と同じである。
+
+---
+
+## 双直交の短い漸化式
+
+一般の非 Hermitian な $A$ では、短い漸化式と、ある内積のノルムでの誤差や残差の最小化を両立できない（Faber–Manteuffel の定理。
+例外は $A^{\mathsf H}$ が $A$ の低い次数の多項式で書けるような、ごく限られた行列である）。
+GMRES は最小化を選んでメモリが反復とともに増え、双直交法は短い漸化式を選んで最小化をあきらめる。
+
+| 解法 | 考え方 | 一回の反復の計算コストと作業領域（長さ $n$ のベクトル） | 注意点 |
+|---|---|---|---|
+| `BicgSolver` | $A$ と $A^{\mathsf H}$ の Krylov 空間を双直交にする両側 Lanczos 過程（BiCG） | $A$ と $A^{\mathsf H}$ の積 1 回ずつ、13 本 | $A$ は `AdjointOperator` で渡し、前処理は `Preconditioning::InverseAdjoint` で渡す。残差が単調に減らない |
+| `CgsSolver` | BiCG の残差多項式を二乗して $A^{\mathsf H}$ を不要にする（CGS） | $A$ の積 2 回、14 本 | 振動が二乗されて丸め誤差が増幅されやすい |
+| `QmrSolver` | BiCG と同じ基底（先読みなし）の上で準最小残差をとる（QMR） | $A$ と $A^{\mathsf H}$ の積 1 回ずつ、18 本 | BiCG と同じく随伴が必要。滑らかに収束するが、残差の最小化ではない |
+| `TfqmrSolver` | CGS の漸化式に準最小残差の考え方を使い、$A^{\mathsf H}$ を使わない QMR（TFQMR） | 半ステップ 1 回が 1 反復で $A$ の積 1 回、14 本 | 残差の履歴は検査点の間で上界 $\tau\sqrt{k+1}$ を記録する |
+
+前処理は 4 種類とも右からかけ、求解の間は同じ線形の $M^{-1}$ を前提とする。
+真の残差は 50 回ごと、漸化式で求めた残差の推定が許容誤差を満たしたとき、終わりに計算し直す。
+CGS は打ち消しによる漂流を抑えるために、2 回目の積で反復ごとに真の残差 $b - Ax$ を計算し直し、方向と影の残差はそのまま保つ。
+
+どの解法も、漸化式の分母、つまり影の残差との内積 $\hat r^{\mathsf H} v$ などが 0 に近づくと破綻しうる。
+`scioxide-linalg` は $\lvert \hat r^{\mathsf H} v \rvert \le \varepsilon_{\mathrm{mach}}^2 \lVert \hat r \rVert_2 \lVert v \rVert_2$ のときだけ破綻とみなし、それより大きな内積は打ち消しで精度が落ちていてもそのまま使う。
+CGS では二乗した多項式が内積の打ち消しを増幅するので、影の内積を Dot2 のアルゴリズム（作業精度のおよそ 2 倍）で計算する。
+Dot2 の誤差の上界でしきい値との大小が決まらないときは厳密な累積で判定するので、破綻の判定は厳密な内積の場合と一致する。
+破綻すると終了理由 `Breakdown(RecurrenceDenominator)` の `Ok` を返し、返す解は前のページの規約に従う。
+`with_breakdown_restarts` で回数を許すと、最後に確かめた反復解から、その真の残差を新しい影の残差として漸化式を始め直す（`BicgstabSolver` も同じで、既定は始め直さない）。
+受理された一歩の前に 2 回目の破綻が起きると、始め直しの回数が残っていても止まる。
+
+## 最小二乗問題の Krylov 法
+
+長方行列 $A \in \mathbb{K}^{m \times n}$ の最小二乗問題 $\min \lVert Ax - b \rVert_2$ は、正規方程式 $A^{\mathsf H}A x = A^{\mathsf H} b$ を作らずに Golub–Kahan の二重対角化で解ける。
+LSQR（Paige–Saunders）は CG を正規方程式に適用したのと数学的に同じ反復を安定な形で行い、LSMR（Fong–Saunders）は MINRES に当たる反復で、正規方程式の残差 $\lVert A^{\mathsf H} r_k \rVert$ を厳密な計算では単調に減らす。
+`LsqrSolver` と `LsmrSolver` は $m < n$、$m = n$、$m > n$ のどれも受け付け、一回の反復は $A$ と $A^{\mathsf H}$ の積 1 回ずつである。
+$A$ は `AdjointOperator`（scioxide-sparse の疎行列や密行列の有限ビューなど）で渡し、前処理の引数は持たないので、標準形式は `solve(&a, &b)`、オプション付き形式は `solve_with_options(&a, &b, x0)` になる。
+
+$b$ が $A$ の値域に入らない場合、残差 $\lVert r \rVert$ は 0 にならないので、収束は正規方程式の残差で判定する。
+正規方程式の残差の判定は $\lVert A^{\mathsf H} r \rVert_2 \le \tau_{\mathrm{abs}} + \tau_{\mathrm{rel}} \lVert A \rVert \lVert r \rVert_2$（$\lVert A \rVert$ は反復中に更新する推定値）で、`with_normal_tolerance` で指定しなければ $\tau_{\mathrm{abs}} = 0$、$\tau_{\mathrm{rel}}$ は残差の許容誤差の相対値と同じになる。
+これを満たすと終了理由は `LeastSquaresConverged`、元の残差 $\lVert r \rVert$ の許容誤差を満たせば `Converged` になり、どちらの残差も 50 回ごとと収束を受理する前に計算し直す。
+`with_condition_limit` は、射影した小さな問題の逆条件数の推定がしきい値（`ReciprocalConditionThreshold`、0 なら無効）を下回ったところで `ConditionLimit` で止め、悪条件の問題でのノイズの増幅を抑える（推定は行列全体のランクの証明ではない）。
+診断 `KrylovDiagnostics` の `normal_residual()` は返した解から計算し直した正規残差 $\lVert A^{\mathsf H} r \rVert_2$、`condition_estimate()` は射影した問題の逆条件数の推定である。
+
+次のブロックはこのページの二つのセルが共有する補助関数である。
+`termination_name` は終了理由を表す列挙子の名前を、`severity` は判定の順位（成功 0、上限・停滞・停止 1、破綻 2）を、`relative_difference` は参照解との相対差 $\lVert x - y \rVert_\infty / \lVert y \rVert_\infty$ を返す。
+
+```rust
+//| id: linalg-advanced-krylov-helpers
+//| kind: definitions
+//| title: 終了理由の名前・判定の順位・相対差
+//| crates: [scioxide-linalg]
+use scioxide_linalg::{LinearSolveBreakdown, LinearSolveTermination};
+
+/// 終了理由の列挙子名（表の列と判定の status に使う）。
+pub(crate) fn termination_name(termination: LinearSolveTermination) -> &'static str {
+    match termination {
+        LinearSolveTermination::Converged => "Converged",
+        LinearSolveTermination::LeastSquaresConverged => "LeastSquaresConverged",
+        LinearSolveTermination::ConditionLimit => "ConditionLimit",
+        LinearSolveTermination::IterationLimit => "IterationLimit",
+        LinearSolveTermination::EvaluationLimit => "EvaluationLimit",
+        LinearSolveTermination::Stagnation => "Stagnation",
+        LinearSolveTermination::Breakdown(cause) => match cause {
+            LinearSolveBreakdown::RecurrenceDenominator => "Breakdown(RecurrenceDenominator)",
+            LinearSolveBreakdown::NonPositiveCurvature => "Breakdown(NonPositiveCurvature)",
+            LinearSolveBreakdown::ArnoldiInvariant => "Breakdown(ArnoldiInvariant)",
+            LinearSolveBreakdown::Preconditioner => "Breakdown(Preconditioner)",
+        },
+        LinearSolveTermination::ExecutionStopped(_) => "ExecutionStopped",
+    }
+}
+
+/// 判定の順位：成功 0、上限・停滞・停止 1（返った反復解は推定値）、破綻 2。
+pub(crate) fn severity(termination: LinearSolveTermination) -> u8 {
+    match termination {
+        t if t.is_success() => 0,
+        LinearSolveTermination::Breakdown(_) => 2,
+        _ => 1,
+    }
+}
+
+/// 参照解 y との最大値ノルムの相対差 ‖x − y‖∞ / ‖y‖∞。
+pub(crate) fn relative_difference(x: &[f64], reference: &[f64]) -> f64 {
+    let scale = reference.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+    let gap = x
+        .iter()
+        .zip(reference)
+        .fold(0.0_f64, |acc, (p, q)| acc.max((p - q).abs()));
+    gap / scale
+}
+```
+
+次のセルは特異値を 1 から $10^{-t}$ まで等比に並べた $120 \times 40$ の行列 $A = H_u \begin{bmatrix} \Sigma \\ 0 \end{bmatrix} H_v$（$H_u$、$H_v$ は Householder 鏡映）について、$b = Ax^{\star} + s\, w$（$w = H_u e_{41}$ は値域に直交する単位ベクトル）の最小二乗解を LSQR と LSMR のオプション付き形式で求める。
+残差の許容誤差は相対 $10^{-12}$、正規残差の許容誤差は相対 $10^{q}$、反復の上限は 5000 回である。
+最小二乗解は $s$ によらず $x^{\star} = (1, 1.1, \dots, 4.9)$ で、ワンショット関数 `least_squares`（列ピボット付き Householder QR）の解も同じ表で比べる。
+逆条件数の下限 $10^{c}$ を上げると、射影した問題の逆条件数の推定がそれを下回ったところで `ConditionLimit` で止まる。
+判定は二つの反復法の終了理由のうち悪い方で決める。
+
+```rust
+//| id: linalg-lsqr-rectangular
+//| ref: linalg-lsqr-rectangular
+//| title: LSQR と LSMR による長方行列の最小二乗解
+//| run: button
+//| uses: [linalg-advanced-krylov-helpers]
+//| crates: [scioxide-core, scioxide-linalg]
+//| inputs:
+//|   condition_exponent: {"type":"range","label":"条件数 κ₂ = 10^t の t","description":"特異値を 1 から 10^−t まで等比に並べる。","min":0,"max":4,"step":0.5,"value":2}
+//|   residual_size: {"type":"range","label":"値域の外の成分 s","description":"b = A x* + s w の s。0 なら b は値域に入る。","min":0,"max":10,"step":0.5,"value":1}
+//|   normal_exponent: {"type":"range","label":"正規残差の許容誤差 10^q の q","description":"‖Aᴴr‖ ≤ 10^q ‖A‖ ‖r‖ になったら止める（‖A‖ は反復中の推定値）。","min":-14,"max":-6,"step":1,"value":-12}
+//|   limit_exponent: {"type":"range","label":"逆条件数の下限 10^c の c","description":"射影した問題の逆条件数の推定が 10^c を下回ったら止める。","min":-8,"max":-1,"step":1,"value":-8}
+//| cases:
+//|   - {"id":"consistent","label":"s = 0","description":"b が値域に入ると、元の残差の判定で Converged になる。","inputs":{"residual_size":0}}
+//|   - {"id":"loose-normal","label":"q = −6","description":"正規残差の判定を緩めると早く止まり、x* との差が上界の程度に増える。","inputs":{"normal_exponent":-6}}
+//|   - {"id":"condition-limit","label":"t = 4, c = −2","description":"逆条件数の推定が下限を下回り、ConditionLimit で止まる。","inputs":{"condition_exponent":4,"limit_exponent":-2}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"solutions","path":"/rows/0/5","range":{"max":1e-12}}
+//|       - {"artifact":"solutions","path":"/rows/1/1","equals":"LeastSquaresConverged"}
+//|       - {"artifact":"solutions","path":"/rows/1/5","range":{"max":1e-8}}
+//|       - {"artifact":"solutions","path":"/rows/2/5","range":{"max":1e-8}}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+//|   - case: consistent
+//|     expect:
+//|       - {"artifact":"solutions","path":"/rows/1/1","equals":"Converged"}
+//|       - {"artifact":"solutions","path":"/rows/2/5","range":{"max":1e-8}}
+//|   - case: loose-normal
+//|     expect:
+//|       - {"artifact":"solutions","path":"/rows/1/5","range":{"min":1e-4,"max":1e-1}}
+//|   - case: condition-limit
+//|     expect:
+//|       - {"artifact":"solutions","path":"/rows/1/1","equals":"ConditionLimit"}
+//|       - {"artifact":"solutions","path":"/rows/0/5","range":{"max":1e-9}}
+//|       - {"artifact":"solutions","path":"/rows/2/5","range":{"min":0.1,"max":1.5}}
+//|       - {"path":"/outputs/1/state","equals":"partial"}
+use scioxide_core::{Budget, GradientTolerance, ResidualTolerance};
+use scioxide_linalg::{
+    LinearSolveTermination, LsmrSolver, LsqrSolver, Matrix, ReciprocalConditionThreshold,
+    least_squares,
+};
+
+let (m, n) = (120_usize, 40_usize);
+// Householder 鏡映 H_w = I − 2 w wᵀ / (wᵀ w) の (i, k) 成分。
+let reflect = |w: &[f64], i: usize, k: usize| {
+    let identity = if i == k { 1.0 } else { 0.0 };
+    identity - 2.0 * w[i] * w[k] / w.iter().map(|x| x * x).sum::<f64>()
+};
+let u: Vec<f64> = (0..m).map(|i| 1.0 + ((i * 7) % 11) as f64).collect();
+let v: Vec<f64> = (0..n).map(|i| ((i + 1) as f64).sqrt()).collect();
+let sigma: Vec<f64> = (0..n)
+    .map(|k| 10.0_f64.powf(-condition_exponent * k as f64 / (n - 1) as f64))
+    .collect();
+// A = H_u [Σ; 0] H_v を成分ごとに作る（行優先）。
+let entries = (0..m * n).map(|index| {
+    let (i, j) = (index / n, index % n);
+    (0..n)
+        .map(|k| reflect(&u, i, k) * sigma[k] * reflect(&v, k, j))
+        .sum()
+});
+let a = Matrix::from_vec(m, n, entries.collect()).map_err(|e| e.to_string())?;
+let x_star: Vec<f64> = (0..n).map(|j| 1.0 + 0.1 * j as f64).collect();
+let ax = a.view().mul_vec(&x_star[..]).map_err(|e| e.to_string())?;
+// w = H_u e₄₁ は値域に直交する単位ベクトル。
+let b: Vec<f64> = (0..m)
+    .map(|i| ax.as_slice()[i] + residual_size * reflect(&u, i, n))
+    .collect();
+// 参照：ワンショット呼び出しの最小二乗解（列ピボット付き Householder QR）。
+let qr = least_squares(&a, &b[..]).map_err(|e| e.to_string())?;
+let operator = a.view().try_finite().map_err(|e| e.to_string())?;
+let tolerance = ResidualTolerance::new(0.0, 1e-12).map_err(|e| e.to_string())?;
+let budget = Budget::try_from(5000).map_err(|e| e.to_string())?;
+// 正規残差の判定は ‖Aᴴr‖ ≤ 10^q ‖A‖ ‖r‖（‖A‖ は反復中の推定値）。
+let normal =
+    GradientTolerance::new(0.0, 10.0_f64.powf(normal_exponent)).map_err(|e| e.to_string())?;
+let limit = ReciprocalConditionThreshold::new(10.0_f64.powf(limit_exponent))
+    .map_err(|e| e.to_string())?;
+let lsqr = LsqrSolver::new(tolerance, budget)
+    .with_normal_tolerance(normal)
+    .with_condition_limit(limit)
+    .solve_with_options(&operator, &b[..], None)
+    .map_err(|e| e.to_string())?;
+let lsmr = LsmrSolver::new(tolerance, budget)
+    .with_normal_tolerance(normal)
+    .with_condition_limit(limit)
+    .solve_with_options(&operator, &b[..], None)
+    .map_err(|e| e.to_string())?;
+let qr_error = relative_difference(qr.as_slice(), &x_star);
+let mut rows = vec![("least_squares（QR）", None, None, None, None, qr_error)];
+let mut worst = LinearSolveTermination::Converged;
+for (name, result) in [("LSQR", &lsqr), ("LSMR", &lsmr)] {
+    let report = result.report();
+    let krylov = report.krylov();
+    let normal_residual = krylov
+        .and_then(|k| k.normal_residual())
+        .map(|r| r.raw_norm());
+    let rcond = krylov
+        .and_then(|k| k.condition_estimate())
+        .map(|c| c.reciprocal().value());
+    let termination = report.termination();
+    if severity(termination) > severity(worst) {
+        worst = termination;
+    }
+    let error = relative_difference(result.solution().as_slice(), &x_star);
+    let iterations = Some(report.iterations());
+    let name_of = Some(termination_name(termination));
+    rows.push((name, name_of, iterations, normal_residual, rcond, error));
+}
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "解法" },
+    { "key": "1", "label": "終了理由", "nullText": "-" },
+    { "key": "2", "label": "反復回数 [回]", "type": "integer", "nullText": "-" },
+    {
+        "key": "3",
+        "label": "正規残差 ‖Aᴴr‖₂ [-]",
+        "type": "number",
+        "format": sci2,
+        "nullText": "-"
+    },
+    {
+        "key": "4",
+        "label": "逆条件数の推定 [-]",
+        "type": "number",
+        "format": sci2,
+        "nullText": "-"
+    },
+    { "key": "5", "label": "x* との相対差 [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "solutions" })
+);
+let outcome = match severity(worst) {
+    0 => Outcome::satisfied("LSQR と LSMR がともに収束の判定を満たした"),
+    1 => Outcome::partial("収束の判定の前に止まった反復法がある")
+        .explanation("止まった反復法の解は真の残差が最小の検証済みの反復解である。"),
+    _ => Outcome::failed("漸化式が破綻した反復法がある"),
+};
+emit_outcome!(
+    outcome
+        .status(termination_name(worst))
+        .diagnostic("LSQR の反復回数", lsqr.report().iterations() as f64, None)
+        .diagnostic("LSMR の反復回数", lsmr.report().iterations() as f64, None)
+        .diagnostic("QR の x* との相対差", qr_error, None)
+);
+```
+
+既定の $\kappa_2 = 100$、$s = 1$、$q = -12$ では、LSQR も LSMR も 110 回の反復で `LeastSquaresConverged` になり（回数は丸めの違いで実行環境ごとに数回変わりうる）、$x^{\star}$ との相対差は $2.1 \times 10^{-11}$ で、QR の $7.1 \times 10^{-15}$ には届かない。
+最小二乗解では $A^{\mathsf H}(b - Ax^{\star}) = 0$ なので、反復解 $x$ の残差 $r = b - Ax$ について $x^{\star} - x = (A^{\mathsf H}A)^{-1} A^{\mathsf H} r$ が成り立ち、誤差は $\lVert A^{\mathsf H} r \rVert_2 / \sigma_{\min}^2$ で抑えられる。
+表の正規残差 $1.2 \times 10^{-12}$ と $\sigma_{\min} = 10^{-2}$ からは誤差の 2 ノルムの上界 $1.2 \times 10^{-8}$ が得られ、実際の差（最大値ノルムで $1.0 \times 10^{-10}$）はその下にある。
+判定の右辺 $10^{q} \lVert A \rVert \lVert r \rVert_2$ の $\lVert A \rVert$ は反復で更新する推定値なので、止まったときの正規残差は $10^{q} \lVert r \rVert_2$（ここでは $\lVert r \rVert_2 = s = 1$ なので $10^{-12}$）と一致せず、わずかに上回る。
+$q = -6$ に緩めると 77 回で止まり、正規残差は $4.4 \times 10^{-6}$（LSQR）と $4.0 \times 10^{-6}$（LSMR）、相対差は $3.1 \times 10^{-3}$ と $3.5 \times 10^{-3}$ に増え、$q = -14$ では 117 回で相対差が $1.8 \times 10^{-12}$ になる。
+$s = 0$（$b$ が値域に入る）では元の残差の許容誤差が先に満たされ、終了理由は `Converged` になる。
+
+列が 40 本なので、厳密な計算なら Golub–Kahan 過程は高々 40 回で終わる。
+それより多くかかるのは、丸め誤差で基底の直交性が失われ、同じ特異値を捉え直すためである。
+$s = 1$ の回数は $t = 0, 1, 2, 3, 4$ で 1、57、110、198、326 回と $\kappa$ とともに増える（$t = 0$ では列が正規直交なので 1 回で終わる）。
+$t = 4$ では相対差が $5.1 \times 10^{-7}$ まで増え、QR の $1.2 \times 10^{-11}$ との開きが大きくなる。
+反復回数の上界が正規方程式の $\sqrt{\kappa(A^{\mathsf H}A)} = \kappa(A)$ に比例するという CG と同じ見積もりは、異なる特異値が反復回数よりずっと多い大規模な問題での目安である。
+
+逆条件数の推定は射影した問題のもので、既定の入力では LSQR が $8.1 \times 10^{-4}$ と真の値 $1/\kappa_2 = 10^{-2}$ より小さく、LSMR が $3.0 \times 10^{-2}$ と大きいので、真の逆条件数の上界にも下界にも使えない。
+$t = 4$ で下限を $10^{-2}$ にすると、LSQR は 17 回、LSMR は 44 回で `ConditionLimit` で止まり、判定は「部分的」になる。
+小さい特異値の成分を解く前に止まるので、$x^{\star}$ との相対差は 0.92 と 0.74 になり、ノイズを含む右辺では正則化として働く一方、この例の厳密な最小二乗解は得られない。
+この例のように列の少ない密行列では QR が適しており、LSQR と LSMR は作用だけが安く得られる大きな疎行列や作用素に使う。
+前処理の引数はないので、右前処理は呼び出し側が $AM^{-1}$ の作用素を作って解き、$x = M^{-1}y$ で戻す。
+
+## 柔軟な前処理・再利用・ブロック
+
+前処理が反復ごとに変わる場合、たとえば内側で別の反復法を前処理に使う入れ子の解法には、`GmresSolver` がそのまま使える。
+`GmresSolver` は作用させた方向を保持するので、反復ごとに変わる右前処理を受け付ける（[前のページ](oxref:linalg-minres-gmres-bicgstab)の像の QR による）。
+`LgmresSolver`、`GcrotSolver` とブロック版も同じで、前処理は `Preconditioning` として呼び出しごとに渡す。
+
+- `LgmresSolver`（LGMRES）は区間の終わりごとに、直近のいくつかの区間で得た補正 $x_i - x_{i-1}$ を正規化したものとその像を探索空間に加え、広げた空間で残差を最小にして、再始動による停滞を抑える。
+- `GcrotSolver`（柔軟な GCROT($m$, $k$)）は、直交正規化した像 $c_i = A u_i$ と方向 $u_i$ の組を最大 $k$ 個の外側の空間に持つ。
+  各区間ではまず $\operatorname{span}\{u_i\}$ の上で残差を最小にし、$c_i$ に直交する Arnoldi 基底で GMRES を $m$ 回進め、区間の補正を $c_i$ に対して直交化して空間に加える。
+
+どちらも組は呼び出し側が持つ `KrylovRecycleSpace` に入り、満杯になると最も古い組を捨てる。
+組を蓄えて使うのは出力先を指定する API `solve_recycled_into(&a, &b, p, epoch, &mut space, x, &mut ws, cx)` だけで（`BlockLgmresSolver` と `BlockGcrotSolver` にも同じ名前の形がある）、標準形式 `solve`・オプション付き形式 `solve_with_options`・`solve_into` は組を持たず、再始動つきの柔軟 GMRES と同じ反復になる。
+`KrylovRecycleSpace::new(n, k, epoch)` で作る容量 $k$ の空間は長さ $n$ のベクトルを $2k$ 本持ち、作業領域にはおよそ $4k + 2$ 本を足す（`IterativeWorkspaceRequest::with_recycle_space(&space)` で事前確保に含める）。
+エポック `epoch` は作用素 $A$ を識別するために呼び出し側が選ぶ `ProblemToken` で、右辺には依存しない。
+蓄えた像は作った作用素でだけ正しいので、`solve_recycled_into` はエポックが空間のものと違う場合と、もう一方の解法が満たした空間を、$A$ を作用させる前に `InvalidInput`（`Inconsistent`）で拒否する。
+空間は `Ok` を返した呼び出しでは収束条件を満たさない終了理由でも更新され、エラーのときは変わらない。
+
+作用素が変わったら、`clear(epoch)` で空にするか、`refresh(&a, epoch, rank, &options, &mut ws, cx)` で像 $c_i = A u_i$ を計算し直す。
+`refresh` は GCROT の像を直交正規化し直し、LGMRES では新しい像が数値的に従属になった方向を捨てる（従属の判定は `rank` のしきい値）。
+方向 1 本ごとに $A$ の積 1 回で、`options` の反復の上限に 1 回として数え、上限・取り消し・期限で止まると `Ok(false)` を返して古い空間をそのまま残す。
+作り直しの作業領域 `KrylovRecycleWorkspace` は `KrylovRecycleWorkspaceRequest::new(&a, &options)?`（作用素の形と補助の長さを読むので失敗しうる）を `space.workspace(&request)` に渡して作るか、`space.workspace_requirements(&request)` が返す `KrylovRecycleRequirements` で事前確保する。
+作業領域の `last_attempt()` は空間を置き換えたとき `Succeeded`、止まって残したとき `Stopped` を記録する。
+
+ブロック版（`BlockGmresSolver`、`BlockLgmresSolver`、`BlockGcrotSolver`）は、複数の右辺を一つのブロック Krylov 空間でまとめて解く。
+空間は未収束の列の残差から作り、各列の残差をその上で最小にし、他の列の残差の張る空間に数値的に入る残差は捨てる（デフレーション）ので、従属な右辺は積を増やさない。
+列 $j$ は $\lVert b_j - A x_j \rVert_2 \le \tau_{\mathrm{abs}} + \tau_{\mathrm{rel}} \lVert b_j \rVert_2$ で収束し、すべての列が収束したときだけ成功になる。
+ブロック版は標準形式とオプション付き形式に分かれておらず、所有値を返す API `solve(&a, b, p, x0)` は前処理と初期値（`BlockVectorView`）を受け取って `BlockKrylovResult` を返す。
+結果の解は列ごとに並び、列ごとの真の残差・基準・収束は `residuals()`、`references()`、`converged()` で読み、履歴は最大の列の残差である。
+出力先を指定する API `solve_into` のレポート `BlockKrylovReport` は全体の終了理由、ブロックの反復回数、最大の残差 `max_residual()`、再始動の数、捨てた方向の数 `deflated()` などを持ち、列ごとの値は `last_accepted()` の `KrylovColumns` で読む。
+作業領域は `with_right_hand_sides(k)` で列の数を指定した要求から事前確保する。
+
+`IterativeLinearSolver` は、CG・GMRES・BiCGSTAB・MINRES・Richardson・CGS・TFQMR・LGMRES・GCROT を `dyn` で切り替える共通の API で、標準形式・オプション付き形式・出力先を指定する API と、独立な複数の右辺を事前確保済みの作業領域で 1 列ずつ解く `solve_block_into` を持つ。
+`solve_block_into` は各列を独立に解く関数で、ブロック Krylov 法ではない。
+すべての列が収束したときだけ出力を書き、収束しない最初の列で `ConvergenceFailure` になる。
+随伴が必要な BiCG・QMR、行列の成分を使う定常反復、長方行列の LSQR・LSMR、ブロック版は、それぞれの型のメソッドで呼ぶ。
+
+## 定常反復と緩和係数
+
+$A = D - L - U$（対角・狭義下三角・狭義上三角）と分けると、定常反復 $x_{k+1} = x_k + M^{-1}(b - Ax_k)$ は $M$ の選び方で名前が変わる。
+
+| 解法 | $M$ | 重み | 入力 |
+|---|---|---|---|
+| `RichardsonSolver` | $\omega^{-1} I$（`Preconditioning` で $P^{-1}$ を左から付けると $\omega^{-1} P$） | `RelaxationWeight`（正） | `LinearOperator` と前処理 |
+| `JacobiSolver` | $\omega^{-1} D$ | `RelaxationWeight`（`with_weight`、既定 1） | `StationaryMatrix` |
+| `GaussSeidelSolver` | $D - L$ | なし（SOR の $\omega = 1$） | `StationaryMatrix` |
+| `SorSolver` | $\omega^{-1} D - L$ | `SorWeight`（$0 < \omega < 2$） | `StationaryMatrix` |
+
+誤差 $e_k = x - x_k$ は反復行列 $G = I - M^{-1}A$ で $e_{k+1} = G e_k$ と変わるので、すべての初期値で収束するのはスペクトル半径 $\rho(G) < 1$ のときに限り、十分に反復したあとは一回で誤差がおよそ $\rho(G)$ 倍になる。
+SOR の反復行列 $G_\omega$ は $\rho(G_\omega) \ge \lvert \omega - 1 \rvert$ を満たすので $0 < \omega < 2$ でしか収束せず（Kahan の定理）、`SorWeight` はその範囲の外の値を作れない。
+Hermitian 正定値な $A$ では、この範囲のどの $\omega$ でも収束する（Ostrowski–Reich の定理）。
+重み $0 < \omega \le 1$ の Jacobi は狭義優対角な $A$ で、Gauss–Seidel は狭義優対角か Hermitian 正定値な $A$ で収束する（どちらも十分条件）。
+整合順序の行列（一次元 Poisson 方程式の三重対角行列など）では、Jacobi の反復行列のスペクトル半径を $\rho_J$ とすると Gauss–Seidel のスペクトル半径は $\rho_J^2$ で、$\rho(G_\omega)$ を最小にする緩和係数とそのときのスペクトル半径は次のとおりである（Young の理論）。
+
+$$
+\omega_{\mathrm{opt}} = \frac{2}{1 + \sqrt{1 - \rho_J^2}}, \qquad \rho(G_{\omega_{\mathrm{opt}}}) = \omega_{\mathrm{opt}} - 1
+$$
+
+一次元 Poisson 方程式では $\rho_J = \cos \pi h$ なので $\omega_{\mathrm{opt}} = 2/(1 + \sin \pi h)$、$\rho(G_{\omega_{\mathrm{opt}}}) \approx 1 - 2\pi h$ となる。
+Gauss–Seidel の $\cos^2 \pi h \approx 1 - \pi^2 h^2$ と比べると、誤差を一定の割合だけ減らす反復回数は $O(h^{-2})$ から $O(h^{-1})$ に下がる。
+Jacobi・Gauss–Seidel・SOR は対角と狭義下三角の成分を使うので `StationaryMatrix`（`Dense` の有限ビュー、`Csr`、`Csc`）を受け取り、前処理の引数を持たず、対角に厳密な 0 があると `Singular` のエラーになる。
+一回の反復は、Jacobi が $O(n)$ の補正、Gauss–Seidel と SOR が $D - L$（$\omega^{-1}D - L$）の前進代入 1 回で、どれもそのあと $A$ との積 1 回で真の残差を計算して収束を判定する。
+補正と前進代入は内部の作業で、評価回数の上限にはこの残差の積と、50 回ごとの検査点で丸めの下限を調べるときの積（[反復の状態と停止したときの結果](oxref:linalg-iterative-status)）だけを数える。
+単独の解法としては Krylov 法に劣るが、多重格子の平滑化や前処理として使われる。
+
+次のセルは $n$ 個の内点の一次元 Poisson 方程式 $-u'' = 1$（$2u_i - u_{i-1} - u_{i+1} = h^2$、$h = 1/(n+1)$、$u(0) = u(1) = 0$）を SOR のオプション付き形式で解く。
+許容誤差は相対 $10^{-8}$、反復の上限は 100 000 回である。
+表は Gauss–Seidel（$\omega = 1$）と $\omega_{\mathrm{opt}}$ の反復回数、終了理由、スペクトル半径、誤差を $10^{-8}$ 倍にする回数の目安 $\ln 10^{-8} / \ln \rho$ と、離散方程式の厳密解 $u_i = x_i(1 - x_i)/2$（二階差分は二次式に対して厳密）との相対差を示す。
+グラフは $\omega = 1.0, 1.1, \dots, 1.9$ での反復回数で、$\omega_{\mathrm{opt}}$ を縦線で示す。
+
+```rust
+//| id: linalg-sor-omega
+//| ref: linalg-sor-omega
+//| title: SOR の緩和係数と反復回数
+//| run: reactive
+//| uses: [linalg-advanced-krylov-helpers]
+//| crates: [scioxide-core, scioxide-linalg, scioxide-sparse]
+//| inputs:
+//|   points: {"type":"range","label":"内点の数 n","description":"格子幅は h = 1/(n + 1)。","min":10,"max":40,"step":5,"value":30}
+//| cases:
+//|   - {"id":"coarse","label":"n = 10","description":"粗い格子では Gauss–Seidel と最適な SOR の差が小さい。","inputs":{"points":10}}
+//|   - {"id":"fine","label":"n = 40","description":"細かい格子では Gauss–Seidel の回数が h⁻² に、最適な SOR の回数が h⁻¹ に比例して増える。","inputs":{"points":40}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"sor","path":"/rows/0/2","range":{"min":1700,"max":1850}}
+//|       - {"artifact":"sor","path":"/rows/0/3","equals":"Converged"}
+//|       - {"artifact":"sor","path":"/rows/0/4","approx":{"value":0.98976,"atol":1e-4}}
+//|       - {"artifact":"sor","path":"/rows/1/2","range":{"min":90,"max":140}}
+//|       - {"artifact":"sor","path":"/rows/1/6","range":{"max":1e-5}}
+//|   - case: coarse
+//|     expect:
+//|       - {"artifact":"sor","path":"/rows/0/4","approx":{"value":0.92063,"atol":1e-4}}
+//|       - {"artifact":"sor","path":"/rows/1/6","range":{"max":1e-5}}
+//|   - case: fine
+//|     expect:
+//|       - {"artifact":"sor","path":"/rows/0/2","range":{"min":2900,"max":3300}}
+//|       - {"artifact":"sor","path":"/rows/0/6","range":{"max":1e-6}}
+//|       - {"artifact":"sor","path":"/rows/1/2","range":{"min":120,"max":200}}
+use scioxide_core::{Budget, ResidualTolerance};
+use scioxide_linalg::{IterativeSolveResult, SorSolver, SorWeight, StationaryMatrix, Vector};
+use scioxide_sparse::sparse_diagonals;
+
+let n = points.round() as usize;
+let h = 1.0 / (n + 1) as f64;
+let (main, off) = (vec![2.0; n], vec![-1.0; n - 1]);
+let a =
+    sparse_diagonals(n, n, &[0, 1, -1], &[&main[..], &off, &off]).map_err(|e| e.to_string())?;
+let b = Vector::from_vec(vec![h * h; n]);
+// 離散方程式の厳密解 u_i = x_i(1 − x_i)/2（x_i = ih）。
+let exact: Vec<f64> = (1..=n)
+    .map(|i| i as f64 * h * (1.0 - i as f64 * h) / 2.0)
+    .collect();
+let tolerance = ResidualTolerance::new(0.0, 1e-8).map_err(|e| e.to_string())?;
+let budget = Budget::try_from(100_000).map_err(|e| e.to_string())?;
+let sor = |omega: f64| -> Result<IterativeSolveResult<f64>, String> {
+    let weight = SorWeight::new(omega).map_err(|e| e.to_string())?;
+    SorSolver::new(tolerance, budget, weight)
+        .solve_with_options(StationaryMatrix::Csr(&a), &b, None)
+        .map_err(|e| e.to_string())
+};
+let pi_h = std::f64::consts::PI * h;
+let omega_opt = 2.0 / (1.0 + pi_h.sin());
+// 誤差を 1e-8 倍にする回数の目安 ln(1e-8)/ln ρ。
+let predict = |rho: f64| (1e-8_f64).ln() / rho.ln();
+let mut rows = Vec::new();
+for (name, omega, rho) in [
+    ("Gauss–Seidel", 1.0, pi_h.cos().powi(2)),
+    ("SOR（ω_opt）", omega_opt, omega_opt - 1.0),
+] {
+    let result = sor(omega)?;
+    let report = result.report();
+    let termination = termination_name(report.termination());
+    let error = relative_difference(result.solution().as_slice(), &exact);
+    rows.push((
+        name,
+        omega,
+        report.iterations(),
+        termination,
+        rho,
+        predict(rho),
+        error,
+    ));
+}
+let fixed0 = serde_json::json!({ "fractionDigits": 0 });
+let fixed4 = serde_json::json!({ "fractionDigits": 4 });
+let fixed5 = serde_json::json!({ "fractionDigits": 5 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "方法" },
+    { "key": "1", "label": "ω [-]", "type": "number", "format": fixed4 },
+    { "key": "2", "label": "反復回数 [回]", "type": "integer" },
+    { "key": "3", "label": "終了理由" },
+    { "key": "4", "label": "ρ(G) [-]", "type": "number", "format": fixed5 },
+    { "key": "5", "label": "目安 ln 10⁻⁸ / ln ρ [回]", "type": "number", "format": fixed0 },
+    { "key": "6", "label": "厳密解との相対差 [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(columns, rows, metadata = serde_json::json!({ "id": "sor" }));
+let mut curve = Vec::new();
+for k in 0..10 {
+    let omega = 1.0 + 0.1 * k as f64;
+    curve.push([omega, sor(omega)?.report().iterations() as f64]);
+}
+emit_line_chart!(
+    &vec![serde_json::json!({ "name": "SOR の反復回数", "points": curve })],
+    options = &serde_json::json!({
+        "xLabel": "緩和係数 ω [-]",
+        "yLabel": "反復回数 [回]",
+        "yType": "log",
+        "annotations": [{ "kind": "line", "axis": "x", "value": omega_opt, "label": "ω_opt" }]
+    })
+);
+```
+
+既定の $n = 30$ では、Gauss–Seidel が 1783 回で、スペクトル半径からの目安 1791 回とよく合う。
+$\omega_{\mathrm{opt}} \approx 1.816$ では 115 回で、目安の 91 回より多い。
+$\omega_{\mathrm{opt}}$ では SOR の反復行列が対角化できず（固有値 $\omega_{\mathrm{opt}} - 1$ に大きさ 2 の Jordan 細胞を持つ）、誤差が $\rho^k$ ではなく $k\rho^k$ の程度で減るためで、$k\rho^k \le 10^{-8}$ となる最小の $k$ は観測と同じ 115 である。
+厳密解との相対差は Gauss–Seidel が $1.1 \times 10^{-8}$、最適な SOR が $3.3 \times 10^{-9}$ で、どちらも残差の許容誤差 $10^{-8}$ の程度である。
+グラフでは $\omega$ を 1 から上げると反復回数がゆっくり減り、$\omega_{\mathrm{opt}}$ の近くの $\omega = 1.8$ で最小の 152 回になったあと、$\omega = 1.9$ で 186 回に増える。
+$n$ を 10 から 40 に増やすと、Gauss–Seidel の回数は 223 回から 3120 回へ $h^{-2}$ の比 $(41/11)^2 \approx 13.9$ とほぼ同じ割合で増え、最適な SOR の回数は 40 回から 152 回へ $h^{-1}$ の比 3.7 とほぼ同じ割合で増える。
+
+---
+
+## まとめ
+
+非対称な系では、短い漸化式の双直交法（BiCG・CGS・QMR・TFQMR）がメモリを抑える代わりに残差の最小化を捨てて破綻の危険を負い、GMRES 系はメモリと直交化の演算が増える代わりに残差を最小にする。
+長方行列の最小二乗問題は LSQR と LSMR が正規方程式を作らずに解き、値域の外の成分があるときは正規方程式の残差で収束を判定するが、解の誤差の上界は正規残差を $\sigma_{\min}^2$ で割った値なので、悪条件では許容誤差よりずっと大きく残りうる。
+前処理が反復ごとに変わる場合も `GmresSolver` がそのまま使え、同じ作用素で右辺を変えて解き直すなら LGMRES・GCROT の再利用空間を `solve_recycled_into` に渡し、作用素が変わったら `refresh` か `clear` で空間を合わせる。
+複数の右辺を同じ空間でまとめて解くにはブロック版を、独立に解くには `solve_block_into` を使う。
+SOR は緩和係数で収束の速さが大きく変わり、最適値 $2/(1 + \sin\pi h)$ の近くでは Gauss–Seidel より反復が一桁以上少ない。
+
+## 次に読むページ
+
+- [行列関数・Fréchet 微分・疎行列関数](../matrix-functions-and-equations/)：連立方程式から離れ、行列の指数関数や対数を計算する方法へ進む。
+- [取り消し・回数上限による停止と受理済み反復解の読み方](../../examples/accepted-state-and-cancellation/)：反復解法が止まったときに返る結果の読み方を例題で確かめる。

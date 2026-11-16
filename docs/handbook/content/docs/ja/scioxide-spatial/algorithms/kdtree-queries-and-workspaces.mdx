@@ -1,0 +1,173 @@
+---
+title: KD 木の照会と作業領域
+description: KD 木の単発と一括の最近傍・半径の照会の呼び出し方、作業領域の要求と事前確保、出力が足りないときのエラーと出力の扱い、一括照会の並列実行と取り消し。
+sidebar:
+  order: 327
+references:
+  spatial-kdtree-queries-workspaces: "照会の形式と作業領域"
+---
+
+KD 木を作った後の処理は、照会点を渡して近傍を受け取ることである。
+多数の照会を繰り返すときは、照会のたびに結果の配列を割り当てると計算コストがかさむので、作業領域と出力を呼び出し側が用意して使い回す。
+このページは単発と一括の照会の呼び出し方、作業領域の大きさの決め方、出力や作業領域が足りないときのエラーと出力の扱い、一括照会の並列実行を説明する。
+木の構築、枝刈り、近似探索、周期箱の意味は[KD 木による近傍探索](../spatial-trees-and-distance/)で扱う。
+
+## 照会の形式と作業領域
+
+照会は木（準備済みの値）、照会ごとの作業領域、出力を分ける。
+作業領域は `SearchWorkspaceRequest` で大きさを宣言し、`tree.workspace_requirements(request)` が `SearchWorkspaceRequirements` を返す。
+`tree.workspace(request)` は事前確保済みの `SearchWorkspace` を返す。
+`SearchWorkspace::new()` で作った空の作業領域には `try_reserve(&requirements)` で事前確保し、`check` で足りるかを確かめる。
+`SearchWorkspaceRequest::new(neighbors, options)` は単発の照会の結果の数を宣言する。
+最近傍の照会なら $\min(k, n)$、半径の照会なら見込まれる一致の数の上限である。
+`with_batch(queries, neighbors, workers)` は一括照会の照会の数、全照会の結果の総数、ワーカーの数（32 まで）を加える。
+要件はワーカーの数 `workers()`、ワーカーごとの近傍の枠 `neighbors_per_worker()`、一括の結果の枠 `output_len()`、照会ごとの件数の枠 `count_len()`（照会の数より 1 多い。
+一括照会がなければ 0）と、そのバイト数を返す。
+`SearchOptions` の `with_max_workspace_bytes` は作業領域が保持してよいバイト数の上限で、超えると `ResourceLimit` になる。
+
+| 照会 | 呼び出し | 出力と、足りないときの扱い |
+|---|---|---|
+| 単発の最近傍 | `tree.nearest_into(&q, k, options, &mut out, &mut ws, cx)` | $\min(k, n)$ 個を書き、その数を返す。`out` か作業領域が足りなければ探索の前に `DimensionMismatch` |
+| 単発の半径 | `tree.radius_into(&q, r, options, &mut out, &mut ws, cx)` | 半径内の点を書き、その数を返す。`out` か作業領域より多くの点が見つかれば `ResourceLimit` |
+| 一括の最近傍 | `tree.nearest_batch_into(&queries, k, options, &mut out, &mut ws, cx)` | 各照会の $\min(k, n)$ 個を照会の順につなげて `out` に書き、総数を返す。`out` か作業領域が足りなければ `DimensionMismatch` |
+| 一括の半径 | `tree.radius_batch_into(&queries, r, options, &mut out, &mut counts, &mut ws, cx)` | 全照会の結果を照会の順につなげて `out` に書き、照会 $i$ の件数を `counts[i]` に書いて総数を返す。結果が `out`、`counts`、作業領域に収まらなければ `DimensionMismatch` |
+
+一括の最近傍では各照会の件数が $\min(k, n)$ に決まるので、件数の配列を受け取らない。
+半径の一括照会はまず各照会の件数だけを数え、累積和から書き込む位置を決めてから、2 回目の走査で結果を埋めて並べる。
+そのため一括の半径の照会はワーカーごとの近傍の枠を使わず、`SearchWorkspaceRequest::new(0, options)` に `with_batch` で結果の総数を加えて事前確保する。
+どの照会も結果を作業領域に置き、成功した後で出力へ写すので、失敗したときに出力は変わらない。
+出力が長ければ、書いた件数より後ろの要素は変えない。
+照会は作業領域を広げないので、事前確保した後の照会は割り当てを行わない（注入したエグゼキューターの割り当ては、そのエグゼキューターの規則に従う）。
+`tree.nearest(&q, k)`、`tree.radius(&q, r)`、`tree.nearest_batch(&queries, k)` は、既定の `SearchOptions` で作業領域と結果を割り当てて返す簡易 API である。
+`radius` は件数を数えてから、ちょうどその数だけ割り当てる。
+近似や作業領域の上限を指定するときは `_into` の形を使う。
+
+`SearchOptions::new()` は厳密な探索、逐次の実行、上限なしを選ぶ。
+`with_execution_policy(ExecutionPolicy::Auto)` では、照会が 256 個以上で、ワーカー 1 つあたりの計算量がエグゼキューターの最小の計算量以上になるときに、一括照会が並列に動く。
+計算量は照会 1 つあたり $d\,(b(n) + \text{葉の大きさ} + k)$ と見積もり、ワーカーは 32 までである。
+$b(n) = \lfloor \log_2 n \rfloor + 1$ は $n$ の 2 進数の桁数で、木の深さの目安である。
+作業領域は、エグゼキューターが使いうる最大のワーカーの数で事前確保しておく。
+取り消しと期限は少なくとも 64 節点ごとと、大きな葉の 256 点ごとに調べる。
+wasm で動くセルは逐次で、`Auto` でも並列にはならない。
+
+次のセルは x 軸上の 4 点 $(0, 0), (1, 0), (2, 0), (3, 0)$ の木で、出力が足りない 3 種類の照会を試す。
+照会点は $(0.4, 0)$ で、半径 $r$ の照会は $r \ge 0.4$ で 1 点、$r \ge 0.6$ で 2 点、$r \ge 1.6$ で 3 点を見つける。
+出力の枠はどれも 2 個で、目印として番号 `usize::MAX` の近傍で埋めておき、失敗した後も目印が残るかを見る。
+表は各照会の結果（受理かエラーの分類）、受理したときに書いた件数、出力が変わらなかったかを示す。
+
+```rust
+//| id: spatial-kdtree-output-limits
+//| ref: spatial-kdtree-output-limits
+//| title: 出力が足りないときの単発と一括の照会のエラー
+//| run: reactive
+//| crates: [scioxide-core, scioxide-spatial]
+//| inputs:
+//|   radius: {"type":"range","label":"半径 r [-]","min":0.2,"max":2,"step":0.2,"value":1.8}
+//| cases:
+//|   - {"id":"fits","label":"r = 1.0","description":"見つかる点が 2 つで出力に収まり、半径の照会は受理される。","inputs":{"radius":1}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"limits","path":"/rows/0/1","equals":"ResourceLimit"}
+//|       - {"artifact":"limits","path":"/rows/0/2","equals":null}
+//|       - {"artifact":"limits","path":"/rows/0/3","equals":true}
+//|       - {"artifact":"limits","path":"/rows/1/1","equals":"DimensionMismatch"}
+//|       - {"artifact":"limits","path":"/rows/1/3","equals":true}
+//|       - {"artifact":"limits","path":"/rows/2/1","equals":"DimensionMismatch"}
+//|       - {"artifact":"limits","path":"/rows/2/3","equals":true}
+//|   - case: fits
+//|     expect:
+//|       - {"artifact":"limits","path":"/rows/0/1","equals":"受理"}
+//|       - {"artifact":"limits","path":"/rows/0/2","equals":2}
+//|       - {"artifact":"limits","path":"/rows/0/3","equals":false}
+use core::num::NonZeroUsize;
+use scioxide_core::{ExecutionContext, SciOxideError, NdView, StridedLayout};
+use scioxide_spatial::{KdTree, Neighbor, PointSet, SearchOptions, SearchWorkspaceRequest};
+
+let coordinates = [0.0_f64, 0.0, 1.0, 0.0, 2.0, 0.0, 3.0, 0.0];
+let (shape, strides) = ([4, 2], [2, 1]);
+let layout = StridedLayout::new(&shape, &strides).map_err(|e| e.to_string())?;
+let points = PointSet::new(NdView::new(&coordinates, layout).map_err(|e| e.to_string())?)
+    .map_err(|e| e.to_string())?;
+let tree = KdTree::new(&points).map_err(|e| e.to_string())?;
+let (options, context) = (SearchOptions::new(), ExecutionContext::sequential());
+let marker = Neighbor {
+    index: usize::MAX,
+    distance: -1.0,
+};
+let unchanged = |output: &[Neighbor<f64>]| output.iter().all(|v| *v == marker);
+// (結果, 書いた件数)。件数は受理したときだけ。
+let classify = |result: Result<usize, SciOxideError>| match result {
+    Ok(count) => ("受理".to_string(), Some(count)),
+    Err(error) => (format!("{:?}", error.kind()), None),
+};
+let query = [0.4, 0.0];
+
+// 単発の照会: 作業領域も出力も 2 個分。
+let request = SearchWorkspaceRequest::new(2, options);
+let mut ws = tree.workspace(request).map_err(|e| e.to_string())?;
+let mut out = [marker; 2];
+let result = tree.radius_into(&query, radius, options, &mut out, &mut ws, context);
+let single_radius = (classify(result), unchanged(&out));
+let mut out = [marker; 2];
+let result = tree.nearest_into(&query, 3, options, &mut out, &mut ws, context);
+let single_nearest = (classify(result), unchanged(&out));
+
+// 一括の半径の照会: 同じ照会点を 2 回、結果の枠は合わせて 2 個。
+let (twice, query_shape) = ([0.4, 0.0, 0.4, 0.0], [2, 2]);
+let layout = StridedLayout::new(&query_shape, &strides).map_err(|e| e.to_string())?;
+let queries = PointSet::new(NdView::new(&twice, layout).map_err(|e| e.to_string())?)
+    .map_err(|e| e.to_string())?;
+let request = SearchWorkspaceRequest::new(0, options).with_batch(2, 2, NonZeroUsize::MIN);
+let mut batch_ws = tree.workspace(request).map_err(|e| e.to_string())?;
+let (mut out, mut counts) = ([marker; 2], [0; 2]);
+let result = tree.radius_batch_into(
+    &queries,
+    1.0,
+    options,
+    &mut out,
+    &mut counts,
+    &mut batch_ws,
+    context,
+);
+let batch_radius = (classify(result), unchanged(&out));
+let rows: Vec<(&str, String, Option<usize>, bool)> = [
+    ("radius_into（半径 r）", single_radius),
+    ("nearest_into（k = 3）", single_nearest),
+    ("radius_batch_into（半径 1.0、2 照会）", batch_radius),
+]
+.into_iter()
+.map(|(label, ((result, count), kept))| (label, result, count, kept))
+.collect();
+let columns = serde_json::json!([
+    { "key": "0", "label": "照会" },
+    { "key": "1", "label": "結果" },
+    { "key": "2", "label": "書いた件数 [個]", "type": "integer", "nullText": "—" },
+    { "key": "3", "label": "出力が不変", "type": "boolean" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "limits" })
+);
+```
+
+既定値 $r = 1.8$ では、`radius_into` が出力の枠より多い 3 点を見つけて `ResourceLimit` を返し、出力には目印が残る。
+$r = 1.0$ では 2 点が枠に収まり、受理されて出力が書き換わる。
+`nearest_into` は出力が $k = 3$ に足りないので、探索の前に `DimensionMismatch` を返す。
+`radius_batch_into` は 2 つの照会で合わせて 4 点を見つけて枠の 2 個に収まらず、単発の照会と違って `DimensionMismatch` を返す。
+一括の照会は件数を数え終えてから出力の長さを確かめるので、出力の不足を `DimensionMismatch` で返す。
+
+## まとめ
+
+照会を繰り返すときは、`SearchWorkspaceRequest` で結果の数を宣言して作業領域を 1 回事前確保し、`_into` の形で出力を使い回せば、照会は割り当てを行わない。
+最近傍の照会では出力の大きさが $\min(k, n)$ に決まるので、足りなければ探索の前に `DimensionMismatch` になる。
+単発の半径の照会は一致の数が前もって分からないので、枠を超えたときは `ResourceLimit` で知らせる。
+一括の半径の照会は件数を数えてから書くので、結果の総数と照会ごとの件数を受け取れる。
+どの照会も失敗したときは出力を書き換えないので、エラーを受けて枠を広げ、同じ照会をやり直せる。
+
+## 次に読むページ
+
+- [KD 木による近傍探索](../spatial-trees-and-distance/)：照会の結果の意味、つまり枝刈りの正しさ、近似探索の保証、周期箱の minimum image を確かめる。
+- [有向 Hausdorff 距離](../directed-hausdorff/)：2 つの点集合のずれを、一括の 1 近傍の照会の最大として求める使い方を確かめる。
+- [星表の角距離近傍探索](../../examples/celestial-neighbor-search/)：半径の照会の出力と作業領域を、星表の例題で使う。

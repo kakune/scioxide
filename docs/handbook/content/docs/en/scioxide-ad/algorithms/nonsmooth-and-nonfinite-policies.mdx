@@ -1,0 +1,625 @@
+---
+title: "Kinks and nonfinite-value policies"
+description: "The convention of using the midpoint of one-sided derivatives at kinks and a function-by-function table; its relationship to Clarke's generalized gradient and a composition that falls outside it; tape kink counting and KinkPolicy; the difference between the absolute-zero product azmul and IEEE multiplication; and nonfinite-value checking with NonFinitePolicy."
+sidebar:
+  order: 360
+references:
+  ad-kink-convention: "kink-conventions"
+  ad-clarke-gradient: "relationship-to-clarkes-generalized-gradient"
+  ad-kink-policy: "kink-counting-and-kinkpolicy"
+  ad-absolute-zero-product: "the-absolute-zero-product-azmul"
+  ad-non-finite-policy: "nonfinite-values-and-nonfinitepolicy"
+---
+
+Functions such as `abs`, `max`, and `floor` lack classical derivatives at particular points.
+Automatic differentiation connects each operation's local derivatives by the chain rule, so a choice of local derivative is needed at such points.
+A choice is also needed between propagating NaN or infinite primal values and derivatives as values and stopping computation.
+
+`scioxide-ad` handles these two issues as follows.
+All numeric types generally use the midpoint of one-sided derivatives at points without a derivative.
+Tapes count encounters with such points, and `KinkPolicy` chooses whether to return the count or an error.
+Numeric operations propagate NaN and infinity according to IEEE 754; `NonFinitePolicy` checks points and results at transformation boundaries.
+Both policies are values held by `TapeOptions` and `BatchOptions`, rather than thread-wide or process-wide state.
+
+## Kink conventions
+
+A point where a function lacks a derivative or its value jumps is called a kink.
+The following table lists kinks in `scioxide-ad` and the derivatives used there.
+
+| Function | Derivative | Kinks |
+|---|---|---|
+| `abs` | $\operatorname{sign} x$, zero at $x = 0$ | $x = 0$ |
+| `min`, `max` | 1 for the returned side, $\tfrac12$ each at a tie, 0 for the NaN side | $a = b$ |
+| `floor`, `ceil`, `round`, `trunc`, `signum` | 0 | Integers (`floor`, `ceil`), half-integers (`round`), nonzero integers (`trunc`), zero (`signum`) |
+| `fract`, `a % b` | 1, $(1,\ -n)$ ($n$ is the remainder quotient), or $(1,\ -(n - \tfrac12 \operatorname{sign} n))$ at a kink | Nonzero integer $x$; for `a % b`, zero remainder with $a \ne 0$ |
+| `hypot`, `atan2` | $(0, 0)$ at the origin | The origin; for `atan2(a, b)`, also $a = 0$, $b < 0$ |
+
+Zero for `abs` at zero is the midpoint of one-sided derivatives $-1$ and $+1$; $(\tfrac12, \tfrac12)$ for `max` at a tie is the midpoint of $(1, 0)$ and $(0, 1)$.
+Rounding functions and `signum` return zero because their derivatives on both sides are zero; the value jump does not appear in the derivative.
+On a tape, results of rounding functions and `signum` are passive values, and no statement is recorded (kinks are still counted).
+Integer kinks include only finite integers; `floor`, `ceil`, `trunc`, and `fract` at $\pm\infty$ are not counted as kinks.
+`fract` has derivative 1 on both sides and likewise ignores the jump.
+At the `atan2` branch cut $a = 0$, $b < 0$, the value jumps between $\pm\pi$, but the partial derivatives on both sides agree and that value is used.
+At the origin, `hypot` and `atan2` use partial derivatives $(0, 0)$.
+
+In the partial derivative $-n$ of `a % b` with respect to $b$, $n$ is the quotient $n = (a - r)/b$ that produced the remainder $r = a \bmod b$, an integer obtained from the base values.
+The quotient is not computed from $a/b$ because floating-point $a/b$ can round to the next integer (`1.0 % 0.1` is $0.0999\ldots$ with quotient 9, but $\mathrm{fl}(1.0/0.1) = 10$).
+Where $a/b$ equals a nonzero integer $n$ (zero remainder with $a \ne 0$), the partial derivatives on the two sides are $-n$ and $-(n - \operatorname{sign} n)$; the rule returns their midpoint $-(n - \tfrac12 \operatorname{sign} n)$.
+
+`min` and `max` follow IEEE 754 and return the other argument if exactly one is NaN.
+The returned side's partial derivative is then 1 and the NaN side's is 0; if both are NaN, the partial derivatives are also NaN.
+`clamp(x, lo, hi)` is differentiated as `min(max(x, lo), hi)`, with its value taken from `clamp` in the numeric type one level below.
+Thus NaN $x$ remains NaN, $-0$ inside the interval retains its sign, and every numeric type's value matches `clamp` on `f64`.
+It returns NaN at points with $lo > hi$ or a NaN boundary.
+
+Kink rules select partial derivatives with comparisons and `select`, rather than constructing them through arithmetic such as $x/|x|$.
+`Jet` uses the same conventions coefficient by coefficient; `abs` multiplies all coefficients from $c_1$ upward by $\operatorname{sign} x_0$ (zero at $x_0 = 0$) ([Taylor jets and higher-order coefficients](../taylor-jets/)).
+
+`select` and comparisons are not kinks.
+Comparisons use base values (the innermost values such as `f64`), and `select` returns the selected side's derivative directly.
+Thus $|x|$ written as `R::select(x.lt(zero), -x, x)` returns derivative 1 of the selected side $x$ at $x = 0$, and the tape does not count it.
+Region-dependent expression switching in [Elementary function derivatives and accuracy](../elementary-functions/) also uses `select` and is not counted as a kink.
+
+## Relationship to Clarke's generalized gradient
+
+Clarke's generalized gradient explains mathematically what the midpoint convention returns.
+A function $f: \mathbb{R}^n \to \mathbb{R}$ is locally Lipschitz at $x$ when $f$ satisfies $|f(y) - f(z)| \le K \|y - z\|$ in a neighborhood of that point.
+By Rademacher's theorem, a locally Lipschitz function is differentiable except on a measure-zero set $\Omega_f$.
+Clarke's generalized gradient is the convex hull of limits of gradients at differentiable points:
+
+$$
+\partial_{\mathrm{C}} f(x) = \operatorname{conv} \Bigl\{ \lim_{k \to \infty} \nabla f(x_k) \;:\; x_k \to x,\ x_k \notin \Omega_f \Bigr\}
+$$
+
+(F. H. Clarke, *Optimization and Nonsmooth Analysis*, Wiley, 1983).
+$\partial_{\mathrm{C}} f(x)$ is a nonempty bounded closed convex set; it equals $\{\nabla f(x)\}$ if $f$ is continuously differentiable near $x$, and the subdifferential of convex analysis if $f$ is convex.
+For a continuous piecewise smooth function of one variable, it is the interval with endpoints equal to the one-sided derivatives $f'(x_0^-)$ and $f'(x_0^+)$.
+At the origin it is $[-1, 1]$ for $|x|$, $[0, 1]$ for $\max(x, 0)$, and the unit disk for $\operatorname{hypot}(a, b)$.
+
+For a single operation, the convention's value for the table's Lipschitz functions (`abs`, `min`, `max`, `hypot`) belongs to that operation's Clarke generalized gradient.
+For `abs` and `max` it is the midpoint of the generalized gradient's line segment; for `hypot` it is the disk's center.
+Functions with value jumps (rounding functions, `signum`, `fract`, `%`, and the branch cut of `atan2`) are not locally Lipschitz at jumps, so Clarke's generalized gradient is undefined there.
+
+For compositions, the chain rule for Clarke's generalized gradient generally gives only the inclusion
+
+$$
+\partial_{\mathrm{C}} (g \circ h)(x) \subseteq \operatorname{conv}\bigl\{ \xi^{\mathsf T} \zeta : \xi \in \partial_{\mathrm{C}} g(h(x)),\ \zeta \in \partial_{\mathrm{C}} h(x) \bigr\}
+$$
+
+where $\partial_{\mathrm{C}} h(x)$ is the generalized Jacobian of $h$.
+The midpoint convention is applied operation by operation, so its value for a composite function generally differs from the midpoint of that function's one-sided derivatives.
+$g(x) = \max(\max(x, 0), 0)$ equals $\max(x, 0)$; at $x = 0$ its one-sided derivatives are 0 and 1 with midpoint $\tfrac12$.
+The convention multiplies $\tfrac12$ from the inner `max` by $\tfrac12$ from the outer `max`, returning $\tfrac14$, which does belong to the generalized gradient $[0, 1]$ of $g$.
+Choosing an element of the generalized gradient for each operation and connecting them with the chain rule gives a value in the right-hand side, but not necessarily the left-hand side.
+For example, $f(x) = \max(\max(x, 0), 0) - \max(x, 0)$ is zero for every $x$, so $\partial_{\mathrm{C}} f(0) = \{0\}$; however, the midpoint convention has the outer `max` multiply the inner slope $\tfrac12$ by another $\tfrac12$, returning $\tfrac14 - \tfrac12 = -\tfrac14$.
+In contrast, $\max(x, 0) - \max(-x, 0) = x$ gives $\tfrac12 - \tfrac12 \cdot (-1) = 1$, matching the correct value.
+Even if the composite function is smooth at the kink, there is no guarantee that automatic differentiation gives its derivative.
+
+In many computations, points encountering kinks lie in a measure-zero set, and a point chosen from a continuous distribution rarely hits them.
+But structured points such as zero-initialized weights, integer inputs, and ReLU boundaries hit kinks exactly.
+When intermediate values are constant over an interval, the points encountering a kink can extend over the entire interval.
+For $g(x) = \max(\max(x, 0), 0)$, the outer `max` ties zero with zero at every point with $x < 0$; derivative zero is correct, but the tape counts one kink each time.
+Tape counting detects such cases.
+
+## Kink counting and KinkPolicy
+
+A tape counts an operation with an active (input-dependent) argument at a kink once per operation and lane (one SIMD element).
+A binary operation (`min`, `max`, `hypot`, `%`, `atan2`) counts only once if at least one argument is active, even when both are active.
+Operations with only passive arguments are not recorded and are not counted.
+`Dual`, `MultiDual`, and `Jet` apply the convention without counting.
+
+Read the count from the last recording with `TapeReport::kinks()`.
+For reverse-mode batch evaluation, `BatchEstimate::kinks()` returns the sum of item counts per lane and `prepare` counts once per block; value-only and forward-mode evaluation return `None` ([Batch evaluation of many items](../batches/)).
+
+Select `KinkPolicy` with `TapeOptions::with_kink_policy` and `BatchOptions::with_kink_policy`.
+
+| Policy | Behavior |
+|---|---|
+| `Midpoint` (default) | Use midpoint derivatives and return the count |
+| `Error` | If the count is nonzero, return `DomainError` (argument `point`, reason `Undefined`) at the transformation boundary |
+
+`Error` is checked immediately after recording, before gradients or products are written, so a failed transformation leaves output unchanged.
+`Tape::linearize` fails during recording and does not proceed to products on `Linearization`.
+For computations whose intermediate values are constant over an interval, `Error` rejects every point in that interval (every point with $x \le 0$ for $\max(\max(x, 0), 0)$).
+Use `Error` when checking whether a computation encounters a kink; to continue despite kinks, retain `Midpoint` and read `kinks()` to decide how to handle the result.
+
+For batch evaluation, `BatchOptions::with_kink_policy(KinkPolicy::Error)` forces reverse mode; the evaluating plan passes this policy to each worker's tape.
+If any item's active argument is at a kink, `evaluate_into` and `hvp_into` return `DomainError` without writing output.
+`jvp_into` works with dual numbers and does not count kinks, so this policy has no effect there.
+
+The next cell evaluates the table's functions, the three compositions above, and $|x|$ written with `select` at kinks, comparing derivatives from `Dual::variable` with gradients and kink counts from `Tape::gradient_into`.
+The input is the tape's `KinkPolicy`.
+The “Clarke generalized gradient” column in the first table gives manually computed generalized gradients of the entire function (intervals, since these are univariate); functions with value jumps display “Discontinuous”.
+The tape gradient output is prefilled with 9 to verify that failed transformations leave output unchanged.
+The second table checks counting rules with a separate `Midpoint` tape.
+
+```rust
+//| id: ad-kink-conventions
+//| ref: ad-kink-conventions
+//| title: "Derivatives at kinks, Clarke's generalized gradient, and counting"
+//| run: reactive
+//| crates: [scioxide-ad, scioxide-core]
+//| inputs:
+//|   policy: {"type":"select","label":"Tape KinkPolicy","description":"With Error, recordings encountering kinks return DomainError.","options":["Midpoint","Error"],"value":"Midpoint"}
+//| cases:
+//|   - {"id":"error-policy","label":"KinkPolicy::Error","description":"Only rows encountering kinks fail; gradient output remains unchanged.","inputs":{"policy":"Error"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"kinks","path":"/rows/0/3","equals":0}
+//|       - {"artifact":"kinks","path":"/rows/0/5","equals":1}
+//|       - {"artifact":"kinks","path":"/rows/2/4","approx":{"value":0.5,"atol":1e-15}}
+//|       - {"artifact":"kinks","path":"/rows/4/4","approx":{"value":1,"atol":1e-15}}
+//|       - {"artifact":"kinks","path":"/rows/5/3","approx":{"value":0.25,"atol":1e-15}}
+//|       - {"artifact":"kinks","path":"/rows/5/5","equals":2}
+//|       - {"artifact":"kinks","path":"/rows/5/6","equals":"Inside"}
+//|       - {"artifact":"kinks","path":"/rows/6/3","approx":{"value":-0.25,"atol":1e-15}}
+//|       - {"artifact":"kinks","path":"/rows/6/5","equals":3}
+//|       - {"artifact":"kinks","path":"/rows/6/6","equals":"Outside"}
+//|       - {"artifact":"kinks","path":"/rows/8/3","approx":{"value":1,"atol":1e-15}}
+//|       - {"artifact":"kinks","path":"/rows/8/5","equals":0}
+//|       - {"artifact":"kinks","path":"/rows/11/4","approx":{"value":-1,"atol":1e-15}}
+//|       - {"artifact":"counting","path":"/rows/0/1","equals":2}
+//|       - {"artifact":"counting","path":"/rows/1/1","equals":0}
+//|       - {"artifact":"counting","path":"/rows/2/1","equals":1}
+//|       - {"artifact":"counting","path":"/rows/3/1","equals":1}
+//|       - {"artifact":"counting","path":"/rows/4/1","equals":2}
+//|   - case: error-policy
+//|     expect:
+//|       - {"artifact":"kinks","path":"/rows/0/4","equals":9}
+//|       - {"artifact":"kinks","path":"/rows/0/7","equals":"DomainError（point, Undefined）"}
+//|       - {"artifact":"kinks","path":"/rows/1/4","approx":{"value":-1,"atol":1e-15}}
+//|       - {"artifact":"kinks","path":"/rows/1/7","equals":"Success"}
+//|       - {"artifact":"kinks","path":"/rows/8/7","equals":"Success"}
+//|       - {"artifact":"kinks","path":"/rows/9/5","equals":1}
+use scioxide_ad::{Dual, KinkPolicy, Lanes, Real, Tape, TapeOptions, Var};
+use scioxide_core::{DomainReason, ExecutionContext, SciOxideErrorKind, SciOxideErrorView};
+
+// Functions for each row, each written once for numeric type R.
+fn row<R: Real>(index: usize, x: R) -> R {
+    let zero = R::zero();
+    match index {
+        0 | 1 => x.abs(),
+        2 => x.max(zero),
+        3 => x.max(x),
+        4 => x.max(zero) - (-x).max(zero),
+        5 => x.max(zero).max(zero),
+        6 => x.max(zero).max(zero) - x.max(zero),
+        7 => x.hypot(zero),
+        8 => R::select(x.lt(zero), -x, x),
+        9 => x.floor(),
+        10 => x.fract(),
+        _ => x.atan2(R::constant(-1.0)),
+    }
+}
+// (Expression and point, point, whole-function Clarke generalized gradient [lower, upper]; None if discontinuous)
+let specs: [(&str, f64, Option<(f64, f64)>); 12] = [
+    ("|x|, x = 0", 0.0, Some((-1.0, 1.0))),
+    ("|x|, x = −2", -2.0, Some((-1.0, -1.0))),
+    ("max(x, 0), x = 0", 0.0, Some((0.0, 1.0))),
+    ("max(x, x) = x, x = 0", 0.0, Some((1.0, 1.0))),
+    ("max(x, 0) − max(−x, 0) = x, x = 0", 0.0, Some((1.0, 1.0))),
+    (
+        "max(max(x, 0), 0) = max(x, 0), x = 0",
+        0.0,
+        Some((0.0, 1.0)),
+    ),
+    (
+        "max(max(x, 0), 0) − max(x, 0) = 0, x = 0",
+        0.0,
+        Some((0.0, 0.0)),
+    ),
+    ("hypot(x, 0) = |x|, x = 0", 0.0, Some((-1.0, 1.0))),
+    ("select(x < 0, −x, x) = |x|, x = 0", 0.0, Some((-1.0, 1.0))),
+    ("floor(x), x = 1", 1.0, None),
+    ("fract(x), x = 1", 1.0, None),
+    ("atan2(x, −1), x = 0", 0.0, None),
+];
+let kink_policy = match policy.as_str() {
+    "Error" => KinkPolicy::Error,
+    _ => KinkPolicy::Midpoint,
+};
+let cx = ExecutionContext::sequential();
+let mut tape = Tape::<f64>::new(TapeOptions::new().with_kink_policy(kink_policy));
+let mut rows = Vec::new();
+for (index, &(name, point, clarke)) in specs.iter().enumerate() {
+    let forward = row(index, Dual::variable(point)).derivative();
+    let mut gradient = [9.0];
+    let outcome = tape.gradient_into(|x| Ok(row(index, x[0])), &[point], &mut gradient, cx);
+    // Classify errors with kind() and view().
+    let status = match outcome {
+        Ok(_) => "Success".to_string(),
+        Err(error) => match (error.kind(), error.view()) {
+            (
+                SciOxideErrorKind::DomainError,
+                SciOxideErrorView::DomainError {
+                    argument, reason, ..
+                },
+            ) => {
+                let reason = match reason {
+                    DomainReason::Undefined => "Undefined",
+                    _ => "Other",
+                };
+                format!("DomainError（{}, {reason}）", argument.as_str())
+            }
+            _ => error.to_string(),
+        },
+    };
+    let member = clarke.map(|(low, high)| {
+        if low <= forward && forward <= high {
+            "Inside"
+        } else {
+            "Outside"
+        }
+    });
+    rows.push((
+        name,
+        clarke.map(|c| c.0),
+        clarke.map(|c| c.1),
+        forward,
+        gradient[0],
+        tape.report().kinks(),
+        member,
+        status,
+    ));
+}
+
+// Counting: once per operation and lane. Passive operations are not counted.
+let mut counter = Tape::<f64>::new(TapeOptions::new());
+let mut count =
+    |f: for<'t> fn(&[Var<'t, f64>]) -> Var<'t, f64>, point: f64| -> Result<u64, String> {
+        let mut gradient = [0.0];
+        counter
+            .gradient_into(|x| Ok(f(x)), &[point], &mut gradient, cx)
+            .map_err(|e| e.to_string())?;
+        Ok(counter.report().kinks())
+    };
+let both = count(|x| x[0].abs() + x[0].max(x[0]), 0.0)?;
+let passive = count(|x| x[0] * Var::constant(0.0).abs(), 1.0)?;
+let one_active = count(|x| x[0].max(Var::constant(1.0)), 1.0)?;
+// For x < 0, the outer max ties zero with zero.
+let flat = count(
+    |x| x[0].max(Var::constant(0.0)).max(Var::constant(0.0)),
+    -1.0,
+)?;
+let mut lanes = Tape::<Lanes<f64, 4>>::new(TapeOptions::new());
+let mut lane_gradient = [Lanes::splat(0.0)];
+let lane_point = [Lanes::from_array([0.0, 1.0, 0.0, -1.0])];
+lanes
+    .gradient_into(|x| Ok(x[0].abs()), &lane_point, &mut lane_gradient, cx)
+    .map_err(|e| e.to_string())?;
+let counts = vec![
+    ("|x| + max(x, x), x = 0", both),
+    ("x·|0| (|0| is passive), x = 1", passive),
+    ("max(x, 1) (1 is constant), x = 1", one_active),
+    ("max(max(x, 0), 0), x = −1", flat),
+    ("|x|, 4 lanes with x = (0, 1, 0, −1)", lanes.report().kinks()),
+];
+
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Expression and point" },
+    { "key": "1", "label": "Clarke lower endpoint [-]", "type": "number", "nullText": "Discontinuous" },
+    { "key": "2", "label": "Clarke upper endpoint [-]", "type": "number", "nullText": "Discontinuous" },
+    { "key": "3", "label": "Dual derivative [-]", "type": "number", "format": fixed2 },
+    { "key": "4", "label": "Tape gradient output [-]", "type": "number", "format": fixed2 },
+    { "key": "5", "label": "Kink count [count]", "type": "integer" },
+    { "key": "6", "label": "Dual value in Clarke gradient", "nullText": "—" },
+    { "key": "7", "label": "Tape result" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "kinks" })
+);
+emit_table_with_columns!(
+    ["Recording", "Kink count [count]"],
+    counts,
+    metadata = serde_json::json!({ "id": "counting" })
+);
+```
+
+With the default `Midpoint`, `Dual` and the tape return the same value in every row.
+In eight of the nine rows where the entire function has a Clarke generalized gradient, this value lies in that generalized gradient.
+The $\max(\max(x, 0), 0)$ row returns $\tfrac14$ and the tape counts two kinks.
+This differs from the midpoint $\tfrac12$ of the function's one-sided derivatives 0 and 1 but belongs to the generalized gradient $[0, 1]$.
+Only the $\max(\max(x, 0), 0) - \max(x, 0)$ row returns $-\tfrac14$ outside the generalized gradient; the tape counts three kinks there (two $\max(x, 0)$ operations and one outer `max`).
+The $\max(x, 0) - \max(-x, 0)$ row counts two kinks, but its value is the correct 1.
+$|x|$ written with `select` returns derivative 1 of the selected side and is not counted as a kink.
+At the value jumps of `floor` and `fract` and the branch cut of `atan2`, the returned derivatives are 0, 1, and $-1$ respectively, equal on both sides; each discontinuity is counted once.
+$|x|$ at $x = -2$ is not at a kink, so its count is zero and its derivative is the classical $-1$.
+
+With `KinkPolicy::Error`, the ten rows with counts at least one return `DomainError` (argument `point`, reason `Undefined`), leaving gradient output at the prefilled 9.
+$|x|$ at $x = -2$ and $|x|$ written with `select` succeed.
+Branches written with `select` are not detected even with `Error`, so the author must verify boundary behavior.
+
+In the second table, $|x| + \max(x, x)$ counts once for each of its two operations, passive $|0|$ counts zero, and $\max(x, 1)$ with just one active argument counts once.
+$\max(\max(x, 0), 0)$ counts once even at $x = -1$ where the function is smooth, because its outer `max` has a tie.
+The four-lane $|x|$ counts twice, for the two lanes with value zero.
+
+## The absolute-zero product azmul
+
+`Real::azmul(a, b)` returns the product $a \cdot b$, except that if either factor is exactly zero, it returns $+0$ even if the other is infinite or NaN.
+This is called the absolute-zero product (B. M. Bell, CppAD).
+In IEEE 754 multiplication, $0 \cdot \infty$ and $0 \cdot \text{NaN}$ give NaN.
+
+Each chain-rule term has the form (partial derivative) × (tangent or adjoint).
+A path with exactly zero tangent should contribute nothing to a derivative, but if its partial derivative is infinite (the partial derivative of $\sqrt{x}$ or $\ln x$ at $x = 0$), IEEE multiplication gives NaN and makes the entire derivative NaN.
+`azmul` makes this term zero.
+
+`scioxide-ad` uses the products as follows.
+
+| Location | Product |
+|---|---|
+| Tape reverse and tangent sweeps | `azmul` in every update |
+| `Dual`, `MultiDual` | IEEE multiplication for partial derivatives of `×`, scalar multiplication, `to_degrees`, `to_radians`, `fract`, `exp`, `exp2`, `exp_m1`, `sin`, `cos`, `sinh`, `cosh`, `tanh`, `atan`, and `asinh`; `azmul` for other partial derivatives |
+| `Jet` | `azmul` for kink rules (`abs`, `min`, `max`, `%`); IEEE multiplication for other coefficient recurrences |
+
+This distinction has two consequences.
+First, the derivative of $\sqrt{\max(v, 0)}$ at $v < 0$ is $+0$ with `Dual`, `MultiDual`, and reverse mode.
+This is because `max` returns constant zero, making the tangent zero, and its product with the partial derivative $+\infty$ of $\sqrt{\cdot}$ at zero becomes $+0$ with `azmul`.
+For `Jet`, the coefficient recurrence of $\sqrt{\cdot}$ uses IEEE multiplication for the same product, so $c_1$ becomes NaN.
+Second, in rules using IEEE multiplication, the product of an infinite (or NaN) partial derivative with an exactly zero tangent is NaN in forward mode and zero in tape sweeps.
+Differentiating $x \cdot y$ at $(x, y) = (+\infty, 2)$ in direction $(1, 0)$ gives $2 \cdot 1 + \infty \cdot 0 = \text{NaN}$ with `Dual` and $2$ with the tape's `jvp_into`.
+
+Except in the second case, for a single operation the tape gradient and `Dual` derivative agree in bits, with the sole difference that exactly zero derivatives become $+0$ on the tape.
+
+The following block contains definitions used by the remaining two cells on this page.
+`clipped_root` expresses $\sqrt{\max(v, 0)}$ using operations of numeric type `R`.
+`class` classifies value types for the table: nonfinite values as `NaN`, `+∞`, and `−∞`, and signed zeros as `+0` and `−0`.
+
+```rust
+//| id: ad-non-finite-helpers
+//| kind: definitions
+//| title: "√max(v, 0) and value classification"
+//| crates: [scioxide-ad]
+use scioxide_ad::Real;
+
+/// √max(v, 0), written with operations of numeric type R.
+pub(crate) fn clipped_root<R: Real>(v: R) -> R {
+    v.max(R::zero()).sqrt()
+}
+
+/// Show nonfinite values with classification strings instead of numeric columns. Distinguish zero signs.
+pub(crate) fn class(v: f64) -> &'static str {
+    if v.is_nan() {
+        "NaN"
+    } else if v.is_infinite() {
+        if v > 0.0 { "+∞" } else { "−∞" }
+    } else if v == 0.0 {
+        if v.is_sign_negative() { "−0" } else { "+0" }
+    } else {
+        "Finite"
+    }
+}
+```
+
+The next cell checks the two consequences above.
+It obtains the derivative of $\sqrt{\max(v, 0)}$ at $v = -1$ with `Dual`, a tape, and $c_1$ of `Jet`, and differentiates $x \cdot y$ at $(+\infty, 2)$ in direction $(1, 0)$ with `Dual` and the tape's `jvp_into`.
+For comparison, it also shows `azmul(+∞, 0)` and the f64 IEEE product $+\infty \times 0$.
+Numeric table columns display only finite values; the classification column indicates value types.
+
+```rust
+//| id: ad-azmul-products
+//| ref: ad-azmul-products
+//| title: "Derivative differences between the absolute-zero product and IEEE multiplication"
+//| run: reactive
+//| crates: [scioxide-ad, scioxide-core]
+//| uses: [ad-non-finite-helpers]
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"products","path":"/rows/0/2","equals":"+0"}
+//|       - {"artifact":"products","path":"/rows/1/2","equals":"NaN"}
+//|       - {"artifact":"products","path":"/rows/2/2","equals":"+0"}
+//|       - {"artifact":"products","path":"/rows/3/2","equals":"+0"}
+//|       - {"artifact":"products","path":"/rows/4/2","equals":"NaN"}
+//|       - {"artifact":"products","path":"/rows/5/2","equals":"NaN"}
+//|       - {"artifact":"products","path":"/rows/6/1","approx":{"value":2,"atol":1e-15}}
+//|       - {"artifact":"products","path":"/rows/7/2","equals":"+∞"}
+use scioxide_ad::{Dual, Jet, Real, Tape, TapeOptions};
+use scioxide_core::ExecutionContext;
+
+let cx = ExecutionContext::sequential();
+// Derivative of √max(v, 0) at v = −1.
+let root_dual = clipped_root(Dual::variable(-1.0)).derivative();
+let root_jet = clipped_root(Jet::<f64, 2>::variable(-1.0)).coefficients()[1];
+let mut tape = Tape::<f64>::new(TapeOptions::new());
+let mut root_tape = [0.0];
+tape.gradient_into(|x| Ok(clipped_root(x[0])), &[-1.0], &mut root_tape, cx)
+    .map_err(|e| e.to_string())?;
+// Derivative of x·y at (+∞, 2) in direction (1, 0).
+let product_dual = (Dual::new(f64::INFINITY, 1.0) * Dual::new(2.0, 0.0)).derivative();
+let (mut product_jvp, mut product_vjp) = ([0.0], [0.0; 2]);
+{
+    let mut linear = tape
+        .linearize(
+            |x, y| {
+                y.push(x[0] * x[1]);
+                Ok(())
+            },
+            &[f64::INFINITY, 2.0],
+            cx,
+        )
+        .map_err(|e| e.to_string())?;
+    linear
+        .jvp_into(&[1.0, 0.0], &mut product_jvp, cx)
+        .map_err(|e| e.to_string())?;
+    linear
+        .vjp_into(&[1.0], &mut product_vjp, cx)
+        .map_err(|e| e.to_string())?;
+}
+// The second row is an f64 IEEE product for comparison, not a SciOxide rule.
+let products: Vec<_> = [
+    ("azmul(+∞, 0)", <f64 as Real>::azmul(f64::INFINITY, 0.0)),
+    ("+∞ × 0 (IEEE product)", f64::INFINITY * 0.0),
+    ("√max(v, 0), v = −1: Dual derivative", root_dual),
+    ("Same: tape gradient", root_tape[0]),
+    ("Same: Jet c₁", root_jet),
+    ("x·y, (+∞, 2), direction (1, 0): Dual derivative", product_dual),
+    ("Same: tape jvp_into", product_jvp[0]),
+    ("Same: tape vjp_into ∂/∂y", product_vjp[1]),
+]
+.iter()
+.map(|&(name, v)| (name, v.is_finite().then_some(v), class(v)))
+.collect();
+
+let general = serde_json::json!({ "significantDigits": 6 });
+let product_columns = serde_json::json!([
+    { "key": "0", "label": "Expression and method" },
+    { "key": "1", "label": "Result [-]", "type": "number", "format": general, "nullText": "Nonfinite" },
+    { "key": "2", "label": "Classification" }
+]);
+emit_table_with_columns!(
+    product_columns,
+    products,
+    metadata = serde_json::json!({ "id": "products" })
+);
+```
+
+`azmul(+∞, 0)` returns $+0$, while the IEEE product $+\infty \times 0$ returns NaN.
+The derivative of $\sqrt{\max(v, 0)}$ at $v = -1$ becomes $+0$ through `azmul` with `Dual` and the tape; $c_1$ of `Jet`, which uses IEEE multiplication, becomes NaN.
+Differentiating $x \cdot y$ at $(+\infty, 2)$ in direction $(1, 0)$ gives NaN with `Dual`, which uses IEEE multiplication for `×`, and 2 with the tape's `jvp_into`, which uses `azmul`.
+$\partial/\partial y$ from `vjp_into` is the partial derivative $x = +\infty$ itself and is therefore $+\infty$.
+
+## Nonfinite values and NonFinitePolicy
+
+IEEE 754 nonfinite values (NaN and $\pm\infty$) arise from mathematical singularities (the derivative $+\infty$ of $\sqrt{x}$ at the origin, or $\ln 0 = -\infty$), overflow ($e^{710}$), and indeterminate forms ($0/0$) ([Floating-point numbers and conditioning](../../../concepts/floating-point-and-conditioning/)).
+Numeric operations do not check their arguments and propagate NaN and infinity directly.
+Checking follows `NonFinitePolicy` at the boundary of a transformation that accepts a point and writes results.
+
+| Policy | Behavior |
+|---|---|
+| `Propagate` (default) | Write computed values directly, including NaN and infinity |
+| `Error` | Check the point before executing the function, returning `NonFinite` (origin `Input`) if nonfinite. If values or derivatives are nonfinite, return `NonFinite` (origin `Output`) before writing anything |
+
+Select it with `TapeOptions::with_non_finite_policy` for `Tape` and `BatchOptions::with_non_finite_policy` for batch evaluation.
+For wrapped values such as `Tape<Dual<f64>>`, point checking covers every value and derivative component.
+Under `Error`, output values are checked immediately after recording; `gradient_into` and each product on `Linearization` (such as `vjp_into` and `jvp_into`) check results before writing.
+Read the error origin from `SciOxideErrorView::NonFinite { origin, .. }` in `e.view()`.
+One-shot functions such as `grad` use the default `Propagate`.
+Forward mode using `Dual` or `Jet` directly, and `jvp` and `jet`, have no policy; check results with `is_finite()` if needed.
+
+The next cell evaluates six expressions producing nonfinite values with `Tape::gradient_into`.
+The input is the tape's `NonFinitePolicy`.
+Value and gradient types use the same classification as the preceding cell; gradient output is prefilled with 7 to verify that failed transformations leave output unchanged.
+
+```rust
+//| id: ad-non-finite-checks
+//| ref: ad-non-finite-checks
+//| title: "Checking points and results with NonFinitePolicy"
+//| run: reactive
+//| crates: [scioxide-ad, scioxide-core]
+//| uses: [ad-non-finite-helpers]
+//| inputs:
+//|   policy: {"type":"select","label":"Tape NonFinitePolicy","description":"With Error, nonfinite points and results return errors.","options":["Propagate","Error"],"value":"Propagate"}
+//| cases:
+//|   - {"id":"error-policy","label":"NonFinitePolicy::Error","description":"Nonfinite points give Input errors; nonfinite values or gradients give Output errors.","inputs":{"policy":"Error"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"policy","path":"/rows/0/3","equals":"+∞"}
+//|       - {"artifact":"policy","path":"/rows/2/1","equals":"NaN"}
+//|       - {"artifact":"policy","path":"/rows/3/2","approx":{"value":2e200,"rtol":1e-15}}
+//|       - {"artifact":"policy","path":"/rows/5/4","equals":"Success"}
+//|   - case: error-policy
+//|     expect:
+//|       - {"artifact":"policy","path":"/rows/0/4","equals":"NonFinite (origin Output)"}
+//|       - {"artifact":"policy","path":"/rows/0/2","equals":7}
+//|       - {"artifact":"policy","path":"/rows/0/3","equals":"Not written"}
+//|       - {"artifact":"policy","path":"/rows/2/4","equals":"NonFinite (origin Input)"}
+//|       - {"artifact":"policy","path":"/rows/3/4","equals":"NonFinite (origin Output)"}
+//|       - {"artifact":"policy","path":"/rows/5/4","equals":"Success"}
+use scioxide_ad::{NonFinitePolicy, Real, Tape, TapeOptions, Var};
+use scioxide_core::{ExecutionContext, SciOxideErrorKind, SciOxideErrorView, NonFiniteOrigin};
+
+let cx = ExecutionContext::sequential();
+let non_finite = match policy.as_str() {
+    "Error" => NonFinitePolicy::Error,
+    _ => NonFinitePolicy::Propagate,
+};
+let mut strict = Tape::<f64>::new(TapeOptions::new().with_non_finite_policy(non_finite));
+let specs: [(&str, f64, for<'t> fn(Var<'t, f64>) -> Var<'t, f64>); 6] = [
+    ("√x, x = 0", 0.0, |x| x.sqrt()),
+    ("1/x, x = 0", 0.0, |x| x.recip()),
+    ("2x, x = NaN", f64::NAN, |x| x * 2.0),
+    ("x·x, x = 10²⁰⁰", 1e200, |x| x * x),
+    ("ln x, x = −1", -1.0, |x| x.ln()),
+    ("√max(x, 0), x = −1", -1.0, |x| clipped_root(x)),
+];
+let mut rows = Vec::new();
+for &(name, point, f) in &specs {
+    let mut gradient = [7.0];
+    let outcome = strict.gradient_into(|x| Ok(f(x[0])), &[point], &mut gradient, cx);
+    let (value_class, status) = match outcome {
+        Ok(value) => (class(value), "Success".to_string()),
+        Err(error) => {
+            let status = match (error.kind(), error.view()) {
+                (SciOxideErrorKind::NonFinite, SciOxideErrorView::NonFinite { origin, .. }) => {
+                    let origin = match origin {
+                        NonFiniteOrigin::Input => "Input",
+                        NonFiniteOrigin::Output => "Output",
+                        _ => "Other",
+                    };
+                    format!("NonFinite (origin {origin})")
+                }
+                _ => error.to_string(),
+            };
+            ("Not returned", status)
+        }
+    };
+    // A failed transformation leaves output unchanged, so gradient output remains 7.
+    let g = gradient[0];
+    let gradient_class = if value_class == "Not returned" {
+        "Not written"
+    } else {
+        class(g)
+    };
+    rows.push((
+        name,
+        value_class,
+        g.is_finite().then_some(g),
+        gradient_class,
+        status,
+    ));
+}
+
+let general = serde_json::json!({ "significantDigits": 6 });
+let policy_columns = serde_json::json!([
+    { "key": "0", "label": "Expression and point" },
+    { "key": "1", "label": "Value classification" },
+    { "key": "2", "label": "Gradient output [-]", "type": "number", "format": general, "nullText": "Nonfinite" },
+    { "key": "3", "label": "Gradient classification" },
+    { "key": "4", "label": "Result" }
+]);
+emit_table_with_columns!(
+    policy_columns,
+    rows,
+    metadata = serde_json::json!({ "id": "policy" })
+);
+```
+
+With the default `Propagate`, all six expressions succeed and nonfinite values and gradients are written directly.
+The gradient of $\sqrt{x}$ at zero is $+\infty$; $1/x$ gives value $+\infty$ and gradient $-\infty$.
+For $2x$ at a NaN point, the value is NaN and gradient 2; for $x \cdot x$ at $10^{200}$ the value overflows to $+\infty$ but gradient $2 \times 10^{200}$ is finite; $\ln(-1)$ has value NaN and gradient $-1$.
+These three rows have finite gradients, so checking only gradients would miss the problem; values must also be checked.
+
+With `Error`, the NaN point fails with origin `Input` before function execution; the other four fail with origin `Output` when checking values or gradients.
+Failed rows retain gradient output 7.
+$\sqrt{\max(x, 0)}$ has finite value and gradient and succeeds under either policy.
+
+## Summary
+
+All numeric types in `scioxide-ad` generally use the midpoint of one-sided derivatives at kinks; for a single Lipschitz operation this value belongs to Clarke's generalized gradient, but it can fall outside for a composite function.
+A tape counts operations with active arguments at kinks per operation and lane; treat results with nonzero `TapeReport::kinks()` as derivatives chosen by convention, checking with shifted points or smooth approximations if needed.
+To stop computations encountering kinks, set the tape to `KinkPolicy::Error` and receive `DomainError` (argument `point`); assume that branch boundaries written with `select` are not counted.
+Batch evaluation also returns `DomainError` at kinks under `Error`, while under `Midpoint` it returns the count in `BatchEstimate::kinks()`.
+Tape sweeps and many forward rules use `azmul`, so infinite partial derivatives on paths with exactly zero tangent do not produce NaN; rules using IEEE multiplication (including `Jet` coefficient recurrences) can produce NaN.
+To stop nonfinite values early, use `NonFinitePolicy::Error` and distinguish point problems from result problems by origins `Input` and `Output`.
+
+## Further reading
+
+- [Kinks and differentiation conventions in L1 regularization](../../examples/nonsmooth-l1-policy/): examine the midpoint convention of `abs` and `KinkPolicy::Error` in an optimization example.
+- [Branches, masks, and table lookup](../control-flow/): examine derivatives of branches written with `select` and masks, and the range of points where patterns apply.
+- [Batch evaluation of many items](../batches/): examine kink counting in batch evaluation and how policies select the evaluation method.
+- [Error contracts and partial results](../../../concepts/errors-and-partial-results/): examine error classification with `kind()` and `view()`.

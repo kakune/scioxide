@@ -1,0 +1,412 @@
+---
+title: "Prepared and batch evaluation"
+description: "Shared evaluation traits and component order, univariate scalar forms, query workspace lifetimes, output-preserving failures, coordinate reports, and evaluate_many/BatchEvaluator execution policies."
+sidebar:
+  order: 360
+references:
+  interp-batch-evaluation: "batch-evaluation"
+  interp-common-traits: "shared-traits-and-multiple-components"
+  interp-coordinate-report: "coordinate-reports"
+  interp-owned-and-reserved: "owned-and-reserved-forms"
+  interp-query-workspace: "query-workspace"
+---
+
+In inner loops evaluating thousands of points, allocations and neighborhood searches can dominate cost.
+SciOxide separates immutable prepared models, per-query workspace, and many-point evaluators.
+They differ in reconstruction frequency and concurrency.
+This page explains shared evaluation contracts, workspace use, coordinate reports, and batches.
+Derivative and integral mathematics appears in [Interpolant derivatives and integrals](../derivatives-integrals-and-workspaces/).
+
+| Value | Construction | Changes | Concurrent use |
+|---|---|---|---|
+| Interpolant/model | `new`, `with_options`, `build`, `fit` | Immutable after construction | Shareable, `Sync` |
+| Query workspace | Interpolant `workspace()` | Contents change each query | One per caller |
+| `BatchEvaluator` | `BatchEvaluator::new(model, policy)` | Immutable | Shareable |
+| `BatchWorkspace` | `evaluator.workspace(request)` | Contents change each batch | One per concurrent batch |
+
+## Shared traits and multiple components
+
+`Interpolant<S, D>` is shared by every method returning values from $D$ real coordinates.
+Associated `Value` is the owned output type and `Workspace` query-workspace type.
+`domains()` returns closed axis intervals spanned by data; `value_dimension()` real value components.
+Domain handling follows each interval, box, hull, or sphere and `ExtrapolationPolicy`, without default policies.
+
+Values implement `AffineValue`, supporting real, complex, arrays, and vectors.
+Complex values are two real components `[real part, imaginary part]`.
+Components share geometry and bases and use identical real arithmetic.
+No component selects separate neighborhoods or bases.
+Gradients of `Differentiable` use `[axis, real component]` and Hessians of `TwiceDifferentiable` row-major `[axis, axis, real component]`; `*_into` writes real components in this order.
+Owned `gradient` returns `[Value; D]`; `hessian` returns `[[Value; D]; D]`.
+
+Generic output-argument methods prevent trait-object `dyn Interpolant` use.
+Functions accepting several methods use type parameters such as `I: Interpolant<S, D>`.
+`&T` implements the same traits, allowing borrowed interpolants.
+
+## Query workspace
+
+Workspace stores intermediate values for one query.
+Only interpolant `workspace()` constructs it; sufficiency follows when `workspace_capacity(&workspace)` gives `Capacity::Sufficient`.
+It never grows in evaluation; insufficiency gives `DimensionMismatch`.
+Same-kind models may reuse workspace whenever requirements fit.
+Queries initialize every read portion, permitting reuse after failures.
+
+Associated `Workspace` identifies method-specific workspace types.
+
+| Workspace | Methods |
+|---|---|
+| `QueryWorkspace` | Global polynomials including Neville, Bulirsch–Stoer, Floater–Hormann, piecewise cubics, B-splines, NURBS, bilinear/bicubic, global RBFs |
+| `ScatteredWorkspace` | Four Delaunay methods |
+| `SphericalSplineWorkspace` | Spherical splines |
+| `LocalPredictionWorkspace` | Local polynomials/RBFs and GP prediction |
+| `()`, no workspace | AAA `BarycentricRational` and Padé |
+
+`QueryWorkspace` keeps at most 16 scalars off the heap, so small-requirement real owned queries also avoid allocation.
+Workspace type `Send` can move across threads but cannot serve two simultaneous queries.
+For parallel queries, share the model and create one workspace per caller.
+
+## Owned and reserved forms
+
+Each evaluation has two forms.
+Owned `evaluate(point, policy)` constructs workspace and output per call and returns it.
+`evaluate_into(point, policy, out, workspace)` uses caller output/workspace, writing complete finite results to `out` on success without allocation.
+Derivative `gradient_into` and `hessian_into` and integral `integral_into` follow the same pattern.
+Owned `evaluate_many(points, policy)` sequentially evaluates point arrays into value `Vec` with one workspace, each bitwise-identical to `evaluate`.
+Any failed point returns its error with no values.
+
+Univariate `Interpolant<S, 1>` methods also have scalar trait `Univariate`.
+`value_at(x)`, `values_at(xs)`, `derivative_at(x)`, and `integrate(a, b)` match bits of `evaluate`, `evaluate_many`, `gradient`, and `integral` with coordinate `[x]` and `ExtrapolationPolicy::Reject`.
+Thus outside closed domains gives `DomainError`; use policy forms for extensions such as `Clamp`.
+`Univariate` applies to all `Interpolant<S, 1>` and needs only trait import; like owned forms it creates workspace per call.
+
+SciOxide-wide `*_into` contracts write complete results or preserve original `out` on errors ([Workspaces and reproducibility](../../../concepts/workspaces-and-reproducibility/)).
+Most methods stage results in workspace and copy to `out` only when every component is finite.
+Outside domains, nonfinite coordinates, shape mismatches, and numerical failures all preserve `out`.
+Workspace contents may change on errors but remain reusable.
+Prepare workspace/output outside loops and use `*_into` inside to avoid repeated allocation.
+
+## Coordinate reports
+
+`report(point, policy, workspace)` returns `ExtrapolationReport` classifying coordinates against method domains.
+`original()` is supplied coordinates, `effective()` used coordinates projected only under `Clamp`, and `outside_distance()` per-axis exterior distances, zero inside.
+This is geometry, not accuracy or stability estimation.
+`evaluate_into_with_report` returns values and reports together, sharing hull location classification where applicable.
+The default computes reports first and evaluates second; either failure preserves `out`.
+
+## Batch evaluation
+
+`evaluate_many` allocates value arrays per call and evaluates sequentially on the calling thread.
+Use `BatchEvaluator` for caller array views and parallel workers.
+`BatchEvaluator::new(model, policy)` is an immutable model/policy `ExecutionPolicy` pair ensuring identical worker counts during sizing and execution.
+It holds no precomputed data beyond bundling model and policy.
+It may own interpolants or borrow supplied `&model`.
+`BatchRequest` describes quantity (`Values`, `Gradients`, `Hessians` in `BatchOperation`), queries, and report requests, constructed with `BatchRequest::values(n)`, `gradients(n)`, `hessians(n)`, and `with_reports()`.
+`BatchRequirements` from `evaluator.workspace_requirements(request)` gives queries, real components per result, workers, and temporary-storage size.
+Construct `BatchWorkspace` through `evaluator.workspace(request)`, or check `check` before growing `try_reserve`.
+`try_reserve` reconstructs insufficient worker workspaces from the model and retains valid gained capacity even on allocation failure.
+One `BatchWorkspace` serves evaluators with identical model-workspace types but not simultaneous batches.
+
+`evaluator.evaluate_into(queries, policy, out, reports, workspace, context)` evaluates shape-`[query, D]` coordinates `NdView` into shape-`[query, component]` `NdViewMut`.
+`gradient_into` writes `[query, D, component]` for `Differentiable` models; `hessian_into` writes `[query, D, D, component]` for `TwiceDifferentiable` models.
+Inputs and outputs allow arbitrary strides, including broadcast coordinates with zero strides.
+Output-layout gaps remain unchanged.
+Passing `Some(&mut reports)` to `reports` also writes per-query `ExtrapolationReport`.
+
+First check every shape and workspace capacity, returning `DimensionMismatch` if insufficient.
+Then compute every query in temporary workspace and copy outputs/reports only if all succeed.
+Any failure preserves original output and reports, without partial overwrite.
+Reserved batches allocate nothing.
+Pass context such as `ExecutionContext::sequential_native()` to `context`; stop/deadline checks occur per query.
+
+Policy passed to `BatchEvaluator::new` bounds workers.
+`Sequential` uses one, `Parallel(n)` at most $\min(n,64)$, and `Auto` at most 64, further bounded by queries and executors.
+Workers receive contiguous point ranges and evaluate each like `evaluate_into`, giving worker-independent results.
+Each worker owns model workspace; `Auto` can reserve up to 64 workspaces.
+Wasm cells run sequentially.
+
+## Agreement of point and batch evaluation
+
+This and the next section share a model interpolating two-component $p(x)=(x,x^2)$ at nodes $0,1,2$ through `NewtonInterpolator`.
+The following definition constructs it.
+
+```rust
+//| id: interp-batch-curve-model
+//| kind: definitions
+//| title: "Newton interpolation of p(x) = (x, x²)"
+//| crates: [scioxide-core, scioxide-interp]
+use scioxide_core::SciOxideError;
+use scioxide_interp::NewtonInterpolator;
+
+/// Interpolate two-component p(x) = (x, x²) at 0, 1, 2.
+pub(crate) fn curve_model() -> Result<NewtonInterpolator<f64, [f64; 2]>, SciOxideError> {
+    NewtonInterpolator::new(
+        vec![0.0, 1.0, 2.0],
+        vec![[0.0, 0.0], [1.0, 1.0], [2.0, 4.0]],
+    )
+}
+```
+
+Batch evaluation uses `BatchEvaluator::new(&model, ExecutionPolicy::Sequential)` with a borrowed interpolant.
+Three-node Newton exactly represents quadratics, so values and derivatives should match analytic expressions within rounding.
+Input query $x\in[0,2]$ joins $x=0$ and $x=2$ as three batch points, with controlled $x$.
+Outputs show values, derivatives, maximum analytic differences, and differences from same-point `evaluate_into`.
+Batch gradients have shape `[query, axis, component]`, with one axis here.
+
+```rust
+//| id: interp-batch-point-agreement
+//| ref: interp-batch-point-agreement
+//| title: "Compare vector-valued point and batch evaluations"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-interp]
+//| uses: [interp-batch-curve-model]
+//| inputs:
+//|   query_x: {"type":"range","label":"Query x [-]","min":0,"max":2,"step":0.1,"value":0.5}
+//| cases:
+//|   - {"id":"right-end","label":"x = 2","description":"Boundary queries also match point evaluation bitwise.","inputs":{"query_x":2}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"agreement","path":"/rows/1/1","approx":{"value":0.5,"rtol":1e-15}}
+//|       - {"artifact":"agreement","path":"/rows/1/2","approx":{"value":0.25,"rtol":1e-14}}
+//|       - {"artifact":"agreement","path":"/rows/1/4","approx":{"value":1,"rtol":1e-14}}
+//|       - {"artifact":"agreement","path":"/rows/1/5","range":{"max":1e-14}}
+//|       - {"artifact":"agreement","path":"/rows/1/6","equals":0}
+//|   - case: right-end
+//|     expect:
+//|       - {"artifact":"agreement","path":"/rows/1/2","approx":{"value":4,"rtol":1e-14}}
+//|       - {"artifact":"agreement","path":"/rows/1/6","equals":0}
+use scioxide_core::{ExecutionContext, ExecutionPolicy, NdView, NdViewMut, StridedLayout};
+use scioxide_interp::{BatchEvaluator, BatchRequest, ExtrapolationPolicy, Interpolant};
+
+// Interpolate two-component p(x) = (x, x²) at three nodes
+let model = curve_model().map_err(|e| e.to_string())?;
+let policy = ExtrapolationPolicy::Reject;
+let context = ExecutionContext::sequential_native();
+let points = [0.0, query_x, 2.0];
+let queries = NdView::new(
+    &points,
+    StridedLayout::new(&[3, 1], &[1, 1]).map_err(|e| e.to_string())?,
+)
+.map_err(|e| e.to_string())?;
+// Prepare evaluator and workspace once outside loops; sequential uses one worker
+let evaluator = BatchEvaluator::new(&model, ExecutionPolicy::Sequential);
+let mut value_workspace = evaluator
+    .workspace(BatchRequest::values(3))
+    .map_err(|e| e.to_string())?;
+let mut gradient_workspace = evaluator
+    .workspace(BatchRequest::gradients(3))
+    .map_err(|e| e.to_string())?;
+let mut values = [0.0; 6];
+let mut gradients = [0.0; 6];
+{
+    // Values row-major [query, component], derivatives [query, axis, component]
+    let mut out = NdViewMut::new(
+        &mut values,
+        StridedLayout::new(&[3, 2], &[2, 1]).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    evaluator
+        .evaluate_into(
+            &queries,
+            policy,
+            &mut out,
+            None,
+            &mut value_workspace,
+            context,
+        )
+        .map_err(|e| e.to_string())?;
+    let mut out = NdViewMut::new(
+        &mut gradients,
+        StridedLayout::new(&[3, 1, 2], &[2, 2, 1]).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    evaluator
+        .gradient_into(
+            &queries,
+            policy,
+            &mut out,
+            None,
+            &mut gradient_workspace,
+            context,
+        )
+        .map_err(|e| e.to_string())?;
+}
+// Point evaluation uses model workspace
+let mut point_workspace = model.workspace().map_err(|e| e.to_string())?;
+let mut rows = Vec::new();
+for (i, &x) in points.iter().enumerate() {
+    let mut single = [0.0; 2];
+    model
+        .evaluate_into([x], policy, &mut single, &mut point_workspace)
+        .map_err(|e| e.to_string())?;
+    let (v, g) = (&values[2 * i..2 * i + 2], &gradients[2 * i..2 * i + 2]);
+    // Independent check: p(x) = (x, x²), p'(x) = (1, 2x)
+    let analytic = [x, x * x, 1.0, 2.0 * x];
+    let computed = [v[0], v[1], g[0], g[1]];
+    let difference = analytic
+        .iter()
+        .zip(computed)
+        .fold(0.0_f64, |m, (a, c)| m.max((a - c).abs()));
+    let agreement = (single[0] - v[0]).abs().max((single[1] - v[1]).abs());
+    rows.push((x, v[0], v[1], g[0], g[1], difference, agreement));
+}
+let fixed4 = serde_json::json!({ "fractionDigits": 4 });
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "x [-]", "type": "number", "format": fixed4 },
+    { "key": "1", "label": "First component [-]", "type": "number", "format": fixed4 },
+    { "key": "2", "label": "Second component [-]", "type": "number", "format": fixed4 },
+    { "key": "3", "label": "First-component derivative [-]", "type": "number", "format": fixed4 },
+    { "key": "4", "label": "Second-component derivative [-]", "type": "number", "format": fixed4 },
+    { "key": "5", "label": "Maximum analytic difference [-]", "type": "number", "format": sci3 },
+    { "key": "6", "label": "Point-evaluation difference [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "agreement" })
+);
+```
+
+At every point, values and derivatives match analytic formulas and batch/point differences are zero.
+Batches call the same model evaluation per query, matching pointwise results bitwise.
+Derivative columns read `[query, axis, component]` output rowwise.
+
+## Failed batches and coordinate reports
+
+Using the same interpolator, the next cell moves the third query coordinate outside domain $[0,2]$.
+Input third $x_3\in[2,3]$ gives coordinates $[0.5,1.5,x_3]$.
+Fill output with known values, evaluate under `Reject`, and tabulate success and whether outputs stayed unchanged.
+Then evaluate with reports under `Clamp` and `MethodDefined`, comparing third-point values and coordinates.
+Initialize reports with one constructed by `ExtrapolationPolicy::resolve`.
+
+```rust
+//| id: interp-batch-failure-and-reports
+//| ref: interp-batch-failure-and-reports
+//| title: "Check failed batch output and coordinate reports"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-interp]
+//| uses: [interp-batch-curve-model]
+//| inputs:
+//|   outside_x: {"type":"range","label":"Third coordinate x₃ [-]","min":2,"max":3,"step":0.1,"value":2.5}
+//| cases:
+//|   - {"id":"on-boundary","label":"x₃ = 2","description":"Boundary points belong to domains; Reject succeeds with zero distance.","inputs":{"outside_x":2}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"batches","path":"/rows/0/1","equals":"DomainError"}
+//|       - {"artifact":"batches","path":"/rows/0/2","equals":true}
+//|       - {"artifact":"batches","path":"/rows/1/4","approx":{"value":4,"rtol":1e-14}}
+//|       - {"artifact":"batches","path":"/rows/2/4","approx":{"value":6.25,"rtol":1e-14}}
+//|       - {"artifact":"reports","path":"/rows/0/2","equals":2}
+//|       - {"artifact":"reports","path":"/rows/1/2","equals":2.5}
+//|       - {"artifact":"reports","path":"/rows/1/3","equals":0.5}
+//|   - case: on-boundary
+//|     expect:
+//|       - {"artifact":"batches","path":"/rows/0/1","equals":"Success"}
+//|       - {"artifact":"reports","path":"/rows/0/3","equals":0}
+use scioxide_core::{ExecutionContext, ExecutionPolicy, NdView, NdViewMut, StridedLayout};
+use scioxide_interp::{BatchEvaluator, BatchRequest, ExtrapolationPolicy, Interpolant};
+
+let model = curve_model().map_err(|e| e.to_string())?;
+let context = ExecutionContext::sequential_native();
+let points = [0.5, 1.5, outside_x];
+let queries = NdView::new(
+    &points,
+    StridedLayout::new(&[3, 1], &[1, 1]).map_err(|e| e.to_string())?,
+)
+.map_err(|e| e.to_string())?;
+let evaluator = BatchEvaluator::new(&model, ExecutionPolicy::Sequential);
+let mut workspace = evaluator
+    .workspace(BatchRequest::values(3).with_reports())
+    .map_err(|e| e.to_string())?;
+// Initialize report arrays from an in-domain-point report
+let blank = ExtrapolationPolicy::Reject
+    .resolve(model.domains(), [0.0])
+    .map_err(|e| e.to_string())?;
+let mut outcomes = Vec::new();
+let mut report_rows = Vec::new();
+let policies = [
+    ("Reject", ExtrapolationPolicy::Reject),
+    ("Clamp", ExtrapolationPolicy::Clamp),
+    ("MethodDefined", ExtrapolationPolicy::MethodDefined),
+];
+for (name, policy) in policies {
+    // Fill outputs with known -1 before evaluation
+    let mut values = [-1.0; 6];
+    let mut reports = [blank; 3];
+    let result = {
+        let mut out = NdViewMut::new(
+            &mut values,
+            StridedLayout::new(&[3, 2], &[2, 1]).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        evaluator.evaluate_into(
+            &queries,
+            policy,
+            &mut out,
+            Some(&mut reports),
+            &mut workspace,
+            context,
+        )
+    };
+    let status = match &result {
+        Ok(()) => "Success".to_string(),
+        Err(e) => format!("{:?}", e.kind()),
+    };
+    let unchanged = values == [-1.0; 6];
+    outcomes.push((name, status, unchanged, values[4], values[5]));
+    if result.is_ok() {
+        let r = reports[2];
+        report_rows.push((
+            name,
+            r.original()[0],
+            r.effective()[0],
+            r.outside_distance()[0],
+        ));
+    }
+}
+let fixed4 = serde_json::json!({ "fractionDigits": 4 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Policy" },
+    { "key": "1", "label": "Result" },
+    { "key": "2", "label": "Output unchanged from initial", "type": "boolean" },
+    { "key": "3", "label": "Third point first component [-]", "type": "number", "format": fixed4 },
+    { "key": "4", "label": "Third point second component [-]", "type": "number", "format": fixed4 }
+]);
+emit_table_with_columns!(
+    columns,
+    outcomes,
+    metadata = serde_json::json!({ "id": "batches" })
+);
+let report_columns = serde_json::json!([
+    { "key": "0", "label": "Policy" },
+    { "key": "1", "label": "Original coordinate [-]", "type": "number", "format": fixed4 },
+    { "key": "2", "label": "Effective coordinate [-]", "type": "number", "format": fixed4 },
+    { "key": "3", "label": "Outside distance [-]", "type": "number", "format": fixed4 }
+]);
+emit_table_with_columns!(
+    report_columns,
+    report_rows,
+    metadata = serde_json::json!({ "id": "reports" })
+);
+```
+
+At default $x_3=2.5$, `Reject` fails with `DomainError` and all six components retain $-1$.
+Under `Clamp`, third points project to boundary $x=2$, giving $(2,4)$, effective coordinate 2 and distance 0.5.
+Under `MethodDefined`, polynomial extension gives $(2.5,6.25)$, original effective 2.5, and the same distance 0.5.
+At $x_3=2$ (`on-boundary`), the boundary is inside, so even `Reject` succeeds with zero distance.
+Reports classify coordinates without describing extended-value errors.
+
+## Summary
+
+Immutable models can share threads; create per-caller workspace from model `workspace()`.
+Use `*_into` and reserved workspace inside iterations to avoid allocations and preserve output on failures.
+Check exterior coordinates with `ExtrapolationReport` of `report` or `evaluate_into_with_report`, remembering it is not an accuracy estimate.
+For many values alone, use `evaluate_many` or univariate `values_at`.
+For caller arrays or parallelism use `BatchEvaluator` and request-reserved `BatchWorkspace`; any failed query preserves all outputs/reports.
+
+## Further reading
+
+- [Interpolant derivatives and integrals](../derivatives-integrals-and-workspaces/): examine calculus support and errors by method.
+- [Shared contracts and batch-evaluation APIs](../../api/contracts-and-batches/): look up traits, policies, workspace, and batches.
+- [Workspaces and reproducibility](../../../concepts/workspaces-and-reproducibility/): examine cross-chapter workspace, owned-output, and partial-result contracts.

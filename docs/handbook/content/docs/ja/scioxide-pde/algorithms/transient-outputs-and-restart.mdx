@@ -1,0 +1,345 @@
+---
+title: 時間発展の出力・再開・終了理由
+description: ParabolicProblem と HyperbolicProblem の進め方、出力の予定と出力先、状態とチェックポイントからの再開、終了理由・部分結果・診断の読み方。
+sidebar:
+  order: 324
+references:
+  pde-transient-advance-flow: "準備から終端までの流れ"
+  pde-overview-time: "準備から終端までの流れ"
+  pde-transient-output-schedules: "出力の予定と出力先"
+  pde-transient-checkpoints: "状態とチェックポイント"
+  pde-transient-terminations: "終了理由と部分結果"
+---
+
+放物型と双曲型の時間発展は、終端時刻まで一度に解くこともできるが、長い計算では途中の場を受け取り、止まった計算を続ける必要がある。
+このページでは `ParabolicProblem` と `HyperbolicProblem` に共通する進め方、出力の予定と出力先、状態とチェックポイントからの再開、終了理由と部分結果の読み方を説明する。
+時間積分の方法と安定性は[放物型方程式の時間積分](../parabolic-time-integration/)と[波動方程式と CFL 条件](../hyperbolic-waves-and-cfl/)で扱う。
+
+## 準備から終端までの流れ
+
+時間発展の計算は所有者とライフタイムの異なる四つの部品からなる。
+
+| 部品 | 作り方 | 持つもの |
+|---|---|---|
+| 問題 `ParabolicProblem`、`HyperbolicProblem` | `new(discretization, source, end)` | 空間の離散化と源項の借用、終端時刻、Dirichlet の自由度を除いた半離散系 |
+| 設定 `ParabolicOptions`、`HyperbolicOptions` | `new()` と `with_*` | 時間積分の方法、許容誤差、刻みの上限、出力の予定、試行の上限 |
+| 状態 `PdeState` | `initial_state` | 時刻、自由な未知数の座標、Rannacher 起動の残り、メッシュの revision と自由度の並び |
+| 作業領域 `PdeWorkspace` | `workspace()` または `PdeWorkspace::new()` | ODE と線の方法のメモリ領域、最後の試行の記録 |
+
+`new` は半離散系（集中化した質量、自由度間のヤコビアンとその疎な構造）を非零要素数に比例する手間で一度だけ組み立て、以後のすべての呼び出しで使い回す。
+終端時刻が有限でなければ非有限値のエラー、0 以下なら `InvalidInput` を返す。
+係数は時刻に依存せず、源項と境界データは時刻に依存してよい。
+
+状態は `initial_state` が初期値の `FieldData` を自由な未知数の位置で時刻 0 に標本化して作る。
+放物型では `initial_state(initial, options)` で、Rannacher 起動の区間の終わりはこのときの設定から決まる。
+双曲型では `initial_state(displacement, velocity)` で、座標は自由な変位、自由な速度の順に並ぶ。
+全未知数の値の列から作るときは `initial_state_from_values` を使い、Dirichlet の位置の値は無視される。
+
+`PdeWorkspace::new()` は何も確保しない。
+`advance` が事前検査の段階で足りないメモリ領域を広げるので、同じ作業領域を次の呼び出しに渡せば確保は繰り返されない。
+一つの作業領域を放物型と双曲型の両方に使えるが、メモリ領域は最後の問題に合わせた大きさになる。
+
+中心の呼び出しは次の形である。
+
+```text
+problem.advance(&options, &mut state, &mut sink, &mut workspace, scope) -> Result<PdeSolveReport, SciOxideError>
+```
+
+`advance` は `state` を終端時刻まで進め、途中の場を `sink` に渡し、終了理由と診断を `PdeSolveReport` で返す。
+`scope` には `ExecutionContext::sequential()` などの実行コンテキストを渡す。
+場の値はレポートに含まれないので、終端の場は `values(&state)` か、確保しない `values_into(&state, &mut out)` で、Dirichlet の値を戻した全未知数の並びに組み立てる。
+双曲型の `values` は変位だけを返す。
+
+一度で解くときは所有する結果を返す二つの関数を使う。
+`solve(initial)` は既定の設定で解いて終端の場を返し、`Completed` 以外の終了をすべてエラーにする。
+`solve_with_options(initial, options)` は `PdeSolution`（状態、終端の場、レポート、出力の記録）を返し、上限で止まった場合もレポートとともに返す。
+どちらも、計算の途中で失敗したときは、受理した状態があればそれを `PartialFailure<PdeProgress>` に入れて返す。
+
+## 出力の予定と出力先
+
+途中の場を受け取る時刻は、設定の `with_output_schedule` に渡す `PdeOutputSchedule` で決める。
+
+| 予定 | 出力先に渡る場 | 制約 |
+|---|---|---|
+| `FinalOnly`（既定） | 各呼び出しの最後に受理した状態 | 上限で止まった呼び出しでも、止まった時刻の場を渡す |
+| `TimeSteps` | 初期状態と、受理した各刻みの終わりの状態 | 刻みの数だけ場が渡る |
+| `Times(times)` | 指定した各時刻の場（同じ時刻の重複も、指定の順に渡す） | 有限、0 以上、非減少で、$[0,\,\text{終端時刻}]$ に入ること。積分法が連続補間出力（刻みの内部の補間）を持つこと |
+
+`Times` の時刻は積分法の連続補間出力から補間するので、刻みの数を増やさない。
+組み込みの後退 Euler 法、Crank–Nicolson 法、Rannacher 起動は連続補間出力を持たないので、自由な未知数があるときに `Times` と組み合わせると、事前検査が `InvalidInput`（`UnsupportedConfiguration`）で拒む。
+既定の Radau IIA 法と、陽的な Dormand–Prince 5(4) 法は連続補間出力を持つ。
+
+出力先は `PdeOutputSink` トレイトを実装する型で、`observe(&mut self, observation)` が積分の順に一つずつ `PdeObservation` を受け取る。
+`PdeObservation` は時刻 `time()`、全未知数の並びの場 `values()`、`Times` の何番目の要求かを表す `request_index()` を持つ。
+`values()` は Dirichlet の値を戻した物理的な場で、双曲型では変位である。
+場は借用なので、残すときは出力先が写す。
+型付きの場へは `SpatialDiscretization::field` で変換する。
+`request_index()` は要求の並び全体での番号で、`FinalOnly` と `TimeSteps` の場では `None` になる。
+
+`PdeOutputSink` は三種類の型に実装されている。
+`()` はすべての観測を捨てる。
+`FnMut(PdeObservation) -> Result<(), SciOxideError>` の閉包はそのまま出力先になる。
+`PdeTrajectory` は時刻と場を写し取って保持し、`times()`、`states()`、`into_parts()` で返す。
+出力先がエラーを返すと、その時点で `advance` が止まり、エラーはそのまま呼び出し側に返る。
+このとき状態は最後に受理した時刻の値を持ち、それまでに渡した観測は取り消されない。
+
+## 状態とチェックポイント
+
+`PdeState` は時刻 `time()`、自由な未知数の座標 `coordinates()`、未完了の Rannacher 起動の終わり `startup_end()`、メッシュの revision `mesh_token()`、方程式の階数 `order()` を持つ。
+`advance` は数値計算の前に、状態が同じメッシュの revision、同じ自由度の並び、同じ階数のものか、時刻が $[0,\,\text{終端時刻}]$ にあるか、座標が有限か、起動の位相が設定と合うかを確かめる。
+起動の位相が合うとは、状態の時刻が設定の起動区間の中にあれば状態が同じ起動の終わりを持ち、区間を過ぎていれば持たないことをいう（[Rannacher 起動](oxref:pde-crank-nicolson-rannacher)）。
+事前検査で拒まれた呼び出しは状態を変えない。
+一刻みでも受理した後に止まった呼び出しは、最後に受理した点を状態に残す。
+
+止まった計算を続ける方法は二つある。
+同じ状態をもう一度 `advance` に渡せば、状態の時刻から終端まで進む。
+このとき `Times` のうち状態の時刻より前の要求は飛ばされ、要求の番号は最初の並びの番号のまま渡る。
+もう一つは `PdeCheckpoint::new(&state)` で状態を写し取っておき、`resume(options, &checkpoint, &mut state, sink, workspace, scope)` で戻す方法である。
+`resume` はチェックポイントのメッシュの revision、自由度の並び、階数、時刻、起動の位相を検査してから状態に書き戻し、新しい呼び出しの計算回数の上限（試行の上限と `SolveBudgets`）で進める。
+検査で拒まれたときは、状態もチェックポイントも変わらない。
+チェックポイントは状態の複製なので、別の状態変数に戻してもよく、同じ点から設定を変えて何度でもやり直せる。
+
+## 終了理由と部分結果
+
+`advance` と `resume` の戻り値は二つの層に分かれる。
+数値計算が規則どおりに終わったときは `Ok(PdeSolveReport)` を返し、止まった理由は `termination()` の `PdeTermination` に入る。
+入力の誤り、コールバックと出力先のエラー、陰的な段の Newton 反復の失敗のような数値的な失敗は `Err(SciOxideError)` で返る。
+
+時間発展で現れる `PdeTermination` は次の五つである。
+`LinearIterationLimit` などの `Linear` で始まる列挙子は楕円型の求解だけで使われる。
+
+| 終了理由 | 意味 | 状態の読み方 | outcome |
+|---|---|---|---|
+| `Completed` | 終端時刻に達した | 終端時刻の解 | satisfied |
+| `TimeStepLimit` | 1 回の呼び出しで試した刻みの数が `with_step_budget` の上限（既定 100,000、起動と主積分の合計）に達した | 最後に受理した時刻 `final_time()` の解 | partial |
+| `TimeStepSizeLimit` | 許される刻みを表せる限り小さくしても進めない | 同上 | partial |
+| `EvaluationLimit` | `with_budgets` の評価回数などの計算回数の上限に達した | 同上 | partial |
+| `ExecutionStopped(reason)` | 取り消しか期限で止まった | 同上 | partial |
+
+成功の判定は `PdeSolveReport::is_success()`（`PdeTermination::is_success()` と同じ）で行い、列挙子を自分で並べない。
+`Display` は `RadauIia: TimeStepLimit` のように方法の名前と終了理由を表示する。
+`diagnostics()` の `PdeDiagnostics` は試行・受理・棄却・失敗した刻みの数、因子分解と線形求解の回数、右辺とヤコビアンの評価回数、最後の刻みの正規化した誤差推定を持つ。
+試行した刻みの数は受理・棄却・失敗の和に等しい。
+`trust()` は出力に反映した状態の信頼の程度（`PartialResultTrust`）である。
+
+`PdeWorkspace::last_attempt()` は最後の呼び出しの記録 `AttemptRecord<PdeProgress>` を返す。
+その `outcome()` は事前検査で拒まれたとき `PreflightRejected`、エラーで終わったとき `Failed`、成功せずに止まったとき `Stopped`、成功したとき `Succeeded` になる。
+`progress()` の `PdeProgress` は、その呼び出しが受理した最後の状態 `state()`、時刻 `time()`、刻みの数 `steps()`、最後の誤差推定 `last_step_error_estimate()`、信頼の程度 `trust()` を持ち、`into_state()` で次の `advance` に渡せる状態になる。
+`Err` で終わった呼び出しの部分結果はここから読む。
+所有する結果を返す `solve` と `solve_with_options` は同じ `PdeProgress` を `PartialFailure` に入れて返す。
+
+## 試行の上限で止めた計算の再開
+
+次のセルは上の手順を一つの熱伝導の計算で確かめる。
+区間 $[0,1]$ の両端を 0 に保った $u_t=u_{xx}$ を 41 点の一様格子（`StructuredFdmPlan::dirichlet_laplacian`）で離散化し、初期値 $\sin\pi x$ から終端時刻 0.1 まで、既定の Radau IIA 法と許容誤差 $10^{-8}$ で進める。
+出力は終端時刻までを等分した `Times` の時刻とし、出力先には `PdeOutputSink` を実装した `Recorder` を使って $x=0.5$ の値を記録する。
+
+1 回目の `advance` は試行の上限を入力の値に絞り、`TimeStepLimit` で止める。
+止まった状態を `PdeCheckpoint` に写し、新しく作った状態へ `resume` で戻して、既定の上限で終端まで進める。
+独立な検算は半離散系の厳密解 $u(0.5,t)=e^{-\lambda_h t}$、$\lambda_h=(4/h^2)\sin^2(\pi h/2)$ である。
+1 番目の表は各観測の要求の番号、時刻、出した呼び出し、値と厳密解の差、2 番目の表は呼び出しごとの終了理由、刻みと因子分解の数、作業領域に残った試行の記録である。
+
+```rust
+//| id: pde-transient-checkpoint-resume
+//| ref: pde-transient-checkpoint-resume
+//| title: 試行の上限で止めた熱伝導をチェックポイントから再開する
+//| run: reactive
+//| crates: [scioxide-pde, scioxide-core]
+//| inputs:
+//|   first_budget: {"type":"range","label":"1 回目の試行の上限 [回]","description":"1 回目の advance が試せる刻みの数を変える。","min":1,"max":40,"step":1,"value":8}
+//|   requests: {"type":"range","label":"指定時刻の数 [-]","description":"終端時刻 0.1 までを等分した出力時刻の数を変える。","min":1,"max":20,"step":1,"value":10}
+//| cases:
+//|   - {"id":"enough-budget","label":"上限 40 回","description":"1 回目で終端に届き、再開は刻みを進めずに Completed を返す。","inputs":{"first_budget":40}}
+//|   - {"id":"one-step","label":"上限 1 回","description":"1 回目は 1 刻みで止まり、すべての指定時刻を再開側が出す。","inputs":{"first_budget":1}}
+//|   - {"id":"many-requests","label":"指定時刻 20 個","description":"連続補間出力で 20 個の時刻を出しても、刻みの数は変わらない。","inputs":{"requests":20}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"calls","path":"/rows/0/1","equals":"TimeStepLimit"}
+//|       - {"artifact":"calls","path":"/rows/0/3","equals":8}
+//|       - {"artifact":"calls","path":"/rows/0/6","equals":"Stopped"}
+//|       - {"artifact":"calls","path":"/rows/1/1","equals":"Completed"}
+//|       - {"artifact":"calls","path":"/rows/1/2","approx":{"value":0.1,"rtol":1e-12}}
+//|       - {"artifact":"samples","path":"/rows/2/2","equals":"1 回目"}
+//|       - {"artifact":"samples","path":"/rows/3/2","equals":"再開"}
+//|       - {"artifact":"samples","path":"/rows/9/0","equals":9}
+//|       - {"artifact":"samples","path":"/rows/9/5","range":{"max":1e-7}}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+//|   - case: enough-budget
+//|     expect:
+//|       - {"artifact":"calls","path":"/rows/0/1","equals":"Completed"}
+//|       - {"artifact":"calls","path":"/rows/1/3","equals":0}
+//|   - case: one-step
+//|     expect:
+//|       - {"artifact":"samples","path":"/rows/0/2","equals":"再開"}
+//|       - {"artifact":"samples","path":"/rows/9/5","range":{"max":1e-7}}
+//|   - case: many-requests
+//|     expect:
+//|       - {"artifact":"calls","path":"/rows/0/3","equals":8}
+//|       - {"artifact":"samples","path":"/rows/19/0","equals":19}
+use scioxide_core::{Budget, ExecutionContext, SciOxideError, RealScalar};
+use scioxide_pde::{
+    FieldData, FieldPoint, ParabolicOptions, ParabolicProblem, PdeCheckpoint, PdeObservation,
+    PdeOutputSchedule, PdeOutputSink, PdeSolveReport, PdeWorkspace, StructuredFdmPlan,
+};
+
+// 出力先: 観測ごとに (要求の番号, 時刻, x = 0.5 の値) を記録する。
+struct Recorder {
+    middle: usize,
+    samples: Vec<(Option<usize>, f64, f64)>,
+}
+impl PdeOutputSink<f64> for Recorder {
+    fn observe(
+        &mut self,
+        observation: PdeObservation<'_, f64, f64>,
+    ) -> Result<(), SciOxideError> {
+        let value = observation.values()[self.middle];
+        self.samples
+            .push((observation.request_index(), observation.time(), value));
+        Ok(())
+    }
+}
+let nodes = 41_usize;
+let h = 1.0 / (nodes - 1) as f64;
+let end = 0.1;
+let count = requests.round() as usize;
+let plan =
+    StructuredFdmPlan::dirichlet_laplacian([0.0], [1.0], [nodes]).map_err(|e| e.to_string())?;
+let source = FieldData::zero();
+let problem = ParabolicProblem::new(&plan, &source, end).map_err(|e| e.to_string())?;
+let times = (1..=count)
+    .map(|k| end * k as f64 / count as f64)
+    .collect::<Vec<_>>();
+let rest = ParabolicOptions::new().with_output_schedule(PdeOutputSchedule::Times(times));
+let budget = Budget::try_from(first_budget.round() as usize).map_err(|e| e.to_string())?;
+let first = rest.clone().with_step_budget(budget);
+let pi = core::f64::consts::PI;
+let initial = FieldData::time_invariant(move |p: FieldPoint<f64, 1>| {
+    Ok(RealScalar::sin(pi * p.point[0]))
+});
+let mut sink = Recorder {
+    middle: nodes / 2,
+    samples: Vec::new(),
+};
+let mut workspace = problem.workspace().map_err(|e| e.to_string())?;
+let mut state = problem
+    .initial_state(&initial, &first)
+    .map_err(|e| e.to_string())?;
+let sequential = ExecutionContext::sequential;
+let stopped = problem
+    .advance(&first, &mut state, &mut sink, &mut workspace, sequential())
+    .map_err(|e| e.to_string())?;
+let split = sink.samples.len();
+// 呼び出しごとの終了理由、刻みの数、ワークスペースに残った試行の記録を 1 行にまとめる。
+let summary = |call: &'static str, report: &PdeSolveReport<f64>, work: &PdeWorkspace<f64>| {
+    let d = report.diagnostics();
+    let record = work.last_attempt();
+    (
+        call,
+        report.termination().to_string(),
+        report.final_time(),
+        d.num_time_steps(),
+        d.num_accepted_steps(),
+        d.num_factorizations(),
+        record.map(|r| format!("{:?}", r.outcome())),
+        record.and_then(|r| r.progress()).map(|p| p.time()),
+    )
+};
+let mut calls = vec![summary("1 回目", &stopped, &workspace)];
+// 最後に受理した状態を写し取り、新しく作った状態へ戻して再開する。
+let checkpoint = PdeCheckpoint::new(&state).map_err(|e| e.to_string())?;
+let mut resumed = problem
+    .initial_state(&initial, &rest)
+    .map_err(|e| e.to_string())?;
+let finished = problem
+    .resume(
+        &rest,
+        &checkpoint,
+        &mut resumed,
+        &mut sink,
+        &mut workspace,
+        sequential(),
+    )
+    .map_err(|e| e.to_string())?;
+// 半離散の厳密解 u(0.5, t) = exp(−λ_h t)、λ_h = (4/h²) sin²(πh/2)（独立な検算）。
+let lambda = 4.0 / (h * h) * RealScalar::powi(RealScalar::sin(pi * h / 2.0), 2);
+let rows = sink
+    .samples
+    .iter()
+    .enumerate()
+    .map(|(k, &(index, t, u))| {
+        let call = if k < split { "1 回目" } else { "再開" };
+        let exact = RealScalar::exp(-lambda * t);
+        (index, t, call, u, exact, (u - exact).abs())
+    })
+    .collect::<Vec<_>>();
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed6 = serde_json::json!({ "fractionDigits": 6 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "要求の番号", "type": "integer", "nullText": "なし" },
+    { "key": "1", "label": "時刻 t [-]", "type": "number", "format": fixed6 },
+    { "key": "2", "label": "呼び出し" },
+    { "key": "3", "label": "u(0.5, t) [-]", "type": "number", "format": fixed6 },
+    { "key": "4", "label": "半離散の厳密解 [-]", "type": "number", "format": fixed6 },
+    { "key": "5", "label": "差 [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "samples" })
+);
+let call_columns = serde_json::json!([
+    { "key": "0", "label": "呼び出し" },
+    { "key": "1", "label": "終了理由" },
+    { "key": "2", "label": "到達時刻 [-]", "type": "number", "format": fixed6 },
+    { "key": "3", "label": "試行した刻み [回]", "type": "integer" },
+    { "key": "4", "label": "受理 [回]", "type": "integer" },
+    { "key": "5", "label": "因子分解 [回]", "type": "integer" },
+    { "key": "6", "label": "試行の記録", "nullText": "なし" },
+    { "key": "7", "label": "PdeProgress の時刻 [-]", "type": "number", "format": fixed6, "nullText": "なし" }
+]);
+calls.push(summary("再開", &finished, &workspace));
+emit_table_with_columns!(
+    call_columns,
+    calls,
+    metadata = serde_json::json!({ "id": "calls" })
+);
+let worst = rows.iter().map(|row| row.5).fold(0.0, f64::max);
+let outcome = if finished.is_success() {
+    Outcome::satisfied("再開した積分が終端時刻に達し、すべての指定時刻を出した")
+} else {
+    Outcome::partial("再開した積分が終端時刻の前に止まった")
+        .explanation("状態は最後に受理した時刻の値で、試行の上限を上げて再び再開できる。")
+};
+emit_outcome!(
+    outcome
+        .status(finished.termination().to_string())
+        .diagnostic("到達時刻", finished.final_time(), None)
+        .diagnostic("観測の数", rows.len() as f64, None)
+        .diagnostic("半離散の厳密解との最大の差", worst, None)
+);
+```
+
+既定の上限 8 回では、1 回目の呼び出しは $t=0.0304$ で `TimeStepLimit` になり、要求 0〜2（$t=0.01,0.02,0.03$）を出した。
+作業領域の記録は `Stopped` で、`PdeProgress` の時刻は状態の時刻と同じである。
+再開は残りの要求 3〜9 を、番号を保ったまま出し、17 刻みで `Completed` に達した。
+すべての観測で半離散の厳密解との差は $2.6\times10^{-9}$ 以下で、許容誤差 $10^{-8}$ の範囲にある。
+上限を 40 回にすると 1 回目が 25 刻みで終端に届き、再開は刻みを進めずに `Completed` を返す。
+分けて解いても、刻みの総数は 1 回で解いた 25 刻みとほぼ同じである（上限 1 回なら 1 + 25 刻み）。
+再開した積分は最初の刻みを推定し直すので、刻みの列と途中の値は 1 回で解いた場合と丸めの水準ではなく許容誤差の水準で異なる。
+指定時刻を 20 個にしても刻みの数は 8 と 17 のままで、`Times` が連続補間出力から値を補間することが分かる。
+
+## まとめ
+
+時間発展は、問題（半離散系）、設定、呼び出し側が持つ状態、作業領域の四つを分けて扱い、`advance` が状態を進めてレポートを返す。
+途中の場は `PdeOutputSchedule` で時刻を選び、`PdeOutputSink` を実装した出力先（閉包、`PdeTrajectory`、自作の型）で受け取る。
+`Times` は連続補間出力を持つ積分法でだけ使え、後退 Euler 法、Crank–Nicolson 法、Rannacher 起動とは組み合わせられない。
+上限で止まった計算は同じ状態で `advance` を呼ぶか、`PdeCheckpoint` から `resume` して続けられる。
+終了理由は `is_success()` で判定し、`Completed` 以外の終了で残る状態は `final_time()` の時刻の値として解釈する。
+
+## 次に読むページ
+
+- [放物型方程式の時間積分](../parabolic-time-integration/)：`ParabolicScheme` と刻みの決め方が拡散の半離散系の安定性と精度にどう効くかを確かめる。
+- [波動方程式と CFL 条件](../hyperbolic-waves-and-cfl/)：`HyperbolicProblem` で `CflPolicy` を替えたとき、終了理由が `Completed` のまま不安定になる例を確かめる。
+- [棒の熱拡散の例](../../examples/heat-crank-nicolson/)：`TimeSteps` の出力と後退 Euler 法・Crank–Nicolson 法の比較を、段差の初期値で確かめる。
+- [線の方法と半離散系](../method-of-lines-and-nonlinear/)：`ParabolicProblem` を使わずに、半離散系を `scioxide-ode` の積分法へ直接渡す方法を確かめる。

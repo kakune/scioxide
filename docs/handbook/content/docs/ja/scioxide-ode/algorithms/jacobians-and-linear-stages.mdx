@@ -1,0 +1,494 @@
+---
+title: Jacobi 行列と各ステージの線形方程式の解法
+description: 陰的な方式が使う Jacobi 行列の求め方（解析的、自動微分、前進差分）と既定の順序、差分の刻み、クロージャの Jacobi 行列、疎性パターンと彩色差分、密な LU・疎な LU・行列を作らない GMRES の選択と、求め方と解き方の組み合わせの比較。
+sidebar:
+  order: 325
+references:
+  ode-derivative-strategy: "jacobi-行列の求め方"
+  ode-finite-difference-jacobian: "差分による-jacobi-行列"
+  ode-stage-backends: "線形段の解き方"
+  ode-sparse-stages: "疎な-lu-と疎性パターン"
+  ode-krylov-backend: "行列を作らない-gmres"
+---
+
+陰的な Runge–Kutta 法、BDF 法、Rosenbrock-W 法と DAE の `DaeBdf` は、刻みごとに
+
+$$
+\bigl(M - h\gamma J\bigr)\, \Delta = r, \qquad J = \frac{\partial f}{\partial y}(t, y)
+$$
+
+の形の線形方程式を解く（$\gamma$ は方式の係数、$M$ は質量行列）。
+このページでは Jacobi 行列 $J$ の求め方と、この線形方程式（線形段）の解き方を扱う。
+どちらも精度より計算量に効き、解の精度は段の方程式の収束の判定と局所誤差の制御で決まる。
+段の非線形方程式の Newton 法と分解の再利用は[陰的 Runge–Kutta 法と質量行列](../implicit-runge-kutta-and-mass-matrices/)で説明する。
+
+## Jacobi 行列の求め方
+
+$J$ の求め方は方式の `with_derivative_strategy` に渡す `DerivativeStrategy`（scioxide-differentiate）で選ぶ。
+`BackwardEuler`、`ImplicitTrapezoid`、`Sdirk`、`GaussRk`、`RadauIia`、`Bdf`、`RosenbrockW` がこの設定を持ち、`DaeBdf` は `DaeNumericalOptions::with_derivative_strategy` で選ぶ。
+方式の既定は `DerivativeStrategy::AnalyticOrAutomaticOrForward` で、次の順に求め方を試す。
+
+1. 解析的な Jacobi 行列 `OdeSystem::jacobian`。
+2. 自動微分による Jacobi 行列 `OdeSystem::automatic_jacobian`。
+3. 前進差分。
+
+求め方が `Ok(None)` を返したときだけ次の求め方に進み、エラーを返したときはそのエラーで止まる。
+`jacobian` と `automatic_jacobian` の既定の実装は `Ok(None)` を返すので、何も実装しなければ前進差分になる。
+`DerivativeStrategy::Analytic` のように 1 つの求め方だけを選ぶと、それが `Ok(None)` を返したときは Jacobi 行列を得られずに失敗する。
+`Forward` と `Central` は差分だけを使い、`AnalyticOrForward` と `AnalyticOrCentral` は解析的な求め方の次に差分を試す（scioxide-differentiate の `DerivativeStrategy` の既定は `AnalyticOrForward` で、`scioxide-ode` の方式の既定とは違う）。
+
+`jacobian` と `automatic_jacobian` の呼び出しは `EvaluationRole::Jacobian` の評価として数え、差分のための右辺の呼び出しは `RightHandSide` の評価として数える。
+返した行列は大きさと有限性を確かめられ、NaN や無限大は `NonFinite`（`Callback`）のエラーになる。
+状態が複素数のときは、どの求め方も $f$ が $y$ について正則（複素微分可能）であることを仮定する。
+
+### 差分による Jacobi 行列
+
+前進差分は、列 $j$ の差分の刻みを
+
+$$
+\delta_j = \sqrt{\varepsilon}\, \max(|y_j|,\, \mathrm{atol}_j)
+$$
+
+として（中心差分では $\sqrt[3]{\varepsilon}$）、$J_{:,j} \approx \bigl(f(t, y + \delta_j e_j) - f(t, y)\bigr)/\delta_j$ を求める。
+$\varepsilon$ は機械イプシロン、$\mathrm{atol}_j$ はその成分の絶対許容誤差（0 なら 1）である。
+下限を 1 ではなく絶対許容誤差にとるので、Robertson の反応系の中間体のような小さい成分でも、その大きさに見合う刻みになる。
+$f(t, y)$ は段の残差の計算ですでに求めた値を使い回すので、密な Jacobi 行列 1 回に右辺の評価は $d$ 回要る。
+割った値が 0 になった成分は、成分の尺度の最大値で刻みを取り直してもう一度差分を求める（$y_0 + y_1 + y_2 - 1$ のように大きい項の中で小さい成分の寄与が消える場合に備える）。
+前進差分の誤差は丸め誤差と打ち切り誤差の釣り合いで約 $\sqrt{\varepsilon}$ の相対誤差になる（[Taylor 展開と刻みの選び方](../../../scioxide-differentiate/algorithms/taylor-and-step-size/)）。
+Jacobi 行列の誤差は Newton 法の収束の速さを変えるだけで、段の方程式の残差は常に $f$ そのもので評価するので、収束した解の精度は変わらない。
+
+### クロージャで与える Jacobi 行列
+
+`OdeFn` は右辺のクロージャから系を作り、`with_jacobian` で解析的な Jacobi 行列のクロージャを、`with_automatic_jacobian` で自動微分による Jacobi 行列のクロージャを付ける。
+どちらのクロージャも `Fn(S, &[T], &mut MatrixViewMut<'_, T>) -> Result<(), SciOxideError>` の形で、$(t, y)$ での $\partial f/\partial y$ を $d \times d$ の行列に書く。
+`OdeFn` の型引数のうち Jacobi 行列の位置は `JacobianCallback` を満たす型で、このトレイトは外部からの実装を許可していないため、クロージャと、クロージャがないことを表す `NoJacobian` だけが実装する。
+`NoJacobian` の位置の Jacobi 行列は `Ok(None)` を返すので、次の求め方に進む。
+自動微分による Jacobi 行列はたとえば scioxide-ad の前進モードで右辺を微分して書く（[前進モード](../../../scioxide-ad/algorithms/forward-mode/)）。
+
+`OdeSystem::jacobian_is_constant` が真を返す系（$f(t, y) = Jy + g(t)$、$J$ が定数）では、陰的な方式は Jacobi 行列を刻みをまたいで使い回し、直接法の分解が現在のものなら各段を 1 回の補正で解く。
+Rosenbrock-W 法は時間の偏微分 $\partial f/\partial t$ も使い、`OdeSystem::time_derivative` で与えなければ同じ `DerivativeStrategy` に従って状態を固定した時間の差分で求める（[Rosenbrock 法と剛性の自動切り替え](../rosenbrock-and-stiffness-switching/)）。
+
+## 線形段の解き方
+
+線形段の解き方は方式の `with_backend` に渡す `OdeStageBackend` で選ぶ。
+選んだ解き方は失敗しても別の解き方に切り替わらない。
+
+| `OdeStageBackend` | 解き方 | Jacobi 行列の求め方 | 1 回の分解か解法の計算量の目安 |
+|---|---|---|---|
+| `Dense`（既定） | 部分ピボット付き LU 分解 | 解析的、自動微分、列ごとの差分 | 分解 $O(d^3)$、解法 $O(d^2)$ |
+| `Sparse { pattern, limits }` | 疎な LU 分解 | パターン上の解析的な値、彩色した差分 | 非零要素と fill-in の数による |
+| `Krylov { iterations, restart, operator_scratch, preconditioner_scratch }` | Jacobi 行列と vector の積による再始動付き GMRES | 解析的な積、差分の積 | 反復ごとに積 1 回 |
+
+疎な LU と GMRES は単位行列の質量行列に限られ、それ以外の質量行列では最初の刻みで `InvalidInput` を返す。
+方式は Jacobi 行列と分解を、[簡略 Newton 法](oxref:ode-newton-modes)の規則に従って刻みをまたいで使い回す。
+
+### 疎な LU と疎性パターン
+
+`OdeStageBackend::Sparse` は、Jacobi 行列の構造的な非零位置を CSR 形式の `StructuralPattern`（scioxide-core）で受け取る。
+パターンは $d \times d$ で、すべての対角成分を含み、値が 0 になりうる位置も含めて $f$ のすべての依存関係を含まなければならない。
+条件を満たさないパターンは、方式が作業領域を用意するときに `InvalidInput` になる。
+主対角と隣の 2 本の対角だけのパターンは 3 重対角行列として分解する。
+`limits` は `SparseLuLimits`（scioxide-sparse）で、分解の要素数と作業用のバイト数の上限を与える（[三角行列と疎な LU](../../../scioxide-sparse/algorithms/triangular-and-sparse-lu/)）。
+`GaussRk` は同じパターンを繰り返した $2d \times 2d$ の結合した系を、`RadauIia` は $d \times d$ の各系をこのパターンで分解する。
+
+疎な解き方での Jacobi 行列の値は、`OdeSystem::sparse_jacobian` が CSR の順に書く。
+これを実装しなければ、パターンの列を互いに重ならない組に分けて（列の彩色）、組ごとに 1 回の右辺の評価で差分を求める（[疎な Jacobi 行列と彩色](../../../scioxide-differentiate/algorithms/sparse-coloring/)）。
+3 重対角のパターンは少ない色数で塗れるので、Jacobi 行列 1 回の評価の回数は $d$ によらない。
+疎な解き方には自動微分の求め方がない。
+
+### 行列を作らない GMRES
+
+`OdeStageBackend::Krylov` は Jacobi 行列を作らず、Jacobi 行列とベクトルの積 $Jv$ だけを使う再始動付き GMRES で線形段を解く（[Krylov 部分空間法と前処理](../../../scioxide-linalg/algorithms/krylov-and-preconditioning/)）。
+`iterations` は 1 回の線形解法の反復の上限、`restart` は保持する Krylov 基底の数、`operator_scratch` と `preconditioner_scratch` は解析的な積と前処理の 1 回の適用が使う作業用の値の数である。
+積は `OdeSystem::jacobian_product` か `OdeSystem::jacobian_operator` が与え、与えなければ $Jv \approx (f(t, y + \delta v) - f(t, y))/\delta$ の差分で求める（$\delta |v_j| \le \sqrt{\varepsilon}\, s_j$）。
+差分の積の精度は状態の尺度に対して約 $\sqrt{\varepsilon}$ なので、それより厳しい段の許容誤差には解析的な積が要る。
+線形段の許容誤差は成分の尺度の最小値に対して残差の 1% を目安にし、1% より緩くはしない。
+1 段の系は `OdeSystem::stage_preconditioner`（$I - \gamma J$ の右前処理）で、`GaussRk` の結合した系は `OdeSystem::coupled_preconditioner` で前処理できる。
+`RadauIia` は各系の実部のシフトで `stage_preconditioner` を使う。
+前処理がなければ、刻みが大きく $\gamma h \|J\|$ が大きいほど GMRES の反復が増える。
+
+## 求め方と解き方の比較
+
+次の 2 つのセルは 1 次元の反応拡散方程式 $u_t = u_{xx} - u^3$（$0 < x < 1$、$u(0) = u(1) = 0$、$u(x, 0) = 2\sin \pi x$）を、内部の格子点 $d$ 個の 2 次の差分で離散化した半離散系
+
+$$
+u_i' = \frac{u_{i-1} - 2u_i + u_{i+1}}{\Delta x^2} - u_i^3, \qquad \Delta x = \frac{1}{d + 1}
+$$
+
+を `RadauIia` で $t = 0.1$ まで解く。
+Jacobi 行列は 3 重対角で、対角は $-2/\Delta x^2 - 3u_i^2$、隣の 2 本は $1/\Delta x^2$ である。
+拡散の項の固有値は約 $-4/\Delta x^2$ まで広がるので、$d$ を増やすほど剛性が強くなる。
+
+次のブロックは 2 つのセルが共有する定義である。
+`ReactionDiffusion` が右辺 `rhs`、密な Jacobi 行列 `jacobian`、疎性パターン上の値 `sparse_jacobian`、Jacobi 行列とベクトルの積 `jacobian_product` を与え、`entry` が位置 $(i, j)$ の Jacobi 行列の値を返す。
+`initial_profile` は初期値、`integrate` は許容誤差 $\varepsilon$ で $t = 0.1$ まで解いて終端の状態とレポートを返す。
+
+```rust
+//| id: ode-reaction-diffusion-model
+//| kind: definitions
+//| title: 反応拡散方程式の半離散系と Jacobi 行列の 3 つの与え方
+//| crates: [scioxide-core, scioxide-linalg, scioxide-ode]
+use scioxide_core::{
+    ErrorTolerance, ExecutionContext, SciOxideError, NormSelection, SolveContext,
+    StructuralPatternView,
+};
+use scioxide_linalg::{MatrixViewMut, Vector};
+use scioxide_ode::{OdeMethod, OdeOptions, OdeProblem, OdeSolveReport, OdeState, OdeSystem};
+
+/// 半離散系 u_i' = D(u_{i−1} − 2u_i + u_{i+1}) − u_i³（D = 1/Δx²、境界の値は 0）。
+pub(crate) struct ReactionDiffusion {
+    pub(crate) points: usize,
+    pub(crate) diffusion: f64,
+}
+
+impl ReactionDiffusion {
+    /// 位置 (row, col) の Jacobi 行列の値。3 重対角の外は 0。
+    pub(crate) fn entry(&self, u: &[f64], row: usize, col: usize) -> f64 {
+        match row.abs_diff(col) {
+            0 => -2.0 * self.diffusion - 3.0 * u[row] * u[row],
+            1 => self.diffusion,
+            _ => 0.0,
+        }
+    }
+}
+
+impl OdeSystem<f64> for ReactionDiffusion {
+    fn dimension(&self) -> usize {
+        self.points
+    }
+    fn rhs(
+        &self,
+        _: f64,
+        u: &[f64],
+        out: &mut [f64],
+        _: &mut SolveContext<'_, '_>,
+    ) -> Result<(), SciOxideError> {
+        for i in 0..self.points {
+            let left = if i > 0 { u[i - 1] } else { 0.0 };
+            let right = if i + 1 < self.points { u[i + 1] } else { 0.0 };
+            out[i] = self.diffusion * (left - 2.0 * u[i] + right) - u[i].powi(3);
+        }
+        Ok(())
+    }
+    fn jacobian(
+        &self,
+        _: f64,
+        u: &[f64],
+        j: &mut MatrixViewMut<'_, f64>,
+        _: &mut SolveContext<'_, '_>,
+    ) -> Result<Option<()>, SciOxideError> {
+        for row in 0..self.points {
+            for col in 0..self.points {
+                j.set(row, col, self.entry(u, row, col))?;
+            }
+        }
+        Ok(Some(()))
+    }
+    fn sparse_jacobian(
+        &self,
+        _: f64,
+        u: &[f64],
+        pattern: StructuralPatternView<'_>,
+        values: &mut [f64],
+        _: &mut SolveContext<'_, '_>,
+    ) -> Result<Option<()>, SciOxideError> {
+        let (starts, columns) = (pattern.row_ptr(), pattern.col_indices());
+        for row in 0..self.points {
+            for k in starts[row]..starts[row + 1] {
+                values[k] = self.entry(u, row, columns[k]);
+            }
+        }
+        Ok(Some(()))
+    }
+    fn jacobian_product(
+        &self,
+        _: f64,
+        u: &[f64],
+        x: &[f64],
+        out: &mut [f64],
+        _: &mut [f64],
+        _: &mut SolveContext<'_, '_>,
+    ) -> Result<Option<()>, SciOxideError> {
+        for (row, out) in out.iter_mut().enumerate() {
+            let columns = row.saturating_sub(1)..(row + 2).min(self.points);
+            *out = columns.map(|col| self.entry(u, row, col) * x[col]).sum();
+        }
+        Ok(Some(()))
+    }
+}
+
+/// 初期値 u_i(0) = 2 sin(π i Δx)（f64 の標準関数）。
+pub(crate) fn initial_profile(points: usize) -> Vec<f64> {
+    let dx = 1.0 / (points as f64 + 1.0);
+    (1..=points)
+        .map(|i| 2.0 * (core::f64::consts::PI * i as f64 * dx).sin())
+        .collect()
+}
+
+/// u(0) から t = 0.1 まで許容誤差 ε で解き、終端の状態とレポートを返す。
+pub(crate) fn integrate<M: OdeMethod<f64> + Clone>(
+    method: &M,
+    system: &ReactionDiffusion,
+    epsilon: f64,
+) -> Result<(Vec<f64>, OdeSolveReport<f64>), String> {
+    let tolerance = ErrorTolerance::scalar(epsilon, epsilon, NormSelection::RootMeanSquare)
+        .map_err(|e| e.to_string())?;
+    let options = OdeOptions::new().with_error_tolerance(tolerance);
+    let problem = OdeProblem::new(system, 0.1);
+    let mut workspace = method
+        .workspace(&problem, &options)
+        .map_err(|e| e.to_string())?;
+    let initial = Vector::from_vec(initial_profile(system.points));
+    let mut state = OdeState::new(0.0, initial);
+    let report = method
+        .advance(
+            &problem,
+            &options,
+            &mut state,
+            &mut (),
+            &mut workspace,
+            ExecutionContext::sequential(),
+        )
+        .map_err(|e| e.to_string())?;
+    if !report.is_success() {
+        return Err(format!("{:?}", report.termination()));
+    }
+    Ok((state.values().to_vec(), report))
+}
+```
+
+最初のセルは密な LU と疎な LU のそれぞれで、解析的な Jacobi 行列と差分の Jacobi 行列を比べる。
+参照解は `DormandPrince853` で許容誤差 $10^{-12}$ で求める。
+陽的な方式は安定性のために刻みが小さく、精度の高い独立な参照解になる。
+入力は格子点の数 $d$ と許容誤差（絶対・相対とも $10^q$）で、このセルは $d$、$q$ と参照解を次のセルに渡す。
+
+```rust
+//| id: ode-jacobian-backends
+//| ref: ode-jacobian-backends
+//| title: 反応拡散方程式で Jacobi 行列の求め方と直接法の解き方を比べる
+//| run: button
+//| cache: inputs
+//| uses: [ode-reaction-diffusion-model]
+//| crates: [scioxide-core, scioxide-differentiate, scioxide-linalg, scioxide-ode, scioxide-sparse]
+//| exports: [points, tolerance_exponent, reference]
+//| inputs:
+//|   points: {"type":"range","label":"内部の格子点の数 d [-]","description":"系の次元。拡散の剛性は d² に比例して強くなる。","min":10,"max":80,"step":10,"value":40}
+//|   tolerance_exponent: {"type":"range","label":"許容誤差の指数 q [-]","description":"絶対・相対許容誤差をともに 10^q とする。","min":-8,"max":-4,"step":1,"value":-6}
+//| cases:
+//|   - {"id":"fine-grid","label":"d = 80","description":"差分の評価は密な解き方で d に比例して増え、疎な解き方では増えない。","inputs":{"points":80}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"backends","path":"/rows/0/2","range":{"max":1e-6}}
+//|       - {"artifact":"backends","path":"/rows/3/2","range":{"max":1e-6}}
+//|       - {"artifact":"backends","path":"/rows/0/6","range":{"min":1}}
+//|       - {"artifact":"backends","path":"/rows/1/6","equals":0}
+//|   - case: fine-grid
+//|     expect:
+//|       - {"artifact":"backends","path":"/rows/1/5","range":{"min":400}}
+//|       - {"artifact":"backends","path":"/rows/3/5","range":{"max":140}}
+use scioxide_core::{EvaluationRole, StructuralPattern};
+use scioxide_differentiate::DerivativeStrategy;
+use scioxide_ode::{DormandPrince853, OdeStageBackend, RadauIia};
+use scioxide_sparse::SparseLuLimits;
+
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let d = points as usize;
+let system = ReactionDiffusion {
+    points: d,
+    diffusion: (points + 1.0).powi(2),
+};
+// 独立な参照解: 陽的な DormandPrince853 を許容誤差 1e-12 で解いた終端の状態。
+let (reference, _) = integrate(&DormandPrince853::new(), &system, 1e-12)?;
+// 3 重対角の疎性パターン（CSR、行ごとに列の番号を昇順に並べる）。
+let mut starts = vec![0];
+let mut columns = Vec::new();
+for row in 0..d {
+    columns.extend(row.saturating_sub(1)..(row + 2).min(d));
+    starts.push(columns.len());
+}
+let pattern = StructuralPattern::new(d, d, starts, columns).map_err(|e| e.to_string())?;
+let limits = SparseLuLimits::new(16 * d, 1 << 22);
+let sparse = OdeStageBackend::Sparse { pattern, limits };
+let forward = DerivativeStrategy::Forward;
+let configurations = [
+    ("密な LU", "解析的", RadauIia::new()),
+    (
+        "密な LU",
+        "前進差分",
+        RadauIia::new().with_derivative_strategy(forward),
+    ),
+    (
+        "疎な LU",
+        "解析的",
+        RadauIia::new().with_backend(sparse.clone()),
+    ),
+    (
+        "疎な LU",
+        "彩色した差分",
+        RadauIia::new()
+            .with_backend(sparse)
+            .with_derivative_strategy(forward),
+    ),
+];
+let epsilon = 10.0_f64.powf(tolerance_exponent);
+let mut rows = Vec::new();
+for (backend, source, method) in configurations {
+    let (state, report) = integrate(&method, &system, epsilon)?;
+    let error = state
+        .iter()
+        .zip(&reference)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0, f64::max);
+    let counts = report.accounting().total().map_err(|e| e.to_string())?;
+    rows.push((
+        backend,
+        source,
+        error,
+        report.accepted_steps(),
+        report.rejected_steps(),
+        counts.provider(EvaluationRole::RightHandSide),
+        counts.provider(EvaluationRole::Jacobian),
+        counts.provider(EvaluationRole::Factorization),
+    ));
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "解き方" },
+    { "key": "1", "label": "求め方" },
+    { "key": "2", "label": "参照解との差 [-]", "type": "number", "format": sci2 },
+    { "key": "3", "label": "受理 [回]", "type": "integer" },
+    { "key": "4", "label": "棄却 [回]", "type": "integer" },
+    { "key": "5", "label": "右辺の評価 [回]", "type": "integer" },
+    { "key": "6", "label": "Jacobi 行列 [回]", "type": "integer" },
+    { "key": "7", "label": "分解 [回]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "backends" })
+);
+export!(points, points);
+export!(tolerance_exponent, tolerance_exponent);
+export!(reference, reference);
+```
+
+既定値（$d = 40$、$q = -6$）では、4 つの組み合わせはどれも 17 刻みを棄却なしで受理し、参照解との差は $6.0 \times 10^{-9}$ である。
+解析的な Jacobi 行列の評価は 2 回で、簡略 Newton 法がそれを 17 刻みにわたって使い回す。
+分解は 18 回で、`RadauIia` は刻み幅が変わるたびに分解を作り直す。
+
+密な LU で前進差分を使うと、右辺の評価は 120 回から 277 回に増える。
+増えた 157 回は Jacobi 行列 1 回あたり約 $2d$ 回である。
+3 重対角の外の成分は差分が 0 になるので、刻みを取り直してもう一度差分を求めるためで、すべての成分が 0 でない Jacobi 行列なら 1 回あたり約 $d$ 回になる。
+疎な LU の彩色した差分では、増える評価は 10 回で、$d = 80$ でも 8 回と $d$ によらない。
+密な LU の分解は 1 回に $O(d^3)$ の計算量がかかるが、3 重対角の分解は $O(d)$ で済むので、$d$ が大きい問題では疎な LU の方が速い。
+許容誤差を $10^{-8}$ にすると 52 刻みになり、参照解との差は 4 つとも $2.2 \times 10^{-11}$ に下がる。
+差分の Jacobi 行列は Newton 法の収束の速さを変えるだけなので、解析的な Jacobi 行列と誤差は変わらず、違いは評価の回数に現れる。
+
+次のセルは同じ $d$、$q$ と参照解を前のセルから受け取り、行列を作らない GMRES で解く。
+Jacobi 行列とベクトルの積は、解析的な `jacobian_product` と差分の 2 通りで、前処理は使わない。
+入力は再始動までに保持する Krylov 基底の数（`restart`）で、1 回の線形解法の反復は 200 回までとする。
+
+```rust
+//| id: ode-krylov-stages
+//| ref: ode-krylov-stages
+//| title: 行列を作らない GMRES で線形段を解き、積の求め方と再始動の長さを比べる
+//| run: button
+//| uses: [ode-reaction-diffusion-model]
+//| crates: [scioxide-core, scioxide-differentiate, scioxide-linalg, scioxide-ode]
+//| dependsOn:
+//|   solve: ode-jacobian-backends
+//| inputs:
+//|   restart: {"type":"range","label":"再始動の長さ m [-]","description":"GMRES が保持する Krylov 基底の数。","min":5,"max":40,"step":5,"value":30}
+//| cases:
+//|   - {"id":"short-restart","label":"m = 5","description":"再始動が短いと 1 回の線形解法の反復が増える。","inputs":{"restart":5}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"krylov","path":"/rows/0/1","range":{"max":1e-6}}
+//|       - {"artifact":"krylov","path":"/rows/0/6","equals":0}
+//|       - {"artifact":"krylov","path":"/rows/1/4","range":{"min":500}}
+//|   - case: short-restart
+//|     expect:
+//|       - {"artifact":"krylov","path":"/rows/0/1","range":{"max":1e-6}}
+use scioxide_core::{Budget, EvaluationRole};
+use scioxide_differentiate::DerivativeStrategy;
+use scioxide_ode::{OdeStageBackend, RadauIia};
+
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let points = solve["points"].as_f64().ok_or("格子点の数がない")?;
+let epsilon = 10.0_f64.powf(
+    solve["tolerance_exponent"]
+        .as_f64()
+        .ok_or("許容誤差がない")?,
+);
+let reference: Vec<f64> =
+    serde_json::from_value(solve["reference"].clone()).map_err(|e| e.to_string())?;
+let system = ReactionDiffusion {
+    points: points as usize,
+    diffusion: (points + 1.0).powi(2),
+};
+let krylov = OdeStageBackend::Krylov {
+    iterations: Budget::try_from(200).map_err(|e| e.to_string())?,
+    restart: Budget::try_from(restart as usize).map_err(|e| e.to_string())?,
+    operator_scratch: 0,
+    preconditioner_scratch: 0,
+};
+let configurations = [
+    ("解析的な積", RadauIia::new().with_backend(krylov.clone())),
+    (
+        "差分の積",
+        RadauIia::new()
+            .with_backend(krylov)
+            .with_derivative_strategy(DerivativeStrategy::Forward),
+    ),
+];
+let mut rows = Vec::new();
+for (source, method) in configurations {
+    let (state, report) = integrate(&method, &system, epsilon)?;
+    let error = state
+        .iter()
+        .zip(&reference)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0, f64::max);
+    let counts = report.accounting().total().map_err(|e| e.to_string())?;
+    rows.push((
+        source,
+        error,
+        report.accepted_steps(),
+        report.rejected_steps(),
+        counts.provider(EvaluationRole::RightHandSide),
+        counts.provider(EvaluationRole::LinearOperator),
+        counts.provider(EvaluationRole::Factorization),
+    ));
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "積の求め方" },
+    { "key": "1", "label": "参照解との差 [-]", "type": "number", "format": sci2 },
+    { "key": "2", "label": "受理 [回]", "type": "integer" },
+    { "key": "3", "label": "棄却 [回]", "type": "integer" },
+    { "key": "4", "label": "右辺の評価 [回]", "type": "integer" },
+    { "key": "5", "label": "作用素の適用 [回]", "type": "integer" },
+    { "key": "6", "label": "分解 [回]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "krylov" })
+);
+```
+
+既定値（$m = 30$）では、GMRES は分解を作らず、解析的な積による作用素の適用は 1065 回で、刻みと誤差は直接法と同じになる。
+差分の積では積ごとに右辺を 1 回評価するので、右辺の評価は 1242 回に増え、1 回の棄却が加わり、参照解との差は $1.0 \times 10^{-8}$ になる。
+$m = 5$ では再始動が増え、作用素の適用は解析的な積で 1214 回、差分の積で 1338 回に増える。
+前処理がないので、剛性が強い（$d$ が大きい）ほど 1 回の線形解法の反復が増える。
+$d$ が大きく Jacobi 行列を作れない問題では、`OdeSystem::stage_preconditioner` で前処理を与えると反復を減らせる。
+
+## まとめ
+
+陰的な方式は既定では解析的な Jacobi 行列、自動微分、前進差分の順に Jacobi 行列を求め、求め方が `Ok(None)` を返したときだけ次に進む。
+前進差分の刻みは $\sqrt{\varepsilon}\,\max(|y_j|, \mathrm{atol}_j)$ で、密な Jacobi 行列 1 回に $d$ 回（0 になる成分の取り直しを含めると最大 $2d$ 回）の右辺の評価を使い、疎性パターンを与えれば彩色によって評価の回数を列の色の数まで減らせる。
+線形段は `OdeStageBackend` で密な LU、疎な LU、行列を作らない GMRES から選び、疎な LU と GMRES は単位行列の質量行列に限られる。
+Jacobi 行列の誤差は Newton 法の収束の速さに効くだけで解の精度は変えないので、求め方と解き方は評価回数と計算量で選ぶ。
+次元が大きく Jacobi 行列が疎な問題では疎な LU と解析的な値を、Jacobi 行列を作れない問題では GMRES と良い前処理を使う。
+
+段の非線形方程式の反復と分解の再利用は[簡略 Newton 法と完全 Newton 法](oxref:ode-newton-modes)で、Rosenbrock-W 法での Jacobi 行列の使い方は[Rosenbrock 法と剛性の自動切り替え](../rosenbrock-and-stiffness-switching/)で確かめられる。

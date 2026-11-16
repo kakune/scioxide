@@ -1,0 +1,317 @@
+---
+title: "Three-Dimensional Rotations and Orientation Interpolation"
+description: "Represent rotations by unit quaternions with canonical signs, examine composition order, 12 Euler-angle sequences and intrinsic/extrinsic frames, gimbal-lock tests and angle conditioning, constant Slerp angular velocities and knot jumps, and batch-evaluation workspaces."
+sidebar:
+  order: 350
+references:
+  spatial-rotation-quaternion: "rotation-matrices-and-unit-quaternions"
+  spatial-rotation-composition: "composition-order-and-inverse-rotations"
+  spatial-euler-sequences: "sequences-and-intrinsicextrinsic-rotations"
+  spatial-gimbal-lock: "angle-ranges-and-gimbal-lock"
+  spatial-slerp: "spherical-linear-interpolation-slerp"
+  spatial-rotation-batches: "batch-evaluation-and-workspaces"
+---
+
+Rigid-body orientation is a three-dimensional rotation appearing in computations such as robot joints, spacecraft attitude control, and molecular-orientation comparisons.
+Rotation composition depends on order, and three-angle representations have singularities.
+Connecting key orientations over time also raises questions about interpolated angular velocity.
+This page uses derivations and numerical experiments to explain rotation representation and composition with `Rotation`, Euler angles and gimbal lock, and the basic orientation interpolant `Slerp`.
+[Rotation splines](../rotation-spline/) covers interpolation continuous through angular acceleration.
+
+## Rotation matrices and unit quaternions
+
+Three-dimensional rotations are elements of the special orthogonal group:
+
+$$
+\mathrm{SO}(3) = \{ R \in \mathbb{R}^{3\times 3} : R^\top R = I,\ \det R = 1 \}
+$$
+
+Rotation through angle $\theta$ [rad] about unit vector $\hat u$ can be represented by the unit quaternion:
+
+$$
+q = \left(\hat u \sin\frac{\theta}{2},\ \cos\frac{\theta}{2}\right) = (x, y, z, w), \qquad x^2 + y^2 + z^2 + w^2 = 1
+$$
+
+Since $q$ and $-q$ represent the same rotation, unit quaternions form a double cover of $\mathrm{SO}(3)$.
+A rotation matrix's nine entries satisfy six orthogonality constraints, while a quaternion has only the single unit-norm constraint.
+Renormalizing after composition therefore preserves rotation structure even as rounding accumulates.
+
+`Rotation` in `scioxide-spatial` represents active, right-handed rotations; `apply` rotates vectors in a fixed coordinate frame.
+A positive angle about $z$ rotates the $x$ axis toward $y$.
+Quaternions store the scalar part last, in $[x, y, z, w]$ order.
+Of $q$ and $-q$, it stores the one whose first nonzero component in $(w, x, y, z)$ order is positive, giving $w \ge 0$; even a half turn ($w = 0$) has a unique representative through the vector-part sign.
+Matrices use row-major storage and act on column vectors.
+
+### Construction and extraction
+
+| Function | Input | Processing and failures |
+|---|---|---|
+| `Rotation::identity()` | None | Identity rotation $[0, 0, 0, 1]$ |
+| `Rotation::from_quaternion(q)` | Any nonzero-length quaternion $[x, y, z, w]$ | Divides by the largest component before normalization, keeping the sum of squares in $[1, 4]$ without overflow or underflow. A zero quaternion gives `InvalidInput`; NaN or infinity gives `NonFinite` |
+| `Rotation::from_axis_angle(axis, angle)` | Axis, not necessarily unit length, and angle [rad] | Zero angle gives identity regardless of axis. Nonzero angle with zero axis gives `InvalidInput`; NaN or infinity gives `NonFinite` |
+| `Rotation::from_rotation_vector(v)` | Rotation vector $v = \theta\hat u$ | NaN or infinity gives `NonFinite`; unrepresentable $\lvert v\rvert$ gives `NumericalInstability` |
+| `Rotation::from_matrix(m, tolerance)` | Row-major 3×3 matrix | Accepts only matrices passing the tolerance checks below |
+| `as_quaternion()` | None | Canonicalized $[x, y, z, w]$ |
+| `as_axis_angle()` | None | Unit axis and angle in $[0, \pi]$. Identity returns the $x$ axis and angle 0 |
+| `as_rotation_vector()` | None | Axis multiplied by angle (length in $[0, \pi]$) |
+| `as_matrix()` | None | Row-major rotation matrix |
+
+`as_axis_angle` obtains the angle using $\theta = 2\,\mathrm{atan2}(\lvert(x, y, z)\rvert, w)$.
+The derivative of $2\arccos w$ diverges at $w \to 1$ ($\theta \to 0$), and $2\arcsin\lvert(x, y, z)\rvert$ has the same issue at $\theta \to \pi$; $\mathrm{atan2}$ remains well-conditioned for every angle in $[0, \pi]$.
+
+`from_matrix` does not project matrices to the nearest rotation.
+It forms threshold $\mathrm{atol} + \mathrm{rtol}\cdot 1$ from tolerance `tolerance`'s $\mathrm{atol}$ and $\mathrm{rtol}$, checking that the absolute values of all nine components of $M M^\top - I$ and $\lvert\det M - 1\rvert$ are at most that threshold.
+Nonorthogonal matrices and reflections with negative determinant return `InvalidInput`.
+The quaternion is obtained by Shepperd's method.
+From the largest of the trace and three diagonal components, it obtains the corresponding quaternion component, then forms the others from sums and differences of off-diagonal components.
+The component computed first has magnitude at least $1/2$, avoiding cancellation even near a half turn.
+
+### Composition order and inverse rotations
+
+`r.compose(other)` returns rotation $R_{\text{self}} R_{\text{other}}$ applying `other` first and `r` afterward.
+Passing the Hamilton product through `from_quaternion` maintains unit length and canonical signs under repeated composition.
+`inverse()` returns the quaternion with its vector-part sign reversed.
+A half turn is its own inverse and is returned unchanged, preserving the canonical sign.
+Rotation composition is noncommutative: applying 90° rotations about $x$ and $y$ in order gives a different orientation from reversing that order.
+
+`r.apply(v)` returns $Rv$, the rotated vector $v$.
+Rotation-matrix entries use ordinary floating-point arithmetic; each component of $Rv$ is rounded once from an exact sum of three products ([Error guarantees for checked arithmetic functions](oxref:core-checked-arithmetic)).
+Intermediate products and sums neither overflow nor underflow, so `NumericalInstability` occurs only for unrepresentable result components.
+Error consists of rotation-matrix rounding (a few $\varepsilon$) multiplied by $\lvert v\rvert$, plus one final rounding.
+NaN or infinity in $v$ returns `NonFinite`.
+No memory is allocated.
+
+The difference between rotations $R_a$ and $R_b$ is measured by the relative rotation $R_a^{-1}R_b$'s angle:
+
+$$
+d(R_a, R_b) = \angle\left(R_a^{-1} R_b\right) \in [0, \pi]
+$$
+
+This is the geodesic distance on $\mathrm{SO}(3)$; every “rotation error” in this page and its examples is this angle.
+
+## Euler angles
+
+### Sequences and intrinsic/extrinsic rotations
+
+Euler angles express a rotation as a product of rotations about three coordinate axes.
+Specify axes with `RotationAxis::X`, `Y`, and `Z`; `EulerSequence::new(axes, frame)` combines the three-axis sequence with frame `EulerFrame`.
+Adjacent equal axes are rejected with `InvalidInput`.
+The supported sequences are thus six proper Euler sequences with equal first and last axes (Z-X-Z, X-Y-X, Y-Z-Y, Z-Y-Z, X-Z-X, Y-X-Y) and six Tait–Bryan sequences with distinct axes (X-Y-Z, Y-Z-X, Z-X-Y, X-Z-Y, Z-Y-X, Y-X-Z), each intrinsic or extrinsic.
+
+With `EulerFrame::Intrinsic` (intrinsic), each rotation is about body axes moved by all preceding rotations.
+With `EulerFrame::Extrinsic` (extrinsic), each rotation is about axes of the fixed reference frame.
+Writing $R_k$ for rotation by angle $\alpha_k$ about axis $a_k$, `Rotation::from_euler(sequence, [α₁, α₂, α₃])` is:
+
+$$
+R_{\text{intrinsic}} = R_1 R_2 R_3, \qquad R_{\text{extrinsic}} = R_3 R_2 R_1
+$$
+
+For intrinsic rotations, later rotations multiply first (from the right); extrinsic rotations multiply from the left in the supplied order.
+Thus intrinsic sequence $(a_1, a_2, a_3)$ with angles $(\alpha_1, \alpha_2, \alpha_3)$ gives the same rotation as extrinsic reversed sequence $(a_3, a_2, a_1)$ with angles $(\alpha_3, \alpha_2, \alpha_1)$.
+Yaw $\psi$, pitch $\theta$, and roll $\phi$, common in aircraft and spacecraft, use intrinsic Z-Y-X and can be written $R = R_z(\psi) R_y(\theta) R_x(\phi)$.
+`from_euler` returns `NonFinite` only for NaN or infinite angles.
+
+### Angle ranges and gimbal lock
+
+`rotation.as_euler(sequence, tolerance)` converts a rotation back to `EulerAngles`.
+`angles` contains three angles [rad] in sequence order; `gimbal_lock` is the gimbal-lock flag.
+The middle angle $\beta$ lies in $[0, \pi]$ for proper Euler sequences or $[-\pi/2, \pi/2]$ for Tait–Bryan sequences; outer angles lie in $[-\pi, \pi]$.
+Angles come from rotation-matrix entries using Shoemake's method with $\mathrm{atan2}$.
+
+At $\sin\beta = 0$ for proper Euler sequences or $\cos\beta = 0$ for Tait–Bryan sequences, the first and third rotation axes align, losing one degree of freedom.
+This is gimbal lock: first and third angles are not individually determined, only their sum or difference.
+For example, intrinsic Z-Y-X with $\theta = +\pi/2$ gives $R = R_z(\psi - \phi) R_y(\pi/2)$ from $R_y(\pi/2) R_x(\phi) = R_z(-\phi) R_y(\pi/2)$, determining only $\psi - \phi$.
+
+Outer angles become ill-conditioned even before lock.
+The two outer angles come from $\mathrm{atan2}$ of two matrix entries proportional to $\cos\beta$ ($\sin\beta$ for proper Euler sequences), amplifying entry rounding errors $\varepsilon$ to angle errors $\varepsilon/\lvert\cos\beta\rvert$.
+When magnitude $\lvert\cos\beta\rvert$ ($\lvert\sin\beta\rvert$ for proper Euler sequences) is at most `tolerance`'s threshold $\mathrm{atol} + \mathrm{rtol}\cdot 1$, `as_euler` sets `gimbal_lock` true, sets the third angle to 0, and places the determined combination in the first angle.
+For `Tolerance::from_sqrt_epsilon()`, the threshold is $2\sqrt{\varepsilon} \approx 2.98 \times 10^{-8}$; Tait–Bryan pitch within about $1.7 \times 10^{-6}$ degrees of $\pm 90°$ is classified as locked.
+Only threshold overflow returns `NumericalInstability`.
+
+The next cell fixes yaw $\psi$ and roll $\phi$ in intrinsic Z-Y-X, sets pitch to $\theta = 90° - \delta$, and reduces $\delta$ from 10° to 0.
+For each $\delta$, construct a rotation with `from_euler`, extract angles with `as_euler`, and reconstruct a rotation from them with `from_euler`.
+Table `roundtrip` shows the three recovered angles [deg], lock flag, larger outer-angle error [deg], and distance $d$ [rad] between original and reconstructed rotations.
+Table `frames` uses rotation distances to check that intrinsic Z-Y-X equals extrinsic X-Y-Z with reversed angles, while extrinsic Z-Y-X with the same angles differs.
+
+```rust
+//| id: spatial-euler-gimbal-lock
+//| ref: spatial-euler-gimbal-lock
+//| title: "Approach a pitch of 90° to examine Euler-angle round trips and gimbal lock"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-spatial]
+//| inputs:
+//|   yaw: {"type":"range","label":"Yaw ψ [deg]","description":"First angle in intrinsic Z-Y-X.","min":-180,"max":180,"step":5,"value":30}
+//|   roll: {"type":"range","label":"Roll φ [deg]","description":"Third angle in intrinsic Z-Y-X.","min":-180,"max":180,"step":5,"value":20}
+//| cases:
+//|   - {"id":"equal-yaw-roll","label":"ψ = φ = 45°","description":"At lock, the determined difference ψ − φ is 0, so the first recovered angle is also 0.","inputs":{"yaw":45,"roll":45}}
+//|   - {"id":"negative-roll","label":"ψ = −120°, φ = −150°","description":"Negative outer angles also round-trip to the same angles outside lock.","inputs":{"yaw":-120,"roll":-150}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"roundtrip","path":"/rows/0/4","equals":false}
+//|       - {"artifact":"roundtrip","path":"/rows/0/5","range":{"max":1e-12}}
+//|       - {"artifact":"roundtrip","path":"/rows/7/4","equals":true}
+//|       - {"artifact":"roundtrip","path":"/rows/7/1","approx":{"value":10,"atol":1e-6}}
+//|       - {"artifact":"roundtrip","path":"/rows/7/3","equals":0}
+//|       - {"artifact":"roundtrip","path":"/rows/9/6","range":{"max":1e-14}}
+//|       - {"artifact":"frames","path":"/rows/0/1","range":{"max":1e-15}}
+//|       - {"artifact":"frames","path":"/rows/1/1","range":{"min":0.1}}
+//|   - case: equal-yaw-roll
+//|     expect:
+//|       - {"artifact":"roundtrip","path":"/rows/9/1","approx":{"value":0,"atol":1e-6}}
+//|   - case: negative-roll
+//|     expect:
+//|       - {"artifact":"roundtrip","path":"/rows/0/1","approx":{"value":-120,"atol":1e-9}}
+//|       - {"artifact":"roundtrip","path":"/rows/0/3","approx":{"value":-150,"atol":1e-9}}
+use scioxide_core::{NumericScalar, RealScalar, Tolerance};
+use scioxide_spatial::{EulerFrame, EulerSequence, Rotation, RotationAxis};
+
+let axes = [RotationAxis::Z, RotationAxis::Y, RotationAxis::X];
+let intrinsic = EulerSequence::new(axes, EulerFrame::Intrinsic).map_err(|e| e.to_string())?;
+let tolerance = Tolerance::from_sqrt_epsilon();
+// Rotation distance d(a, b): angle of relative rotation a⁻¹ b [rad].
+let distance = |a: Rotation<f64>, b: Rotation<f64>| -> Result<f64, String> {
+    let relative = a.inverse().compose(b).map_err(|e| e.to_string())?;
+    Ok(relative.as_axis_angle().1)
+};
+// Wrap angle differences into (−180°, 180°].
+let wrapped = |x: f64| x - 360.0 * RealScalar::round(x / 360.0);
+
+// Reduce δ = 90° − θ [deg] from 10° to 0.
+let offsets = [10.0, 1.0, 1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 0.0];
+let mut rows = Vec::new();
+for delta in offsets {
+    let input = [yaw, 90.0 - delta, roll];
+    let rotation = Rotation::from_euler(intrinsic, input.map(RealScalar::to_radians))
+        .map_err(|e| e.to_string())?;
+    let euler = rotation
+        .as_euler(intrinsic, tolerance)
+        .map_err(|e| e.to_string())?;
+    let output = euler.angles.map(RealScalar::to_degrees);
+    let rebuilt = Rotation::from_euler(intrinsic, euler.angles).map_err(|e| e.to_string())?;
+    let outer_error = NumericScalar::abs(wrapped(output[0] - input[0]))
+        .max(NumericScalar::abs(wrapped(output[2] - input[2])));
+    rows.push((
+        delta,
+        output[0],
+        output[1],
+        output[2],
+        euler.gimbal_lock,
+        outer_error,
+        distance(rotation, rebuilt)?,
+    ));
+}
+let fixed = serde_json::json!({ "notation": "standard", "significantDigits": 10 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "δ = 90° − θ [deg]", "type": "number", "format": sci2 },
+    { "key": "1", "label": "Recovered ψ [deg]", "type": "number", "format": fixed },
+    { "key": "2", "label": "Recovered θ [deg]", "type": "number", "format": fixed },
+    { "key": "3", "label": "Recovered φ [deg]", "type": "number", "format": fixed },
+    { "key": "4", "label": "Gimbal lock", "type": "boolean" },
+    { "key": "5", "label": "Outer-angle error [deg]", "type": "number", "format": sci2 },
+    { "key": "6", "label": "Rotation distance d [rad]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "roundtrip" })
+);
+
+// Compare intrinsic Z-Y-X with extrinsic X-Y-Z (reversed angles) and extrinsic Z-Y-X (same angles).
+let angles = [yaw, 80.0, roll].map(RealScalar::to_radians);
+let reference = Rotation::from_euler(intrinsic, angles).map_err(|e| e.to_string())?;
+let reversed_axes = [RotationAxis::X, RotationAxis::Y, RotationAxis::Z];
+let extrinsic_reversed =
+    EulerSequence::new(reversed_axes, EulerFrame::Extrinsic).map_err(|e| e.to_string())?;
+let extrinsic_same =
+    EulerSequence::new(axes, EulerFrame::Extrinsic).map_err(|e| e.to_string())?;
+let reversed = Rotation::from_euler(extrinsic_reversed, [angles[2], angles[1], angles[0]])
+    .map_err(|e| e.to_string())?;
+let same = Rotation::from_euler(extrinsic_same, angles).map_err(|e| e.to_string())?;
+let frames = vec![
+    ("Extrinsic X-Y-Z, angles (φ, θ, ψ)", distance(reference, reversed)?),
+    ("Extrinsic Z-Y-X, angles (ψ, θ, φ)", distance(reference, same)?),
+];
+let frame_columns = serde_json::json!([
+    { "key": "0", "label": "Rotation compared with intrinsic Z-Y-X (ψ, 80°, φ)" },
+    { "key": "1", "label": "Rotation distance d [rad]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    frame_columns,
+    frames,
+    metadata = serde_json::json!({ "id": "frames" })
+);
+```
+
+With defaults ($\psi = 30°$, $\phi = 20°$), $\delta = 10°$ through $10^{-5}$ degrees is not classified as locked and recovered angles agree with supplied angles.
+Outer-angle error grows from $2.5 \times 10^{-14}$ degrees at $\delta = 10°$ to $2.6 \times 10^{-8}$ degrees at $\delta = 10^{-5}$ degrees.
+Reducing $\delta$ by six orders increases errors by roughly six orders; rounding varies the increase at each scale, but the overall trend follows $1/\delta$.
+Distance $d$ to the angle-reconstructed rotation also increases from $2.5 \times 10^{-16}$ rad to $3.0 \times 10^{-10}$ rad.
+Passing through angles loses a similar amount of accuracy in the rotation itself.
+
+At $\delta = 10^{-6}$ degrees, $\lvert\cos\theta\rvert = 1.7 \times 10^{-8}$ falls below threshold, `gimbal_lock` becomes true, and recovered angles are $(10°, 90°, 0°)$.
+The first angle 10° is the determined combination $\psi - \phi$; each outer angle differs by 20°, yet rotation distance stays at $d = 6.1 \times 10^{-9}$ rad.
+This $d$ corresponds to the discarded term magnitude $\lvert\phi\rvert\,\lvert\cos\theta\rvert \approx 0.35 \times 1.7 \times 10^{-8}$ rad when treating the rotation as locked.
+Near threshold $2\sqrt\varepsilon$, both unlocked error $\varepsilon/\lvert\cos\theta\rvert$ and locked error $\lvert\phi\rvert\,\lvert\cos\theta\rvert$ are of order $\sqrt\varepsilon$.
+At $\delta = 0$, the distance is $d = 2.3 \times 10^{-16}$ rad.
+In table `frames`, intrinsic Z-Y-X and extrinsic X-Y-Z with reversed angles have distance $3.1 \times 10^{-17}$ rad and represent the same rotation; extrinsic Z-Y-X with the same angles differs by 0.81 rad.
+
+Near gimbal lock, each conversion through Euler angles loses accuracy.
+Perform interpolation and composition with quaternions and limit Euler angles to input/output display.
+
+## Spherical linear interpolation (Slerp)
+
+Given times $t_0 < t_1 < \cdots < t_{n-1}$ and rotations $R_i$, `Slerp` interpolates on interval $[t_i, t_{i+1}]$ as:
+
+$$
+R(t) = R_i \exp\left(u\, \hat v_i\right), \qquad u = \frac{t - t_i}{\Delta t_i}, \qquad \Delta t_i = t_{i+1} - t_i
+$$
+
+$v_i$ is the rotation vector of relative rotation $R_i^{-1}R_{i+1}$ (principal angle at most $\pi$), $\hat v$ is the cross-product matrix of $v$, and $\exp$ maps rotation vectors to rotations.
+Choosing a rotation vector with angle at most $\pi$ follows the shorter arc; for exactly a half turn, `Rotation`'s sign convention determines direction.
+This is constant-speed motion along a great circle of the unit-quaternion sphere (Shoemake 1985).
+
+Since $\exp(u\hat v_i)$ commutes with $v_i$, body-frame angular velocity is constant within each interval at
+
+$$
+\omega(t) = \frac{v_i}{\Delta t_i}, \qquad \lvert\omega\rvert = \frac{\angle(R_i^{-1}R_{i+1})}{\Delta t_i}
+$$
+
+and angular acceleration is zero inside the interval.
+At knot $t_i$, left and right angular velocities $v_{i-1}/\Delta t_{i-1}$ and $v_i/\Delta t_i$ generally differ, so angular velocity jumps and angular acceleration becomes an impulse (delta function).
+`Slerp` has no angular-velocity function; compute it from relative rotations using the formula above.
+
+`Slerp::new(times, rotations)` validates knots and stores times, rotations, and each interval's $v_i$.
+Memory usage is $O(n)$.
+Fewer than two times or non-strictly increasing times return `InvalidInput`, NaN or infinite times `NonFinite`, unrepresentable adjacent-time differences `NumericalInstability`, differing array lengths `DimensionMismatch`, and allocation failure `AllocationFailure`.
+`evaluate(t)` finds an interval by binary search, costing $O(\log n)$ without allocation.
+At knot times it returns supplied rotations unchanged.
+No extrapolation is performed; times outside $[t_0, t_{n-1}]$ give `InvalidInput` and NaN or infinite times give `NonFinite`.
+
+Slerp velocity jumps abruptly change motion direction between key orientations; a rigid body following them requires torque impulses at knots.
+For continuous angular velocity and acceleration, use [Rotation splines](../rotation-spline/), whose interval rotation vectors are cubic.
+
+## Batch evaluation and workspaces
+
+For rotations at many times, `Slerp::evaluate_rotations_into` and rotation splines' corresponding function `RotationSpline::evaluate_rotations_into` accept time arrays and write rotations to output arrays.
+`evaluate_rotations(&times)` performs the same evaluation with default settings, allocating workspace and result `Vec` to return.
+Times can appear in arbitrary order and may repeat.
+Obtain Euler angles for many rotations with `Rotation::as_euler_batch_into`.
+Both first write results to `TransformWorkspace`, copying to output only after all succeed, so errors leave output unchanged.
+Determine workspace size with `TransformWorkspaceRequest::rotations(count, options)` and `TransformWorkspaceRequest::euler(count, options)`.
+[Batch transformations and workspaces](oxref:spatial-transform-batches) explains reservation steps.
+
+## Summary
+
+`Rotation` stores rotations as unit quaternions $[x, y, z, w]$ with canonical signs; `compose` applies its argument first, and `from_matrix` accepts only matrices passing tolerance checks.
+Euler angles select 12 sequences and intrinsic/extrinsic frames with `EulerSequence`; intrinsic composition uses order $R_1R_2R_3$ and extrinsic order $R_3R_2R_1$.
+Near gimbal lock, outer-angle errors are amplified to $\varepsilon/\lvert\cos\beta\rvert$ and reconstructed rotations lose similar accuracy; interpolate and compose with quaternions, and do not interpret outer angles separately when `gimbal_lock` is true.
+`Slerp` follows the shortest arc with constant interval angular velocity, jumping at knots; choose a rotation spline when velocity continuity is needed.
+For batches of times or rotations, reserve workspace once with `TransformWorkspaceRequest` and use the `*_into` functions.
+
+## Further reading
+
+- [Rotation splines](../rotation-spline/): derive and check interpolation with continuous angular velocity and acceleration through Hermite conditions, a block-tridiagonal system, and fixed-point iteration.
+- [Rigid and batch transformations](../rigid-transforms/): examine composition and inversion of `RigidTransform` combining rotation with translation, and batch-transformation workspace reservation.
+- [Spacecraft orientation interpolation and angular velocity](../../examples/attitude-interpolation/): interpolate Euler-angle key orientations and check interval angular velocities and round-trip errors near pitch 90°.

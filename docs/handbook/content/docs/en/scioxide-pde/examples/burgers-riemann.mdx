@@ -1,0 +1,634 @@
+---
+title: "Burgers shocks and Riemann solutions"
+description: "Solve Riemann problems (shocks and rarefactions) for the inviscid Burgers equation and shock formation from sinusoidal initial data with finite volumes; check exact solutions, total-quantity balance, and total variation."
+sidebar:
+  order: 440
+references:
+  pde-burgers-riemann-problem: "exact-solution-of-the-riemann-problem"
+  pde-burgers-sine-shock: "shock-formation-from-a-sine-wave"
+---
+
+The inviscid Burgers equation $u_t + (u^2/2)_x = 0$ is the simplest nonlinear conservation law that forms shocks.
+It models phenomena in which faster regions catch up with slower ones, such as steepening nonlinear acoustic waves in gases or the front of a traffic jam.
+This example uses finite volumes from `scioxide-pde` to solve shocks and rarefactions in Riemann problems and shock formation from sinusoidal initial data for dimensionless $u$ on the interval $[0, 1]$.
+Check results using $L^1$ error against the exact solution, shock position, the change in total quantity predicted by boundary fluxes, and nonincrease of total variation.
+
+## Burgers equation and characteristics
+
+A smooth solution is constant along characteristics $dx/dt = u$, so it can be written implicitly as $u(x, t) = u_0(x - u t)$ from initial data $u_0$.
+Differentiating both sides with respect to $x$ gives $u_x = u_0'(\xi)/(1 + u_0'(\xi)\,t)$ ($\xi = x - ut$ is the foot of the characteristic); where $u_0' < 0$, the slope diverges at $t = -1/u_0'(\xi)$.
+The earliest blow-up time, and hence the shock formation time, is
+
+$$
+t^* = -\frac{1}{\min_\xi u_0'(\xi)}
+$$
+
+Afterward, consider weak solutions containing discontinuities moving according to the Rankine–Hugoniot condition $s = (u_L + u_R)/2$ ([Conservation laws and numerical fluxes](oxref:pde-conservation-riemann)).
+
+For numerical computation, discretize `Burgers { direction: [1.0] }` with `StructuredConservationPlan` and advance the `ConservationSystem` created by `bind` with `scioxide_ode::Heun`.
+Because `Heun` is a fixed-step method, supply a large initial step so each step matches the CFL limit $\Delta t_{\max} = 0.45\,h/(s_{i-1/2} + s_{i+1/2})$ ([CFL conditions and time integration for conservation laws](oxref:pde-conservation-cfl)).
+Record total variation $\mathrm{TV} = \sum_i |\bar u_{i+1} - \bar u_i|$ and maximum difference quotient $\max_i |\bar u_{i+1} - \bar u_i|/h$ after each accepted step; call `ConservationSystem::report` at the final state to read exterior-face flux `boundary_flux` and the number of limited cells.
+
+For periodic initial data $u_0(x) = A\sin(2\pi x)$, the exact solution is a root of the equation for the characteristic foot $\xi$:
+
+$$
+u = A \sin\bigl(2\pi(x - u t)\bigr)
+$$
+
+
+Since $u_0$ is odd about $x = 1/2$, the shock forms at $x = 1/2$ and stays there.
+For $0 < x < 1/2$, characteristic feet not yet absorbed into the shock lie in $[0, 1/2)$, and there is exactly one root in $u \in [0, \min(A, x/t)]$.
+At the endpoints, $g(u) = u - A\sin(2\pi(x - ut))$ satisfies $g(0) < 0 \le g(\min(A, x/t))$, so pass this interval to Brent's method from `scioxide-rootfind`.
+For $1/2 < x < 1$, use $u(x) = -u(1 - x)$.
+
+The following definitions block shares finite-volume computations and this exact solution between two cells.
+
+```rust
+//| id: pde-burgers-model
+//| kind: definitions
+//| title: "Finite-volume computation and exact solution for the Burgers equation"
+//| crates: [scioxide-core, scioxide-ode, scioxide-pde, scioxide-rootfind, scioxide-spatial]
+use scioxide_core::{ExecutionContext, Interval, NumericScalar, RealScalar};
+use scioxide_ode::{Heun, OdeMethod, OdeOptions, OdeOutputSchedule, OdeProblem, OdeState};
+use scioxide_pde::{Burgers, ConservationBoundary, ConservationOptions, ConservationReconstruction};
+use scioxide_pde::{NumericalFlux, StructuredConservationPlan};
+use scioxide_rootfind::{Brent, ScalarFn, ScalarRootOptions, ScalarRootSolver};
+use scioxide_spatial::SegmentMesh;
+use scioxide_spatial::{AxisSide, AxisTopology, BoundarySet, CellField, CoordinateAxis, Grid1d};
+
+/// Result of one run. history contains (t, total variation, max |Δu|/h) at each accepted step.
+pub(crate) struct BurgersRun {
+    pub(crate) centers: Vec<f64>,
+    pub(crate) values: Vec<f64>,
+    pub(crate) status: String,
+    pub(crate) success: bool,
+    pub(crate) steps: usize,
+    pub(crate) history: Vec<[f64; 3]>,
+    pub(crate) boundary_flux: f64,
+    pub(crate) limited: usize,
+}
+
+/// Sum of differences between adjacent cell averages (including the endpoints for periodic data), and the maximum difference quotient.
+fn variation(u: &[f64], periodic: bool, h: f64) -> (f64, f64) {
+    let mut jumps: Vec<f64> = u
+        .windows(2)
+        .map(|w| NumericScalar::abs(w[1] - w[0]))
+        .collect();
+    if periodic {
+        jumps.push(NumericScalar::abs(u[0] - u[u.len() - 1]));
+    }
+    (
+        jumps.iter().sum(),
+        jumps.iter().copied().fold(0.0, f64::max) / h,
+    )
+}
+
+/// Advance N cells on [0, 1] from initial cell averages average(a, b) to time T with Heun's method.
+pub(crate) fn solve_burgers<F: NumericalFlux<f64, Burgers<f64, 1>, 1, 1>>(
+    flux: &F,
+    reconstruction: ConservationReconstruction,
+    cells: usize,
+    periodic: bool,
+    average: impl Fn(f64, f64) -> f64,
+    end: f64,
+) -> Result<BurgersRun, String> {
+    let h = 1.0 / cells as f64;
+    let topology = if periodic {
+        AxisTopology::Periodic
+    } else {
+        AxisTopology::Bounded
+    };
+    let axis = CoordinateAxis::uniform(0.0, 1.0, cells + 1).map_err(|e| e.to_string())?;
+    let grid = Grid1d::new([axis], [topology]).map_err(|e| e.to_string())?;
+    let mesh = SegmentMesh::new(grid).map_err(|e| e.to_string())?;
+    let mut conditions = Vec::new();
+    if !periodic {
+        for side in [AxisSide::Start, AxisSide::End] {
+            let set = BoundarySet::axis_side(&mesh, 0, side).map_err(|e| e.to_string())?;
+            conditions.push((set, ConservationBoundary::Transmissive));
+        }
+    }
+    let options = ConservationOptions::new().with_reconstruction(reconstruction);
+    let plan = StructuredConservationPlan::with_options(mesh, conditions, options)
+        .map_err(|e| e.to_string())?;
+    let initial = CellField::from_fn(plan.mesh(), |i| [average(i as f64 * h, (i + 1) as f64 * h)])
+        .map_err(|e| e.to_string())?;
+    let law = Burgers { direction: [1.0] };
+    let mut workspace = plan.workspace().map_err(|e| e.to_string())?;
+    let system = plan
+        .bind(&law, flux, &mut workspace)
+        .map_err(|e| e.to_string())?;
+    let problem = OdeProblem::new(&system, end);
+    // Give fixed-step Heun a large initial step so each step reaches the CFL limit.
+    let options = OdeOptions::new()
+        .with_initial_step(1.0)
+        .with_output_schedule(OdeOutputSchedule::AcceptedSteps);
+    let vector = plan
+        .initial_state(&law, initial.view())
+        .map_err(|e| e.to_string())?;
+    let (tv, slope) = variation(vector.as_slice(), periodic, h);
+    let mut history = vec![[0.0, tv, slope]];
+    let mut state = OdeState::new(0.0, vector);
+    let mut sink = |t: f64, u: &[f64]| {
+        let (tv, slope) = variation(u, periodic, h);
+        history.push([t, tv, slope]);
+        Ok(())
+    };
+    let method = Heun::new();
+    let mut ode_workspace = method
+        .workspace(&problem, &options)
+        .map_err(|e| e.to_string())?;
+    let execution = ExecutionContext::sequential();
+    let solve = method
+        .advance(
+            &problem,
+            &options,
+            &mut state,
+            &mut sink,
+            &mut ode_workspace,
+            execution,
+        )
+        .map_err(|e| e.to_string())?;
+    let report = system
+        .report(state.time(), state.values(), execution)
+        .map_err(|e| e.to_string())?;
+    Ok(BurgersRun {
+        centers: plan.centers().iter().map(|x| x[0]).collect(),
+        values: state.values().to_vec(),
+        status: solve.termination().map_or("None".into(), |t| t.to_string()),
+        success: solve.is_success(),
+        steps: solve.accepted_steps(),
+        history,
+        boundary_flux: report.boundary_flux()[0],
+        limited: report.limited_cells(),
+    })
+}
+
+/// Exact solution at time T of the Riemann problem initially jumping from u_L to u_R at x = 1/2.
+/// The solution is piecewise linear, joining u = clamp((x − 1/2)/T, u_L, u_R) across [x₁, x₂];
+/// for a shock (u_L > u_R), x₁ = x₂ = 1/2 + sT, s = (u_L + u_R)/2.
+pub(crate) struct StepRiemann {
+    pub(crate) left: f64,
+    pub(crate) right: f64,
+    pub(crate) end: f64,
+    pub(crate) x1: f64,
+    pub(crate) x2: f64,
+}
+
+impl StepRiemann {
+    pub(crate) fn new(left: f64, right: f64, end: f64) -> Self {
+        let (x1, x2) = if left > right {
+            let x = 0.5 + 0.5 * (left + right) * end;
+            (x, x)
+        } else {
+            (0.5 + left * end, 0.5 + right * end)
+        };
+        Self {
+            left,
+            right,
+            end,
+            x1,
+            x2,
+        }
+    }
+
+    /// Antiderivative Φ(x) = ∫₀ˣ u(y, T) dy. The cell average is (Φ(b) − Φ(a))/(b − a).
+    pub(crate) fn primitive(&self, x: f64) -> f64 {
+        let fan =
+            |y: f64| ((y - 0.5) * (y - 0.5) - (self.x1 - 0.5) * (self.x1 - 0.5)) / (2.0 * self.end);
+        if x <= self.x1 {
+            self.left * x
+        } else if x <= self.x2 {
+            self.left * self.x1 + fan(x)
+        } else {
+            self.left * self.x1 + fan(self.x2) + self.right * (x - self.x2)
+        }
+    }
+
+    /// Average of the initial data (time 0) over [a, b].
+    pub(crate) fn initial_average(&self, a: f64, b: f64) -> f64 {
+        let left_part = RealScalar::max(RealScalar::min(b, 0.5) - a, 0.0);
+        let right_part = RealScalar::max(b - RealScalar::max(a, 0.5), 0.0);
+        (self.left * left_part + self.right * right_part) / (b - a)
+    }
+}
+
+/// Exact solution for periodic initial data A sin(2πx). For 0 < x < 1/2, find the root with foot ξ = x − ut ∈ [0, 1/2);
+/// for 1/2 < x < 1, use odd symmetry u(x) = −u(1 − x). The shock stays at x = 1/2.
+pub(crate) fn exact_sine(amplitude: f64, t: f64, x: f64) -> Result<f64, String> {
+    let (x, sign) = if x < 0.5 { (x, 1.0) } else { (1.0 - x, -1.0) };
+    if x <= 0.0 || t == 0.0 {
+        return Ok(sign * amplitude * RealScalar::sin(2.0 * <f64 as RealScalar>::PI * x));
+    }
+    let g = |u: f64| u - amplitude * RealScalar::sin(2.0 * <f64 as RealScalar>::PI * (x - u * t));
+    let upper = RealScalar::min(amplitude, x / t);
+    let bracket = Interval::new(0.0, upper).map_err(|e| e.to_string())?;
+    let function = ScalarFn::new(|u: f64| Ok(g(u)));
+    let root = Brent
+        .solve(&function, bracket, &ScalarRootOptions::default())
+        .map_err(|e| e.to_string())?;
+    if !root.termination().is_success() {
+        return Err(format!(
+            "Root finding for the characteristic foot stopped with {}",
+            root.termination()
+        ));
+    }
+    Ok(sign * root.point())
+}
+```
+
+## Exact solution of the Riemann problem
+
+For piecewise constant initial data ($u_L$ for $x < 1/2$ and $u_R$ for $x > 1/2$), the exact solution is a shock of speed $s = (u_L + u_R)/2$ if $u_L > u_R$, or a rarefaction with $u = (x - 1/2)/t$ over $u_L \le (x - 1/2)/t \le u_R$ if $u_L < u_R$.
+Both can be written as a piecewise linear function equal to $u_L$ for $x \le x_1$, $(x - 1/2)/T$ for $x_1 \le x \le x_2$, and $u_R$ for $x \ge x_2$.
+For shocks, $x_1 = x_2 = 1/2 + sT$; for rarefactions, $x_1 = 1/2 + u_L T$ and $x_2 = 1/2 + u_R T$; exact cell averages follow in closed form from differences of the antiderivative.
+The wave does not reach the endpoints by time $T = 0.25$, so exterior-face flux $f(u_R) - f(u_L)$ stays constant and total quantity $Q = \sum_i h\bar u_i$ changes by
+
+$$
+Q(T) - Q(0) = -T\,\bigl(f(u_R) - f(u_L)\bigr)
+$$
+
+
+The next cell selects $u_L$, $u_R$, numerical flux, reconstruction, and cell count $N$, then compares the solution at $T = 0.25$ with the exact solution.
+In the table, “−T × boundary flux” is the change in total quantity predicted by `boundary_flux` at the final state; “Maximum increase in total variation” is the maximum $\mathrm{TV} - |u_L - u_R|$ over all accepted steps.
+
+```rust
+//| id: pde-burgers-riemann
+//| ref: pde-burgers-riemann
+//| title: "Solve the Burgers Riemann problem with different fluxes and reconstructions"
+//| run: reactive
+//| uses: [pde-burgers-model]
+//| crates: [scioxide-core, scioxide-ode, scioxide-pde, scioxide-rootfind, scioxide-spatial]
+//| inputs:
+//|   left: {"type":"range","label":"Left value u_L [-]","min":-1,"max":1.5,"step":0.25,"value":1}
+//|   right: {"type":"range","label":"Right value u_R [-]","min":-1,"max":1.5,"step":0.25,"value":0}
+//|   flux: {"type":"select","label":"Numerical flux","options":["Godunov","Rusanov"],"value":"Godunov"}
+//|   reconstruction: {"type":"select","label":"Reconstruction","options":["Constant","minmod","MC"],"value":"minmod"}
+//|   cells: {"type":"select","label":"Cell count N","options":["100","200","400"],"value":"200"}
+//| cases:
+//|   - {"id":"rusanov","label":"Rusanov","description":"Solving the same shock with Rusanov flux gives a larger L¹ error than Godunov.","inputs":{"flux":"Rusanov"}}
+//|   - {"id":"transonic","label":"u_L = −1, u_R = 1, constant","description":"Rarefaction containing a sonic point.","inputs":{"left":-1,"right":1,"reconstruction":"Constant"}}
+//|   - {"id":"transonic-rusanov","label":"u_L = −1, u_R = 1, constant, Rusanov","description":"Solve a rarefaction containing a sonic point with Rusanov.","inputs":{"left":-1,"right":1,"reconstruction":"Constant","flux":"Rusanov"}}
+//|   - {"id":"stationary","label":"u_L = 1, u_R = −1","description":"Stationary shock.","inputs":{"right":-1}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","approx":{"value":0.00186067,"rtol":1e-4}}
+//|       - {"artifact":"summary","path":"/rows/0/1","approx":{"value":0.625,"atol":2e-4}}
+//|       - {"artifact":"summary","path":"/rows/0/3","approx":{"value":0.125,"atol":1e-12}}
+//|       - {"artifact":"summary","path":"/rows/0/4","approx":{"value":0.125,"atol":1e-12}}
+//|       - {"artifact":"summary","path":"/rows/0/5","range":{"max":1e-13}}
+//|       - {"artifact":"summary","path":"/rows/0/6","equals":223}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+//|   - case: rusanov
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","approx":{"value":0.00226358,"rtol":1e-4}}
+//|   - case: transonic
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/1","equals":null}
+//|       - {"artifact":"summary","path":"/rows/0/0","approx":{"value":0.0198177,"rtol":1e-4}}
+//|       - {"artifact":"summary","path":"/rows/0/5","range":{"max":1e-13}}
+//|   - case: transonic-rusanov
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","approx":{"value":0.0179286,"rtol":1e-4}}
+//|   - case: stationary
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","range":{"max":1e-13}}
+//|       - {"artifact":"summary","path":"/rows/0/1","approx":{"value":0.5,"atol":1e-12}}
+use scioxide_core::NumericScalar;
+use scioxide_pde::{ConservationReconstruction, Godunov, Rusanov};
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed4 = serde_json::json!({ "fractionDigits": 4 });
+let (end, n) = (0.25, cells.parse::<usize>().map_err(|_| "Invalid cell count")?);
+let reconstruction = match reconstruction.as_str() {
+    "Constant" => ConservationReconstruction::Constant,
+    "minmod" => ConservationReconstruction::Minmod,
+    _ => ConservationReconstruction::MonotonizedCentral,
+};
+let exact = StepRiemann::new(left, right, end);
+let initial = |a: f64, b: f64| exact.initial_average(a, b);
+let run = if flux == "Godunov" {
+    solve_burgers(&Godunov, reconstruction, n, false, initial, end)?
+} else {
+    solve_burgers(&Rusanov, reconstruction, n, false, initial, end)?
+};
+let h = 1.0 / n as f64;
+let error: f64 = run
+    .values
+    .iter()
+    .enumerate()
+    .map(|(i, &u)| {
+        NumericScalar::abs(
+            u * h - (exact.primitive((i + 1) as f64 * h) - exact.primitive(i as f64 * h)),
+        )
+    })
+    .sum();
+// Change in total quantity Q = Σ h u. Exterior-face flux f(u_R) − f(u_L) is constant, so the prediction is −T × flux.
+let change = run.values.iter().sum::<f64>() * h - (left * 0.5 + right * 0.5);
+// Shock position: linearly interpolate where cell averages cross (u_L + u_R)/2.
+let middle = 0.5 * (left + right);
+let crossing = (left > right)
+    .then(|| {
+        run.values
+            .windows(2)
+            .zip(run.centers.windows(2))
+            .find_map(|(u, x)| {
+                ((u[0] - middle) * (u[1] - middle) <= 0.0 && u[0] != u[1])
+                    .then(|| x[0] + (middle - u[0]) / (u[1] - u[0]) * (x[1] - x[0]))
+            })
+    })
+    .flatten();
+let tv0 = NumericScalar::abs(left - right);
+let growth = run
+    .history
+    .iter()
+    .map(|r| r[1] - tv0)
+    .fold(f64::NEG_INFINITY, f64::max);
+let points: Vec<[f64; 2]> = run
+    .centers
+    .iter()
+    .zip(&run.values)
+    .map(|(&x, &u)| [x, u])
+    .collect();
+let corners = vec![
+    [0.0, left],
+    [exact.x1, left],
+    [exact.x2, right],
+    [1.0, right],
+];
+emit_chart!(
+    serde_json::json!({
+        "kind": "xy",
+        "xLabel": "Position x [-]",
+        "yLabel": "u(x, T) [-]",
+        "dataZoom": true,
+        "tooltip": true,
+        "layers": [
+            { "id": "numerical", "kind": "scatter", "name": "Cell average", "points": points },
+            {
+                "id": "exact",
+                "kind": "line",
+                "name": "Exact solution",
+                "points": corners,
+                "style": { "lineType": "dashed", "showSymbol": false }
+            }
+        ]
+    }),
+    metadata = serde_json::json!({ "id": "profile" })
+);
+let columns = serde_json::json!([
+    { "key": "0", "label": "L¹ error [-]", "type": "number", "format": sci3 },
+    { "key": "1", "label": "Shock position [-]", "type": "number", "format": fixed4, "nullText": "Rarefaction" },
+    { "key": "2", "label": "Exact position [-]", "type": "number", "format": fixed4, "nullText": "Rarefaction" },
+    { "key": "3", "label": "Change in total quantity [-]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "−T × boundary flux [-]", "type": "number", "format": sci3 },
+    { "key": "5", "label": "Maximum increase in total variation [-]", "type": "number", "format": sci3 },
+    { "key": "6", "label": "Accepted steps [count]", "type": "integer" },
+    { "key": "7", "label": "Limited cells [count]", "type": "integer" }
+]);
+let row = (
+    error,
+    crossing,
+    (left > right).then_some(exact.x1),
+    change,
+    -end * run.boundary_flux,
+    growth,
+    run.steps,
+    run.limited,
+);
+emit_table_with_columns!(
+    columns,
+    vec![row],
+    metadata = serde_json::json!({ "id": "summary" })
+);
+let outcome = if run.success {
+    Outcome::satisfied("Reached the final time")
+        .explanation("This judges the ODE termination reason; read spatial accuracy from the L¹ error.")
+} else {
+    Outcome::partial("Stopped before the final time").explanation("Shows the last accepted state.")
+};
+emit_outcome!(
+    outcome
+        .status(run.status.clone())
+        .diagnostic("L¹ error", error, None)
+        .diagnostic("Accepted steps", run.steps as f64, None)
+);
+```
+
+With default values ($u_L = 1$, $u_R = 0$, `Godunov`, minmod, $N = 200$), shock position is 0.62505, differing from the exact position $1/2 + T/2 = 0.625$ by 1% of cell width 0.005.
+The $L^1$ error is $1.86 \times 10^{-3}$, and the shock remains a few cells wide.
+The total-quantity change 0.125 agrees with the boundary-flux prediction $-0.25 \times (0 - 0.5) = 0.125$ to rounding error; total variation never exceeded its initial value 1 by more than $2.2 \times 10^{-16}$ in any of the 223 steps.
+Under the same conditions, switching to `Rusanov` increases $L^1$ error to $2.26 \times 10^{-3}$; constant reconstruction gives $3.34 \times 10^{-3}$, while MC reduces it to $1.41 \times 10^{-3}$.
+
+For the stationary shock with $u_L = 1$ and $u_R = -1$, $L^1$ error is $1.5 \times 10^{-15}$.
+Godunov flux at the shock face is $\max_{[-1, 1]} u^2/2 = 1/2$, equal to the physical flux on both sides, so cell averages remain unchanged apart from rounding error.
+The rarefaction with $u_L = -1$ and $u_R = 1$ contains the sonic point $u = 0$ in its fan.
+With constant reconstruction, $L^1$ error is 0.0198 for `Godunov` and 0.0179 for `Rusanov`; both produce a rarefaction without a remaining discontinuity.
+Monotone fluxes converge to the entropy solution, so no expansion shock remains at the sonic point.
+
+## Shock formation from a sine wave
+
+For periodic initial data $u_0(x) = A\sin(2\pi x)$, $\min u_0' = -2\pi A$ ($x = 1/2$), giving shock formation time $t^* = 1/(2\pi A)$.
+For $t < t^*$ the solution is smooth, and the slope at $x = 1/2$ grows as $|u_x| = 2\pi A/(1 - t/t^*)$.
+For $t > t^*$ there is a stationary shock at $x = 1/2$, whose left value $u_s$ is the positive root of $u = A\sin(2\pi u t)$.
+Periodic boundaries have no exterior faces, so total quantity $\sum_i h\bar u_i$ stays at its initial value 0.
+
+The next cell selects amplitude $A$, final-time ratio $T/t^*$, cell count, and reconstruction, then solves to time $T$ with `Godunov`.
+The upper graph shows cell averages of $u(x, T)$ and the exact solution at cell centers (dashed).
+The lower graph plots the maximum difference quotient over time with a logarithmic vertical axis; the dashed curve is the exact maximum slope for $t < 0.95\,t^*$, and the vertical line marks $t^*$.
+The table's $L^1$ error integrates the difference between cell averages and the exact solution at cell centers with the midpoint rule, including an $O(h^2)$ difference in smooth regions.
+
+```rust
+//| id: pde-burgers-shock-formation
+//| ref: pde-burgers-shock-formation
+//| title: "Compare the time of shock formation from a periodic sine wave and solutions before and after it with the exact solution"
+//| run: reactive
+//| uses: [pde-burgers-model]
+//| crates: [scioxide-core, scioxide-ode, scioxide-pde, scioxide-rootfind, scioxide-spatial]
+//| inputs:
+//|   amplitude: {"type":"range","label":"Amplitude A [-]","description":"Amplitude of initial data A sin(2πx). Shock formation time is t* = 1/(2πA).","min":0.25,"max":1,"step":0.25,"value":0.5}
+//|   ratio: {"type":"range","label":"Final-time ratio T/t* [-]","min":0.25,"max":3,"step":0.25,"value":2}
+//|   cells: {"type":"select","label":"Cell count N","options":["100","200","400"],"value":"200"}
+//|   reconstruction: {"type":"select","label":"Reconstruction","options":["Constant","minmod","MC"],"value":"MC"}
+//| cases:
+//|   - {"id":"before","label":"T = t*/2","description":"Before shock formation. The exact solution is smooth and total variation stays at 4A.","inputs":{"ratio":0.5}}
+//|   - {"id":"late","label":"T = 3t*","description":"The shock weakens and total variation decreases to 4u_s.","inputs":{"ratio":3}}
+//|   - {"id":"constant","label":"Constant reconstruction","description":"A first-order method has larger error in smooth regions on both sides of the shock.","inputs":{"reconstruction":"Constant"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","approx":{"value":0.3183098862,"rtol":1e-9}}
+//|       - {"artifact":"summary","path":"/rows/0/2","approx":{"value":3.0061e-5,"rtol":1e-3}}
+//|       - {"artifact":"summary","path":"/rows/0/4","approx":{"value":1.8951684,"rtol":1e-6}}
+//|       - {"artifact":"summary","path":"/rows/0/5","range":{"max":1e-13}}
+//|       - {"artifact":"summary","path":"/rows/0/6","range":{"min":-1e-14,"max":1e-14}}
+//|       - {"artifact":"summary","path":"/rows/0/7","approx":{"value":0.47387357,"rtol":1e-6}}
+//|       - {"path":"/outputs/3/state","equals":"satisfied"}
+//|   - case: before
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/7","equals":null}
+//|   - case: late
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/7","approx":{"value":0.37981044,"rtol":1e-6}}
+//|   - case: constant
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/2","approx":{"value":2.0122e-3,"rtol":1e-3}}
+use scioxide_core::{NumericScalar, RealScalar};
+use scioxide_pde::{ConservationReconstruction, Godunov};
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed4 = serde_json::json!({ "fractionDigits": 4 });
+let n: usize = cells.parse().map_err(|_| "Invalid cell count")?;
+let reconstruction = match reconstruction.as_str() {
+    "Constant" => ConservationReconstruction::Constant,
+    "minmod" => ConservationReconstruction::Minmod,
+    _ => ConservationReconstruction::MonotonizedCentral,
+};
+let two_pi = 2.0 * <f64 as RealScalar>::PI;
+let breaking = 1.0 / (two_pi * amplitude);
+let end = ratio * breaking;
+// Cell average of A sin(2πx): A (cos 2πa − cos 2πb) / (2π (b − a)).
+let average = |a: f64, b: f64| {
+    amplitude * (RealScalar::cos(two_pi * a) - RealScalar::cos(two_pi * b)) / (two_pi * (b - a))
+};
+let run = solve_burgers(&Godunov, reconstruction, n, true, average, end)?;
+let h = 1.0 / n as f64;
+let mut exact = Vec::with_capacity(n);
+for &x in &run.centers {
+    exact.push(exact_sine(amplitude, end, x)?);
+}
+// Difference from the exact solution at cell centers (midpoint-rule approximation of L¹ error).
+let error: f64 = run
+    .values
+    .iter()
+    .zip(&exact)
+    .map(|(u, v)| h * NumericScalar::abs(u - v))
+    .sum();
+let mass = run.values.iter().sum::<f64>() * h;
+let tv0 = run.history[0][1];
+let growth = run
+    .history
+    .windows(2)
+    .map(|w| w[1][1] - w[0][1])
+    .fold(f64::NEG_INFINITY, f64::max);
+// Exact value u_s to the left of the shock (positive root of u = A sin(2πuT)). There is no shock for T ≤ t*.
+let jump = (end > breaking)
+    .then(|| exact_sine(amplitude, end, 0.5 - 1e-9))
+    .transpose()?;
+let numerical: Vec<[f64; 2]> = run
+    .centers
+    .iter()
+    .zip(&run.values)
+    .map(|(&x, &u)| [x, u])
+    .collect();
+let reference: Vec<[f64; 2]> = run
+    .centers
+    .iter()
+    .zip(&exact)
+    .map(|(&x, &u)| [x, u])
+    .collect();
+emit_chart!(
+    serde_json::json!({
+        "kind": "xy",
+        "xLabel": "Position x [-]",
+        "yLabel": "u(x, T) [-]",
+        "dataZoom": true,
+        "tooltip": true,
+        "layers": [
+            { "id": "numerical", "kind": "scatter", "name": "Cell average", "points": numerical },
+            {
+                "id": "exact",
+                "kind": "line",
+                "name": "Exact solution (cell centers)",
+                "points": reference,
+                "style": { "lineType": "dashed", "showSymbol": false }
+            }
+        ]
+    }),
+    metadata = serde_json::json!({ "id": "profile" })
+);
+// Maximum slope: adjacent-cell-average difference quotient for the numerical solution, 2πA/(1 − t/t*) for the exact solution (t < t*).
+let slope: Vec<[f64; 2]> = run.history.iter().map(|r| [r[0], r[2]]).collect();
+let theory: Vec<[f64; 2]> = (0..=95)
+    .map(|k| k as f64 / 100.0 * breaking)
+    .filter(|&t| t <= end)
+    .map(|t| [t, two_pi * amplitude / (1.0 - t / breaking)])
+    .collect();
+emit_chart!(serde_json::json!({
+    "kind": "line",
+    "xLabel": "Time t [-]",
+    "yLabel": "Maximum slope |∂u/∂x| [-]",
+    "yType": "log",
+    "dataZoom": true,
+    "tooltip": true,
+    "series": [
+        { "name": "Numerical max |Δu|/h", "style": { "lineType": "dotted" }, "points": slope },
+        { "name": "Exact 2πA/(1 − t/t*)", "style": { "lineType": "dashed" }, "points": theory }
+    ],
+    "annotations": [{ "kind": "line", "axis": "x", "value": breaking, "label": "t*" }]
+}));
+let columns = serde_json::json!([
+    { "key": "0", "label": "t* [-]", "type": "number", "format": fixed4 },
+    { "key": "1", "label": "T [-]", "type": "number", "format": fixed4 },
+    { "key": "2", "label": "L¹ error [-]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "Total variation TV(0) [-]", "type": "number", "format": fixed4 },
+    { "key": "4", "label": "Total variation TV(T) [-]", "type": "number", "format": fixed4 },
+    { "key": "5", "label": "Maximum TV increase in one step [-]", "type": "number", "format": sci3 },
+    { "key": "6", "label": "Total quantity Σh u [-]", "type": "number", "format": sci3 },
+    { "key": "7", "label": "Exact u_s [-]", "type": "number", "format": fixed4, "nullText": "No shock" }
+]);
+let row = (
+    breaking,
+    end,
+    error,
+    tv0,
+    run.history[run.history.len() - 1][1],
+    growth,
+    mass,
+    jump,
+);
+emit_table_with_columns!(
+    columns,
+    vec![row],
+    metadata = serde_json::json!({ "id": "summary" })
+);
+let outcome = if run.success {
+    Outcome::satisfied("Reached the final time")
+        .explanation("This judges the ODE termination reason; read spatial accuracy from the L¹ error.")
+} else {
+    Outcome::partial("Stopped before the final time").explanation("Shows the last accepted state.")
+};
+emit_outcome!(
+    outcome
+        .status(run.status.clone())
+        .diagnostic("L¹ error", error, None)
+        .diagnostic("Accepted steps", run.steps as f64, None)
+);
+```
+
+With default values ($A = 0.5$, $T = 2t^* = 0.637$, $N = 200$, MC), the exact value to the left of the shock is $u_s = 0.4739$.
+The maximum difference quotient agrees with the dashed curve within 0.3% up to $t \approx 0.85\,t^*$ (19.86 at $t = 0.84\,t^*$, exact value 19.85), then falls below it as time approaches $t^*$ (29.8 at $t = 0.90\,t^*$, exact value 30.9).
+The numerical solution represents the shock over 1–2 cells, so the grid cuts off the slope divergence.
+After $t^*$, the difference quotient becomes roughly the ratio $2u_s/h$ of the jump $2u_s$ to the cell width; at $T = 2t^*$ it is 189.52 ($2u_s/h = 189.55$).
+
+The $L^1$ error is $3.0 \times 10^{-5}$; because the shock lies on face $x = 1/2$, differences between cell averages and the exact solution remain small on both sides of the shock.
+Total variation decreases from $1.99967$ to $1.89517$, with increases no larger than $3 \times 10^{-15}$ in any step.
+The characteristic carrying maximum value $u = A$ (foot $\xi = 1/4$) enters the shock at time $1/(4A) = (\pi/2)\,t^*$.
+Afterward the exact solution increases monotonically from 0 to $u_s$ left of $x = 1/2$, jumps to $-u_s$ at the shock, and returns to 0 on the right; total variation is therefore $4u_s = 1.8955$, differing from the numerical solution by $3 \times 10^{-4}$.
+At $T = 3t^*$, $u_s = 0.3798$, and numerical total variation is $1.5192$, agreeing with $4u_s = 1.5192$.
+The total quantity remains 0 within rounding error $10^{-17}$.
+Constant reconstruction gives $L^1$ error $2.0 \times 10^{-3}$, leaving first-order error even in smooth regions away from the shock.
+
+## Summary
+
+Shock positions in the Burgers equation follow the Rankine–Hugoniot condition, and conservative finite volumes reproduce these positions regardless of flux choice.
+`Godunov` preserves a stationary shock to rounding error; `Rusanov` gives slightly larger $L^1$ error for a moving shock than `Godunov`, but both produce rarefactions containing sonic points as entropy solutions.
+Shock formation can be read as the time when the maximum difference quotient, after growing along $2\pi A/(1 - t/t^*)$, saturates at the grid-width limit.
+Besides $L^1$ error against exact cell averages, checks use the total-quantity change predicted by `boundary_flux` and nonincrease of total variation; both held to rounding error.
+
+## Further reading
+
+- [Conservation laws and numerical fluxes](../../algorithms/conservation-laws/) examines derivations of Godunov and Rusanov fluxes and weak solutions of Riemann problems.
+- [Reconstruction and boundaries for conservation laws](../../algorithms/conservation-reconstruction/) examines minmod and MC slope selection and bounds on face values.
+- [Sod shock tube](../sod-shock-tube/) applies the same finite-volume method to the three-component Euler equations and solves a Riemann problem containing a contact discontinuity.

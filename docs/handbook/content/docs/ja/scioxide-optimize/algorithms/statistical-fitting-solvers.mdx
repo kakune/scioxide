@@ -1,0 +1,260 @@
+---
+title: 統計推定へのソルバーの受け渡し
+description: scioxide-stats の FitSolver と TransportSolver を実装する LeastSquaresFitSolver、LbfgsBFitSolver、SqpFitSolver、SimplexTransportSolver の役割、制約、終了状態の対応を説明する。
+sidebar:
+  order: 336
+references:
+  optimize-fitting-statistics-link: "最適化と統計推定の接続"
+---
+
+scioxide-stats の母数推定は、目的関数（負の対数尤度やモーメントの不一致）を組み立てるが、それを最小化するアルゴリズムを持たない。
+最小化は `FitSolver`（当てはめ）と `TransportSolver`（離散輸送）というトレイトを通じて、呼び出し側が渡すソルバーが行う。
+scioxide-optimize はこの二つのトレイトを実装する型を提供する。
+このページではどの型をどの推定に使えるか、ソルバーの終了理由が統計側の終了状態にどう写るか、結果をどちらの側から読むかを説明する。
+
+## 最適化と統計推定の接続
+
+scioxide-stats の `fit_into`（とその簡略形の `fit_with_options`）は、当てはめを次の四段階で進める。
+
+1. 形、開始点、ソルバーが要求の境界・整数制約を扱えるか、ソルバーが必要とする残差や導関数が要求にあるかを確かめる。
+2. 開始点で目的の定義域を確かめる。
+3. `FitSolver::solve` でソルバーを実行する。
+4. ソルバーの結果が境界と整数制約を満たすかを確かめ、その点で目的を評価し直す。
+
+出力の母数は 4 が成功したあとにだけ書かれる。
+最適化側は点と終了理由を求め、統計側はデータの意味、重み、推定量と不確かさを扱う。
+ソルバーを交換しても、尤度や観測ノイズの仮定まで交換されたことにはならない。
+
+| 型 | 実装するトレイト | 構築 | 扱える問題 |
+|---|---|---|---|
+| `LeastSquaresFitSolver` | `FitSolver` | `new(solver: LeastSquares<S>, parameters, residuals)` | 残差を返す目的（モーメント法・分位点法の一致）。境界・整数変数・作用素のヤコビ行列は扱わない |
+| `LbfgsBFitSolver` | `FitSolver` | `new(solver: LbfgsB<S>, dimension)` | 有限・片側・固定の境界を持つスカラーの目的。整数変数は扱わない |
+| `SqpFitSolver` | `FitSolver` | `new(solver: Sqp<S>, constraints: Constraints<S>)` | 非線形制約付きの目的。要求の境界は制約の境界と一致させる |
+| `SimplexTransportSolver` | `TransportSolver` | `new(solver: SimplexSolver<S>, max_pairs, max_model_bytes)` | 周辺分布を等式制約とする輸送の線形計画 |
+
+`LeastSquaresFitSolver::new` は、母数の数と残差の数を固定して密なメモリを構築時に確保する。
+空の形、二乗以外の損失、`LeastSquaresLinearSolver::Lsmr` を使う `LeastSquares` は `InvalidInput` で拒む。
+ロバストな損失や作用素だけの線形化は残差の統計的な意味を変えるので、この型では使えない。
+残差を返さない目的（最尤法）は、手順 1 で `NotImplemented` になる。
+許容誤差と大域化は渡した `LeastSquares` の設定から取り、反復の上限はその設定と要求に残る反復の許容量の小さいほうになる。
+`result()` は最後の求解の `LeastSquaresResult` を返すので、最適化側の終了理由、数値階数、条件数の推定はここから読む。
+その `cost()` は $\tfrac12\sum_i r_i^2$ で、scioxide-stats の一致法の目的値 $\sum_i r_i^2$ とは 2 倍だけ違う。
+
+`LbfgsBFitSolver` は解析的な勾配を要求の `derivatives` から受け取り、なければ `LbfgsB` に設定した微分の方針で近似する。
+`SqpFitSolver` は `Constraints` を所有し、`result()` は KKT と制約の残差を含む `OptimizeResult` を返す。
+
+三つの `FitSolver` は最適化の終了理由を統計側の分類 `StatsTermination` へ写す。
+
+| 最適化側の終了理由 | 統計側の終了状態 |
+|---|---|
+| `Converged`、`GradientSmall` | `Converged` |
+| `IterationLimit`、`EvaluationLimit`、`MemoryLimit` などの上限 | `BudgetExhausted` |
+| `Cancelled`、`TimeLimit` | `Stopped` |
+| それ以外（`StepSmall`、`Stagnation` など） | `NotConverged` |
+
+統計側の `Converged` は、最適化側で成功の判定（`is_success()`）が真だったことだけを意味する。
+推定量の不確かさやモデルの妥当性は、統計側で別に評価する。
+
+## 正規分布の当てはめと二つのソルバー
+
+公称 100 Ω の抵抗器の抵抗値が正規分布 $N(\mu,\sigma^2)$ に従うとして、$n$ 個の測定値 $x_i$ [Ω] から $(\mu,\sigma)$ を推定する。
+測定値は真の値 $\mu=100.3$ Ω、$\sigma=1.5$ Ω の正規乱数で作り、入力は標本数 $n$ と乱数のシードである。
+同じデータを二つの方法で当てはめる。
+
+- 最尤法（`FitMethod::Likelihood`）を、箱 $[80,120]\times[0.1,10]$ Ω の中で `LbfgsBFitSolver` で解く。
+  解析的な勾配は `ExactFitDerivatives` から渡す。
+- モーメント法（`FitMethod::Moments`）を、境界なしで `LeastSquaresFitSolver` で解く。
+  残差は $r_1=\mu-\bar x$ と $r_2=(\mu^2+\sigma^2-\overline{x^2})/200$ で、$\overline{x^k}=\frac1n\sum_i x_i^k$ は標本の原点モーメントである（200 Ω² は二つの残差の大きさをそろえる尺度）。
+
+正規分布ではどちらの方法の推定も閉じた形 $\hat\mu=\bar x$、$\hat\sigma=\sqrt{\frac1n\sum_i(x_i-\bar x)^2}$ になるので、これを独立な検算に使う。
+出力は、二つの方法の推定値、閉じた形との差、統計側の終了状態と最適化側の終了理由、統計側が評価し直した目的値の表である。
+
+```rust
+//| id: optimize-statistical-fit-solvers
+//| ref: optimize-statistical-fit-solvers
+//| title: 正規分布の最尤法とモーメント法を二つのソルバーで解く
+//| run: reactive
+//| crates: [scioxide-core, scioxide-optimize, scioxide-random, scioxide-stats]
+//| inputs:
+//|   sample_size: {"type":"range","label":"標本数 n [個]","description":"測定した抵抗器の数を変える。","min":5,"max":200,"step":5,"value":40}
+//|   seed: {"type":"range","label":"乱数のシード [-]","description":"測定値の擬似乱数列を変える。","min":1,"max":50,"step":1,"value":3}
+//| cases:
+//|   - {"id":"small-sample","label":"n = 5","description":"標本が少なく推定は真の値から離れるが、二つの方法は同じ閉じた形の値を返す。","inputs":{"sample_size":5}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"fits","path":"/rows/0/4","range":{"min":0,"max":1e-5}}
+//|       - {"artifact":"fits","path":"/rows/1/4","range":{"min":0,"max":1e-5}}
+//|       - {"artifact":"fits","path":"/rows/0/5","equals":"Converged"}
+//|       - {"artifact":"fits","path":"/rows/1/5","equals":"Converged"}
+//|   - case: small-sample
+//|     expect:
+//|       - {"artifact":"fits","path":"/rows/0/4","range":{"min":0,"max":1e-5}}
+//|       - {"artifact":"fits","path":"/rows/1/4","range":{"min":0,"max":1e-5}}
+use scioxide_core::{Bounds, RealScalar};
+use scioxide_optimize::{
+    LbfgsB, LbfgsBFitSolver, LeastSquares, LeastSquaresFitSolver, LeastSquaresOptions,
+};
+use scioxide_random::{Distribution, Normal, SeedableRng, SplitMix64};
+use scioxide_stats::{
+    DistributionFitModel, ExactFitDerivatives, FitMethod, FitObservation, FitRequest,
+    PreparedFit, StatisticsOptions, fit_with_options,
+};
+
+let sig7 = serde_json::json!({ "significantDigits": 7 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+// 抵抗値の測定 x_i ~ N(100.3, 1.5²) [Ω]。
+let n = sample_size as usize;
+let mut rng = SplitMix64::from_seed(seed as u64);
+let samples = Normal::new(100.3_f64, 1.5)
+    .map_err(|e| e.to_string())?
+    .sample_n(&mut rng, n)
+    .map_err(|e| e.to_string())?;
+let observations: Vec<FitObservation<f64>> =
+    samples.iter().map(|&x| FitObservation::Exact(x)).collect();
+let options = StatisticsOptions::new().with_max_bytes(1 << 20);
+let model = DistributionFitModel::Normal;
+let integrality = [false; 2];
+let initial = [95.0, 5.0];
+
+// 最尤法: 箱 [80, 120] × [0.1, 10] Ω の中で L-BFGS-B が負の対数尤度を最小化する。
+let boxed = Bounds::new(vec![(Some(80.0), Some(120.0)), (Some(0.1), Some(10.0))])
+    .map_err(|e| e.to_string())?;
+let likelihood = PreparedFit::new(
+    &model,
+    &observations,
+    FitMethod::Likelihood,
+    None,
+    &boxed,
+    &integrality,
+    options,
+)
+.map_err(|e| e.to_string())?;
+let derivatives = ExactFitDerivatives {
+    model,
+    samples: &samples,
+};
+let mut lbfgsb = LbfgsBFitSolver::new(LbfgsB::default(), 2).map_err(|e| e.to_string())?;
+let request = FitRequest {
+    objective: &likelihood,
+    derivatives: Some(&derivatives),
+    bounds: &boxed,
+    integrality: &integrality,
+    initial: &initial,
+};
+let mle = fit_with_options(request, &mut lbfgsb, options).map_err(|e| e.to_string())?;
+
+// モーメント法: 1 次と 2 次の原点モーメントの残差を LeastSquares で 0 にする（境界なし）。
+let free = Bounds::new(vec![(None, None); 2]).map_err(|e| e.to_string())?;
+let (orders, scales) = ([1_usize, 2], [1.0, 200.0]);
+let method = FitMethod::Moments {
+    orders: &orders,
+    scales: &scales,
+};
+let moments = PreparedFit::new(
+    &model,
+    &observations,
+    method,
+    None,
+    &free,
+    &integrality,
+    options,
+)
+.map_err(|e| e.to_string())?;
+let solver = LeastSquares::new(LeastSquaresOptions::default()).map_err(|e| e.to_string())?;
+let mut least_squares = LeastSquaresFitSolver::new(solver, 2, 2).map_err(|e| e.to_string())?;
+let request = FitRequest {
+    objective: &moments,
+    derivatives: None,
+    bounds: &free,
+    integrality: &integrality,
+    initial: &initial,
+};
+let matched =
+    fit_with_options(request, &mut least_squares, options).map_err(|e| e.to_string())?;
+
+// 独立な検算（式）: 正規分布の最尤推定とモーメント推定は標本平均と（n で割る）標本標準偏差。
+let mean = samples.iter().sum::<f64>() / n as f64;
+let spread = samples.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / n as f64;
+let closed = [mean, RealScalar::sqrt(spread)];
+let mut rows = Vec::new();
+for (name, fit, inner) in [
+    (
+        "最尤法（LbfgsBFitSolver）",
+        &mle,
+        lbfgsb.result().termination(),
+    ),
+    (
+        "モーメント法（LeastSquaresFitSolver）",
+        &matched,
+        least_squares.result().termination(),
+    ),
+] {
+    let p = fit
+        .parameters()
+        .ok_or("当てはめが母数を書かなかった".to_string())?;
+    let gap = (p[0] - closed[0]).abs().max((p[1] - closed[1]).abs());
+    rows.push((
+        name,
+        p[0],
+        p[1],
+        closed[1],
+        gap,
+        format!("{:?}", fit.report().termination()),
+        inner.to_string(),
+        fit.report().objective(),
+    ));
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "方法（ソルバー）" },
+    { "key": "1", "label": "μ̂ [Ω]", "type": "number", "format": sig7 },
+    { "key": "2", "label": "σ̂ [Ω]", "type": "number", "format": sig7 },
+    { "key": "3", "label": "閉じた形の σ̂ [Ω]", "type": "number", "format": sig7 },
+    { "key": "4", "label": "閉じた形との差の最大 [Ω]", "type": "number", "format": sci2 },
+    { "key": "5", "label": "統計側の終了状態" },
+    { "key": "6", "label": "最適化側の終了理由" },
+    { "key": "7", "label": "統計側の目的値 [-]", "type": "number", "format": sig7, "nullText": "なし" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "fits" })
+);
+```
+
+既定の $n=40$、シード 3 では、二つの方法の推定はどちらも $\hat\mu=100.010$ Ω、$\hat\sigma=1.72665$ Ω で、統計側の `Converged` と最適化側の `GradientSmall` で止まる。
+閉じた形との差は最尤法で $5.9\times10^{-12}$ Ω、モーメント法で $1.5\times10^{-9}$ Ω である。
+モーメント法の差が大きいのは、約 $10^4$ Ω² の原点モーメント $\overline{x^2}$ から約 3 Ω² の $\sigma^2$ を引き出すので、残差 $r_2$ の小さな残りが $\delta\sigma\approx200\,\delta r_2/(2\sigma)$ に拡大されるためである。
+統計側が評価し直した目的値は、最尤法では負の対数尤度の 78.6、モーメント法では $\sum_i r_i^2\approx7\times10^{-22}$ になる。
+$n=5$ では推定が $\hat\mu=98.85$ Ω、$\hat\sigma=1.264$ Ω と真の値から離れるが、二つの方法と閉じた形の一致は変わらない。
+真の値からのずれは標本の少なさによる統計的なばらつきで、ソルバーの精度とは別の量である。
+
+## 離散輸送の線形計画
+
+`SimplexTransportSolver` は、scioxide-stats の Wasserstein 距離などが使う離散最適輸送の線形計画を、疎な改訂単体法（`SimplexSolver`）で解く。
+重み $a\in\mathbb{R}^m$ の輸送元と重み $b\in\mathbb{R}^n$ の輸送先（どちらも和が 1）、計算コスト $c_{ij}\ge0$ に対して
+
+$$
+\min_{x}\ \sum_{i,j}c_{ij}x_{ij}\quad\text{subject to}\quad \sum_j x_{ij}=a_i,\quad \sum_i x_{ij}=b_j,\quad x_{ij}\ge0
+$$
+
+を解き、輸送計画 $x$ と、周辺の等式制約に対する双対変数を返す。
+周辺の等式は全体の和を通じて一本が他から従うので、輸送先の制約を一本除いて組み立てる。
+`max_pairs` は輸送元と輸送先の組の数 $mn$ の上限、`max_model_bytes` は組み立てる線形計画の大きさの上限（`required_model_bytes` で見積もれる）で、超えると `ResourceLimit` を返す。
+単体法が分解に使うメモリの上限は、渡す `SimplexSolver` の設定で別に決める。
+線形計画の `Converged` は統計側の `Converged` に、取り消しと時間上限は `Stopped` に、反復・評価・メモリの上限は `BudgetExhausted` に写り、それ以外の終了理由は `ConvergenceFailure` のエラーになる。
+同じ統計クレートへの接続でも、微分可能な残差の当てはめとは問題の構造が異なり、[線形計画の単体法](../linear-programming/)の終了理由の読み方がそのまま当てはまる。
+輸送問題の作り方と結果の検算は、[stats の確率距離と最適輸送](../../../scioxide-stats/algorithms/circular-information-and-distances/)で扱う。
+
+## まとめ
+
+scioxide-stats の当てはめには、残差を返す一致法なら `LeastSquaresFitSolver`、境界付きのスカラーの目的（最尤法など）なら `LbfgsBFitSolver`、非線形制約があれば `SqpFitSolver` を渡す。
+統計側の `Converged` は最適化側で成功と判定された終了を写したもので、上限は `BudgetExhausted`、`StepSmall` や `Stagnation` は `NotConverged` になる。
+最適化側の詳しい終了理由と診断は各型の `result()` から読み、`LeastSquaresFitSolver` の `cost()` は統計側の目的値を 2 で割った値になることに注意する。
+離散輸送の線形計画には `SimplexTransportSolver` を渡し、組み立ての大きさを `max_pairs` と `max_model_bytes` で抑える。
+
+## 次に読むページ
+
+- [識別可能性と統計的な当てはめ](../identifiability-and-fitting/)：当てはめた母数が観測で決まるかを、特異値、共分散、プロファイル尤度で確かめる。
+- [stats の分布フィッティング](../../../scioxide-stats/algorithms/distribution-fitting-and-confidence-limits/)：`PreparedFit`、`FitMethod`、信頼限界など、統計側の当てはめの仕様を確かめる。
+- [非線形・線形最小二乗の API](../../api/least-squares/)：`LeastSquaresFitSolver`、`LbfgsBFitSolver`、`SqpFitSolver` の構築とエラーの仕様を確かめる。

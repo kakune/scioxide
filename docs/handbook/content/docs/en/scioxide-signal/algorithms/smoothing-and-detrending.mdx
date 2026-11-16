@@ -1,0 +1,820 @@
+---
+title: "Smoothing and detrending"
+description: "Explain local polynomials and endpoints in Savitzky–Golay filtering, penalized least squares and missing-data weights in Whittaker–Henderson smoothing, B-spline interpolation coefficients and symmetric recursive filters, and piecewise least-squares detrending, including plans, workspace, and diagnostics."
+sidebar:
+  order: 360
+references:
+  signal-savitzky-golay: "savitzkygolay-filters"
+  signal-savitzky-golay-boundary: "endpoint-handling"
+  signal-whittaker-henderson: "whittakerhenderson-smoothing"
+  signal-whittaker-diagnostics: "conditioning-and-solution-diagnostics"
+  signal-spline-filters: "b-spline-coefficients-and-symmetric-recursive-filters"
+  signal-detrend: "detrending"
+---
+
+Measurements combine the changes of interest with high-frequency noise and slowly varying trends (drift).
+Smoothing reduces the former, while detrending removes the latter.
+Both can be written as least-squares problems that express the assumption of smooth connections between nearby samples through polynomials or difference penalties.
+This page explains Savitzky–Golay filtering with local polynomials, Whittaker–Henderson smoothing with difference penalties, recursive filters for B-spline interpolation coefficients, and least-squares detrending.
+
+Outliers such as spikes can strongly alter a least-squares fit.
+For data containing outliers, first use a median or Hampel filter from [Local filters and peaks](../local-filters-and-features/).
+
+## Savitzky–Golay filters
+
+### Local polynomial least squares
+
+For each equally spaced sample $x[i]$, fit a polynomial of degree $p$ by least squares to $w = 2M + 1$ samples centered at $i$ and evaluate its value or derivative at the center.
+This is the Savitzky–Golay filter.
+For window positions $j = -M, \dots, M$ and design matrix $V_{jk} = j^k$ ($k = 0, \dots, p$), the fitted coefficients are $a = V^{+} x$, where $V^{+}$ is the pseudoinverse.
+The derivative of order $d$ at the center is $d!\,a_d / h^d$ ($h$ is the sample spacing), so the output is a fixed weighted sum of window samples:
+
+$$
+y[i] = \sum_{j=-M}^{M} c_j\, x[i + j]
+$$
+
+
+Weights $c_j$ depend only on position within the window, not sample values, making this an FIR filter in correlation form.
+
+Polynomials of degree at most $p$ are represented exactly by the fit, so interior outputs reproduce their values or derivatives up to rounding error.
+For smoothing that evaluates the center value ($d = 0$), window symmetry makes the weights for degrees $2q$ and $2q + 1$ identical.
+White-noise variance $\sigma^2$ decreases to $\sigma^2 \sum_j c_j^2$ at the output.
+A wider window or lower degree reduces noise but also removes fine features such as peak height and width.
+
+`SavitzkyGolayOptions` holds derivative order $d$ (`with_derivative`, at most $p$), sample spacing $h$ (`with_spacing`, positive), and evaluation position (`with_position`).
+Defaults are smoothing ($d = 0$), spacing 1, and evaluation at the window midpoint, which requires an odd window length.
+`with_position(t)` evaluates at position $t \in [0, w - 1]$ samples from the window start, allowing even windows or off-center evaluation.
+
+`SavitzkyGolayPlan::new(window_length, polynomial_degree, options)` factors a monomial design matrix with window coordinates scaled to $[-1, 1]$ using Householder QR with column pivoting, preparing all interior and endpoint weights.
+Preparation costs $O(wp^2)$ with $O(wp)$ memory; each output is an $O(w)$ sum of products.
+Sum-of-products error follows the crate's bound for such sums.
+Zero window length gives `InvalidInput` (`Empty`); $p \ge w$ or $d > p$ gives `InvalidInput` (`OutOfRange`); requesting the midpoint of an even window gives `InvalidInput` (`UnsupportedConfiguration`); numerical rank loss in the design matrix gives `NumericalInstability`.
+`condition_estimate()` estimates the 1-norm condition number of the scaled design matrix.
+It indicates the fit's sensitivity to rounding error, rather than bounding output error.
+`coefficients()` returns the interior weights $c$ in window time order.
+
+### Endpoint handling
+
+At a record endpoint, part of the window lies outside the record.
+`SavitzkyGolayBoundary` selects how to handle this.
+
+- `Polynomial` evaluates the polynomial fitted to the first (last) complete window at the endpoint output positions (Gorry's method).
+  It assumes no values outside the record, but a nonempty record must be at least the window length; otherwise, it returns `InvalidInput` (`Inconsistent`).
+- `Extend(SignalBoundary)` extends the record before applying the interior weights.
+  `Zero` uses zero outside; `Periodic` repeats with period $n$; `Reflect` mirrors without repeating endpoint samples ($x[-1] = x[1]$).
+
+Extension creates values outside the record; endpoint outputs reproduce a polynomial only if those assumptions hold.
+The one-shot call `savitzky_golay(input, window_length, polynomial_degree)` performs smoothing with default `SavitzkyGolayOptions` and fixed `Polynomial` boundaries.
+Create a plan for derivatives, other boundaries, or many records with the same window.
+The plan's `filter(input, boundary)` allocates and returns results; `filter_into` uses workspace prepared with `workspace_requirements` to write into caller-provided output.
+`filter_axis_into` processes each sequence along one axis of an N-dimensional array.
+
+### Polynomial reproduction
+
+The following cell filters the polynomial $x(t) = \sum_{j=0}^{q} u^j$ of degree $q$ (61 samples at $t = 0, 0.1, \dots, 6$, with $u = (t - 3)/3$) and compares with its closed-form derivative of order $d$.
+The closed form is computed independently within the cell as a check.
+The table shows maximum errors in the interior where the window fits and in the $M$ samples at each end, the condition estimate, weight sum $\sum c_j$, and noise gain $\sqrt{\sum c_j^2}$.
+Smoothing gives $\sum c_j = 1$; differentiation gives $\sum c_j = 0$.
+The chart overlays the closed form (dashed) and filter output (points).
+
+```rust
+//| id: signal-savgol-polynomial-reproduction
+//| ref: signal-savgol-polynomial-reproduction
+//| title: "Reproduce polynomials and derivatives with a Savitzky–Golay filter"
+//| run: reactive
+//| crates: [scioxide-signal]
+//| inputs:
+//|   window_length: {"type":"range","label":"Window length w [samples]","description":"Number of samples used for fitting (odd).","min":7,"max":21,"step":2,"value":11}
+//|   filter_degree: {"type":"range","label":"Fit degree p [-]","description":"Local polynomial degree.","min":2,"max":6,"step":1,"value":3}
+//|   signal_degree: {"type":"range","label":"Signal degree q [-]","description":"Input polynomial degree.","min":0,"max":6,"step":1,"value":3}
+//|   derivative: {"type":"select","label":"Derivative order d","options":["0 (smoothing)","1 (first derivative)","2 (second derivative)"],"value":"1 (first derivative)"}
+//|   boundary: {"type":"select","label":"Endpoint handling","options":["Polynomial","Reflect","Periodic","Zero"],"value":"Polynomial"}
+//| cases:
+//|   - {"id":"degree-above-fit","label":"q = 5","description":"A polynomial above the fitted degree is not reproduced even in the interior.","inputs":{"signal_degree":5}}
+//|   - {"id":"reflect","label":"Reflect","description":"Polynomials are not reproduced at extended endpoints.","inputs":{"boundary":"Reflect"}}
+//|   - {"id":"even-degree","label":"p = 2, q = 3, smoothing","description":"Centered smoothing gives identical weights for degrees 2 and 3.","inputs":{"filter_degree":2,"derivative":"0 (smoothing)"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"reproduction","path":"/rows/0/0","range":{"max":1e-12}}
+//|       - {"artifact":"reproduction","path":"/rows/0/1","range":{"max":1e-12}}
+//|       - {"artifact":"reproduction","path":"/rows/0/3","range":{"max":1e-12}}
+//|   - case: degree-above-fit
+//|     expect:
+//|       - {"artifact":"reproduction","path":"/rows/0/0","range":{"min":1e-6}}
+//|   - case: reflect
+//|     expect:
+//|       - {"artifact":"reproduction","path":"/rows/0/0","range":{"max":1e-12}}
+//|       - {"artifact":"reproduction","path":"/rows/0/1","range":{"min":1e-3}}
+//|   - case: even-degree
+//|     expect:
+//|       - {"artifact":"reproduction","path":"/rows/0/0","range":{"max":1e-12}}
+//|       - {"artifact":"reproduction","path":"/rows/0/1","range":{"min":1e-6}}
+//|       - {"artifact":"reproduction","path":"/rows/0/3","approx":{"value":1.0,"atol":1e-12}}
+use scioxide_signal::{
+    SavitzkyGolayBoundary, SavitzkyGolayOptions, SavitzkyGolayPlan, SignalBoundary,
+};
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed4 = serde_json::json!({ "fractionDigits": 4 });
+let w = window_length.round() as usize;
+let p = filter_degree.round() as usize;
+let q = signal_degree.round() as usize;
+// The leading digit of the option gives derivative order d.
+let d: usize = derivative[..1]
+    .parse()
+    .map_err(|e: std::num::ParseIntError| e.to_string())?;
+let edge = match boundary.as_str() {
+    "Reflect" => SavitzkyGolayBoundary::Extend(SignalBoundary::Reflect),
+    "Periodic" => SavitzkyGolayBoundary::Extend(SignalBoundary::Periodic),
+    "Zero" => SavitzkyGolayBoundary::Extend(SignalBoundary::Zero),
+    _ => SavitzkyGolayBoundary::Polynomial,
+};
+
+let (n, spacing) = (61_usize, 0.1_f64);
+let u = |k: usize| (k as f64 * spacing - 3.0) / 3.0;
+let samples: Vec<f64> = (0..n)
+    .map(|k| (0..=q).map(|j| u(k).powi(j as i32)).sum())
+    .collect();
+// Independent check: closed-form derivative of order d of Σ u^j with respect to t (du/dt = 1/3).
+let exact = |k: usize| -> f64 {
+    (d..=q)
+        .map(|j| {
+            let falling: f64 = (j - d + 1..=j).map(|i| i as f64).product();
+            falling * u(k).powi((j - d) as i32) / 3.0_f64.powi(d as i32)
+        })
+        .sum()
+};
+
+let options = SavitzkyGolayOptions::new()
+    .with_derivative(d)
+    .with_spacing(spacing);
+let plan = SavitzkyGolayPlan::new(w, p, options).map_err(|e| e.to_string())?;
+let output = plan.filter(&samples, edge).map_err(|e| e.to_string())?;
+
+let half = w / 2;
+let (mut interior, mut edges) = (0.0_f64, 0.0_f64);
+for (k, &y) in output.iter().enumerate() {
+    let error = (y - exact(k)).abs();
+    if k < half || k >= n - half {
+        edges = edges.max(error);
+    } else {
+        interior = interior.max(error);
+    }
+}
+let weight_sum: f64 = plan.coefficients().iter().sum();
+let noise_gain = plan
+    .coefficients()
+    .iter()
+    .map(|c| c * c)
+    .sum::<f64>()
+    .sqrt();
+
+let columns = serde_json::json!([
+    { "key": "0", "label": "Maximum interior error [-]", "type": "number", "format": sci3 },
+    { "key": "1", "label": "Maximum endpoint error [-]", "type": "number", "format": sci3 },
+    { "key": "2", "label": "Condition estimate [-]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "Weight sum Σc [-]", "type": "number", "format": fixed4 },
+    { "key": "4", "label": "Noise gain √Σc² [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    vec![(
+        interior,
+        edges,
+        plan.condition_estimate(),
+        weight_sum,
+        noise_gain
+    )],
+    metadata = serde_json::json!({ "id": "reproduction" })
+);
+
+let reference: Vec<[f64; 2]> = (0..n).map(|k| [k as f64 * spacing, exact(k)]).collect();
+let filtered: Vec<[f64; 2]> = (0..n).map(|k| [k as f64 * spacing, output[k]]).collect();
+emit_line_chart!(
+    &vec![
+        serde_json::json!({
+            "name": "Closed form",
+            "points": reference,
+            "style": { "lineType": "dashed", "showSymbol": false }
+        }),
+        serde_json::json!({
+            "name": "Savitzky–Golay",
+            "points": filtered,
+            "style": { "symbol": "circle" }
+        }),
+    ],
+    options = &serde_json::json!({ "xLabel": "Time t [-]", "yLabel": "Derivative of order d [-]" })
+);
+```
+
+With defaults ($w = 11$, $p = 3$, $q = 3$, $d = 1$, `Polynomial`), maximum interior error is $2.9 \times 10^{-15}$ and maximum endpoint error $1.7 \times 10^{-14}$, reproducing the polynomial derivative at rounding-error level, including endpoints.
+The condition estimate is 16.9, and noise gain is 2.46.
+In case “q = 5”, signal degree exceeds fit degree and interior error grows to $7.8 \times 10^{-5}$.
+In case “Reflect”, interior reproduction persists ($2.9 \times 10^{-15}$), but endpoint error reaches 2.0.
+Mirror extension reverses derivative signs, driving the endpoint first derivative toward zero.
+In case “p = 2, q = 3, smoothing”, even a degree-2 fit reproduces the cubic polynomial in the interior, with error $8.9 \times 10^{-16}$.
+Endpoint `Polynomial` evaluates the polynomial off center, so this symmetry does not apply and endpoint error is $1.3 \times 10^{-3}$.
+
+## Whittaker–Henderson smoothing
+
+### Penalized least squares and banded solvers
+
+Whittaker–Henderson smoothing fits the entire record at once.
+For observations $y_1, \dots, y_n$, nonnegative weights $w_i$, penalty strength $\lambda \ge 0$, and difference order $d$, the smoothed sequence $z$ minimizes
+
+$$
+S(z) = \sum_{i=1}^{n} w_i\,|z_i - y_i|^2 + \lambda\,\lVert D_d z \rVert^2
+$$
+
+
+$D_d$ is the $(n - d) \times n$ matrix of forward differences of order $d$, without additional boundary rows.
+For example, $d = 2$ gives $(D_2 z)_i = z_{i+2} - 2z_{i+1} + z_i$.
+The minimizer satisfies the normal equations
+
+$$
+(W + \lambda D_d^{\mathsf T} D_d)\, z = W y, \qquad W = \operatorname{diag}(w)
+$$
+
+
+The coefficient matrix is symmetric and banded with half-bandwidth $d$, allowing banded Cholesky factorization in $O(nd^2)$ operations and $O(nd)$ memory.
+As $\lambda \to \infty$, $z$ approaches the weighted least-squares polynomial fit of degree at most $d - 1$; at $\lambda = 0$, $z = y$.
+The same equation handles endpoints and interior, without choosing a window length.
+
+`WhittakerHendersonPlan::new(n, order, lambda, weights, options)` checks record length $n$, order $d$, $\lambda$, and weights (`None` means unit weights), then factors the coefficient matrix once.
+Smoothing each record, including diagnostics, costs $O(nd)$.
+Data may be real or complex; weights and $\lambda$ are real.
+$n < 2$, $d$ outside $1 \le d < n$, or negative $\lambda$ or weights gives `InvalidInput`.
+
+### Weights and missing data
+
+Zero-weight samples are treated as missing; their values do not affect the minimizer.
+Rows of $W$ vanish over a missing interval, so $z$ satisfies $(D_d^{\mathsf T} D_d z)_i = 0$, bridging the interval with a polynomial of degree $2d - 1$.
+Uniqueness requires at least $d$ positive weights; for $\lambda = 0$, all weights must be positive.
+Otherwise, it returns `InvalidInput`.
+
+If a positive weight $w_i$ is too small relative to the penalty diagonal, with $w_i \le \varepsilon\lambda (D_d^{\mathsf T} D_d)_{ii}$, rounding in addition loses the weight.
+Preparation then returns `NumericalInstability` (`IllConditioned`).
+Use zero, rather than a small positive weight, to represent missing data.
+
+### Conditioning and solution diagnostics
+
+`conditioning()` returns `SmoothingConditioning`, computed during preparation from the data-independent coefficient matrix conditioning.
+
+- `Identity` corresponds to $\lambda = 0$ and copies the input without solving a system.
+- `ReciprocalSpectralBound(r)` gives a lower bound $r = \min w / (\max w + \lambda (\sum_j |\delta_j|)^2)$ on the reciprocal spectral condition number when all weights are positive.
+  Here, $\delta_j$ are coefficients of the difference of order $d$, with $\sum_j |\delta_j| = 2^d$.
+- `OneNormEstimate` is the Hager–Higham estimate of the reciprocal 1-norm condition number when weights include zeros.
+
+`smooth(input)` returns the result and `SmoothingDiagnostics`.
+`data_fidelity()` is the fitting term $\sum w_i|z_i - y_i|^2$, and `penalty()` is the penalty term $\lambda\lVert D_d z\rVert^2$, both expressed in the supplied weight units.
+`scaled_optimality_residual()` is the componentwise backward error $\max_i |Az - b|_i / (|A||z| + |b|)_i$ for $A = W + \lambda D_d^{\mathsf T} D_d$ and $b = Wy$.
+These describe the computed solution; they are not error bounds.
+Small backward error can accompany large forward error in an ill-conditioned system, so read conditioning diagnostics and backward error separately.
+
+The caller-provided-output API `smooth_into(input, output, workspace, cx)` uses a `WhittakerWorkspace` prepared according to the `WhittakerRequirements` returned by `workspace_requirements(lanes)` and allocates nothing during execution.
+Use `workspace(1)` for one record.
+`smooth_axis_into` independently smooths each sequence along one axis of an N-dimensional array with the same weights and order, without computing diagnostics.
+It does not apply a multidimensional penalty.
+One workspace can be shared by several plans if preallocated for their largest requirement.
+
+The following cell smooths $y_k = \sin(2\pi k / 75) + 0.5\cos(2\pi k / 150) + \varepsilon_k$ ($k = 0, \dots, 149$, with $\varepsilon_k$ Gaussian random values of standard deviation 0.2).
+An interval starting at index 60 is made missing by setting its weights to zero.
+The upper table compares SciOxide diagnostics with independent computations of the same quantities within the cell.
+The stationarity residual divides the maximum gradient $W(z - y) + \lambda D_d^{\mathsf T} D_d z$ by $\max|Wy|$ and is computed manually by applying differences directly from their definition.
+The lower table shows conditioning diagnostics and RMS errors against the true signal at observed points and over the missing interval.
+
+```rust
+//| id: signal-whittaker-gap
+//| ref: signal-whittaker-gap
+//| title: "Remove noise and interpolate missing data with Whittaker–Henderson smoothing"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-random, scioxide-signal]
+//| inputs:
+//|   lambda_exponent: {"type":"range","label":"Penalty exponent e (λ = 10^e)","description":"Strength of the smoothness penalty.","min":-1,"max":6,"step":0.5,"value":3}
+//|   difference_order: {"type":"range","label":"Difference order d [-]","description":"Order of differences used for the penalty.","min":1,"max":3,"step":1,"value":2}
+//|   gap_length: {"type":"range","label":"Missing interval length [samples]","description":"Number of samples assigned zero weight starting at index 60.","min":0,"max":40,"step":5,"value":20}
+//|   seed: {"type":"range","label":"Random seed","description":"Choose the noise realization.","min":1,"max":20,"step":1,"value":7}
+//| cases:
+//|   - {"id":"no-gap","label":"No missing data","description":"All weights are positive, so the conditioning diagnostic is a lower bound on the spectral condition number.","inputs":{"gap_length":0}}
+//|   - {"id":"weak-penalty","label":"λ = 0.1","description":"The weak penalty leaves most noise intact.","inputs":{"lambda_exponent":-1}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"diagnostics","path":"/rows/0/3","range":{"max":1e-12}}
+//|       - {"artifact":"diagnostics","path":"/rows/1/3","range":{"max":1e-10}}
+//|       - {"artifact":"diagnostics","path":"/rows/2/1","range":{"max":1e-12}}
+//|       - {"artifact":"diagnostics","path":"/rows/3/2","range":{"max":1e-12}}
+//|       - {"artifact":"accuracy","path":"/rows/0/0","equals":"OneNormEstimate"}
+//|   - case: no-gap
+//|     expect:
+//|       - {"artifact":"accuracy","path":"/rows/0/0","equals":"ReciprocalSpectralBound"}
+//|       - {"artifact":"accuracy","path":"/rows/0/3","equals":null}
+//|   - case: weak-penalty
+//|     expect:
+//|       - {"artifact":"diagnostics","path":"/rows/3/2","range":{"max":1e-12}}
+use scioxide_core::ExecutionContext;
+use scioxide_random::{Distribution, Normal, SeedableRng, SplitMix64};
+use scioxide_signal::{SignalExecutionOptions, SmoothingConditioning, WhittakerHendersonPlan};
+use std::f64::consts::PI;
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let n = 150_usize;
+let order = difference_order.round() as usize;
+let lambda = 10.0_f64.powf(lambda_exponent);
+let gap = 60..60 + gap_length.round() as usize;
+// True signal (reference using standard f64 functions) and Gaussian noise with a fixed seed.
+let truth: Vec<f64> = (0..n)
+    .map(|k| (2.0 * PI * k as f64 / 75.0).sin() + 0.5 * (2.0 * PI * k as f64 / 150.0).cos())
+    .collect();
+let noise = Normal::new(0.0, 0.2).map_err(|e| e.to_string())?;
+let mut rng = SplitMix64::from_seed(seed as u64);
+let mut data = Vec::with_capacity(n);
+for &value in &truth {
+    data.push(value + noise.sample(&mut rng).map_err(|e| e.to_string())?);
+}
+let weights: Vec<f64> = (0..n)
+    .map(|k| if gap.contains(&k) { 0.0 } else { 1.0 })
+    .collect();
+
+let plan = WhittakerHendersonPlan::new(
+    n,
+    order,
+    lambda,
+    Some(&weights),
+    SignalExecutionOptions::new(),
+)
+.map_err(|e| e.to_string())?;
+let mut workspace = plan.workspace(1).map_err(|e| e.to_string())?;
+let mut smoothed = vec![0.0; n];
+let diagnostics = plan
+    .smooth_into(
+        &data,
+        &mut smoothed,
+        &mut workspace,
+        ExecutionContext::sequential(),
+    )
+    .map_err(|e| e.to_string())?;
+
+// Independent check: apply D and Dᵀ from their definitions to form both terms and the stationarity condition.
+let difference =
+    |v: &[f64]| -> Vec<f64> { v.windows(2).map(|pair| pair[1] - pair[0]).collect() };
+let transpose = |v: &[f64]| -> Vec<f64> {
+    (0..=v.len())
+        .map(|i| if i > 0 { v[i - 1] } else { 0.0 } - if i < v.len() { v[i] } else { 0.0 })
+        .collect()
+};
+let mut differenced = smoothed.clone();
+for _ in 0..order {
+    differenced = difference(&differenced);
+}
+let mut penalty_gradient = differenced.clone();
+for _ in 0..order {
+    penalty_gradient = transpose(&penalty_gradient);
+}
+let fidelity: f64 = (0..n)
+    .map(|i| weights[i] * (smoothed[i] - data[i]).powi(2))
+    .sum();
+let penalty = lambda * differenced.iter().map(|v| v * v).sum::<f64>();
+let scale = (0..n)
+    .map(|i| (weights[i] * data[i]).abs())
+    .fold(0.0, f64::max);
+let stationarity = (0..n)
+    .map(|i| (weights[i] * (smoothed[i] - data[i]) + lambda * penalty_gradient[i]).abs())
+    .fold(0.0, f64::max)
+    / scale;
+
+let relative = |a: f64, b: f64| (a - b).abs() / b.abs();
+let diagnostic_rows = vec![
+    (
+        "Fitting term Σw(z − y)²",
+        Some(diagnostics.data_fidelity()),
+        Some(fidelity),
+        Some(relative(diagnostics.data_fidelity(), fidelity)),
+    ),
+    (
+        "Penalty term λ‖D z‖²",
+        Some(diagnostics.penalty()),
+        Some(penalty),
+        Some(relative(diagnostics.penalty(), penalty)),
+    ),
+    (
+        "Componentwise backward error",
+        Some(diagnostics.scaled_optimality_residual()),
+        None,
+        None,
+    ),
+    ("Relative stationarity residual", None, Some(stationarity), None),
+];
+let diagnostic_columns = serde_json::json!([
+    { "key": "0", "label": "Quantity" },
+    { "key": "1", "label": "SciOxide diagnostic [-]", "type": "number", "format": sci3, "nullText": "—" },
+    { "key": "2", "label": "Independent computation [-]", "type": "number", "format": sci3, "nullText": "—" },
+    { "key": "3", "label": "Relative difference [-]", "type": "number", "format": sci3, "nullText": "—" }
+]);
+emit_table_with_columns!(
+    diagnostic_columns,
+    diagnostic_rows,
+    metadata = serde_json::json!({ "id": "diagnostics" })
+);
+
+let (kind, reciprocal) = match plan.conditioning() {
+    SmoothingConditioning::Identity => ("Identity", None),
+    SmoothingConditioning::ReciprocalSpectralBound(bound) => {
+        ("ReciprocalSpectralBound", Some(bound))
+    }
+    SmoothingConditioning::OneNormEstimate(estimate) => {
+        ("OneNormEstimate", Some(estimate.reciprocal().value()))
+    }
+};
+let rms = |indices: Vec<usize>| -> Option<f64> {
+    let count = indices.len() as f64;
+    let sum: f64 = indices
+        .iter()
+        .map(|&i| (smoothed[i] - truth[i]).powi(2))
+        .sum();
+    (count > 0.0).then(|| (sum / count).sqrt())
+};
+let observed_rms = rms((0..n).filter(|k| !gap.contains(k)).collect());
+let gap_rms = rms(gap.clone().collect());
+let accuracy_columns = serde_json::json!([
+    { "key": "0", "label": "Conditioning diagnostic" },
+    { "key": "1", "label": "Reciprocal condition number [-]", "type": "number", "format": sci3, "nullText": "—" },
+    { "key": "2", "label": "RMS error (observed points) [-]", "type": "number", "format": sci3, "nullText": "—" },
+    { "key": "3", "label": "RMS error (missing interval) [-]", "type": "number", "format": sci3, "nullText": "No missing data" }
+]);
+emit_table_with_columns!(
+    accuracy_columns,
+    vec![(kind, reciprocal, observed_rms, gap_rms)],
+    metadata = serde_json::json!({ "id": "accuracy" })
+);
+
+let observed: Vec<[f64; 2]> = (0..n)
+    .filter(|k| !gap.contains(k))
+    .map(|k| [k as f64, data[k]])
+    .collect();
+let truth_curve: Vec<[f64; 2]> = (0..n).map(|k| [k as f64, truth[k]]).collect();
+let smooth_curve: Vec<[f64; 2]> = (0..n).map(|k| [k as f64, smoothed[k]]).collect();
+let mut annotations = Vec::new();
+if !gap.is_empty() {
+    annotations.push(serde_json::json!({
+        "kind": "range",
+        "axis": "x",
+        "from": gap.start as f64,
+        "to": (gap.end - 1) as f64,
+        "label": "Missing data (zero weight)"
+    }));
+}
+emit_chart!(serde_json::json!({
+    "kind": "xy",
+    "xLabel": "Sample index k [-]",
+    "yLabel": "Value [-]",
+    "yMin": -2.0,
+    "yMax": 2.0,
+    "layers": [
+        { "id": "data", "kind": "scatter", "name": "Observations y", "points": observed },
+        {
+            "id": "truth",
+            "kind": "line",
+            "name": "True signal",
+            "points": truth_curve,
+            "style": { "lineType": "dashed", "showSymbol": false }
+        },
+        { "id": "smoothed", "kind": "line", "name": "Smoothed z", "points": smooth_curve }
+    ],
+    "annotations": annotations
+}));
+```
+
+With defaults ($\lambda = 10^3$, $d = 2$, 20 missing samples, seed 7), both fitting and penalty terms agree with independent computations to relative differences at most $5 \times 10^{-16}$.
+Backward error is $1.3 \times 10^{-16}$ and the stationarity residual $9.8 \times 10^{-13}$; the banded Cholesky solution satisfies the normal equations at rounding-error level.
+Because weights include zeros, the conditioning diagnostic is `OneNormEstimate`, with reciprocal condition estimate $1.0 \times 10^{-5}$.
+RMS errors against the true signal are 0.058 at observed points and 0.126 over the missing interval, below the noise standard deviation of 0.2.
+A cubic polynomial connects observations on both sides across the missing interval.
+
+In the “No missing data” case, the conditioning diagnostic is the `ReciprocalSpectralBound` lower bound $6.25 \times 10^{-5}$.
+This equals $1/(1 + 16\lambda)$ and decreases by about a factor of 10 when $\lambda$ increases tenfold.
+The “λ = 0.1” case has a weak penalty and observed-point RMS error 0.153, leaving most noise intact.
+Increasing $\lambda$ to $10^6$ instead brings the curve toward a linear trend, also removing sinusoidal peaks.
+Choose $\lambda$ by trading noise reduction against shape preservation, rather than by residual magnitude alone.
+
+## B-spline coefficients and symmetric recursive filters
+
+An interpolating spline of degree $p$ passing through equally spaced samples $x[0], \dots, x[n-1]$ is
+
+$$
+s(u) = \sum_k c[k]\,\beta^p(u - k), \qquad s(i) = x[i] \quad (i = 0, \dots, n - 1)
+$$
+
+
+Here, $\beta^p$ is the centered B-spline of degree $p$, and $u$ is position in sample units.
+`SplineDegree::Quadratic` has $\beta^2(0) = 3/4$ and $\beta^2(\pm 1) = 1/8$, while `SplineDegree::Cubic` has $\beta^3(0) = 2/3$ and $\beta^3(\pm 1) = 1/6$.
+The interpolation condition is the coefficient convolution $x[i] = \beta^p(0)c[i] + \beta^p(1)(c[i-1] + c[i+1])$, so its inverse filter gives the coefficients.
+The inverse filter factors into first-order terms, with pole $-3 + 2\sqrt{2}$ for degree 2 and $-2 + \sqrt{3}$ for degree 3.
+
+`SymmetricFilter` provides general zero-phase recursive filters of this form.
+The transfer function is
+
+$$
+H(z) = \frac{g}{A(z)\,A(z^{-1})}, \qquad A(z) = 1 - p z^{-1} \ \text{or}\ 1 - 2r\cos\theta\,z^{-1} + r^2 z^{-2}
+$$
+
+with a causal $1/A(z)$ pass followed by an anticausal $1/A(z^{-1})$ pass.
+`first_order(pole, gain, options)` takes a real pole $|p| < 1$; `second_order(radius, angle, gain, options)` takes conjugate poles of radius $[0, 1)$ and angle $[0, \pi]$; values outside these ranges give `InvalidInput`.
+The record uses half-sample mirror extension ($x[-1] = x[0]$, $x[n] = x[n-1]$); each pass starts in the exact steady state of that periodic extension, avoiding startup transients.
+The cost is $O(n)$.
+It provides `filter`, `filter_into`, and `filter_axis_into`; construction only checks coefficients.
+
+`SplineFilter::new(degree, options)` retains the degree and recursive filter.
+`coefficients` computes coefficients $c$; `reconstruct` reconstructs samples $s(i)$ from them; `evaluate_into` maps arbitrary coordinates $x$ to $u = (x - \text{origin})/\text{spacing}$ and evaluates $s(u)$.
+Coefficients also use half-sample mirror extension, so $s$ is even about $u = -1/2$ and $u = n - 1/2$ and extends outside the record with period $2n$.
+Find workspace size by passing `SplineRequest::Coefficients(layout)`, `Reconstruct(layout)`, or `Evaluate(count)` to `workspace_requirements` for the operation.
+Coefficient computation costs $O(n)$; reconstruction and evaluation cost $O(1)$ per point.
+This performs interpolation, so it does not remove noise.
+
+The following cell computes coefficients of a sinusoid $x[i] = \sin(2\pi i / P)$ with period $P$ samples ($n = 200$) and performs three checks.
+Reconstruction error $\max|s(i) - x[i]|$ checks the interpolation condition.
+Manually assemble samples from the coefficients using $\beta^p$ values and compare with `reconstruct`.
+Measure error at interior midpoints $u = i + 1/2$ for periods $P$ and $2P$ and compute observed order from the log ratio $\log_2(e_P / e_{2P})$.
+A degree-$p$ interpolating spline has error $O(h^{p+1})$ for sufficiently smooth functions.
+
+```rust
+//| id: signal-spline-interpolation
+//| ref: signal-spline-interpolation
+//| title: "Interpolation with B-spline coefficients and midpoint error order"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-signal]
+//| inputs:
+//|   samples_per_period: {"type":"range","label":"Samples per period P [samples]","description":"Sinusoid period. Larger values sample more densely.","min":6,"max":40,"step":2,"value":12}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"spline","path":"/rows/0/1","range":{"max":1e-12}}
+//|       - {"artifact":"spline","path":"/rows/1/2","range":{"max":1e-12}}
+//|       - {"artifact":"spline","path":"/rows/1/5","approx":{"value":4.0,"atol":0.3}}
+use scioxide_core::ExecutionContext;
+use scioxide_signal::{SignalExecutionOptions, SplineDegree, SplineFilter, SplineRequest};
+use std::f64::consts::PI;
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let n = 200_usize;
+// Use only interior midpoints away from boundaries.
+let coordinates: Vec<f64> = (n / 4..3 * n / 4).map(|i| i as f64 + 0.5).collect();
+let degrees = [
+    ("Quadratic", SplineDegree::Quadratic, 0.75, 0.125),
+    ("Cubic", SplineDegree::Cubic, 2.0 / 3.0, 1.0 / 6.0),
+];
+let mut rows = Vec::new();
+for (name, degree, center, neighbor) in degrees {
+    let spline = SplineFilter::<f64>::new(degree, SignalExecutionOptions::new())
+        .map_err(|e| e.to_string())?;
+    let mut workspace = spline
+        .workspace::<f64>(SplineRequest::Evaluate(coordinates.len()))
+        .map_err(|e| e.to_string())?;
+    let mut midpoint_errors = [0.0_f64; 2];
+    let (mut interpolation, mut assembly) = (0.0_f64, 0.0_f64);
+    for (level, error) in midpoint_errors.iter_mut().enumerate() {
+        let period = samples_per_period * f64::from(1_u32 << level);
+        // Samples and true midpoint values are references (standard f64 functions).
+        let samples: Vec<f64> = (0..n)
+            .map(|i| (2.0 * PI * i as f64 / period).sin())
+            .collect();
+        let coefficients = spline.coefficients(&samples).map_err(|e| e.to_string())?;
+        let mut values = vec![0.0; coordinates.len()];
+        spline
+            .evaluate_into(
+                &coefficients,
+                &coordinates,
+                0.0,
+                1.0,
+                &mut values,
+                &mut workspace,
+                ExecutionContext::sequential(),
+            )
+            .map_err(|e| e.to_string())?;
+        *error = coordinates
+            .iter()
+            .zip(&values)
+            .map(|(&u, &s)| (s - (2.0 * PI * u / period).sin()).abs())
+            .fold(0.0, f64::max);
+        if level == 0 {
+            let nodes = spline
+                .reconstruct(&coefficients)
+                .map_err(|e| e.to_string())?;
+            interpolation = nodes
+                .iter()
+                .zip(&samples)
+                .map(|(s, x)| (s - x).abs())
+                .fold(0.0, f64::max);
+            // Independent check: multiply by β values and sum with half-sample mirror extension c[−1] = c[0], c[n] = c[n−1].
+            let c = |i: isize| coefficients[i.clamp(0, n as isize - 1) as usize];
+            assembly = (0..n as isize)
+                .map(|i| {
+                    (center * c(i) + neighbor * (c(i - 1) + c(i + 1)) - nodes[i as usize]).abs()
+                })
+                .fold(0.0, f64::max);
+        }
+    }
+    let order = (midpoint_errors[0] / midpoint_errors[1]).log2();
+    rows.push((
+        name,
+        interpolation,
+        assembly,
+        midpoint_errors[0],
+        midpoint_errors[1],
+        order,
+    ));
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "Degree" },
+    { "key": "1", "label": "Interpolation error [-]", "type": "number", "format": sci3 },
+    { "key": "2", "label": "Difference from manual reconstruction [-]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "Midpoint error (P) [-]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "Midpoint error (2P) [-]", "type": "number", "format": sci3 },
+    { "key": "5", "label": "Observed order [-]", "type": "number", "format": fixed2 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "spline" })
+);
+```
+
+With default $P = 12$, interpolation error is $1.0 \times 10^{-15}$ for degree 2 and $4.4 \times 10^{-16}$ for degree 3; both sets of coefficients give splines passing through the samples.
+The difference from manually assembled reconstruction is also at most $2.3 \times 10^{-16}$.
+Cubic midpoint error decreases from $2.0 \times 10^{-4}$ to $1.2 \times 10^{-5}$, giving observed order 4.04, close to the theoretical 4.
+The quadratic observed order is also 3.99, faster than $O(h^3)$ at general positions.
+Centered quadratic B-spline knots lie at sample midpoints; for even-degree interpolating splines, knot errors decrease one order faster (superconvergence).
+As $P$ decreases toward 6 samples per period, both degrees depart from their asymptotic orders.
+
+## Detrending
+
+Detrending fits a constant or line to each record or segment by least squares and returns the residual.
+`DetrendKind::Constant` subtracts the segment mean; `DetrendKind::Linear` subtracts the least-squares line $\alpha + \beta k$ in sample index $k$.
+The line's slope is
+
+$$
+\beta = \frac{\sum_k (k - \bar k)(x_k - \bar x)}{\sum_k (k - \bar k)^2}, \qquad \alpha + \beta k = \bar x + \beta (k - \bar k)
+$$
+
+and SciOxide accumulates moments using indices centered at the segment midpoint to reduce cancellation.
+A one-sample segment has zero residual.
+Real and imaginary parts of complex samples are fitted separately.
+
+The one-shot call `detrend(input, kind)` fits one trend to the whole record and allocates the result.
+An empty record returns an empty result.
+`detrend_into(input, kind, breakpoints, output, cx)` divides the record at strictly increasing interior indices `breakpoints` (in $1, \dots, n - 1$) and fits each segment independently.
+Zero and $n$ are implicit breakpoints.
+Nonincreasing or out-of-range breakpoints give `InvalidInput` (`OutOfRange`).
+Trends need not join continuously; jumps at breakpoints are allowed.
+It borrows no work array and makes two passes, checking all segments before writing, for $O(n)$ computation without allocation.
+Each residual component has absolute error at most $\gamma_{8n+32} M + (8n + 32)\eta$ for a segment of length $n$ ($M$ is the segment's maximum component magnitude, and $\eta$ is the smallest positive subnormal).
+
+The following cell creates a 200-sample record by adding a trend with a jump and slope change at breakpoint $b$ to an oscillation $0.5\sin(2\pi k / 25)$ of period 25 samples.
+The trend is $0.01k$ for $k < b$ and $J - 0.005(k - b)$ for $k \ge b$ ($J$ is the jump).
+Compare residuals from whole-record detrending (`detrend`) and detrending with a breakpoint (`detrend_into`) against the original oscillation.
+Independently compute each segment's least-squares line from the normal equations within the cell and compare with `detrend_into`.
+
+```rust
+//| id: signal-detrend-piecewise
+//| ref: signal-detrend-piecewise
+//| title: "Piecewise and whole-record detrending"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-signal]
+//| inputs:
+//|   breakpoint: {"type":"range","label":"Breakpoint b [samples]","description":"Index where the trend jumps.","min":40,"max":160,"step":10,"value":120}
+//|   jump: {"type":"range","label":"Jump J [-]","description":"Trend value at the breakpoint.","min":-2,"max":2,"step":0.5,"value":1.5}
+//|   kind: {"type":"select","label":"Trend to fit","options":["Linear","Constant"],"value":"Linear"}
+//| cases:
+//|   - {"id":"constant","label":"Constant","description":"Subtracting only the mean leaves the slope within each segment.","inputs":{"kind":"Constant"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"detrend","path":"/rows/0/2","range":{"max":1e-12}}
+//|       - {"artifact":"detrend","path":"/rows/0/1","range":{"max":0.1}}
+//|   - case: constant
+//|     expect:
+//|       - {"artifact":"detrend","path":"/rows/0/2","range":{"max":1e-12}}
+use scioxide_core::ExecutionContext;
+use scioxide_signal::{DetrendKind, detrend, detrend_into};
+use std::f64::consts::PI;
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let n = 200_usize;
+let b = breakpoint.round() as usize;
+let linear = kind == "Linear";
+let method = if linear {
+    DetrendKind::Linear
+} else {
+    DetrendKind::Constant
+};
+// The oscillation is a reference (standard f64 functions).
+let oscillation: Vec<f64> = (0..n)
+    .map(|k| 0.5 * (2.0 * PI * k as f64 / 25.0).sin())
+    .collect();
+let record: Vec<f64> = (0..n)
+    .map(|k| {
+        let trend = if k < b {
+            0.01 * k as f64
+        } else {
+            jump - 0.005 * (k - b) as f64
+        };
+        trend + oscillation[k]
+    })
+    .collect();
+
+let global = detrend(&record, method).map_err(|e| e.to_string())?;
+let mut piecewise = vec![0.0; n];
+detrend_into(
+    &record,
+    method,
+    &[b],
+    &mut piecewise,
+    ExecutionContext::sequential(),
+)
+.map_err(|e| e.to_string())?;
+
+// Independent check: derive segment least-squares lines (or means) from the normal equations.
+let mut hand = vec![0.0; n];
+for (start, end) in [(0, b), (b, n)] {
+    let count = (end - start) as f64;
+    let mean_k = (start..end).map(|k| k as f64).sum::<f64>() / count;
+    let mean_x = record[start..end].iter().sum::<f64>() / count;
+    let sxx: f64 = (start..end).map(|k| (k as f64 - mean_k).powi(2)).sum();
+    let sxy: f64 = (start..end)
+        .map(|k| (k as f64 - mean_k) * (record[k] - mean_x))
+        .sum();
+    let slope = if linear { sxy / sxx } else { 0.0 };
+    for k in start..end {
+        hand[k] = record[k] - (mean_x + slope * (k as f64 - mean_k));
+    }
+}
+let rms = |residual: &[f64]| {
+    (residual
+        .iter()
+        .zip(&oscillation)
+        .map(|(r, o)| (r - o).powi(2))
+        .sum::<f64>()
+        / n as f64)
+        .sqrt()
+};
+let check = piecewise
+    .iter()
+    .zip(&hand)
+    .map(|(a, h)| (a - h).abs())
+    .fold(0.0, f64::max);
+let columns = serde_json::json!([
+    { "key": "0", "label": "RMS difference between whole-record detrending and oscillation [-]", "type": "number", "format": sci3 },
+    { "key": "1", "label": "RMS difference between piecewise detrending and oscillation [-]", "type": "number", "format": sci3 },
+    { "key": "2", "label": "Maximum difference from manual computation [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    vec![(rms(&global), rms(&piecewise), check)],
+    metadata = serde_json::json!({ "id": "detrend" })
+);
+
+let curve = |values: &[f64]| -> Vec<[f64; 2]> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(k, &v)| [k as f64, v])
+        .collect()
+};
+emit_line_chart!(
+    &vec![
+        serde_json::json!({ "name": "Record", "points": curve(&record) }),
+        serde_json::json!({ "name": "Whole-record detrending", "points": curve(&global) }),
+        serde_json::json!({ "name": "Piecewise detrending", "points": curve(&piecewise) }),
+    ],
+    options = &serde_json::json!({
+        "xLabel": "Sample index k [-]",
+        "yLabel": "Value [-]",
+        "yMin": -3.0,
+        "yMax": 3.5,
+        "annotations": [{
+            "kind": "line",
+            "axis": "x",
+            "value": b as f64,
+            "label": "Breakpoint b",
+            "style": { "lineType": "dotted" }
+        }]
+    })
+);
+```
+
+With defaults ($b = 120$, $J = 1.5$, `Linear`), the RMS difference between piecewise residuals and the original oscillation is 0.044; the only discrepancy is the small component of the oscillation projected onto each segment's line.
+Whole-record detrending cannot represent the jump with a single line, increasing the RMS difference to 0.196.
+The maximum difference from manual computation is $6.7 \times 10^{-16}$, confirming independent fits in each segment.
+The “Constant” case subtracts only means, leaving segment slopes; even piecewise detrending then gives RMS difference 0.279.
+Moving a breakpoint away from the actual jump leaves part of the trend in the mismatched segment.
+Place breakpoints using external information, such as sensor restart times.
+
+## Summary
+
+The Savitzky–Golay filter is an FIR filter reproducing polynomials within a window; window length and degree trade noise reduction against shape preservation, and `SavitzkyGolayBoundary` explicitly selects endpoint handling.
+Whittaker–Henderson smoothing uses penalized least squares over the whole record, fills missing data through zero weights, and requires conditioning diagnostics and backward error to be read separately.
+`SplineFilter` computes B-spline interpolation coefficients rather than smoothing; `SymmetricFilter` applies zero-phase recursive filters starting from steady state.
+Detrending uses segmentwise least squares; pass breakpoints to `detrend_into` when jump positions are known.
+See [Local filters and peaks](../local-filters-and-features/) for preprocessing outliers and detecting peaks, and [Checking smoothing, peaks, and outliers](../../examples/smoothing-peaks-and-outliers/) for checks combining noise, peaks, and outliers.

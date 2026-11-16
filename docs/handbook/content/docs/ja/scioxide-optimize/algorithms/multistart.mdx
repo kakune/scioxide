@@ -1,0 +1,574 @@
+---
+title: 複数開始点法
+description: 複数開始点法 MultiStart の構成、開始点の設計と数える乱数源、局所ソルバーの差し替え、開始点ごとのレポートと吸引域のまとめ方を、Himmelblau 関数で確かめる。
+sidebar:
+  order: 381
+references:
+  optimize-multistart: "複数開始点法の構成"
+  optimize-start-designs: "開始点の設計と乱数源"
+  optimize-local-solver-injection: "局所ソルバーの差し替え"
+  optimize-global-search-results: "結果と作業領域"
+---
+
+複数開始点法（multistart）は、箱の中に置いた多数の開始点からそれぞれ局所ソルバーを走らせ、得られた局所解の中で最も低いものを大域的最小点の候補にする。
+局所ソルバーの速さをそのまま使え、開始点ごとの計算が独立なので並列に実行できる。
+必要な開始点の数は[吸引域の命中確率](oxref:optimize-basin-hit-probability)のとおり吸引域の体積比で決まる。
+
+このページでは SciOxide の `MultiStart` を構成する開始点の設計、乱数源、局所ソルバーの factory と、結果の読み方を説明する。
+最後に Himmelblau 関数で、開始点の数と設計によって見つかる極小点がどう変わるかと、局所ソルバーによって評価回数と局所解の精度がどう変わるかを調べる。
+`MultiStart` は大域最適性を主張せず、全ての開始点を実行した終了は成功ではない `SearchBudgetCompleted` である。
+
+## 複数開始点法の構成
+
+$M$ 個の開始点 $\mathbf{x}^{(0)}_i$（$i = 0, \dots, M-1$）に対して、探索は次の手順を開始点の順に行う。
+
+1. 開始点の設計から $\mathbf{x}^{(0)}_i$ を作る。
+2. $\mathbf{x}^{(0)}_i$ から局所ソルバーで最小化し、結果を開始点のレポートに残す。
+3. 目的値がそれまでで最も低ければ最良点を更新し、局所求解が成功していれば既に見つけた局所解と比べて吸引域にまとめる。
+
+計算量は $M$ 回の局所求解の合計で、メモリは開始点ごとの点と結果の $O(Md)$ である。
+
+`MultiStart::new(options, design, factory)` は、探索の設定 `GlobalSearchOptions`、開始点の設計 `StartDesign`、局所ソルバーを作る `LocalSolverFactory` を組み合わせる。
+`new` は観測した極小点をまとめる許容誤差が NaN、無限大、0 以下のとき `InvalidInput` を返す。
+探索する箱は手法オブジェクトに固定せず、呼び出しごとに `minimize_into(problem, output, workspace, scope)` か `minimize(problem)` の `BoundedObjective` から受け取る。
+`BoundedObjective::new(objective, bounds)` の `scioxide_core::Bounds` は全ての座標に有限な上下端 $l_i < u_i$ を持つ必要があり、そうでなければ `minimize_into` が `InvalidInput` を返す。
+探索はこの箱を、有限で順序の正しい箱を表す `FiniteBounds` に変換して、開始点の設計と局所ソルバーへ渡す。
+
+`GlobalSearchOptions::default()` は開始点 10 個、シード 42、各局所求解の上限なし、極小点をまとめる許容誤差 $\sqrt{\varepsilon}$（座標と目的値の両方）、逐次実行、時間上限なしである。
+`with_starts`、`with_seed`、`with_local_budgets`、`with_basin_tolerances`、`with_execution`、`with_time_limit` で変える。
+時間上限には実行コンテキストのクロックが必要で、クロックのないコンテキストでは `minimize_into` が `CapabilityUnavailable` を返す。
+評価回数のような探索全体の上限は設定に含まれない。
+`scope` に親の `SolveContext` を渡すと、その上限が局所求解の評価も含めて探索全体に適用される。
+
+逐次でない実行方針では問題を `BoundedObjective::new_sync` で作る必要がある。
+このとき探索は親に残っている有限の上限を開始点ごとの固定の配分に分けてから並列に実行する。
+使われなかった配分は他の開始点に回らないので、有限の上限のもとでは結果が逐次実行と異なることがあるが、ワーカーの数には依存しない。
+
+## 開始点の設計と乱数源
+
+`StartDesign` トレイトは開始点を作る規則である。
+`validate(dimension, starts)` は最初の評価の前に、次元と要求された開始点の数に対応できるかを検査する。
+`point(index, bounds, random, output)` は $i$ 番目の開始点を `output` に書く。
+点は添字、箱、渡された乱数源だけで決まり、以前の呼び出しには依存しない。
+実装は `output` の全ての座標を書く必要がある。
+組み込みの設計の `point` は、箱と `output` の次元（`BorrowedStartDesign` と `QmcPlan` では設計の次元も）が合わないと、`output` を書き換えず乱数も引かずに `DimensionMismatch` を返す。
+返した点が箱の外にあるか有限でないと、探索が `InvalidInput` を返す。
+
+組み込みの設計は次の三つである。
+
+- `UniformStartDesign`：座標ごとに一様乱数を 1 つ引き、区間 $[l_j, u_j]$ へ一次変換する。
+- `BorrowedStartDesign::new(points, dimension)`：利用者が行ごとに並べた点を借用し、$i$ 行目を $i$ 番目の開始点にする。
+  次元が 0、点が空、長さが次元の倍数でない、NaN か無限大を含む、のどれかなら `InvalidInput` を返し、行が開始点の数より少なければ `validate` が `InvalidInput` を返す。
+- scioxide-random の `QmcPlan`：Sobol 列や Halton 列の $i$ 番目の点を箱へ一次変換して使い、乱数を引かない。
+
+層化抽出のような別の設計は、その点を `BorrowedStartDesign` で渡すか、`StartDesign` を実装する。
+
+`SearchRandom` は、探索が開始点の設計と basin hopping の変位へ渡す乱数源である。
+利用者は作らず、トレイトの実装の中で借用として受け取る。
+`uniform()` は $[0, 1)$ の一様乱数を返す。
+`SearchRandom` は scioxide-random の `BitGenerator` と `Rng` も実装するので、scioxide-random の分布から標本を引ける。
+乱数のワード（64 ビットのワードなど）を 1 つ引くごとに、探索の標本数の上限に 1 を数える。
+上限が引き出しを拒むと生成器は進まず、探索は `SampleLimit` で止まって、それまでの最良点を返す。
+複数開始点法では開始点ごとに、シードから導いた別の乱数列を使う。
+このため $i$ 番目の開始点は他の開始点の計算にも実行の順序にも依存せず、同じシードと設定なら同じ開始点が得られる。
+
+## 局所ソルバーの差し替え
+
+`LocalSolverFactory` は、開始点から局所最適化する局所ソルバーを作るトレイトである。
+`prepare(dimension)` は最初の評価の前に呼ばれ、探索は開始点ごとに一つずつソルバーを用意するので、開始点の間で状態を共有しない。
+factory の `Debug` 出力が設定の識別に使われ、出力が変わると作業領域の局所ソルバーは用意し直される。
+
+`SearchLocalSolver::minimize_into(problem, start, seed, output, context)` は、`start` から一回の局所求解を行う。
+呼び出しのたびに新しい求解を始め、以前の呼び出しの状態を使ってはいけない。
+目的の評価は渡された `context` を通して行う。
+`context` は大域探索のコンテキストの子なので、局所求解の評価回数も探索全体の上限に数えられる。
+`seed` は開始点を識別する値で、乱数を使う局所ソルバーが使う。
+
+局所ソルバーが `ConvergenceFailure`、`NumericalInstability`、`Singular` のエラーを返すと、探索はそのエラーを開始点のレポートに残して次の開始点へ進む。
+逐次実行では、局所求解が実行停止（`ExecutionStopped`）で終わった場合も同じくレポートに残す。
+それ以外のエラーは探索を止める。
+局所ソルバーが箱の外の点、有限でない目的値、`NotStarted` の終了理由を返した場合も、探索は `InvalidInput` で止まる。
+
+組み込みの `PowellLocalFactory` は探索の箱を境界にした [Powell 法](../powell-conjugate-directions/)の局所ソルバー `PowellSearchLocal` を作る。
+`PowellLocalFactory::new(options)` は `PowellOptions` を受け取り、`default()` は既定の設定を使う。
+`PowellSearchLocal` の各直線探索は、方向と箱が交わる線分全体で[一変数の最小化](../scalar-minimization/)の Brent 法を使う。
+線分全体で現在の値より低い点が見つからなければ、現在点の両側に長さ 1 以下（線分の端を越えない）の試し点を一つずつ評価し、現在の値より低い試し点との間か、二つの高い試し点が現在点を挟む区間で最小化し直す。
+このため、線分の別の谷に引き寄せられても、現在点の近くの減少を探し直す。
+一変数の最小化の結果は、点とそこでの有限な目的値の組 `MinimumSample` で、最良点と最後の三点（`ScalarMinimumResult::samples()`）を返す。
+勾配を使う局所ソルバーを接続する例は [Lennard-Jones クラスタの構造探索](../../examples/lennard-jones-clusters/)にある。
+
+## 結果と作業領域
+
+`GlobalSearchResult::empty()` は確保せずに結果を用意し、探索が最初の呼び出しで大きさを合わせる。
+`starts()` は実行した開始点のレポート `SearchStartReport` を開始点の順に返す。
+レポートは開始点 `start()`、候補 `candidate()`、局所求解の結果 `local_result()`、失敗した場合のエラー `error()`、評価回数 `counts()`、まとめた吸引域の番号 `basin()` を持つ。
+
+`best()` は局所求解の成否によらず目的値が最も低い候補、`best_successful()` は局所求解が成功した（終了理由の `is_success()` が真の）候補の中で最も低いものを返す。
+どちらも大域的最小点である証明ではない。
+`successes()`、`failures()`、`completed()` は成功した局所求解、エラーで終わった局所求解、候補を出した開始点の数を返す。
+
+`basins()` は、成功した局所解を吸引域ごとにまとめた数である。
+二つの局所解 $\mathbf{a}$、$\mathbf{b}$ は、目的値の組 $(f(\mathbf{a}), f(\mathbf{b}))$ と座標ごとの組 $(a_j, b_j)$ を $(x, y)$ としたとき、どの組も
+
+$$
+\left| \frac{x}{s} - \frac{y}{s} \right| \le \tau, \qquad s = \max(1, |x|, |y|)
+$$
+
+を満たすとき、同じ吸引域とみなす。
+$\tau$ は座標と目的値それぞれの許容誤差で、`with_basin_tolerances` で変える。
+$s$ の形から、絶対値が 1 より小さい量は絶対誤差で、大きい量は相対誤差で比べる。
+`basin()` は同じ吸引域に入った最初の開始点の番号を返す。
+このまとめ方は経験的な規則であり、本当に同じ吸引域にあることの証明ではない。
+
+全ての開始点を実行した終了は `SearchBudgetCompleted` で、成功ではない。
+評価回数などの上限、取り消し、期限で止まった場合は、実行した開始点のレポートを残し、終了理由がその原因を示す。
+最初の点を受理する前に止まった場合は、結果ではなくエラーが返る。
+
+`GlobalSearchWorkspace` は開始点ごとの局所ソルバー、シード、レポートのメモリを持つ。
+`MultiStart::workspace(dimension)` で用意し、次元、開始点の数、シード、局所ソルバーの設定が同じ呼び出しでは確保し直さずに再利用する。
+`GlobalSearchWorkspaceRequirements` は `workspace_requirements(dimension)` が返す必要量で、`dimension()` と `starts()` を持つ。
+`last_attempt()` と `last_accepted()` は直前の呼び出しの記録と最良点を返す。
+
+## Himmelblau 関数と注入する局所ソルバー
+
+Himmelblau 関数
+
+$$
+f(x, y) = (x^2 + y - 11)^2 + (x + y^2 - 7)^2
+$$
+
+は箱 $[-5, 5]^2$ に 4 つの極小点を持ち、どの極小点でも $f = 0$ である。
+極小点は $(3, 2)$、$(-2.805118, 3.131312)$、$(-3.779310, -3.283186)$、$(3.584428, -1.848126)$ で、最初の点以外は数値で求めた値である。
+勾配は
+
+$$
+\nabla f = \bigl(4x a + 2b,\; 2a + 4y b\bigr), \qquad a = x^2 + y - 11,\; b = x + y^2 - 7
+$$
+
+である。
+
+次の定義のブロックはこの関数を解析的な勾配付きの `ObjectiveFunction` として定義し、L-BFGS-B を局所ソルバーとして注入する factory を実装する。
+`LbfgsBFactory::prepare` は開始点ごとに `LbfgsB` と作業領域を一つずつ用意し、`LbfgsBLocal::minimize_into` は渡された箱付きの問題とコンテキストで一回の局所求解を行う。
+`search` は開始点の設計と局所ソルバーの選択から `MultiStart` を作って解く補助関数である。
+既知の極小点までの距離 `nearest` と勾配の最大成分 `gradient_norm` は、結果を独立に確かめるために使う。
+
+```rust
+//| id: optimize-multistart-himmelblau-model
+//| kind: definitions
+//| title: Himmelblau 関数と L-BFGS-B を注入する局所ソルバーの factory
+//| crates: [scioxide-core, scioxide-optimize]
+use scioxide_core::{SciOxideError, SolveContext};
+use scioxide_optimize::{
+    BoundedObjective, GlobalSearchOptions, GlobalSearchResult, LbfgsB, LbfgsBWorkspace,
+    LocalSolverFactory, MultiStart, ObjectiveFunction, OptimizeResult, PowellLocalFactory,
+    SearchLocalSolver, StartDesign,
+};
+
+/// Himmelblau 関数 f = a² + b²、a = x² + y − 11、b = x + y² − 7 と、その解析的な勾配。
+pub(crate) struct Himmelblau;
+impl ObjectiveFunction<f64> for Himmelblau {
+    fn dim(&self) -> usize {
+        2
+    }
+    fn eval(&self, x: &[f64]) -> Result<f64, SciOxideError> {
+        let (a, b) = (x[0] * x[0] + x[1] - 11.0, x[0] + x[1] * x[1] - 7.0);
+        Ok(a * a + b * b)
+    }
+    fn gradient_into(&self, x: &[f64], out: &mut [f64]) -> Result<bool, SciOxideError> {
+        let (a, b) = (x[0] * x[0] + x[1] - 11.0, x[0] + x[1] * x[1] - 7.0);
+        out[0] = 4.0 * x[0] * a + 2.0 * b;
+        out[1] = 2.0 * a + 4.0 * x[1] * b;
+        Ok(true)
+    }
+}
+
+/// 注入する局所ソルバーの factory。探索は開始点ごとに prepare を呼ぶ。
+#[derive(Debug)]
+pub(crate) struct LbfgsBFactory;
+pub(crate) struct LbfgsBLocal {
+    solver: LbfgsB<f64>,
+    work: LbfgsBWorkspace<f64>,
+}
+impl LocalSolverFactory<f64> for LbfgsBFactory {
+    type Solver = LbfgsBLocal;
+    fn prepare(&self, dimension: usize) -> Result<LbfgsBLocal, SciOxideError> {
+        let solver = LbfgsB::default();
+        let work = solver.workspace(dimension)?;
+        Ok(LbfgsBLocal { solver, work })
+    }
+}
+impl SearchLocalSolver<f64> for LbfgsBLocal {
+    fn minimize_into(
+        &mut self,
+        problem: &BoundedObjective<'_, f64>,
+        start: &[f64],
+        _: u64,
+        output: &mut OptimizeResult<f64>,
+        context: &mut SolveContext<'_, '_>,
+    ) -> Result<(), SciOxideError> {
+        // 箱は problem が持ち、評価は渡されたコンテキストで数える。
+        self.solver
+            .minimize_into(problem, start, output, &mut self.work, context)
+    }
+}
+
+/// 設計の型ごとに手法オブジェクトを作って解く。powell が真なら組み込みの Powell 法を使う。
+pub(crate) fn search<D: StartDesign<f64>>(
+    options: GlobalSearchOptions<f64>,
+    design: D,
+    powell: bool,
+    problem: &BoundedObjective<'_, f64>,
+) -> Result<GlobalSearchResult<f64>, SciOxideError> {
+    if powell {
+        MultiStart::new(options, design, PowellLocalFactory::default())?.minimize(problem)
+    } else {
+        MultiStart::new(options, design, LbfgsBFactory)?.minimize(problem)
+    }
+}
+
+/// 既知の 4 つの極小点（どれも f = 0）。(3, 2) 以外は Newton 法で倍精度まで求めた値。
+pub(crate) const MINIMA: [(f64, f64); 4] = [
+    (3.0, 2.0),
+    (-2.805118086952745, 3.131312518250573),
+    (-3.779310253377747, -3.283185991286170),
+    (3.584428340330492, -1.848126526964404),
+];
+
+/// 最も近い既知の極小点までの距離。
+pub(crate) fn nearest(x: &[f64]) -> f64 {
+    MINIMA
+        .iter()
+        .map(|&(a, b)| (x[0] - a).hypot(x[1] - b))
+        .fold(f64::INFINITY, f64::min)
+}
+
+/// 解析的な勾配の最大成分 ‖∇f‖∞。
+pub(crate) fn gradient_norm(x: &[f64]) -> Result<f64, SciOxideError> {
+    let mut g = [0.0; 2];
+    Himmelblau.gradient_into(x, &mut g)?;
+    Ok(g[0].abs().max(g[1].abs()))
+}
+```
+
+### 開始点の数と設計
+
+このセルは L-BFGS-B を注入した `MultiStart` で、開始点の数 $M$ と設計（一様乱数、Sobol 列、Halton 列）を変えて、何個の極小点が見つかるかを調べる。
+出力は開始点と局所解の散布図、吸引域ごとの代表の表、探索全体の要約と判定である。
+代表の点の勾配の大きさと既知の極小点までの距離を独立な検算に使い、$10^{-4}$ 以内に入った既知の極小点の数を数える。
+
+```rust
+//| id: optimize-multistart-designs
+//| ref: optimize-multistart-designs
+//| title: 開始点の数と設計を変えて Himmelblau 関数の極小点の見つかり方を見る
+//| run: reactive
+//| uses: [optimize-multistart-himmelblau-model]
+//| crates: [scioxide-core, scioxide-optimize, scioxide-random]
+//| inputs:
+//|   starts: {"type":"range","label":"開始点の数 M [点]","description":"局所ソルバーを走らせる開始点の数。","min":1,"max":40,"step":1,"value":6}
+//|   design: {"type":"select","label":"開始点の設計","options":["一様乱数","Sobol 列","Halton 列"],"value":"一様乱数"}
+//|   seed: {"type":"range","label":"乱数のシード [-]","description":"一様乱数の設計の開始点を変える。準乱数列の設計には影響しない。","min":1,"max":100,"step":1,"value":42}
+//| cases:
+//|   - {"id":"many-starts","label":"M = 40","description":"4 つの吸引域が全て見つかり、各吸引域に入った開始点の数から吸引域の大きさの違いが分かる。","inputs":{"starts":40}}
+//|   - {"id":"halton","label":"Halton 列","description":"同じ 6 点でも、Halton 列では 4 つの極小点が全て見つかる。","inputs":{"design":"Halton 列"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":"SearchBudgetCompleted"}
+//|       - {"artifact":"summary","path":"/rows/0/3","equals":3}
+//|       - {"artifact":"summary","path":"/rows/0/4","equals":3}
+//|       - {"artifact":"basins","path":"/rows/0/5","range":{"min":0,"max":1e-6}}
+//|       - {"path":"/outputs/3/state","equals":"partial"}
+//|   - case: many-starts
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/4","equals":4}
+//|   - case: halton
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/4","equals":4}
+use scioxide_core::{Bounds, Budget, EvaluationRole};
+use scioxide_optimize::{BoundedObjective, GlobalSearchOptions, UniformStartDesign};
+use scioxide_random::QmcPlan;
+
+let bounds = Bounds::new(vec![(Some(-5.0), Some(5.0)); 2]).map_err(|e| e.to_string())?;
+let problem = BoundedObjective::new(&Himmelblau, &bounds).map_err(|e| e.to_string())?;
+let count = Budget::try_from(starts.round() as usize).map_err(|e| e.to_string())?;
+let options = GlobalSearchOptions::default()
+    .with_starts(count)
+    .with_seed(seed.round() as u64);
+// 設計ごとに型が違うので、手法オブジェクトは search の中で作る。
+let result = match design.as_str() {
+    "Sobol 列" => search(
+        options,
+        QmcPlan::sobol(2).map_err(|e| e.to_string())?,
+        false,
+        &problem,
+    ),
+    "Halton 列" => search(
+        options,
+        QmcPlan::halton(2).map_err(|e| e.to_string())?,
+        false,
+        &problem,
+    ),
+    _ => search(options, UniformStartDesign, false, &problem),
+}
+.map_err(|e| e.to_string())?;
+
+let reports = result.starts();
+let start_points: Vec<[f64; 2]> = reports
+    .iter()
+    .map(|r| [r.start()[0], r.start()[1]])
+    .collect();
+let local_points: Vec<[f64; 2]> = reports
+    .iter()
+    .filter_map(|r| r.local_result())
+    .map(|r| [r.x()[0], r.x()[1]])
+    .collect();
+let known: Vec<[f64; 2]> = MINIMA.iter().map(|&(a, b)| [a, b]).collect();
+emit_scatter_chart!(
+    &vec![
+        serde_json::json!({
+            "name": "開始点",
+            "points": start_points,
+            "style": { "symbol": "circle" }
+        }),
+        serde_json::json!({
+            "name": "局所解",
+            "points": local_points,
+            "style": { "symbol": "diamond" }
+        }),
+        serde_json::json!({
+            "name": "既知の極小点",
+            "points": known,
+            "style": { "symbol": "emptyCircle" }
+        })
+    ],
+    options = &serde_json::json!({
+        "xLabel": "x [-]",
+        "yLabel": "y [-]",
+        "xMin": -5.0,
+        "xMax": 5.0,
+        "yMin": -5.0,
+        "yMax": 5.0
+    })
+);
+// 吸引域ごとの代表（その吸引域に入った最初の開始点）と、入った開始点の数。
+let mut basins = Vec::new();
+for (index, report) in reports.iter().enumerate() {
+    if let (Some(basin), Some(point)) = (report.basin(), report.local_result())
+        && basin == index
+    {
+        let members = reports.iter().filter(|r| r.basin() == Some(index)).count();
+        let x = point.x();
+        let gradient = gradient_norm(x).map_err(|e| e.to_string())?;
+        basins.push((
+            index,
+            x[0],
+            x[1],
+            point.fun(),
+            members,
+            gradient,
+            nearest(x),
+        ));
+    }
+}
+let found = MINIMA
+    .iter()
+    .filter(|&&(a, b)| {
+        basins
+            .iter()
+            .any(|row| (row.1 - a).hypot(row.2 - b) <= 1e-4)
+    })
+    .count();
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed4 = serde_json::json!({ "fractionDigits": 4 });
+emit_table_with_columns!(
+    serde_json::json!([
+        { "key": "0", "label": "代表の開始点の番号", "type": "integer" },
+        { "key": "1", "label": "x [-]", "type": "number", "format": fixed4 },
+        { "key": "2", "label": "y [-]", "type": "number", "format": fixed4 },
+        { "key": "3", "label": "目的値 [-]", "type": "number", "format": sci3 },
+        { "key": "4", "label": "入った開始点 [点]", "type": "integer" },
+        { "key": "5", "label": "勾配の大きさ ‖∇f‖∞ [-]", "type": "number", "format": sci3 },
+        { "key": "6", "label": "既知の極小点までの距離 [-]", "type": "number", "format": sci3 }
+    ]),
+    basins,
+    metadata = serde_json::json!({ "id": "basins" })
+);
+let evaluations = result
+    .counts()
+    .total()
+    .map_err(|e| e.to_string())?
+    .provider(EvaluationRole::Objective);
+let best = result.best().map(|r| r.fun());
+emit_table_with_columns!(
+    serde_json::json!([
+        { "key": "0", "label": "終了理由" },
+        { "key": "1", "label": "局所求解の成功 [点]", "type": "integer" },
+        { "key": "2", "label": "局所求解のエラー [点]", "type": "integer" },
+        { "key": "3", "label": "吸引域 [個]", "type": "integer" },
+        { "key": "4", "label": "見つかった既知の極小点 [個]", "type": "integer" },
+        { "key": "5", "label": "最良の目的値 [-]", "type": "number", "format": sci3, "nullText": "なし" },
+        { "key": "6", "label": "目的の評価 [回]", "type": "integer" }
+    ]),
+    vec![(
+        result.termination().to_string(),
+        result.successes(),
+        result.failures(),
+        result.basins(),
+        found,
+        best,
+        evaluations
+    )],
+    metadata = serde_json::json!({ "id": "summary" })
+);
+let mut outcome = Outcome::partial("開始点を使い切った。最良点は大域的最小点の候補である")
+    .status(result.termination().to_string())
+    .diagnostic("吸引域の数", result.basins() as f64, None)
+    .diagnostic("見つかった既知の極小点", found as f64, None)
+    .diagnostic("目的の評価", evaluations as f64, None);
+if let Some(value) = best {
+    outcome = outcome.diagnostic("最良の目的値", value, None);
+}
+emit_outcome!(outcome);
+```
+
+既定の一様乱数 6 点では、6 回の局所求解がどれも成功し、3 つの吸引域にまとまった。
+見つかったのは $(-3.7793, -3.2832)$、$(3.5844, -1.8481)$、$(3, 2)$ で、$(-2.8051, 3.1313)$ の吸引域には開始点が入らなかった。
+代表の点の勾配の大きさは $3 \times 10^{-8}$ 以下、既知の極小点までの距離は $6 \times 10^{-10}$ 以下で、目的の評価は合わせて 100 回である。
+開始点を 40 点にすると 4 つの吸引域が全て見つかり、各吸引域に入った開始点は 6、7、19、8 点になる。
+入った開始点の割合はこの局所ソルバーに対する吸引域の体積比の推定値であり、$(3, 2)$ の吸引域が最も大きい。
+6 点のままでも、Halton 列では 4 つ、Sobol 列では 3 つが見つかる。
+一様乱数のシードを 1 にすると 4 つ、100 にすると 3 つで、開始点が少ないうちは設計やシードによる違いが大きい。
+
+### 局所ソルバーの評価回数と精度
+
+注入する局所ソルバーは、目的が何を返せるかと、局所解をどこまで詰めるかで選ぶ。
+このセルは同じシードの一様な開始点に対して、勾配を使わない組み込みの Powell 法と、解析的な勾配を使う L-BFGS-B を走らせ、開始点ごとに二つの局所ソルバーの行を並べる。
+同じシードなら開始点は局所ソルバーによらず同じなので、行ごとに二つの局所ソルバーを比べられる。
+出力は開始点ごとの終了理由、目的値、目的と勾配の評価回数の表と、局所ソルバーごとの合計と最悪値の表である。
+局所解の精度は、局所ソルバーの判定とは別に計算した勾配の最大成分 $\|\nabla f\|_\infty$ と、既知の極小点までの距離で確かめる。
+
+```rust
+//| id: optimize-multistart-local-check
+//| ref: optimize-multistart-local-check
+//| title: 同じ開始点で Powell 法と L-BFGS-B の局所解を勾配で確かめる
+//| run: reactive
+//| uses: [optimize-multistart-himmelblau-model]
+//| crates: [scioxide-core, scioxide-optimize]
+//| inputs:
+//|   check_starts: {"type":"range","label":"開始点の数 M [点]","description":"比べる開始点の数。","min":1,"max":20,"step":1,"value":6}
+//|   check_seed: {"type":"range","label":"乱数のシード [-]","description":"一様な開始点の列を変える。","min":1,"max":100,"step":1,"value":42}
+//| cases:
+//|   - {"id":"other-seed","label":"シード 7","description":"別の開始点でも、二つの局所ソルバーの評価回数と精度の差が同じ傾向かを確かめる。","inputs":{"check_seed":7}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"local-check","path":"/rows/0/1","equals":"Powell"}
+//|       - {"artifact":"local-summary","path":"/rows/0/1","equals":6}
+//|       - {"artifact":"local-summary","path":"/rows/0/2","range":{"min":0,"max":1e-10}}
+//|       - {"artifact":"local-summary","path":"/rows/0/4","range":{"min":1000,"max":2000}}
+//|       - {"artifact":"local-summary","path":"/rows/1/1","equals":6}
+//|       - {"artifact":"local-summary","path":"/rows/1/2","range":{"min":0,"max":1e-7}}
+//|       - {"artifact":"local-summary","path":"/rows/1/3","range":{"min":0,"max":1e-6}}
+//|       - {"artifact":"local-summary","path":"/rows/1/4","range":{"min":50,"max":200}}
+//|   - case: other-seed
+//|     expect:
+//|       - {"artifact":"local-summary","path":"/rows/0/1","equals":6}
+//|       - {"artifact":"local-summary","path":"/rows/1/2","range":{"min":0,"max":1e-7}}
+use scioxide_core::{Bounds, Budget, EvaluationRole};
+use scioxide_optimize::{BoundedObjective, GlobalSearchOptions, UniformStartDesign};
+
+let bounds = Bounds::new(vec![(Some(-5.0), Some(5.0)); 2]).map_err(|e| e.to_string())?;
+let problem = BoundedObjective::new(&Himmelblau, &bounds).map_err(|e| e.to_string())?;
+let count = Budget::try_from(check_starts.round() as usize).map_err(|e| e.to_string())?;
+let options = GlobalSearchOptions::default()
+    .with_starts(count)
+    .with_seed(check_seed.round() as u64);
+let powell =
+    search(options.clone(), UniformStartDesign, true, &problem).map_err(|e| e.to_string())?;
+let lbfgsb = search(options, UniformStartDesign, false, &problem).map_err(|e| e.to_string())?;
+let mut rows = Vec::new();
+let mut summary = Vec::new();
+for (name, result) in [("Powell", &powell), ("L-BFGS-B", &lbfgsb)] {
+    // 合計: 成功した局所求解、勾配と距離の最悪値、目的と勾配の評価回数。
+    let mut worst = (0.0_f64, 0.0_f64);
+    let (mut objective, mut gradient) = (0, 0);
+    for (index, report) in result.starts().iter().enumerate() {
+        let counts = report.counts().total().map_err(|e| e.to_string())?;
+        let local = report.local_result();
+        // 独立な検算: 局所解での解析的な勾配と、既知の極小点までの距離。
+        let check = local
+            .map(|r| gradient_norm(r.x()).map(|g| (g, nearest(r.x()))))
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        if let Some((g, d)) = check {
+            worst = (worst.0.max(g), worst.1.max(d));
+        }
+        objective += counts.provider(EvaluationRole::Objective);
+        gradient += counts.provider(EvaluationRole::Gradient);
+        rows.push((
+            index,
+            name,
+            local.map_or("エラー".to_string(), |r| r.termination().to_string()),
+            local.map(|r| r.fun()),
+            check.map(|c| c.0),
+            check.map(|c| c.1),
+            counts.provider(EvaluationRole::Objective),
+            counts.provider(EvaluationRole::Gradient),
+        ));
+    }
+    summary.push((name, result.successes(), worst.0, worst.1, objective, gradient));
+}
+rows.sort_by_key(|row| row.0);
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+emit_table_with_columns!(
+    serde_json::json!([
+        { "key": "0", "label": "開始点の番号", "type": "integer" },
+        { "key": "1", "label": "局所ソルバー" },
+        { "key": "2", "label": "終了理由" },
+        { "key": "3", "label": "目的値 [-]", "type": "number", "format": sci3, "nullText": "なし" },
+        { "key": "4", "label": "‖∇f‖∞ [-]", "type": "number", "format": sci3, "nullText": "なし" },
+        { "key": "5", "label": "極小点までの距離 [-]", "type": "number", "format": sci3, "nullText": "なし" },
+        { "key": "6", "label": "目的の評価 [回]", "type": "integer" },
+        { "key": "7", "label": "勾配の評価 [回]", "type": "integer" }
+    ]),
+    rows,
+    metadata = serde_json::json!({ "id": "local-check" })
+);
+emit_table_with_columns!(
+    serde_json::json!([
+        { "key": "0", "label": "局所ソルバー" },
+        { "key": "1", "label": "成功した局所求解 [点]", "type": "integer" },
+        { "key": "2", "label": "最大の ‖∇f‖∞ [-]", "type": "number", "format": sci3 },
+        { "key": "3", "label": "極小点までの最大の距離 [-]", "type": "number", "format": sci3 },
+        { "key": "4", "label": "目的の評価の合計 [回]", "type": "integer" },
+        { "key": "5", "label": "勾配の評価の合計 [回]", "type": "integer" }
+    ]),
+    summary,
+    metadata = serde_json::json!({ "id": "local-summary" })
+);
+```
+
+既定のシード 42 の 6 点では、二つの局所ソルバーとも 6 回の局所求解が全て成功の終了（Powell 法は `Converged`、L-BFGS-B は `GradientSmall`）で終わり、どの局所解も既知の極小点の近くにある。
+Powell 法は目的を合わせて 1478 回（開始点ごとに 163〜289 回）評価し、勾配の最大成分は $5.9 \times 10^{-14}$ 以下、既知の極小点までの距離は $10^{-15}$ 以下である。
+L-BFGS-B は目的を 100 回、勾配を 73 回評価し、勾配の最大成分は $2.6 \times 10^{-8}$ 以下、距離は $5.4 \times 10^{-10}$ 以下である。
+L-BFGS-B は勾配の判定（既定の許容誤差は絶対・相対とも $\sqrt{\varepsilon}$）を満たした時点で止まるので、勾配の大きさはこの許容誤差の程度にとどまる。
+Powell 法は勾配を使わず、1 回の掃引での座標の移動量と目的の減少量がどちらも許容誤差を下回るまで直線探索を続ける。
+この関数では、Powell 法は L-BFGS-B の約 15 倍の目的の評価を使い、極小点のずっと近くで止まった。
+開始点を 20 点にしても全ての局所求解が成功し、目的の評価は Powell 法の 4645 回に対して L-BFGS-B は 319 回（ほかに勾配 241 回）である。
+勾配を安く計算できる目的では、勾配を使う局所ソルバーを注入すると評価が減る。
+勾配のない目的には組み込みの Powell 法を使う。
+どちらの場合も、局所ソルバーの成功の終了だけで極小点とは決めず、勾配や既知の値で確かめる。
+
+## まとめ
+
+`MultiStart` は開始点の設計、局所ソルバーの factory、設定を組み合わせ、開始点ごとのレポートと吸引域のまとめを返す。
+開始点は `UniformStartDesign`、`BorrowedStartDesign`、`QmcPlan` から選ぶか `StartDesign` を実装し、乱数はシードから開始点ごとに導かれるので同じ設定なら再現する。
+局所ソルバーは `LocalSolverFactory` と `SearchLocalSolver` を実装して差し替え、評価は渡されたコンテキストで数える。
+勾配を計算できる目的では勾配を使う局所ソルバーを注入すると評価が大きく減り、どちらの局所ソルバーでも成功の終了だけで極小点とは決めず、勾配や既知の値で確かめる。
+`SearchBudgetCompleted` は成功ではないので、最良点は別のシードや設計、別の方法で確かめる候補として扱う。
+
+## 次に読むページ
+
+- [大域探索の限界と吸引域の命中確率](../global-search/)：必要な開始点の数を吸引域の体積比から見積もり、他の大域探索法と比べる。
+- [差分進化法](../differential-evolution/)：局所ソルバーを使わずに集団で探す方法と、世代ごとの受理と広がりの読み方を確かめる。
+- [複数開始点・basin hopping・dual annealing・差分進化の API](../../api/global-search/)：`MultiStart`、開始点の設計、局所ソルバーのトレイト、結果型の仕様を確かめる。

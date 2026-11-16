@@ -1,0 +1,383 @@
+---
+title: "Rational-function evaluation and cancellation"
+description: "Normal forms and arithmetic, pole detection through denominator error estimates and evaluation near poles, quotient derivatives from numerator and denominator derivatives, approximate-GCD cancellation criteria, and reduced exact-coefficient rational functions."
+sidebar:
+  order: 343
+references:
+  poly-exact-rational-functions: "exact-coefficient-rational-functions"
+  poly-rational-approximate-cancellation: "approximate-cancellation"
+  poly-rational-derivative: "numerator-and-denominator-derivatives"
+  poly-rational-near-pole-evaluation: "evaluation-near-poles"
+  poly-rational-normal-form: "normal-form-and-operations"
+---
+
+Rational functions $r(x) = p(x)/q(x)$ represent functions with poles and asymptotes that are difficult to express as polynomials, and arise in Padé approximations, transfer functions, and saturation models.
+With floating-point coefficients, results depend on how far denominator values near poles can be trusted and whether nearby numerator and denominator factors should be cancelled.
+This page covers SciOxide normal forms and arithmetic, near-pole evaluation criteria, derivatives, approximate cancellation, and exact-coefficient rational functions.
+Approximate GCDs for cancellation are covered in [Polynomial GCDs and approximate GCDs](../approximate-gcd/); decomposition from denominator factors in [Partial-fraction decomposition](../partial-fractions/).
+The symbol $\varepsilon$ is machine epsilon ($2^{-52}$ for `f64`); polynomial coefficients use ascending powers.
+
+## Rational normal forms and poles
+
+Rational function $r(x) = p(x)/q(x)$ is the ratio of numerator $p$ (degree $m$) to nonzero denominator $q$ (degree $n$).
+Roots of $p$ are zeros; roots of $q$ not shared with $p$ are poles.
+An improper fraction with $m \ge n$ uniquely separates by division $p = sq + r_{\text{rem}}$ into polynomial part $s$ and proper fraction $r_{\text{rem}}/q$ ($\deg r_{\text{rem}} < n$).
+
+### Normal form and operations
+
+`ApproxRationalFunction::new(numerator, denominator)` makes the denominator monic (leading coefficient 1) and divides the numerator by the same leading coefficient (division uses extended-exponent arithmetic and rounds each coefficient once).
+A zero numerator is represented as $0/1$.
+Common factors remain uncancelled; perform explicit cancellation through `simplify` below.
+A zero denominator gives `InvalidInput` (`OutOfRange`); different numerator/denominator policies give `InvalidInput` (`Inconsistent`).
+
+`try_add`, `try_sub`, `try_mul`, `try_div`, and `reciprocal` form new numerators and denominators through products, as in $a/b + c/d = (ad + cb)/(bd)$, without cancelling common factors.
+`try_div` by the zero function and `reciprocal` of the zero function give a zero denominator and return `InvalidInput` (`OutOfRange`).
+Repeated arithmetic raises degrees and retains factors that cancel only approximately; when needed, inspect `simplify` diagnostics and cancel at the end.
+`numerator()` and `denominator()` borrow normalized numerator and denominator.
+
+### Evaluation near poles
+
+`evaluate(x)` evaluates numerator and denominator separately by Horner and returns the rational value.
+`evaluate_parts(x)` returns `ApproximateRationalEvaluation` containing value plus numerator and denominator evaluations, using the same pole criterion as `evaluate`.
+`value()` is the rational value; `numerator()` and `denominator()` are separate `PolynomialEvaluation` containing values, derivatives, and conditioning reports.
+If the computed denominator is 0 or its estimated relative forward error $\gamma_N \max(1, \kappa_q(x))$ is at least 1, evaluation treats $x$ as a pole and returns `DomainError` (`OutsideDomain`).
+Here $\gamma_N = N\varepsilon/(1 - N\varepsilon)$, $N$ is denominator coefficient count, and $\kappa_q(x) = \sum_k |q_k||x|^k / |q(x)|$ is the condition number of denominator evaluation ([Horner rounding error](../horner-rounding-error/)).
+An estimate at least 1 means the denominator is smaller than its estimated error, leaving sign and magnitude undetermined.
+Near simple pole $a$, $|q(x)| \approx |q'(a)||x - a|$, so the interval triggering this criterion has width about $\gamma_N \sum_k |q_k||a|^k / |q'(a)|$.
+A small but accurately computed denominator returns a value independently of coefficient tolerances.
+Division uses extended-exponent arithmetic followed by one rounding, avoiding intermediate overflow or underflow; only a rounded quotient unrepresentable in `f64` gives `NumericalInstability` (`Overflow`).
+Non-finite points are rejected with `NonFinite`.
+
+The cells below use saturation model $v(c)/V_{\max} = c/(K + c)$ ($c$ is substrate concentration and $K$ the half-saturation constant, both mmol/L) and its reciprocal $(K + c)/c$.
+At the first function's pole $c = -K$, denominator $K + c$ becomes small through cancellation; at the reciprocal's pole $c = 0$, denominator $c$ becomes small without cancellation.
+In the definitions block, `saturation(k)` constructs the rational model; `denominator_estimate(f, c)` returns the denominator relative forward-error estimate at point $c$.
+Denominator evaluation exposes the estimate even where rational evaluation rejects the point; at an exactly zero denominator, infinity is returned as `None`.
+
+```rust
+//| id: poly-rational-pole-model
+//| kind: definitions
+//| title: "Saturation model c/(K + c) and denominator error estimates"
+//| crates: [scioxide-core, scioxide-poly]
+use scioxide_core::SciOxideError;
+use scioxide_poly::{ApproxPolynomial, ApproxRationalFunction};
+
+/// Saturation model v/Vmax = c/(K + c). Numerator [0, 1], denominator [K, 1] (ascending powers). c and K have units mmol/L
+pub(crate) fn saturation(k: f64) -> Result<ApproxRationalFunction<f64>, SciOxideError> {
+    let numerator = ApproxPolynomial::monomial(vec![0.0_f64, 1.0])?;
+    let denominator = ApproxPolynomial::monomial(vec![k, 1.0])?;
+    ApproxRationalFunction::new(numerator, denominator)
+}
+
+/// Estimated denominator relative forward error γ_N max(1, κ_q(c)) at c.
+/// Readable from denominator evaluation even where rational evaluation rejects a point. Exactly zero denominators have infinite estimates, returned as None
+pub(crate) fn denominator_estimate(
+    f: &ApproxRationalFunction<f64>,
+    c: f64,
+) -> Result<Option<f64>, SciOxideError> {
+    let estimate = f
+        .denominator()
+        .evaluate_with_derivative(c)?
+        .condition()
+        .forward_error_estimate();
+    Ok(Some(estimate).filter(|x| x.is_finite()))
+}
+```
+
+The next cell selects relative pole distance $h = 2^{-j}$, evaluating $v$ at $c = -K(1 - h)$ and $1/v$ at $c = K h$ through `evaluate_parts`.
+Inputs are half-saturation constant $K$ and $j$; the table shows points, estimated denominator relative forward error, values, relative closed-form discrepancies, and evaluation results.
+Independent checks use closed forms $v = 1 - 1/h$ and $1/v = 1 + 1/h$.
+For integer $K$, $c$ is exact; otherwise rounding of $c$ enters the denominator.
+
+```rust
+//| id: poly-rational-saturation-scale
+//| ref: poly-rational-saturation-scale
+//| title: "Evaluating a saturation model near a pole"
+//| run: reactive
+//| uses: [poly-rational-pole-model]
+//| crates: [scioxide-core, scioxide-poly]
+//| inputs:
+//|   half_saturation: {"type":"range","label":"Half-saturation constant K [mmol/L]","description":"Integer values make near-pole points exactly binary-representable.","min":0.2,"max":5,"step":0.2,"value":1}
+//|   distance_power: {"type":"range","label":"j in relative pole distance h=2⁻ʲ","description":"Choose evaluation points c = −K(1 − h) and c = Kh.","min":2,"max":60,"step":2,"value":40}
+//| cases:
+//|   - {"id":"inexact-constant","label":"K = 0.2 mmol/L","description":"Rounding c affects K + c, producing closed-form discrepancies.","inputs":{"half_saturation":0.2}}
+//|   - {"id":"at-pole","label":"j = 52","description":"The estimate exceeds 1, treating the point as a pole and giving DomainError.","inputs":{"distance_power":52}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"evaluations","path":"/rows/0/6","equals":"Returns a value"}
+//|       - {"artifact":"evaluations","path":"/rows/0/5","range":{"max":1e-15}}
+//|       - {"artifact":"evaluations","path":"/rows/0/2","approx":{"value":1.0e-3,"rtol":0.1}}
+//|       - {"artifact":"evaluations","path":"/rows/1/2","approx":{"value":4.440892098500626e-16,"rtol":1e-6}}
+//|   - case: inexact-constant
+//|     expect:
+//|       - {"artifact":"evaluations","path":"/rows/0/5","range":{"min":1e-6,"max":1e-3}}
+//|   - case: at-pole
+//|     expect:
+//|       - {"artifact":"evaluations","path":"/rows/0/6","equals":"DomainError（OutsideDomain）"}
+//|       - {"artifact":"evaluations","path":"/rows/1/6","equals":"Returns a value"}
+use scioxide_core::{SciOxideErrorKind, RealScalar};
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let (sig12, sig17) = (
+    serde_json::json!({ "significantDigits": 12 }),
+    serde_json::json!({ "significantDigits": 17 }),
+);
+let k = half_saturation;
+let model = saturation(k).map_err(|e| e.to_string())?;
+// Reciprocal (K + c)/c has pole c = 0, without cancellation in denominator evaluation
+let inverse = model.reciprocal().map_err(|e| e.to_string())?;
+let h = RealScalar::powi(2.0_f64, -(distance_power as i32));
+let mut rows = Vec::new();
+// Independent check: closed forms v = 1 − 1/h and 1/v = 1 + 1/h (f64 arithmetic)
+for (name, f, c, exact) in [
+    ("v(c), c = −K(1 − h)", &model, -k * (1.0 - h), 1.0 - 1.0 / h),
+    ("1/v(c), c = Kh", &inverse, k * h, 1.0 + 1.0 / h),
+] {
+    let (value, outcome) = match f.evaluate_parts(c) {
+        Ok(e) => (Some(e.value()), "Returns a value".to_string()),
+        Err(error) if error.kind() == SciOxideErrorKind::DomainError => {
+            (None, "DomainError（OutsideDomain）".to_string())
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    let difference = value.map(|v| ((v - exact) / exact).abs());
+    let estimate = denominator_estimate(f, c).map_err(|e| e.to_string())?;
+    rows.push((name, c, estimate, value, exact, difference, outcome));
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "Function and point" },
+    { "key": "1", "label": "Point c [mmol/L]", "type": "number", "format": sig17 },
+    { "key": "2", "label": "Estimated denominator relative error [-]", "type": "number", "format": sci3, "nullText": "∞" },
+    { "key": "3", "label": "Value [-]", "type": "number", "format": sig12, "nullText": "None" },
+    { "key": "4", "label": "Closed form [-]", "type": "number", "format": sig12 },
+    { "key": "5", "label": "Relative closed-form discrepancy [-]", "type": "number", "format": sci3, "nullText": "None" },
+    { "key": "6", "label": "Evaluation result" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "evaluations" })
+);
+```
+
+At $c = -K(1 - h)$, the denominator condition number is about $2/h$ and estimated relative forward error is $\gamma_2 \cdot 2/h \approx 8.9 \times 10^{-16}/h$.
+Defaults ($K = 1$, $h = 2^{-40}$) give estimate $9.8 \times 10^{-4}$ and return a value with zero relative closed-form discrepancy.
+At $j = 52$, the estimate is 4.0 and `evaluate_parts` returns `DomainError`.
+For $1/v(Kh)$ approaching reciprocal pole $c = 0$, denominator $c$ has no cancellation, so the estimate stays $\gamma_2 = 4.4 \times 10^{-16}$ and evaluation returns value $1 + 1/h$.
+For values not exactly representable in binary, such as $K = 0.2$, rounding of $c$ enters $K + c$, giving relative closed-form discrepancy $6.1 \times 10^{-5}$ at $h = 2^{-40}$.
+
+The next cell computes the same estimates at 30 points $j = 2, 4, \dots, 60$, plotting logarithmically against $h$.
+For $c = -K(1 - h)$, it also compares values of `evaluate` with the closed form.
+The table shows the first $j$ where `evaluate` returns `DomainError`, counts of exactly zero denominators and zero closed-form discrepancies (both omitted from plots), and the maximum relative discrepancy.
+The only input is half-saturation constant $K$.
+
+```rust
+//| id: poly-rational-pole-sweep
+//| ref: poly-rational-pole-sweep
+//| title: "Pole distance and estimated denominator error"
+//| run: reactive
+//| uses: [poly-rational-pole-model]
+//| crates: [scioxide-core, scioxide-poly]
+//| inputs:
+//|   half_saturation: {"type":"range","label":"Half-saturation constant K [mmol/L]","description":"Integer values give zero closed-form discrepancy at evaluable points.","min":0.2,"max":5,"step":0.2,"value":1}
+//| cases:
+//|   - {"id":"inexact-constant","label":"K = 0.2 mmol/L","description":"Rounding c makes relative closed-form discrepancy grow proportionally to 1/h.","inputs":{"half_saturation":0.2}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"sweep","path":"/rows/0/0","equals":50}
+//|       - {"artifact":"sweep","path":"/rows/0/1","equals":4}
+//|       - {"artifact":"sweep","path":"/rows/0/2","equals":24}
+//|   - case: inexact-constant
+//|     expect:
+//|       - {"artifact":"sweep","path":"/rows/0/0","equals":50}
+//|       - {"artifact":"sweep","path":"/rows/0/3","range":{"min":1e-3,"max":0.1}}
+use scioxide_core::{SciOxideErrorKind, RealScalar};
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let model = saturation(half_saturation).map_err(|e| e.to_string())?;
+let inverse = model.reciprocal().map_err(|e| e.to_string())?;
+// Omit and count infinite estimates (zero denominators) and zero relative discrepancies on logarithmic axes
+let (mut cancelling, mut plain, mut observed) = (Vec::new(), Vec::new(), Vec::new());
+let (mut zero_denominator, mut exact_values, mut first_pole) = (0, 0, None);
+for j in (2..=60).step_by(2) {
+    let h = RealScalar::powi(2.0_f64, -j);
+    let c = -half_saturation * (1.0 - h);
+    match denominator_estimate(&model, c).map_err(|e| e.to_string())? {
+        Some(value) => cancelling.push([h, value]),
+        None => zero_denominator += 1,
+    }
+    let plain_estimate = denominator_estimate(&inverse, half_saturation * h);
+    if let Some(value) = plain_estimate.map_err(|e| e.to_string())? {
+        plain.push([h, value]);
+    }
+    // Independent check: compare evaluable points with 1 − 1/h. Record the first rejected j
+    match model.evaluate(c) {
+        Ok(value) => {
+            let difference = ((value - (1.0 - 1.0 / h)) / (1.0 - 1.0 / h)).abs();
+            if difference > 0.0 {
+                observed.push([h, difference]);
+            } else {
+                exact_values += 1;
+            }
+        }
+        Err(error) if error.kind() == SciOxideErrorKind::DomainError => {
+            first_pole = first_pole.or(Some(j));
+        }
+        Err(error) => return Err(error.to_string()),
+    }
+}
+let largest = observed.iter().map(|point| point[1]).reduce(f64::max);
+let columns = serde_json::json!([
+    { "key": "0", "label": "First rejected j [-]", "type": "integer", "nullText": "None" },
+    { "key": "1", "label": "Points with denominator 0 [count]", "type": "integer" },
+    { "key": "2", "label": "Points with zero closed-form discrepancy [count]", "type": "integer" },
+    { "key": "3", "label": "Maximum relative discrepancy [-]", "type": "number", "format": sci3, "nullText": "0" }
+]);
+emit_table_with_columns!(
+    columns,
+    vec![(first_pole, zero_denominator, exact_values, largest)],
+    metadata = serde_json::json!({ "id": "sweep" })
+);
+emit_line_chart!(
+    &vec![
+        serde_json::json!({
+            "name": "Estimate: K + c (pole c = −K)",
+            "points": cancelling,
+            "style": { "lineType": "dashed" }
+        }),
+        serde_json::json!({
+            "name": "Estimate: c (pole c = 0)",
+            "points": plain,
+            "style": { "lineType": "dotted" }
+        }),
+        serde_json::json!({
+            "name": "Relative discrepancy from 1 − 1/h",
+            "points": observed,
+            "style": { "symbol": "circle", "showSymbol": true }
+        })
+    ],
+    options = &serde_json::json!({
+        "xLabel": "Relative pole distance h [-]",
+        "yLabel": "Relative error [-]",
+        "xType": "log",
+        "yType": "log",
+        "annotations": [{ "kind": "line", "axis": "y", "value": 1.0, "label": "Pole-detection threshold" }]
+    })
+);
+```
+
+The dashed estimate grows inversely with $h$ and reaches 1 at $h = 2^{-50}$, so at $j \ge 50$, `evaluate` returns `DomainError`.
+For $h \le 2^{-54}$, $c$ rounds to $-K$, making the denominator exactly 0 and estimate infinite (4 points $j = 54, \dots, 60$ for every $K$ in the input range, omitted from the plot).
+The dotted reciprocal-denominator estimate stays $\gamma_2$ independently of $h$ because $c$ has no cancellation; evaluation returns values even at $h = 2^{-60}$.
+Pole detection depends on denominator-to-estimated-error ratio, not denominator magnitude alone.
+
+For integers such as $K = 1$, both $c$ and $K + c$ are exact; all 24 evaluable points have zero closed-form discrepancy (omitted from plots).
+At $K = 0.2$, relative closed-form discrepancy grows proportionally to $1/h$ at about one order of magnitude below the estimate, reaching maximum $1.5 \times 10^{-2}$ at $j = 48$.
+The estimate measures denominator changes under coefficient and point rounding of this size; detection uses the estimate even if actual error is smaller.
+
+### Numerator and denominator derivatives
+
+No function directly returns a rational derivative.
+The numerator and denominator evaluations in `evaluate_parts` contain derivatives, allowing the quotient rule
+
+$$
+r'(x) = \frac{p'(x)\, q(x) - p(x)\, q'(x)}{q(x)^2}
+$$
+
+
+Away from poles, numerator and denominator values and derivatives have relative error $O(\varepsilon)$, and this formula adds only a few arithmetic roundings, so relative error in $r'$ remains $O(\varepsilon)$.
+Near poles, $q^2$ decreases and numerator cancellation can also occur; check $r'$ accuracy separately even at points passing pole detection.
+
+The next cell computes saturation-model derivatives at 4 points $c/K = 0, 1/2, 1, 4$, checking against closed form $K/(K + c)^2$ independently.
+At $c = 0$, the value is origin slope $1/K$.
+
+```rust
+//| id: poly-rational-quotient-derivative
+//| ref: poly-rational-quotient-derivative
+//| title: "Rational derivatives from numerator and denominator derivatives"
+//| run: reactive
+//| uses: [poly-rational-pole-model]
+//| crates: [scioxide-core, scioxide-poly]
+//| inputs:
+//|   half_saturation: {"type":"range","label":"Half-saturation constant K [mmol/L]","description":"The derivative's closed form is K/(K + c)².","min":0.2,"max":5,"step":0.2,"value":1}
+//| cases:
+//|   - {"id":"inexact-constant","label":"K = 0.2 mmol/L","description":"Even non-binary-representable K gives derivative agreement with the closed form to rounding accuracy.","inputs":{"half_saturation":0.2}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"derivative","path":"/rows/0/1","approx":{"value":1,"rtol":1e-15}}
+//|       - {"artifact":"derivative","path":"/rows/3/3","range":{"max":1e-15}}
+//|   - case: inexact-constant
+//|     expect:
+//|       - {"artifact":"derivative","path":"/rows/0/1","approx":{"value":5,"rtol":1e-15}}
+//|       - {"artifact":"derivative","path":"/rows/2/3","range":{"max":1e-15}}
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let sig15 = serde_json::json!({ "significantDigits": 15 });
+let k = half_saturation;
+let model = saturation(k).map_err(|e| e.to_string())?;
+let mut rows = Vec::new();
+// Points c/K = 0, 1/2, 1, 4. At c = 0, the value is origin slope 1/K
+for ratio in [0.0_f64, 0.5, 1.0, 4.0] {
+    let c = ratio * k;
+    let parts = model.evaluate_parts(c).map_err(|e| e.to_string())?;
+    let (p, q) = (parts.numerator(), parts.denominator());
+    // Quotient rule r′ = (p′q − pq′)/q²
+    let derivative =
+        (p.derivative() * q.value() - p.value() * q.derivative()) / (q.value() * q.value());
+    // Independent check: d/dc [c/(K + c)] = K/(K + c)² (f64 arithmetic)
+    let exact = k / ((k + c) * (k + c));
+    rows.push((c, derivative, exact, ((derivative - exact) / exact).abs()));
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "Point c [mmol/L]", "type": "number", "format": sig15 },
+    { "key": "1", "label": "Quotient-rule r′(c) [L/mmol]", "type": "number", "format": sig15 },
+    { "key": "2", "label": "Closed form K/(K + c)² [L/mmol]", "type": "number", "format": sig15 },
+    { "key": "3", "label": "Relative discrepancy [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "derivative" })
+);
+```
+
+At default $K = 1$, all 4 relative discrepancies are 0; the value at $c = 0$ matches origin slope $1/K = 1$.
+Even for $K = 0.2$, relative discrepancies stay at most $2.8 \times 10^{-16}$, on the order of $\varepsilon$ including rounding in $K$ and $c$.
+
+### Approximate cancellation
+
+`ApproxRationalFunction::simplify()` applies `approximate_gcd` to numerator and denominator, constructing a new rational function from retained cofactors only when both remainders meet policy tolerances.
+It reuses cofactors from GCD division without repeating division.
+Each remainder's maximum absolute coefficient must be at most $\tau_{\text{abs}} + \tau_{\text{rel}} \max_i |\text{input}_i|$ ([GCD and simplification reports](oxref:poly-gcd-simplification-report)).
+If either remainder exceeds tolerance, return `NumericalInstability` (`IllConditioned`) without partial results.
+On success, `ApproximateRationalSimplification` returns cancelled rational function `rational()`, supporting `gcd_report()`, and normalized remainders `numerator_error()` and `denominator_error()` at original numerator and denominator scales.
+Degree-0 GCDs leave the normal form unchanged.
+
+Factors shared only approximately make cancellation change the original function.
+Rank thresholds determine common-factor degree; tolerances determine acceptance of cancellation.
+Select them as separate policy components.
+The [rational saturation example](../../examples/rational-saturation/) checks changes in values and preservation of model properties such as zeros after cancellation.
+
+## Exact-coefficient rational functions
+
+For exact coefficients (`ExactField`), `ExactRationalFunction::new` forms an exact-GCD-reduced expression with monic denominator and reduces after every arithmetic operation.
+Uniqueness of reduced form makes equal rational functions compare equal under `==`.
+`reciprocal` merely swaps reduced numerator and denominator without GCD computation; the zero function gives `InvalidInput` (`OutOfRange`).
+`ExactRationalFunction::evaluate` rejects exactly zero-denominator points with `InvalidInput` (`OutOfRange`).
+Coefficient-type division violating $(a/b) \cdot b = a$ gives `NumericalInstability` (`Breakdown`).
+
+## Summary
+
+`ApproxRationalFunction` retains monic-denominator normal form without cancelling factors in arithmetic; cancel explicitly with `simplify`.
+Poles are detected when estimated relative forward error $\gamma_N \max(1, \kappa_q)$ reaches 1, rather than from denominator magnitude; cancellation-free denominators allow evaluation very near 0.
+Treat points returning `DomainError` as poles; read estimates from denominator evaluation's `condition()`.
+Construct derivatives from numerator and denominator derivatives in `evaluate_parts` using the quotient rule, checking near-pole accuracy separately.
+With exact coefficients, `ExactRationalFunction` reduces after every operation and rejects only exactly zero-denominator points.
+
+## Further reading
+
+- [Polynomial GCDs and approximate GCDs](../approximate-gcd/): examine approximate-GCD degree decisions and reports supporting cancellation.
+- [Partial-fraction decomposition](../partial-fractions/): split rational functions with known denominator factors and assess coefficient errors near close poles.
+- [Rational saturation example](../../examples/rational-saturation/): examine effects of cancelling nearby factors on saturation-model values and zeros.
+- [Padé approximation of the exponential and its poles](../../examples/pade-exponential-poles/): examine function approximation with rational functions and their poles.

@@ -1,0 +1,358 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: Exact source revision to validate
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # Hundreds of integration-test binaries must fit on standard hosted runners.
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  fmt:
+    name: Format
+    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: 1.95.0
+          components: rustfmt
+      - run: cargo fmt --all --check
+      - name: License notices and reference-data boundaries
+        run: |
+          python3 scripts/checks/licenses.py
+          python3 -m unittest discover -s scripts/tests -p test_licenses.py
+          python3 -m unittest discover -s scripts/tests -p test_regression_quartet.py
+      - name: Test Python scripts and reproduce MGH definitions
+        run: |
+          python3 -m venv "$RUNNER_TEMP/scioxide-provenance"
+          "$RUNNER_TEMP/scioxide-provenance/bin/pip" install --only-binary=:all: -r scripts/requirements-dev.txt
+          "$RUNNER_TEMP/scioxide-provenance/bin/python" scripts/generators/mgh_models.py --check
+          "$RUNNER_TEMP/scioxide-provenance/bin/python" -m unittest discover -s scripts/tests -v
+
+  clippy:
+    name: Clippy
+    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: 1.95.0
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Workspace, all features
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - name: Each crate, no_std + alloc
+        run: |
+          for crate in crates/*/; do
+            cargo clippy --locked -p "$(basename "$crate")" --no-default-features --all-targets -- -D warnings
+          done
+
+  test-matrix:
+    name: Plan isolated test shards
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      shards: ${{ steps.matrix.outputs.shards }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - id: matrix
+        run: |
+          shards=$(python3 scripts/checks/ci_matrix.py)
+          echo "shards=$shards" >> "$GITHUB_OUTPUT"
+
+  test:
+    name: Test / ${{ matrix.rust }} / ${{ matrix.shard.name }}
+    needs: test-matrix
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ["1.93.0", stable]
+        shard: ${{ fromJSON(needs.test-matrix.outputs.shards) }}
+    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: ${{ matrix.rust }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: test-${{ matrix.shard.name }}
+      - name: Each crate, all features
+        env:
+          CRATES: ${{ matrix.shard.crates }}
+        run: |
+          for crate in $CRATES; do
+            cargo test --locked -p "$crate" --all-features
+            case "$crate" in
+              scioxide-fft|scioxide-random|scioxide-ad)
+                cargo test --locked -p "$crate" --no-default-features ;;
+            esac
+          done
+
+  package:
+    name: Publish dry run
+    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: 1.93.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - run: python3 scripts/checks/release.py
+      - run: cargo publish --locked --workspace --registry crates-io --dry-run
+      - name: Verify packaged license notices
+        run: python3 scripts/checks/licenses.py --packages
+
+  fft-aarch64:
+    name: FFT / native aarch64 NEON
+    timeout-minutes: 60
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: 1.93.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: All FFT tests, including independent forward fixtures on NEON
+        run: cargo test --locked -p scioxide-fft
+
+  features:
+    name: Feature isolation
+    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: 1.93.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      # One Cargo invocation per crate and mode, so feature unification across
+      # the workspace cannot hide a missing feature edge.
+      - run: |
+          for crate in crates/*/; do
+            name="$(basename "$crate")"
+            cargo check --locked -p "$name"
+            cargo check --locked -p "$name" --no-default-features
+            cargo check --locked -p "$name" --all-features
+          done
+
+  core-portable:
+    name: Core / no_std + alloc
+    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: 1.93.0
+          targets: aarch64-unknown-none
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Portable library, integration and doc tests
+        run: cargo test --locked -p scioxide-core --no-default-features
+      - name: Real no_std target
+        run: cargo check --locked -p scioxide-core --no-default-features --target aarch64-unknown-none
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: 1.95.0
+          components: clippy
+          targets: aarch64-unknown-none
+      - name: Real no_std target lints
+        run: cargo clippy --locked -p scioxide-core --no-default-features --lib --target aarch64-unknown-none -- -D warnings
+
+  core-native:
+    name: Core elementary envelopes / ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    timeout-minutes: 60
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: 1.93.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Native std elementary and stable fixtures
+        run: cargo test --locked -p scioxide-core --test elementary --test elementary_dispatch --test stable_transforms --test stable_boundaries
+      - name: Portable elementary and stable fixtures
+        run: cargo test --locked -p scioxide-core --no-default-features --test elementary --test elementary_dispatch --test stable_transforms --test stable_boundaries
+
+  miri:
+    name: Partition ownership and recycled AD variables / Miri
+    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    env:
+      # Override the stable channel pinned in rust-toolchain.toml.
+      RUSTUP_TOOLCHAIN: nightly-2026-07-12
+      # Scoped deadline tests need the host clock; the suites use no network.
+      MIRIFLAGS: -Zmiri-disable-isolation
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
+          components: miri, rust-src
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - run: cargo miri setup
+      - name: Single-consumer partition slots
+        run: cargo miri test --locked -p scioxide-core --lib partition_slot
+      - name: Scoped executor
+        run: cargo miri test --locked -p scioxide-core --lib execution::std_threads::tests::scoped_
+      - name: Portable partition slots
+        run: |
+          cargo miri test --locked -p scioxide-core --no-default-features --lib scoped_partition_slot_is_single_consumer
+      - name: Recycled AD recording variables
+        run: cargo miri test --locked -p scioxide-ad --lib reverse::variables
+
+  i686:
+    name: Core invariants and scaled arithmetic / i686
+    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: 1.95.0
+          targets: i686-unknown-linux-gnu
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Install 32-bit linker
+        run: sudo apt-get update && sudo apt-get install --yes gcc-multilib
+      - name: Debug and release, std and portable
+        run: |
+          target=i686-unknown-linux-gnu
+          for features in "" "--no-default-features"; do
+            cargo clippy --locked -p scioxide-core --target "$target" $features --lib -- -D warnings
+            cargo test --locked -p scioxide-ad --target "$target" $features --test tape --test structured size_overflow_precedes_callback
+            cargo test --locked -p scioxide-core --target "$target" $features --lib kernel::
+            cargo test --locked -p scioxide-sparse --target "$target" $features --lib hermitian::
+            cargo test --locked -p scioxide-core --target "$target" $features --lib tolerance::
+            cargo test --locked -p scioxide-core --target "$target" $features --test verified_dispatch --test api_inventory
+            cargo test --locked -p scioxide-core --target "$target" $features --lib scaled::
+            for family in accumulator product_sum checked quadratic norm commit; do
+              cargo test --locked -p scioxide-core --target "$target" $features --lib "arithmetic::${family}::"
+            done
+            cargo test --locked -p scioxide-core --target "$target" $features \
+              --test scaled_arithmetic --test scaled_values --test scaled_oracle \
+              --test checked_arithmetic
+            cargo test --locked -p scioxide-core --target "$target" $features --release \
+              --test scaled_arithmetic --test scaled_values --test scaled_oracle
+          done
+
+  rustdoc:
+    name: Rustdoc
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - run: cargo doc --locked --workspace --all-features --no-deps
+
+  quality:
+    name: Workflow and dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: DeterminateSystems/nix-installer-action@c5a866b6ab867e88becbed4467b93592bce69f8a # v21
+        with:
+          determinate: false
+      - run: nix develop .#ci --command actionlint
+      - run: nix develop .#ci --command cargo audit --deny warnings
+      - run: nix develop .#ci --command pnpm --dir docs/handbook audit --prod --audit-level high
+
+  handbook:
+    name: Handbook
+    uses: ./.github/workflows/handbook.yml
+    with:
+      ref: ${{ inputs.ref || github.sha }}
+      upload-pages: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+  ci:
+    name: CI success
+    if: ${{ always() }}
+    needs: [fmt, clippy, test-matrix, test, package, fft-aarch64, features, core-portable, core-native, miri, i686, rustdoc, quality, handbook]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every validation job to succeed
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          results = json.loads(os.environ['RESULTS'])
+          failed = [name for name, job in results.items() if job['result'] != 'success']
+          if failed:
+              raise SystemExit('Validation did not succeed: ' + ', '.join(failed))
+          PY

@@ -1,0 +1,672 @@
+---
+title: Franke 関数による RBF の交差検証
+description: 散在点の Gaussian RBF について、形状係数と対角正則化が条件推定に与える影響、内部点の一つ抜き誤差と独立格子の誤差の対応を標準誤差つきで調べ、Clough–Tocher と比べる。
+sidebar:
+  order: 450
+---
+
+測候所のような散在点から場を推定するとき、補間は標本点で一致し、弱い正則化でも標本での残差はほぼ 0 になるので、その残差では核の形状係数を選べない。
+ここでは Gaussian RBF の幅を変え、標本を一つずつ除いたときの誤差で未観測点の精度を見積もる。
+真値が分かる Franke 関数を使い、交差検証の誤差が実際の近似誤差をどれだけ反映するかを調べる。
+
+## 試験関数と観測点
+
+$[0,1]^2$ 上で
+
+$$
+\begin{aligned}
+f(x,y)={}&\tfrac34e^{-[(9x-2)^2+(9y-2)^2]/4}
++\tfrac34e^{-(9x+1)^2/49-(9y+1)/10}\\
+&+\tfrac12e^{-[(9x-7)^2+(9y-3)^2]/4}
+-\tfrac15e^{-(9x-4)^2-(9y-7)^2}
+\end{aligned}
+$$
+
+とする。
+幅と高さの異なる二つの山、なだらかな斜面、狭い窪みを含むので、一つの尺度の基底では全体を表しにくい。
+原典は [Franke, Scattered Data Interpolation: Tests of Some Methods](https://doi.org/10.1090/S0025-5718-1982-0637296-4) である。
+観測点は正方形の四隅を必ず含め、残りを一様乱数で発生させる。
+四隅を含めると、全点の外接長方形と凸包がどちらも正方形になる。
+`RbfInterpolator` の定義域は点の外接長方形、`CloughTocherInterpolator` の定義域は Delaunay 分割の凸包なので、二つを同じ正方形の上で比べられる。
+
+## Gaussian RBF と条件
+
+Gaussian 核は $\varphi(r)=\exp[-(\epsilon r)^2]$ であり、$\epsilon>0$ を形状係数と呼ぶ。
+補間は多項式項を持たない $s(\boldsymbol x)=\sum_jw_j\varphi(\|\boldsymbol x-\boldsymbol x_j\|)$ の重み $w$ を、核行列 $K_{ij}=\varphi(\|\boldsymbol x_i-\boldsymbol x_j\|)$ の方程式 $(K+\lambda I)w=y$ から求める。
+Gaussian 核の $K$ は相異なる点に対して正定値（Bochner の定理）なので、`RbfInterpolator` は Cholesky 分解を使う。
+分解が破綻するか、数値的な階数や条件の検査に失敗すると、特異値分解に切り替える。
+特異値分解でも、設定した閾値のもとで数値的に階数が不足すると `Singular` のエラーを返す。
+構築は $O(n^3)$ の時間と $O(n^2)$ のメモリ領域を使い、評価は 1 点あたり $O(n)$ である。
+$\lambda>0$ は `RbfRegularization::Diagonal(λ)` で与える対角正則化であり、標本での厳密な一致を緩めてデータを平滑化する。
+核 `RbfKernel::Gaussian(ε)` は標本と並ぶ引数として渡し、正則化と数値的な階数の閾値（ここでは相対 $10^{-14}$、既定は機械イプシロン）は `RbfOptions` の設定関数で与えて、オプション付き形式 `RbfInterpolator::with_options(points, values, kernel, options)` で作る。
+
+$\epsilon$ が小さいと基底が平坦になり、$K$ の列が互いに近くなって条件数が急に大きくなる（平坦極限）。
+一方、正則化があれば $A=K+\lambda I$ の最小固有値は $\lambda$ 以上なので、$\|A^{-1}\|_2\le1/\lambda$ である。
+核の値は 1 以下なので $\|A\|_1\le n+\lambda$、また $\|A^{-1}\|_1\le\sqrt n\,\|A^{-1}\|_2$ から、1 ノルムの逆条件数は
+
+$$
+\kappa_1^{-1}\ge\frac{\lambda}{\sqrt n\,(n+\lambda)}
+$$
+
+を満たす。
+`RbfConditioning::reciprocal_condition_number` は、Cholesky や LU の因子からは 1 ノルムの逆条件数の推定値を、特異値分解からは 2 ノルムの特異値比 $\sigma_{\min}/\sigma_{\max}$ を返す。
+1 ノルムの推定値は上界でも下界でもない推定値である。
+ただし、推定に使う Hager–Higham の方法は厳密な演算では $\|A^{-1}\|_1$ を下から見積もるので、推定値はふつう真の逆条件数以上になる。
+2 ノルムの逆条件数 $\lambda_{\min}/\lambda_{\max}\ge\lambda/(n+\lambda)$ も同じ下界を満たす。
+
+次のブロックは、ページの三つのセルが共有する試験関数と観測点、検証の補助関数である。
+`franke` が $f$、`stations` が四隅と一様乱数の観測点、`test_grid` が $20\times20$ の格子の中心、`shape_parameter` が $\epsilon=2^{k/2}$、`rbf_options` が正則化と階数の閾値、`without` が 1 点を除いた標本、`mean_and_half_width` が平均と 1.96 SE に対応する。
+
+```rust
+//| id: interp-station-franke-model
+//| kind: definitions
+//| title: Franke 関数、観測点と検証の補助関数
+//| crates: [scioxide-core, scioxide-interp, scioxide-random]
+use scioxide_core::{SciOxideError, RankThreshold, RealScalar};
+use scioxide_interp::{RbfOptions, RbfRegularization};
+use scioxide_random::{Rng, SeedableRng, SplitMix64};
+
+/// Franke の試験関数（Franke 1982）。
+pub(crate) fn franke(x: f64, y: f64) -> f64 {
+    let (u, v) = (9.0 * x, 9.0 * y);
+    0.75 * RealScalar::exp(-((u - 2.0) * (u - 2.0) + (v - 2.0) * (v - 2.0)) / 4.0)
+        + 0.75 * RealScalar::exp(-(u + 1.0) * (u + 1.0) / 49.0 - (v + 1.0) / 10.0)
+        + 0.5 * RealScalar::exp(-((u - 7.0) * (u - 7.0) + (v - 3.0) * (v - 3.0)) / 4.0)
+        - 0.2 * RealScalar::exp(-(u - 4.0) * (u - 4.0) - (v - 7.0) * (v - 7.0))
+}
+
+/// 正方形の四隅（番号 0〜3）と、[0, 1)² の一様乱数の点を合わせた count 点。
+pub(crate) fn stations(count: usize, seed: f64) -> Result<Vec<[f64; 2]>, SciOxideError> {
+    let mut sites = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+    let mut rng = SplitMix64::from_seed(seed as u64);
+    while sites.len() < count {
+        sites.push([rng.next_float()?, rng.next_float()?]);
+    }
+    Ok(sites)
+}
+
+/// 標本と独立な 20 × 20 の格子の中心。
+pub(crate) fn test_grid() -> Vec<[f64; 2]> {
+    (0..400)
+        .map(|k| {
+            [
+                ((k / 20) as f64 + 0.5) / 20.0,
+                ((k % 20) as f64 + 0.5) / 20.0,
+            ]
+        })
+        .collect()
+}
+
+/// 形状係数 ε = 2^(k/2)。
+pub(crate) fn shape_parameter(k: i32) -> f64 {
+    RealScalar::powf(2.0, f64::from(k) / 2.0)
+}
+
+/// 正則化と、数値的な階数の閾値（相対 10⁻¹⁴）。
+pub(crate) fn rbf_options(
+    regularization: RbfRegularization<f64>,
+) -> Result<RbfOptions<f64>, SciOxideError> {
+    Ok(RbfOptions::new()
+        .with_regularization(regularization)
+        .with_rank_threshold(RankThreshold::new(0.0, 1e-14)?))
+}
+
+/// 番号 omitted の点を除いた標本。
+pub(crate) fn without(
+    sites: &[[f64; 2]],
+    values: &[f64],
+    omitted: usize,
+) -> (Vec<[f64; 2]>, Vec<f64>) {
+    sites
+        .iter()
+        .zip(values)
+        .enumerate()
+        .filter(|(i, _)| *i != omitted)
+        .map(|(_, (&p, &v))| (p, v))
+        .unzip()
+}
+
+/// 標本平均と 95% 区間の半幅 1.96 SE（SE = 標本標準偏差 / √m）。
+pub(crate) fn mean_and_half_width(x: &[f64]) -> (f64, f64) {
+    let m = x.len() as f64;
+    let mean = x.iter().sum::<f64>() / m;
+    let variance = x.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / (m - 1.0);
+    (mean, 1.96 * RealScalar::sqrt(variance / m))
+}
+```
+
+## 形状係数と正則化による条件
+
+次のセルは全点の RBF を $\epsilon=2^{k/2}$（$k=-4,\dots,8$、0.25 から 16 までの 13 通り）と四つの正則化で作り、逆条件数の推定値を比べる。
+入力は点数と乱数のシードである。
+条件は値によらないので、値はすべて 1 にそろえる。
+グラフは逆条件数の推定値の両対数グラフで、各 $\lambda$ の下界 $\lambda/(\sqrt n(n+\lambda))$ を基準線で示す。
+1 つ目の表は各候補の推定値で、作れなかった候補は「作れない」と示し、0 で置き換えない。
+2 つ目の表は正則化ごとに、特異値分解に切り替えた候補の数、作れなかった候補の数とエラーの種類を示す。
+このセルの点数とシードは、次の二つのセルにも渡す。
+
+```rust
+//| id: interp-station-rbf-conditioning
+//| ref: interp-station-rbf-conditioning
+//| title: 形状係数と正則化による条件推定の変化
+//| run: reactive
+//| uses: [interp-station-franke-model]
+//| crates: [scioxide-core, scioxide-interp, scioxide-random]
+//| exports: [count, seed]
+//| inputs:
+//|   count: {"type":"range","label":"点数 n [-]","min":12.0,"max":40.0,"step":4.0,"value":24.0}
+//|   seed: {"type":"range","label":"乱数のシード","min":1.0,"max":100.0,"step":1.0,"value":7.0}
+//| cases:
+//|   - {"id":"many-points","label":"n = 40","description":"点の間隔が縮み、同じ ε でも条件が悪くなる。","inputs":{"count":40}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"rcond","path":"/rows/0/1","equals":null}
+//|       - {"artifact":"rcond","path":"/rows/12/1","approx":{"value":0.16227,"rtol":1e-3}}
+//|       - {"artifact":"rcond","path":"/rows/0/3","range":{"min":8.5e-11}}
+//|       - {"artifact":"rcond","path":"/rows/0/4","approx":{"value":1.984e-6,"rtol":1e-2}}
+//|       - {"artifact":"failures","path":"/rows/0/2","equals":2}
+//|       - {"artifact":"failures","path":"/rows/0/3","equals":"Singular"}
+//|       - {"artifact":"failures","path":"/rows/1/2","equals":0}
+//|   - case: many-points
+//|     expect:
+//|       - {"artifact":"failures","path":"/rows/0/1","equals":1}
+//|       - {"artifact":"failures","path":"/rows/0/2","equals":4}
+//|       - {"artifact":"rcond","path":"/rows/12/1","approx":{"value":0.022538,"rtol":1e-3}}
+use scioxide_core::RealScalar;
+use scioxide_interp::{RbfInterpolator, RbfKernel, RbfRegularization};
+
+let count = count as usize;
+let sites = stations(count, seed).map_err(|e| e.to_string())?;
+let values = vec![1.0; count];
+let lambdas = [None, Some(1e-12), Some(1e-8), Some(1e-4)];
+let names = ["正則化なし", "λ = 10⁻¹²", "λ = 10⁻⁸", "λ = 10⁻⁴"];
+let mut curves = vec![Vec::new(); lambdas.len()];
+let mut rows = Vec::new();
+// 正則化ごとの [SVD に切り替えた数, 作れなかった数] と最後のエラーの種類
+let mut tally = [[0_usize; 2]; 4];
+let mut kinds = [None, None, None, None];
+for k in -4..=8 {
+    let epsilon = shape_parameter(k);
+    let mut rcond = [None; 4];
+    for (j, lambda) in lambdas.into_iter().enumerate() {
+        let regularization =
+            lambda.map_or(RbfRegularization::None, RbfRegularization::Diagonal);
+        let options = rbf_options(regularization).map_err(|e| e.to_string())?;
+        let kernel = RbfKernel::Gaussian(epsilon);
+        match RbfInterpolator::with_options(sites.clone(), values.clone(), kernel, options) {
+            Ok(model) => {
+                let conditioning = model.conditioning();
+                let value = conditioning.reciprocal_condition_number();
+                rcond[j] = Some(value);
+                curves[j].push([epsilon, value]);
+                if conditioning.used_fallback() {
+                    tally[j][0] += 1;
+                }
+            }
+            Err(e) => {
+                tally[j][1] += 1;
+                kinds[j] = Some(format!("{:?}", e.kind()));
+            }
+        }
+    }
+    rows.push((epsilon, rcond[0], rcond[1], rcond[2], rcond[3]));
+}
+let n = count as f64;
+let bound = |lambda: f64| lambda / (RealScalar::sqrt(n) * (n + lambda));
+let series: Vec<_> = curves
+    .iter()
+    .zip(names)
+    .map(|(points, name)| serde_json::json!({ "name": name, "points": points }))
+    .collect();
+let mut annotations = Vec::new();
+for (lambda, label) in [(1e-12, "λ = 10⁻¹²"), (1e-8, "λ = 10⁻⁸"), (1e-4, "λ = 10⁻⁴")]
+{
+    annotations.push(serde_json::json!({
+        "kind": "line",
+        "axis": "y",
+        "value": bound(lambda),
+        "label": format!("{label} の下界")
+    }));
+}
+emit_line_chart!(
+    &series,
+    options = &serde_json::json!({
+        "xLabel": "形状係数 ε [-]",
+        "yLabel": "逆条件数の推定 [-]",
+        "xType": "log",
+        "yType": "log",
+        "annotations": annotations
+    })
+);
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "形状係数 ε [-]", "type": "number", "format": { "significantDigits": 3 } },
+    { "key": "1", "label": "正則化なし [-]", "type": "number", "format": sci2, "nullText": "作れない" },
+    { "key": "2", "label": "λ = 10⁻¹² [-]", "type": "number", "format": sci2, "nullText": "作れない" },
+    { "key": "3", "label": "λ = 10⁻⁸ [-]", "type": "number", "format": sci2, "nullText": "作れない" },
+    { "key": "4", "label": "λ = 10⁻⁴ [-]", "type": "number", "format": sci2, "nullText": "作れない" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "rcond" })
+);
+let failure_rows: Vec<_> = (0..4)
+    .map(|j| (names[j], tally[j][0], tally[j][1], kinds[j].clone()))
+    .collect();
+let failure_columns = serde_json::json!([
+    { "key": "0", "label": "正則化" },
+    { "key": "1", "label": "SVD に切り替えた候補 [-]", "type": "integer" },
+    { "key": "2", "label": "作れなかった候補 [-]", "type": "integer" },
+    { "key": "3", "label": "エラーの種類", "nullText": "なし" }
+]);
+emit_table_with_columns!(
+    failure_columns,
+    failure_rows,
+    metadata = serde_json::json!({ "id": "failures" })
+);
+export!(count, count);
+export!(seed, seed);
+```
+
+既定の $n=24$ で $\epsilon$ を 16 から小さくすると、正則化なしの逆条件数の推定値は 0.16 から $\epsilon=0.5$ の $5.8\times10^{-14}$ まで下がり、$\epsilon\le0.35$ の 2 候補は `Singular` のエラーで作れない。
+作れた候補はどれも特異値分解に切り替わらず、値は Cholesky 分解からの 1 ノルムの推定値である。
+正則化を加えると逆条件数は下げ止まり、$\lambda=10^{-8}$ では $2.1\times10^{-10}$〜$3.5\times10^{-8}$、$\lambda=10^{-4}$ では $2.0\times10^{-6}$ 以上になる。
+平坦な側の下げ止まりの値は下界 $\lambda/(\sqrt n(n+\lambda))$（$\lambda=10^{-8}$ で $8.5\times10^{-11}$、$10^{-4}$ で $8.5\times10^{-7}$）の 2〜4 倍で、どの候補も下界を下回らない。
+$\epsilon\ge4$ では核行列の条件がよく、$\lambda\le10^{-4}$ の正則化は推定値をほとんど変えない。
+$n=40$ にすると点の間隔が縮まり、同じ $\epsilon$ でも基底が相対的に平坦になるので、$\epsilon=16$ の推定値は 0.023 に下がり、正則化なしでは 4 候補が作れず、1 候補が特異値分解に切り替わる。
+逆条件数が大きいことは方程式を安定に解けることを示すだけで、補間の精度がよいことは示さない。
+
+## 一つ抜き交差検証
+
+標本 $i$ を除いて作ったモデルを $s_{-i}$ とし、除いた点での誤差 $e_i=s_{-i}(\boldsymbol x_i)-y_i$ から
+
+$$
+E_{\mathrm{CV}}=\sqrt{\frac1{|I|}\sum_{i\in I}e_i^2}
+$$
+
+を求める。
+四隅を除くと外接長方形が縮み、除いた点が RBF の定義域の外に出るので、ここでは四隅を常に残し、内部の点 $I$ だけを順に除く。
+これは全点の一つ抜き誤差ではなく、境界の値を既知とした内部点の検証である。
+`RbfInterpolator` は一つ抜き誤差を閉形式で返す機能を提供しないので、点を除くたびに作り直す。
+作り直しの計算コストは 1 回 $O(n^3)$、全体で $O(n^4)$ である。
+閉形式の一つ抜き予測が必要なら、Gauss 過程の `GaussianProcessModel::leave_one_out_into` を使う（[局所モデルと kriging の予測分散](../../algorithms/local-models-and-kriging/)）。
+
+$E_{\mathrm{CV}}$ 自体も限られた点から求めた推定値である。
+二乗誤差の平均の標準誤差 $\mathrm{SE}=s_{e^2}/\sqrt{|I|}$ をデルタ法で $\mathrm{SE}/(2E_{\mathrm{CV}})$ に換算し、$E_{\mathrm{CV}}$ の 95% 区間の半幅を求める。
+比較のため、全点のモデルと真の関数との差の RMS $E_{\mathrm{test}}$ を、標本と独立な $20\times20$ の格子の中心で測る。
+形状係数を変えたときに $E_{\mathrm{CV}}$ と $E_{\mathrm{test}}$ の順位がどれだけそろうかを Spearman の順位相関係数 $r_s=1-6\sum d_i^2/[m(m^2-1)]$（$d_i$ は候補 $i$ の二つの順位の差、$m$ は候補の数）で表す。
+さらに、$E_{\mathrm{CV}}$ が最小の $\epsilon$ を選んだときの $E_{\mathrm{test}}$ を、$E_{\mathrm{test}}$ の最小値と比べる。
+
+次のセルは前のセルの点数とシードを受け取り、対角正則化の指数 $\log_{10}\lambda$ を入力にする。
+形状係数は前のセルと同じ 13 通りである。
+1 つ目の表は各候補の $E_{\mathrm{CV}}$ と区間、$E_{\mathrm{test}}$、状態を、2 つ目の表は順位相関と選んだ $\epsilon$ を示す。
+作れなかった候補はエラーの種類を状態に示し、誤差 0 で置き換えない。
+グラフは $E_{\mathrm{CV}}\pm1.96$ SE の帯と $E_{\mathrm{test}}$ の折れ線を両対数で描く。
+このセルの $\lambda$ は次のセルにも渡す。
+
+```rust
+//| id: interp-station-rbf-shape-scan
+//| ref: interp-station-rbf-shape-scan
+//| title: 一つ抜き誤差と独立格子の誤差で形状係数を比べる
+//| run: button
+//| cache: inputs
+//| uses: [interp-station-franke-model]
+//| crates: [scioxide-core, scioxide-interp, scioxide-random]
+//| dependsOn:
+//|   layout: interp-station-rbf-conditioning
+//| exports: [count, seed, exponent]
+//| inputs:
+//|   exponent: {"type":"range","label":"対角正則化の指数 log₁₀λ [-]","min":-14.0,"max":-2.0,"step":1.0,"value":-8.0}
+//| cases:
+//|   - {"id":"weak-regularization","label":"λ = 10⁻¹⁴","description":"平坦な候補が Singular になり、作れた候補も悪条件で誤差が増える。","inputs":{"exponent":-14}}
+//|   - {"id":"strong-regularization","label":"λ = 10⁻²","description":"強い正則化は標本での一致を緩め、どの ε でも誤差の下限が上がる。","inputs":{"exponent":-2}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"selection","path":"/rows/0/0","approx":{"value":0.92857,"atol":1e-4}}
+//|       - {"artifact":"selection","path":"/rows/0/2","approx":{"value":2.8284,"rtol":1e-4}}
+//|       - {"artifact":"selection","path":"/rows/0/4","approx":{"value":2.8284,"rtol":1e-4}}
+//|       - {"artifact":"scan","path":"/rows/7/1","approx":{"value":0.050317,"rtol":1e-3}}
+//|       - {"artifact":"scan","path":"/rows/7/3","approx":{"value":0.055988,"rtol":1e-3}}
+//|   - case: weak-regularization
+//|     expect:
+//|       - {"artifact":"scan","path":"/rows/0/4","equals":"Singular"}
+//|       - {"artifact":"scan","path":"/rows/0/1","equals":null}
+//|       - {"artifact":"scan","path":"/rows/2/3","approx":{"value":0.4898,"rtol":1e-3}}
+//|       - {"artifact":"selection","path":"/rows/0/1","equals":11}
+//|   - case: strong-regularization
+//|     expect:
+//|       - {"artifact":"scan","path":"/rows/0/3","approx":{"value":0.1555,"rtol":1e-3}}
+//|       - {"artifact":"selection","path":"/rows/0/5","approx":{"value":0.050511,"rtol":1e-3}}
+use scioxide_core::{SciOxideError, RealScalar};
+use scioxide_interp::{
+    ExtrapolationPolicy, Interpolant, RbfInterpolator, RbfKernel, RbfRegularization,
+};
+
+let count = layout["count"].as_u64().ok_or("点数がない")? as usize;
+let seed = layout["seed"].as_f64().ok_or("シードがない")?;
+let sites = stations(count, seed).map_err(|e| e.to_string())?;
+let values: Vec<_> = sites.iter().map(|p| franke(p[0], p[1])).collect();
+let grid = test_grid();
+let lambda = RealScalar::powi(10.0, exponent as i32);
+let options = rbf_options(RbfRegularization::Diagonal(lambda)).map_err(|e| e.to_string())?;
+let policy = ExtrapolationPolicy::Reject;
+let mut rows = Vec::new();
+let mut scores = Vec::new();
+for k in -4..=8 {
+    let epsilon = shape_parameter(k);
+    let kernel = RbfKernel::Gaussian(epsilon);
+    // 内部点の一つ抜きの二乗誤差と、全点のモデルの独立格子での二乗平均誤差
+    let trial = (|| -> Result<(Vec<f64>, f64), SciOxideError> {
+        let mut squares = Vec::new();
+        for omitted in 4..count {
+            let (x, y) = without(&sites, &values, omitted);
+            let model = RbfInterpolator::with_options(x, y, kernel, options)?;
+            let e = model.evaluate(sites[omitted], policy)? - values[omitted];
+            squares.push(e * e);
+        }
+        let model =
+            RbfInterpolator::with_options(sites.clone(), values.clone(), kernel, options)?;
+        let mut test = 0.0;
+        for &p in &grid {
+            let e = model.evaluate(p, policy)? - franke(p[0], p[1]);
+            test += e * e / 400.0;
+        }
+        Ok((squares, test))
+    })();
+    match trial {
+        Ok((squares, test)) => {
+            let (mse, half) = mean_and_half_width(&squares);
+            let cv = RealScalar::sqrt(mse);
+            let (half, test) = (half / (2.0 * cv), RealScalar::sqrt(test));
+            rows.push((
+                epsilon,
+                Some(cv),
+                Some(half),
+                Some(test),
+                "成功".to_string(),
+            ));
+            scores.push((k, epsilon, cv, half, test));
+        }
+        Err(e) => rows.push((epsilon, None, None, None, format!("{:?}", e.kind()))),
+    }
+}
+// Spearman の順位相関（同順位はないものとする）
+let rank = |key: fn(&(i32, f64, f64, f64, f64)) -> f64| {
+    let mut order: Vec<_> = (0..scores.len()).collect();
+    order.sort_by(|&a, &b| key(&scores[a]).total_cmp(&key(&scores[b])));
+    let mut ranks = vec![0.0; scores.len()];
+    for (r, &i) in order.iter().enumerate() {
+        ranks[i] = r as f64;
+    }
+    ranks
+};
+let (cv_rank, test_rank) = (rank(|s| s.2), rank(|s| s.4));
+let m = scores.len() as f64;
+let d2: f64 = cv_rank
+    .iter()
+    .zip(&test_rank)
+    .map(|(a, b)| (a - b) * (a - b))
+    .sum();
+let spearman = 1.0 - 6.0 * d2 / (m * (m * m - 1.0));
+let by_cv = scores
+    .iter()
+    .min_by(|a, b| a.2.total_cmp(&b.2))
+    .ok_or("候補がない")?;
+let by_test = scores
+    .iter()
+    .min_by(|a, b| a.4.total_cmp(&b.4))
+    .ok_or("候補がない")?;
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let sig3 = serde_json::json!({ "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "形状係数 ε [-]", "type": "number", "format": sig3 },
+    { "key": "1", "label": "E_CV [-]", "type": "number", "format": sci3, "nullText": "—" },
+    {
+        "key": "2",
+        "label": "E_CV の 1.96 SE [-]",
+        "type": "number",
+        "format": sci3,
+        "nullText": "—"
+    },
+    { "key": "3", "label": "E_test [-]", "type": "number", "format": sci3, "nullText": "—" },
+    { "key": "4", "label": "状態" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "scan" })
+);
+let selection_columns = serde_json::json!([
+    { "key": "0", "label": "順位相関 r_s [-]", "type": "number", "format": sig3 },
+    { "key": "1", "label": "候補の数 [-]", "type": "integer" },
+    { "key": "2", "label": "E_CV 最小の ε [-]", "type": "number", "format": sig3 },
+    { "key": "3", "label": "その E_test [-]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "E_test 最小の ε [-]", "type": "number", "format": sig3 },
+    { "key": "5", "label": "E_test の最小値 [-]", "type": "number", "format": sci3 }
+]);
+let selection = vec![(
+    spearman,
+    scores.len(),
+    by_cv.1,
+    by_cv.4,
+    by_test.1,
+    by_test.4,
+)];
+emit_table_with_columns!(
+    selection_columns,
+    selection,
+    metadata = serde_json::json!({ "id": "selection" })
+);
+let band: Vec<_> = scores
+    .iter()
+    .map(|s| [s.1, s.2, s.2 - s.3, s.2 + s.3])
+    .collect();
+// E_test は幅 0 の帯として同じ図に描く
+let test_line: Vec<_> = scores.iter().map(|s| [s.1, s.4, s.4, s.4]).collect();
+emit_chart!(serde_json::json!({
+    "kind": "band",
+    "xLabel": "形状係数 ε [-]",
+    "yLabel": "RMS 誤差 [-]",
+    "xType": "log",
+    "yType": "log",
+    "series": [
+        { "name": "内部点の一つ抜き E_CV ±1.96 SE", "points": band },
+        { "name": "独立格子 E_test", "points": test_line }
+    ]
+}));
+export!(count, count);
+export!(seed, seed);
+export!(exponent, exponent);
+```
+
+既定値では、順位相関は 0.93 で、$E_{\mathrm{CV}}$ が最小の $\epsilon\approx2.83$ は $E_{\mathrm{test}}$ も最小にする（$E_{\mathrm{CV}}=0.050$、$E_{\mathrm{test}}=0.056$）。
+$E_{\mathrm{CV}}$ の 95% 区間の半幅は $E_{\mathrm{CV}}$ の 3〜7 割に達し、隣り合う候補の区間は多くが重なる。
+最初のセルでシードを 1 にすると順位相関は 0.85 に下がり、$E_{\mathrm{CV}}$ は $\epsilon=0.5$ を選ぶが、そのときの $E_{\mathrm{test}}=0.17$ は最良の 0.10（$\epsilon\approx0.35$）より大きい。
+最初のセルで $n=40$ にすると順位相関は 0.68 に下がり、$E_{\mathrm{CV}}$ が選ぶ $\epsilon=4$ の $E_{\mathrm{test}}=0.053$ は最良の 0.042（$\epsilon\approx2.83$）より 25% 大きい。
+正則化を $10^{-14}$ に弱めると $\epsilon\le0.35$ の候補が `Singular` になり、作れた $\epsilon=0.5$ でも悪条件のために $E_{\mathrm{test}}$ が 0.49 まで増える。
+$\lambda=10^{-2}$ では標本での一致が緩み、平坦な側の $E_{\mathrm{test}}$ は 0.16 以下に抑えられ、$\epsilon\approx2.83$ の $E_{\mathrm{test}}$ も 0.051 とわずかに下がる。
+$E_{\mathrm{CV}}$ の最小値だけで $\epsilon$ を決めず、区間の重なりと逆条件数を合わせて読む。
+
+## Clough–Tocher との比較
+
+Clough–Tocher 補間は Delaunay 分割の各三角形を重心で三つに分け、それぞれに 3 次の Bézier 曲面片を置く大域的に $C^1$ 級の補間である。
+頂点の勾配は Nielson の最小ノルム網の方法で大域的に推定し、Gauss–Seidel の反復が収束したかを `CloughTocherReport` の終了状態で返す。
+勾配の推定が収束しなくても、補間は標本点で値に一致する $C^1$ 級の曲面のままで、頂点の勾配の精度だけが下がる。
+標準形式 `CloughTocherInterpolator::new` は収束しなければエラーを返すので、未収束の回数も数えるこの比較では、レポート付きの補間器を返すオプション付き形式 `with_options` を使う。
+形状係数のような尺度の入力を持たないので、RBF の形状係数の選択がどれだけ効くかを測る比較の基準になる。
+
+次のセルは前のセルの点数、シード、正則化を受け取り、指定した形状係数の RBF と Clough–Tocher について、内部点の一つ抜き誤差と独立格子の誤差を求める。
+Clough–Tocher も点を除くたびに Delaunay 分割から作り直す。
+同じ点を除いた二つの誤差は対応があるので、二乗誤差の差 $d_i=e_{\mathrm{RBF},i}^2-e_{\mathrm{CT},i}^2$ の平均と 1.96 SE でも比べる。
+入力は形状係数の指数 $k$（$\epsilon=2^{k/2}$）である。
+既定の $k=3$（$\epsilon\approx2.83$）は、前のセルの既定値で $E_{\mathrm{CV}}$ が最小になる候補である。
+1 つ目の表は二つの方法の $E_{\mathrm{CV}}$、区間、$E_{\mathrm{test}}$ と、勾配推定が収束しなかった回数を示し、2 つ目の表は対応のある差を示す。
+
+```rust
+//| id: interp-station-cross-validation
+//| ref: interp-station-cross-validation
+//| title: RBF と Clough–Tocher を一つ抜き誤差と独立格子で比べる
+//| run: button
+//| uses: [interp-station-franke-model]
+//| crates: [scioxide-core, scioxide-interp, scioxide-spatial, scioxide-random]
+//| dependsOn:
+//|   scan: interp-station-rbf-shape-scan
+//| inputs:
+//|   shape_index: {"type":"range","label":"形状係数の指数 k（ε = 2^(k/2)）[-]","min":-4.0,"max":8.0,"step":1.0,"value":3.0}
+//| cases:
+//|   - {"id":"flat-kernel","label":"k = −4（ε = 0.25）","description":"平坦な核では RBF が Clough–Tocher より悪くなる。","inputs":{"shape_index":-4}}
+//|   - {"id":"narrow-kernel","label":"k = 8（ε = 16）","description":"幅の狭い核では基底が標本の間を埋められない。","inputs":{"shape_index":8}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"comparison","path":"/rows/0/1","approx":{"value":0.050317,"rtol":1e-3}}
+//|       - {"artifact":"comparison","path":"/rows/1/1","approx":{"value":0.081026,"rtol":1e-3}}
+//|       - {"artifact":"comparison","path":"/rows/1/3","approx":{"value":0.051769,"rtol":1e-3}}
+//|       - {"artifact":"comparison","path":"/rows/1/4","equals":0}
+//|       - {"artifact":"paired","path":"/rows/0/1","approx":{"value":-4.0334e-3,"rtol":1e-3}}
+//|       - {"artifact":"paired","path":"/rows/0/2","approx":{"value":7.1338e-3,"rtol":1e-3}}
+//|   - case: flat-kernel
+//|     expect:
+//|       - {"artifact":"paired","path":"/rows/0/1","approx":{"value":7.1492e-3,"rtol":1e-3}}
+//|       - {"artifact":"paired","path":"/rows/0/2","approx":{"value":4.0201e-3,"rtol":1e-3}}
+//|   - case: narrow-kernel
+//|     expect:
+//|       - {"artifact":"comparison","path":"/rows/0/3","approx":{"value":0.41068,"rtol":1e-3}}
+use scioxide_core::{SciOxideError, RealScalar};
+use scioxide_interp::{
+    CloughTocherInterpolator, CloughTocherOptions, ExtrapolationPolicy, Interpolant,
+    RbfInterpolator, RbfKernel, RbfRegularization, ScatteredValues,
+};
+use scioxide_spatial::{Delaunay, PointSet};
+
+let count = scan["count"].as_u64().ok_or("点数がない")? as usize;
+let seed = scan["seed"].as_f64().ok_or("シードがない")?;
+let exponent = scan["exponent"].as_f64().ok_or("正則化の指数がない")?;
+let sites = stations(count, seed).map_err(|e| e.to_string())?;
+let values: Vec<_> = sites.iter().map(|p| franke(p[0], p[1])).collect();
+let grid = test_grid();
+let kernel = RbfKernel::Gaussian(shape_parameter(shape_index as i32));
+let lambda = RealScalar::powi(10.0, exponent as i32);
+let options = rbf_options(RbfRegularization::Diagonal(lambda)).map_err(|e| e.to_string())?;
+let policy = ExtrapolationPolicy::Reject;
+// 与えた点から RBF を作り、問い合わせ点での値を返す
+let rbf = |points: &[[f64; 2]], data: &[f64], queries: &[[f64; 2]]| {
+    let model = RbfInterpolator::with_options(points.to_vec(), data.to_vec(), kernel, options)?;
+    queries
+        .iter()
+        .map(|&q| model.evaluate(q, policy))
+        .collect::<Result<Vec<_>, SciOxideError>>()
+};
+// 与えた点の Delaunay 分割から Clough–Tocher を作り、値と勾配推定の収束を返す
+let clough_tocher = |points: &[[f64; 2]], data: &[f64], queries: &[[f64; 2]]| {
+    let mesh = Delaunay::new(&PointSet::from_points(points)?)?;
+    let samples = ScatteredValues::from_input_values(&mesh, data.to_vec())?;
+    let model =
+        CloughTocherInterpolator::with_options(&mesh, &samples, CloughTocherOptions::new())?;
+    let predicted = queries
+        .iter()
+        .map(|&q| model.evaluate(q, policy))
+        .collect::<Result<Vec<_>, SciOxideError>>()?;
+    Ok::<_, SciOxideError>((
+        predicted,
+        model.gradient_report().termination().is_success(),
+    ))
+};
+// 内部点を一つずつ除き、両方の方法で除いた点の誤差を測る
+let mut squares = [Vec::new(), Vec::new()];
+let mut unconverged = 0;
+for omitted in 4..count {
+    let (x, y) = without(&sites, &values, omitted);
+    let query = [sites[omitted]];
+    let e_rbf = rbf(&x, &y, &query).map_err(|e| e.to_string())?[0] - values[omitted];
+    let (predicted, converged) = clough_tocher(&x, &y, &query).map_err(|e| e.to_string())?;
+    let e_ct = predicted[0] - values[omitted];
+    if !converged {
+        unconverged += 1;
+    }
+    squares[0].push(e_rbf * e_rbf);
+    squares[1].push(e_ct * e_ct);
+}
+let (full_ct, full_converged) =
+    clough_tocher(&sites, &values, &grid).map_err(|e| e.to_string())?;
+let tests = [
+    rbf(&sites, &values, &grid).map_err(|e| e.to_string())?,
+    full_ct,
+];
+let mut rows = Vec::new();
+for (j, name) in ["Gaussian RBF", "Clough–Tocher"].into_iter().enumerate() {
+    let (mse, half) = mean_and_half_width(&squares[j]);
+    let cv = RealScalar::sqrt(mse);
+    let test: f64 = grid
+        .iter()
+        .zip(&tests[j])
+        .map(|(p, v)| (v - franke(p[0], p[1])) * (v - franke(p[0], p[1])) / 400.0)
+        .sum();
+    let failures = (j == 1).then_some(unconverged + usize::from(!full_converged));
+    rows.push((
+        name,
+        cv,
+        half / (2.0 * cv),
+        RealScalar::sqrt(test),
+        failures,
+    ));
+}
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "方法" },
+    { "key": "1", "label": "E_CV [-]", "type": "number", "format": sci3 },
+    { "key": "2", "label": "E_CV の 1.96 SE [-]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "E_test [-]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "勾配推定の未収束 [回]", "type": "integer", "nullText": "—" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "comparison" })
+);
+let differences: Vec<_> = squares[0]
+    .iter()
+    .zip(&squares[1])
+    .map(|(a, b)| a - b)
+    .collect();
+let (difference, difference_half) = mean_and_half_width(&differences);
+let paired_columns = serde_json::json!([
+    { "key": "0", "label": "形状係数 ε [-]", "type": "number", "format": { "significantDigits": 3 } },
+    { "key": "1", "label": "二乗誤差の差 RBF − CT の平均 [-]", "type": "number", "format": sci3 },
+    { "key": "2", "label": "1.96 SE [-]", "type": "number", "format": sci3 }
+]);
+let paired = vec![(
+    shape_parameter(shape_index as i32),
+    difference,
+    difference_half,
+)];
+emit_table_with_columns!(
+    paired_columns,
+    paired,
+    metadata = serde_json::json!({ "id": "paired" })
+);
+```
+
+既定値では、RBF の $E_{\mathrm{CV}}$ は $0.050\pm0.027$、Clough–Tocher は $0.081\pm0.040$ であり、独立格子の誤差は 0.056 と 0.052 でほぼ等しい。
+Clough–Tocher の勾配推定は、点を除いた 20 回と全点の 1 回のすべてで収束した。
+二乗誤差の対応のある差は $-0.0040\pm0.0071$ で区間が 0 を含むので、この点配置では二つの方法の差は一つ抜き誤差から区別できない。
+$\epsilon$ を 0.25 にすると差は $0.0071\pm0.0040$、16 にすると $0.18\pm0.14$ になり、どちらも区間が 0 を含まず、RBF の $E_{\mathrm{CV}}$ と $E_{\mathrm{test}}$ は Clough–Tocher より大きくなる。
+最初のセルで $n=12$ にすると、RBF の独立格子の誤差 0.086 は Clough–Tocher の 0.148 より小さいが、一つ抜き誤差は RBF の 0.160 が Clough–Tocher の 0.074 より大きく、二つの順位が一致しない。
+$n=40$ では独立格子の誤差が RBF 0.042、Clough–Tocher 0.032 で、一つ抜き誤差は RBF 0.018、Clough–Tocher 0.045 と、やはり順位が逆になる。
+形状係数を持たない Clough–Tocher は、RBF の形状係数が適切でないときの比較の基準になるが、どちらが優れるかは点数と配置に依存する。
+
+## まとめ
+
+標本を通す補間では標本での残差がほぼ 0 になるので、形状係数は一つ抜き誤差のように標本の外での誤差で選ぶ。
+一つ抜き誤差は点配置と点数に依存する推定値なので、95% 区間を付けて候補を比べ、区間の重なる候補の差を結論にしない。
+Gaussian RBF の条件は $\epsilon$ を小さくすると急に悪くなり、対角正則化 $\lambda$ は逆条件数を $\lambda/(\sqrt n(n+\lambda))$ 以上に保つが、標本での一致を緩める。
+逆条件数の推定値は方程式を安定に解けるかを示すだけで、精度の指標にはならない。
+Clough–Tocher のような尺度の入力を持たない方法と比べると、形状係数の選択がどれだけ精度に効いているかを確かめられる。
+
+## 次に読むページ
+
+- [規則格子の補間と RBF](../../algorithms/grids-and-rbf/)：RBF 核の種類、形状係数と平坦極限、条件推定の読み方を確かめる。
+- [三角形分割を共有する散在点補間](../../algorithms/scattered-tessellations/)：Clough–Tocher の曲面片と勾配推定、凸包の外の扱いを確かめる。

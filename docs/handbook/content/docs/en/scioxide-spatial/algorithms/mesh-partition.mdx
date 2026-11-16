@@ -1,0 +1,340 @@
+---
+title: "Adaptive Mesh Partitioning and Repartitioning"
+description: "MeshPartition assigns adaptive-mesh active cells to parts, with owned cells, one layer of ghost cells, interface pieces, and ownership of shared entities; RepartitionMap reorders cell values when partitions change."
+sidebar:
+  order: 375
+references:
+  spatial-adaptive-partition: "domain-partitioning-and-ghost-cells"
+  spatial-adaptive-repartition: "repartitioning-and-cell-value-reordering"
+---
+
+For parallel computation of an adaptive mesh across processes, active cells are divided into parts, each updating only its own cells.
+Fluxes and constraints also require values from neighboring parts, so each part keeps copies of one layer of cells outside its boundary (ghost cells), receiving their values through communication.
+If refinement unbalances the load, change cell owners and transfer values.
+This page explains definitions, ownership rules, complexity, APIs, and failure classifications of `MeshPartition` partitioning and `RepartitionMap` repartitioning in `scioxide-spatial`, then checks results on a refined unit square.
+[Adaptive mesh refinement and topological correspondence](../adaptive-mesh-and-shared-tessellation/) defines mesh revisions, hanging entities, and interface pieces.
+
+## Domain partitioning and ghost cells
+
+`MeshPartition` assigns a revision's active cells to parts and gives each part one ghost-cell layer.
+There are two constructors.
+
+- `MeshPartition::balanced(&mesh, parts)` divides active cells in `active_cells()` order into `parts` contiguous intervals of equal size.
+  Lower-index parts receive one extra cell when division is uneven; empty parts are possible.
+- `MeshPartition::new(&mesh, parts, &owners)` assigns active cell $i$ to part `owners[i]`.
+  The caller supplies space-filling-curve or graph-partition assignments as `owners`.
+
+Zero `parts`, an `owners` length different from the active-cell count, or values in `owners` at least `parts` give `InvalidInput`.
+Construction costs $O(N \log N)$ for $N$ active entities and interfaces, counted against the mesh's `AdaptationLimits`; exceeding limits gives `ResourceLimit`.
+
+A partition holds the following quantities.
+
+- `partition_count()` gives the part count and `owners()` each active cell's part.
+- `owned_cells(part)` gives a part's owned cells (in increasing order), and `cell_order()` the complete order grouped by part.
+  `local_cell(i)` returns active cell $i$'s part and position among that part's owned cells.
+- `ghost_cells(part)` comprises cells in other parts sharing a face with this part's cells.
+  If the two sides of an interface piece have different owners, each side's cell becomes a ghost cell of the other part.
+- `interfaces(part)` returns indices of pieces in `mesh.interfaces()` lying on boundaries with other parts.
+- Vertices, faces, and edges shared by multiple parts belong to the lowest-index part, queried with `vertex_owner`, `face_owner`, and `edge_owner`.
+  Corresponding entities across interface pieces or periodic seams also count as shared.
+
+With $G$ stored pairs, `ghost_cells` and `interfaces` queries cost $O(\log G)$ plus work proportional to the returned count.
+An out-of-range part index gives `OutOfBounds`.
+A partition returns its construction revision's token through `mesh_token()` and combines only with that revision's mesh.
+
+## Repartitioning and cell-value reordering
+
+Store cell values grouped by part in `cell_order()` order.
+`RepartitionMap::new(&source, &destination)` constructs a permutation reordering these values between two partitions of the same revision.
+The partitions may have different part counts.
+Use `RepartitionMap::with_options(&source, &destination, options)` to choose an execution policy; `RepartitionOptions` holds only the `gather_into` execution policy (sequential by default).
+Partitions from different revisions, even siblings, give `InvalidInput`.
+
+- `permutation()[i]` is the original position of the cell appearing at new position $i$.
+- `migration_cells(from, to)` returns cells moving from part `from` to `to`.
+  For receiving part `to`, this is also its incoming-cell list.
+- `gather_into(&input, &mut output, &mut staging, cx)` computes `output[i] = input[permutation()[i]]` without allocation.
+  `input` and `output` must have lengths equal to the active-cell count and `staging` at least that length; otherwise it gives `DimensionMismatch`.
+  Cancellation or an execution-context deadline gives `ExecutionStopped`.
+
+`gather_into` accepts no partitions and checks only lengths.
+To verify that value order belongs to the partitions used at construction, call `validate(&source, &destination)`.
+Each partition receives a unique identity at construction, so `validate` rejects even a reconstructed partition with the same owners as a different partition.
+When refinement changes the revision, transfer values to the new revision with `TopologyMap`, then reconstruct partitions on it.
+
+## Cell counts by part
+
+Divide the unit square into $2 \times 2$ root cells and repeatedly refine the deepest active cell having the square’s center $(1/2, 1/2)$ as a vertex.
+This is the default refinement of [Adaptive mesh refinement and topological correspondence](oxref:spatial-adaptive-mesh-epoch); three refinements produce 28 active cells.
+The following definitions block supplies `refined_square`, which constructs this revision, to both cells on this page.
+
+```rust
+//| id: spatial-mesh-partition-model
+//| kind: definitions
+//| title: "Adaptive mesh of the unit square refined toward its center"
+//| crates: [scioxide-core, scioxide-spatial]
+use scioxide_spatial::{
+    AdaptationLimits, AdaptationRequest, AdaptiveMesh, AxisTopology, CellMesh, CoordinateAxis,
+    Grid2d,
+};
+
+/// Divide the unit square into 2 × 2 root cells and refine the deepest active cell having center (1/2, 1/2) as a vertex
+/// (first in active-cell order for equal depths) steps times, returning that revision (depth limit 8).
+pub(crate) fn refined_square(steps: usize) -> Result<AdaptiveMesh<f64, 2>, String> {
+    let axis = CoordinateAxis::uniform(0.0, 1.0, 3).map_err(|e| e.to_string())?;
+    let bounded = [AxisTopology::Bounded; 2];
+    let grid = Grid2d::new([axis.clone(), axis], bounded).map_err(|e| e.to_string())?;
+    let roots = CellMesh::new(grid).map_err(|e| e.to_string())?;
+    let limits = AdaptationLimits::new().with_max_depth(8);
+    let mut mesh = AdaptiveMesh::from_structured(&roots, limits).map_err(|e| e.to_string())?;
+    for _ in 0..steps {
+        let mut chosen: Option<(usize, u8)> = None;
+        for (index, &id) in mesh.active_cells().iter().enumerate() {
+            let level = mesh.level(id).map_err(|e| e.to_string())?;
+            for vertex in mesh.cell_vertices(index).map_err(|e| e.to_string())? {
+                let point = mesh.point(vertex).map_err(|e| e.to_string())?;
+                if *point.as_array() == [0.5, 0.5] && chosen.is_none_or(|(_, best)| level > best) {
+                    chosen = Some((id, level));
+                }
+            }
+        }
+        let (id, _) = chosen.ok_or("No cell has the center as a vertex")?;
+        let request = AdaptationRequest {
+            source: mesh.mesh_token(),
+            refine: &[id],
+            coarsen: &[],
+        };
+        mesh = mesh.adapt(request).map_err(|e| e.to_string())?.mesh;
+    }
+    Ok(mesh)
+}
+```
+
+The next cell selects refinement and part counts, partitions with `MeshPartition::balanced`, and tabulates each part's owned cells, ghost cells, interface pieces with other parts, and owned vertices.
+Ghost-cell counts are compared with counts reconstructed from `mesh.interfaces()` pieces whose two sides have different owners, checking the definition.
+Refinement and part counts are passed to the next cell.
+
+```rust
+//| id: spatial-mesh-partition
+//| ref: spatial-mesh-partition
+//| title: "Equally partition a refined mesh and count owned cells, ghost cells, interfaces, and owned vertices"
+//| run: reactive
+//| uses: [spatial-mesh-partition-model]
+//| crates: [scioxide-core, scioxide-spatial]
+//| exports: [refinements, parts]
+//| inputs:
+//|   steps: {"type":"range","label":"Refinement count","min":1,"max":6,"step":1,"value":3}
+//|   parts: {"type":"range","label":"Part count","min":1,"max":6,"step":1,"value":3}
+//| cases:
+//|   - {"id":"six-parts","label":"6 parts","description":"Increasing parts increases the ratio of ghost cells to owned cells.","inputs":{"parts":6}}
+//|   - {"id":"one-step","label":"1 refinement","description":"Dividing seven active cells into three parts assigns the extra cell to part 0.","inputs":{"steps":1}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"partition","path":"/rows/0/1","equals":10}
+//|       - {"artifact":"partition","path":"/rows/1/1","equals":9}
+//|       - {"artifact":"partition","path":"/rows/1/2","equals":11}
+//|       - {"artifact":"partition","path":"/rows/1/3","equals":11}
+//|       - {"artifact":"partition","path":"/rows/0/5","equals":19}
+//|   - case: six-parts
+//|     expect:
+//|       - {"artifact":"partition","path":"/rows/5/1","equals":4}
+//|       - {"artifact":"partition","path":"/rows/3/2","equals":12}
+//|       - {"artifact":"partition","path":"/rows/3/3","equals":12}
+//|   - case: one-step
+//|     expect:
+//|       - {"artifact":"partition","path":"/rows/0/1","equals":3}
+//|       - {"artifact":"partition","path":"/rows/2/1","equals":2}
+use scioxide_spatial::MeshPartition;
+
+let mesh = refined_square(steps as usize)?;
+let count = parts as usize;
+let partition = MeshPartition::balanced(&mesh, count).map_err(|e| e.to_string())?;
+// Independent check: recount each part's ghost cells from interface pieces with different owners on their two sides.
+let owners = partition.owners();
+let mut ghost_pairs = std::collections::BTreeSet::new();
+for interface in mesh.interfaces() {
+    if let Some(right) = interface.right {
+        let (a, b) = (owners[interface.left_cell], owners[right.cell]);
+        if a != b {
+            ghost_pairs.insert((a, right.cell));
+            ghost_pairs.insert((b, interface.left_cell));
+        }
+    }
+}
+let mut rows = Vec::new();
+for part in 0..count {
+    let owned = partition
+        .owned_cells(part)
+        .map_err(|e| e.to_string())?
+        .len();
+    let ghosts = partition
+        .ghost_cells(part)
+        .map_err(|e| e.to_string())?
+        .count();
+    let recount = ghost_pairs.iter().filter(|&&(p, _)| p == part).count();
+    let pieces = partition
+        .interfaces(part)
+        .map_err(|e| e.to_string())?
+        .count();
+    let mut vertices = 0;
+    for v in 0..mesh.vertex_count() {
+        vertices += usize::from(partition.vertex_owner(v).map_err(|e| e.to_string())? == part);
+    }
+    rows.push((part, owned, ghosts, recount, pieces, vertices));
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "Part", "type": "integer" },
+    { "key": "1", "label": "Owned cells [count]", "type": "integer" },
+    { "key": "2", "label": "Ghost cells [count]", "type": "integer" },
+    { "key": "3", "label": "Ghost cells counted from interfaces [count]", "type": "integer" },
+    { "key": "4", "label": "Interface pieces with other parts [count]", "type": "integer" },
+    { "key": "5", "label": "Owned vertices [count]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "partition" })
+);
+export!(refinements, steps as u64);
+export!(parts, count as u64);
+```
+
+With defaults (three refinements, three parts), 28 active cells split into 10, 9, and 9, with the extra cell assigned to lowest-index part 0.
+For every part, the `ghost_cells` count agrees with the count reconstructed from interfaces.
+Part 1 lies in the middle of active-cell order and adjoins parts on both sides, giving the largest counts: 11 ghost cells and 13 interface pieces.
+Shared vertices belong to the lowest-index part, so part 0 owns the most vertices, 19.
+
+With “6 parts,” each part has 4–5 cells and 5–12 ghost cells, exceeding owned cells in every part.
+Finer partitioning increases the fraction of communicating cells relative to computing cells.
+With “1 refinement,” seven active cells split into 3, 2, and 2.
+
+## Repartitioning permutation
+
+The next cell reconstructs the preceding cell's revision and partition, changes owners to construct another partition with `MeshPartition::new`, and reorders cell values with `RepartitionMap`.
+Choose either reversed part indices ($p \mapsto P - 1 - p$, with $P$ parts) or a shift by one ($p \mapsto (p + 1) \bmod P$).
+Values are active-cell indices themselves, so agreement of reordered values with the new partition's `cell_order()` verifies the permutation.
+Compare moving-cell counts from `migration_cells` with the number of cells whose owners differ between partitions.
+Finally, pass a reconstructed partition with identical owners to `validate` and check that it is rejected as a different partition.
+
+```rust
+//| id: spatial-mesh-repartition
+//| ref: spatial-mesh-repartition
+//| title: "Reorder cell values to a partition with changed owners and check the permutation and moving cells"
+//| run: reactive
+//| uses: [spatial-mesh-partition-model]
+//| crates: [scioxide-core, scioxide-spatial]
+//| dependsOn:
+//|   upstream: spatial-mesh-partition
+//| inputs:
+//|   rule: {"type":"select","label":"Owner reassignment","options":["Reverse part indices","Shift part indices by one"],"value":"Reverse part indices"}
+//| cases:
+//|   - {"id":"shift","label":"Shift by one","description":"Moving part p's cells to part (p + 1) mod P moves every cell when there are at least two parts.","inputs":{"rule":"Shift part indices by one"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"repartition","path":"/rows/0/0","equals":28}
+//|       - {"artifact":"repartition","path":"/rows/0/1","equals":19}
+//|       - {"artifact":"repartition","path":"/rows/0/2","equals":19}
+//|       - {"artifact":"repartition","path":"/rows/0/3","equals":true}
+//|       - {"artifact":"repartition","path":"/rows/0/4","equals":true}
+//|       - {"artifact":"repartition","path":"/rows/0/5","equals":"InvalidInput"}
+//|   - case: shift
+//|     expect:
+//|       - {"artifact":"repartition","path":"/rows/0/1","equals":28}
+//|       - {"artifact":"repartition","path":"/rows/0/3","equals":true}
+use scioxide_core::ExecutionContext;
+use scioxide_spatial::{MeshPartition, RepartitionMap};
+
+// Reconstruct the preceding cell's revision and partition (the mesh itself cannot be passed between cells).
+let steps = upstream["refinements"].as_u64().ok_or("Missing refinement count")? as usize;
+let count = upstream["parts"].as_u64().ok_or("Missing part count")? as usize;
+let mesh = refined_square(steps)?;
+let source = MeshPartition::balanced(&mesh, count).map_err(|e| e.to_string())?;
+let reverse = rule.starts_with("Reverse part indices");
+let owners: Vec<usize> = source
+    .owners()
+    .iter()
+    .map(|&p| {
+        if reverse {
+            count - 1 - p
+        } else {
+            (p + 1) % count
+        }
+    })
+    .collect();
+let destination = MeshPartition::new(&mesh, count, &owners).map_err(|e| e.to_string())?;
+let map = RepartitionMap::new(&source, &destination).map_err(|e| e.to_string())?;
+// Values are active-cell indices. Input uses source order (grouped by part); output uses destination order.
+let input = source.cell_order().to_vec();
+let (mut output, mut staging) = (vec![0; input.len()], vec![0; input.len()]);
+map.gather_into(
+    &input,
+    &mut output,
+    &mut staging,
+    ExecutionContext::sequential(),
+)
+.map_err(|e| e.to_string())?;
+let mut moved = 0;
+for from in 0..count {
+    for to in (0..count).filter(|&to| to != from) {
+        moved += map
+            .migration_cells(from, to)
+            .map_err(|e| e.to_string())?
+            .count();
+    }
+}
+// Independent check: count cells with different owners in the two partitions.
+let changed = (0..mesh.cell_count())
+    .filter(|&c| source.owners()[c] != destination.owners()[c])
+    .count();
+// A reconstructed partition with identical owners is rejected by validate as a different partition.
+let rebuilt = MeshPartition::new(&mesh, count, &owners).map_err(|e| e.to_string())?;
+let accepted = map.validate(&source, &destination).is_ok();
+let rebuilt_kind = match map.validate(&source, &rebuilt) {
+    Ok(()) => "Accepted".to_string(),
+    Err(e) => format!("{:?}", e.kind()),
+};
+let columns = serde_json::json!([
+    { "key": "0", "label": "Active cells [count]", "type": "integer" },
+    { "key": "1", "label": "Moving cells [count]", "type": "integer" },
+    { "key": "2", "label": "Cells changing owner [count]", "type": "integer" },
+    { "key": "3", "label": "Reordered values match new order", "type": "boolean" },
+    { "key": "4", "label": "Original partitions pass validate", "type": "boolean" },
+    { "key": "5", "label": "Reconstructed partition validate" }
+]);
+let summary = vec![(
+    input.len(),
+    moved,
+    changed,
+    output == destination.cell_order(),
+    accepted,
+    rebuilt_kind,
+)];
+emit_table_with_columns!(
+    columns,
+    summary,
+    metadata = serde_json::json!({ "id": "repartition" })
+);
+```
+
+With defaults (reversed part indices), the 19 cells of parts 0 and 2 move, while the nine cells of central part 1 stay.
+The 19 cells counted by `migration_cells` agree with the number changing owner.
+Reordered values agree with the new partition's `cell_order()`, and both construction partitions pass `validate`.
+A reconstructed partition with identical owners is rejected with `InvalidInput` even though its contents agree.
+
+“Shift by one” changes every part index, moving all 28 cells.
+Setting the preceding cell's part count to 1 leaves owners unchanged for either reassignment and moves zero cells.
+
+## Summary
+
+For parallel computation, divide active cells into parts with `MeshPartition::balanced` or `MeshPartition::new` accepting caller-supplied assignments.
+Each part updates owned cells, receives `ghost_cells` values from neighboring parts, and constructs fluxes on `interfaces(part)` pieces.
+Shared vertices, faces, and edges belong to the lowest-index part; use this rule to avoid duplicate degree-of-freedom numbering and summation.
+To change owners, construct `RepartitionMap`, reorder values without allocation with `gather_into`, and determine outgoing cells with `migration_cells`.
+When refinement changes the revision, transfer values with `TopologyMap` before reconstructing partitions.
+
+## Further reading
+
+- [Adaptive mesh refinement and topological correspondence](../adaptive-mesh-and-shared-tessellation/): examine refinement and coarsening producing revisions to partition and definitions of interface pieces and hanging entities.
+- [Adaptive refinement](../../../scioxide-pde/api/adaptive-refinement/): examine the PDE adaptive-refinement workflow from marking through refinement and field transfer.

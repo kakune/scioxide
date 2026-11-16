@@ -1,0 +1,634 @@
+---
+title: Burgers 方程式の衝撃波と Riemann 解
+description: 非粘性 Burgers 方程式の Riemann 問題（衝撃波と膨張波）と、正弦波の初期値からの衝撃波の形成を有限体積法で解き、厳密解、総量の収支、全変動で確かめる。
+sidebar:
+  order: 440
+references:
+  pde-burgers-riemann-problem: "riemann-問題の厳密解"
+  pde-burgers-sine-shock: "正弦波からの衝撃波の形成"
+---
+
+非粘性 Burgers 方程式 $u_t + (u^2/2)_x = 0$ は、衝撃波を作る最も簡単な非線形の保存則である。
+気体の非線形な音波の切り立ちや交通流の渋滞の先端のように、速い部分が遅い部分に追いつく現象のモデルとして使われる。
+この例題では区間 $[0, 1]$ の無次元の $u$ について、Riemann 問題の衝撃波と膨張波、正弦波の初期値から衝撃波ができる過程を `scioxide-pde` の有限体積法で解く。
+厳密解との $L^1$ 誤差、衝撃波の位置、境界の流束から見込む総量の変化、全変動の非増加で結果を確かめる。
+
+## Burgers 方程式と特性曲線
+
+滑らかな解は特性曲線 $dx/dt = u$ に沿って一定なので、初期値 $u_0$ から $u(x, t) = u_0(x - u t)$ と陰に書ける。
+両辺を $x$ で微分すると $u_x = u_0'(\xi)/(1 + u_0'(\xi)\,t)$（$\xi = x - ut$ は特性曲線の足）となり、$u_0' < 0$ の点では $t = -1/u_0'(\xi)$ で傾きが発散する。
+最初に発散する時刻
+
+$$
+t^* = -\frac{1}{\min_\xi u_0'(\xi)}
+$$
+
+が衝撃波の形成時刻で、それ以後は Rankine–Hugoniot 条件 $s = (u_L + u_R)/2$ で動く不連続を含む弱解を考える（[保存則と数値流束](oxref:pde-conservation-riemann)）。
+
+数値計算では `Burgers { direction: [1.0] }` を `StructuredConservationPlan` で離散化し、`bind` で作った `ConservationSystem` を `scioxide_ode::Heun` で進める。
+`Heun` は固定刻みの方法なので、初期刻みに大きな値を渡し、各刻みを CFL の上限 $\Delta t_{\max} = 0.45\,h/(s_{i-1/2} + s_{i+1/2})$ にそろえる（[保存則の CFL 条件と時間積分](oxref:pde-conservation-cfl)）。
+受理した刻みごとに全変動 $\mathrm{TV} = \sum_i |\bar u_{i+1} - \bar u_i|$ と最大の差分商 $\max_i |\bar u_{i+1} - \bar u_i|/h$ を記録し、最後の状態で `ConservationSystem::report` を呼んで、外部の面の流束 `boundary_flux` と制限したセルの数を読む。
+
+周期の初期値 $u_0(x) = A\sin(2\pi x)$ の厳密解は、特性曲線の足 $\xi$ の方程式
+
+$$
+u = A \sin\bigl(2\pi(x - u t)\bigr)
+$$
+
+の根である。
+$u_0$ は $x = 1/2$ について奇対称なので、衝撃波は $x = 1/2$ にできてそこに留まる。
+$0 < x < 1/2$ では、衝撃波に入っていない特性曲線の足は $[0, 1/2)$ にあり、$u \in [0, \min(A, x/t)]$ に根が一つだけある。
+両端で $g(u) = u - A\sin(2\pi(x - ut))$ は $g(0) < 0 \le g(\min(A, x/t))$ を満たすので、この区間を `scioxide-rootfind` の Brent 法に渡す。
+$1/2 < x < 1$ では $u(x) = -u(1 - x)$ を使う。
+
+次の定義のブロックは有限体積の計算と、この厳密解を 2 つのセルで共有する。
+
+```rust
+//| id: pde-burgers-model
+//| kind: definitions
+//| title: Burgers 方程式の有限体積の計算と厳密解
+//| crates: [scioxide-core, scioxide-ode, scioxide-pde, scioxide-rootfind, scioxide-spatial]
+use scioxide_core::{ExecutionContext, Interval, NumericScalar, RealScalar};
+use scioxide_ode::{Heun, OdeMethod, OdeOptions, OdeOutputSchedule, OdeProblem, OdeState};
+use scioxide_pde::{Burgers, ConservationBoundary, ConservationOptions, ConservationReconstruction};
+use scioxide_pde::{NumericalFlux, StructuredConservationPlan};
+use scioxide_rootfind::{Brent, ScalarFn, ScalarRootOptions, ScalarRootSolver};
+use scioxide_spatial::SegmentMesh;
+use scioxide_spatial::{AxisSide, AxisTopology, BoundarySet, CellField, CoordinateAxis, Grid1d};
+
+/// 1 回の計算の結果。history は受理した刻みごとの (t, 全変動, max |Δu|/h)。
+pub(crate) struct BurgersRun {
+    pub(crate) centers: Vec<f64>,
+    pub(crate) values: Vec<f64>,
+    pub(crate) status: String,
+    pub(crate) success: bool,
+    pub(crate) steps: usize,
+    pub(crate) history: Vec<[f64; 3]>,
+    pub(crate) boundary_flux: f64,
+    pub(crate) limited: usize,
+}
+
+/// 隣り合うセル平均の差の和（周期なら端どうしの差も含む）と、最大の差分商。
+fn variation(u: &[f64], periodic: bool, h: f64) -> (f64, f64) {
+    let mut jumps: Vec<f64> = u
+        .windows(2)
+        .map(|w| NumericScalar::abs(w[1] - w[0]))
+        .collect();
+    if periodic {
+        jumps.push(NumericScalar::abs(u[0] - u[u.len() - 1]));
+    }
+    (
+        jumps.iter().sum(),
+        jumps.iter().copied().fold(0.0, f64::max) / h,
+    )
+}
+
+/// [0, 1] の N セルで、セル平均 average(a, b) の初期値から時刻 T まで Heun 法で進める。
+pub(crate) fn solve_burgers<F: NumericalFlux<f64, Burgers<f64, 1>, 1, 1>>(
+    flux: &F,
+    reconstruction: ConservationReconstruction,
+    cells: usize,
+    periodic: bool,
+    average: impl Fn(f64, f64) -> f64,
+    end: f64,
+) -> Result<BurgersRun, String> {
+    let h = 1.0 / cells as f64;
+    let topology = if periodic {
+        AxisTopology::Periodic
+    } else {
+        AxisTopology::Bounded
+    };
+    let axis = CoordinateAxis::uniform(0.0, 1.0, cells + 1).map_err(|e| e.to_string())?;
+    let grid = Grid1d::new([axis], [topology]).map_err(|e| e.to_string())?;
+    let mesh = SegmentMesh::new(grid).map_err(|e| e.to_string())?;
+    let mut conditions = Vec::new();
+    if !periodic {
+        for side in [AxisSide::Start, AxisSide::End] {
+            let set = BoundarySet::axis_side(&mesh, 0, side).map_err(|e| e.to_string())?;
+            conditions.push((set, ConservationBoundary::Transmissive));
+        }
+    }
+    let options = ConservationOptions::new().with_reconstruction(reconstruction);
+    let plan = StructuredConservationPlan::with_options(mesh, conditions, options)
+        .map_err(|e| e.to_string())?;
+    let initial = CellField::from_fn(plan.mesh(), |i| [average(i as f64 * h, (i + 1) as f64 * h)])
+        .map_err(|e| e.to_string())?;
+    let law = Burgers { direction: [1.0] };
+    let mut workspace = plan.workspace().map_err(|e| e.to_string())?;
+    let system = plan
+        .bind(&law, flux, &mut workspace)
+        .map_err(|e| e.to_string())?;
+    let problem = OdeProblem::new(&system, end);
+    // 固定刻みの Heun に大きな初期刻みを渡し、各刻みを CFL の上限にする。
+    let options = OdeOptions::new()
+        .with_initial_step(1.0)
+        .with_output_schedule(OdeOutputSchedule::AcceptedSteps);
+    let vector = plan
+        .initial_state(&law, initial.view())
+        .map_err(|e| e.to_string())?;
+    let (tv, slope) = variation(vector.as_slice(), periodic, h);
+    let mut history = vec![[0.0, tv, slope]];
+    let mut state = OdeState::new(0.0, vector);
+    let mut sink = |t: f64, u: &[f64]| {
+        let (tv, slope) = variation(u, periodic, h);
+        history.push([t, tv, slope]);
+        Ok(())
+    };
+    let method = Heun::new();
+    let mut ode_workspace = method
+        .workspace(&problem, &options)
+        .map_err(|e| e.to_string())?;
+    let execution = ExecutionContext::sequential();
+    let solve = method
+        .advance(
+            &problem,
+            &options,
+            &mut state,
+            &mut sink,
+            &mut ode_workspace,
+            execution,
+        )
+        .map_err(|e| e.to_string())?;
+    let report = system
+        .report(state.time(), state.values(), execution)
+        .map_err(|e| e.to_string())?;
+    Ok(BurgersRun {
+        centers: plan.centers().iter().map(|x| x[0]).collect(),
+        values: state.values().to_vec(),
+        status: solve.termination().map_or("なし".into(), |t| t.to_string()),
+        success: solve.is_success(),
+        steps: solve.accepted_steps(),
+        history,
+        boundary_flux: report.boundary_flux()[0],
+        limited: report.limited_cells(),
+    })
+}
+
+/// x = 1/2 で u_L から u_R に跳ぶ初期値の Riemann 問題の、時刻 T の厳密解。
+/// 解は u = clamp((x − 1/2)/T, u_L, u_R) を区間 [x₁, x₂] でつないだ区分線形の関数で、
+/// 衝撃波（u_L > u_R）では x₁ = x₂ = 1/2 + sT、s = (u_L + u_R)/2。
+pub(crate) struct StepRiemann {
+    pub(crate) left: f64,
+    pub(crate) right: f64,
+    pub(crate) end: f64,
+    pub(crate) x1: f64,
+    pub(crate) x2: f64,
+}
+
+impl StepRiemann {
+    pub(crate) fn new(left: f64, right: f64, end: f64) -> Self {
+        let (x1, x2) = if left > right {
+            let x = 0.5 + 0.5 * (left + right) * end;
+            (x, x)
+        } else {
+            (0.5 + left * end, 0.5 + right * end)
+        };
+        Self {
+            left,
+            right,
+            end,
+            x1,
+            x2,
+        }
+    }
+
+    /// 原始関数 Φ(x) = ∫₀ˣ u(y, T) dy。セル平均は (Φ(b) − Φ(a))/(b − a)。
+    pub(crate) fn primitive(&self, x: f64) -> f64 {
+        let fan =
+            |y: f64| ((y - 0.5) * (y - 0.5) - (self.x1 - 0.5) * (self.x1 - 0.5)) / (2.0 * self.end);
+        if x <= self.x1 {
+            self.left * x
+        } else if x <= self.x2 {
+            self.left * self.x1 + fan(x)
+        } else {
+            self.left * self.x1 + fan(self.x2) + self.right * (x - self.x2)
+        }
+    }
+
+    /// 初期値（時刻 0）の区間 [a, b] での平均。
+    pub(crate) fn initial_average(&self, a: f64, b: f64) -> f64 {
+        let left_part = RealScalar::max(RealScalar::min(b, 0.5) - a, 0.0);
+        let right_part = RealScalar::max(b - RealScalar::max(a, 0.5), 0.0);
+        (self.left * left_part + self.right * right_part) / (b - a)
+    }
+}
+
+/// 周期の初期値 A sin(2πx) の厳密解。0 < x < 1/2 では足 ξ = x − ut ∈ [0, 1/2) の根を、
+/// 1/2 < x < 1 では奇対称 u(x) = −u(1 − x) を使う。衝撃波は x = 1/2 に留まる。
+pub(crate) fn exact_sine(amplitude: f64, t: f64, x: f64) -> Result<f64, String> {
+    let (x, sign) = if x < 0.5 { (x, 1.0) } else { (1.0 - x, -1.0) };
+    if x <= 0.0 || t == 0.0 {
+        return Ok(sign * amplitude * RealScalar::sin(2.0 * <f64 as RealScalar>::PI * x));
+    }
+    let g = |u: f64| u - amplitude * RealScalar::sin(2.0 * <f64 as RealScalar>::PI * (x - u * t));
+    let upper = RealScalar::min(amplitude, x / t);
+    let bracket = Interval::new(0.0, upper).map_err(|e| e.to_string())?;
+    let function = ScalarFn::new(|u: f64| Ok(g(u)));
+    let root = Brent
+        .solve(&function, bracket, &ScalarRootOptions::default())
+        .map_err(|e| e.to_string())?;
+    if !root.termination().is_success() {
+        return Err(format!(
+            "特性曲線の足の求根が {} で止まった",
+            root.termination()
+        ));
+    }
+    Ok(sign * root.point())
+}
+```
+
+## Riemann 問題の厳密解
+
+区分的に一定な初期値（$x < 1/2$ で $u_L$、$x > 1/2$ で $u_R$）の厳密解は、$u_L > u_R$ なら速さ $s = (u_L + u_R)/2$ の衝撃波、$u_L < u_R$ なら $u_L \le (x - 1/2)/t \le u_R$ で $u = (x - 1/2)/t$ の膨張波である。
+どちらも、$x \le x_1$ で $u_L$、$x_1 \le x \le x_2$ で $(x - 1/2)/T$、$x \ge x_2$ で $u_R$ となる区分線形の関数で書ける。
+衝撃波では $x_1 = x_2 = 1/2 + sT$、膨張波では $x_1 = 1/2 + u_L T$、$x_2 = 1/2 + u_R T$ で、厳密なセル平均は原始関数の差から閉形式で求まる。
+波は時刻 $T = 0.25$ までに端に届かないので、外部の面の流束は $f(u_R) - f(u_L)$ で一定であり、総量 $Q = \sum_i h\bar u_i$ は
+
+$$
+Q(T) - Q(0) = -T\,\bigl(f(u_R) - f(u_L)\bigr)
+$$
+
+だけ変わる。
+次のセルは $u_L$、$u_R$、数値流束、再構成、セル数 $N$ を選び、時刻 $T = 0.25$ の解を厳密解と比べる。
+表の「−T × 境界の流束」は最後の状態の `boundary_flux` から見込む総量の変化、「全変動の最大の増加」は受理したすべての刻みの $\mathrm{TV} - |u_L - u_R|$ の最大である。
+
+```rust
+//| id: pde-burgers-riemann
+//| ref: pde-burgers-riemann
+//| title: Burgers 方程式の Riemann 問題を流束と再構成を変えて解く
+//| run: reactive
+//| uses: [pde-burgers-model]
+//| crates: [scioxide-core, scioxide-ode, scioxide-pde, scioxide-rootfind, scioxide-spatial]
+//| inputs:
+//|   left: {"type":"range","label":"左の値 u_L [-]","min":-1,"max":1.5,"step":0.25,"value":1}
+//|   right: {"type":"range","label":"右の値 u_R [-]","min":-1,"max":1.5,"step":0.25,"value":0}
+//|   flux: {"type":"select","label":"数値流束","options":["Godunov","Rusanov"],"value":"Godunov"}
+//|   reconstruction: {"type":"select","label":"再構成","options":["定数","minmod","MC"],"value":"minmod"}
+//|   cells: {"type":"select","label":"セル数 N","options":["100","200","400"],"value":"200"}
+//| cases:
+//|   - {"id":"rusanov","label":"Rusanov","description":"同じ衝撃波を Rusanov の流束で解くと、L¹ 誤差が Godunov より大きい。","inputs":{"flux":"Rusanov"}}
+//|   - {"id":"transonic","label":"u_L = −1, u_R = 1、定数","description":"音速点を含む膨張波。","inputs":{"left":-1,"right":1,"reconstruction":"定数"}}
+//|   - {"id":"transonic-rusanov","label":"u_L = −1, u_R = 1、定数、Rusanov","description":"音速点を含む膨張波を Rusanov で解く。","inputs":{"left":-1,"right":1,"reconstruction":"定数","flux":"Rusanov"}}
+//|   - {"id":"stationary","label":"u_L = 1, u_R = −1","description":"静止した衝撃波。","inputs":{"right":-1}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","approx":{"value":0.00186067,"rtol":1e-4}}
+//|       - {"artifact":"summary","path":"/rows/0/1","approx":{"value":0.625,"atol":2e-4}}
+//|       - {"artifact":"summary","path":"/rows/0/3","approx":{"value":0.125,"atol":1e-12}}
+//|       - {"artifact":"summary","path":"/rows/0/4","approx":{"value":0.125,"atol":1e-12}}
+//|       - {"artifact":"summary","path":"/rows/0/5","range":{"max":1e-13}}
+//|       - {"artifact":"summary","path":"/rows/0/6","equals":223}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+//|   - case: rusanov
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","approx":{"value":0.00226358,"rtol":1e-4}}
+//|   - case: transonic
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/1","equals":null}
+//|       - {"artifact":"summary","path":"/rows/0/0","approx":{"value":0.0198177,"rtol":1e-4}}
+//|       - {"artifact":"summary","path":"/rows/0/5","range":{"max":1e-13}}
+//|   - case: transonic-rusanov
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","approx":{"value":0.0179286,"rtol":1e-4}}
+//|   - case: stationary
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","range":{"max":1e-13}}
+//|       - {"artifact":"summary","path":"/rows/0/1","approx":{"value":0.5,"atol":1e-12}}
+use scioxide_core::NumericScalar;
+use scioxide_pde::{ConservationReconstruction, Godunov, Rusanov};
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed4 = serde_json::json!({ "fractionDigits": 4 });
+let (end, n) = (0.25, cells.parse::<usize>().map_err(|_| "セル数が不正")?);
+let reconstruction = match reconstruction.as_str() {
+    "定数" => ConservationReconstruction::Constant,
+    "minmod" => ConservationReconstruction::Minmod,
+    _ => ConservationReconstruction::MonotonizedCentral,
+};
+let exact = StepRiemann::new(left, right, end);
+let initial = |a: f64, b: f64| exact.initial_average(a, b);
+let run = if flux == "Godunov" {
+    solve_burgers(&Godunov, reconstruction, n, false, initial, end)?
+} else {
+    solve_burgers(&Rusanov, reconstruction, n, false, initial, end)?
+};
+let h = 1.0 / n as f64;
+let error: f64 = run
+    .values
+    .iter()
+    .enumerate()
+    .map(|(i, &u)| {
+        NumericScalar::abs(
+            u * h - (exact.primitive((i + 1) as f64 * h) - exact.primitive(i as f64 * h)),
+        )
+    })
+    .sum();
+// 総量 Q = Σ h u の変化。外部の面の流束 f(u_R) − f(u_L) は一定なので、見込みは −T × 流束。
+let change = run.values.iter().sum::<f64>() * h - (left * 0.5 + right * 0.5);
+// 衝撃波の位置: セル平均が (u_L + u_R)/2 を横切る位置を線形補間で求める。
+let middle = 0.5 * (left + right);
+let crossing = (left > right)
+    .then(|| {
+        run.values
+            .windows(2)
+            .zip(run.centers.windows(2))
+            .find_map(|(u, x)| {
+                ((u[0] - middle) * (u[1] - middle) <= 0.0 && u[0] != u[1])
+                    .then(|| x[0] + (middle - u[0]) / (u[1] - u[0]) * (x[1] - x[0]))
+            })
+    })
+    .flatten();
+let tv0 = NumericScalar::abs(left - right);
+let growth = run
+    .history
+    .iter()
+    .map(|r| r[1] - tv0)
+    .fold(f64::NEG_INFINITY, f64::max);
+let points: Vec<[f64; 2]> = run
+    .centers
+    .iter()
+    .zip(&run.values)
+    .map(|(&x, &u)| [x, u])
+    .collect();
+let corners = vec![
+    [0.0, left],
+    [exact.x1, left],
+    [exact.x2, right],
+    [1.0, right],
+];
+emit_chart!(
+    serde_json::json!({
+        "kind": "xy",
+        "xLabel": "位置 x [-]",
+        "yLabel": "u(x, T) [-]",
+        "dataZoom": true,
+        "tooltip": true,
+        "layers": [
+            { "id": "numerical", "kind": "scatter", "name": "セル平均", "points": points },
+            {
+                "id": "exact",
+                "kind": "line",
+                "name": "厳密解",
+                "points": corners,
+                "style": { "lineType": "dashed", "showSymbol": false }
+            }
+        ]
+    }),
+    metadata = serde_json::json!({ "id": "profile" })
+);
+let columns = serde_json::json!([
+    { "key": "0", "label": "L¹ 誤差 [-]", "type": "number", "format": sci3 },
+    { "key": "1", "label": "衝撃波の位置 [-]", "type": "number", "format": fixed4, "nullText": "膨張波" },
+    { "key": "2", "label": "厳密な位置 [-]", "type": "number", "format": fixed4, "nullText": "膨張波" },
+    { "key": "3", "label": "総量の変化 [-]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "−T × 境界の流束 [-]", "type": "number", "format": sci3 },
+    { "key": "5", "label": "全変動の最大の増加 [-]", "type": "number", "format": sci3 },
+    { "key": "6", "label": "受理した刻み [回]", "type": "integer" },
+    { "key": "7", "label": "制限したセル [個]", "type": "integer" }
+]);
+let row = (
+    error,
+    crossing,
+    (left > right).then_some(exact.x1),
+    change,
+    -end * run.boundary_flux,
+    growth,
+    run.steps,
+    run.limited,
+);
+emit_table_with_columns!(
+    columns,
+    vec![row],
+    metadata = serde_json::json!({ "id": "summary" })
+);
+let outcome = if run.success {
+    Outcome::satisfied("終端時刻まで進んだ")
+        .explanation("ODE の終了理由の判定で、空間の精度は L¹ 誤差で読む。")
+} else {
+    Outcome::partial("終端時刻の前に止まった").explanation("最後に受理した状態を示している。")
+};
+emit_outcome!(
+    outcome
+        .status(run.status.clone())
+        .diagnostic("L¹ 誤差", error, None)
+        .diagnostic("受理した刻み", run.steps as f64, None)
+);
+```
+
+既定値（$u_L = 1$、$u_R = 0$、`Godunov`、minmod、$N = 200$）では、衝撃波の位置は 0.62505 で、厳密な位置 $1/2 + T/2 = 0.625$ との差はセル幅 0.005 の 1% である。
+$L^1$ 誤差は $1.86 \times 10^{-3}$ で、衝撃波は数セルの幅に保たれる。
+総量の変化 0.125 は境界の流束から見込む $-0.25 \times (0 - 0.5) = 0.125$ と丸め誤差の範囲で一致し、全変動は 223 回のどの刻みでも初期値の 1 を $2.2 \times 10^{-16}$ より多く超えなかった。
+同じ条件で `Rusanov` に替えると $L^1$ 誤差は $2.26 \times 10^{-3}$ に、定数の再構成では $3.34 \times 10^{-3}$ に増え、MC では $1.41 \times 10^{-3}$ に減る。
+
+$u_L = 1$、$u_R = -1$ の静止した衝撃波では、$L^1$ 誤差は $1.5 \times 10^{-15}$ である。
+衝撃波のある面の Godunov の流束は $\max_{[-1, 1]} u^2/2 = 1/2$ で、両側の物理流束と等しいので、セル平均は丸め誤差を除いて変わらない。
+$u_L = -1$、$u_R = 1$ の膨張波は扇の中に音速点 $u = 0$ を含む。
+定数の再構成で、`Godunov` の $L^1$ 誤差は 0.0198、`Rusanov` は 0.0179 で、どちらも不連続を残さずに膨張波を作る。
+単調な流束はエントロピー解に収束するので、音速点で膨張衝撃波が残ることはない。
+
+## 正弦波からの衝撃波の形成
+
+周期の初期値 $u_0(x) = A\sin(2\pi x)$ では $\min u_0' = -2\pi A$（$x = 1/2$）なので、衝撃波の形成時刻は $t^* = 1/(2\pi A)$ である。
+$t < t^*$ では解は滑らかで、$x = 1/2$ の傾きは $|u_x| = 2\pi A/(1 - t/t^*)$ で増える。
+$t > t^*$ では $x = 1/2$ に静止した衝撃波があり、その左の値 $u_s$ は $u = A\sin(2\pi u t)$ の正の根である。
+周期境界なので外部の面はなく、総量 $\sum_i h\bar u_i$ は初期値の 0 のまま保存される。
+
+次のセルは振幅 $A$、終端時刻の比 $T/t^*$、セル数、再構成を選び、`Godunov` で時刻 $T$ まで解く。
+上のグラフは $u(x, T)$ のセル平均と、セルの中心での厳密解（破線）である。
+下のグラフは最大の差分商の時間変化を対数の縦軸で描き、破線は $t < 0.95\,t^*$ の厳密な最大の傾き、縦線は $t^*$ である。
+表の $L^1$ 誤差はセル平均とセルの中心の厳密解の差を中点則で積分した値で、滑らかな部分では $O(h^2)$ の違いを含む。
+
+```rust
+//| id: pde-burgers-shock-formation
+//| ref: pde-burgers-shock-formation
+//| title: 周期の正弦波から衝撃波ができる時刻と、その前後の解を厳密解と比べる
+//| run: reactive
+//| uses: [pde-burgers-model]
+//| crates: [scioxide-core, scioxide-ode, scioxide-pde, scioxide-rootfind, scioxide-spatial]
+//| inputs:
+//|   amplitude: {"type":"range","label":"振幅 A [-]","description":"初期値 A sin(2πx) の振幅。衝撃波の形成時刻は t* = 1/(2πA)。","min":0.25,"max":1,"step":0.25,"value":0.5}
+//|   ratio: {"type":"range","label":"終端時刻の比 T/t* [-]","min":0.25,"max":3,"step":0.25,"value":2}
+//|   cells: {"type":"select","label":"セル数 N","options":["100","200","400"],"value":"200"}
+//|   reconstruction: {"type":"select","label":"再構成","options":["定数","minmod","MC"],"value":"MC"}
+//| cases:
+//|   - {"id":"before","label":"T = t*/2","description":"衝撃波の形成前。厳密解は滑らかで、全変動は 4A のまま。","inputs":{"ratio":0.5}}
+//|   - {"id":"late","label":"T = 3t*","description":"衝撃波が強さを失い、全変動は 4u_s まで減る。","inputs":{"ratio":3}}
+//|   - {"id":"constant","label":"定数の再構成","description":"1 次の方法では、衝撃波の前後の滑らかな部分の誤差が大きい。","inputs":{"reconstruction":"定数"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","approx":{"value":0.3183098862,"rtol":1e-9}}
+//|       - {"artifact":"summary","path":"/rows/0/2","approx":{"value":3.0061e-5,"rtol":1e-3}}
+//|       - {"artifact":"summary","path":"/rows/0/4","approx":{"value":1.8951684,"rtol":1e-6}}
+//|       - {"artifact":"summary","path":"/rows/0/5","range":{"max":1e-13}}
+//|       - {"artifact":"summary","path":"/rows/0/6","range":{"min":-1e-14,"max":1e-14}}
+//|       - {"artifact":"summary","path":"/rows/0/7","approx":{"value":0.47387357,"rtol":1e-6}}
+//|       - {"path":"/outputs/3/state","equals":"satisfied"}
+//|   - case: before
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/7","equals":null}
+//|   - case: late
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/7","approx":{"value":0.37981044,"rtol":1e-6}}
+//|   - case: constant
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/2","approx":{"value":2.0122e-3,"rtol":1e-3}}
+use scioxide_core::{NumericScalar, RealScalar};
+use scioxide_pde::{ConservationReconstruction, Godunov};
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed4 = serde_json::json!({ "fractionDigits": 4 });
+let n: usize = cells.parse().map_err(|_| "セル数が不正")?;
+let reconstruction = match reconstruction.as_str() {
+    "定数" => ConservationReconstruction::Constant,
+    "minmod" => ConservationReconstruction::Minmod,
+    _ => ConservationReconstruction::MonotonizedCentral,
+};
+let two_pi = 2.0 * <f64 as RealScalar>::PI;
+let breaking = 1.0 / (two_pi * amplitude);
+let end = ratio * breaking;
+// A sin(2πx) のセル平均 A (cos 2πa − cos 2πb) / (2π (b − a))。
+let average = |a: f64, b: f64| {
+    amplitude * (RealScalar::cos(two_pi * a) - RealScalar::cos(two_pi * b)) / (two_pi * (b - a))
+};
+let run = solve_burgers(&Godunov, reconstruction, n, true, average, end)?;
+let h = 1.0 / n as f64;
+let mut exact = Vec::with_capacity(n);
+for &x in &run.centers {
+    exact.push(exact_sine(amplitude, end, x)?);
+}
+// セルの中心の厳密解との差（中点則による L¹ 誤差の近似）。
+let error: f64 = run
+    .values
+    .iter()
+    .zip(&exact)
+    .map(|(u, v)| h * NumericScalar::abs(u - v))
+    .sum();
+let mass = run.values.iter().sum::<f64>() * h;
+let tv0 = run.history[0][1];
+let growth = run
+    .history
+    .windows(2)
+    .map(|w| w[1][1] - w[0][1])
+    .fold(f64::NEG_INFINITY, f64::max);
+// 衝撃波の左の厳密な値 u_s（u = A sin(2πuT) の正の根）。T ≤ t* では衝撃波がない。
+let jump = (end > breaking)
+    .then(|| exact_sine(amplitude, end, 0.5 - 1e-9))
+    .transpose()?;
+let numerical: Vec<[f64; 2]> = run
+    .centers
+    .iter()
+    .zip(&run.values)
+    .map(|(&x, &u)| [x, u])
+    .collect();
+let reference: Vec<[f64; 2]> = run
+    .centers
+    .iter()
+    .zip(&exact)
+    .map(|(&x, &u)| [x, u])
+    .collect();
+emit_chart!(
+    serde_json::json!({
+        "kind": "xy",
+        "xLabel": "位置 x [-]",
+        "yLabel": "u(x, T) [-]",
+        "dataZoom": true,
+        "tooltip": true,
+        "layers": [
+            { "id": "numerical", "kind": "scatter", "name": "セル平均", "points": numerical },
+            {
+                "id": "exact",
+                "kind": "line",
+                "name": "厳密解（セルの中心）",
+                "points": reference,
+                "style": { "lineType": "dashed", "showSymbol": false }
+            }
+        ]
+    }),
+    metadata = serde_json::json!({ "id": "profile" })
+);
+// 最大の傾き: 数値解は隣り合うセル平均の差分商、厳密解は 2πA/(1 − t/t*)（t < t*）。
+let slope: Vec<[f64; 2]> = run.history.iter().map(|r| [r[0], r[2]]).collect();
+let theory: Vec<[f64; 2]> = (0..=95)
+    .map(|k| k as f64 / 100.0 * breaking)
+    .filter(|&t| t <= end)
+    .map(|t| [t, two_pi * amplitude / (1.0 - t / breaking)])
+    .collect();
+emit_chart!(serde_json::json!({
+    "kind": "line",
+    "xLabel": "時刻 t [-]",
+    "yLabel": "最大の傾き |∂u/∂x| [-]",
+    "yType": "log",
+    "dataZoom": true,
+    "tooltip": true,
+    "series": [
+        { "name": "数値解の max |Δu|/h", "style": { "lineType": "dotted" }, "points": slope },
+        { "name": "厳密解 2πA/(1 − t/t*)", "style": { "lineType": "dashed" }, "points": theory }
+    ],
+    "annotations": [{ "kind": "line", "axis": "x", "value": breaking, "label": "t*" }]
+}));
+let columns = serde_json::json!([
+    { "key": "0", "label": "t* [-]", "type": "number", "format": fixed4 },
+    { "key": "1", "label": "T [-]", "type": "number", "format": fixed4 },
+    { "key": "2", "label": "L¹ 誤差 [-]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "全変動 TV(0) [-]", "type": "number", "format": fixed4 },
+    { "key": "4", "label": "全変動 TV(T) [-]", "type": "number", "format": fixed4 },
+    { "key": "5", "label": "1 刻みの TV の最大の増加 [-]", "type": "number", "format": sci3 },
+    { "key": "6", "label": "総量 Σh u [-]", "type": "number", "format": sci3 },
+    { "key": "7", "label": "厳密な u_s [-]", "type": "number", "format": fixed4, "nullText": "衝撃波なし" }
+]);
+let row = (
+    breaking,
+    end,
+    error,
+    tv0,
+    run.history[run.history.len() - 1][1],
+    growth,
+    mass,
+    jump,
+);
+emit_table_with_columns!(
+    columns,
+    vec![row],
+    metadata = serde_json::json!({ "id": "summary" })
+);
+let outcome = if run.success {
+    Outcome::satisfied("終端時刻まで進んだ")
+        .explanation("ODE の終了理由の判定で、空間の精度は L¹ 誤差で読む。")
+} else {
+    Outcome::partial("終端時刻の前に止まった").explanation("最後に受理した状態を示している。")
+};
+emit_outcome!(
+    outcome
+        .status(run.status.clone())
+        .diagnostic("L¹ 誤差", error, None)
+        .diagnostic("受理した刻み", run.steps as f64, None)
+);
+```
+
+既定値（$A = 0.5$、$T = 2t^* = 0.637$、$N = 200$、MC）では、衝撃波の左の厳密な値は $u_s = 0.4739$ である。
+最大の差分商は $t \approx 0.85\,t^*$ まで破線と 0.3% 以内で一致し（$t = 0.84\,t^*$ で 19.86、厳密値 19.85）、$t^*$ に近づくと破線より小さくなる（$t = 0.90\,t^*$ で 29.8、厳密値 30.9）。
+数値解は衝撃波をセル 1〜2 個の幅で表すので、傾きの発散は格子で切られる。
+$t^*$ の後は差分商が跳び $2u_s$ とセル幅の比 $2u_s/h$ 程度になり、$T = 2t^*$ では 189.52（$2u_s/h = 189.55$）である。
+
+$L^1$ 誤差は $3.0 \times 10^{-5}$ で、衝撃波が面 $x = 1/2$ にあるので、セル平均と厳密解の差は衝撃波の前後でも小さい。
+全変動は $1.99967$ から $1.89517$ に減り、どの刻みでも増加は $3 \times 10^{-15}$ 以下だった。
+最大値 $u = A$ を運ぶ特性曲線（足 $\xi = 1/4$）は時刻 $1/(4A) = (\pi/2)\,t^*$ に衝撃波へ入る。
+それ以後の厳密解は $x = 1/2$ の左で 0 から $u_s$ まで単調に増えて、衝撃波で $-u_s$ に跳び、右で 0 に戻るので、全変動は $4u_s = 1.8955$ で、数値解との差は $3 \times 10^{-4}$ である。
+$T = 3t^*$ では $u_s = 0.3798$、数値解の全変動は $1.5192$ で、$4u_s = 1.5192$ と一致する。
+総量は丸め誤差の $10^{-17}$ の範囲で 0 に保たれた。
+定数の再構成では $L^1$ 誤差が $2.0 \times 10^{-3}$ になり、衝撃波から離れた滑らかな部分でも 1 次の誤差が残る。
+
+## まとめ
+
+Burgers 方程式の衝撃波の位置は Rankine–Hugoniot 条件で決まり、保存形の有限体積法は流束の選び方によらずこの位置を再現する。
+`Godunov` は静止した衝撃波を丸め誤差の範囲で保ち、`Rusanov` は動く衝撃波の $L^1$ 誤差が `Godunov` よりやや大きいが、どちらも音速点を含む膨張波をエントロピー解として作る。
+衝撃波の形成は、最大の差分商が $2\pi A/(1 - t/t^*)$ に沿って増えたあと格子の幅で頭打ちになる時刻として読める。
+解の検算には厳密なセル平均との $L^1$ 誤差に加えて、`boundary_flux` から見込む総量の変化と全変動の非増加が使え、どちらも丸め誤差の範囲で成り立った。
+
+## 次に読むページ
+
+- [保存則と数値流束](../../algorithms/conservation-laws/)では、Godunov と Rusanov の流束の導出と、Riemann 問題の弱解を確かめる。
+- [保存則の再構成と境界](../../algorithms/conservation-reconstruction/)では、minmod と MC の勾配の選び方と、面の値の上下限を確かめる。
+- [Sod の衝撃波管](../sod-shock-tube/)では、同じ有限体積法を 3 成分の Euler 方程式に使い、接触不連続を含む Riemann 問題を解く。

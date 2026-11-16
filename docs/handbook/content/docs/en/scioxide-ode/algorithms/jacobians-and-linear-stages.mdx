@@ -1,0 +1,494 @@
+---
+title: "Jacobians and linear stage equations"
+description: "Jacobian evaluation for implicit methods (analytical, automatic differentiation, forward differences) and default preferences, difference steps, Jacobian closures, sparsity patterns and coloring, dense LU, sparse LU, matrix-free GMRES, and comparisons of evaluation and solver combinations."
+sidebar:
+  order: 325
+references:
+  ode-derivative-strategy: "computing-jacobians"
+  ode-finite-difference-jacobian: "finite-difference-jacobians"
+  ode-stage-backends: "solving-linear-stages"
+  ode-sparse-stages: "sparse-lu-and-sparsity-patterns"
+  ode-krylov-backend: "matrix-free-gmres"
+---
+
+Implicit Runge–Kutta, BDF, Rosenbrock-W, and the DAE solver `DaeBdf` solve linear systems of the form
+
+$$
+\bigl(M - h\gamma J\bigr)\, \Delta = r, \qquad J = \frac{\partial f}{\partial y}(t, y)
+$$
+
+at each step ($\gamma$ is a method coefficient and $M$ the mass matrix).
+This page covers evaluating Jacobian $J$ and solving this linear system (the linear stage).
+Both mainly affect cost rather than accuracy; stage-equation convergence tests and local error control determine solution accuracy.
+[Implicit Runge–Kutta methods and mass matrices](../implicit-runge-kutta-and-mass-matrices/) explains Newton stage solves and factorization reuse.
+
+## Computing Jacobians
+
+Select evaluation of $J$ through `DerivativeStrategy` (scioxide-differentiate) supplied to the method's `with_derivative_strategy`.
+The methods `BackwardEuler`, `ImplicitTrapezoid`, `Sdirk`, `GaussRk`, `RadauIia`, `Bdf`, and `RosenbrockW` provide this setting; `DaeBdf` selects it through `DaeNumericalOptions::with_derivative_strategy`.
+The method default is `DerivativeStrategy::AnalyticOrAutomaticOrForward`, trying the following order.
+
+1. Analytical Jacobian `OdeSystem::jacobian`.
+2. Automatic-differentiation Jacobian `OdeSystem::automatic_jacobian`.
+3. Forward differences.
+
+Only a return of `Ok(None)` advances to the next method; errors stop evaluation with that error.
+Default implementations of `jacobian` and `automatic_jacobian` return `Ok(None)`, so without implementations, forward differences are used.
+Selecting only one method, such as `DerivativeStrategy::Analytic`, fails to obtain a Jacobian if it returns `Ok(None)`.
+The methods `Forward` and `Central` use differences only; `AnalyticOrForward` and `AnalyticOrCentral` try analytical then differences (scioxide-differentiate's `DerivativeStrategy` defaults to `AnalyticOrForward`, unlike methods in `scioxide-ode`).
+
+Calls to `jacobian` and `automatic_jacobian` count as `EvaluationRole::Jacobian` evaluations; right-hand-side calls for differences count as `RightHandSide` evaluations.
+Returned matrices are checked for shape and finiteness; NaN or infinity gives `NonFinite` (`Callback`).
+For complex states, every method assumes $f$ is holomorphic (complex differentiable) in $y$.
+
+### Finite-difference Jacobians
+
+Forward differences choose the column-$j$ perturbation
+
+$$
+\delta_j = \sqrt{\varepsilon}\, \max(|y_j|,\, \mathrm{atol}_j)
+$$
+
+($\sqrt[3]{\varepsilon}$ for central differences), computing $J_{:,j} \approx \bigl(f(t, y + \delta_j e_j) - f(t, y)\bigr)/\delta_j$.
+Here $\varepsilon$ is machine epsilon and $\mathrm{atol}_j$ the component's absolute tolerance (1 if zero).
+Using absolute tolerance rather than 1 as the lower scale makes perturbations appropriate even for small components such as Robertson reaction intermediates.
+The value $f(t, y)$ is reused from stage-residual evaluation, so each dense Jacobian needs $d$ right-hand-side evaluations.
+For components whose quotient is zero, recompute the difference with a perturbation based on the maximum component scale (handling lost small contributions inside large terms, such as $y_0 + y_1 + y_2 - 1$).
+Balancing rounding and truncation errors gives approximately $\sqrt{\varepsilon}$ relative error for forward differences ([Taylor expansion and step selection](../../../scioxide-differentiate/algorithms/taylor-and-step-size/)).
+Jacobian error changes Newton convergence speed only; stage residuals always use $f$ itself, so converged-solution accuracy is unchanged.
+
+### Jacobians supplied by closures
+
+The constructor `OdeFn` builds a system from a right-hand-side closure; `with_jacobian` adds an analytical Jacobian closure and `with_automatic_jacobian` an automatic-differentiation Jacobian closure.
+Both have form `Fn(S, &[T], &mut MatrixViewMut<'_, T>) -> Result<(), SciOxideError>`, writing $\partial f/\partial y$ at $(t, y)$ into the $d \times d$ matrix.
+Jacobian type arguments of `OdeFn` satisfy `JacobianCallback`; this sealed trait is implemented only by closures and `NoJacobian` representing an absent closure.
+The Jacobian in a `NoJacobian` position returns `Ok(None)`, advancing to the next evaluation method.
+An automatic-differentiation closure can, for example, differentiate the right-hand side using scioxide-ad forward mode ([Forward mode](../../../scioxide-ad/algorithms/forward-mode/)).
+
+For systems where `OdeSystem::jacobian_is_constant` returns true ($f(t, y) = Jy + g(t)$ with constant $J$), implicit methods reuse Jacobians across steps; with a current direct factorization, each stage takes one correction.
+Rosenbrock-W also uses time partial derivative $\partial f/\partial t$; without `OdeSystem::time_derivative`, the same `DerivativeStrategy` policy computes it by time differences with state fixed ([Rosenbrock methods and automatic stiffness switching](../rosenbrock-and-stiffness-switching/)).
+
+## Solving linear stages
+
+Select the linear solver through `OdeStageBackend` supplied to the method's `with_backend`.
+Failure never causes a switch to another solver.
+
+| `OdeStageBackend` | Approach | Jacobian evaluation | Approximate cost per factorization or solve |
+|---|---|---|---|
+| `Dense` (default) | Partial-pivoted LU | Analytical, automatic differentiation, columnwise differences | Factorization $O(d^3)$, solve $O(d^2)$ |
+| `Sparse { pattern, limits }` | Sparse LU | Analytical values on the pattern, colored differences | Depends on nonzeros and fill-in |
+| `Krylov { iterations, restart, operator_scratch, preconditioner_scratch }` | Restarted GMRES using Jacobian–vector products | Analytical or differenced products | One product per iteration |
+
+Sparse LU and GMRES support only identity mass matrices; other matrices give `InvalidInput` at the first step.
+Methods reuse Jacobians and factorizations across steps under [Simplified Newton](oxref:ode-newton-modes) rules.
+
+### Sparse LU and sparsity patterns
+
+The solver `OdeStageBackend::Sparse` accepts structural Jacobian nonzeros as CSR-format `StructuralPattern` (scioxide-core).
+The pattern must be $d \times d$, include all diagonal entries, and cover every dependency in $f$, including entries whose values may be zero.
+Invalid patterns give `InvalidInput` during workspace preparation.
+Patterns containing only the main diagonal and its two adjacent diagonals use tridiagonal factorization.
+The setting `limits` is `SparseLuLimits` (scioxide-sparse), supplying factor-entry and workspace-byte limits ([Triangular matrices and sparse LU](../../../scioxide-sparse/algorithms/triangular-and-sparse-lu/)).
+The method `GaussRk` factors the coupled $2d \times 2d$ system with repeated copies of this pattern; `RadauIia` factors each $d \times d$ system using it.
+
+For sparse solvers, `OdeSystem::sparse_jacobian` writes Jacobian values in CSR order.
+If unimplemented, columns are grouped without overlap (column coloring), obtaining differences with one right-hand-side evaluation per group ([Sparse Jacobians and coloring](../../../scioxide-differentiate/algorithms/sparse-coloring/)).
+Tridiagonal patterns need few colors, making Jacobian evaluation counts independent of $d$.
+Sparse solvers have no automatic-differentiation evaluation method.
+
+### Matrix-free GMRES
+
+The backend `OdeStageBackend::Krylov` solves linear stages using restarted GMRES with only Jacobian–vector products $Jv$, without forming Jacobians ([Krylov subspace methods and preconditioning](../../../scioxide-linalg/algorithms/krylov-and-preconditioning/)).
+The field `iterations` limits iterations per linear solve, `restart` gives retained Krylov vectors, and `operator_scratch` and `preconditioner_scratch` give workspace values needed per analytical product and preconditioner application.
+Products come from `OdeSystem::jacobian_product` or `OdeSystem::jacobian_operator`; otherwise approximate them by finite differences, $Jv \approx (f(t, y + \delta v) - f(t, y))/\delta$ ($\delta |v_j| \le \sqrt{\varepsilon}\, s_j$).
+Difference products have accuracy about $\sqrt{\varepsilon}$ relative to state scale, so tighter stage tolerances require analytical products.
+Linear-stage tolerances target a residual of 1% relative to the smallest component scale and are never looser than 1%.
+Single-stage systems can be preconditioned through `OdeSystem::stage_preconditioner` (right preconditioning of $I - \gamma J$); coupled `GaussRk` systems use `OdeSystem::coupled_preconditioner`.
+The method `RadauIia` uses `stage_preconditioner` at the real-part shift of each system.
+Without preconditioning, larger steps and larger $\gamma h \|J\|$ increase GMRES iterations.
+
+## Comparing evaluation methods and solvers
+
+The next two cells solve the semidiscrete system obtained by second-order differences of the one-dimensional reaction–diffusion equation $u_t = u_{xx} - u^3$ ($0 < x < 1$, $u(0) = u(1) = 0$, $u(x, 0) = 2\sin \pi x$) at $d$ interior grid points,
+
+$$
+u_i' = \frac{u_{i-1} - 2u_i + u_{i+1}}{\Delta x^2} - u_i^3, \qquad \Delta x = \frac{1}{d + 1}
+$$
+
+using `RadauIia` through $t = 0.1$.
+The Jacobian is tridiagonal, with diagonal $-2/\Delta x^2 - 3u_i^2$ and adjacent diagonals $1/\Delta x^2$.
+Diffusion eigenvalues extend to approximately $-4/\Delta x^2$, increasing stiffness with $d$.
+
+The following definitions are shared by both cells.
+The type `ReactionDiffusion` supplies right-hand side `rhs`, dense Jacobian `jacobian`, sparse-pattern values `sparse_jacobian`, and Jacobian–vector product `jacobian_product`; `entry` returns the Jacobian entry at $(i, j)$.
+The function `initial_profile` gives initial values; `integrate` solves through $t = 0.1$ at tolerance $\varepsilon$, returning terminal state and report.
+
+```rust
+//| id: ode-reaction-diffusion-model
+//| kind: definitions
+//| title: "Semidiscrete reaction–diffusion system and three Jacobian representations"
+//| crates: [scioxide-core, scioxide-linalg, scioxide-ode]
+use scioxide_core::{
+    ErrorTolerance, ExecutionContext, SciOxideError, NormSelection, SolveContext,
+    StructuralPatternView,
+};
+use scioxide_linalg::{MatrixViewMut, Vector};
+use scioxide_ode::{OdeMethod, OdeOptions, OdeProblem, OdeSolveReport, OdeState, OdeSystem};
+
+/// Semidiscrete system u_i' = D(u_{i−1} − 2u_i + u_{i+1}) − u_i³ (D = 1/Δx², zero boundary values).
+pub(crate) struct ReactionDiffusion {
+    pub(crate) points: usize,
+    pub(crate) diffusion: f64,
+}
+
+impl ReactionDiffusion {
+    /// Jacobian entry at (row, col). Zero outside the three diagonals.
+    pub(crate) fn entry(&self, u: &[f64], row: usize, col: usize) -> f64 {
+        match row.abs_diff(col) {
+            0 => -2.0 * self.diffusion - 3.0 * u[row] * u[row],
+            1 => self.diffusion,
+            _ => 0.0,
+        }
+    }
+}
+
+impl OdeSystem<f64> for ReactionDiffusion {
+    fn dimension(&self) -> usize {
+        self.points
+    }
+    fn rhs(
+        &self,
+        _: f64,
+        u: &[f64],
+        out: &mut [f64],
+        _: &mut SolveContext<'_, '_>,
+    ) -> Result<(), SciOxideError> {
+        for i in 0..self.points {
+            let left = if i > 0 { u[i - 1] } else { 0.0 };
+            let right = if i + 1 < self.points { u[i + 1] } else { 0.0 };
+            out[i] = self.diffusion * (left - 2.0 * u[i] + right) - u[i].powi(3);
+        }
+        Ok(())
+    }
+    fn jacobian(
+        &self,
+        _: f64,
+        u: &[f64],
+        j: &mut MatrixViewMut<'_, f64>,
+        _: &mut SolveContext<'_, '_>,
+    ) -> Result<Option<()>, SciOxideError> {
+        for row in 0..self.points {
+            for col in 0..self.points {
+                j.set(row, col, self.entry(u, row, col))?;
+            }
+        }
+        Ok(Some(()))
+    }
+    fn sparse_jacobian(
+        &self,
+        _: f64,
+        u: &[f64],
+        pattern: StructuralPatternView<'_>,
+        values: &mut [f64],
+        _: &mut SolveContext<'_, '_>,
+    ) -> Result<Option<()>, SciOxideError> {
+        let (starts, columns) = (pattern.row_ptr(), pattern.col_indices());
+        for row in 0..self.points {
+            for k in starts[row]..starts[row + 1] {
+                values[k] = self.entry(u, row, columns[k]);
+            }
+        }
+        Ok(Some(()))
+    }
+    fn jacobian_product(
+        &self,
+        _: f64,
+        u: &[f64],
+        x: &[f64],
+        out: &mut [f64],
+        _: &mut [f64],
+        _: &mut SolveContext<'_, '_>,
+    ) -> Result<Option<()>, SciOxideError> {
+        for (row, out) in out.iter_mut().enumerate() {
+            let columns = row.saturating_sub(1)..(row + 2).min(self.points);
+            *out = columns.map(|col| self.entry(u, row, col) * x[col]).sum();
+        }
+        Ok(Some(()))
+    }
+}
+
+/// Initial values u_i(0) = 2 sin(π i Δx) (f64 standard function).
+pub(crate) fn initial_profile(points: usize) -> Vec<f64> {
+    let dx = 1.0 / (points as f64 + 1.0);
+    (1..=points)
+        .map(|i| 2.0 * (core::f64::consts::PI * i as f64 * dx).sin())
+        .collect()
+}
+
+/// Solve from u(0) to t = 0.1 at tolerance ε, returning terminal state and report.
+pub(crate) fn integrate<M: OdeMethod<f64> + Clone>(
+    method: &M,
+    system: &ReactionDiffusion,
+    epsilon: f64,
+) -> Result<(Vec<f64>, OdeSolveReport<f64>), String> {
+    let tolerance = ErrorTolerance::scalar(epsilon, epsilon, NormSelection::RootMeanSquare)
+        .map_err(|e| e.to_string())?;
+    let options = OdeOptions::new().with_error_tolerance(tolerance);
+    let problem = OdeProblem::new(system, 0.1);
+    let mut workspace = method
+        .workspace(&problem, &options)
+        .map_err(|e| e.to_string())?;
+    let initial = Vector::from_vec(initial_profile(system.points));
+    let mut state = OdeState::new(0.0, initial);
+    let report = method
+        .advance(
+            &problem,
+            &options,
+            &mut state,
+            &mut (),
+            &mut workspace,
+            ExecutionContext::sequential(),
+        )
+        .map_err(|e| e.to_string())?;
+    if !report.is_success() {
+        return Err(format!("{:?}", report.termination()));
+    }
+    Ok((state.values().to_vec(), report))
+}
+```
+
+The first cell compares analytical and difference Jacobians with both dense and sparse LU.
+The reference solution uses `DormandPrince853` at tolerance $10^{-12}$.
+Stability forces small explicit steps, producing an accurate independent reference solution.
+Inputs are grid-point count $d$ and tolerance (absolute and relative both $10^q$); the cell passes $d$, $q$, and the reference solution to the next cell.
+
+```rust
+//| id: ode-jacobian-backends
+//| ref: ode-jacobian-backends
+//| title: "Compare Jacobian evaluation and direct solvers for reaction–diffusion equations"
+//| run: button
+//| cache: inputs
+//| uses: [ode-reaction-diffusion-model]
+//| crates: [scioxide-core, scioxide-differentiate, scioxide-linalg, scioxide-ode, scioxide-sparse]
+//| exports: [points, tolerance_exponent, reference]
+//| inputs:
+//|   points: {"type":"range","label":"Interior grid-point count d [-]","description":"System dimension. Diffusion stiffness grows in proportion to d².","min":10,"max":80,"step":10,"value":40}
+//|   tolerance_exponent: {"type":"range","label":"Tolerance exponent q [-]","description":"Set absolute and relative tolerances both to 10^q.","min":-8,"max":-4,"step":1,"value":-6}
+//| cases:
+//|   - {"id":"fine-grid","label":"d = 80","description":"Difference evaluations grow with d for dense solvers but not sparse solvers.","inputs":{"points":80}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"backends","path":"/rows/0/2","range":{"max":1e-6}}
+//|       - {"artifact":"backends","path":"/rows/3/2","range":{"max":1e-6}}
+//|       - {"artifact":"backends","path":"/rows/0/6","range":{"min":1}}
+//|       - {"artifact":"backends","path":"/rows/1/6","equals":0}
+//|   - case: fine-grid
+//|     expect:
+//|       - {"artifact":"backends","path":"/rows/1/5","range":{"min":400}}
+//|       - {"artifact":"backends","path":"/rows/3/5","range":{"max":140}}
+use scioxide_core::{EvaluationRole, StructuralPattern};
+use scioxide_differentiate::DerivativeStrategy;
+use scioxide_ode::{DormandPrince853, OdeStageBackend, RadauIia};
+use scioxide_sparse::SparseLuLimits;
+
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let d = points as usize;
+let system = ReactionDiffusion {
+    points: d,
+    diffusion: (points + 1.0).powi(2),
+};
+// Independent reference: terminal state from explicit DormandPrince853 at tolerance 1e-12.
+let (reference, _) = integrate(&DormandPrince853::new(), &system, 1e-12)?;
+// Tridiagonal sparsity pattern (CSR, ascending column indices within rows).
+let mut starts = vec![0];
+let mut columns = Vec::new();
+for row in 0..d {
+    columns.extend(row.saturating_sub(1)..(row + 2).min(d));
+    starts.push(columns.len());
+}
+let pattern = StructuralPattern::new(d, d, starts, columns).map_err(|e| e.to_string())?;
+let limits = SparseLuLimits::new(16 * d, 1 << 22);
+let sparse = OdeStageBackend::Sparse { pattern, limits };
+let forward = DerivativeStrategy::Forward;
+let configurations = [
+    ("Dense LU", "Analytic", RadauIia::new()),
+    (
+        "Dense LU",
+        "Forward difference",
+        RadauIia::new().with_derivative_strategy(forward),
+    ),
+    (
+        "Sparse LU",
+        "Analytic",
+        RadauIia::new().with_backend(sparse.clone()),
+    ),
+    (
+        "Sparse LU",
+        "Colored differences",
+        RadauIia::new()
+            .with_backend(sparse)
+            .with_derivative_strategy(forward),
+    ),
+];
+let epsilon = 10.0_f64.powf(tolerance_exponent);
+let mut rows = Vec::new();
+for (backend, source, method) in configurations {
+    let (state, report) = integrate(&method, &system, epsilon)?;
+    let error = state
+        .iter()
+        .zip(&reference)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0, f64::max);
+    let counts = report.accounting().total().map_err(|e| e.to_string())?;
+    rows.push((
+        backend,
+        source,
+        error,
+        report.accepted_steps(),
+        report.rejected_steps(),
+        counts.provider(EvaluationRole::RightHandSide),
+        counts.provider(EvaluationRole::Jacobian),
+        counts.provider(EvaluationRole::Factorization),
+    ));
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "Approach" },
+    { "key": "1", "label": "Evaluation method" },
+    { "key": "2", "label": "Difference from reference [-]", "type": "number", "format": sci2 },
+    { "key": "3", "label": "Accepted [count]", "type": "integer" },
+    { "key": "4", "label": "Rejected [count]", "type": "integer" },
+    { "key": "5", "label": "Right-hand-side evaluations [count]", "type": "integer" },
+    { "key": "6", "label": "Jacobians [count]", "type": "integer" },
+    { "key": "7", "label": "Factorizations [count]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "backends" })
+);
+export!(points, points);
+export!(tolerance_exponent, tolerance_exponent);
+export!(reference, reference);
+```
+
+With defaults ($d = 40$, $q = -6$), all four combinations accept 17 steps without rejection and differ from the reference by $6.0 \times 10^{-9}$.
+The analytical Jacobian is evaluated twice, with simplified Newton reusing it over 17 steps.
+There are 18 factorizations; `RadauIia` refactors whenever step size changes.
+
+Forward differences with dense LU increase right-hand-side evaluations from 120 to 277.
+The additional 157 evaluations are about $2d$ per Jacobian.
+Off-tridiagonal components give zero differences and are recomputed with new perturbations; a Jacobian with no zero components would need about $d$ evaluations each.
+Colored differences with sparse LU add 10 evaluations, or eight even at $d = 80$, independently of $d$.
+Dense LU costs $O(d^3)$ per factorization, while tridiagonal factorization costs only $O(d)$, making sparse LU faster for large $d$.
+Tolerance $10^{-8}$ gives 52 steps, reducing all four reference differences to $2.2 \times 10^{-11}$.
+Difference Jacobians affect only Newton convergence speed; errors match analytical Jacobians, while evaluation counts differ.
+
+The next cell receives the same $d$, $q$, and reference solution from the preceding cell and solves with matrix-free GMRES.
+Jacobian–vector products are either analytical `jacobian_product` or differenced, without preconditioning.
+The input is retained Krylov vectors before restart (`restart`), with at most 200 iterations per linear solve.
+
+```rust
+//| id: ode-krylov-stages
+//| ref: ode-krylov-stages
+//| title: "Solve linear stages with matrix-free GMRES and compare product evaluation and restart lengths"
+//| run: button
+//| uses: [ode-reaction-diffusion-model]
+//| crates: [scioxide-core, scioxide-differentiate, scioxide-linalg, scioxide-ode]
+//| dependsOn:
+//|   solve: ode-jacobian-backends
+//| inputs:
+//|   restart: {"type":"range","label":"Restart length m [-]","description":"Number of Krylov vectors retained by GMRES.","min":5,"max":40,"step":5,"value":30}
+//| cases:
+//|   - {"id":"short-restart","label":"m = 5","description":"Shorter restarts increase iterations per linear solve.","inputs":{"restart":5}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"krylov","path":"/rows/0/1","range":{"max":1e-6}}
+//|       - {"artifact":"krylov","path":"/rows/0/6","equals":0}
+//|       - {"artifact":"krylov","path":"/rows/1/4","range":{"min":500}}
+//|   - case: short-restart
+//|     expect:
+//|       - {"artifact":"krylov","path":"/rows/0/1","range":{"max":1e-6}}
+use scioxide_core::{Budget, EvaluationRole};
+use scioxide_differentiate::DerivativeStrategy;
+use scioxide_ode::{OdeStageBackend, RadauIia};
+
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let points = solve["points"].as_f64().ok_or("No grid-point count")?;
+let epsilon = 10.0_f64.powf(
+    solve["tolerance_exponent"]
+        .as_f64()
+        .ok_or("Tolerance is missing")?,
+);
+let reference: Vec<f64> =
+    serde_json::from_value(solve["reference"].clone()).map_err(|e| e.to_string())?;
+let system = ReactionDiffusion {
+    points: points as usize,
+    diffusion: (points + 1.0).powi(2),
+};
+let krylov = OdeStageBackend::Krylov {
+    iterations: Budget::try_from(200).map_err(|e| e.to_string())?,
+    restart: Budget::try_from(restart as usize).map_err(|e| e.to_string())?,
+    operator_scratch: 0,
+    preconditioner_scratch: 0,
+};
+let configurations = [
+    ("Analytical products", RadauIia::new().with_backend(krylov.clone())),
+    (
+        "Difference products",
+        RadauIia::new()
+            .with_backend(krylov)
+            .with_derivative_strategy(DerivativeStrategy::Forward),
+    ),
+];
+let mut rows = Vec::new();
+for (source, method) in configurations {
+    let (state, report) = integrate(&method, &system, epsilon)?;
+    let error = state
+        .iter()
+        .zip(&reference)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0, f64::max);
+    let counts = report.accounting().total().map_err(|e| e.to_string())?;
+    rows.push((
+        source,
+        error,
+        report.accepted_steps(),
+        report.rejected_steps(),
+        counts.provider(EvaluationRole::RightHandSide),
+        counts.provider(EvaluationRole::LinearOperator),
+        counts.provider(EvaluationRole::Factorization),
+    ));
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "Product evaluation" },
+    { "key": "1", "label": "Difference from reference [-]", "type": "number", "format": sci2 },
+    { "key": "2", "label": "Accepted [count]", "type": "integer" },
+    { "key": "3", "label": "Rejected [count]", "type": "integer" },
+    { "key": "4", "label": "Right-hand-side evaluations [count]", "type": "integer" },
+    { "key": "5", "label": "Operator applications [count]", "type": "integer" },
+    { "key": "6", "label": "Factorizations [count]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "krylov" })
+);
+```
+
+With default $m = 30$, GMRES forms no factorizations, uses 1065 operator applications with analytical products, and matches direct-method steps and errors.
+Difference products evaluate the right-hand side once per product, increasing its evaluations to 1242, adding one rejection, and giving reference difference $1.0 \times 10^{-8}$.
+At $m = 5$, more restarts increase operator applications to 1214 with analytical products and 1338 with differences.
+Without preconditioning, greater stiffness (larger $d$) increases iterations per linear solve.
+For large $d$ where forming Jacobians is infeasible, supplying preconditioning through `OdeSystem::stage_preconditioner` reduces iterations.
+
+## Summary
+
+Implicit methods default to analytical Jacobians, automatic differentiation, then forward differences, advancing only when a method returns `Ok(None)`.
+Forward-difference perturbations are $\sqrt{\varepsilon}\,\max(|y_j|, \mathrm{atol}_j)$; one dense Jacobian needs $d$ right-hand-side evaluations (up to $2d$ including retries of zero components), while sparsity-pattern coloring reduces them to the column-color count.
+Select dense LU, sparse LU, or matrix-free GMRES through `OdeStageBackend`; sparse LU and GMRES permit only identity mass matrices.
+Since Jacobian error affects Newton convergence speed rather than solution accuracy, choose evaluation and solver methods by evaluation counts and cost.
+For large sparse Jacobians, use sparse LU and analytical values; when Jacobians cannot be formed, use GMRES with good preconditioning.
+
+[Simplified and full Newton](oxref:ode-newton-modes) covers nonlinear stage iteration and factorization reuse; [Rosenbrock methods and automatic stiffness switching](../rosenbrock-and-stiffness-switching/) covers Jacobian use in Rosenbrock-W.

@@ -1,0 +1,324 @@
+---
+title: "Solve lifecycle and computation count management"
+description: "Six solve phases and workspace capacity preparation, solve state and epochs through SolveState and SolveContext, limits through budget! and Budget, local and shared limits, pre-execution admission, cancellation checks, reliability categories, and attempt records."
+sidebar:
+  order: 310
+references:
+  core-solve-identity: "solve-identity-and-epochs"
+  core-local-and-shared-budgets: "local-and-shared-solve-limits"
+  core-cancellation-checks: "cancellation-checks"
+  core-workspace-capacity: "preparing-workspace-capacity"
+  core-budget-construction: "constructing-limits"
+  core-admission: "admission-before-execution"
+  core-attempt-records: "reliability-categories-and-attempt-records"
+  core-solve-stages: "six-solve-phases"
+---
+
+Iterative methods may finish early after reaching a count limit or being stopped externally.
+The caller then needs to know how far the remaining state can be trusted and how many iterations or function evaluations were used.
+`scioxide-core` keeps solve state in the owned type `SolveState` and uses `SolveContext`, borrowed only for one solve, to check admission, record counts, and commit accepted states.
+Specify count limits separately from tolerances through `Budget` and `SolveBudgets`.
+Tolerances define success conditions, while limits keep work finite even when success is not achieved.
+This page covers rules within one solve; [Nested solves, accounting, and diagnostics](../nested-solves-and-diagnostics/) covers invoking another solve inside it.
+
+## Six solve phases
+
+All stateful algorithms pass through the following six phases.
+[Error contracts and partial results](../../../concepts/errors-and-partial-results/) illustrates them diagrammatically.
+
+1. Preflight validation checks inputs, solve identity, shapes, injected execution capabilities (such as clocks), computation count limits, and workspace capacity.
+   It invokes no callbacks and changes no externally visible state.
+   An attempt rejected here is recorded as `AttemptOutcome::PreflightRejected` and has no epoch.
+2. Candidate generation constructs the next candidate from the last accepted state.
+3. Evaluation invokes callbacks, writes results into workspace, and counts each invocation.
+4. Assessment computes errors, residuals, acceptance conditions, and certificates.
+5. Commit publishes the candidate and its metadata together.
+   `SolveContext::commit_accepted(trust)` performs this step, incrementing the accepted-proposal count and accepted-state revision and recording reliability category `PartialResultTrust`.
+6. Rollback preserves the last accepted state.
+   Workspace contents may change, but the workspace remains reusable.
+   `record_rejected()` increments only the rejection count without changing accepted-state metadata.
+
+Separating candidate computation from commit prevents intermediate values from failed attempts from escaping.
+Numerical state such as solution vectors is not stored in `SolveState`; each algorithm's result type or workspace holds it.
+
+### Preparing workspace capacity
+
+Preparing capacity during preflight avoids growing workspace after candidate generation begins.
+For APIs with workspaces, `workspace_requirements(request)` computes capacity requirements without allocation, and the workspace's `check(&requirements)` reports whether retained storage suffices through `Capacity`.
+`Capacity::Sufficient` means existing storage suffices and need not grow during numerical computation.
+For `Capacity::NeedsGrowth`, allocate the missing capacity through `try_reserve(&requirements)` before computation.
+Allocation failure produces `AllocationFailure`, exceeding the caller's byte limit produces `ResourceLimit`, and supplying an undersized workspace without growth produces `DimensionMismatch`.
+This assessment concerns workspace only, excluding user callbacks and allocation of separate output storage.
+`scioxide-core` defines only the `Capacity` type; workspaces following this protocol belong to later crates such as scioxide-linalg, scioxide-differentiate, and scioxide-random.
+[Execution forms, workspaces, and reproducibility](../../../concepts/workspaces-and-reproducibility/) gives the detailed contracts.
+
+## Solve identity and epochs
+
+`SolveState::begin_solve(execution, identity, &mut budgets)` starts a new epoch, initializes counts and accepted-state metadata, and returns `SolveContext`.
+The accepted state starts at revision 0 with reliability `DiagnosticOnly`.
+Limits configured in `budgets` persist across solves; only consumption resets to zero.
+The returned context borrows both state and execution context, so it cannot be retained inside a plan or workspace.
+Epoch numbers `SolveEpoch` start at 1 for each `SolveState`; exhaustion produces `SizeOverflow`.
+
+`SolveIdentity::new(problem, algorithm, shape_token, options_token)` represents solve identity.
+
+- `ProblemToken`: A caller-selected problem identifier (`u128`).
+- `AlgorithmId`: Algorithm family, method, and semantic version.
+  Construct it with compile-time spelling checks, as in `algorithm_id!("linear", "cg", 1)`.
+- `shape_token` and `options_token`: Caller-defined identifiers for shape and options fixed during a solve (both `u128`).
+
+To resume, construct `SolveCheckpointMetadata` through `SolveContext::checkpoint(state_token)` and pass it to `SolveState::resume`.
+If identity, schema version, or the algorithm-supplied state token mismatches, `resume` rejects the resume with `InvalidInput` without modifying state or computation count limits.
+A resumed solve starts no new epoch; it restores counts, accepted state, limits, and consumed counts from the checkpoint and continues.
+
+## Local and shared solve limits
+
+`BudgetKind` identifies a limited work category; its treatment in nested solves follows one of two rules.
+A nested solve is another solve (child) started inside a solve (parent); [Nested solves, accounting, and diagnostics](oxref:core-nested-accounting) explains construction and recording rules.
+
+| Kind | Target | Nested treatment |
+|---|---|---|
+| `Iteration` | Iterations | Local; child iterations do not count as the parent's own iterations |
+| `Proposal` | Candidate proposals | Local |
+| `Evaluation` | Callback and provider invocations (all `EvaluationRole`, including functions, residuals, and Jacobians) | Shared; child evaluations also count toward every outer solve |
+| `Subdivision` | Adaptive subdivisions | Shared |
+| `Sample` | Random samples | Shared |
+| `Node` | Search-tree nodes | Shared |
+
+If evaluations were counted only against local solve limits, giving an outer solve a limit $E$ would not constrain inner evaluations.
+With $N$ outer iterations and an inner solve evaluating up to $E_{\mathrm{in}}$ times per iteration, total evaluations could reach $E + N E_{\mathrm{in}}$.
+Evaluations cost the same regardless of nesting level, so the caller wants to constrain this total.
+Sharing adds child evaluations to all outer solves simultaneously, letting the root limit $E$ directly constrain the sum across all levels.
+Subdivisions, samples, and nodes are shared for the same reason.
+
+Iterations differ.
+An outer Newton iteration and an inner linear solver iteration measure progress of different algorithms, so adding them gives no meaningful quantity.
+Counting child iterations as the parent's own would make the allowed number of Newton iterations depend on the difficulty of the inner linear system, so the parent's limit would no longer describe its own slow convergence.
+Iterations and proposals are therefore local, allowing each level to assess its own convergence under its own limit.
+
+### Constructing limits
+
+`Budget` is a positive integer and cannot represent zero.
+Choose its construction method according to when the value is determined.
+
+| Construction | When determined | If zero is supplied |
+|---|---|---|
+| `budget!(256)`, `budget!(64 * 1024)` | Compile time (constant expression) | Compilation error |
+| `Budget::try_from(n)?` | Runtime (`usize`) | `InvalidInput` (`OutOfRange`) |
+| `Budget::from(n)` | Runtime (`NonZeroUsize`) | The type excludes zero |
+| `Budget::ONE` | Constant 1 | Cannot be zero |
+
+`budget!` evaluates its argument as a constant, so it can also appear in definitions such as `const MAX_TERMS: Budget = budget!(256);` and requires no error handling.
+A nonconstant expression fails to compile; convert input-dependent limits with `Budget::try_from`.
+`get()` returns the limit as `usize`, and `saturating_add(additional)` returns a sum saturating at `usize::MAX`.
+
+`SolveBudgets::unbounded()` leaves every category unlimited; `with_limit(kind, budget)` configures a limit per category.
+Even without limits, counts use `usize`, so unrepresentable counts produce `SizeOverflow`.
+
+### Admission before execution
+
+Each operation checks its count against limits before execution and records consumption when execution is admitted.
+Rejected operations change no records, so recorded counts match work actually performed.
+
+- `record_iteration()` returns `Admission`.
+  Within limits it returns `Admission::Granted`; otherwise it returns `Admission::Denied(BudgetReport)` without changing any category's counts.
+  An API unable to return partial results can convert rejection to `ConvergenceFailure` through `.require()?`.
+  The reason is `IterationLimit`, `EvaluationLimit`, or `ResourceLimit(kind)`, according to the limit category.
+- `invoke_provider(role, callback)` invokes the callback only after admission and returns `Invocation::Evaluated(value)`.
+  On rejection, it returns `Invocation::BudgetExhausted(report)` without invoking the callback.
+  Callback errors propagate unchanged, and their invocations still count as evaluations.
+- `try_consume(kind, amount)` records work other than provider calls, such as nodes and samples.
+- `can_consume(kind, amount)`, `can_record_iterations(amount)`, and `can_record_proposals(amount)` check admission without recording consumption.
+  Use them to check a whole work requirement before starting work that cannot stop partway.
+- `record_iterations(amount)`, `record_providers(role, amount)`, and `record_proposals(amount)` count multiple units together: either all are admitted or none are counted.
+- `record_cache_hit()` counts cache lookups.
+  A cache lookup is not an evaluation and does not increase evaluation counts.
+
+The third variant `ExecutionStopped(reason)` of `Invocation` indicates an evaluation that did not finish because of cancellation or a deadline.
+`invoke_provider` does not return it; evaluations performing inner work, such as an operator's `apply_into_scoped`, do.
+These admission operations do not check cancellation or deadlines, so algorithms separately call `stop_reason()` at iteration boundaries ([cancellation checks](#cancellation-checks)).
+
+The following cell takes iteration and function evaluation limits (each 1–3) and attempts three iterations and three function evaluations.
+The first table shows iteration decisions; the second shows function evaluation decisions and callback return values (100 plus the attempt number).
+Consumed and remaining are `consumed()` and `remaining()` of the `BudgetReport` read through `budget_report(kind)` after each attempt.
+Check that consumption equals $\min(\text{attempt number}, \text{limit})$ and that rejected attempts never invoke the callback.
+
+```rust
+//| id: core-solve-admission
+//| ref: core-solve-admission
+//| title: "Obtaining admission before iterations and function evaluations"
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   max_iterations: {"type":"range","label":"Iteration limit [iterations]","description":"The BudgetKind::Iteration limit.","min":1,"max":3,"step":1,"value":1}
+//|   max_evaluations: {"type":"range","label":"Function evaluation limit [evaluations]","description":"The BudgetKind::Evaluation limit.","min":1,"max":3,"step":1,"value":1}
+//| cases:
+//|   - {"id":"larger-limits","label":"Up to 3 iterations and 2 evaluations","description":"All three iterations are admitted; only the third function evaluation is rejected.","inputs":{"max_iterations":3,"max_evaluations":2}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"iterations","path":"/rows/0/1","equals":"Granted"}
+//|       - {"artifact":"iterations","path":"/rows/1/1","equals":"Denied"}
+//|       - {"artifact":"iterations","path":"/rows/2/2","equals":1}
+//|       - {"artifact":"evaluations","path":"/rows/0/2","equals":101}
+//|       - {"artifact":"evaluations","path":"/rows/1/1","equals":"BudgetExhausted"}
+//|       - {"artifact":"evaluations","path":"/rows/1/2","equals":null}
+//|       - {"artifact":"evaluations","path":"/rows/2/3","equals":1}
+//|   - case: larger-limits
+//|     expect:
+//|       - {"artifact":"iterations","path":"/rows/2/1","equals":"Granted"}
+//|       - {"artifact":"iterations","path":"/rows/2/2","equals":3}
+//|       - {"artifact":"iterations","path":"/rows/2/3","equals":0}
+//|       - {"artifact":"evaluations","path":"/rows/1/2","equals":102}
+//|       - {"artifact":"evaluations","path":"/rows/2/1","equals":"BudgetExhausted"}
+//|       - {"artifact":"evaluations","path":"/rows/2/3","equals":2}
+use scioxide_core::{
+    Admission, Budget, BudgetKind, EvaluationRole, ExecutionContext, ProblemToken,
+    SolveBudgets, SolveIdentity, SolveState, algorithm_id,
+};
+
+// Convert input-dependent limits at runtime. Zero produces InvalidInput.
+let limit = |count: f64| Budget::try_from(count as usize).map_err(|e| e.to_string());
+let identity = SolveIdentity::new(
+    ProblemToken::new(1),
+    algorithm_id!("handbook", "admission", 1),
+    0,
+    0,
+);
+let mut budgets = SolveBudgets::unbounded()
+    .with_limit(BudgetKind::Iteration, limit(max_iterations)?)
+    .with_limit(BudgetKind::Evaluation, limit(max_evaluations)?);
+let mut state = SolveState::new();
+let mut cx = state
+    .begin_solve(ExecutionContext::sequential(), identity, &mut budgets)
+    .map_err(|e| e.to_string())?;
+
+// Attempt three iterations. Rejected attempts do not count as executions.
+let mut iterations = Vec::new();
+for attempt in 1..=3_u32 {
+    let decision = match cx.record_iteration().map_err(|e| e.to_string())? {
+        Admission::Granted(()) => "Granted",
+        Admission::Denied(_) => "Denied",
+    };
+    let report = cx.budget_report(BudgetKind::Iteration);
+    iterations.push((attempt, decision, report.consumed(), report.remaining()));
+}
+
+// Attempt three function evaluations. Invoke the callback only when admitted, returning 100 + attempt.
+let mut evaluations = Vec::new();
+for attempt in 1..=3_u32 {
+    let invocation = cx
+        .invoke_provider(EvaluationRole::Function, || Ok(100 + attempt))
+        .map_err(|e| e.to_string())?;
+    let (decision, value) = if invocation.is_exhausted() {
+        ("BudgetExhausted", None)
+    } else {
+        let value = invocation.require().map_err(|e| e.to_string())?;
+        ("Evaluated", Some(value))
+    };
+    let report = cx.budget_report(BudgetKind::Evaluation);
+    evaluations.push((
+        attempt,
+        decision,
+        value,
+        report.consumed(),
+        report.remaining(),
+    ));
+}
+
+let iteration_columns = serde_json::json!([
+    { "key": "0", "label": "Attempt [number]", "type": "integer" },
+    { "key": "1", "label": "Admission decision" },
+    { "key": "2", "label": "Consumed consumed() [count]", "type": "integer" },
+    { "key": "3", "label": "Remaining remaining() [count]", "type": "integer", "nullText": "Unlimited" }
+]);
+emit_table_with_columns!(
+    iteration_columns,
+    iterations,
+    metadata = serde_json::json!({ "id": "iterations", "title": "Iterations record_iteration" })
+);
+let evaluation_columns = serde_json::json!([
+    { "key": "0", "label": "Attempt [number]", "type": "integer" },
+    { "key": "1", "label": "Invocation decision" },
+    { "key": "2", "label": "Callback return value", "type": "integer", "nullText": "Not invoked" },
+    { "key": "3", "label": "Consumed consumed() [count]", "type": "integer" },
+    { "key": "4", "label": "Remaining remaining() [count]", "type": "integer", "nullText": "Unlimited" }
+]);
+emit_table_with_columns!(
+    evaluation_columns,
+    evaluations,
+    metadata = serde_json::json!({ "id": "evaluations", "title": "Function evaluations invoke_provider" })
+);
+```
+
+At the defaults (both limits equal 1), only the first iteration and evaluation are admitted; the second and third are rejected.
+Consumption stays at 1 on rejected rows because rejection changes no records.
+The second and third function evaluations return `BudgetExhausted` without invoking the callback, leaving the return-value field empty.
+With limits of 3 iterations and 2 evaluations, all iterations return `Granted` and leave zero remaining; evaluations return 101 and 102, then reject only the third attempt.
+The cells in [Error contracts and partial results](../../../concepts/errors-and-partial-results/) compare receiving rejection as a value with converting it to an error.
+
+## Cancellation checks
+
+`Cancellation` is a trait that answers whether cancellation was requested through `is_cancelled()`.
+The `scioxide-core` implementation `CancellationToken` is a flag shareable between threads; request cancellation with `cancel()` and reset it with `reset()` before the next solve.
+Attach the token to the execution context through `ExecutionContext::with_cancellation(&token)`; all solves and child solves started in that context see the same cancellation.
+
+`SolveContext::stop_reason()` checks cancellation before deadlines, returning `Some(ExecutionStopReason::Cancelled)` as a value when cancellation is requested.
+An iterative method can therefore return its last accepted state with its reliability category as an unsuccessful result before stopping.
+For APIs unable to return partial results, the execution context's `check()` performs the same checks and returns a `ExecutionStopped` error.
+Cancellation takes effect when the algorithm checks at a boundary with consistent state; it does not interrupt a running callback.
+
+Deadlines belong to the execution context and are inherited by child solves.
+`SolveScope::with_time_limit(duration)` adds a deadline only to the child without changing the parent, and `SolveContext::limit_time(duration)` adds a deadline during a solve.
+Both preserve any existing earlier deadline and return `CapabilityUnavailable` if the context has no clock.
+[Cancellation, clocks, and deadlines](../cancellation-clocks-and-deadlines/) covers clocks and deadlines.
+
+## Reliability categories and attempt records
+
+Even after a limit or external stopping, the last accepted state may be useful.
+`PartialResultTrust` expresses how far that state can be trusted.
+
+| Reliability category | Meaning |
+|---|---|
+| `DiagnosticOnly` | A finite diagnostic state with no claim about feasibility or residuals |
+| `Admissible` | A state accepted under the algorithm's own acceptance or feasibility rules |
+| `ResidualChecked` | A state whose residual independently meets the configured threshold |
+| `CertificateVerified` | A state supported by an independently verified certificate |
+
+`commit_accepted` records reliability during acceptance, while `assess_accepted` updates only the current state's reliability without accepting a new proposal.
+`assess_accepted` also applies to the initial state at revision 0.
+The last accepted state is available as `AcceptedStateMetadata` (epoch, revision, reliability) through `accepted_state()`.
+
+A single call or resume outcome can be recorded in `AttemptRecord<P>`.
+The record holds the epoch, kind (`AttemptKind::Call` or `Resume`), outcome `AttemptOutcome`, `SolveCounts`, and progress `P` for the attempt.
+
+| `AttemptOutcome` | Meaning | Interpretation |
+|---|---|---|
+| `Succeeded` | Success conditions met | Use the result directly |
+| `Stopped` | Stopped without success but has an accepted state | Check reliability before use |
+| `Failed` | Execution returned an error | Use progress for diagnosis if available |
+| `PreflightRejected` | Validation rejected execution before numerical computation | Correct the rejection cause (inputs, settings, workspace capacity, and so on) |
+
+A `PreflightRejected` record has neither epoch nor progress, and its counts are zero.
+Storage left from a previous attempt in the workspace does not become progress of the rejected attempt.
+Counts in a `Resume` record include work inherited from the checkpoint.
+
+Use `PartialFailure::with_progress(error, capture)` to retain progress on failure.
+If `capture` fails, progress becomes `None` and the original error is not replaced.
+[Kepler's equation and solve accounting](../../examples/kepler-solve-accounting/) shows separate recording of `Succeeded` and `Stopped`.
+
+## Summary
+
+A solve proceeds through six phases from preflight to commit or rollback; only committed accepted states are externally visible.
+Construct constant limits with `budget!` and input-dependent limits with `Budget::try_from`, setting each category in `SolveBudgets`.
+Iteration and proposal limits are local to a solve; evaluation, subdivision, sample, and node limits are shared with nested solves.
+Obtain admission through `Admission` or `Invocation` before consuming resources; use `.require()?` to make rejection an error only when a partial result cannot be returned.
+Admission does not check cancellation or deadlines, so call `stop_reason()` at iteration boundaries.
+When using a truncated result, inspect `PartialResultTrust` and do not treat a `DiagnosticOnly` state as a converged solution.
+
+## Further reading
+
+- [Nested solves, accounting, and diagnostics](../nested-solves-and-diagnostics/): Check which counts consume shared limits and which levels record work when one solve invokes another.
+- [Cancellation, clocks, and deadlines](../cancellation-clocks-and-deadlines/): Check injected cancellation, clocks, and deadlines in solve contexts.
+- [Kepler's equation and solve accounting](../../examples/kepler-solve-accounting/): Learn attempt outcome and reliability interpretation through separate recording of `Succeeded` and `Stopped`.
+- [Solve accounting and execution APIs](../../api/solve-and-execution/): Look up every `SolveContext` method and its error conditions.

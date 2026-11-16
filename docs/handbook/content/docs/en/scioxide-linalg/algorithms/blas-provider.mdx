@@ -1,0 +1,329 @@
+---
+title: "External BLAS provider contract"
+description: "How to supply an external BLAS library through the blas feature. Provider capabilities, dispatch and fallback to the built-in implementation, ULP accuracy guarantees, call types and workspace sizes, and native checks for behavior that cannot be observed in Wasm."
+sidebar:
+  order: 395
+references:
+  linalg-blas-feature: "role-of-the-blas-feature"
+  linalg-blas-capabilities: "advertised-capabilities"
+  linalg-blas-dispatch: "dispatch-rules"
+  linalg-blas-operands: "call-types-and-workspace"
+---
+
+Dense matrix products and factorizations in `scioxide-linalg` use a dependency-free built-in Rust implementation.
+To use a BLAS library tuned for the target machine, enable the `blas` feature, implement a provider wrapping that library, and pass it through the execution context.
+This page explains the capabilities a provider advertises, the rules SciOxide uses to dispatch calls to the provider or fall back to the built-in implementation, the accuracy guarantees for provider results, and the types exchanged in calls.
+BLAS level 1–3 operations and the `Standard` and `Exact` accuracy tiers are described in [Memory layout, views, dense matrix kernels, and accuracy tiers](../storage-views-and-kernels/); calling forms such as caller-provided-output and scoped APIs are described in [Workspaces, execution contexts, and attempt records](oxref:linalg-execution-forms).
+
+---
+
+## Role of the blas feature
+
+The `blas` feature is disabled by default; enabling it adds only types and dispatch logic.
+It does not link a BLAS library or add dependency crates, build scripts, or process-wide settings.
+The same API is available in a `no_std + alloc` configuration.
+The caller wraps a CBLAS-compatible library, implements the `BlasProvider` trait, and attaches a `BlasDispatch::new(&provider, fallback)` to the context with `LinalgExecutionContext::with_blas`.
+Read the provider attached to the context with `LinalgExecutionContext::blas()`.
+
+Only caller-provided-output APIs that accept a context (`*_into` and `*_in_place`) and scoped APIs (`*_scoped`) can use a provider.
+APIs returning owned values (standard and with-options forms) and one-shot functions run on `ExecutionContext::sequential_native()` and have no provider.
+Context-accepting dense matrix products, triangular products and solves, vector operations and plane-rotation generation, and internal products in factorizations such as LU, Cholesky, LDL, QR and its variants, and SVD can use the provider through this context.
+The triangular-system plan `TriangularPlan` also passes single-right-hand-side solves to the provider as TRSV, TBSV, or TPSV.
+
+The 45 variants of `BlasOperation` are the operations that can be dispatched to a provider; they correspond to CBLAS names.
+Level 1 includes `Copy`, `Scale`, `Axpy`, inner products `Dotu` and `Dotc`, `Norm2`, `Asum`, `Iamax`, `Swap`, plane rotations `Rotg`, `Rotmg`, `Rot`, and `Rotm`, `WideDot` (DSDOT), which accumulates a binary32 inner product in binary64 and returns binary64, and `OffsetDot` (SDSDOT), which adds an inner product accumulated in binary64 to a binary32 constant and returns binary32.
+Level 2 covers matrix–vector products (`Gemv`, banded `Gbmv`, and symmetric or Hermitian `Symv`, `Hemv`, `Sbmv`, `Hbmv`, `Spmv`, and `Hpmv`), triangular solves (`Trsv`, `Tbsv`, and `Tpsv`), and rank-1 and rank-2 updates (`Geru`, `Gerc`, `Syr`, `Syr2`, `Her`, `Her2`, `Spr`, `Spr2`, `Hpr`, and `Hpr2`); level 3 consists of `Gemm`, `Symm`, `Hemm`, `Syrk`, `Herk`, `Syr2k`, `Her2k`, `Trmm`, and `Trsm`.
+`BlasOperation::supports_scalar` reports whether CBLAS defines the operation for the scalar type.
+Level-2 symmetric operations (`Symv`, `Sbmv`, `Spmv`, `Syr`, `Syr2`, `Spr`, and `Spr2`) and plane rotations are defined only for real types, Hermitian operations and `Gerc` only for complex types, and `WideDot` and `OffsetDot` only for `f32`; the other operations are defined for every scalar type.
+Level-3 symmetric operations `Symm`, `Syrk`, and `Syr2k` are also defined for complex types (CBLAS complex symmetric products).
+
+## Advertised capabilities
+
+A provider advertises the following items as `BlasCapabilities` through `capabilities()`.
+`BlasCapabilities::empty(width)` advertises no support; add items with `with_*`.
+
+| Item | Setting | Meaning |
+|---|---|---|
+| Integer width | `empty(BlasIntegerWidth::Lp64)` or `Ilp64` | Pass sizes, strides, and leading dimensions as signed 32-bit or 64-bit integers. Calls containing values above the limit follow the fallback policy |
+| Storage order | `with_layout(BlasLayout::RowMajor)`, `ColumnMajor` | All matrices in a call use the same order. Banded and packed operands use column-major order only |
+| Transformations | `with_transform(BlasTransform::None)` and others | Matrix `None`, `Transpose`, and `Adjoint`, and vector conjugation `Conjugate`. Ordinary vectors also require advertised `None` support |
+| Operations and accuracy | `with_operation(ScalarKind::F64, BlasOperation::Gemm, BlasUlp::new(4))` | Advertise a componentwise error bound in ULP for each scalar-type/operation pair. Pairs not defined by CBLAS give `InvalidInput` (`UnsupportedConfiguration`) |
+| Alignment | `with_minimum_alignment(bytes)` (default 1) | Alignment of each operand's starting address. Zero or a non-power-of-two value gives `InvalidInput` at runtime |
+| Threads | `with_threading(BlasThreading::SingleThreaded)` (default) or `Budgeted` | A `Budgeted` provider follows the worker count supplied for each call |
+
+`ScalarKind` is a `scioxide_core::backend` type distinguishing `F32`, `F64`, `Complex32`, and `Complex64`.
+A ULP (unit in the last place) is the spacing between two adjacent floating-point values.
+`BlasUlp::new(m)` promises that each component of the provider's result lies within $m$ ULP (including $m$) of the built-in `Exact`-tier result.
+Because `Exact` products are correctly rounded, $m = 0$ means agreement with the correctly rounded result for products, with relative error at most approximately $(m + \tfrac12) \cdot 2^{1-p}$ in the normal range ($p$ is the significand precision, $2^{1-p} \approx 2.2 \times 10^{-16}$ for `f64`).
+Read these settings with `supports_layout`, `supports_transform`, `operation_ulp`, `integer_width`, `minimum_alignment`, and `threading`.
+
+## Dispatch rules
+
+Whether an operation is dispatched to the provider is decided in the following order.
+The fallback policy `BlasFallbackPolicy` offers `Reference`, which performs unsupported operations with the built-in implementation, and `Error`, which returns an `CapabilityUnavailable` error.
+
+| Order | Condition | Result |
+|---|---|---|
+| 1 | Empty work (vector length 0, or a matrix product with zero rows, columns, or inner dimension) | Use the built-in implementation regardless of policy. Only scale the output by $\beta$; do not call the provider |
+| 2 | Advertised alignment is zero or not a power of two | `InvalidInput` as soon as capabilities are read, regardless of policy |
+| 3 | The operation/scalar-type pair is not advertised; storage order, transformation, integer width, alignment, or packing-buffer length does not match; or a modified Givens rotation needs an extended exponent range for intermediate values | Built-in implementation for `Reference`; `CapabilityUnavailable` for `Error` |
+| 4 | The accuracy tier is `Exact` and the advertised ULP is nonzero | Same as 3 |
+| 5 | None of 1–4 applies | Call the provider |
+
+Before checking 3, SciOxide checks whether matrix views can be passed without repacking.
+It uses row-major storage if advertised, and column-major storage otherwise.
+If the strides match that order, it passes the view directly with transformation `None`; if swapping rows and columns makes them match, it uses `Transpose` (`Adjoint` for a conjugated view).
+If neither matches the advertised capabilities, it repacks the matrix contiguously in that order in workspace and passes it with `None`.
+CBLAS has no matrix argument for conjugation alone, so a conjugated view is never passed as `Conjugate`.
+Operation-specific restrictions take precedence over advertised capabilities: for example, `Symm` and `Hemm` accept no transformation, `Syrk` accepts only `None` and `Transpose`, and `Herk` accepts only `None` and `Adjoint`.
+The matrix–vector product `Gemv` does not repack; if it cannot pass the operands directly using either advertised row-major or column-major support, it follows the fallback policy.
+
+After calling the provider, SciOxide validates the result before copying it to the caller's output.
+A provider returning `Err` gives `CapabilityFailure`; NaN or infinity in the result gives `NonFinite` (the non-finite source classification is `Callback`).
+Finite but invalid results (negative norms or sums, out-of-range `Iamax` indices, imaginary diagonal parts in Hermitian matrices, or invalid modified-rotation flags) give `CapabilityFailure`.
+The provider writes to storage separate from the caller's output, so any failure leaves the output unchanged and does not retry with the built-in implementation.
+Products that update only one triangle validate and copy only that triangle to the output.
+
+A `SingleThreaded` provider always receives a worker count of 1.
+A `Budgeted` provider receives 1 for execution policy `Sequential`, at most the smaller of $k$ and the executor's computation-count limit for `Parallel(k)`, and at most the executor's computation-count limit for `Auto`; matrix products further restrict this count through the product plan.
+The product plan reduces the worker count according to matrix size, so small products and small products inside factorizations may receive 1.
+
+For computations combining many operations, such as factorizations, the policy affects the result.
+With `Error`, the entire computation stops with `CapabilityUnavailable` if any internal call cannot be dispatched to the provider.
+With `Reference`, supported calls go to the provider and the rest use the built-in implementation.
+
+## Accuracy guarantees and differences from the built-in implementation
+
+The advertised ULP is a promise by the provider; SciOxide does not recompute exact values to check it at runtime.
+Runtime checks cover only the finiteness and value ranges described above.
+The advertised ULP is used only for dispatch: `Standard` imposes no limit, while `Exact`, which accumulates products exactly and rounds once, dispatches only operations advertising 0 ULP (row 4 of the dispatch table).
+
+For products with inner dimension $k$, each component computed by the built-in `Standard` implementation satisfies $\lvert \hat c_{ij} - c_{ij} \rvert \le \gamma_k (\lvert A \rvert \lvert B \rvert)_{ij} + k u_{\mathrm{sub}}$ (where $\gamma_k = k\varepsilon/(1-k\varepsilon)$), provided $k\varepsilon < 1$.
+This bound is proportional to $\lvert A \rvert \lvert B \rvert$, so components involving cancellation can have large relative errors.
+Promising a few ULP for the same component requires accumulation that controls error relative to the value after cancellation.
+Advertising a small ULP for a library using ordinary summation can make the promise stronger than the actual error bound; provider authors therefore choose the advertised value from error analysis and tests of their implementation.
+
+Reproducibility guarantees also depend on the execution path.
+With the same options and instruction set, the built-in `Standard` implementation returns bitwise identical results regardless of worker count ([shared reproducibility discussion](../../../concepts/workspaces-and-reproducibility/)).
+Provider results can depend on the library's blocking and thread count.
+SciOxide does not promise bitwise agreement between provider and built-in results; they can differ within the advertised ULP and the `Standard` bound.
+To check advertised capabilities, compute the same inputs with the built-in `Exact` implementation and count the componentwise ULP distances.
+
+## Call types and workspace
+
+The `BlasCall` received by a provider is a single enum with operation-specific variants (named as in `BlasOperation`); `operation()` returns the operation kind.
+Each variant contains operands and, as appropriate, scalars $\alpha$ and $\beta$, matrix transformations `BlasTransform`, and the stored-triangle selection.
+The provider writes `Norm2` and `Asum` results using the real type `S::Real`, even for complex calls.
+Operands have the following types, borrowing initialized, bounds-checked slices without exposing raw pointers.
+
+| Type | Contents |
+|---|---|
+| `BlasVector` | Read-only vector. Element $i$ is `values()[i * stride()]`. `len`, `stride`, `is_conjugated`, `is_empty` |
+| `BlasVectorMut` | Writable vector. `values` and `values_mut`, `len`, `stride`, `is_empty`. Points into SciOxide workspace |
+| `BlasMatrix` | Read-only dense matrix. Stored `rows` and `cols` before transformation, leading dimension `leading_dimension`, and storage order `layout`. Entry $(i, j)$ is `i * ld + j` in row-major order or `j * ld + i` in column-major order |
+| `BlasMatrixMut` | Writable dense matrix. Same as `BlasMatrix` apart from `values_mut`; points into SciOxide workspace |
+| `BlasBandMatrix` | Column-major band storage. `rows`, `cols`, lower bandwidth `lower`, upper bandwidth `upper`, and leading dimension. Entry $(i, j)$ is `j * ld + upper + i − j` |
+| `BlasPackedMatrix` | Triangle packed by columns. Order `order` and stored triangle `triangle` (`Triangle` from scioxide-core). Upper-triangular $(i, j)$ ($i \le j$) is `i + j(j + 1)/2` |
+| `BlasPackedMatrixMut` | Writable packed triangle. Points into SciOxide workspace |
+
+`BlasProvider` requires `Sync` and implements `name`, `capabilities`, scalar-specific `execute_f32`, `execute_f64`, `execute_complex32`, and `execute_complex64`.
+`execute_*` receives one call and worker count `workers` (`NonZeroUsize`), and returns scioxide-core's `CapabilityError` if the library reports failure.
+Because SciOxide passes no raw pointers, an implementation calling external code can construct library arguments from bounds-checked slices.
+`BlasDispatch` pairs a provider with a policy, read through `provider()` and `fallback()`.
+The following skeleton shows a provider advertising only `Gemm` for `f64` (for a native build with `--features blas`; it does not run as a browser cell).
+
+```text
+impl BlasProvider for MyBlas {
+    fn name(&self) -> &'static str { "my-blas" }
+    fn capabilities(&self) -> BlasCapabilities {
+        BlasCapabilities::empty(BlasIntegerWidth::Lp64)
+            .with_layout(BlasLayout::RowMajor)
+            .with_transform(BlasTransform::None).with_transform(BlasTransform::Transpose)
+            .with_operation(ScalarKind::F64, BlasOperation::Gemm, BlasUlp::new(4))
+            .unwrap() // Gemm is defined for f64, so this cannot fail
+    }
+    fn execute_f64(&self, call: BlasCall<'_, f64>, workers: NonZeroUsize) -> Result<(), CapabilityError> {
+        match call {
+            BlasCall::Gemm { alpha, a, b, left_transform, right_transform, beta, c } => { /* cblas_dgemm */ Ok(()) }
+            _ => Err(CapabilityError::new("unsupported routine")),
+        }
+    }
+    // Implement execute_f32, execute_complex32, and execute_complex64 in the same form.
+}
+let cx = LinalgExecutionContext::sequential().with_blas(BlasDispatch::new(&my_blas, BlasFallbackPolicy::Reference));
+a.view().mul_mat_into(&b, &options, c.view_mut(), &mut workspace, cx)?;
+```
+
+Packing buffers come from the caller's workspace.
+Dense-matrix request types and factorization request types (such as `DenseWorkspaceRequest`, `LuWorkspaceRequest`, `CholeskyWorkspaceRequest`, and `HouseholderWorkspaceRequest`) add regions for repacking entire operands through `with_provider_packing()`.
+`for_context(&cx)` determines the worker count from the context and adds the same regions only when the context has a provider.
+These regions can be calculated even without the `blas` feature.
+Owned workspace grows to include these regions during preparation for caller-provided-output APIs; however, borrowed fixed workspace passed with `LinalgWorkspace::from_scalar_slice` that has room only for the built-in implementation gives `DimensionMismatch` with a provider-bearing context before the provider is called ([Workspaces, execution contexts, and attempt records](oxref:linalg-workspace-reservation)).
+
+## Example
+
+The following cell compares workspace requirements with and without `with_provider_packing()` for $n \times n$ matrix products, triangular matrix products, and LU, Cholesky, and QR factorizations.
+The input is matrix order $n$ (1–512); requirements are read as scalar-element counts in `LinalgRequirements::scalar_len()` and byte counts in `required_bytes::<f64>()`.
+The execution policy is uniformly sequential, `with_execution_policy(ExecutionPolicy::Sequential)`, so worker counts do not change the regions.
+The table's increment divided by $n^2$ shows how much the regions for repacking entire operands exceed the built-in regions.
+This cell runs without the `blas` feature and does not observe provider dispatch itself.
+
+```rust
+//| id: linalg-blas-provider-packing
+//| ref: linalg-blas-provider-packing
+//| title: "Workspace sizes prepared for provider calls"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-linalg]
+//| inputs:
+//|   order: {"type":"range","label":"Matrix order n","description":"Compare products and factorizations of n × n matrices.","min":1,"max":512,"step":1,"value":64}
+//| cases:
+//|   - {"id":"small","label":"n = 8","description":"The built-in implementation does not block small products, so space increases by 2n² elements for two operands.","inputs":{"order":8}}
+//|   - {"id":"large","label":"n = 512","description":"The built-in block regions become smaller than n², and the product increment becomes 1.62 n².","inputs":{"order":512}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"packing","path":"/rows/0/3","equals":0}
+//|       - {"artifact":"packing","path":"/rows/1/3","equals":4096}
+//|   - case: small
+//|     expect:
+//|       - {"artifact":"packing","path":"/rows/0/1","equals":64}
+//|       - {"artifact":"packing","path":"/rows/0/3","equals":128}
+//|   - case: large
+//|     expect:
+//|       - {"artifact":"packing","path":"/rows/0/2","equals":786432}
+//|       - {"artifact":"packing","path":"/rows/0/4","approx":{"value":1.62,"atol":0.005}}
+use scioxide_core::{ExecutionPolicy, SciOxideError};
+use scioxide_linalg::{CholeskyDecomposition, CholeskyWorkspaceRequest, DenseWorkspaceRequest};
+use scioxide_linalg::{
+    HouseholderDecomposition, HouseholderOrientation, HouseholderWorkspaceRequest,
+};
+use scioxide_linalg::{LinalgExecutionOptions, LinalgRequirements, LinalgWorkspace};
+use scioxide_linalg::{LuDecomposition, LuWorkspaceRequest};
+
+let n = order.round() as usize;
+// Create requests with a sequential execution policy so worker counts do not affect region sizes.
+let options = LinalgExecutionOptions::new().with_execution_policy(ExecutionPolicy::Sequential);
+let dense = |r: DenseWorkspaceRequest| LinalgWorkspace::<f64>::workspace_requirements(&r);
+type Pair = (
+    Result<LinalgRequirements, SciOxideError>,
+    Result<LinalgRequirements, SciOxideError>,
+);
+let product = DenseWorkspaceRequest::product(n, n, n, &options);
+let triangular = DenseWorkspaceRequest::triangular_product(n, n, n, &options);
+let lu = LuWorkspaceRequest::factor(n, &options);
+let cholesky = CholeskyWorkspaceRequest::factor(n, &options);
+let qr = HouseholderWorkspaceRequest::factor(n, n, HouseholderOrientation::Qr, &options);
+// Each row is (built-in-only request, request with with_provider_packing()).
+let cases: [(&str, Pair); 5] = [
+    (
+        "Matrix product C = AB",
+        (dense(product), dense(product.with_provider_packing())),
+    ),
+    (
+        "Triangular matrix product",
+        (dense(triangular), dense(triangular.with_provider_packing())),
+    ),
+    (
+        "LU factorization",
+        (
+            LuDecomposition::<f64>::workspace_requirements(&lu),
+            LuDecomposition::<f64>::workspace_requirements(&lu.with_provider_packing()),
+        ),
+    ),
+    (
+        "Cholesky factorization",
+        (
+            CholeskyDecomposition::<f64>::workspace_requirements(&cholesky),
+            CholeskyDecomposition::<f64>::workspace_requirements(
+                &cholesky.with_provider_packing(),
+            ),
+        ),
+    ),
+    (
+        "QR factorization (Householder)",
+        (
+            HouseholderDecomposition::<f64>::workspace_requirements(&qr),
+            HouseholderDecomposition::<f64>::workspace_requirements(
+                &qr.with_provider_packing(),
+            ),
+        ),
+    ),
+];
+let mut rows = Vec::new();
+for (name, (native, provider)) in cases {
+    let native = native.map_err(|e| e.to_string())?;
+    let provider = provider.map_err(|e| e.to_string())?;
+    let a = native.scalar_len().map_err(|e| e.to_string())?;
+    let b = provider.scalar_len().map_err(|e| e.to_string())?;
+    let bytes = provider
+        .required_bytes::<f64>()
+        .map_err(|e| e.to_string())?;
+    // Divide the increment by n² to count equivalent full-operand packing regions.
+    rows.push((name, a, b, b - a, (b - a) as f64 / (n * n) as f64, bytes));
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "Operation" },
+    { "key": "1", "label": "Built-in only [elements]", "type": "integer" },
+    { "key": "2", "label": "Including provider packing [elements]", "type": "integer" },
+    { "key": "3", "label": "Increment [elements]", "type": "integer" },
+    { "key": "4", "label": "Increment / n² [-]", "type": "number", "format": { "fractionDigits": 2 } },
+    { "key": "5", "label": "Provider total [B]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "packing" })
+);
+```
+
+The built-in product repacks only blocks sized for the cache.
+Small matrices are computed directly without blocking, so at $n = 8$ the built-in region contains only the output's $n^2 = 64$ elements, with an additional $2n^2 = 128$ elements for the provider's $A$ and $B$.
+At the default $n = 64$, the built-in regions for blocks of $A$ and $B$ already each contain at least $n^2$ elements, so the increment is zero for the matrix product and all three factorizations.
+At $n = 512$, both regions are smaller than $n^2$, and the matrix-product total becomes $3n^2 = 786\,432$ elements (6.3 MB) for the output and two operands, an increment of $1.62 n^2$.
+The built-in triangular matrix product does not repack the triangle, so only the triangle's $n^2$ elements are added for every $n$.
+The LU and Cholesky increments equal those for their internal products; QR gives $0.78 n^2$ at $n = 512$.
+
+## Behavior unavailable in Wasm and native checks
+
+Handbook cells do not enable the `blas` feature, so types such as `BlasProvider` and `with_blas` are unavailable inside cells.
+In a native build with the `blas` feature, a mock provider that records calls can check dispatch rules, the worker counts passed to providers, and result validation.
+Set `scioxide-linalg = { version = "…", features = ["blas"] }` in `Cargo.toml` and implement a provider that records the `BlasCall` variant, transformations, storage order, leading dimensions, and worker count received by `execute_f64`, then writes results using a simple triple loop.
+
+The following table gives results from a sequential context for the product `mul_mat_into` of $A$ ($a_{ij} = 0.1(4i + j) + 1/3$), of shape $3 \times 4$, and $B$ ($b_{ij} = 0.7 - 0.3(2i + j)$), of shape $4 \times 2$, using a mock provider advertising only `Gemm` for `f64` at 4 ULP and supporting row-major order, `None`, and `Transpose` (the same provider applies unless otherwise stated).
+
+| Condition | Provider calls | Result |
+|---|---|---|
+| `Standard`, `Error` | 1 | Success. Matches the built-in `Standard` result |
+| `Exact`, `Reference` | 0 | Success. Built-in `Exact` result |
+| `Exact`, `Error` | 0 | `CapabilityUnavailable`. Output unchanged |
+| Advertises 0 ULP, `Exact`, `Error` | 1 | Success |
+| Inner dimension 0, `Error` | 0 | Success. Output is 0 |
+| Advertises alignment 3, `Reference` | 0 | `InvalidInput` (success if the inner dimension is 0) |
+| Provider writes NaN, `Reference` | 1 | `NonFinite`. Output unchanged |
+| Provider returns `Err`, `Reference` | 1 | `CapabilityFailure`. Output unchanged |
+| Advertises column-major order, `None`, and `Transpose` | 1 | Treats row-major $A$ and $B$ as transposes in column-major order and passes both with `Transpose`. No repacking |
+| Advertises only column-major order and `None` | 1 | Repacks in column-major order and passes with `None` |
+| `mul_vec_into` using `Gemv`, `Error` and `Reference` | 0 | `CapabilityUnavailable` and success with the built-in implementation |
+| Borrowed fixed workspace containing only the built-in requirement (6 elements) | 0 | `DimensionMismatch` (26 elements required) |
+| Cholesky factorization of $80 \times 80$, `Reference` and `Error` | 2 and 0 | Success and `CapabilityUnavailable` |
+| Product of $200 \times 200$ with a 4-worker executor and a `Budgeted` provider | 1 | Worker count is 1 for `Sequential`, 2 for `Parallel(2)`, and 1 for `Auto` (restricted by the product plan) |
+
+The mock provider in the 0-ULP row actually uses ordinary summation, producing a result differing by $2.2 \times 10^{-16}$ from the built-in `Exact` implementation, but it was still copied to the output.
+This row demonstrates that SciOxide does not check the accuracy of advertised capabilities at runtime.
+
+---
+
+## Summary
+
+To use external BLAS, implement a `BlasProvider` wrapping the library and pass it through `BlasDispatch` and `LinalgExecutionContext::with_blas` to caller-provided-output and scoped API calls.
+Advertise storage order, transformations, integer width, alignment, threading, and ULP for each scalar-type/operation pair in `BlasCapabilities`; choose the ULP values, which SciOxide does not check, from error analysis and tests of your implementation.
+Choose with `BlasFallbackPolicy` whether calls that do not match the advertised capabilities and `Exact` calls with nonzero ULP continue with the built-in implementation or stop with `CapabilityUnavailable`.
+Provider failures and non-finite results return errors without changing the output; callers must implement any required retry with the built-in implementation.
+When passing fixed workspace to a provider-bearing context, obtain requirements with `with_provider_packing()` or `for_context(&cx)` (larger matrices require more space for repacking entire operands).
+Check dispatch behavior using a mock provider in a native build with the `blas` feature.
+
+## Further reading
+
+- [Memory layout, views, dense matrix kernels, and accuracy tiers](../storage-views-and-kernels/): check the error bounds and reproducibility of the built-in `Standard` and `Exact` implementations.
+- [Workspaces, execution contexts, and attempt records](../workspaces-and-execution/): check how to preallocate and reuse workspace from request types and the forms of calls that accept a context.
+- [External BLAS provider API](../../api/blas-provider/): consult the 18 types and methods.

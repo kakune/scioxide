@@ -1,0 +1,924 @@
+---
+title: "Convolution and correlation"
+description: "Linear, circular, and N-dimensional convolution and correlation lag conventions, choosing direct sums or FFTs and their errors, separable two-dimensional FIR filters, overlap-add streaming, and deconvolution by polynomial division."
+sidebar:
+  order: 305
+references:
+  signal-linear-convolution: "linear-convolution-and-output-extents"
+  signal-circular-convolution: "circular-convolution"
+  signal-correlation-lags: "correlation-lag-order"
+  signal-convolution-method: "choosing-direct-sums-or-ffts"
+  signal-convolution-nd: "n-dimensional-convolution-and-boundaries"
+  signal-separable-fir: "separable-two-dimensional-fir-filters"
+  signal-overlap-add: "overlap-add-streaming"
+  signal-deconvolution: "deconvolution-and-polynomial-division"
+---
+
+Applying an FIR filter, combining acoustic propagation, and smoothing an image all convolve a finite record with coefficients.
+Correlation is used to estimate time differences between two records or detect a known waveform.
+This page explains the definitions of convolution and correlation in `scioxide-signal`, output extents and lag order, the choice and errors of direct sums and FFTs, extensions to multidimensional arrays and streaming input, and the inverse of convolution.
+It assumes the DFT circular convolution theorem and the derivation of zero-padding lengths from [Linear and circular convolution](oxref:fft-convolution) in the `scioxide-fft` chapter, without repeating them here.
+
+## Linear convolution and output extents
+
+For a length-$N$ record $a$ and length-$M$ coefficients (kernel) $b$, define linear convolution by treating samples outside the interval as zero:
+
+$$
+y[n] = (a * b)[n] = \sum_{k=0}^{M-1} a[n-k]\, b[k], \qquad n = 0, \dots, N + M - 2
+$$
+
+
+Since $a[n-k]\,b[k]$ is nonzero only when both $0 \le k \le M-1$ and $0 \le n-k \le N-1$ hold, the output length is $N + M - 1$.
+Writing polynomials in $z^{-1}$, such as $A(z) = \sum_n a[n] z^{-n}$, gives $Y(z) = A(z)\,B(z)$, so linear convolution is the same operation as polynomial multiplication.
+Direct summation requires $NM$ multiplications.
+
+`convolve(a, b)` returns this entire result (`ConvolutionExtent::Full`).
+The `ConvolutionNdPlan` plan can extract a portion of it with `ConvolutionOptions::with_extent`.
+
+| `ConvolutionExtent` | Output length | Position within the full output | Main uses |
+|---|---|---|---|
+| `Full` | $N + M - 1$ | Starting at index $0$ | Complete system responses, polynomial products |
+| `Same` | $N$ | Starting at index $\lfloor (M-1)/2 \rfloor$ | Smoothing with the same length as the record (zero delay for odd-length symmetric kernels) |
+| `Valid` | $N - M + 1$ (requires $N \ge M$) | Starting at index $M-1$ | Only positions where the entire kernel overlaps the record |
+| `Circular` | $N$ | Circular convolution (below) | Periodic records |
+
+Selecting `Valid` with $N < M$ produces `InvalidInput` during preparation.
+`convolve`, `correlate`, and `convolve_circular` return `InvalidInput` for empty records, `NonFinite` for NaN or infinity, and `NumericalInstability` for result overflow.
+
+## Circular convolution
+
+Treating two records of the same length $N$ as one period of period-$N$ sequences gives circular convolution:
+
+$$
+y_\circ[n] = \sum_{k=0}^{N-1} a[(n-k) \bmod N]\, b[k], \qquad n = 0, \dots, N-1
+$$
+
+
+For a length-$N$ DFT, elementwise multiplication of spectra corresponds to this operation.
+`convolve_circular(a, b)` rejects records of different lengths, returning `DimensionMismatch` without zero-padding or truncation.
+Wrapping and adding the linear convolution result with period $N$ gives circular convolution.
+
+$$
+y_\circ[n] = \sum_{q \ge 0} y[n + qN]
+$$
+
+This wrapping (circular aliasing) is why computing linear convolution with FFTs requires zero-padding.
+`convolve` and `ConvolutionNdPlan` zero-pad internally even when using FFTs, so callers need not adjust lengths.
+
+## Correlation lag order
+
+Define cross-correlation as
+
+$$
+c[\ell] = \sum_{k} a[k]\, \overline{b[k-\ell]}, \qquad \ell = -(M-1), \dots, N-1
+$$
+
+
+The sum covers $0 \le k < N$ and $0 \le k-\ell < M$; conjugation has no effect for real records.
+`correlate(a, b)` returns these $N + M - 1$ values in increasing order of lag $\ell$.
+Array index $j$ and lag satisfy $\ell = j - (M-1)$, with zero lag at index $M-1$.
+
+Interpret the lag sign as follows.
+When $a$ contains the waveform $a[n] = b[n-d]$ obtained by delaying $b$ by $d$ samples, the Cauchy–Schwarz inequality makes $c[\ell] = \sum_k b[k-d]\,b[k-\ell]$ maximal at $\ell = d$.
+Thus, if the maximizing lag $\ell^\ast$ is positive, the waveform resembling $b$ in $a$ occurs $\ell^\ast$ samples later.
+Swapping arguments gives $c_{ba}[\ell] = \overline{c_{ab}[-\ell]}$, reversing the array and changing the sign of the maximizing lag.
+With sampling period $T_s = 1/f_s$, the time difference is $\tau = \ell^\ast T_s$.
+
+Correlation equals convolution $c[\ell] = (a * \tilde b)[\ell + M - 1]$ with the time-reversed conjugate $\tilde b[m] = \overline{b[M-1-m]}$ of $b$.
+`correlate` returns only the inner-product sums; it neither subtracts means nor divides by norms.
+For a correlation coefficient in $[-1, 1]$, the caller subtracts the means from both records and divides by $\lVert a \rVert_2 \lVert b \rVert_2$.
+The number of samples overlapping at lag $\ell$ varies with $\ell$, so also remember that endpoint lags sum fewer samples.
+
+The next cell delays a length-$M = 7$ template $b$ by $d$ samples, embeds it in a length-$N = 32$ record $a$, and adds a weak sine wave.
+It compares `convolve`, `convolve_circular`, and `correlate` with direct sums of the defining formulas above (an independent check).
+For circular convolution it passes $b_0$, formed by zero-extending $b$ to length $N$, and also compares with the wrapped linear convolution.
+The second table shows maximizing correlation indices and lags, checking whether `correlate(a, b)` gives $+d$ and `correlate(b, a)` gives $-d$.
+
+```rust
+//| id: signal-convolution-conventions
+//| ref: signal-convolution-conventions
+//| title: "Check convolution, circular convolution, and correlation against direct sums of their definitions"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-signal]
+//| inputs:
+//|   delay: {"type":"range","label":"Embedded delay d [samples]","description":"Position of template b in record a.","min":0,"max":25,"step":1,"value":9}
+//| cases:
+//|   - {"id":"no-delay","label":"d = 0","description":"The correlation maximum occurs at lag 0 (index M − 1 = 6).","inputs":{"delay":0}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"checks","path":"/rows/0/1","equals":38}
+//|       - {"artifact":"checks","path":"/rows/0/2","range":{"max":1e-14}}
+//|       - {"artifact":"checks","path":"/rows/1/2","range":{"max":1e-14}}
+//|       - {"artifact":"checks","path":"/rows/2/2","range":{"max":1e-14}}
+//|       - {"artifact":"checks","path":"/rows/3/2","range":{"max":1e-14}}
+//|       - {"artifact":"checks","path":"/rows/4/2","range":{"max":1e-14}}
+//|       - {"artifact":"lags","path":"/rows/0/2","equals":9}
+//|       - {"artifact":"lags","path":"/rows/1/2","equals":-9}
+//|   - case: no-delay
+//|     expect:
+//|       - {"artifact":"lags","path":"/rows/0/1","equals":6}
+//|       - {"artifact":"lags","path":"/rows/0/2","equals":0}
+use scioxide_core::RealScalar;
+use scioxide_signal::{convolve, convolve_circular, correlate};
+
+// Template b (M = 7), and record a (N = 32) formed by delaying b by d samples and adding a weak sine wave
+let template = [1.0_f64, -2.0, 3.0, 0.5, -1.0, 2.0, -0.5];
+let (n, m) = (32_usize, template.len());
+let d = delay.round() as i64;
+// Read values with out-of-range indices treated as zero
+let at = |x: &[f64], i: i64| usize::try_from(i).ok().and_then(|i| x.get(i)).copied();
+let record: Vec<f64> = (0..n as i64)
+    .map(|i| at(&template, i - d).unwrap_or(0.0) + 0.2 * RealScalar::sin(1.7 * i as f64))
+    .collect();
+let padded: Vec<f64> = (0..n as i64)
+    .map(|k| at(&template, k).unwrap_or(0.0))
+    .collect();
+
+let full = convolve(&record, &template).map_err(|e| e.to_string())?;
+let circular = convolve_circular(&record, &padded).map_err(|e| e.to_string())?;
+let forward = correlate(&record, &template).map_err(|e| e.to_string())?;
+let backward = correlate(&template, &record).map_err(|e| e.to_string())?;
+let unequal = convolve_circular(&record, &template).map_err(|e| format!("{:?}", e.kind()));
+
+// Independent check: direct sums of the defining formulas
+let linear: Vec<f64> = (0..(n + m - 1) as i64)
+    .map(|j| {
+        (0..m)
+            .map(|k| at(&record, j - k as i64).unwrap_or(0.0) * template[k])
+            .sum()
+    })
+    .collect();
+let circular_sum: Vec<f64> = (0..n)
+    .map(|j| (0..n).map(|k| record[(j + n - k) % n] * padded[k]).sum())
+    .collect();
+let lagged: Vec<f64> = (-(m as i64 - 1)..n as i64)
+    .map(|l| {
+        (0..n)
+            .map(|k| record[k] * at(&template, k as i64 - l).unwrap_or(0.0))
+            .sum()
+    })
+    .collect();
+// Linear convolution wrapped and summed with period N
+let mut wrapped = vec![0.0_f64; n];
+linear
+    .iter()
+    .enumerate()
+    .for_each(|(j, v)| wrapped[j % n] += v);
+let reversed: Vec<f64> = backward.iter().rev().copied().collect();
+
+let largest = |x: &[f64], y: &[f64]| {
+    x.iter()
+        .zip(y)
+        .map(|(p, q)| (p - q).abs())
+        .fold(0.0_f64, f64::max)
+};
+let checks = vec![
+    ("convolve(a, b)", full.len(), largest(&full, &linear)),
+    (
+        "convolve_circular(a, b₀)",
+        circular.len(),
+        largest(&circular, &circular_sum),
+    ),
+    (
+        "Wrapping with period N",
+        wrapped.len(),
+        largest(&circular, &wrapped),
+    ),
+    ("correlate(a, b)", forward.len(), largest(&forward, &lagged)),
+    (
+        "Reversed correlate(b, a)",
+        backward.len(),
+        largest(&reversed, &forward),
+    ),
+];
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Quantity compared" },
+    { "key": "1", "label": "Output length [samples]", "type": "integer" },
+    { "key": "2", "label": "Maximum difference from direct sum [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    columns,
+    checks,
+    metadata = serde_json::json!({ "id": "checks" })
+);
+
+// Maximizing index j and lag ℓ = j − (length of second argument − 1)
+let peak = |c: &[f64]| (0..c.len()).fold(0, |best, j| if c[j] > c[best] { j } else { best });
+let lags = vec![
+    (
+        "correlate(a, b)",
+        peak(&forward),
+        peak(&forward) as i64 - (m as i64 - 1),
+    ),
+    (
+        "correlate(b, a)",
+        peak(&backward),
+        peak(&backward) as i64 - (n as i64 - 1),
+    ),
+];
+let columns = serde_json::json!([
+    { "key": "0", "label": "Call" },
+    { "key": "1", "label": "Maximizing index j [-]", "type": "integer" },
+    { "key": "2", "label": "Lag ℓ [samples]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    lags,
+    metadata = serde_json::json!({ "id": "lags" })
+);
+emit_text!(format!(
+    "convolve_circular with lengths 32 and 7: {}",
+    unequal.err().unwrap_or_default()
+));
+
+let curve: Vec<[f64; 2]> = forward
+    .iter()
+    .enumerate()
+    .map(|(j, &c)| [j as f64 - (m as f64 - 1.0), c])
+    .collect();
+emit_line_chart!(
+    &vec![serde_json::json!({ "name": "c[ℓ] = correlate(a, b)", "points": curve })],
+    options = &serde_json::json!({
+        "xLabel": "Lag ℓ [samples]",
+        "yLabel": "Correlation c[ℓ] [-]",
+        "annotations": [{ "kind": "line", "axis": "x", "value": d as f64, "label": "Embedded d" }]
+    })
+);
+```
+
+With the default $d = 9$, the four operations differ from the direct sums of their definitions by at most $4.4 \times 10^{-15}$, agreeing within roundoff.
+Circular convolution also agrees with the linear convolution wrapped with period 32 to within the same difference.
+Reversing `correlate(b, a)` agrees with `correlate(a, b)` with zero difference, confirming $c_{ba}[\ell] = c_{ab}[-\ell]$ for real records.
+In the second table, `correlate(a, b)` is maximal at index 15, and $15 - (7 - 1) = 9$ matches the embedded $d$.
+`correlate(b, a)` is maximal at index 22; since the second argument has length 32, the lag is $22 - 31 = -9$, reversing the sign.
+With $d = 0$ the maximum moves to index 6 (lag 0); lag 25 is also recovered for $d = 25$, where the template's final sample overlaps the end of the record.
+`convolve_circular` with different-length records returns `DimensionMismatch`.
+
+## Choosing direct sums or FFTs
+
+Direct summation computes each output in working precision as a sum of $m$ products.
+With unit roundoff $u = \varepsilon/2$, $\gamma_k = ku/(1-ku)$, and smallest positive subnormal number $\eta$, each component's absolute error is bounded by
+
+$$
+\lvert \hat y[n] - y[n] \rvert \le \gamma_{2m+8}\, \sum_k \lvert a[n-k]\, b[k] \rvert + (2m+8)\,\eta
+$$
+
+
+Since the bound is proportional to the sum of absolute products in each component, even small outputs are relatively accurate when all products have the same sign.
+
+The FFT method zero-pads and transforms both inputs, then inverse-transforms their spectral product.
+`ConvolutionNdPlan` rounds each selected axis length up to a power of two at least $N + M - 1$ (plus $2(M-1)$ when extension outside the interval is nonzero).
+The cost is $O(P \log P)$ for $P$ zero-padded elements.
+Errors are proportional to norms and are of order $\varepsilon \log_2 P\, \lVert a \rVert_2 \lVert b \rVert_2$ up to a constant factor in every component.
+Output components many orders of magnitude below the maximum can be buried in this error, losing relative accuracy and even changing sign.
+If the largest input values approach the ends of the exponent range, inputs are scaled by powers of two before transformation, so finite results do not overflow or underflow at intermediate steps.
+Overflow of the result itself produces `NumericalInstability`.
+
+`ConvolutionMethod` has three choices: `Direct`, `Fft`, and `Automatic` (the default).
+`Automatic` estimates both operation counts during preparation, choosing `Direct` if the direct product count does not exceed the FFT cost and `Fft` otherwise.
+
+$$
+\text{direct product count} = \prod_{\text{selected axes}} N_i M_i \times (\text{batch count}), \qquad
+\text{FFT cost} = P \sum_{\text{selected axes}} \log_2 p_i
+$$
+
+$p_i$ is the zero-padded length of axis $i$.
+The direct product count is exact for `Full` with zero extension; for other extents it is an upper bound counting $\min(N_i, M_i)$ products per output.
+The `ConvolutionSelection` returned by `selection()` holds the selected method (`method()`) and both estimates (`direct_products()`, `fft_work()`).
+Estimates are operation counts, not measured execution times.
+Both methods satisfy the same error bound, but different rounding orders can change the final few bits.
+
+The next cell convolves a Gaussian pulse $a$ ($N = 256$), centered at 128 with standard deviation 16 samples, with a decaying exponential $b[k] = e^{-k/4}$ of length $M$.
+It creates three plans with the same kernel, using `Direct`, `Fft`, and `Automatic`, and tabulates the estimates from `selection()` and differences from the direct method.
+The endpoint values of $a$ are $e^{-32} \approx 1.3 \times 10^{-14}$, so the output spans about 14 orders of magnitude.
+The plot shows direct output $\lvert y[n] \rvert$ and its difference from the FFT on logarithmic axes, with the norm-based error scale $\varepsilon \log_2 P\, \lVert a \rVert_2 \lVert b \rVert_2$ dashed.
+Zero differences cannot appear on a logarithmic axis, so these points are omitted and their count is shown below the table.
+
+```rust
+//| id: signal-convolution-method-selection
+//| ref: signal-convolution-method-selection
+//| title: "Compare direct-sum and FFT estimates and errors"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-signal]
+//| inputs:
+//|   kernel_length: {"type":"range","label":"Kernel length M [samples]","description":"Change the relative sizes of the direct product count 256 M and FFT cost.","min":4,"max":64,"step":2,"value":24}
+//| cases:
+//|   - {"id":"short-kernel","label":"M = 16","description":"The product count 4096 is at most the FFT cost 4608, so Automatic selects Direct.","inputs":{"kernel_length":16}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/2/1","equals":"Fft"}
+//|       - {"artifact":"methods","path":"/rows/2/2","equals":6144}
+//|       - {"artifact":"methods","path":"/rows/2/3","equals":4608}
+//|       - {"artifact":"methods","path":"/rows/0/4","equals":0}
+//|       - {"artifact":"methods","path":"/rows/1/4","range":{"max":1e-14}}
+//|       - {"artifact":"methods","path":"/rows/1/5","range":{"max":1e-12}}
+//|       - {"artifact":"methods","path":"/rows/1/6","range":{"min":0.1}}
+//|   - case: short-kernel
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/2/1","equals":"Direct"}
+//|       - {"artifact":"methods","path":"/rows/2/5","equals":0}
+use scioxide_core::{NdView, RealScalar, StridedLayout};
+use scioxide_signal::{ConvolutionMethod, ConvolutionNdPlan, ConvolutionOptions};
+
+let (n, m) = (256_usize, kernel_length.round() as usize);
+let signal: Vec<f64> = (0..n)
+    .map(|i| RealScalar::exp(-0.5 * ((i as f64 - 128.0) / 16.0).powi(2)))
+    .collect();
+let kernel: Vec<f64> = (0..m).map(|k| RealScalar::exp(-(k as f64) / 4.0)).collect();
+// Shapes and strides of one-dimensional records (borrowed by the views)
+let (signal_shape, kernel_shape, unit) = ([n], [m], [1_usize]);
+let kernel_layout = StridedLayout::new(&kernel_shape, &unit).map_err(|e| e.to_string())?;
+let signal_layout = StridedLayout::new(&signal_shape, &unit).map_err(|e| e.to_string())?;
+let kernel_view = NdView::new(&kernel, kernel_layout).map_err(|e| e.to_string())?;
+let signal_view = NdView::new(&signal, signal_layout).map_err(|e| e.to_string())?;
+
+// Prepare three plans with the same kernel and obtain their selections and outputs
+let mut runs = Vec::new();
+for method in [
+    ConvolutionMethod::Direct,
+    ConvolutionMethod::Fft,
+    ConvolutionMethod::Automatic,
+] {
+    let options = ConvolutionOptions::new().with_method(method);
+    let plan =
+        ConvolutionNdPlan::new(&[n], kernel_view, &[0], options).map_err(|e| e.to_string())?;
+    let output = plan.convolve(signal_view).map_err(|e| e.to_string())?;
+    runs.push((method, plan.selection(), output));
+}
+let direct = runs[0].2.clone();
+let peak = direct.iter().fold(0.0_f64, |acc, y| acc.max(y.abs()));
+
+let mut rows = Vec::new();
+for (method, selection, output) in &runs {
+    let differences: Vec<f64> = output
+        .iter()
+        .zip(&direct)
+        .map(|(y, r)| (y - r).abs())
+        .collect();
+    // Measure relative differences both for components at least 10⁻³ of the maximum and for all components
+    let relative = |floor: f64| {
+        differences
+            .iter()
+            .zip(&direct)
+            .filter(|(_, r)| r.abs() >= floor * peak)
+            .fold(0.0_f64, |acc, (e, r)| acc.max(e / r.abs()))
+    };
+    rows.push((
+        format!("{method:?}"),
+        format!("{:?}", selection.method()),
+        selection.direct_products(),
+        selection.fft_work(),
+        differences.iter().fold(0.0_f64, |acc, &e| acc.max(e)),
+        relative(1e-3),
+        relative(0.0),
+    ));
+}
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Requested method" },
+    { "key": "1", "label": "Selected method" },
+    { "key": "2", "label": "Direct product count [operations]", "type": "integer" },
+    { "key": "3", "label": "FFT cost [-]", "type": "integer" },
+    { "key": "4", "label": "Maximum difference from direct method [-]", "type": "number", "format": sci2 },
+    { "key": "5", "label": "Maximum relative difference (|y| ≥ 10⁻³ max) [-]", "type": "number", "format": sci2 },
+    { "key": "6", "label": "Maximum relative difference (all components) [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "methods" })
+);
+
+// Norm-based error scale ε log₂P ‖a‖₂ ‖b‖₂ (P is the zero-padded length)
+let norm = |x: &[f64]| RealScalar::sqrt(x.iter().map(|v| v * v).sum::<f64>());
+let padded = (n + m - 1).next_power_of_two() as f64;
+let scale = f64::EPSILON * RealScalar::log2(padded) * norm(&signal) * norm(&kernel);
+let magnitude: Vec<[f64; 2]> = direct
+    .iter()
+    .enumerate()
+    .map(|(i, y)| [i as f64, y.abs()])
+    .collect();
+let error: Vec<[f64; 2]> = runs[1]
+    .2
+    .iter()
+    .zip(&direct)
+    .enumerate()
+    .filter(|(_, (y, r))| y != r)
+    .map(|(i, (y, r))| [i as f64, (y - r).abs()])
+    .collect();
+emit_text!(format!(
+    "Error scale ε log₂P ‖a‖₂‖b‖₂ = {scale:.1e}; zero FFT differences omitted from the plot: {} / {}",
+    direct.len() - error.len(),
+    direct.len()
+));
+emit_line_chart!(
+    &vec![
+        serde_json::json!({ "name": "|y[n]| (direct method)", "points": magnitude }),
+        serde_json::json!({
+            "name": "|FFT − direct method|",
+            "points": error,
+            "style": { "symbol": "circle" }
+        }),
+    ],
+    options = &serde_json::json!({
+        "xLabel": "Output index n [-]",
+        "yLabel": "Magnitude [-]",
+        "yType": "log",
+        "annotations": [{
+            "kind": "line",
+            "axis": "y",
+            "value": scale,
+            "label": "ε log₂P ‖a‖₂‖b‖₂",
+            "style": { "lineType": "dashed" }
+        }]
+    })
+);
+```
+
+With the default $M = 24$, the direct product count $256 \times 24 = 6144$ exceeds the FFT cost $512 \times 9 = 4608$, so `Automatic` selects `Fft`.
+The FFT differs from the direct method by at most $1.8 \times 10^{-15}$, below the error scale $1.7 \times 10^{-14}$.
+For components at least $10^{-3}$ of the maximum, relative differences remain within $3.3 \times 10^{-14}$, but across all components they reach 4.3.
+In the plot, $\lvert y[n] \rvert$ drops below the error-scale line at both output endpoints, where the FFT difference becomes comparable to $\lvert y[n] \rvert$.
+With $M = 16$ the product count 4096 is at most 4608, so `Automatic` selects `Direct` and agrees with `Direct` with zero difference.
+With $M = 64$ the endpoint values decrease further, and the relative difference over all components rises to $8.4 \times 10^4$.
+Specify `ConvolutionMethod::Direct` when tail output values matter (such as probability-distribution convolutions or quantities whose logarithms are taken).
+
+## N-dimensional convolution and boundaries
+
+`ConvolutionNdPlan::new(shape, kernel, axes, options)` creates a plan to convolve an array of shape `shape` with a kernel `kernel` (`NdView`, of the same rank) along axes selected by `axes`.
+Unselected axes are batch axes; the kernel length on each must be 1 (the same kernel for every batch) or equal the array length (a kernel per batch), otherwise `DimensionMismatch` results.
+Input and output are row-major arrays, and `output_shape()` returns the output shape.
+`convolve2d(a, b)` is a one-shot function that accepts `MatrixView` and returns a `Matrix` computing `Full` along both axes.
+
+Select extension outside the interval with `SignalBoundary`.
+
+| `SignalBoundary` | Values outside the interval (length-$n$ record) | Main uses |
+|---|---|---|
+| `Zero` (default) | $x[-1] = x[n] = 0$ | Linear convolution, system responses |
+| `Periodic` | $x[-1] = x[n-1]$ | Periodic records. Required for `Circular` |
+| `Reflect` | $x[-1] = x[1]$, $x[n] = x[n-2]$ (reflection without repeating endpoints) | Avoiding darkened edges in image smoothing |
+
+For boundaries other than `Zero`, the plan extends the record by $M-1$ samples on each side before convolution.
+The direct product count uses $M$ products per output, and the zero-padded FFT length also increases by the extension length.
+Selecting `SignalProduct::Correlation` makes the same plan compute convolution with the kernel's time-reversed conjugate, namely correlation.
+`correlate` executes a one-dimensional plan once with this setting and the default extent.
+
+The plan owns the kernel and, if FFT is selected, computes its spectrum once during preparation.
+The owned-result API `convolve(input)` allocates output and workspace on every call, while the output-destination API `convolve_into(input, output, workspace, cx)` writes into caller-owned output and workspace.
+Query workspace requirements with `workspace_requirements(kernel)`, specifying the kernel used through `ConvolutionKernel`.
+`ConvolutionKernel::Prepared` uses the plan's kernel; `ConvolutionKernel::Supplied` uses a same-shaped kernel passed to `convolve_pair_into(input, kernel, output, workspace, cx)` on every call, transforming it each time for FFT, so its requirements are at least those of `Prepared`.
+A `SignalWorkspace` allocated with `workspace(kernel)` can serve any subsequent call to the same plan without growing during execution.
+Mismatched input, output, or workspace shapes produce `DimensionMismatch`, and nonfinite inputs produce `NonFinite`; failed calls leave output unchanged.
+
+## Separable two-dimensional FIR filters
+
+A two-dimensional kernel is separable (rank 1) if it is the outer product $h[p, q] = r[p]\, c[q]$ of two one-dimensional sequences.
+Gaussian kernels $e^{-(p^2 + q^2)/(2\sigma^2)} = e^{-p^2/(2\sigma^2)}\, e^{-q^2/(2\sigma^2)}$ and box averages are separable; circular averages are not.
+Convolution with a separable kernel equals two one-dimensional convolutions: convolve with $r$ along axis 0, then convolve the result with $c$ along axis 1.
+
+$$
+\sum_{p,q} x[i-p,\, j-q]\, r[p]\, c[q] = \sum_q c[q] \Big( \sum_p x[i-p,\, j-q]\, r[p] \Big)
+$$
+
+`SeparableFir2dPlan::new(shape, row_taps, column_taps, options)` retains the plans for these two passes.
+`row_taps` acts along axis 0 (the row-index direction), and `column_taps` along axis 1.
+Both passes use the same `ConvolutionOptions`, so the result agrees with `ConvolutionNdPlan` using the outer-product kernel, apart from rounding differences.
+For an $R \times C$ array and sequences of lengths $k_r$ and $k_c$, the direct product count decreases from $RC\,k_r k_c$ for the outer-product kernel to about $RC\,(k_r + k_c)$.
+Intermediate results reside in caller-owned workspace (`workspace(())`), and output is written only after both passes succeed.
+
+The next cell smooths a 48 × 64 test image (two circles and diagonal stripes) with a Gaussian kernel of standard deviation $\sigma$ ($k = 2\lceil 3\sigma \rceil + 1$ coefficients with radius rounded up from $3\sigma$, normalized to sum to 1).
+It uses extent `Same` and boundary `Reflect` and compares `SeparableFir2dPlan` with `ConvolutionNdPlan` using the outer-product kernel.
+The table shows each plan's selected method, estimated direct product count, and maximum result difference.
+
+```rust
+//| id: signal-separable-gaussian-blur
+//| ref: signal-separable-gaussian-blur
+//| title: "Compare separable Gaussian smoothing with an outer-product kernel"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-signal]
+//| inputs:
+//|   sigma: {"type":"range","label":"Gaussian kernel standard deviation σ [pixels]","description":"Change the coefficient count k = 2⌈3σ⌉ + 1 and smoothing strength.","min":0.5,"max":4,"step":0.5,"value":1.5}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"plans","path":"/rows/0/2","equals":67584}
+//|       - {"artifact":"plans","path":"/rows/1/1","equals":"Fft"}
+//|       - {"artifact":"plans","path":"/rows/1/2","equals":371712}
+//|       - {"artifact":"plans","path":"/rows/1/3","range":{"max":1e-15}}
+use scioxide_core::{ExecutionContext, NdView, NdViewMut, RealScalar, StridedLayout};
+use scioxide_signal::{
+    ConvolutionExtent, ConvolutionKernel, ConvolutionNdPlan, ConvolutionOptions,
+    SeparableFir2dPlan, SignalBoundary,
+};
+
+let (rows, cols) = (48_usize, 64_usize);
+// Test image: two disks and diagonal stripes (values from 0 to 1)
+let image: Vec<f64> = (0..rows * cols)
+    .map(|i| {
+        let (y, x) = ((i / cols) as f64, (i % cols) as f64);
+        let disc =
+            |cy: f64, cx: f64, r: f64| f64::from((y - cy).powi(2) + (x - cx).powi(2) < r * r);
+        let stripes = f64::from(((x + y) / 4.0).floor() as i64 % 2 == 0);
+        (disc(16.0, 18.0, 10.0) + 0.5 * disc(30.0, 44.0, 12.0) + 0.25 * stripes).min(1.0)
+    })
+    .collect();
+let radius = (3.0 * sigma).ceil() as i64;
+let raw: Vec<f64> = (-radius..=radius)
+    .map(|p| RealScalar::exp(-0.5 * (p as f64 / sigma).powi(2)))
+    .collect();
+let total: f64 = raw.iter().sum();
+let taps: Vec<f64> = raw.iter().map(|v| v / total).collect();
+let k = taps.len();
+let options = ConvolutionOptions::new()
+    .with_extent(ConvolutionExtent::Same)
+    .with_boundary(SignalBoundary::Reflect);
+// Shapes and strides of the row-major image and kernel (borrowed by views)
+let (image_shape, image_strides) = ([rows, cols], [cols, 1]);
+let (kernel_shape, kernel_strides) = ([k, k], [k, 1]);
+let layout = || StridedLayout::new(&image_shape, &image_strides).map_err(|e| e.to_string());
+
+// Separable plan: two one-dimensional convolutions along axes 0 and 1
+let separable =
+    SeparableFir2dPlan::new([rows, cols], &taps, &taps, options).map_err(|e| e.to_string())?;
+let mut workspace = separable.workspace(()).map_err(|e| e.to_string())?;
+let mut smoothed = vec![0.0_f64; rows * cols];
+let input = NdView::new(&image, layout()?).map_err(|e| e.to_string())?;
+separable
+    .filter_into(
+        input,
+        NdViewMut::new(&mut smoothed, layout()?).map_err(|e| e.to_string())?,
+        &mut workspace,
+        ExecutionContext::sequential(),
+    )
+    .map_err(|e| e.to_string())?;
+
+// Comparison: two-dimensional plan with outer-product kernel h[p, q] = r[p] c[q]
+let outer: Vec<f64> = (0..k * k).map(|i| taps[i / k] * taps[i % k]).collect();
+let kernel_layout =
+    StridedLayout::new(&kernel_shape, &kernel_strides).map_err(|e| e.to_string())?;
+let kernel = NdView::new(&outer, kernel_layout).map_err(|e| e.to_string())?;
+let full = ConvolutionNdPlan::new(&[rows, cols], kernel, &[0, 1], options)
+    .map_err(|e| e.to_string())?;
+let mut workspace = full
+    .workspace(ConvolutionKernel::Prepared)
+    .map_err(|e| e.to_string())?;
+let mut reference = vec![0.0_f64; rows * cols];
+full.convolve_into(
+    input,
+    NdViewMut::new(&mut reference, layout()?).map_err(|e| e.to_string())?,
+    &mut workspace,
+    ExecutionContext::sequential(),
+)
+.map_err(|e| e.to_string())?;
+
+let difference = smoothed
+    .iter()
+    .zip(&reference)
+    .fold(0.0_f64, |acc, (a, b)| acc.max((a - b).abs()));
+let plans = vec![
+    (
+        "SeparableFir2dPlan",
+        None,
+        // Each of two one-dimensional passes uses k products per output pixel
+        2 * rows * cols * k,
+        None,
+    ),
+    (
+        "ConvolutionNdPlan (outer-product kernel)",
+        Some(format!("{:?}", full.selection().method())),
+        full.selection().direct_products(),
+        Some(difference),
+    ),
+];
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Plan" },
+    { "key": "1", "label": "Selected method", "nullText": "Selected by each axis plan" },
+    { "key": "2", "label": "Direct product count [operations]", "type": "integer" },
+    { "key": "3", "label": "Maximum difference from separable form [-]", "type": "number", "format": sci2, "nullText": "Reference" }
+]);
+emit_table_with_columns!(
+    columns,
+    plans,
+    metadata = serde_json::json!({ "id": "plans" })
+);
+
+let heat: Vec<[f64; 3]> = (0..rows * cols)
+    .map(|i| [(i % cols) as f64, (i / cols) as f64, smoothed[i]])
+    .collect();
+emit_chart!(serde_json::json!({
+    "kind": "heatmap",
+    "data": heat,
+    "title": "Smoothed image (Same, Reflect)",
+    "xLabel": "Column x [pixels]",
+    "yLabel": "Row y [pixels]",
+    "colorMin": 0.0,
+    "colorMax": 1.0,
+    "tooltip": true
+}));
+```
+
+With the default $\sigma = 1.5$, there are $k = 11$ coefficients; the direct product count is $2 \times 48 \times 64 \times 11 = 67584$ in separable form and $48 \times 64 \times 121 = 371712$ for the outer-product kernel.
+The outer-product kernel plan estimates a lower FFT cost and selects `Fft`; the two results differ by at most $4.4 \times 10^{-16}$.
+With $\sigma = 0.5$ ($k = 5$), the outer-product kernel plan also selects `Direct`, and the difference is $3.3 \times 10^{-16}$.
+With $\sigma = 4$ ($k = 25$), the product-count ratio widens to $1920000 / 153600 = 12.5 = k/2$.
+The separable product count assumes both passes use the direct method; each pass's plan can also select FFT with the same rule.
+With the `Reflect` boundary, smoothed image edges do not darken as they would under zero extension.
+
+## Overlap-add streaming
+
+To process endless input or a long record with an FIR filter, convolve length-$B$ blocks instead of transforming the entire record at once.
+The linear convolution of block $x_r[n] = x[n + rB]$ ($0 \le n < B$) with kernel $h$ (length $K$) has length $B + K - 1$; by linearity, the full convolution is
+
+$$
+y[n] = \sum_r (x_r * h)[n - rB]
+$$
+
+
+Results from neighboring blocks overlap by $K - 1$ samples, so adding the overlaps yields the full linear convolution.
+This is overlap-add.
+The method that extracts input blocks overlapping by $K-1$ samples and keeps only the portion of circular convolution unaffected by wrapping is called overlap-save.
+`scioxide-signal` provides only overlap-add plans, with no overlap-save plan.
+
+`OverlapPlan::new(taps, block_size, SignalExecutionOptions::new())` prepares FFTs for block length $B$ and the kernel spectrum.
+The FFT length is a power of two $L$ at least $B + K - 1$; the cost is $O(L \log L)$ per block and $O((L/B) \log L)$ per output sample.
+Increasing $B$ reduces computational cost per sample, while decreasing it reduces delay and workspace.
+
+The `OverlapStream` returned by `plan.stream()` owns the current block's input and the previous block's overlap as state and borrows the plan.
+`process_into(input, chunk, output, workspace, cx)` accepts chunks of arbitrary length.
+A `StreamChunk::Partial` call writes only complete blocks of output, leaving up to $B - 1$ input samples to await the next call.
+A `StreamChunk::Final` call zero-fills and processes the last block, writes the kernel's trailing $K - 1$ samples, and closes the stream until `reset`.
+Calling a closed stream produces `InvalidInput`.
+Concatenating every call's output agrees with `convolve` for the whole record.
+
+`output_len(input_len, chunk)` gives the number of samples to be written in advance; the returned `StreamProgress` reports input samples consumed (`consumed()`), output samples written (`produced()`), and the first output's absolute index (`first_output_index()`).
+Workspace allocated once with `stream.workspace(max_input_len)` serves every call with at most `max_input_len` input samples.
+Calls process chunks atomically; a failed call changes neither state nor output.
+Copy state with `clone` and restore it without allocation with `clone_from`.
+
+The next cell splits a 200-sample record into seeded chunks of lengths 1–23 and feeds them into `OverlapStream`.
+The kernel is the length-21 exponential decay $h[k] = 0.85^k$.
+Only the final chunk uses `Final`; the cell tabulates consumption, production, and absolute indices for each call and compares the concatenated output with the one-shot `convolve`.
+
+```rust
+//| id: signal-overlap-stream
+//| ref: signal-overlap-stream
+//| title: "Compare an overlap-add stream with one-shot convolution"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-signal]
+//| inputs:
+//|   block_size: {"type":"range","label":"Block length B [samples]","description":"Change the output unit of Partial calls and the FFT length.","min":4,"max":64,"step":4,"value":16}
+//|   seed: {"type":"range","label":"Chunk-length seed [-]","description":"Determines the sequence of chunk lengths.","min":1,"max":50,"step":1,"value":7}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":220}
+//|       - {"artifact":"summary","path":"/rows/0/1","equals":220}
+//|       - {"artifact":"summary","path":"/rows/0/2","range":{"max":1e-13}}
+use scioxide_core::{ExecutionContext, RealScalar};
+use scioxide_signal::{OverlapPlan, SignalExecutionOptions, StreamChunk, convolve};
+
+let record: Vec<f64> = (0..200)
+    .map(|i| RealScalar::sin(0.07 * i as f64) + 0.5 * RealScalar::sin(0.31 * i as f64))
+    .collect();
+let taps: Vec<f64> = (0..21).map(|k| 0.85_f64.powi(k)).collect();
+let plan = OverlapPlan::new(
+    &taps,
+    block_size.round() as usize,
+    SignalExecutionOptions::new(),
+)
+.map_err(|e| e.to_string())?;
+let mut stream = plan.stream().map_err(|e| e.to_string())?;
+// Chunks have at most 23 samples, so allocate workspace sufficient for calls with up to 23 samples just once
+let mut workspace = stream.workspace(23).map_err(|e| e.to_string())?;
+
+// Use a seeded linear congruential generator to produce chunk lengths 1–23
+let mut state = seed.round() as u64;
+let mut start = 0;
+let mut streamed = Vec::new();
+let mut calls = Vec::new();
+while start < record.len() {
+    state = state
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    let end = (start + 1 + (state >> 33) as usize % 23).min(record.len());
+    let chunk = if end == record.len() {
+        StreamChunk::Final
+    } else {
+        StreamChunk::Partial
+    };
+    let mut output = vec![
+        0.0_f64;
+        stream
+            .output_len(end - start, chunk)
+            .map_err(|e| e.to_string())?
+    ];
+    let progress = stream
+        .process_into(
+            &record[start..end],
+            chunk,
+            &mut output,
+            &mut workspace,
+            ExecutionContext::sequential(),
+        )
+        .map_err(|e| e.to_string())?;
+    calls.push((
+        format!("{chunk:?}"),
+        progress.consumed(),
+        progress.produced(),
+        progress.first_output_index(),
+    ));
+    streamed.extend_from_slice(&output[..progress.produced()]);
+    start = end;
+}
+let closed = stream
+    .output_len(1, StreamChunk::Partial)
+    .map_err(|e| format!("{:?}", e.kind()))
+    .err()
+    .unwrap_or_default();
+
+// Independent check: one-shot linear convolution
+let whole = convolve(&record, &taps).map_err(|e| e.to_string())?;
+let difference = streamed
+    .iter()
+    .zip(&whole)
+    .fold(0.0_f64, |acc, (a, b)| acc.max((a - b).abs()));
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Concatenated output [samples]", "type": "integer" },
+    { "key": "1", "label": "N + K − 1 [samples]", "type": "integer" },
+    { "key": "2", "label": "Maximum difference from convolve [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    columns,
+    vec![(streamed.len(), whole.len(), difference)],
+    metadata = serde_json::json!({ "id": "summary" })
+);
+let columns = serde_json::json!([
+    { "key": "0", "label": "Chunk kind" },
+    { "key": "1", "label": "Consumed [samples]", "type": "integer" },
+    { "key": "2", "label": "Produced [samples]", "type": "integer" },
+    { "key": "3", "label": "First output absolute index [-]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    calls,
+    metadata = serde_json::json!({ "id": "calls" })
+);
+emit_text!(format!("output_len after Final: {closed}"));
+```
+
+With the default $B = 16$, the first two calls (7 and 4 samples) write nothing because a complete block is not yet available.
+On receiving 19 samples in the third call, the stream writes one block of 16 output samples from the accumulated 30 samples and carries the remaining 14 forward.
+`Partial` output is always a multiple of 16; `Final` writes the remaining 44 samples (the last block and the kernel's 20-sample tail) together.
+The concatenated output contains $200 + 21 - 1 = 220$ samples and differs from `convolve` by at most $3.6 \times 10^{-15}$.
+With $B = 64$, output comes in groups of 64 samples, and the amount written by `Final` increases to 92 samples.
+After `Final`, `output_len` returns `InvalidInput`, indicating that the stream is closed.
+
+## Deconvolution and polynomial division
+
+Since linear convolution is polynomial multiplication, its inverse is polynomial division.
+`deconvolve(signal, divisor)` treats the two coefficient sequences in sample order as polynomials in descending powers (the leading coefficient has the highest degree), performs long division, and returns a quotient and remainder satisfying
+
+$$
+\text{signal} = \text{convolve}(\text{quotient}, \text{divisor}) + \text{remainder}
+$$
+
+
+For a length-$L_s$ signal and length-$L_d$ divisor, the quotient length is $L_s - L_d + 1$ and the remainder length is $L_s$.
+The first $L_s - L_d + 1$ remainder elements are zero; nonzero values occupy the last $L_d - 1$ elements.
+If signal is shorter than divisor, the quotient is empty and the remainder equals signal.
+An empty divisor or zero `divisor[0]` produces `InvalidInput`, nonfinite coefficients produce `NonFinite`, and overflow in the quotient or remainder produces `NumericalInstability`.
+
+Long division in sample order determines the quotient recursively from the beginning:
+
+$$
+q[n] = \frac{1}{d[0]} \Big( s[n] - \sum_{k=1}^{L_d - 1} d[k]\, q[n-k] \Big)
+$$
+
+This is equivalent to applying an IIR filter with transfer function $1/D(z)$ ($D(z) = \sum_k d[k] z^{-k}$) to signal.
+Roundoff at each step propagates to later quotient entries through this filter's impulse response.
+When all zeros of $D(z)$ lie inside the unit circle (the divisor is minimum phase), the impulse response decays and the error remains bounded.
+A zero outside the unit circle at radius $\rho > 1$ makes errors grow approximately as $\rho^n$.
+A `divisor[0]` small relative to the other coefficients is a typical case of this amplification.
+In deconvolving records with observation noise, the noise is amplified at the same rate, so the long-division result cannot be used directly as a signal estimate.
+
+The next cell constructs signal $s = q * d$ with `convolve` from a quadratic divisor $d = [1, -2\rho\cos\theta, \rho^2]$ with zeros $\rho e^{\pm i\theta}$ ($\theta = 1$ rad) and a known length-60 quotient $q$, then recovers $q$ with `deconvolve`.
+The plot shows quotient error $\lvert \hat q[n] - q[n] \rvert$ at each index on a logarithmic axis, with the amplification scale $\varepsilon \rho^n$ overlaid as a dashed line.
+The table shows maximum quotient error, maximum remainder magnitude, and the residual of the identity $s = \hat q * d + r$ (independently checked with `convolve`).
+
+```rust
+//| id: signal-deconvolution-stability
+//| ref: signal-deconvolution-stability
+//| title: "Compare error amplification in long-division deconvolution by zero radius"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-signal]
+//| inputs:
+//|   radius: {"type":"range","label":"Divisor zero radius ρ [-]","description":"Above 1, the long-division recurrence becomes unstable.","min":0.5,"max":1.6,"step":0.05,"value":0.8}
+//| cases:
+//|   - {"id":"outside","label":"ρ = 1.5","description":"Zeros lie outside the unit circle, and quotient errors grow as ρⁿ.","inputs":{"radius":1.5}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"division","path":"/rows/0/0","range":{"max":1e-14}}
+//|       - {"artifact":"division","path":"/rows/0/2","range":{"max":1e-14}}
+//|   - case: outside
+//|     expect:
+//|       - {"artifact":"division","path":"/rows/0/0","range":{"min":1e-9}}
+use scioxide_core::RealScalar;
+use scioxide_signal::{convolve, deconvolve};
+
+let theta = 1.0_f64;
+let divisor = [1.0, -2.0 * radius * RealScalar::cos(theta), radius * radius];
+let quotient: Vec<f64> = (0..60)
+    .map(|n| 0.5 + RealScalar::cos(0.3 * n as f64))
+    .collect();
+let signal = convolve(&quotient, &divisor).map_err(|e| e.to_string())?;
+let (estimate, remainder) = deconvolve(&signal, &divisor).map_err(|e| e.to_string())?;
+
+// Independent check: reconstruct signal from quotient and remainder
+let rebuilt = convolve(&estimate, &divisor).map_err(|e| e.to_string())?;
+let identity = signal
+    .iter()
+    .zip(&rebuilt)
+    .zip(&remainder)
+    .fold(0.0_f64, |acc, ((s, q), r)| acc.max((s - q - r).abs()));
+let errors: Vec<f64> = estimate
+    .iter()
+    .zip(&quotient)
+    .map(|(a, b)| (a - b).abs())
+    .collect();
+let rows = vec![(
+    errors.iter().fold(0.0_f64, |acc, &e| acc.max(e)),
+    remainder.iter().fold(0.0_f64, |acc, r| acc.max(r.abs())),
+    identity,
+    estimate.len(),
+    remainder.len(),
+)];
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Maximum quotient error [-]", "type": "number", "format": sci2 },
+    { "key": "1", "label": "Maximum remainder magnitude [-]", "type": "number", "format": sci2 },
+    { "key": "2", "label": "Maximum magnitude of s − (q̂ * d + r) [-]", "type": "number", "format": sci2 },
+    { "key": "3", "label": "Quotient length [-]", "type": "integer" },
+    { "key": "4", "label": "Remainder length [-]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "division" })
+);
+
+let measured: Vec<[f64; 2]> = errors
+    .iter()
+    .enumerate()
+    .filter(|(_, e)| **e > 0.0)
+    .map(|(n, &e)| [n as f64, e])
+    .collect();
+let growth: Vec<[f64; 2]> = (0..60)
+    .map(|n| [n as f64, f64::EPSILON * radius.powi(n)])
+    .collect();
+emit_text!(format!(
+    "Zero-error indices omitted from the plot: {} / 60",
+    60 - measured.len()
+));
+emit_line_chart!(
+    &vec![
+        serde_json::json!({
+            "name": "|q̂[n] − q[n]|",
+            "points": measured,
+            "style": { "symbol": "circle" }
+        }),
+        serde_json::json!({
+            "name": "ε ρⁿ (scale)",
+            "points": growth,
+            "style": { "lineType": "dashed", "showSymbol": false }
+        }),
+    ],
+    options = &serde_json::json!({
+        "xLabel": "Quotient index n [-]",
+        "yLabel": "Error [-]",
+        "yType": "log"
+    })
+);
+```
+
+With the default $\rho = 0.8$, the maximum quotient error is $2.2 \times 10^{-16}$, 53 of 60 entries have zero error, and the remainder is exactly zero.
+With $\rho = 1.5$, the maximum quotient error increases to $6.6 \times 10^{-7}$, and the plotted errors grow with the same slope as the dashed $\varepsilon \rho^n$ line.
+The remainder also reaches $1.5 \times 10^{-6}$ to cancel the quotient error, so the identity's residual remains $5.6 \times 10^{-17}$.
+Thus a small residual for $s = \hat q * d + r$ does not imply an accurate quotient.
+With $\rho = 1.6$, the maximum quotient error reaches $2.0 \times 10^{-5}$.
+
+## Summary
+
+Linear convolution with zero extension is a polynomial product of length $N + M - 1$; `ConvolutionExtent` can extract `Same` or `Valid` extents.
+`correlate(a, b)` orders lags increasingly from $-(M-1)$ to $N-1$, so subtract $M-1$ from the maximizing index to obtain the lag; a positive lag means the waveform in $a$ is delayed.
+Direct sums provide componentwise accuracy, FFTs are fast with norm-proportional errors, and `Automatic` chooses by estimated operation counts; specify `Direct` when relative accuracy of small output components is needed.
+Use `ConvolutionNdPlan` and workspace for repeated use of the same kernel, `SeparableFir2dPlan` for separable two-dimensional kernels, and `OverlapStream` for long inputs.
+Since `deconvolve` is long division, check that errors grow exponentially when the divisor is not minimum phase before using it.
+
+Polyphase resampling computes a decimated form of the same FIR sums of products, so continue with [Resampling](../resampling/).
+See [Estimating seismic arrival-time differences with cross-correlation](../../examples/seismic-delay-correlation/) for correlation-based time differences, and [Cross-correlation and lag order](oxref:fft-correlation) in the `scioxide-fft` chapter for constructing convolution with FFTs.

@@ -1,0 +1,637 @@
+---
+title: 解く手順と結果の仕様
+description: ワンショット関数と積分法オブジェクトの solve・workspace・advance、問題・設定・状態・作業領域の役割、計算回数の上限と入れ子の回数の集計、受理した状態と試行の分離、上限による停止と失敗の返し方、エラーの分類、状態の定義域、複素数の状態。
+sidebar:
+  order: 375
+references:
+  ode-one-shot-and-method-values: "ワンショット関数と積分法オブジェクト"
+  ode-problem-options-state-workspace: "問題設定状態作業領域"
+  ode-budgets-and-accounting: "計算回数の上限と回数の集計"
+  ode-accepted-state-and-trials: "受理した状態と試行"
+  ode-termination-and-partial-results: "終了状態と途中までの結果"
+  ode-error-classes: "エラーの分類"
+  ode-admissible-states: "状態の定義域"
+  ode-complex-states: "複素数の状態"
+---
+
+このページは、初期値問題を解くときに呼び出し側が渡すものと受け取るもの、途中で止まったときに残るものをまとめる。
+方式ごとのアルゴリズムは他のページで扱い、ここでは全方式に共通の手順と仕様を説明する。
+遅延方程式（`DdePlan`）、確率微分方程式（`SdeMethod`）、DAE（`DaeBdf`）、力学系（`StormerVerlet`、`Rattle`）も同じ形の `advance` を持つ。
+族ごとの違いはそれぞれのページで述べる。
+
+## ワンショット関数と積分法オブジェクト
+
+初期値問題の API は 2 種類ある。
+
+ワンショット関数 `solve_ivp(rhs, t0, t1, y0)` と `solve_ivp_at(rhs, times, y0)` は、右辺のクロージャ `Fn(t, y, dy) -> Result<(), SciOxideError>` を受け取り、Dormand–Prince 5(4) で解く。
+局所誤差の許容誤差は絶対 $10^{-6}$、相対 $10^{-3}$ で、誤差のノルムは二乗平均（RMS）である。
+`solve_ivp` は終端 $t_1$ の状態を `Vector` で返す。
+`solve_ivp_at` は `times` の各時刻の状態を 1 行ずつ並べた `Matrix` を返し、1 行目は `y0` である。
+`times` は 2 個以上の時刻を、増える向きか減る向きのどちらかに単調に並べる。
+同じ時刻を繰り返すと同じ行が出る。
+途中の時刻の値は連続出力（dense output）から取るので、時刻の並べ方で刻みは変わらない。
+ワンショット関数は設定も作業領域も受け取らない。
+終端に達しなかった場合は、上限による停止も含めてすべてエラーになる。
+
+積分法オブジェクトは `DormandPrince5::new()` や `RadauIia::new()` のような値で、`OdeMethod` トレイトの次のメソッドを持つ。
+
+| メソッド | 役割 | 失敗の返し方 |
+|---|---|---|
+| `validate(&options, dimension)` | 方式と設定の組み合わせを検査する | `Err(SciOxideError)` |
+| `workspace_requirements(&problem, &options)` | 必要な作業領域の大きさ `OdeRequirements` を返す | `Err(SciOxideError)` |
+| `workspace(&problem, &options)` | 作業領域 `OdeWorkspace` を確保する | `Err(SciOxideError)` |
+| `advance(&problem, &options, &mut state, &mut sink, &mut workspace, scope)` | 状態をその場で終端まで進める | 上限による停止は `Ok`、失敗は `Err(SciOxideError)` |
+| `solve(&problem, &options, initial)` | 作業領域と軌道を新しく確保して解く | 上限による停止は `Ok`、失敗は `Err(PartialFailure<OdeProgress>)` |
+
+積分法オブジェクトは許容誤差や出力の方針を持たず、これらは呼び出しごとに `OdeOptions` で渡す。
+同じ積分法オブジェクトと作業領域を、設定や問題を変えて何度でも使える。
+`solve` は、新しい作業領域、軌道を保存する `OdeTrajectory`、逐次の実行コンテキスト `ExecutionContext::sequential_native()` を `advance` に渡したものである。
+繰り返し解くときやメモリの確保を避けたいときは、`workspace` と `advance` を使う。
+`BuiltinOdeMethod` は組み込みの方式を実行時に選ぶ値で、同じメソッドを持つ。
+
+## 問題・設定・状態・作業領域
+
+`advance` の引数は役割ごとに分かれている。
+
+- `OdeProblem::new(&system, end)` は系を借用し、終端の時刻を持つ。
+  事象関数は `with_events` で、利用者が用意した段の解法は `with_stage_solver` で加える。
+  積分は状態の時刻から `end` へ進み、`end` が状態の時刻より前なら時間を逆向きに進む。
+- `OdeOptions` は局所誤差の許容誤差（既定はワンショット関数と同じ）、初期刻み、最小刻みと最大刻み、刻みの制御、出力の方針、事象の設定、刻みと評価の回数の上限を持つ。
+  `with_…` の設定関数は値を検査しない。
+  `validate` と `advance` が組み合わせ全体を検査する。
+- `OdeState` は時刻と状態の値を持ち、`advance` がその場で書き換える。
+  戻った後は最後に受理した点を持つ。
+- 出力先（sink）は `OdeOutputSink` を実装する値で、出力の方針が選んだ状態と事象を、刻みを受理するたびに受け取る。
+  `OdeTrajectory` はすべてをメモリに保存し、`()` はすべて捨てる。
+- `OdeWorkspace` は方式の作業用のメモリと事象の記録を持ち、最後の呼び出しの記録 `last_attempt()` を保持する。
+  `OdeRequirements` は状態の次元、事象関数の数、1 刻みで生じうる事象の記録の数、利用者の段の解法の有無を返す。
+  `OdeWorkspace::check(&requirements)` は作業領域が足りるかを答え、`try_reserve(&requirements)` は不足分を確保する。
+  作業領域が足りなければ `advance` が検査の段階で大きくするので、`workspace` で前もって確保しなくても結果は変わらない。
+
+各 `advance` は新しい実行の単位で、前の呼び出しの刻み幅や多段法の履歴を引き継がない。
+十分な大きさの作業領域を渡し、右辺と sink がメモリを確保しなければ、`advance` は事象と指定時刻の出力を含めてメモリを確保しない。
+`OdeTrajectory` に保存するときは、出力の分のメモリを別に確保する。
+
+## 計算回数の上限と回数の集計
+
+`OdeOptions::with_max_steps(n)` は試行した刻みの数を制限し、棄却と再試行も 1 回と数える。
+`with_max_evaluations(n)` はコールバックの評価回数（右辺、ヤコビ行列、質量行列、事象関数、段の解法）を制限する。
+上限は `Budget::try_from(n)?` で作る。
+上限に達すると `advance` は終了状態 `BudgetLimit(kind)` のレポートを `Ok` で返し、`kind` は刻みの上限なら `Proposal`、評価の上限なら `Evaluation` である。
+
+最後の引数 `scope` には新しい求解を始める `ExecutionContext` か、外側の求解の `&mut SolveContext` を渡す。
+後者を渡すと、外側の上限と取り消しもこの積分に及ぶ。
+右辺や事象関数などのコールバックは、呼び出した刻みの `SolveContext` を受け取る。
+コールバックの中で別の求解（陰的な関係を解く求根など）を行うときは、受け取ったコンテキストをその求解の `scope` に渡す。
+そうすると内側の評価は同じ評価の上限に数えられ、内側の反復は外側の反復と分けて記録される（[入れ子の求解と回数の集計](oxref:core-nested-accounting)）。
+レポートの `counts()` はこの呼び出し自身の評価と反復を返し、`accounting()` は入れ子の求解を含めた回数を返す。
+
+## 受理した状態と試行
+
+適応刻みの積分では、棄却した刻みの途中の値が受理した状態を書き換えてはいけない。
+`scioxide-ode` は呼び出し側の `OdeState` と作業領域の中の試行の候補を別のメモリに置き、各刻みを次の順に進める。
+
+1. 受理した状態から段を計算し、候補を作業領域に書く。
+   段の入力と候補の状態が系の定義域にあるかは `OdeSystem::admits` で確かめる（[状態の定義域](#状態の定義域)）。
+2. 局所誤差の推定値を許容誤差で正規化し、1 を超えれば候補を捨て、刻みを縮めて 1 からやり直す。
+   受理した状態はこの間変わらない。
+3. 候補を受理できれば、その刻みの中の事象を連続出力の上で探し、出力の方針が選んだ状態と事象を sink に送る。
+4. 失敗しうる処理がすべて成功してから、候補と受理した状態を入れ替える。
+
+この順序のため、どの時点でエラーが起きても `OdeState` は最後に受理した点を持つ。
+一方、3 で sink に送った標本と事象は取り消されない。
+sink がエラーを返したときも、その刻みで先に送った標本は sink に残る。
+
+## 終了状態と途中までの結果
+
+`advance` の結果は 3 通りに分かれる。
+
+- 終端か終端の事象に達した場合は `Ok` を返し、レポートの `is_success()` は真になる。
+  終了状態は `ReachedEnd` か `TerminalEvent` である。
+- 刻みや評価の上限、最小刻み、取り消し、期限で止まった場合も `Ok` を返すが、`is_success()` は偽になる。
+  終了状態は `BudgetLimit(kind)`、`StepSizeLimit`、`ExecutionStopped(reason)` のどれかで、状態は止まった時点の最後の受理点を持つ。
+- それ以外の失敗では `Err(SciOxideError)` を返す。
+  状態は最後の受理点を持ち、作業領域の `last_attempt()` が進捗 `OdeProgress`（時刻、状態、刻みの数、最後の局所誤差の推定値、信頼の区分）を記録する。
+
+`Ok` は成功を意味しないので、レポートの `is_success()` か `termination()` を必ず確かめる。
+`termination()` は `Option` を返すが、`OdeSolveReport` では常に `Some` である。
+レポートの `trust()` は最後の受理点の信頼の区分 `PartialResultTrust` で、受理の規則を満たした点は `Admissible` になる。
+`last_attempt()` の `outcome()` は成功で `Succeeded`、上限などによる停止で `Stopped`、エラーで `Failed`、実行前の検査での拒否で `PreflightRejected` になる（[試行の記録](oxref:core-attempt-records)）。
+
+`solve` は失敗のとき `PartialFailure<OdeProgress>` を返し、`error()` が原因を、`progress()` が最後の受理点を持つ。
+原因を取り除いた後、`OdeProgress::into_state()` で `OdeState` に戻せば、続きを `advance` で解ける。
+失敗のとき `solve` は軌道を返さないので、途中の出力が必要なら自分の sink を `advance` に渡す。
+ワンショット関数は上限による停止を `ConvergenceFailure`（取り消しと期限は `ExecutionStopped`）にし、他の失敗と同じく `PartialFailure` で返す。
+
+### 冷却の問題で確かめる
+
+外気温の表が $0 \le t \le t_{\mathrm{table}}$ [h] でしか与えられていない冷却の問題
+
+$$
+T' = -k\bigl(T - T_a(t)\bigr), \qquad T_a(t) = 15 + 5\sin\frac{2\pi t}{24}\ [^\circ\mathrm{C}], \qquad k = 0.3\ \mathrm{h^{-1}}, \qquad T(0) = 80\ ^\circ\mathrm{C}
+$$
+
+を $t = 12$ h まで解く。
+$T$ は物体の温度 [°C]、$T_a$ は外気温 [°C]、$k$ は熱の交換の速さを表す定数である。
+右辺は表の外の時刻で評価されると `InvalidInput`（`OutOfRange`）のエラーを返す。
+試行の段は刻みの終点まで右辺を評価するので、受理した最後の時刻が $t_{\mathrm{table}}$ に届く前に、表の外を評価してエラーになる。
+
+次のブロックは二つのセルが共有する定義である。
+`cooling` が右辺、`cooling_options` が許容誤差 $10^{-8}$（絶対・相対）と、受理したすべての刻みを出力する方針の設定である。
+
+```rust
+//| id: ode-cooling-table-model
+//| kind: definitions
+//| title: 外気温の表が途中で切れる冷却の右辺と設定
+//| crates: [scioxide-core, scioxide-ode]
+use scioxide_core::{
+    ErrorTolerance, SciOxideError, InvalidInputReason, NormSelection, RealScalar, argument,
+};
+use scioxide_ode::{OdeOptions, OdeOutputSchedule};
+
+/// 冷却の右辺 T' = −k (T − Tₐ(t))、k = 0.3 /h。外気温 Tₐ の表は 0 ≤ t ≤ table [h] だけを覆う。
+pub(crate) fn cooling(
+    t: f64,
+    y: &[f64],
+    dy: &mut [f64],
+    table: f64,
+) -> Result<(), SciOxideError> {
+    if t > table {
+        let reason = InvalidInputReason::OutOfRange;
+        return Err(SciOxideError::invalid_input(
+            argument!("time"),
+            reason,
+            "no table entry",
+        ));
+    }
+    let ambient = 15.0 + 5.0 * RealScalar::sin(2.0 * core::f64::consts::PI * t / 24.0);
+    dy[0] = -0.3 * (y[0] - ambient);
+    Ok(())
+}
+
+/// 許容誤差 10⁻⁸（絶対・相対、RMS ノルム）で、受理したすべての刻みの状態を出力する設定。
+pub(crate) fn cooling_options() -> Result<OdeOptions<f64>, SciOxideError> {
+    let tolerance = ErrorTolerance::scalar(1e-8, 1e-8, NormSelection::RootMeanSquare)?;
+    Ok(OdeOptions::new()
+        .with_error_tolerance(tolerance)
+        .with_output_schedule(OdeOutputSchedule::AcceptedSteps))
+}
+```
+
+次のセルは同じ積分法オブジェクトと作業領域で `advance` を 2 回呼ぶ。
+1 回目は表が全区間を覆う系に刻みの上限を付け、2 回目は表が $t_{\mathrm{table}}$ で切れる系を上限なしで解く。
+表は戻り値、終了状態かエラーの分類、`OdeState` の時刻、`last_attempt()` の進捗の時刻、受理した刻みの数、sink に残った標本の数、試行の記録を並べる。
+図は二つの呼び出しで sink に残った温度で、縦線が表の終端である。
+
+```rust
+//| id: ode-failure-partial
+//| ref: ode-failure-partial
+//| title: 刻みの上限で止まった advance と右辺のエラーで失敗した advance
+//| run: reactive
+//| uses: [ode-cooling-table-model]
+//| crates: [scioxide-core, scioxide-ode]
+//| exports: [table_end]
+//| inputs:
+//|   step_budget: {"type":"range","label":"刻みの上限 [回]","description":"1 回目の呼び出しで試行できる刻みの数。","min":2,"max":40,"step":1,"value":10}
+//|   table_end: {"type":"range","label":"外気温の表の終端 t_table [h]","description":"これより後の時刻で右辺がエラーを返す。12 h なら全区間を覆う。","min":2,"max":12,"step":0.5,"value":6}
+//| cases:
+//|   - {"id":"large-budget","label":"刻みの上限 40 回","description":"上限が足りると、1 回目も終端に達する。","inputs":{"step_budget":40}}
+//|   - {"id":"full-table","label":"t_table = 12 h","description":"表が全区間を覆うと、2 回目も終端に達する。","inputs":{"table_end":12}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"advance","path":"/rows/0/1","equals":"Ok"}
+//|       - {"artifact":"advance","path":"/rows/0/2","equals":"BudgetLimit(Proposal)"}
+//|       - {"artifact":"advance","path":"/rows/0/5","equals":10}
+//|       - {"artifact":"advance","path":"/rows/0/7","equals":"Stopped"}
+//|       - {"artifact":"advance","path":"/rows/1/1","equals":"Err"}
+//|       - {"artifact":"advance","path":"/rows/1/2","equals":"InvalidInput"}
+//|       - {"artifact":"advance","path":"/rows/1/3","range":{"min":4,"max":6}}
+//|       - {"artifact":"advance","path":"/rows/1/7","equals":"Failed"}
+//|   - case: large-budget
+//|     expect:
+//|       - {"artifact":"advance","path":"/rows/0/2","equals":"ReachedEnd"}
+//|       - {"artifact":"advance","path":"/rows/0/3","approx":{"value":12,"atol":1e-12}}
+//|   - case: full-table
+//|     expect:
+//|       - {"artifact":"advance","path":"/rows/1/2","equals":"ReachedEnd"}
+//|       - {"artifact":"advance","path":"/rows/1/7","equals":"Succeeded"}
+use scioxide_core::{Budget, ExecutionContext};
+use scioxide_ode::{
+    DormandPrince5, OdeFn, OdeMethod, OdeOptions, OdeProblem, OdeState, OdeSystem,
+    OdeTrajectory,
+};
+
+let end = 12.0;
+let full = OdeFn::new(1, |t: f64, y: &[f64], dy: &mut [f64]| {
+    cooling(t, y, dy, end)
+})
+.map_err(|e| e.to_string())?;
+let short = OdeFn::new(1, |t: f64, y: &[f64], dy: &mut [f64]| {
+    cooling(t, y, dy, table_end)
+})
+.map_err(|e| e.to_string())?;
+let options = cooling_options().map_err(|e| e.to_string())?;
+let budget = Budget::try_from(step_budget as usize).map_err(|e| e.to_string())?;
+let limited = options.clone().with_max_steps(budget);
+let method = DormandPrince5::new();
+// 1 回目は全区間を覆う表に刻みの上限を付け、2 回目は途中で切れる表で解く。作業領域は共有する。
+let mut workspace = method
+    .workspace(&OdeProblem::new(&full, end), &options)
+    .map_err(|e| e.to_string())?;
+let runs: [(&str, &dyn OdeSystem<f64>, &OdeOptions<f64>); 2] = [
+    ("刻みの上限", &full, &limited),
+    ("表の外の時刻", &short, &options),
+];
+let (mut rows, mut series) = (Vec::new(), Vec::new());
+for (cause, system, settings) in runs {
+    let problem = OdeProblem::new(system, end);
+    let mut state = OdeState::from_slice(0.0, &[80.0]).map_err(|e| e.to_string())?;
+    let mut sink = OdeTrajectory::new();
+    let context = ExecutionContext::sequential();
+    let result = method.advance(
+        &problem,
+        settings,
+        &mut state,
+        &mut sink,
+        &mut workspace,
+        context,
+    );
+    let returned = if result.is_ok() { "Ok" } else { "Err" };
+    let status = match &result {
+        Ok(report) => report.termination().map(|t| t.to_string()),
+        Err(error) => Some(format!("{:?}", error.kind())),
+    };
+    // 戻り値によらず、最後の呼び出しの記録と進捗は作業領域に残る。
+    let record = workspace.last_attempt().ok_or("試行の記録がない")?;
+    let progress = record.progress().ok_or("進捗がない")?;
+    let outcome = format!("{:?}", record.outcome());
+    let samples = sink.times().len();
+    let steps = progress.accepted_steps();
+    rows.push((
+        cause,
+        returned,
+        status,
+        state.time(),
+        progress.time(),
+        steps,
+        samples,
+        outcome,
+    ));
+    let states = sink.states().iter().map(|y| y.as_slice()[0]);
+    let points: Vec<_> = sink
+        .times()
+        .iter()
+        .zip(states)
+        .map(|(&t, y)| [t, y])
+        .collect();
+    series.push(serde_json::json!({ "name": cause, "points": points, "kind": "scatter" }));
+}
+emit_line_chart!(
+    &series,
+    options = &serde_json::json!({
+        "xLabel": "時刻 t [h]",
+        "yLabel": "sink に残った温度 T [°C]",
+        "xMin": 0.0,
+        "xMax": end,
+        "annotations": [{ "kind": "line", "axis": "x", "value": table_end, "label": "表の終端" }]
+    })
+);
+let fixed3 = serde_json::json!({ "fractionDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "止まる原因" },
+    { "key": "1", "label": "戻り値" },
+    { "key": "2", "label": "終了状態・エラーの分類" },
+    { "key": "3", "label": "状態の時刻 [h]", "type": "number", "format": fixed3 },
+    { "key": "4", "label": "進捗の時刻 [h]", "type": "number", "format": fixed3 },
+    { "key": "5", "label": "受理した刻み [回]", "type": "integer" },
+    { "key": "6", "label": "sink の標本 [個]", "type": "integer" },
+    { "key": "7", "label": "試行の記録" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "advance" })
+);
+export!(table_end, table_end);
+```
+
+既定値（刻みの上限 10 回、$t_{\mathrm{table}} = 6$ h）では、1 回目は 10 刻みを受理した $t = 2.662$ h で止まり、`Ok` と `BudgetLimit(Proposal)` のレポートを返す。
+試行の記録は `Stopped` で、sink には初期値と 10 刻みの 11 個の標本が残る。
+2 回目は 19 刻みを受理した $t = 5.778$ h の次の試行で表の外を評価し、`Err`（`InvalidInput`）を返す。
+このとき `OdeState` の時刻と進捗の時刻はどちらも 5.778 h で、sink の 20 個の標本も残っている。
+試行の記録は `Failed` である。
+表の終端を 12 h にすると、2 回目も 33 刻みで終端に達して `ReachedEnd` になる。
+
+次のセルは前のセルから表の終端を受け取り、所有値を返す API の `solve` とワンショット関数を比べる。
+`solve` と `solve_ivp_at` の 2 行目以降は失敗の `PartialFailure` から読んだ値で、軌道やレポートは返らない。
+
+```rust
+//| id: ode-failure-owned-forms
+//| ref: ode-failure-owned-forms
+//| title: solve とワンショット関数が失敗のときに返すもの
+//| run: reactive
+//| uses: [ode-cooling-table-model]
+//| crates: [scioxide-core, scioxide-ode]
+//| dependsOn:
+//|   partial: ode-failure-partial
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"owned","path":"/rows/0/1","equals":"Err"}
+//|       - {"artifact":"owned","path":"/rows/0/4","equals":19}
+//|       - {"artifact":"owned","path":"/rows/1/2","equals":"InvalidInput"}
+//|       - {"artifact":"owned","path":"/rows/2/3","range":{"min":0.5,"max":6}}
+use scioxide_core::PartialFailure;
+use scioxide_ode::{
+    DormandPrince5, OdeFn, OdeMethod, OdeProblem, OdeProgress, OdeState, solve_ivp,
+    solve_ivp_at,
+};
+
+let table_end = partial["table_end"].as_f64().ok_or("表の終端がない")?;
+let end = 12.0;
+let rhs = |t: f64, y: &[f64], dy: &mut [f64]| cooling(t, y, dy, table_end);
+// 失敗した行は (呼び出し, 戻り値, エラーの分類, 進捗の時刻, 受理した刻み)。
+let failed = |call, failure: PartialFailure<OdeProgress<f64>>| {
+    let kind = Some(format!("{:?}", failure.error().kind()));
+    let time = failure.progress().map(|p| p.time());
+    let steps = failure.progress().map(|p| p.accepted_steps());
+    (call, "Err", kind, time, steps)
+};
+// solve: 積分法オブジェクトの所有値を返す API。成功ならレポートと軌道を、失敗なら PartialFailure を返す。
+let system = OdeFn::new(1, rhs).map_err(|e| e.to_string())?;
+let problem = OdeProblem::new(&system, end);
+let options = cooling_options().map_err(|e| e.to_string())?;
+let initial = OdeState::from_slice(0.0, &[80.0]).map_err(|e| e.to_string())?;
+let mut rows = vec![
+    match DormandPrince5::new().solve(&problem, &options, initial) {
+        Ok(solution) => {
+            let report = solution.report();
+            let status = report.termination().map(|t| t.to_string());
+            (
+                "solve",
+                "Ok",
+                status,
+                Some(end),
+                Some(report.accepted_steps()),
+            )
+        }
+        Err(failure) => failed("solve", failure),
+    },
+];
+// solve_ivp と solve_ivp_at: ワンショット関数はレポートを返さない（既定の許容誤差）。
+rows.push(match solve_ivp(rhs, 0.0, end, &[80.0]) {
+    Ok(_) => ("solve_ivp", "Ok", None, Some(end), None),
+    Err(failure) => failed("solve_ivp", failure),
+});
+let times: Vec<f64> = (0..=24).map(|i| 0.5 * f64::from(i)).collect();
+rows.push(match solve_ivp_at(rhs, &times, &[80.0]) {
+    Ok(_) => ("solve_ivp_at", "Ok", None, Some(end), None),
+    Err(failure) => failed("solve_ivp_at", failure),
+});
+let fixed3 = serde_json::json!({ "fractionDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "呼び出し" },
+    { "key": "1", "label": "戻り値" },
+    { "key": "2", "label": "終了状態・エラーの分類", "nullText": "返らない" },
+    { "key": "3", "label": "最後の受理時刻 [h]", "type": "number", "format": fixed3 },
+    { "key": "4", "label": "受理した刻み [回]", "type": "integer", "nullText": "返らない" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "owned" })
+);
+```
+
+`solve` は `advance` と同じ許容誤差 $10^{-8}$ なので、19 刻みを受理した 5.778 h で止まる。
+ワンショット関数は既定の許容誤差 $10^{-3}$ で刻みが長く、3 刻みを受理した 3.975 h の次の試行で表の外を評価する。
+`solve_ivp_at` も刻みの選び方は `solve_ivp` と同じなので、同じ時刻で止まる。
+ワンショット関数を使うと、許容誤差を変えられないうえに、表の終端の手前 2 h 分の結果を失う。
+途中までの結果を使う必要があるときは、積分法オブジェクトと自分の sink を使う。
+
+## エラーの分類
+
+エラーは `SciOxideError::kind()`（`SciOxideErrorKind`）で分類する。
+このクレートの分類は次のとおりである。
+
+| 分類 | 起きる場合 |
+|---|---|
+| `InvalidInput` | 設定の値が不正（正でない刻みの上下限、長さの違う許容誤差のベクトル）。方式が要求された機能を持たない（連続出力のない方式での事象や指定時刻の出力、固定刻みの方式への刻みの制御。理由は `UnsupportedConfiguration`）。初期時刻と終端が等しい |
+| `NonFinite` | 時刻、初期状態、設定の NaN や無限大（発生源 `Input`）。コールバックの出力の NaN や無限大（発生源 `Callback`） |
+| `DimensionMismatch` | 系、状態、出力のメモリの次元が問題の次元と合わない |
+| `ConvergenceFailure`、`Singular`、`NumericalInstability` | 固定刻みの方式の段の求解の失敗、DAE の初期化や BVP の Newton 法の未収束 |
+| `ResourceLimit`、`AllocationFailure`、`SizeOverflow` | 作業領域、履歴、チェックポイントのメモリが上限を超えるか確保できない |
+
+入力の検査はすべて最初のコールバックの前に行い、拒否された呼び出しは状態を変えない。
+コールバックが返したエラーは積分を止め、そのまま返る。
+適応刻みの方式は段の求解の失敗や特異な反復行列を刻みの棄却として扱い、刻みを半分にして再試行する。
+それ以上刻みを縮められなければ `StepSizeLimit` で止まる。
+固定刻みの方式は再試行せず、エラーを返す。
+
+## 状態の定義域
+
+濃度や密度のように負になってはいけない量では、試行の段で状態が定義域を外れることがある。
+`OdeSystem::admits(time, state, cx)` を実装すると、積分器は試行の段の入力で右辺を評価する前と、受理しようとする終点で、状態が定義域にあるかを尋ねる。
+`false` を返すと、誤差の推定によらずその刻みを棄却し、受理した状態から刻みを半分にしてやり直す。
+固定刻みの方式でも同じである。
+刻みの下限まで縮めても受理できなければ `StepSizeLimit` で止まる。
+`admits` が返したエラーは積分を止め、刻みを縮めて再試行しない。
+既定の実装は常に `true` を返す。
+`admits` の呼び出しは評価回数に数えないので、内部で重い計算をするなら受け取ったコンテキストに計上する。
+
+## 複素数の状態
+
+`OdeSystem<S, T>` の状態の型 `T` は実数 `S` か複素数 `Complex<S>` で、時刻は常に実数である。
+陽的な方式は任意の右辺を受け付ける。
+陰的な方式とヤコビ行列の取り方（差分を含む）は、右辺が $y$ について正則で $\partial f/\partial y$ が複素線形であることを仮定する。
+正則でない右辺を陰的な方式で解くには、実部と虚部に分けた 2 倍の次元の実数の系にする。
+
+Schrödinger 方程式 $\mathrm{i}\,\dot\psi = H\psi$ は複素数の状態を持つ ODE の典型である。
+ここでは [2 準位量子系の Rabi 振動と行列指数](../../../scioxide-linalg/examples/two-level-rabi/)と同じ回転座標系のハミルトニアン
+
+$$
+H = \frac12 \begin{bmatrix} -\Delta & \Omega \\ \Omega & \Delta \end{bmatrix}\ [\mathrm{rad}/\mu\mathrm{s}], \qquad \psi(0) = (1, 0)
+$$
+
+を、行列指数を使わずに $\dot\psi = -\mathrm{i}H\psi$ として積分する。
+$\Omega$ は Rabi 周波数、$\Delta$ は離調、$\Omega_R = \sqrt{\Omega^2 + \Delta^2}$ は一般化 Rabi 周波数である。
+厳密解は
+
+$$
+\psi(t) = \left( \cos\frac{\Omega_R t}{2} + \mathrm{i}\,\frac{\Delta}{\Omega_R} \sin\frac{\Omega_R t}{2},\; -\mathrm{i}\,\frac{\Omega}{\Omega_R} \sin\frac{\Omega_R t}{2} \right)
+$$
+
+で、励起状態にある確率 $P_e = |\psi_1|^2$ は Rabi の公式 $P_e(t) = (\Omega^2/\Omega_R^2)\sin^2(\Omega_R t/2)$ に従う。
+$H$ がエルミートなので確率の和 $\lVert\psi\rVert^2$ は 1 に保たれる。
+
+$\lVert\psi\rVert^2$ は状態の 2 次の不変量である。
+Gauss–Legendre の Runge–Kutta 法（`GaussRk`）は 2 次の不変量を、段の方程式を解いた精度の範囲で保つ。
+Dormand–Prince 5(4) は保たないので、ノルムのずれは局所誤差の許容誤差の程度で刻みごとに積み重なる。
+次のセルは同じ問題を `DormandPrince5`（適応刻み）と `GaussRk`（固定刻み $T/2^k$）で解き、厳密解との差、Rabi の公式との差、ノルムのずれを比べる。
+二つの図は時刻の軸を連動させてある。
+
+```rust
+//| id: ode-complex-rabi
+//| ref: ode-complex-rabi
+//| title: 複素数の状態を持つ 2 準位系を二つの方式で積分する
+//| run: reactive
+//| crates: [scioxide-core, scioxide-linalg, scioxide-ode]
+//| inputs:
+//|   rabi: {"type":"range","label":"Rabi 周波数 Ω [rad/μs]","description":"駆動の強さ。","min":0.5,"max":20,"step":0.5,"value":6}
+//|   detuning: {"type":"range","label":"離調 Δ [rad/μs]","description":"0 で共鳴。","min":-20,"max":20,"step":0.5,"value":2}
+//|   duration: {"type":"range","label":"時間 T [μs]","description":"積分する時間。","min":0.5,"max":10,"step":0.5,"value":3}
+//|   tolerance_exponent: {"type":"range","label":"DormandPrince5 の許容誤差 10^q の指数 q","description":"絶対・相対の局所誤差の許容誤差。","min":-12,"max":-4,"step":1,"value":-8}
+//|   gauss_log2: {"type":"range","label":"GaussRk の刻みの数 2^k の指数 k","description":"固定刻み T/2^k の数。","min":4,"max":10,"step":1,"value":7}
+//| cases:
+//|   - {"id":"resonance","label":"Δ = 0","description":"共鳴では振幅が 1 になり、励起状態へ移りきる。","inputs":{"detuning":0}}
+//|   - {"id":"loose","label":"q = −4, k = 4","description":"刻みを粗くすると、DormandPrince5 のノルムのずれは許容誤差の程度に増え、GaussRk のずれは小さいままである。","inputs":{"tolerance_exponent":-4,"gauss_log2":4}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/0/3","range":{"max":1e-6}}
+//|       - {"artifact":"methods","path":"/rows/0/5","range":{"min":1e-9,"max":1e-6}}
+//|       - {"artifact":"methods","path":"/rows/1/1","equals":128}
+//|       - {"artifact":"methods","path":"/rows/1/3","range":{"max":1e-5}}
+//|       - {"artifact":"methods","path":"/rows/1/5","range":{"max":1e-10}}
+//|   - case: resonance
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/0/4","range":{"max":1e-6}}
+//|   - case: loose
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/0/5","range":{"min":1e-5}}
+//|       - {"artifact":"methods","path":"/rows/1/5","range":{"max":1e-8}}
+use scioxide_core::{Complex, ErrorTolerance, EvaluationRole, NormSelection};
+use scioxide_linalg::Vector;
+use scioxide_ode::{
+    DormandPrince5, GaussRk, OdeFn, OdeMethod, OdeOptions, OdeOutputSchedule, OdeProblem,
+    OdeSolution, OdeState,
+};
+
+// ψ' = −iHψ、H = ½[[−Δ, Ω], [Ω, Δ]] [rad/μs]。成分は (基底状態, 励起状態) の確率振幅。
+let rhs = OdeFn::new(
+    2,
+    |_t: f64, psi: &[Complex<f64>], dpsi: &mut [Complex<f64>]| {
+        let minus_i = Complex::new(0.0, -1.0);
+        dpsi[0] = minus_i * (psi[0] * (-0.5 * detuning) + psi[1] * (0.5 * rabi));
+        dpsi[1] = minus_i * (psi[0] * (0.5 * rabi) + psi[1] * (0.5 * detuning));
+        Ok(())
+    },
+)
+.map_err(|e| e.to_string())?;
+// 独立な検算: 閉じた形の ψ(t)（f64 の固有メソッドによる参照値）。
+let omega_r = rabi.hypot(detuning);
+let exact = |t: f64| {
+    let (s, c) = (0.5 * omega_r * t).sin_cos();
+    [
+        Complex::new(c, detuning / omega_r * s),
+        Complex::new(0.0, -rabi / omega_r * s),
+    ]
+};
+let problem = OdeProblem::new(&rhs, duration);
+let ground = vec![Complex::new(1.0, 0.0), Complex::new(0.0, 0.0)];
+let output = OdeOptions::new().with_output_schedule(OdeOutputSchedule::AcceptedSteps);
+let epsilon = 10.0_f64.powf(tolerance_exponent);
+let tolerance = ErrorTolerance::scalar(epsilon, epsilon, NormSelection::RootMeanSquare)
+    .map_err(|e| e.to_string())?;
+let adaptive = output.clone().with_error_tolerance(tolerance);
+// 刻み T/2^k は 2 進で正確に表せるので、2^k 刻みでちょうど終端に着く。
+let steps = 2.0_f64.powi(gauss_log2 as i32);
+let fixed = output.with_initial_step(duration / steps);
+let start = || OdeState::new(0.0, Vector::from_vec(ground.clone()));
+let dp5 = DormandPrince5::new().solve(&problem, &adaptive, start());
+let gauss = GaussRk::new().solve(&problem, &fixed, start());
+let solutions: [(&str, OdeSolution<f64, Complex<f64>>); 2] = [
+    ("DormandPrince5", dp5.map_err(|f| f.error().to_string())?),
+    ("GaussRk", gauss.map_err(|f| f.error().to_string())?),
+];
+let (mut rows, mut probability, mut drift) = (Vec::new(), Vec::new(), Vec::new());
+for (name, solution) in &solutions {
+    let path = solution.trajectory();
+    let (mut state_error, mut formula_error, mut norm_error) = (0.0_f64, 0.0_f64, 0.0_f64);
+    let (mut pe, mut norm) = (Vec::new(), Vec::new());
+    for (&t, psi) in path.times().iter().zip(path.states()) {
+        let (psi, reference) = (psi.as_slice(), exact(t));
+        let distance = (psi[0] - reference[0]).norm_sqr() + (psi[1] - reference[1]).norm_sqr();
+        let excited = psi[1].norm_sqr();
+        let deviation = (psi[0].norm_sqr() + excited - 1.0).abs();
+        state_error = state_error.max(distance.sqrt());
+        formula_error = formula_error.max((excited - reference[1].norm_sqr()).abs());
+        norm_error = norm_error.max(deviation);
+        pe.push([t, excited]);
+        // 対数軸に載らない 0 の点は描かない。
+        if deviation > 0.0 {
+            norm.push([t, deviation]);
+        }
+    }
+    let report = solution.report();
+    let evaluations = report.counts().provider(EvaluationRole::RightHandSide);
+    rows.push((
+        *name,
+        report.accepted_steps(),
+        evaluations,
+        state_error,
+        formula_error,
+        norm_error,
+    ));
+    probability.push(serde_json::json!({ "name": name, "points": pe, "kind": "scatter" }));
+    drift.push(serde_json::json!({ "name": name, "points": norm, "kind": "scatter" }));
+}
+let formula: Vec<_> = (0..=400)
+    .map(|i| f64::from(i) * duration / 400.0)
+    .map(|t| [t, exact(t)[1].norm_sqr()])
+    .collect();
+let style = serde_json::json!({ "lineType": "dashed", "showSymbol": false });
+probability
+    .push(serde_json::json!({ "name": "Rabi の公式", "points": formula, "style": style }));
+emit_line_chart!(
+    &probability,
+    options = &serde_json::json!({
+        "link": { "group": "rabi-time" },
+        "xLabel": "時刻 t [μs]",
+        "yLabel": "励起確率 Pₑ [-]",
+        "yMin": 0.0
+    })
+);
+emit_line_chart!(
+    &drift,
+    options = &serde_json::json!({
+        "link": { "group": "rabi-time" },
+        "xLabel": "時刻 t [μs]",
+        "yLabel": "ノルムのずれ |‖ψ‖² − 1| [-]",
+        "yType": "log"
+    })
+);
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "方式" },
+    { "key": "1", "label": "受理した刻み [回]", "type": "integer" },
+    { "key": "2", "label": "右辺の評価 [回]", "type": "integer" },
+    { "key": "3", "label": "max ‖ψ − ψ厳密‖ [-]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "max |Pₑ − 公式| [-]", "type": "number", "format": sci3 },
+    { "key": "5", "label": "max |‖ψ‖² − 1| [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "methods" })
+);
+```
+
+既定値（$\Omega = 6$、$\Delta = 2$ rad/μs、$T = 3$ μs）では、`DormandPrince5`（許容誤差 $10^{-8}$）は 88 刻みで右辺を 530 回評価し、厳密解との差は $4.1 \times 10^{-8}$、ノルムのずれは $8.0 \times 10^{-8}$ である。
+`GaussRk`（128 刻み）は右辺を 929 回評価し、厳密解との差は $4.0 \times 10^{-7}$ と大きいが、ノルムのずれは $8.4 \times 10^{-13}$ にとどまる。
+許容誤差を $10^{-4}$、刻みの数を 16 にすると、`DormandPrince5` のノルムのずれは $4.1 \times 10^{-4}$ まで増える。
+`GaussRk` は厳密解との差が $1.6 \times 10^{-3}$ に増えても、ノルムのずれは $9.1 \times 10^{-11}$ である。
+このずれは段の方程式の Newton 反復を止めた精度で決まり、1024 刻みでは $1.8 \times 10^{-15}$ と丸め誤差の程度になる。
+`GaussRk` の厳密解との差は 128 刻みから 1024 刻みで $4.0 \times 10^{-7}$ から $9.7 \times 10^{-11}$ に減り、比はおよそ $8^4$ で 4 次の収束と合う。
+2 次の不変量を保つことは軌道が正確であることを意味しないので、精度は厳密解や刻みを変えた解との比較で確かめる。
+
+## まとめ
+
+ワンショット関数 `solve_ivp` と `solve_ivp_at` は既定の Dormand–Prince 5(4) で手早く解き、終端に達しなければ上限による停止も含めてエラーにする。
+許容誤差、出力、上限を選ぶときや作業領域を再利用するときは、積分法オブジェクトの `advance` を使い、`Ok` でもレポートの `is_success()` を確かめる。
+上限による停止では状態が最後の受理点を持ち、エラーでは作業領域の `last_attempt()` と `solve` の `PartialFailure` が進捗を持つので、原因を除いてから続きを解ける。
+sink に送った標本と事象は取り消されないので、途中までの出力が必要なら自分の sink を渡す。
+複素数の状態はそのまま積分でき、陰的な方式では右辺が正則である必要がある。
+
+刻みの選び方は [陽的 Runge–Kutta 法と刻みの制御](../explicit-runge-kutta-and-control/)、連続出力と事象は [連続出力と事象](../dense-output-and-events/)、計算回数の上限と試行の記録の一般的な規則は [求解のライフサイクルと計算回数の管理](../../../scioxide-core/algorithms/solve-lifecycle-and-accounting/)で確かめられる。

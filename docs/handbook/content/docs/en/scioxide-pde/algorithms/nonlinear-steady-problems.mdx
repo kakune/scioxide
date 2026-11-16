@@ -1,0 +1,146 @@
+---
+title: "Nonlinear steady problems"
+description: "Pass coupled nonlinear steady residuals to Newton–Krylov with NonlinearPdeProblem and PdeResidual. Three Jacobian representations, field partitions and field preconditioning, tangent operators, termination reasons, and diagnostics."
+sidebar:
+  order: 347
+references:
+  pde-nonlinear-residual: "steady-residuals-and-newtonkrylov"
+  pde-jacobian-modes: "three-jacobian-representations"
+  pde-field-layout-preconditioner: "field-partitions-and-field-preconditioning"
+  pde-nonlinear-termination: "termination-reasons-and-diagnostics"
+---
+
+A steady solution of a partial differential equation with reaction or nonlinear material properties solves the nonlinear system $\mathbf{F}(\mathbf{u})=\mathbf{0}$ obtained after spatial discretization.
+`scioxide-pde` constructs the residual and Jacobian action for this equation, leaving iteration to the Newton–Krylov method in `scioxide-rootfind`.
+This page explains how to construct steady residuals, the three Jacobian representations, preconditioning by coupled field, and termination reasons and diagnostics.
+[Steady reaction front with counter-diffusion](../../examples/reaction-front-steady-newton/) gives an executable example in which two species diffuse from opposite sides of a membrane and react.
+Passing time evolution to an ODE solver is covered in [Method of lines and semidiscrete systems](../method-of-lines-and-nonlinear/).
+
+## Steady residuals and Newton–Krylov
+
+Using the lumped diagonal mass matrix $\mathbf{M}$, a spatially discretized system can be written as
+
+$$
+\mathbf{M}\,\frac{d\mathbf{u}}{dt}=\mathbf{f}(t,\mathbf{u})
+$$
+
+as described in [Method of lines and semidiscrete systems](oxref:pde-method-of-lines-normalization).
+Here $\mathbf{u}\in\mathbb{R}^n$ contains the free unknowns (excluding nodes prescribed by Dirichlet conditions), and $\mathbf{f}$ is the discretized physical residual.
+Since $\mathbf{M}$ is nonsingular, a steady solution at time $t_\ast$ satisfies $\mathbf{F}(\mathbf{u})=\mathbf{f}(t_\ast,\mathbf{u})=\mathbf{0}$, and mass does not affect the steady solution.
+
+`NonlinearPdeProblem::new(provider, time, fields, mode)` fixes a provider implementing `scioxide_ode::OdeSystem` at time `time` and treats its right-hand side `rhs` as the residual $\mathbf{F}$.
+The same provider can be passed to the [method-of-lines plan `MethodOfLinesPlan`](oxref:pde-method-of-lines-normalization) for time integration and to this plan for steady problems.
+If the provider declares its own mass matrix (`mass_matrix_revision` is `Some`), binding rejects it.
+Mass is handled by `MethodOfLinesPlan` and does not enter the steady residual.
+
+At iteration $k$, Newton's method solves the linear equation
+
+$$
+J(\mathbf{u}_k)\,\mathbf{s}_k=-\mathbf{F}(\mathbf{u}_k),\qquad J=\frac{\partial\mathbf{F}}{\partial\mathbf{u}}
+$$
+
+and updates $\mathbf{u}_{k+1}=\mathbf{u}_k+\alpha_k\mathbf{s}_k$ (where $\alpha_k\in(0,1]$ is the line-search step length).
+`NewtonKrylovSolver` solves this linear equation approximately with preconditioned GMRES and chooses the relative residual target (forcing term) $\eta_k$ at each iteration using the Eisenstat–Walker rule.
+GMRES uses only the Jacobian–vector product (JVP) $J\mathbf{v}$.
+Forcing terms, line search, and default controls are described in [Matrix-free Newton–Krylov](../../../scioxide-rootfind/algorithms/matrix-free-newton-krylov/).
+
+The `PdeResidual` returned by the plan's `bind(&mut workspace)` implements the residual action `ResidualOperator` and JVP action `JacobianOperator` (both from `scioxide-core`).
+Pass it directly to `NewtonKrylovProblem::with_jacobian`.
+`PdeResidual` computes outputs in scratch storage and checks finiteness before writing them, so errors leave the output unchanged.
+Evaluations within the solver context (`*_scoped`) count provider calls toward the solver's evaluation counts.
+Evaluations outside that context (such as `residual_into`) call the provider in a private sequential context that discards counts.
+
+## Three Jacobian representations
+
+Explicitly select how to form JVPs with `PdeJacobianMode`.
+If the provider lacks the selected capability, the plan returns an `InvalidInput` (`UnsupportedConfiguration`) error without switching to another representation or finite differences.
+
+| `PdeJacobianMode` | Provider requirement | Storage | JVP computation |
+|---|---|---|---|
+| `Dense` | `OdeSystem::jacobian` | $n\times n$ dense matrix | Multiply by the assembled matrix |
+| `Sparse(pattern)` | `OdeSystem::sparse_jacobian` | CSR matrix with pattern `pattern` | Multiply by the assembled matrix |
+| `Operator { operator_scratch }` | `OdeSystem::jacobian_product` | No matrix (`operator_scratch` scratch entries) | Call the provider's JVP each time |
+
+`problem.workspace()` allocates storage for the selected representation once, without numerical callbacks, and returns it as a `NonlinearPdeWorkspace`.
+Dense and sparse representations hold one assembled matrix and a copy of its assembly point (length $n$).
+The matrix is reused while GMRES repeatedly requests JVPs at the same point and reassembled only when the point changes.
+Assembly is counted under evaluation role `EvaluationRole::Jacobian`; if an evaluation limit denies assembly, an `EvaluationLimit` convergence-failure error is returned.
+Reuse is reset at every binding, so rebind even at the same point if data captured by the provider changes.
+Binding fails if the workspace and plan representations differ.
+
+The sparse representation uses a fixed pattern containing all Jacobian nonzeros, and the provider writes a value at each pattern position.
+The operator representation stores no matrix and calls the provider's `jacobian_product` for each JVP.
+If the provider returns `None`, an error occurs at that point.
+Without forming a matrix, storage is only $O(n)$, but each GMRES iteration evaluates the provider's JVP once.
+If JVPs from all three representations agree to roundoff, Newton and GMRES follow the same iteration history; differences appear in storage and provider call counts.
+
+Use `PdeTangent::new(&residual, point)` to treat the linearization $J(\mathbf{u})$ at a fixed point $\mathbf{u}$ as an operator.
+`PdeTangent` implements `LinearOperator` and returns $J(\mathbf{u})\mathbf{v}$ through `apply_into`.
+Construction evaluates no JVP and rejects nonsquare providers, points of incorrect length, and non-finite coordinates.
+If the provider also supplies adjoint products $J^{\mathsf H}\mathbf{w}$ (`PdeAdjointJacobian`), `PdeTangent` can also be used as an `AdjointOperator`.
+In `PdeResidual`, dense and sparse representations use the conjugate transpose of the assembled matrix, while the operator representation uses adjoint products supplied through `NonlinearPdeProblem::with_adjoint`.
+Binding rejects adjoint products supplied to an assembled representation.
+The same `PdeTangent` also serves linearizations of hyperelasticity (`HyperelasticityPlan`) and the Navier–Stokes equations (`NavierStokesPlan`).
+
+## Field partitions and field preconditioning
+
+For coupled systems solving two or more physical quantities (fields) at the same nodes, arrange unknowns in contiguous partitions by field.
+`PdeFieldLayout::new(&[n_0, n_1, …])` builds partition boundaries from field lengths; `range(i)` gives the index range of field $i$, and `field(values, i)` and `field_mut(values, i)` borrow that field's portion.
+Zero-length fields (all nodes constrained) are allowed, but zero total dimension is rejected.
+Mapping to the mesh and reconstructing physical fields belong to the discretization, rather than the partitions.
+
+For two fields $a,b$, the residual Jacobian splits along the partitions as
+
+$$
+J=\begin{pmatrix} J_{aa} & J_{ab}\\ J_{ba} & J_{bb}\end{pmatrix}
+$$
+
+
+In diffusion-dominated problems, diagonal blocks $J_{aa},J_{bb}$ contain discrete Laplacians and have condition numbers $O(h^{-2})$.
+If fields couple only through values at the same node, as in reaction, the off-diagonal blocks $J_{ab},J_{ba}$ are diagonal matrices.
+Unpreconditioned GMRES needs more iterations as the condition number increases.
+A block-diagonal preconditioner $P^{-1}=\operatorname{diag}(\tilde J_{aa}^{-1},\tilde J_{bb}^{-1})$ arranges approximate field inverses $\tilde J_{ii}^{-1}$ and is inexpensive to construct because it ignores coupling blocks.
+
+`PdeFieldPreconditioner::new(&layout, &blocks)` borrows a `Preconditioner` prepared for each field and assembles this block-diagonal action.
+Construction fails if block and partition counts differ or block dimensions do not match partition lengths.
+This type performs no factorization or nested solve itself; the caller prepares each block.
+Application checks all block dimensions, calls each block in turn, and writes the output after checking that the results are finite.
+The combined application counts as one preconditioner evaluation within the calling solver.
+In the [reaction-front example](oxref:pde-coupled-steady-newton) (99 nodes per field), using the inverse diffusion part for each block reduces total GMRES iterations from 1107 to 43.
+
+## Termination reasons and diagnostics
+
+`NonlinearPdeProblem` and `PdeResidual` have no iterations; the termination decision belongs to `NewtonKrylovResult`, the result of `NewtonKrylovSolver`.
+`termination()` returns `RootTermination` from `scioxide-rootfind`; the only success is `ResidualTolerance`, meaning that the residual satisfies tolerance $\|\mathbf{F}\|_2\le\varepsilon_{\mathrm{abs}}+\varepsilon_{\mathrm{rel}}\|\mathbf{F}(\mathbf{u}_0)\|_2$.
+When `is_success()` is false, `point()` is the last accepted point and is meaningful only when `residual_report()` is `Some`.
+The cells in the [counter-diffusion reaction-front example](../../examples/reaction-front-steady-newton/) classify `GlobalizationFailure` (line search cannot find an acceptable step length) and `LinearFailure(_)` (inner GMRES breakdown) as failed, and other reasons such as iteration limits or stagnation as partial.
+Termination reasons are listed in [Matrix-free Newton–Krylov](../../../scioxide-rootfind/algorithms/matrix-free-newton-krylov/).
+
+A small residual shows that the discretized equations have been solved but does not measure error against the partial differential equation's solution.
+The reaction-front example checks coupling through invariant defects, model behavior through the Da dependence of differences from limiting concentrations, and grid effects through comparisons with different node counts.
+
+Counts are split between two places in `NewtonKrylovResult`.
+`iterations()` counts Newton iterations.
+`accounting().nested()` covers nested work: `iterations()` counts GMRES iterations, `provider(EvaluationRole::Jacobian)` Jacobian assemblies, and `provider(EvaluationRole::Preconditioner)` preconditioner applications.
+One application of `PdeFieldPreconditioner` counts as one preconditioner application regardless of the block count.
+
+Binding rejects invalid inputs before calling provider callbacks.
+A dimension mismatch between the partition and provider gives `DimensionMismatch`.
+Providers declaring mass, non-finite times, workspaces with incompatible representations, and adjoint products supplied to assembled representations give `InvalidInput`.
+If provider output is non-finite, the plan returns a `NonFinite` error without writing the output.
+
+## Summary
+
+A steady solution solves a nonlinear equation whose residual is the semidiscrete right-hand side $\mathbf{f}(t_\ast,\mathbf{u})$, passed to `NewtonKrylovSolver` through `NonlinearPdeProblem` and `PdeResidual`.
+Explicitly select a dense, sparse, or operator Jacobian with `PdeJacobianMode`; dense and sparse representations reuse a matrix assembled at the same point, while the operator representation stores no matrix and calls the provider's JVP each time.
+For coupled systems, use `PdeFieldLayout` to partition fields and `PdeFieldPreconditioner` to arrange approximate inverses prepared for each field, substantially reducing GMRES iterations in diffusion-dominated problems.
+Extracting the linearization at the solution as an operator with `PdeTangent` allows derivative errors to be checked against finite differences of the residual.
+Read termination from `RootTermination`, and assess solution quality independently of residual size using invariants, limits, and refinement.
+
+## Further reading
+
+- [Steady reaction front with counter-diffusion](../../examples/reaction-front-steady-newton/): compare the three representations and field preconditioning in an actual coupled system, checking the solution against a closed-form limit.
+- [Method of lines and semidiscrete systems](../method-of-lines-and-nonlinear/): normalize the same form of provider using mass and coordinate scales and pass it to time integration.
+- [Matrix-free Newton–Krylov](../../../scioxide-rootfind/algorithms/matrix-free-newton-krylov/): examine forcing terms, line search, and termination reasons in detail.
+- [Krylov subspace methods and preconditioning](../../../scioxide-linalg/algorithms/krylov-and-preconditioning/): review the theory of inner linear solvers and preconditioning.
+- [API for the method of lines and nonlinear problems](../../api/method-of-lines-and-nonlinear/): review the contracts of the types on this page in tabular form.

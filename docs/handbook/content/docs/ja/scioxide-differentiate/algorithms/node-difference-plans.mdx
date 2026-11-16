@@ -1,0 +1,404 @@
+---
+title: 節点を指定する差分の Plan と手法オブジェクト
+description: 呼び出し側が選んだ節点で関数を評価する Plan PhysicalDifferencePlan、変位を持つ節点を指定する差分法オブジェクト RelativeDifference、ワンショット関数 physical_difference_derivative の使い分け、作成時と評価時の検査、ヘッセ行列の組み立てと評価回数、誤差の主項と丸め誤差の実測。
+sidebar:
+  order: 318
+references:
+  differentiate-node-checks: "作成時と評価時の検査"
+  differentiate-node-operations: "演算と選択肢"
+  differentiate-physical-one-shot: "スカラー関数のワンショット関数"
+  differentiate-physical-plan: "評価点と節点を固定する-plan"
+  differentiate-relative-difference: "変位を持つ節点を指定する差分法オブジェクト"
+---
+
+[差分ステンシルの重みと任意の節点](../stencil-weights/) では、呼び出し側が持つ値に掛ける重みを `FiniteDifferenceStencil` で作った。
+関数を呼べるときは、節点の位置だけを渡し、関数の評価と重みの適用をライブラリに任せられる。
+決まった格子の上で微分したいとき、5 点や 7 点の高次の公式を使いたいとき、区間の端に寄せた節点を自分で並べたいときがこれに当たる。
+このページでは評価点と節点を固定する Plan `PhysicalDifferencePlan`、変位を持つ節点を指定する差分法オブジェクト `RelativeDifference`、ワンショット関数 `physical_difference_derivative` の仕様を説明し、ヘッセ行列とスカラーの導関数で評価回数と誤差を実測する。
+固定刻みの差分 `FiniteDifference` と違い、節点の位置と数は呼び出し側が決めるので、既定の刻みも、区間の端で節点を選び直す処理もない。
+
+## 演算と選択肢
+
+`PhysicalDifferencePlan` と `RelativeDifference` は計算する導関数を [`DerivativeOperation`](https://docs.rs/scioxide-differentiate/0.1.0/scioxide_differentiate/enum.DerivativeOperation.html) で選ぶ。
+一階（`First`、`Gradient`、`Jacobian`）、二階（`Second`）、ヘッセ行列（`Hessian`）を扱い、方向微分は扱わない。
+方向微分には `AdaptiveDifference::jvp` か `ComplexStep::jvp` を使うか、$t \mapsto f(\mathbf{x} + t \mathbf{v})$ をこれらで一階微分する。
+`First` と `Second` は入力と出力が 1 次元、`Gradient` と `Hessian` は出力が 1 次元の関数に限られ、合わなければ `new` が `InvalidInput`（`operation`、`UnsupportedConfiguration`）を返す。
+出力の並びは行優先で、ヤコビ行列の $\partial f_i / \partial x_j$ は位置 $i n + j$ にある（[演算と出力の配置](oxref:differentiate-operations-layout)）。
+実数だけでなく複素数の値を返す関数も微分でき、実部と虚部を実数の座標で別々に微分する。
+
+実行の方針、評価回数と反復回数の上限、作業領域の上限は [`NodeDifferenceOptions`](https://docs.rs/scioxide-differentiate/0.1.0/scioxide_differentiate/struct.NodeDifferenceOptions.html) の `with_execution`、`with_budgets`、`with_max_workspace_bytes` で指定する。
+既定は逐次実行で、評価回数と反復回数の上限も作業領域の上限もない。
+刻みや差分公式の設定は持たない。
+
+## 評価点と節点を固定する Plan
+
+[`PhysicalDifferencePlan`](https://docs.rs/scioxide-differentiate/0.1.0/scioxide_differentiate/struct.PhysicalDifferencePlan.html)`::new(operation, point, nodes, outputs, options)` は、評価点 `point` と、座標ごとの節点の物理的な位置 `nodes` を作成時に固定する。
+座標ごとの一階の重みと、`Second` と `Hessian` では二階の重みも、作成時に [Fornberg の漸化式](oxref:differentiate-fornberg) で一度だけ作る。
+重みを作る演算は、節点が $k$ 個の座標で $O(k^2)$ である。
+所有値を返す API `evaluate(f, bounds)` と出力先を指定する API `evaluate_into(f, bounds, out, workspace, scope)` は評価点を受け取らず、作成時の点で評価する。
+固定した格子の上の計算に向き、別の点では節点を置き直して Plan を作り直す。
+
+## 変位を持つ節点を指定する差分法オブジェクト
+
+[`RelativeDifference`](https://docs.rs/scioxide-differentiate/0.1.0/scioxide_differentiate/struct.RelativeDifference.html)`::new(operation, offsets, outputs, options)` は、座標ごとの変位 $\Delta$ の並び `offsets` を保持する。
+変位 0 は評価点そのものを表す。
+`evaluate(f, x, bounds)` と `evaluate_into(f, x, bounds, out, workspace, scope)` は評価のたびに節点を $x_i + \Delta$ に置き直す。
+置き直した節点は丸めを含むので、重みは評価のたびに丸めたあとの変位から作り直す。
+この作り直しは座標ごとに $O(k^2)$ の演算（$k$ は変位の数）で、作業領域の中で行うので確保しない。
+点を動かしながら同じ形の公式を使う計算（最適化や時間発展の各段）に向く。
+
+作業領域の要件と事前確保は、どちらも `workspace_requirements::<T>(())` と `workspace::<T>(())` で、関数の値の型 `T` ごとに求める（[Plan・要件・作業領域](oxref:differentiate-plans-requirements)）。
+
+## 作成時と評価時の検査
+
+`new` は次の点を検査する。
+座標ごとの節点（変位）の数は一階で 2 個以上、`Second` と `Hessian` で 3 個以上必要で、足りなければ `InvalidInput`（`nodes` または `offsets`、`OutOfRange`）になる。
+重複した節点（変位）は `InvalidInput`（`Inconsistent`）で拒む。
+`PhysicalDifferencePlan` の評価点と節点、`RelativeDifference` の変位が有限でなければ `NonFinite` になる。
+`PhysicalDifferencePlan` では、節点の並びの数が評価点の次元と違えば `DimensionMismatch` になる。
+
+どちらも区間に合わせて節点を動かすことはなく、区間 `bounds` の外の節点は関数を呼ぶ前に拒む。
+`PhysicalDifferencePlan` では、評価点が区間の外にあれば `InvalidInput`（`bounds`、`OutOfRange`）、節点が外にあれば `InvalidInput`（`bounds`、`UnsupportedConfiguration`）になる。
+`RelativeDifference` は評価点を評価のたびに検査し、有限でなければ `NonFinite`、区間の外にあれば `InvalidInput`（`x`、`OutOfRange`）になる。
+置き直した節点が有限でないか、区間の外に出るか、丸めでほかの節点や評価点に重なれば、`InvalidInput`（`x`、`UnsupportedConfiguration`）になる。
+区間の端の近くでは、端を越えない変位を呼び出し側が選ぶ（[定義域の境界と片側差分](../bounds-and-one-sided/)）。
+
+## 精度・評価回数・終了理由
+
+各座標の公式は、その座標の節点が $k$ 個なら $k - 1$ 次以下の多項式を正確に微分する。
+間隔 $h$ の節点による $d$ 階の導関数の打ち切り誤差は $O(h^{k - d})$ で、評価点について対称な節点では次数が上がることがある（[モーメント条件](oxref:differentiate-moment-conditions)）。
+関数値の丸め誤差は重みの絶対値の和だけ拡大するので、$h$ を小さくしすぎると誤差は増える（[重みの絶対値の和とノイズの拡大](oxref:differentiate-noise-amplification)）。
+
+評価回数は節点の数で決まり、`base` のような既知の値を渡す引数はない。
+一階では座標ごとの節点の数 $k_i$ の和 $\sum_i k_i$ 回である。
+軸をまたいだ再利用はしないので、変位 0 の節点は軸ごとに評価される。
+
+ヘッセ行列は対角を二階のステンシルで、混合項を二つの軸の一階のステンシルのテンソル積で作り、上三角を計算して鏡映する。
+混合項 $H_{ij}$ は $k_i k_j$ 個の点の値を使う。
+同じ評価の中では評価点と軸の上の点（一つの座標だけを動かした点）の値を覚えておき、ビット単位で等しい点を二度評価しない。
+すべての軸の節点が評価点を含むときは、評価点と軸の上の点を混合項で使い回すので、回数は次のようになる。
+
+$$
+1 + \sum_i (k_i - 1) + \sum_{i < j} (k_i - 1)(k_j - 1).
+$$
+
+評価点を含まない軸があると、使い回せる点が減って回数は増える。
+
+推定誤差は返さず、予定した評価を終えると終了理由は `Completed` になる。
+この終了理由は予定した評価を終えたことだけを表し、精度を主張しない。
+評価回数の上限に達したときなどの終了理由と出力への反映の規則は [失敗したときの出力](oxref:differentiate-failure-outputs) にある。
+
+## ヘッセ行列の実測
+
+被微分関数を $f(x, y) = e^{x} \sin y$ とする。
+厳密なヘッセ行列は次のとおりである。
+
+$$
+\mathbf{H} = \begin{pmatrix} e^x \sin y & e^x \cos y \\ e^x \cos y & -e^x \sin y \end{pmatrix}.
+$$
+
+各軸に 5 点の節点 $\{-2h, -h, 0, h, 2h\}$ を置くと、対角は 5 点の二階の公式、混合項は 5 点の一階の公式のテンソル積になる。
+一階の導関数を 5 点の中心差分で近似したときの誤差の主項は $-h^4 f^{(5)} / 30$ である。
+混合項はこの公式を $x$ 方向と $y$ 方向に続けて掛けたものなので、主項は二つの方向の主項の和になる。
+
+$$
+H_{01} - \partial_x \partial_y f \approx -\frac{h^4}{30} \left( \partial_x^5 \partial_y f + \partial_x \partial_y^5 f \right) = -\frac{h^4}{15} e^x \cos y .
+$$
+
+対角の主項 $-h^4 f^{(6)} / 90$ はこれより小さいので、最大誤差はふつう混合項で決まる。
+次の定義のブロックには、被微分関数 `surface` と検算に使う厳密な導関数を置く。
+
+```rust
+//| id: differentiate-node-surface-model
+//| kind: definitions
+//| title: 被微分関数 f(x, y) = e^x sin y と厳密な導関数
+//| crates: [scioxide-core]
+use scioxide_core::RealScalar;
+
+/// 被微分関数 f(x, y) = e^x sin y。SciOxide の関数で評価する。
+pub(crate) fn surface(x: f64, y: f64) -> f64 {
+    RealScalar::exp(x) * RealScalar::sin(y)
+}
+
+/// 厳密なヘッセ行列（行優先）。参照値（f64 の固有メソッド）。
+pub(crate) fn exact_hessian(x: f64, y: f64) -> [f64; 4] {
+    let (s, c) = y.sin_cos();
+    let g = x.exp();
+    [g * s, g * c, g * c, -g * s]
+}
+
+/// 厳密な偏導関数 ∂f/∂x = e^x sin y。参照値（f64 の固有メソッド）。
+pub(crate) fn exact_slope(x: f64, y: f64) -> f64 {
+    x.exp() * y.sin()
+}
+```
+
+次のセルはこのヘッセ行列を `RelativeDifference` と `PhysicalDifferencePlan` で 2 つの点 $(0.2, 0.4)$ と $(0.5, 1.0)$ について計算する。
+`RelativeDifference` は同じ手法オブジェクトを 2 つの点で使い、`PhysicalDifferencePlan` は点ごとに節点を置いて Plan を作り直す。
+表には評価回数と上の式による理論の回数、最大誤差、混合項 $H_{01}$ の誤差とその主項の予測を並べる。
+厳密値と主項の予測は f64 の固有メソッドで作った参照値である。
+
+```rust
+//| id: differentiate-node-plans
+//| ref: differentiate-node-plans
+//| title: 物理的な節点と変位の節点によるヘッセ行列と点の置き直し
+//| run: reactive
+//| uses: [differentiate-node-surface-model]
+//| crates: [scioxide-core, scioxide-differentiate]
+//| inputs:
+//|   spacing: {"type":"select","label":"節点の間隔 h","options":["0.001","0.01","0.1"],"value":"0.01"}
+//| cases:
+//|   - {"id":"coarse","label":"h = 0.1","description":"打ち切り誤差が h⁴ に比例して 10⁴ 倍になり、主項の予測と一致したまま 10⁻⁶ の大きさになる。","inputs":{"spacing":"0.1"}}
+//|   - {"id":"fine","label":"h = 0.001","description":"打ち切りの主項は 10⁻¹³ に下がるが、二階差分の丸め誤差が現れて誤差は予測を上回る。","inputs":{"spacing":"0.001"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"hessian","path":"/rows/0/3","equals":25}
+//|       - {"artifact":"hessian","path":"/rows/0/4","equals":25}
+//|       - {"artifact":"hessian","path":"/rows/2/3","equals":25}
+//|       - {"artifact":"hessian","path":"/rows/0/6","approx":{"value":-7.49991e-10,"rtol":0.01}}
+//|       - {"artifact":"hessian","path":"/rows/1/6","approx":{"value":-5.93872e-10,"rtol":0.01}}
+//|       - {"artifact":"hessian","path":"/rows/3/5","range":{"max":8e-10}}
+//|   - case: coarse
+//|     expect:
+//|       - {"artifact":"hessian","path":"/rows/0/6","approx":{"value":-7.49991e-6,"rtol":0.02}}
+//|       - {"artifact":"hessian","path":"/rows/3/6","approx":{"value":-5.93872e-6,"rtol":0.02}}
+//|   - case: fine
+//|     expect:
+//|       - {"artifact":"hessian","path":"/rows/1/5","range":{"min":7e-11,"max":8.2e-10}}
+use scioxide_core::SciOxideError;
+use scioxide_differentiate::{
+    DerivativeOperation, NodeDifferenceOptions, PhysicalDifferencePlan, RelativeDifference,
+};
+
+let h: f64 = spacing.parse().map_err(|_| "間隔を読めない")?;
+let f = |p: &[f64], y: &mut [f64]| {
+    y[0] = surface(p[0], p[1]);
+    Ok::<(), SciOxideError>(())
+};
+let offsets = [-2.0 * h, -h, 0.0, h, 2.0 * h];
+// すべての軸が評価点を含むときの評価回数 1 + Σ(k_i − 1) + Σ_{i<j}(k_i − 1)(k_j − 1)。
+let k = offsets.len() - 1;
+let theory = 1 + 2 * k + k * k;
+// 行: (方法, x, y, 評価回数, 理論の回数, 最大誤差, H₀₁ の誤差, H₀₁ の主項の予測)。
+let row = |name: &'static str, point: [f64; 2], hessian: &[f64], evaluations: usize| {
+    let reference = exact_hessian(point[0], point[1]);
+    let errors: Vec<f64> = hessian.iter().zip(reference).map(|(a, b)| a - b).collect();
+    let max_error = errors.iter().fold(0.0_f64, |m, e| m.max(e.abs()));
+    // 混合項の主項 −h⁴ e^x cos y / 15。
+    let predicted = -h.powi(4) * reference[1] / 15.0;
+    (
+        name,
+        point[0],
+        point[1],
+        evaluations,
+        theory,
+        max_error,
+        errors[1],
+        predicted,
+    )
+};
+let points = [[0.2_f64, 0.4], [0.5, 1.0]];
+// RelativeDifference は変位だけを持つので、同じ手法オブジェクトを別の点で使える。
+let relative = RelativeDifference::new(
+    DerivativeOperation::Hessian,
+    &[&offsets, &offsets],
+    1,
+    NodeDifferenceOptions::default(),
+)
+.map_err(|e| e.to_string())?;
+let mut rows = Vec::new();
+for point in points {
+    let result = relative
+        .evaluate(f, &point, None)
+        .map_err(|e| e.to_string())?;
+    let hessian = result.values().ok_or("ヘッセ行列が出力に反映されない")?;
+    rows.push(row(
+        "RelativeDifference",
+        point,
+        hessian,
+        result.report().evaluations(),
+    ));
+}
+// PhysicalDifferencePlan は評価点を作成時に固定するので、点ごとに節点を置いて作る。
+for point in points {
+    let nodes_x: Vec<f64> = offsets.iter().map(|d| point[0] + d).collect();
+    let nodes_y: Vec<f64> = offsets.iter().map(|d| point[1] + d).collect();
+    let physical = PhysicalDifferencePlan::new(
+        DerivativeOperation::Hessian,
+        &point,
+        &[&nodes_x, &nodes_y],
+        1,
+        NodeDifferenceOptions::default(),
+    )
+    .map_err(|e| e.to_string())?;
+    let result = physical.evaluate(f, None).map_err(|e| e.to_string())?;
+    let hessian = result.values().ok_or("ヘッセ行列が出力に反映されない")?;
+    rows.push(row(
+        "PhysicalDifferencePlan",
+        point,
+        hessian,
+        result.report().evaluations(),
+    ));
+}
+let (fixed2, sci3) = (
+    serde_json::json!({ "fractionDigits": 2 }),
+    serde_json::json!({ "notation": "scientific", "significantDigits": 3 }),
+);
+let columns = serde_json::json!([
+    { "key": "0", "label": "方法" },
+    { "key": "1", "label": "評価点 x [-]", "type": "number", "format": fixed2 },
+    { "key": "2", "label": "評価点 y [-]", "type": "number", "format": fixed2 },
+    { "key": "3", "label": "評価回数 [回]", "type": "integer" },
+    { "key": "4", "label": "理論の回数 [回]", "type": "integer" },
+    { "key": "5", "label": "最大誤差 [-]", "type": "number", "format": sci3 },
+    { "key": "6", "label": "H₀₁ の誤差 [-]", "type": "number", "format": sci3 },
+    { "key": "7", "label": "H₀₁ の主項の予測 [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "hessian" })
+);
+```
+
+既定の $h = 0.01$ ではどちらの方法もヘッセ行列を 25 回の評価で計算し、理論の回数 $1 + 4 + 4 + 16 = 25$ と一致する。
+最大誤差は混合項 $H_{01}$ の誤差で、点 $(0.2, 0.4)$ で $-7.50 \times 10^{-10}$、点 $(0.5, 1.0)$ で $-5.94 \times 10^{-10}$ になり、主項の予測 $-h^4 e^x \cos y / 15$ と有効数字 3 桁で一致する。
+`RelativeDifference` は同じ手法オブジェクトを 2 つの点で使い、点ごとに作り直した `PhysicalDifferencePlan` と同じ値を返す。
+どちらも節点を $x_i + \Delta$ と同じ順序で丸めるので、重みも同じになる。
+
+$h = 0.1$（ケース coarse）では、誤差は $h^4$ に比例して $10^4$ 倍の $-7.50 \times 10^{-6}$ と $-5.94 \times 10^{-6}$ になり、主項の予測と一致したままである。
+$h = 0.001$（ケース fine）では打ち切りの主項は $10^{-13}$ の大きさに下がるが、誤差は予測を大きく上回る。
+5 点の二階差分の重み $(-1, 16, -30, 16, -1)/(12 h^2)$ の絶対値の和は $64/(12 h^2)$ なので、丸めの目安 $u \lvert f \rvert \cdot 64/(12 h^2)$ は点 $(0.5, 1.0)$ で $8 \times 10^{-10}$ になる。
+この点の最大誤差 $5.0 \times 10^{-10}$ は対角要素の誤差で、目安以下の丸め誤差である（[丸め誤差・ノイズと最適な刻み幅](../roundoff-and-noisy-functions/)）。
+
+## スカラー関数のワンショット関数
+
+スカラー関数の一階導関数だけなら、ワンショット関数 [`physical_difference_derivative`](https://docs.rs/scioxide-differentiate/0.1.0/scioxide_differentiate/fn.physical_difference_derivative.html)`(f, x, nodes)` が使える。
+`f` は `Fn(S) -> Result<T, SciOxideError>` で、値は実数でも複素数でもよい。
+物理的な節点の位置を受け取り、`PhysicalDifferencePlan` を既定の選択肢で作って一度だけ評価し、値だけを返す。
+節点は評価点を含まなくてもよく、節点が 2 個未満なら `InvalidInput`（`nodes`、`OutOfRange`）になる。
+変位の節点にはワンショット関数がないので、`RelativeDifference` を `First` で作って `evaluate` を呼ぶ。
+
+評価点について対称な 5 点 $\{-2h, -h, 0, h, 2h\}$ の一階の公式では、評価点の重みは対称性で 0 になる。
+評価点を除いた 4 点 $\{-2h, -h, h, 2h\}$ の一階の公式は、モーメント条件の解が一意なので、5 点の公式と同じ重みを持つ。
+4 点では $N - m = 3$ が奇数で、対称性により次数が 1 つ上がって 4 になる（[モーメント条件](oxref:differentiate-moment-conditions)）。
+評価点の値は重みが 0 でも評価されるので、4 点にすれば評価を 1 回省いて同じ精度を得られる。
+
+次のセルは $g(x) = f(x, 0.4) = e^x \sin 0.4$ の $x = 0.2$ での導関数を `physical_difference_derivative` と一階の `RelativeDifference` で計算し、主項 $-h^4 g^{(5)}(0.2) / 30$ と比べる。
+節点の入力で、評価点を含む 5 点と含まない 4 点を切り替える。
+値だけを返す `physical_difference_derivative` の評価回数は関数の呼び出しを数えて求める。
+
+```rust
+//| id: differentiate-node-scalar-derivative
+//| ref: differentiate-node-scalar-derivative
+//| title: ワンショット関数と変位の節点によるスカラーの導関数と評価回数
+//| run: reactive
+//| uses: [differentiate-node-surface-model]
+//| crates: [scioxide-core, scioxide-differentiate]
+//| inputs:
+//|   spacing: {"type":"select","label":"節点の間隔 h","options":["0.001","0.01","0.1"],"value":"0.01"}
+//|   layout: {"type":"select","label":"節点","description":"評価点からの変位の集合。","options":["5 点 {−2h, −h, 0, h, 2h}","4 点 {−2h, −h, h, 2h}"],"value":"5 点 {−2h, −h, 0, h, 2h}"}
+//| cases:
+//|   - {"id":"without-center","label":"評価点を含まない 4 点","description":"評価点の重みは 0 なので、評価点を除くと評価が 1 回減り、誤差の主項は変わらない。","inputs":{"layout":"4 点 {−2h, −h, h, 2h}"}}
+//|   - {"id":"coarse","label":"h = 0.1","description":"誤差が h⁴ に比例して 10⁴ 倍になり、主項の予測と一致したまま 10⁻⁶ の大きさになる。","inputs":{"spacing":"0.1"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"scalar","path":"/rows/0/1","equals":5}
+//|       - {"artifact":"scalar","path":"/rows/1/1","equals":5}
+//|       - {"artifact":"scalar","path":"/rows/0/2","approx":{"value":-1.58546e-10,"rtol":0.02}}
+//|       - {"artifact":"scalar","path":"/rows/1/2","approx":{"value":-1.58546e-10,"rtol":0.02}}
+//|   - case: without-center
+//|     expect:
+//|       - {"artifact":"scalar","path":"/rows/0/1","equals":4}
+//|       - {"artifact":"scalar","path":"/rows/1/1","equals":4}
+//|       - {"artifact":"scalar","path":"/rows/0/2","approx":{"value":-1.58546e-10,"rtol":0.02}}
+//|   - case: coarse
+//|     expect:
+//|       - {"artifact":"scalar","path":"/rows/0/2","approx":{"value":-1.58546e-6,"rtol":0.02}}
+use scioxide_core::SciOxideError;
+use scioxide_differentiate::{
+    DerivativeOperation, NodeDifferenceOptions, RelativeDifference,
+    physical_difference_derivative,
+};
+
+let h: f64 = spacing.parse().map_err(|_| "間隔を読めない")?;
+let offsets: Vec<f64> = if layout.starts_with("4") {
+    vec![-2.0 * h, -h, h, 2.0 * h]
+} else {
+    vec![-2.0 * h, -h, 0.0, h, 2.0 * h]
+};
+let (x0, y0) = (0.2_f64, 0.4_f64);
+// g(x) = f(x, 0.4)。値だけを返すワンショット関数の評価回数を、呼び出しを数えて求める。
+let calls = std::cell::Cell::new(0_usize);
+let g = |x: f64| {
+    calls.set(calls.get() + 1);
+    Ok::<f64, SciOxideError>(surface(x, y0))
+};
+let nodes: Vec<f64> = offsets.iter().map(|d| x0 + d).collect();
+let by_nodes: f64 = physical_difference_derivative(g, x0, &nodes).map_err(|e| e.to_string())?;
+let physical_calls = calls.get();
+let first = RelativeDifference::new(
+    DerivativeOperation::First,
+    &[&offsets],
+    1,
+    NodeDifferenceOptions::default(),
+)
+.map_err(|e| e.to_string())?;
+let sample = |x: &[f64], y: &mut [f64]| {
+    y[0] = surface(x[0], y0);
+    Ok::<(), SciOxideError>(())
+};
+let by_offsets = first
+    .evaluate(sample, &[x0], None)
+    .map_err(|e| e.to_string())?;
+let value = by_offsets.values().ok_or("導関数が公開されない")?[0];
+// 参照値: g′(0.2) = e^0.2 sin 0.4 と主項 −h⁴ g⁽⁵⁾(0.2) / 30（g⁽⁵⁾ = g′）。
+let reference = exact_slope(x0, y0);
+let predicted = -h.powi(4) * reference / 30.0;
+let rows = vec![
+    (
+        "physical_difference_derivative",
+        physical_calls,
+        by_nodes - reference,
+        predicted,
+    ),
+    (
+        "RelativeDifference（First）",
+        by_offsets.report().evaluations(),
+        value - reference,
+        predicted,
+    ),
+];
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "呼び出し" },
+    { "key": "1", "label": "評価回数 [回]", "type": "integer" },
+    { "key": "2", "label": "g′(0.2) の誤差 [-]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "主項の予測 [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "scalar" })
+);
+```
+
+既定の $h = 0.01$ と 5 点では、どちらの呼び出しも評価回数は 5 回で、誤差 $-1.59 \times 10^{-10}$ は主項 $-h^4 g^{(5)}(0.2)/30$ と有効数字 3 桁で一致する。
+評価点を含まない 4 点（ケース without-center）では評価回数が 4 回に減り、誤差は 5 点との差が $1.1 \times 10^{-16}$ の丸めの範囲で同じ $-1.59 \times 10^{-10}$ になる。
+$h = 0.1$（ケース coarse）では誤差は $10^4$ 倍の $-1.59 \times 10^{-6}$ で、主項の予測との差は 0.1 % である。
+
+## まとめ
+
+関数を呼べて節点を自分で選びたいときは、評価点を固定するなら Plan `PhysicalDifferencePlan`、点を動かしながら同じ変位を使い回すなら節点を指定する差分法オブジェクト `RelativeDifference` を使う。
+どちらも演算を `DerivativeOperation` で選び、節点の数と重複を作成時に、区間の外の節点を関数を呼ぶ前に検査し、区間に合わせて節点を動かすことはない。
+評価回数は節点の数で決まり、すべての軸が評価点を含むヘッセ行列では評価点と軸の上の点を使い回すので $1 + \sum_i (k_i - 1) + \sum_{i<j} (k_i - 1)(k_j - 1)$ 回になる。
+推定誤差は返らず、終了理由 `Completed` は精度を主張しないので、誤差は主項 $O(h^{k-d})$ と重みの絶対値の和による丸め誤差の目安で見積もる。
+スカラー関数の一階導関数にはワンショット関数 `physical_difference_derivative` を使い、対称な節点では重みが 0 になる評価点を除いて評価を減らせる。
+
+## 次に読むページ
+
+- [差分ステンシルの重みと任意の節点](../stencil-weights/)：節点から重みを作るモーメント条件と Fornberg の漸化式、誤差の主項とノイズの拡大を確かめる。
+- [定義域の境界と片側差分](../bounds-and-one-sided/)：区間の端の近くで固定刻みと適応差分が節点をどう選ぶかを確かめ、節点を指定する差分で自分が選ぶ節点と比べる。
+- [Plan・要件・作業領域の再利用](../plans-workspaces-and-reports/)：Plan と節点を指定する差分法オブジェクトの作業領域を事前確保し、出力先を指定する API `evaluate_into` で確保せずに評価する手順を確かめる。

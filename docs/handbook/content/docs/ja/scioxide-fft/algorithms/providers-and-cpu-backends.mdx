@@ -1,0 +1,273 @@
+---
+title: 外部 FFT 実装と CPU 命令セット
+description: FftProvider による外部 FFT 実装の注入、SciOxide が確かめることと実装者が守ること、プロバイダーのリソースの上限、CPU の命令セットと実行方針の選択を説明する。
+sidebar:
+  order: 313
+references:
+  fft-providers: "外部-fft-実装の注入"
+  fft-provider-contract: "scioxide-が確かめることと実装者の責任"
+  fft-provider-limits: "リソースの上限"
+  fft-execution-environment: "cpu-の命令セットと実行方針"
+---
+
+[FFT の Plan・作業領域・キャッシュ](../plans-workspaces-and-providers/)では、Plan をコンテキストから準備し、準備のあとはコンテキストを持たないことを見た。
+このページでは準備のコンテキストに外部の FFT 実装を入れて、Plan の中の複素 FFT をその実装に任せる方法を説明する。
+外部のライブラリやアクセラレータを使う読者は、SciOxide が確かめることと実装者が守ることの境目を確かめてほしい。
+最後に、SciOxide 自身の CPU 実装の命令セットと実行方針の選び方を説明する。
+
+## 外部 FFT 実装の注入
+
+外部の FFT を使うときは、`FftProvider` を実装し、`FftPlanningContext::with_provider(execution, provider, policy)` で準備のコンテキストに入れて、`build` や `cache.plan` に渡す。
+コンテキストはプロバイダーを借用するので、プロバイダーより長く生きられない。
+Plan はコンテキストを保持しないので、準備した Plan もプロバイダーの参照を持たない。
+外部の実装が準備した状態は `Arc<dyn FftProviderPlan<S>>` として Plan が共有し、実行時の作業領域は呼び出し側が渡す。
+
+Plan が含む長さ 2 以上の複素 FFT は、先にプロバイダーへ渡される。
+実数・多次元・DCT と DST・チャープ Z 変換・非一様 Fourier 変換・FFTLog の内側の複素 FFT も対象で、どの変換の `build` にも同じコンテキストを渡せる。
+プロバイダーが断った長さを CPU 実装の Rader や Bluestein で計算するとき、その内側の畳み込みの FFT はプロバイダーに渡らない。
+
+- `FftProvider::prepare(length, policy, limits, context)` は、その長さの両方向の無尺度の変換を準備して `Ok(Some(plan))` を返すか、`Ok(None)` でその長さを断る。
+  `Err` は準備の失敗としてそのまま呼び出し側へ返り、CPU 実装での計算に切り替わることはない。
+- `FftProviderPolicy::Preferred` は断られた長さを SciOxide の CPU 実装で準備し、`Required` は `InvalidInput`（`UnsupportedConfiguration`）にする。
+  断られた長さに使う CPU 実装は、仕様の `FftBackendStrategy` で選ぶ。
+- `FftProviderPlan::execute(direction, data, scratch, context)` は、その場で無尺度の DFT を計算する。
+  指数の符号は `Forward` で $-$、`Inverse` で $+$ で、[DFT の定義](oxref:fft-dft-definition)と同じである。
+- `workspace_len()` は要る作業領域の複素数の個数、`plan_bytes()` は保持するバイト数、`preparation_bytes()` は準備中に同時に保持するメモリの最大バイト数（`plan_bytes()` 以上）を提示する。
+- `diagnostics()` は Plan の診断に出す値で、`FftPlanDiagnostics::for_provider(stage_count)` で作る。
+  このとき Plan の `diagnostics().algorithm()` は `Provider`、`resolved_backends()` は `FftBackend::Provider` を返す。
+
+## SciOxide が確かめることと実装者の責任
+
+外部の実装と SciOxide の間では、確かめる側が項目ごとに決まっている。
+SciOxide が行うのは次のことである。
+
+- プロバイダーを呼ぶ前と、`prepare` が戻ったあとに、取り消しと期限を確かめる（`ExecutionStopped`）。
+- 断られた長さを `FftProviderPolicy` に従って CPU 実装で準備するか、`InvalidInput` にする。
+- 提示された作業領域とメモリ使用量を上限と比べる（[リソースの上限](#リソースの上限)）。
+- 実行の前に入力を 2 のべきで縮め、実行のあとで尺度を戻して正規化の係数を掛ける。
+- 結果の NaN と無限大を `NonFinite`（由来は `Callback`）として返す。
+- `execute` が返した `Err` はそのまま呼び出し側へ返し、`data` の中身は捨てる。
+  どの失敗でも、呼び出し側の出力は変えない。
+
+実装者は次のことを守る必要があり、SciOxide はこれらを確かめない。
+
+- `execute` は無尺度の DFT を上の符号の規約どおりに計算する。
+  結果の精度は検査されない。
+- `FftProviderPlan` は `Send + Sync` で複数のスレッドから共有されるので、実行中に確保や状態の変更をしない。
+- 準備した Plan は状態をすべて自分で所有し、準備に使ったコンテキストを保持しない。
+- `execute` は作業領域の中身が入るときに不定であることを前提にする。
+- `execute` はどの実行コンテキスト（`ExecutionContext::sequential()` を含む）でも受け付け、戻る前にすべての作業を終える。
+  プロセッサの要件は準備のときに確かめる。
+- `prepare` は確保の前に `limits` を守り、`context` が示す機能だけを使う。
+
+SciOxide の CPU 実装について[計算コストと丸め誤差](oxref:fft-cost-and-accuracy)で述べた試験の範囲は、外部の実装には当てはまらない。
+外部の実装を使う Plan の精度は、その実装の精度で決まる。
+
+## リソースの上限
+
+`FftProviderLimits` はプロバイダーの `preparation_bytes`（準備中に同時に保持するメモリのバイト数）と `workspace_bytes`（準備した Plan が要する作業領域のバイト数）の上限で、既定はどちらも `usize::MAX` である。
+`with_provider_limits` は上限を今の値との小さい方に置き換えるので、重ねて呼んでも狭まるだけである。
+プロバイダーは確保の前に上限を守る責任を持ち、SciOxide は準備のあとで提示された大きさを確かめ直す。
+提示内容が上限を超えれば `ResourceLimit`、`preparation_bytes()` が `plan_bytes()` より小さければ `InvalidInput`（`OutOfRange`）になる。
+準備した Plan の `workspace_requirements(()).byte_limit()` はプロバイダーの部分にこの上限を当て、SciOxide 自身が使う部分の大きさを足した値になる。
+
+次のセルは長さ 8 の無尺度の SciOxide の Plan の対を外部ライブラリの代わりに包んだプロバイダーを作る。
+プロバイダーは長さ 8 だけを引き受け、準備ずみの状態を共有するので新しいメモリ領域を確保しない。
+長さ 8 の複素変換、長さ 6 の複素変換、長さ 16 の実数変換（内側は長さ 8 の複素 FFT）の Plan を、選んだ方針で準備する。
+すべて 1 の列を `Orthonormal` で変換すると DC のビンは $\sqrt N$ になるので、それを独立な検算にする。
+上限を厳しくする場合は、プロバイダーの作業領域（16 個の複素数、256 バイト）より小さい 64 バイトを `workspace_bytes` に与える。
+
+```rust
+//| id: fft-provider-fallback
+//| ref: fft-provider-fallback
+//| title: 外部実装の方針と上限で準備の結果がどう変わるかを確かめる
+//| run: reactive
+//| crates: [scioxide-core, scioxide-fft]
+//| inputs:
+//|   policy: {"type":"select","label":"FftProviderPolicy","description":"プロバイダーが断った長さの扱いを選ぶ。","options":["Preferred","Required"],"value":"Preferred"}
+//|   tight_limit: {"type":"checkbox","label":"workspace_bytes を 64 バイトに制限する","value":false}
+//| cases:
+//|   - {"id":"required","label":"Required","description":"プロバイダーが断る長さ 6 の準備が InvalidInput になる。","inputs":{"policy":"Required"}}
+//|   - {"id":"tight-limit","label":"上限 64 バイト","description":"プロバイダーが引き受けた長さの準備が ResourceLimit になる。","inputs":{"tight_limit":true}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"provider","path":"/rows/0/2","equals":"Provider"}
+//|       - {"artifact":"provider","path":"/rows/1/2","equals":"Cpu(Scalar)"}
+//|       - {"artifact":"provider","path":"/rows/2/2","equals":"Provider"}
+//|       - {"artifact":"provider","path":"/rows/0/4","approx":{"value":2.8284271247461903,"rtol":1e-14}}
+//|       - {"artifact":"provider","path":"/rows/2/4","approx":{"value":4,"rtol":1e-14}}
+//|   - case: required
+//|     expect:
+//|       - {"artifact":"provider","path":"/rows/1/2","equals":"InvalidInput"}
+//|       - {"artifact":"provider","path":"/rows/1/4","equals":null}
+//|   - case: tight-limit
+//|     expect:
+//|       - {"artifact":"provider","path":"/rows/0/2","equals":"ResourceLimit"}
+//|       - {"artifact":"provider","path":"/rows/1/2","equals":"Cpu(Scalar)"}
+use scioxide_core::{Complex, ExecutionContext, ExecutionPolicy, SciOxideError};
+use scioxide_fft::{
+    FftDirection, FftLayout, FftPlan, FftPlanDiagnostics, FftPlanSpec, FftPlanningContext,
+    FftProvider, FftProviderLimits, FftProviderPlan, FftProviderPolicy, HermitianSpectrum,
+    Normalization,
+};
+use std::sync::Arc;
+
+// 外部ライブラリの代わり: 長さ 8 の無尺度の Plan の対
+#[derive(Debug)]
+struct Pair {
+    forward: FftPlan<f64>,
+    inverse: FftPlan<f64>,
+    scratch: usize,
+}
+impl FftProviderPlan<f64> for Pair {
+    fn workspace_len(&self) -> usize {
+        self.scratch
+    }
+    fn plan_bytes(&self) -> usize {
+        self.forward.plan_bytes() + self.inverse.plan_bytes()
+    }
+    fn preparation_bytes(&self) -> usize {
+        self.plan_bytes()
+    }
+    fn diagnostics(&self) -> FftPlanDiagnostics {
+        FftPlanDiagnostics::for_provider(self.forward.diagnostics().stage_count())
+    }
+    fn execute(
+        &self,
+        direction: FftDirection,
+        data: &mut [Complex<f64>],
+        scratch: &mut [Complex<f64>],
+        context: ExecutionContext<'_>,
+    ) -> Result<(), SciOxideError> {
+        let plan = match direction {
+            FftDirection::Forward => &self.forward,
+            FftDirection::Inverse => &self.inverse,
+        };
+        plan.execute_in_place(data, scratch, context)
+    }
+}
+struct Adapter(Arc<Pair>);
+impl FftProvider<f64> for Adapter {
+    fn prepare(
+        &self,
+        length: usize,
+        _: ExecutionPolicy,
+        _: FftProviderLimits,
+        _: ExecutionContext<'_>,
+    ) -> Result<Option<Arc<dyn FftProviderPlan<f64>>>, SciOxideError> {
+        // 長さ 8 だけを引き受け、他は Ok(None) で断る。
+        // 準備ずみの状態を共有するだけなので、新しいメモリ領域を確保しない。
+        Ok((length == 8).then(|| Arc::clone(&self.0) as Arc<dyn FftProviderPlan<f64>>))
+    }
+}
+
+let cx = ExecutionContext::sequential();
+let unscaled = |direction| {
+    let spec = FftPlanSpec::new(8, direction, Normalization::Unscaled, FftLayout::Complex);
+    FftPlan::<f64>::build(spec, cx)
+};
+let forward = unscaled(FftDirection::Forward).map_err(|e| e.to_string())?;
+let scratch = forward
+    .workspace_requirements(())
+    .map_err(|e| e.to_string())?
+    .complex_len();
+let inverse = unscaled(FftDirection::Inverse).map_err(|e| e.to_string())?;
+let adapter = Adapter(Arc::new(Pair {
+    forward,
+    inverse,
+    scratch,
+}));
+let rule = if policy == "Required" {
+    FftProviderPolicy::Required
+} else {
+    FftProviderPolicy::Preferred
+};
+let limits = FftProviderLimits {
+    preparation_bytes: usize::MAX,
+    workspace_bytes: if tight_limit { 64 } else { usize::MAX },
+};
+let planning =
+    FftPlanningContext::with_provider(cx, &adapter, rule).with_provider_limits(limits);
+let mut rows = Vec::new();
+for (n, layout) in [
+    (8, FftLayout::Complex),
+    (6, FftLayout::Complex),
+    (16, FftLayout::Real),
+] {
+    let spec = FftPlanSpec::new(n, FftDirection::Forward, Normalization::Orthonormal, layout);
+    // 準備の失敗は行の結果として e.kind() で示す
+    let (outcome, dc) = match FftPlan::<f64>::build(spec, planning) {
+        Ok(plan) => {
+            let backends: Vec<String> =
+                plan.resolved_backends().map(|b| format!("{b:?}")).collect();
+            let mut work = plan.workspace(()).map_err(|e| e.to_string())?;
+            let dc = if layout == FftLayout::Complex {
+                let mut data = vec![Complex::new(1.0, 0.0); n];
+                plan.execute_in_place(&mut data, &mut work, cx)
+                    .map_err(|e| e.to_string())?;
+                data[0].re
+            } else {
+                let mut bins = HermitianSpectrum::zeros(n).map_err(|e| e.to_string())?;
+                plan.execute_into(&vec![1.0; n], &mut bins, &mut work, cx)
+                    .map_err(|e| e.to_string())?;
+                bins.bins()[0].re
+            };
+            (backends.join("、"), Some(dc))
+        }
+        Err(e) => (format!("{:?}", e.kind()), None),
+    };
+    rows.push((n, format!("{layout:?}"), outcome, (n as f64).sqrt(), dc));
+}
+let digits = serde_json::json!({ "significantDigits": 15 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "N", "type": "integer" },
+    { "key": "1", "label": "配置" },
+    { "key": "2", "label": "resolved_backends() またはエラーの分類" },
+    { "key": "3", "label": "検算 √N [-]", "type": "number", "format": digits },
+    { "key": "4", "label": "DC のビン [-]", "type": "number", "format": digits, "nullText": "準備せず" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "provider" })
+);
+```
+
+既定の `Preferred` では、長さ 8 の複素変換と、長さ 16 の実数変換の内側の長さ 8 の FFT が `Provider` になり、プロバイダーが断った長さ 6 は `Cpu(Scalar)` で準備される。
+DC のビンはどれも $\sqrt N$ と丸めの範囲で一致する（長さ 8 では 1 ulp の差）。
+プロバイダーは無尺度の結果を返し、`Orthonormal` の倍率 $1/\sqrt N$ は SciOxide が掛けている。
+`Required` にすると、長さ 6 の準備が `InvalidInput` になる。
+上限を 64 バイトにすると、プロバイダーが提示した作業領域 256 バイトが上限を超えるので、長さ 8 と 16 の準備が `ResourceLimit` になる。
+断られた長さ 6 は上限に関係なく CPU 実装で準備される。
+
+## CPU の命令セットと実行方針
+
+CPU の FFT 実装には移植可能なスカラー版、x86-64 の AVX2 と FMA、AArch64 の NEON がある。
+`FftBackendStrategy::Automatic` は、コンテキストがレポートすれば AVX2/FMA か NEON を、なければスカラー版を使う。
+`Required(backend)` はその実装を要求し、コンテキストが返しなければ準備が `InvalidInput`（`UnsupportedConfiguration`）で失敗する。
+外部の実装を持つコンテキストでは、要求した命令セットは断られた長さにだけ使うので、実際に CPU 実装を準備するときに初めて確かめる。
+AVX-512 の FFT 実装はないので、`Required(KernelBackend::Avx512)` は外部の実装の有無にかかわらず、どのホストでも失敗する。
+`std` の機能を外すと、`new` もスカラー版で準備する。
+
+実行方針（`ExecutionPolicy`）は、コンテキストの executor で並列に処理するかを決める。
+並列に処理するのは十分に長い複素 FFT の前半の段で、互いに独立な連続した区間を別々のワーカーが受け持つ。
+区間の分け方は Plan とワーカー数で決まるので、結果はスレッドの実行の順番に依らない。
+短い変換は方針にかかわらず逐次に計算する。
+
+本書のセルは wasm32 上で逐次に動き、`ExecutionContext::sequential()` で準備するのでスカラー版を使う。
+`usize` は 32 ビットである。
+ネイティブの環境で `FftPlan::new` を使うと AVX2/FMA などが選ばれ、丸めの順序が変わって結果の最下位の桁が変わりうる。
+
+## まとめ
+
+外部の FFT 実装は `FftPlanningContext::with_provider` で準備のときだけ借用され、Plan は準備した状態を `Arc` で共有する。
+断った長さの扱いは `FftProviderPolicy`、メモリ使用量は `FftProviderLimits` で決め、SciOxide は提示された大きさを準備のあとで確かめ直す。
+正規化、値の範囲の調整、非有限値の検出、失敗時に出力を守ることは SciOxide が行い、無尺度の DFT の正しさと精度、実行中に確保しないことは実装者が守る。
+CPU 実装の命令セットはコンテキストの機能から選ばれ、セルの結果はスカラー版の値である。
+
+## 次に読むページ
+
+- [FFT の Plan・作業領域・キャッシュ](../plans-workspaces-and-providers/) で、外部の実装を使わない Plan の作業領域とキャッシュの規則を確かめる。
+- [FFT のアルゴリズムと任意長変換](../planner-and-arbitrary-lengths/) で、プロバイダーが断った長さに使う CPU のアルゴリズムと、その試験した誤差の範囲を確かめる。
+- [API ガイド](../../api/) で、`FftProvider`、`FftProviderPlan`、`FftPlanningContext` などの型の一覧を確かめる。

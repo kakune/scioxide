@@ -1,0 +1,610 @@
+---
+title: "Molecular Superposition and RMSD"
+description: "Add known rotations, translations, and normal noise to experimental benzene, methane, ethanol, and carbon-dioxide structures, superimpose with Kabsch using uniform or atomic-mass weights, compare RMSD with linearized expectations and replicate means, and check planar rank 2 and linear-molecule errors."
+sidebar:
+  order: 430
+---
+
+Differences between molecular structures are often expressed by root-mean-square deviation (RMSD) of atomic positions after rotating and translating one to superimpose them.
+This compares crystal structures with computationally optimized structures or molecular-dynamics frames with a reference.
+This example adds known rigid transformations and noise modeling measurement errors to four experimentally determined small-molecule structures and superimposes them with `estimate_rigid_transform_with_options`.
+It compares RMSD with expectations derived from noise magnitude and examines planar and linear molecules.
+
+## Molecular coordinates and atomic masses
+
+Coordinates are experimental Cartesian structures [Å] from the NIST Computational Chemistry Comparison and Benchmark Database (CCCBDB).
+Sources of internal coordinates and bond lengths computed from the coordinates follow.
+
+| Molecule | Atoms | Shape | Coordinate-derived bond lengths [Å] | Internal-coordinate source (CCCBDB citation) |
+|---|---|---|---|---|
+| Benzene C₆H₆ | 12 | Planar ($D_{6h}$) | C–C 1.397, C–H 1.084 | Herzberg (1966) |
+| Methane CH₄ | 5 | Regular tetrahedron ($T_d$) | C–H 1.087 | Hirota (1979) |
+| Ethanol C₂H₅OH | 9 | Trans conformation (C–C–O–H 180°) | C–C 1.512, C–O 1.431, O–H 0.971, C–H 1.086–1.098 | Coussan et al. (1998) |
+| Carbon dioxide CO₂ | 3 | Linear ($D_{\infty h}$) | C–O 1.162 | Herzberg (1966) |
+
+Use abridged IUPAC standard atomic weights: H 1.008, C 12.011, O 15.999.
+Atomic-mass weighting makes the weighted centroid the center of mass.
+
+## Observation model and RMSD
+
+Let $p_i$ be reference atomic positions and define observed positions by:
+
+$$
+q_i = R_{\text{true}}\, p_i + t_{\text{true}} + e_i, \qquad e_i \sim N(0, \sigma^2 I_3)
+$$
+
+
+$e_i$ is independent isotropic noise per atom, with equal variance $\sigma^2$ [Å²] in all coordinates.
+Superposition finds the rigid transformation minimizing $\sum_i w_i \lvert R p_i + t - q_i\rvert^2$; RMSD is the square root of the quotient obtained by dividing that minimum by weight sum $W$, corresponding to `RigidEstimationResult::rms_residual`.
+This is the Kabsch method derived in [Rigid registration and singular value decomposition](../../algorithms/rigid-registration/).
+
+## Expected RMSD
+
+For noise small relative to molecular size, deviations of the estimated transformation from truth use six small parameters (three translation, three rotation), and residuals become linear projections of noise.
+For least squares with weights $w_i$, the expected residual sum of squares is:
+
+$$
+\mathrm{E}\left[\sum_i w_i \lvert r_i\rvert^2\right] = \sigma^2\left(\operatorname{tr} D - \operatorname{tr}\!\left[(A^\top D A)^{-1} A^\top D^2 A\right]\right)
+$$
+
+
+$r_i$ is atom $i$'s residual; $A$ is the $3n \times 6$ matrix mapping small rigid displacements to atomic displacements; $D$ is the $3n \times 3n$ diagonal matrix repeating $w_i$ per coordinate, and $\operatorname{tr} D = 3W$.
+Using coordinates $x_i$ about the weighted centroid makes $A^\top D A$ block diagonal, with translation block $W I_3$ and rotation block (inertia tensor with weights $w_i$)
+
+$$
+I_w = \sum_i w_i\left(\lvert x_i\rvert^2 I_3 - x_i x_i^\top\right)
+$$
+
+as its two blocks.
+Consequently:
+
+$$
+\frac{\mathrm{E}\left[\mathrm{RMSD}^2\right]}{\sigma^2} \approx 3 - \frac{1}{W}\left(\frac{3\sum_i w_i^2}{W} + \operatorname{tr}\!\left(I_w^{-1} I_{w^2}\right)\right)
+$$
+
+$I_{w^2}$ is the inertia tensor with weights $w_i^2$ about the same centroid.
+Uniform weights give $\sum_i w_i^2 / W = 1$ and $I_{w^2} = I_w$, hence:
+
+$$
+\mathrm{E}\left[\mathrm{RMSD}^2\right] \approx \frac{\sigma^2 (3n - 6)}{n}
+$$
+
+
+This matches the degrees-of-freedom count: fitting six parameters from $3n$ coordinates leaves the remainder in residuals.
+Atomic-mass weights yield a smaller coefficient because translation fitting absorbs most noise of heavy atoms.
+This formula is a first-order approximation in noise.
+The replicate cell below checks the noise range where it applies.
+
+For linear molecules, rotation about the molecular axis moves no atom, making $I_w$ singular and invalidating the formula.
+For the same reason, observations do not determine that rotation ([Uniqueness and rank tests](oxref:spatial-kabsch-uniqueness)).
+For planar molecules (benzene), rotation about any in-plane axis moves atoms, so $I_w$ is nonsingular; cross-covariance has rank 2, but rotation remains unique.
+
+The following block defines quantities shared by two cells.
+`MOLECULES` supplies coordinates of these four molecules, `Element::mass` atomic masses, `weights` uniform or mass weights, and `bonds` atom pairs within 1.6 Å (scene bonds).
+`expected_rms_squared` computes derived coefficient $c = \mathrm{E}[\mathrm{RMSD}^2]/\sigma^2$ from inertia tensors, returning `None` if $I_w$ is singular.
+The 3×3 inverse uses cofactors; this coefficient is an independent reference.
+`observe_and_fit` constructs observations $q_i$ and superimposes with selected weights passed to `estimate_rigid_transform_with_options`.
+
+```rust
+//| id: spatial-molecule-model
+//| kind: definitions
+//| title: "Molecular coordinates, atomic masses, and superposition observation model"
+//| crates: [scioxide-core, scioxide-random, scioxide-spatial]
+use scioxide_core::SciOxideError;
+use scioxide_random::{Distribution, Normal, SplitMix64};
+use scioxide_spatial::{
+    PointSet, RigidEstimationOptions, RigidEstimationResult, RigidTransform,
+    estimate_rigid_transform_with_options,
+};
+
+#[derive(Clone, Copy)]
+pub(crate) enum Element {
+    H,
+    C,
+    O,
+}
+
+impl Element {
+    /// Abridged IUPAC standard atomic weights.
+    pub(crate) fn mass(self) -> f64 {
+        match self {
+            Element::H => 1.008,
+            Element::C => 12.011,
+            Element::O => 15.999,
+        }
+    }
+}
+
+pub(crate) struct Molecule {
+    pub(crate) name: &'static str,
+    pub(crate) atoms: &'static [(Element, [f64; 3])],
+}
+
+use Element::{C, H, O};
+
+/// Experimental Cartesian structures [Å] from CCCBDB.
+pub(crate) const MOLECULES: [Molecule; 4] = [
+    Molecule {
+        name: "Benzene",
+        atoms: &[
+            (C, [0.0, 1.3970, 0.0]),
+            (C, [1.2098, 0.6985, 0.0]),
+            (C, [1.2098, -0.6985, 0.0]),
+            (C, [0.0, -1.3970, 0.0]),
+            (C, [-1.2098, -0.6985, 0.0]),
+            (C, [-1.2098, 0.6985, 0.0]),
+            (H, [0.0, 2.4810, 0.0]),
+            (H, [2.1486, 1.2405, 0.0]),
+            (H, [2.1486, -1.2405, 0.0]),
+            (H, [0.0, -2.4810, 0.0]),
+            (H, [-2.1486, -1.2405, 0.0]),
+            (H, [-2.1486, 1.2405, 0.0]),
+        ],
+    },
+    Molecule {
+        name: "Methane",
+        atoms: &[
+            (C, [0.0, 0.0, 0.0]),
+            (H, [0.6276, 0.6276, 0.6276]),
+            (H, [0.6276, -0.6276, -0.6276]),
+            (H, [-0.6276, 0.6276, -0.6276]),
+            (H, [-0.6276, -0.6276, 0.6276]),
+        ],
+    },
+    Molecule {
+        name: "Ethanol",
+        atoms: &[
+            (C, [1.1879, -0.3829, 0.0]),
+            (C, [0.0, 0.5526, 0.0]),
+            (O, [-1.1867, -0.2472, 0.0]),
+            (H, [-1.9237, 0.3850, 0.0]),
+            (H, [2.0985, 0.2306, 0.0]),
+            (H, [1.1184, -1.0093, 0.8869]),
+            (H, [1.1184, -1.0093, -0.8869]),
+            (H, [-0.0227, 1.1812, 0.8852]),
+            (H, [-0.0227, 1.1812, -0.8852]),
+        ],
+    },
+    Molecule {
+        name: "Carbon dioxide",
+        atoms: &[
+            (C, [0.0, 0.0, 0.0]),
+            (O, [0.0, 0.0, 1.1621]),
+            (O, [0.0, 0.0, -1.1621]),
+        ],
+    },
+];
+
+/// Uniform (all 1) or atomic-mass weights.
+pub(crate) fn weights(molecule: &Molecule, by_mass: bool) -> Vec<f64> {
+    molecule
+        .atoms
+        .iter()
+        .map(|(element, _)| if by_mass { element.mass() } else { 1.0 })
+        .collect()
+}
+
+/// Atom pairs within 1.6 Å (bonds).
+pub(crate) fn bonds(molecule: &Molecule) -> Vec<(usize, usize)> {
+    let atoms = molecule.atoms;
+    let mut pairs = Vec::new();
+    for i in 0..atoms.len() {
+        for j in i + 1..atoms.len() {
+            let d2: f64 = (0..3)
+                .map(|k| (atoms[i].1[k] - atoms[j].1[k]) * (atoms[i].1[k] - atoms[j].1[k]))
+                .sum();
+            if d2 <= 1.6 * 1.6 {
+                pairs.push((i, j));
+            }
+        }
+    }
+    pairs
+}
+
+/// Inertia tensor about the weighted centroid: Σ wᵢ (|xᵢ|² I − xᵢ xᵢᵀ).
+fn inertia(points: &[[f64; 3]], w: &[f64], centroid: [f64; 3]) -> [[f64; 3]; 3] {
+    let mut tensor = [[0.0; 3]; 3];
+    for (p, &wi) in points.iter().zip(w) {
+        let x = [0, 1, 2].map(|k| p[k] - centroid[k]);
+        let r2 = x[0] * x[0] + x[1] * x[1] + x[2] * x[2];
+        for a in 0..3 {
+            for b in 0..3 {
+                let delta = if a == b { r2 } else { 0.0 };
+                tensor[a][b] += wi * (delta - x[a] * x[b]);
+            }
+        }
+    }
+    tensor
+}
+
+/// Linearized E[RMSD²]/σ² = 3 − (3 Σwᵢ²/W + tr(I_w⁻¹ I_{w²}))/W.
+/// None for singular I_w (linear molecules). The 3×3 inverse uses cofactors (reference).
+pub(crate) fn expected_rms_squared(molecule: &Molecule, w: &[f64]) -> Option<f64> {
+    let points: Vec<[f64; 3]> = molecule.atoms.iter().map(|(_, p)| *p).collect();
+    let total: f64 = w.iter().sum();
+    let centroid =
+        [0, 1, 2].map(|k| points.iter().zip(w).map(|(p, wi)| wi * p[k]).sum::<f64>() / total);
+    let squared: Vec<f64> = w.iter().map(|wi| wi * wi).collect();
+    let a = inertia(&points, w, centroid);
+    let b = inertia(&points, &squared, centroid);
+    let cofactor = |i: usize, j: usize| {
+        let (r0, r1) = ((j + 1) % 3, (j + 2) % 3);
+        let (c0, c1) = ((i + 1) % 3, (i + 2) % 3);
+        a[r0][c0] * a[r1][c1] - a[r0][c1] * a[r1][c0]
+    };
+    let det: f64 = (0..3).map(|j| a[0][j] * cofactor(j, 0)).sum();
+    let scale = a[0][0] + a[1][1] + a[2][2];
+    if det <= 1e-12 * scale * scale * scale {
+        return None;
+    }
+    let trace: f64 = (0..3)
+        .flat_map(|i| (0..3).map(move |j| (i, j)))
+        .map(|(i, j)| cofactor(i, j) * b[j][i])
+        .sum::<f64>()
+        / det;
+    Some(3.0 - (3.0 * squared.iter().sum::<f64>() / total + trace) / total)
+}
+
+/// Construct observations qᵢ = R pᵢ + t + eᵢ (each eᵢ component N(0, σ²)) and superimpose.
+pub(crate) fn observe_and_fit(
+    molecule: &Molecule,
+    truth: RigidTransform<f64>,
+    noise: &Normal<f64>,
+    w: &[f64],
+    rng: &mut SplitMix64,
+) -> Result<(Vec<f64>, Result<RigidEstimationResult<f64>, SciOxideError>), SciOxideError> {
+    let n = molecule.atoms.len();
+    let mut source = Vec::with_capacity(3 * n);
+    let mut target = Vec::with_capacity(3 * n);
+    for (_, p) in molecule.atoms {
+        source.extend_from_slice(p);
+        for x in truth.apply(*p)? {
+            target.push(x + noise.sample(rng)?);
+        }
+    }
+    let p = PointSet::from_rows(&source, 3)?;
+    let q = PointSet::from_rows(&target, 3)?;
+    let fit = estimate_rigid_transform_with_options(&p, &q, Some(w), RigidEstimationOptions::new());
+    Ok((target, fit))
+}
+```
+
+## Superposition from one observation
+
+The next cell draws a uniform (Haar-measure) rotation matrix using seeded scioxide-random `SpecialOrthogonalGroup`, converts it to `Rotation` through `Rotation::from_matrix`, and uses it as the true rotation.
+Translation is fixed at $(5, -3, 2)$ Å.
+For each of four molecules, add coordinate noise $N(0, \sigma^2)$ with `Normal` and superimpose using selected weights.
+Table `molecules` shows atom count, rank, singular values, RMSD, square root of expectation $\sqrt{\mathrm{E}[\mathrm{RMSD}^2]}$, rotation error $d(R_{\text{true}}, R)$ [deg], and failure classifications.
+Singular values are dimensionless, computed after dividing cross-covariance by its largest absolute entry.
+Single-observation RMSD fluctuates around expectation; compare expectations using replicate means in the next cell.
+The scene shows the chosen reference structure and observations transformed back to its frame by estimated inverse $T^{-1}$, in common units [Å].
+For carbon dioxide, whose transformation cannot be estimated, show observations unchanged.
+
+```rust
+//| id: spatial-molecular-superposition
+//| ref: spatial-molecular-superposition
+//| title: "Superimpose four molecules after adding rotation, translation, and noise"
+//| run: reactive
+//| uses: [spatial-molecule-model]
+//| crates: [scioxide-core, scioxide-random, scioxide-spatial]
+//| inputs:
+//|   molecule: {"type":"select","label":"Molecule shown in the scene","options":["Benzene","Methane","Ethanol","Carbon dioxide"],"value":"Ethanol"}
+//|   noise: {"type":"range","label":"Noise standard deviation σ [Å]","description":"Normal noise added to each coordinate.","min":0.005,"max":0.3,"step":0.005,"value":0.05}
+//|   weighting: {"type":"select","label":"Weights","options":["Uniform","Atomic mass"],"value":"Uniform"}
+//|   seed: {"type":"range","label":"Random seed","description":"Seed generating true rotation and noise.","min":1,"max":100,"step":1,"value":11}
+//| cases:
+//|   - {"id":"mass-weights","label":"Atomic-mass weights","description":"Heavy atoms determine the fit, leaving light-hydrogen residuals in RMSD.","inputs":{"weighting":"Atomic mass"}}
+//|   - {"id":"carbon-dioxide","label":"Show carbon dioxide","description":"A linear molecule has undetermined rotation, so observations cannot be transformed back.","inputs":{"molecule":"Carbon dioxide"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"molecules","path":"/rows/0/2","equals":2}
+//|       - {"artifact":"molecules","path":"/rows/1/2","equals":3}
+//|       - {"artifact":"molecules","path":"/rows/2/2","equals":3}
+//|       - {"artifact":"molecules","path":"/rows/3/2","equals":null}
+//|       - {"artifact":"molecules","path":"/rows/3/9","equals":"InvalidInput"}
+//|       - {"artifact":"molecules","path":"/rows/0/7","approx":{"value":0.0790569415,"rtol":1e-9}}
+//|       - {"artifact":"molecules","path":"/rows/0/6","range":{"min":0.04,"max":0.12}}
+//|   - case: mass-weights
+//|     expect:
+//|       - {"artifact":"molecules","path":"/rows/0/7","range":{"min":0.05,"max":0.09}}
+//|   - case: carbon-dioxide
+//|     expect:
+//|       - {"artifact":"molecules","path":"/rows/3/9","equals":"InvalidInput"}
+//|       - {"artifact":"structure","path":"/points/1/position/0","approx":{"value":5,"atol":0.2}}
+//|       - {"artifact":"structure","path":"/points/1/position/1","approx":{"value":-3,"atol":0.2}}
+//|       - {"artifact":"structure","path":"/groups/1/id","equals":"observed"}
+use scioxide_core::{RealScalar, Tolerance};
+use scioxide_random::{Normal, SeedableRng, SpecialOrthogonalGroup, SplitMix64};
+use scioxide_spatial::{RigidTransform, Rotation};
+
+let mut rng = SplitMix64::from_seed(seed as u64);
+// True rotation: draw once from Haar measure on SO(3) and convert to Rotation through tolerance checks.
+let law = SpecialOrthogonalGroup::<f64>::new(3).map_err(|e| e.to_string())?;
+let m = law.sample(&mut rng).map_err(|e| e.to_string())?;
+let matrix = [[m[0], m[1], m[2]], [m[3], m[4], m[5]], [m[6], m[7], m[8]]];
+let rotation =
+    Rotation::from_matrix(matrix, Tolerance::from_sqrt_epsilon()).map_err(|e| e.to_string())?;
+let truth = RigidTransform::new(rotation, [5.0, -3.0, 2.0]).map_err(|e| e.to_string())?;
+let normal = Normal::new(0.0, noise).map_err(|e| e.to_string())?;
+let by_mass = weighting == "Atomic mass";
+
+let mut rows = Vec::new();
+let mut scene = None;
+for item in &MOLECULES {
+    let w = weights(item, by_mass);
+    let (target, fit) =
+        observe_and_fit(item, truth, &normal, &w, &mut rng).map_err(|e| e.to_string())?;
+    let expected = expected_rms_squared(item, &w).map(|c| noise * RealScalar::sqrt(c));
+    let n = item.atoms.len();
+    let row = match &fit {
+        Ok(fit) => {
+            let error = truth
+                .rotation()
+                .inverse()
+                .compose(fit.transform.rotation())
+                .map_err(|e| e.to_string())?
+                .as_axis_angle()
+                .1;
+            let s = fit.singular_values;
+            (
+                item.name,
+                n,
+                Some(fit.rank),
+                Some(s[0]),
+                Some(s[1]),
+                Some(s[2]),
+                Some(fit.rms_residual),
+                expected,
+                Some(RealScalar::to_degrees(error)),
+                None,
+            )
+        }
+        Err(e) => {
+            let kind = Some(format!("{:?}", e.kind()));
+            (
+                item.name, n, None, None, None, None, None, expected, None, kind,
+            )
+        }
+    };
+    rows.push(row);
+    if item.name == molecule {
+        // If estimation succeeds, transform observations back by T⁻¹; otherwise show them unchanged.
+        let back = match &fit {
+            Ok(fit) => Some(fit.transform.inverse().map_err(|e| e.to_string())?),
+            Err(_) => None,
+        };
+        let mut observed = Vec::new();
+        for i in 0..n {
+            let q = [target[3 * i], target[3 * i + 1], target[3 * i + 2]];
+            observed.push(match back {
+                Some(map) => map.apply(q).map_err(|e| e.to_string())?,
+                None => q,
+            });
+        }
+        scene = Some((item, observed, back.is_some()));
+    }
+}
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed4 = serde_json::json!({ "significantDigits": 4 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Molecule" },
+    { "key": "1", "label": "Atoms", "type": "integer" },
+    { "key": "2", "label": "Rank", "type": "integer", "nullText": "—" },
+    { "key": "3", "label": "σ₁ [-]", "type": "number", "format": fixed4, "nullText": "—" },
+    { "key": "4", "label": "σ₂ [-]", "type": "number", "format": fixed4, "nullText": "—" },
+    { "key": "5", "label": "σ₃ [-]", "type": "number", "format": sci3, "nullText": "—" },
+    { "key": "6", "label": "RMSD [Å]", "type": "number", "format": fixed4, "nullText": "—" },
+    { "key": "7", "label": "√E[RMSD²] [Å]", "type": "number", "format": fixed4, "nullText": "—" },
+    { "key": "8", "label": "Rotation error [deg]", "type": "number", "format": sci3, "nullText": "—" },
+    { "key": "9", "label": "Error classification", "nullText": "None" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "molecules" })
+);
+
+let (item, observed, aligned) = scene.ok_or("Selected molecule not found")?;
+let (observed_group, observed_label) = if aligned {
+    ("aligned", "Observations transformed back by T⁻¹")
+} else {
+    ("observed", "Observations (cannot transform back)")
+};
+let title = format!("Reference and observed structures of {}", item.name);
+let mut points = Vec::new();
+let mut edges = Vec::new();
+for (i, (_, p)) in item.atoms.iter().enumerate() {
+    points.push(
+        serde_json::json!({ "id": format!("ref-{i}"), "position": p, "group": "reference" }),
+    );
+    points.push(serde_json::json!({
+        "id": format!("obs-{i}"),
+        "position": observed[i],
+        "group": observed_group
+    }));
+}
+for (i, j) in bonds(item) {
+    edges.push(serde_json::json!({ "from": format!("ref-{i}"), "to": format!("ref-{j}") }));
+    edges.push(serde_json::json!({ "from": format!("obs-{i}"), "to": format!("obs-{j}") }));
+}
+emit_scene3d!(
+    serde_json::json!({
+        "points": points,
+        "edges": edges,
+        "groups": [
+            { "id": "reference", "label": "Reference structure" },
+            { "id": observed_group, "label": observed_label }
+        ],
+        "axes": {
+            "x": { "label": "x", "unit": "Å" },
+            "y": { "label": "y", "unit": "Å" },
+            "z": { "label": "z", "unit": "Å" }
+        }
+    }),
+    metadata = serde_json::json!({ "id": "structure", "title": title })
+);
+```
+
+With defaults ($\sigma = 0.05$ Å, uniform weights, seed 11), benzene has rank 2 ($\sigma_3 = 0$), with $\sigma_1 = 1.155$ and $\sigma_2 = 1.154$ nearly equal.
+Its sixfold planar symmetry gives isotropic in-plane spread; rotation is unique, with true-rotation error 0.84°.
+Methane and ethanol have rank 3 and rotation errors 2.45° and 1.61°.
+RMSDs are 0.0617 Å for benzene, 0.0630 Å for methane, and 0.0798 Å for ethanol, around square-root expectations 0.0791 Å, 0.0671 Å, and 0.0764 Å.
+Carbon dioxide gives `InvalidInput`, leaving RMSD and rotation-error entries empty.
+
+Mass weighting lowers square-root expectations to 0.0741 Å, 0.0520 Å, and 0.0638 Å, with RMSDs 0.0717 Å, 0.0473 Å, and 0.0651 Å.
+Methane's larger decrease occurs because translation fitting absorbs most noise of carbon, carrying 75% of the weight, nearly eliminating its contribution to weighted residuals.
+In the scene, ethanol observations transformed back by $T^{-1}$ overlap the reference, with atomic displacements on the noise scale.
+Selecting carbon dioxide leaves observations untransformed, at positions affected by the true rotation and translation.
+
+## Comparing replicate means with expectations
+
+The next cell holds true rotation fixed, redraws noise for $N$ superpositions, and computes RMSD² sample mean $\overline{\mathrm{RMSD}^2}$ and standard error $\mathrm{SE} = s/\sqrt{N}$ (sample standard deviation $s$) for both weight choices.
+Table `statistics` shows mean, standard error, linearized expectation $\sigma^2 c$, and discrepancy in standard-error units $z = (\overline{\mathrm{RMSD}^2} - \sigma^2 c)/\mathrm{SE}$.
+If the approximation applies, $\lvert z\rvert$ should generally be at most 2.
+As $\sigma$ approaches molecular size, approximation errors exceed standard errors and $\lvert z\rvert$ grows.
+Carbon dioxide fails every replicate, so only failure count is shown.
+Many replicates take time, so this cell uses button execution.
+
+```rust
+//| id: spatial-molecular-rmsd-statistics
+//| ref: spatial-molecular-rmsd-statistics
+//| title: "Repeat superposition to compare mean RMSD² with its linearized expectation"
+//| run: button
+//| uses: [spatial-molecule-model]
+//| crates: [scioxide-core, scioxide-random, scioxide-spatial]
+//| inputs:
+//|   stat_noise: {"type":"range","label":"Noise standard deviation σ [Å]","description":"Larger noise breaks the linearized approximation.","min":0.01,"max":5,"step":0.01,"value":0.05}
+//|   replications: {"type":"range","label":"Replicate count N","description":"Standard error decreases as 1/√N.","min":100,"max":2000,"step":100,"value":500}
+//|   stat_seed: {"type":"range","label":"Random seed","description":"Seed generating true rotation and noise.","min":1,"max":100,"step":1,"value":3}
+//| cases:
+//|   - {"id":"moderate-noise","label":"σ = 2 Å","description":"Even noise near molecular size leaves mean/expectation differences on the standard-error scale.","inputs":{"stat_noise":2}}
+//|   - {"id":"visible-bias","label":"σ = 3 Å","description":"Methane (uniform) and ethanol (mass-weighted) means exceed expectations by more than three standard errors.","inputs":{"stat_noise":3}}
+//|   - {"id":"large-noise","label":"σ = 5 Å","description":"Noise greatly exceeds molecular size, and methane and ethanol means depart from linearized expectations.","inputs":{"stat_noise":5}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"statistics","path":"/rows/0/7","range":{"min":-3.5,"max":3.5}}
+//|       - {"artifact":"statistics","path":"/rows/1/7","range":{"min":-3.5,"max":3.5}}
+//|       - {"artifact":"statistics","path":"/rows/2/7","range":{"min":-3.5,"max":3.5}}
+//|       - {"artifact":"statistics","path":"/rows/3/7","range":{"min":-3.5,"max":3.5}}
+//|       - {"artifact":"statistics","path":"/rows/4/7","range":{"min":-3.5,"max":3.5}}
+//|       - {"artifact":"statistics","path":"/rows/5/7","range":{"min":-3.5,"max":3.5}}
+//|       - {"artifact":"statistics","path":"/rows/6/8","equals":500}
+//|   - case: moderate-noise
+//|     expect:
+//|       - {"artifact":"statistics","path":"/rows/1/7","range":{"min":-3,"max":3}}
+//|       - {"artifact":"statistics","path":"/rows/3/7","range":{"min":-3,"max":3}}
+//|       - {"artifact":"statistics","path":"/rows/5/7","range":{"min":-3,"max":3}}
+//|       - {"artifact":"statistics","path":"/rows/2/5","approx":{"value":7.2,"rtol":1e-12}}
+//|   - case: visible-bias
+//|     expect:
+//|       - {"artifact":"statistics","path":"/rows/2/7","range":{"min":3}}
+//|       - {"artifact":"statistics","path":"/rows/5/7","range":{"min":3}}
+//|   - case: large-noise
+//|     expect:
+//|       - {"artifact":"statistics","path":"/rows/2/7","range":{"min":5}}
+//|       - {"artifact":"statistics","path":"/rows/5/7","range":{"min":5}}
+use scioxide_core::{RealScalar, Tolerance};
+use scioxide_random::{Normal, SeedableRng, SpecialOrthogonalGroup, SplitMix64};
+use scioxide_spatial::{RigidTransform, Rotation};
+
+let mut rng = SplitMix64::from_seed(stat_seed as u64);
+let law = SpecialOrthogonalGroup::<f64>::new(3).map_err(|e| e.to_string())?;
+let m = law.sample(&mut rng).map_err(|e| e.to_string())?;
+let matrix = [[m[0], m[1], m[2]], [m[3], m[4], m[5]], [m[6], m[7], m[8]]];
+let rotation =
+    Rotation::from_matrix(matrix, Tolerance::from_sqrt_epsilon()).map_err(|e| e.to_string())?;
+let truth = RigidTransform::new(rotation, [5.0, -3.0, 2.0]).map_err(|e| e.to_string())?;
+let normal = Normal::new(0.0, stat_noise).map_err(|e| e.to_string())?;
+let count = replications as usize;
+let variance = stat_noise * stat_noise;
+
+let mut rows = Vec::new();
+for item in &MOLECULES {
+    for (label, by_mass) in [("Uniform", false), ("Atomic mass", true)] {
+        let w = weights(item, by_mass);
+        let (mut sum, mut sum_squares, mut failures) = (0.0, 0.0, 0_usize);
+        for _ in 0..count {
+            let (_, fit) = observe_and_fit(item, truth, &normal, &w, &mut rng)
+                .map_err(|e| e.to_string())?;
+            match fit {
+                Ok(fit) => {
+                    let value = fit.rms_residual * fit.rms_residual;
+                    sum += value;
+                    sum_squares += value * value;
+                }
+                Err(_) => failures += 1,
+            }
+        }
+        let successes = (count - failures) as f64;
+        let theory = expected_rms_squared(item, &w).map(|c| variance * c);
+        let (mean, se) = if successes > 1.0 {
+            let mean = sum / successes;
+            let sample_variance = (sum_squares - successes * mean * mean) / (successes - 1.0);
+            (
+                Some(mean),
+                Some(RealScalar::sqrt(sample_variance / successes)),
+            )
+        } else {
+            (None, None)
+        };
+        let z = match (mean, se, theory) {
+            (Some(mean), Some(se), Some(theory)) if se > 0.0 => Some((mean - theory) / se),
+            _ => None,
+        };
+        rows.push((
+            item.name,
+            label,
+            item.atoms.len(),
+            mean,
+            se,
+            theory,
+            theory.map(|t| t / variance),
+            z,
+            failures,
+        ));
+    }
+}
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed3 = serde_json::json!({ "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Molecule" },
+    { "key": "1", "label": "Weights" },
+    { "key": "2", "label": "Atoms", "type": "integer" },
+    { "key": "3", "label": "Mean RMSD² [Å²]", "type": "number", "format": sci3, "nullText": "—" },
+    { "key": "4", "label": "Standard error [Å²]", "type": "number", "format": sci3, "nullText": "—" },
+    { "key": "5", "label": "Expectation σ²c [Å²]", "type": "number", "format": sci3, "nullText": "Undefined" },
+    { "key": "6", "label": "Coefficient c [-]", "type": "number", "format": fixed3, "nullText": "Undefined" },
+    { "key": "7", "label": "z [-]", "type": "number", "format": fixed3, "nullText": "—" },
+    { "key": "8", "label": "Failure count", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "statistics" })
+);
+```
+
+With defaults ($\sigma = 0.05$ Å, $N = 500$, seed 3), all six rows have $z$ between −1.50 and 0.83, so means and linearized expectations agree within two standard errors.
+Coefficient $c$ is 2.5, 1.8, and 2.33 ($(3n - 6)/n$) for benzene, methane, and ethanol with uniform weights, and 2.20, 1.08, and 1.63 with atomic-mass weights.
+Carbon dioxide fails all 500 replicates and has no defined expectation.
+At “σ = 2 Å,” the six non-carbon-dioxide rows also have $z$ from −1.87 to 1.64 and relative mean/expectation differences from −3.4 to +3.7%.
+Standard errors at $N = 500$ are 1.1–2.4% of expectations, so this agreement shows only that first-order approximation bias is below a few percent.
+At “σ = 3 Å,” methane (uniform) and ethanol (mass-weighted) have $z$ 3.6 and 3.9; at “σ = 5 Å,” both reach 6.9, with means above expectations.
+
+## Summary
+
+Pass atomic coordinate sets and weights to `estimate_rigid_transform_with_options` to obtain RMSD as `rms_residual`; mass weights make the centroid the center of mass.
+For isotropic noise $\sigma$, estimate expected RMSD² by $\sigma^2(3n - 6)/n$ with uniform weights or by the inertia-tensor formula for general weights.
+For the three non-carbon-dioxide molecules, neither $\sigma = 0.05$ Å nor 2 Å produced mean/expectation differences distinguishable at $N = 500$ standard errors (1.1–2.4% of expectation).
+RMSD far above this expectation indicates structural differences unexplained by measurement error alone.
+Planar molecules such as benzene uniquely determine rotation at rank 2; linear molecules such as carbon dioxide leave axial rotation undetermined and give `InvalidInput`.
+Compare linear molecules using rotation-invariant quantities such as interatomic distances.
+
+## Further reading
+
+- [Rigid registration and singular value decomposition](../../algorithms/rigid-registration/): examine reflection correction and the computational procedure.
+- [Uniqueness and failures in rigid registration](../../algorithms/rigid-registration-degeneracy/): examine rank thresholds and configurations causing errors.
+- [Spacecraft orientation interpolation and angular velocity](../attitude-interpolation/): examine angular-velocity continuity differences between Slerp and rotation splines when interpolating orientations over time.
+- [Forward kinematics of a planar three-link robot arm](../robot-arm-kinematics/): compare composition and inversion of these estimated rigid transformations with closed forms to examine incorrect composition order.

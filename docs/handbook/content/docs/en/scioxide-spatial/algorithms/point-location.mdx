@@ -1,0 +1,364 @@
+---
+title: "Point Location and Barycentric Coordinates in Delaunay Triangulations"
+description: "Barycentric coordinates as simplex affine maps and piecewise-linear interpolation, visibility-walk point location and boundary rules, workspace starting candidates, barycentric conditioning and simplex shape, and NumericalInstability returned only for ill-conditioned simplices."
+sidebar:
+  order: 340
+references:
+  spatial-barycentric-affine-map: "barycentric-coordinates-and-affine-maps"
+  spatial-point-location: "point-location-and-barycentric-coordinates"
+  spatial-barycentric-conditioning: "barycentric-conditioning-and-simplex-shape"
+---
+
+After constructing a Delaunay triangulation, two typical questions are which simplex contains point $x$ and how to obtain a value at $x$ from values at that simplex's vertices.
+The first is point location; the second is answered by piecewise-linear interpolation weighted by simplex barycentric coordinates.
+`Delaunay::find_simplex` determines the first using exact geometric predicates alone; `barycentric_into` returns rounded weights for the second.
+This page explains barycentric definitions and affine maps, search algorithms and complexity, handling boundaries and points outside the hull, and the relationship between conditioning and simplex shape, then checks input-row mappings, boundary points, and thin triangles.
+[Convex hulls, Delaunay triangulations, and Voronoi diagrams](../delaunay-voronoi-and-hulls/) covers triangulation construction, site sorting, and degeneracy handling.
+
+## Barycentric coordinates and affine maps
+
+Let $p_0, \dots, p_d \in \mathbb{R}^d$ be the vertices of a $d$-simplex.
+The barycentric coordinates $\lambda = (\lambda_0, \dots, \lambda_d)$ of point $x$ are numbers satisfying:
+
+$$
+x = \sum_{i=0}^{d} \lambda_i\, p_i, \qquad \sum_{i=0}^{d} \lambda_i = 1
+$$
+
+Using the edge matrix $A = [\,p_1 - p_0, \dots, p_d - p_0\,]$ ($d \times d$), $\mu = (\lambda_1, \dots, \lambda_d)$ is determined by
+
+$$
+\mu = A^{-1}(x - p_0), \qquad \lambda_0 = 1 - \sum_{i=1}^{d} \mu_i
+$$
+
+making barycentric coordinates affine functions of $x$.
+For a noncollapsed simplex, $A$ is nonsingular and barycentric coordinates are unique.
+
+Barycentric coordinates can also be written as ratios of orientation predicates.
+$\lambda_i$ is the orientation determinant after replacing vertex $p_i$ with $x$, divided by the original orientation determinant $\det[\,p_1 - p_0, \dots, p_d - p_0\,]$.
+Thus $x$ belongs to the closed simplex exactly when none of the $d+1$ replacement determinants has the opposite sign to the simplex orientation; exact predicates can test this without rounded $\lambda$.
+If some $\lambda_i$ is exactly 0, $x$ lies on the face opposite $p_i$.
+
+Barycentric gradients $\nabla \lambda_i$ are constant on the simplex; $\nabla \lambda_1, \dots, \nabla \lambda_d$ are rows of $A^{-1}$, and $\nabla \lambda_0 = -\sum_{i \ge 1} \nabla \lambda_i$.
+Using vertex values $f_i$,
+
+$$
+f_h(x) = \sum_{i=0}^{d} \lambda_i(x)\, f_i
+$$
+
+is linear on each simplex and agrees on neighboring shared faces, giving continuous piecewise-linear interpolation; $\nabla f_h = \sum_i f_i \nabla \lambda_i$ is constant on the simplex.
+$\lambda_i$ are also precisely the shape functions of linear finite elements.
+See [Scattered-data interpolation with a shared triangulation](oxref:interp-nearest-and-linear) for use in scattered interpolation.
+
+## Point location and barycentric coordinates
+
+`find_simplex(point)` finds a closed simplex containing the point and returns `SimplexLocation { simplex, boundary }` as `Some`.
+Outside the convex hull it returns `None`.
+On a face, edge, or vertex shared by several simplices, it returns the lowest-index simplex and sets `boundary` to true.
+`boundary` means some barycentric coordinate is exactly 0, also tested with exact predicates.
+Simplex vertex indices are canonical indices of lexicographically sorted sites ([Site canonicalization and degeneracy handling](oxref:spatial-tessellation-sites)).
+`find_simplex` allocates workspace per query and executes sequentially.
+For many query points, pass a preallocated `GeometryWorkspace` and execution context to `find_simplex_scoped(point, &mut workspace, cx)`.
+
+The search uses a visibility walk (Devillers–Pion–Teillaud).
+
+1. Choose a starting simplex.
+   Construction prepares a tree splitting simplex centroids at medians (each centroid coordinate is divided by the largest absolute site coordinate along its axis).
+   Traverse this tree once toward the query point and choose the simplex whose centroid is closest among visited nodes.
+   If the workspace holds a previously located simplex, use it as the initial candidate, replacing it if a closer centroid appears during traversal.
+2. For each face of the current simplex, test the orientation sign after replacing the opposite vertex with the query point.
+   If the query point lies outside a face, cross it into the neighboring simplex.
+   Skip the face shared with the immediately preceding simplex.
+   The first face examined varies each step using xorshift pseudorandom numbers initialized with the same seed per query (a stochastic walk).
+3. If the point is outside no face, the simplex contains it.
+   If no simplex exists across a crossed face, the point is outside the convex hull.
+4. When the number of visited simplices reaches the total simplex count, examine every simplex in index order.
+   Search therefore always terminates, even if a walk cycles in a degenerate triangulation.
+
+Each step evaluates $d+1$ orientation predicates; the number of simplices traversed depends on the distance from the starting point to the query.
+Starting near the query point requires only a few simplices for many queries.
+The worst case is proportional to simplex count.
+For ordered query points, the preceding simplex retained by the workspace provides a nearby start, reducing traversed simplices for nearby queries.
+
+The preceding simplex remembered by `GeometryWorkspace` passed to `find_simplex_scoped` is only a starting candidate tied to the triangulation's `MeshToken`; results are independent of prior queries.
+Queries using reserved workspace allocate nothing further; `workspace.predicate_terms()` returns the predicate-work count of the most recent query using that workspace.
+A query-point length differing from dimension or insufficient workspace gives `DimensionMismatch`, NaN or infinity gives `NonFinite`, and exceeding predicate-work limits gives `ResourceLimit`.
+Execution-context cancellation or deadlines return `ExecutionStopped`; exhausting solve-context nodes returns `ConvergenceFailure`.
+
+Once a containing simplex is known, compute barycentric coordinates.
+`barycentric(simplex, point)` returns a `Vec` of length $d+1$ containing $\lambda$ in the vertex order of `simplex(s)`.
+The allocation-free form `barycentric_into(simplex, point, &mut output, &mut scratch)` writes the same values to `output`; `output` has length $d+1$ and `scratch` has length at least $d+1$.
+The point may lie outside the simplex (some $\lambda_i$ are negative), so use `find_simplex` for containment tests.
+`barycentric_gradients_into` writes $\nabla \lambda_i$ in $d+1$ rows and $d$ columns; `circumcenter_into` writes the circumcenter (circumsphere center).
+Every query returns `OutOfBounds` for an out-of-range simplex index, `DimensionMismatch` for incorrect `point` or `output` lengths or short `scratch`, and `NonFinite` for NaN or infinity in `point`.
+
+## Barycentric conditioning and simplex shape
+
+Moving $x$ by $\delta x$ changes $\mu$ by $A^{-1}\delta x$, so $\|A^{-1}\|$ indicates barycentric conditioning.
+For a planar triangle with edge lengths around $1$, $\|A^{-1}\|$ is roughly proportional to the reciprocal of its minimum altitude.
+Needle-like triangles with small minimum angles and nearly zero-volume spatial simplices (slivers) have large components of $A^{-1}$, amplifying coordinate rounding errors in barycentric coordinates.
+
+`Delaunay` constructs each simplex's affine map once in `f64` during construction.
+Coordinates are normalized by powers of two, and edge matrix $A$ is divided to make its largest component 1 before inversion by LU factorization.
+Below, $A$ denotes this normalized edge matrix.
+Rounded local-coordinate errors propagate to barycentric coordinates at roughly $\max_{i,j} |(A^{-1})_{ij}| \cdot \varepsilon \cdot d^2$ scale; with $\varepsilon$ denoting `f64` machine epsilon, simplices satisfying
+
+$$
+\max_{i,j} |(A^{-1})_{ij}| \cdot \varepsilon \cdot d^2 > \sqrt{\varepsilon}
+$$
+
+are assigned no map.
+For such simplices, only barycentric-coordinate, gradient, and circumcenter queries return `NumericalInstability`.
+This test excludes ill-conditioned simplices; it does not bound errors at points far from the simplex.
+Point location uses only exact predicates, without rounded maps, so it remains available on these simplices.
+Voronoi vertices also use circumcenters from the same maps; a group consisting entirely of simplices without maps makes `Voronoi::vertex` return `NumericalInstability`.
+
+## Canonical-index mappings and boundary query points
+
+The next cell supplies the unit square's four corners and two interior points as seven shuffled rows with one duplicated point.
+The first table shows each input row's canonical index and representative input row.
+The second table shows each query's containing simplex, boundary flag, input rows of its vertices, minimum barycentric coordinate, and predicate work used.
+One query point is adjustable; the remaining three are fixed at a site, on a hull edge, and outside the hull.
+The final table shows whether reversing input rows yields the same sequence of simplices expressed in canonical indices.
+
+```rust
+//| id: spatial-delaunay-point-location
+//| ref: spatial-delaunay-point-location
+//| title: "Check input-row/site correspondence and find a simplex containing each query point"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-spatial]
+//| inputs:
+//|   query_x: {"type":"range","label":"Query-point x [-]","min":-0.2,"max":1.2,"step":0.05,"value":0.5}
+//|   query_y: {"type":"range","label":"Query-point y [-]","min":-0.2,"max":1.2,"step":0.05,"value":0.3}
+//| cases:
+//|   - {"id":"outside","label":"Outside hull (1.2, 0.3)","description":"Outside the hull, no simplex exists and the result is None.","inputs":{"query_x":1.2}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"sites","path":"/rows/4/3","equals":2}
+//|       - {"artifact":"sites","path":"/rows/4/4","equals":1}
+//|       - {"artifact":"location","path":"/rows/0/4","equals":false}
+//|       - {"artifact":"location","path":"/rows/0/6","range":{"min":1e-17,"max":1e-15}}
+//|       - {"artifact":"location","path":"/rows/1/4","equals":true}
+//|       - {"artifact":"location","path":"/rows/3/3","equals":null}
+//|       - {"artifact":"order","path":"/rows/0/0","equals":true}
+//|   - case: outside
+//|     expect:
+//|       - {"artifact":"location","path":"/rows/0/3","equals":null}
+//|       - {"artifact":"location","path":"/rows/1/3","equals":2}
+use scioxide_core::{ExecutionContext, SciOxideError};
+use scioxide_spatial::{Delaunay, PointSet};
+
+// Seven input rows. Row 4 duplicates row 1's coordinates, leaving six sites.
+let rows: [[f64; 2]; 7] = [
+    [1.0, 1.0],
+    [0.3, 0.4],
+    [0.0, 0.0],
+    [1.0, 0.0],
+    [0.3, 0.4],
+    [0.0, 1.0],
+    [0.7, 0.2],
+];
+let build = |sites: &[[f64; 2]]| -> Result<Delaunay<f64>, SciOxideError> {
+    Delaunay::new(&PointSet::from_points(sites)?)
+};
+let mesh = build(&rows).map_err(|e| e.to_string())?;
+let (mapping, first_row) = (mesh.input_mapping(), mesh.representatives());
+let site_rows: Vec<(usize, f64, f64, usize, usize)> = rows
+    .iter()
+    .enumerate()
+    .map(|(r, p)| (r, p[0], p[1], mapping[r], first_row[mapping[r]]))
+    .collect();
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Input row", "type": "integer" },
+    { "key": "1", "label": "x [-]", "type": "number", "format": fixed2 },
+    { "key": "2", "label": "y [-]", "type": "number", "format": fixed2 },
+    { "key": "3", "label": "Canonical index input_mapping", "type": "integer" },
+    { "key": "4", "label": "Representative input row representatives", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    site_rows,
+    metadata = serde_json::json!({ "id": "sites" })
+);
+
+let mut workspace = mesh.workspace(()).map_err(|e| e.to_string())?;
+let queries = [
+    ("Input point", [query_x, query_y]),
+    ("Site (1, 0)", [1.0, 0.0]),
+    ("Hull-edge midpoint", [0.5, 0.0]),
+    ("Outside hull", [1.1, 0.5]),
+];
+let mut located = Vec::new();
+for (name, query) in queries {
+    let found = mesh
+        .find_simplex_scoped(&query, &mut workspace, ExecutionContext::sequential())
+        .map_err(|e| e.to_string())?;
+    let terms = workspace.predicate_terms();
+    let (mut corners, mut smallest) = (None, None);
+    if let Some(location) = found {
+        let (mut weights, mut scratch) = ([0.0; 3], [0.0; 3]);
+        mesh.barycentric_into(location.simplex, &query, &mut weights, &mut scratch)
+            .map_err(|e| e.to_string())?;
+        smallest = weights.iter().copied().reduce(f64::min);
+        // Simplex vertices use canonical indices; map back to input rows with representatives.
+        let vertices = mesh.simplex(location.simplex).map_err(|e| e.to_string())?;
+        let names: Vec<String> = vertices.iter().map(|&v| first_row[v].to_string()).collect();
+        corners = Some(names.join(", "));
+    }
+    let simplex = found.map(|l| l.simplex);
+    let boundary = found.map(|l| l.boundary);
+    located.push((
+        name, query[0], query[1], simplex, boundary, corners, smallest, terms,
+    ));
+}
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Query" },
+    { "key": "1", "label": "x [-]", "type": "number", "format": fixed2 },
+    { "key": "2", "label": "y [-]", "type": "number", "format": fixed2 },
+    { "key": "3", "label": "Simplex", "type": "integer", "nullText": "None" },
+    { "key": "4", "label": "On boundary", "type": "boolean", "nullText": "—" },
+    { "key": "5", "label": "Vertex input rows", "nullText": "—" },
+    { "key": "6", "label": "Minimum barycentric coordinate [-]", "type": "number", "format": sci2, "nullText": "—" },
+    { "key": "7", "label": "Predicate work [work units]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    located,
+    metadata = serde_json::json!({ "id": "location" })
+);
+
+// Reversing input rows preserves the sequence of simplices expressed in canonical indices.
+let reversed: Vec<[f64; 2]> = rows.iter().rev().copied().collect();
+let other = build(&reversed).map_err(|e| e.to_string())?;
+let count = mesh.simplex_count();
+let same = count == other.simplex_count()
+    && (0..count).all(|s| mesh.simplex(s).ok() == other.simplex(s).ok());
+let columns = serde_json::json!([
+    { "key": "0", "label": "Same simplex sequence for reversed input", "type": "boolean" },
+    { "key": "1", "label": "Simplices [count]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    vec![(same, count)],
+    metadata = serde_json::json!({ "id": "order" })
+);
+```
+
+In the first table, input rows 1 and 4 merge into site 2 with the smaller representative row 1.
+Canonical indices follow coordinate lexicographic order: the origin at input row 2 is site 0, and $(1, 1)$ at input row 0 is site 5.
+Simplex vertices use canonical indices, so “Vertex input rows” in the second table shows values mapped back with `representatives()`.
+
+With real-number coordinates, default query $(0.5, 0.3)$ is the midpoint of the edge joining $(0.3, 0.4)$ and $(0.7, 0.2)$.
+But `f64` values 0.3, 0.4, 0.7, and 0.2 are rounded binary representations of decimal numbers, so exact tests on the supplied coordinates put this point off the edge.
+Thus “On boundary” is false, and the minimum barycentric coordinate is a small positive value $1.1 \times 10^{-16}$ near 0.
+Site $(1, 0)$ and hull-edge midpoint $(0.5, 0)$ lie on simplex 2's boundary, with “On boundary” true and minimum barycentric coordinate exactly 0.
+Site $(1, 0)$ is shared by several triangles, but the lowest-index simplex 2 is returned.
+A point outside the hull has no simplex, giving `None`.
+As the final table shows, reversing input rows preserves all six simplices as the same canonical-index sequence.
+
+## Height threshold for losing a map and needle-like triangles
+
+The next cell constructs a single-triangle triangulation with vertices $(0, 0)$, $(1, 0)$, and $(1/2, h)$, locates centroid $(1/2, h/3)$, then computes barycentric coordinates and the circumcenter.
+The edge matrix is $A = \begin{pmatrix} 1 & 1/2 \\ 0 & h \end{pmatrix}$ and $\max |(A^{-1})_{ij}| = 1/h$, so the threshold for losing a map is $(1/h)\,\varepsilon \cdot 2^2 = \sqrt{\varepsilon}$, or $h^\ast = 4\sqrt{\varepsilon} \approx 6.0 \times 10^{-8}$.
+The table shows height $h$, the simplex containing the centroid, results of both queries (success or failure classification), and the barycentric-coordinate sum minus 1.
+
+```rust
+//| id: spatial-delaunay-sliver-map
+//| ref: spatial-delaunay-sliver-map
+//| title: "Check that point location succeeds on thin triangles while only rounded-affine-map queries fail"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-spatial]
+//| inputs:
+//|   height_exponent: {"type":"range","label":"Height exponent k (h = 10^k) [-]","min":-12,"max":-1,"step":1,"value":-6}
+//| cases:
+//|   - {"id":"needle","label":"h = 10⁻⁹","description":"Below threshold 4√ε, barycentric and circumcenter queries return NumericalInstability.","inputs":{"height_exponent":-9}}
+//|   - {"id":"above-threshold","label":"h = 10⁻⁷","description":"Just above threshold 4√ε ≈ 6.0 × 10⁻⁸, queries still succeed.","inputs":{"height_exponent":-7}}
+//|   - {"id":"below-threshold","label":"h = 10⁻⁸","description":"Just below the threshold, queries return NumericalInstability.","inputs":{"height_exponent":-8}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"sliver","path":"/rows/0/1","equals":0}
+//|       - {"artifact":"sliver","path":"/rows/0/2","equals":"Success"}
+//|       - {"artifact":"sliver","path":"/rows/0/4","range":{"min":-1e-15,"max":1e-15}}
+//|   - case: needle
+//|     expect:
+//|       - {"artifact":"sliver","path":"/rows/0/1","equals":0}
+//|       - {"artifact":"sliver","path":"/rows/0/2","equals":"NumericalInstability"}
+//|       - {"artifact":"sliver","path":"/rows/0/3","equals":"NumericalInstability"}
+//|   - case: above-threshold
+//|     expect:
+//|       - {"artifact":"sliver","path":"/rows/0/2","equals":"Success"}
+//|       - {"artifact":"sliver","path":"/rows/0/4","range":{"min":-1e-15,"max":1e-15}}
+//|   - case: below-threshold
+//|     expect:
+//|       - {"artifact":"sliver","path":"/rows/0/1","equals":0}
+//|       - {"artifact":"sliver","path":"/rows/0/2","equals":"NumericalInstability"}
+use scioxide_core::{ExecutionContext, SciOxideError};
+use scioxide_spatial::{Delaunay, PointSet};
+
+let h = 10.0_f64.powf(height_exponent);
+let vertices = [[0.0, 0.0], [1.0, 0.0], [0.5, h]];
+let points = PointSet::from_points(&vertices).map_err(|e| e.to_string())?;
+let mesh = Delaunay::new(&points).map_err(|e| e.to_string())?;
+
+// Point location uses only exact orientation predicates.
+let centroid = [0.5, h / 3.0];
+let mut workspace = mesh.workspace(()).map_err(|e| e.to_string())?;
+let found = mesh
+    .find_simplex_scoped(&centroid, &mut workspace, ExecutionContext::sequential())
+    .map_err(|e| e.to_string())?;
+// Barycentric coordinates and circumcenters use rounded affine maps prepared during construction.
+let (mut weights, mut scratch, mut center) = ([0.0; 3], [0.0; 3], [0.0; 2]);
+let verdict = |result: Result<(), SciOxideError>| match result {
+    Ok(()) => "Success".to_string(),
+    Err(e) => format!("{:?}", e.kind()),
+};
+let barycentric = mesh.barycentric_into(0, &centroid, &mut weights, &mut scratch);
+let sum_error = barycentric
+    .is_ok()
+    .then(|| weights.iter().sum::<f64>() - 1.0);
+let circumcenter = verdict(mesh.circumcenter_into(0, &mut center));
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Height h [-]", "type": "number", "format": sci2 },
+    { "key": "1", "label": "Simplex containing centroid", "type": "integer", "nullText": "None" },
+    { "key": "2", "label": "barycentric_into" },
+    { "key": "3", "label": "circumcenter_into" },
+    { "key": "4", "label": "Σλ − 1 [-]", "type": "number", "format": sci2, "nullText": "—" }
+]);
+emit_table_with_columns!(
+    columns,
+    vec![(
+        h,
+        found.map(|l| l.simplex),
+        verdict(barycentric),
+        circumcenter,
+        sum_error
+    )],
+    metadata = serde_json::json!({ "id": "sliver" })
+);
+```
+
+With default $h = 10^{-6}$, both barycentric coordinates and circumcenter are available; the coordinate sum differs from 1 by $-1.1 \times 10^{-16}$.
+For the “needle” at $h = 10^{-9}$, point location returns simplex 0, while barycentric and circumcenter queries return `NumericalInstability`.
+Varying $k$ gives success at $h = 10^{-7}$ and failure at $10^{-8}$, agreeing with threshold $h^\ast \approx 6.0 \times 10^{-8}$.
+This failure affects only that simplex's queries; triangulation construction and point location remain unaffected.
+The thin triangle's circumcenter is $(1/2, (h^2 - 1/4)/(2h))$ and moves far away as $h \to 0$.
+For groups consisting entirely of simplices without maps, Voronoi-vertex coordinates also give `NumericalInstability`.
+
+## Summary
+
+Find a containing simplex with `find_simplex`; `None` means outside the hull, while true `boundary` identifies a point on shared faces and returns the lowest-index simplex.
+Reusing workspace in `find_simplex_scoped` for ordered queries uses the preceding simplex as a nearby start, reducing traversed simplices without changing results.
+Use `barycentric_into` barycentric coordinates $\mu = A^{-1}(x - p_0)$ for piecewise-linear interpolation or linear finite-element weights; use the exact `find_simplex` result for containment.
+For thin simplices satisfying $\max |(A^{-1})_{ij}|\,\varepsilon\,d^2 > \sqrt{\varepsilon}$, only barycentric, gradient, and circumcenter queries return `NumericalInstability`; handle those simplices separately while retaining point location and triangulation structure.
+Simplex vertex indices are canonical indices; look up input data through `representatives()`.
+
+## Further reading
+
+- [Convex hulls, Delaunay triangulations, and Voronoi diagrams](../delaunay-voronoi-and-hulls/): examine triangulation construction, site sorting, degeneracy handling, and resource limits.
+- [Exact geometric predicates](../exact-predicates/): examine floating-point filters and exact evaluation determining orientation signs for the walk.
+- [Scattered-data interpolation with a shared triangulation](../../../scioxide-interp/algorithms/scattered-tessellations/): share one `Delaunay` to interpolate multiple value sets piecewise linearly using barycentric coordinates.
+- [Delaunay maximization of the minimum angle](../../examples/delaunay-min-angle/): examine how Delaunay triangulation maximizes the minimum angle and avoids thin triangles.

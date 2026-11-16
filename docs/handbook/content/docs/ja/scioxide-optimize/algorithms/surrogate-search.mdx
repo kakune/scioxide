@@ -1,0 +1,351 @@
+---
+title: サロゲートモデルによる探索
+description: 評価コストが大きい目的の観測に kriging か RBF のサロゲートモデルを当てはめ、期待改善量などの獲得関数を最大にする点を次に評価する探索を導き、SurrogateSearch の履歴・モデル・獲得関数・実行可能性の仕様を Branin 関数で確かめる。
+sidebar:
+  order: 386
+references:
+  optimize-surrogate-acquisition: "サロゲートモデルと獲得関数"
+  optimize-kriging-and-rbf: "kriging-と-rbf"
+  optimize-expected-improvement: "期待改善量"
+  optimize-surrogate-loop: "探索の閉じた反復"
+---
+
+一回の評価に数秒から数時間かかる目的では、評価の回数そのものが計算コストになる。
+サロゲートモデルによる探索（surrogate-based optimization）は、評価した点の観測から目的を近似する安価なモデルを作り、モデルの上で次に評価する点を選ぶ。
+モデルが予測の不確かさも返すなら、予測が低い点と不確かな点のどちらを評価するかを獲得関数で釣り合わせられる。
+モデルに Gauss 過程（kriging）を使い、期待改善量で点を選ぶ方法は、Jones らの EGO（efficient global optimization）として知られ、Bayes 最適化とも呼ばれる。
+このページではモデルと獲得関数を導き、SciOxide の `SurrogateSearch` の仕様を説明し、Branin 関数で評価回数と最良の観測を確かめる。
+`SurrogateSearch` は大域最適性を主張せず、その終了は成功ではない `SearchBudgetCompleted` である。
+
+## サロゲートモデルと獲得関数
+
+サロゲートモデルの探索の問題は観測を蓄えた `SurrogateHistory` である。
+`SurrogateHistory::new(bounds, capacity)` は、`FiniteBounds` の箱と観測の数の上限を受け取り、次元か容量が 0、または箱の次元が型の次元 `D` と違えば `InvalidInput` を返す。
+`SurrogateObservation::new(point, value, noise_variance)` は点、観測値、既知の観測ノイズの分散（正確な値なら 0）を組にする。
+`push` は、履歴が満杯、値かノイズの分散が NaN か無限大、ノイズの分散が負、点が箱の外のとき `InvalidInput` を返す。
+同じ点を何度観測してもよく、ノイズのある観測を重ねられる。
+
+`SurrogateFitter` は履歴から `SurrogateModel` を当てはめるトレイトで、モデルの `predict(point, workspace)` が `SurrogatePrediction` を返す。
+`SurrogatePrediction::new(mean, variance)` の `mean()` は予測平均、`variance()` は潜在関数（観測ノイズを除いた目的）の条件付き分散で、分散を持たないモデルでは `None` である。
+モデルの意味と数値安定性は[局所モデルと kriging](../../../scioxide-interp/algorithms/local-models-and-kriging/)と共通する。
+
+### kriging と RBF
+
+`KrigingSurrogateFitter::new(covariance, numerical)` は、利用者が固定した共分散 $k(\mathbf{a}, \mathbf{b}) = \sigma^2 \rho(r)$ と観測ごとのノイズの分散を使う通常 kriging（定数の未知の平均を持つ Gauss 過程）である。
+$\sigma^2$ は信号の分散、$\rho$ は相関関数、$r$ は長さ尺度で割った距離である。
+学習点の共分散行列にノイズの分散を対角に加えた行列を $K$、問い合わせ点 $\mathbf{x}$ と学習点の共分散のベクトルを $\mathbf{k}_*$、観測値のベクトルを $\mathbf{y}$ とすると、予測平均と分散は
+
+$$
+\mu_* = \hat m + \mathbf{k}_*^T K^{-1} (\mathbf{y} - \hat m \mathbf{1}), \qquad
+s_*^2 = \sigma^2 - \mathbf{k}_*^T K^{-1} \mathbf{k}_* + \frac{(1 - \mathbf{1}^T K^{-1} \mathbf{k}_*)^2}{\mathbf{1}^T K^{-1} \mathbf{1}}
+$$
+
+である。
+$\hat m = \mathbf{1}^T K^{-1} \mathbf{y} / \mathbf{1}^T K^{-1} \mathbf{1}$ は平均の一般化最小二乗推定で、$s_*^2$ の最後の項はその推定の不確かさを足したものである。
+共分散の母数は推定しないので、長さ尺度と信号の分散は利用者が与える。
+`numerical` は scioxide-interp の `LocalModelOptions` で、密な当てはめの次数、メモリ、階数、条件数を制限する。
+$K$ は Cholesky 分解し、階数か条件数の制限に当たると特異値分解に切り替え、対角に自動で値を足すことはしない。
+
+`RbfSurrogateFitter::new(kernel, regularization, numerical)` は、全ての観測を使う動径基底関数（RBF）の補間 $s(\mathbf{x}) = \sum_i w_i \phi(\|\mathbf{x} - \mathbf{x}_i\|) + p(\mathbf{x})$ を当てはめる。
+低次の多項式 $p$ を加えるかは核の種類で決まる。
+対角の平滑化は `regularization` で明示した量だけを使う。
+RBF の予測は平均だけで、`variance()` は `None` になる。
+
+$N$ 個の観測に対する密な当てはめは $O(N^3)$ の分解と $O(N^2)$ のメモリを使い、予測は平均が $O(N)$、kriging の分散が $O(N^2)$ である。
+探索はバッチごとにモデルを当て直すので、観測が増えると当てはめが重くなる。
+`SurrogateHistory` の容量が観測の数、つまりこの計算コストの上限を決める。
+
+### 期待改善量
+
+`SurrogateAcquisition` は、予測から候補点の評価値を計算するトレイトで、探索は評価値が最大の点を提案する。
+`score(prediction, incumbent)` の `incumbent` は現在の最良値 $f_*$ で、観測した点での予測平均の最小値である。
+
+予測平均を $\mu$、予測の標準偏差を $s > 0$（kriging では $s_*$）、改善の余裕を $\xi \ge 0$ とし、目的の値を $Y \sim N(\mu, s^2)$ とみなす。
+$a = f_* - \xi$ と $z = (a - \mu)/s$ を置き、標準正規分布の分布関数を $\Phi$、密度を $\phi$ とする。
+改善量 $I = \max(a - Y, 0)$ の期待値は、$Y = \mu + s t$ と置き換えて
+
+$$
+\mathrm{E}[I] = \int_{-\infty}^{z} (a - \mu - s t)\,\phi(t)\,dt = (a - \mu)\,\Phi(z) + s\,\phi(z)
+$$
+
+となる（$\int_{-\infty}^{z} t\,\phi(t)\,dt = -\phi(z)$ を使う）。
+これが期待改善量（expected improvement）
+
+$$
+\operatorname{EI} = (f_* - \xi - \mu)\,\Phi(z) + s\,\phi(z)
+$$
+
+である。
+第 1 項は予測平均が低い点を、第 2 項は不確かさが大きい点を高く評価し、両方が候補の価値に入る。
+$s = 0$ の極限では $\max(f_* - \xi - \mu, 0)$ になる。
+
+`GaussianAcquisition` は Gauss 分布の予測に基づく三つの組み込みの獲得関数である。
+
+- `ExpectedImprovement { margin }`：上の EI で、`margin` が $\xi$ である。
+- `ProbabilityOfImprovement { margin }`：改善の確率 $\Phi(z)$ で、$s = 0$ では改善があれば 1、なければ 0 である。
+- `LowerConfidenceBound { weight }`：下側信頼限界 $\mu - \kappa s$ の符号を反転した $\kappa s - \mu$ で、`weight` が $\kappa$ である。
+
+どれも予測分散を必要とし、分散のない予測、負の $\xi$ か $\kappa$ には `InvalidInput` を返す。
+RBF と組み合わせるときは、平均だけを使う `SurrogateAcquisition` を自分で実装する。
+獲得関数の値は候補の順位付けであり、モデルの不確かさは元の目的の決定論的な誤差限界ではない。
+
+### 探索の閉じた反復
+
+`SurrogateFeasibility` は、前もって分かっている制約で候補点が実行可能かを判定するトレイトで、`Fn(&[S]) -> Result<bool, SciOxideError>` のクロージャもこれを実装する。
+判定は点だけで決まる必要があり、探索は実行可能な点だけを提案する。
+履歴の中に実行不可能な点があると、提案は `InvalidInput` で止まる。
+
+`SurrogateSearch::new(options, fitter, acquisition, feasibility, design, factory)` は、獲得関数の最大化に使う内側の `MultiStart`（開始点の設計と局所ソルバーの factory）を組み立てる。
+型の次元 `D` が 0 か、分離距離（後述）が NaN、無限大、負なら `InvalidInput` を返す。
+一回の当てはめから選んで評価する点の組をバッチと呼ぶ。
+`minimize(history, objective)` と `minimize_into(history, objective, workspace, scope)` は、バッチごとに次を繰り返す。
+
+1. 履歴にモデルを一度当てはめる。
+2. 内側の `MultiStart` で獲得関数の符号を反転した値を最小化し、開始点と局所解の中から、実行可能で、履歴と同じバッチの他の提案から離れた点のうち獲得関数が最大の点を選ぶ。
+   バッチの点の数だけこれを繰り返す。
+3. `objective` が返す（値、ノイズの分散）を履歴へ追加する。
+
+バッチの点の数は `SurrogateSearchOptions::with_batch_size`、バッチの数は `with_batches` で決める。
+同じバッチの点は同じモデルから選び、各座標を箱の幅で割った座標での Euclid 距離が、履歴の点と同じバッチの他の点のどれからも分離距離 `with_separation` より大きい点だけを候補にする。
+既定は獲得関数の開始点 10、シード 42、分離距離 0（同じ点だけを除く）、1 点のバッチを 1 つである。
+最後のバッチの点の数は履歴の残りの容量までに減らし、履歴が満杯になると残りのバッチを行わずに止まる。
+`propose_batch(history, count)` と `propose_batch_into` は、履歴を変えずに次の点だけを提案する。
+`SurrogateSearchWorkspace` は内側の探索と提案のメモリを持つ。
+
+`SurrogateSearchReport` は、終了理由 `termination()`（全てのバッチを終えたか履歴が満杯になった `SearchBudgetCompleted`）、この呼び出しでの目的の評価の回数 `objective_evaluations()`、完了したバッチの数 `completed_batches()`、履歴の中で観測値が最も低い観測の番号 `best_observation()` を返す。
+エラーで止まった場合も、それまでに追加した観測は履歴に残る。
+
+## Branin 関数での評価の節約
+
+[DIRECT と SHGO](oxref:optimize-direct-branin) と同じ Branin 関数を、評価の評価コストが大きい目的とみなして探す。
+箱は $x \in [-5, 10]$、$y \in [0, 15]$、大域的最小値は $5/(4\pi) \approx 0.397887$ で、最小点は $(-\pi, 12.275)$、$(\pi, 2.275)$、$(3\pi, 2.475)$ である。
+初期の観測は Halton 列の 8 点（列の 1 番目から 8 番目）とし、`KrigingSurrogateFitter` の共分散は Matérn 5/2 の核、両方の座標で同じ長さ尺度 $\ell$、信号の分散を初期の観測値の標本分散とする。
+内側の `MultiStart` は一様な開始点 10 個と組み込みの `PowellLocalFactory` で、近すぎる点で $K$ が特異になるのを避けるため、分離距離を正規化した箱で 0.01 にする。
+1 バッチに 1 点を評価する。
+入力はバッチの数、獲得関数、長さ尺度 $\ell$ である。
+出力は観測した点の散布図、評価回数ごとの最良値と既知の最小値との差（対数軸）、要約と判定である。
+既知の最小値と最小点が独立な検算になる。
+
+```rust
+//| id: optimize-surrogate-branin
+//| ref: optimize-surrogate-branin
+//| title: 獲得関数と長さ尺度を変えてサロゲートモデルの探索が Branin 関数の最小値に近づく様子を見る
+//| run: button
+//| timeoutMs: 120000
+//| crates: [scioxide-core, scioxide-interp, scioxide-optimize, scioxide-random]
+//| inputs:
+//|   batches: {"type":"range","label":"バッチの数 [回]","description":"1 点ずつ評価するバッチの数。","min":4,"max":30,"step":1,"value":20}
+//|   acquisition: {"type":"select","label":"獲得関数","options":["期待改善量 EI","改善の確率 PI","下側信頼限界 κ = 2"],"value":"期待改善量 EI"}
+//|   length_scale: {"type":"range","label":"長さ尺度 ℓ [-]","description":"Matérn 5/2 の核の長さ尺度。x と y で共通。","min":1,"max":8,"step":0.5,"value":5}
+//| cases:
+//|   - {"id":"lower-confidence-bound","label":"下側信頼限界","description":"κ = 2 の下側信頼限界に替え、同じ 28 回の評価での最良値を期待改善量と比べる。","inputs":{"acquisition":"下側信頼限界 κ = 2"}}
+//|   - {"id":"short-length","label":"ℓ = 1","description":"長さ尺度を 1 に短くすると、同じ 28 回の評価で既知の最小値との差は 0.17 にとどまる。","inputs":{"length_scale":1}}
+//|   - {"id":"few-rounds","label":"4 バッチ","description":"初期の 8 点と 4 バッチの探索だけで止め、既知の最小値との差がまだ 1 を超えることを確かめる。","inputs":{"batches":4}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"surrogate","path":"/rows/0/0","equals":"SearchBudgetCompleted"}
+//|       - {"artifact":"surrogate","path":"/rows/0/1","equals":20}
+//|       - {"artifact":"surrogate","path":"/rows/0/5","range":{"min":0.005,"max":0.03}}
+//|       - {"artifact":"surrogate","path":"/rows/0/6","range":{"min":0,"max":0.1}}
+//|       - {"path":"/outputs/3/state","equals":"partial"}
+//|   - case: lower-confidence-bound
+//|     expect:
+//|       - {"artifact":"surrogate","path":"/rows/0/5","range":{"min":0.001,"max":0.01}}
+//|       - {"artifact":"surrogate","path":"/rows/0/6","range":{"min":0,"max":0.1}}
+//|   - case: short-length
+//|     expect:
+//|       - {"artifact":"surrogate","path":"/rows/0/5","range":{"min":0.1,"max":0.3}}
+//|   - case: few-rounds
+//|     expect:
+//|       - {"artifact":"surrogate","path":"/rows/0/5","range":{"min":3,"max":4}}
+use scioxide_core::{Budget, RealScalar};
+use scioxide_interp::{Covariance, CovarianceKernel, LocalModelOptions};
+use scioxide_optimize::{
+    FiniteBounds, GaussianAcquisition, KrigingSurrogateFitter, PowellLocalFactory,
+    SurrogateHistory, SurrogateObservation, SurrogateSearch, SurrogateSearchOptions,
+    UniformStartDesign,
+};
+use scioxide_random::QmcPlan;
+
+let pi = std::f64::consts::PI;
+let branin = |x: &[f64]| {
+    let bowl = x[1] - 5.1 * x[0] * x[0] / (4.0 * pi * pi) + 5.0 * x[0] / pi - 6.0;
+    bowl * bowl + 10.0 * (1.0 - 1.0 / (8.0 * pi)) * RealScalar::cos(x[0]) + 10.0
+};
+let initial = 8;
+let rounds = batches.round() as usize;
+let bounds = FiniteBounds::new(vec![(-5.0, 10.0), (0.0, 15.0)]).map_err(|e| e.to_string())?;
+let mut history =
+    SurrogateHistory::<f64, 2>::new(bounds, initial + rounds).map_err(|e| e.to_string())?;
+// 初期の観測: Halton 列の 1〜8 番目の点を箱へ写して評価する。ノイズの分散は 0。
+let plan = QmcPlan::halton(2).map_err(|e| e.to_string())?;
+for index in 1..=initial {
+    let mut unit = [0.0; 2];
+    plan.point_into(index as u64, &mut unit)
+        .map_err(|e| e.to_string())?;
+    let point = [-5.0 + 15.0 * unit[0], 15.0 * unit[1]];
+    let observation = SurrogateObservation::new(point, branin(&point), 0.0);
+    history.push(observation).map_err(|e| e.to_string())?;
+}
+// 信号の分散は初期の観測値の標本分散にする。
+let values: Vec<f64> = history.observations().iter().map(|o| o.value()).collect();
+let mean = values.iter().sum::<f64>() / initial as f64;
+let variance =
+    values.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / (initial - 1) as f64;
+let kernel = CovarianceKernel::Matern52;
+let covariance =
+    Covariance::new(kernel, variance, [length_scale; 2]).map_err(|e| e.to_string())?;
+let fitter = KrigingSurrogateFitter::new(covariance, LocalModelOptions::new());
+let rule = match acquisition.as_str() {
+    "改善の確率 PI" => GaussianAcquisition::ProbabilityOfImprovement { margin: 0.0 },
+    "下側信頼限界 κ = 2" => GaussianAcquisition::LowerConfidenceBound { weight: 2.0 },
+    _ => GaussianAcquisition::ExpectedImprovement { margin: 0.0 },
+};
+let options = SurrogateSearchOptions::default()
+    .with_batches(rounds)
+    .with_batch_size(Budget::ONE)
+    .with_separation(0.01);
+let feasible = |_: &[f64]| Ok(true);
+let search = SurrogateSearch::new(
+    options,
+    fitter,
+    rule,
+    feasible,
+    UniformStartDesign,
+    PowellLocalFactory::default(),
+)
+.map_err(|e| e.to_string())?;
+let report = search
+    .minimize(&mut history, |x| Ok((branin(x), 0.0)))
+    .map_err(|e| e.to_string())?;
+
+// 独立な検算: 既知の最小値 5/(4π) と三つの最小点。
+let exact = 5.0 / (4.0 * pi);
+let observations = history.observations();
+let points: Vec<[f64; 2]> = observations.iter().map(|o| o.point()).collect();
+let minima = [[-pi, 12.275], [pi, 2.275], [3.0 * pi, 2.475]];
+emit_scatter_chart!(
+    &vec![
+        serde_json::json!({
+            "name": "初期の観測",
+            "points": &points[..initial],
+            "style": { "symbol": "circle" }
+        }),
+        serde_json::json!({
+            "name": "探索が選んだ点",
+            "points": &points[initial..],
+            "style": { "symbol": "diamond" }
+        }),
+        serde_json::json!({
+            "name": "既知の最小点",
+            "points": minima,
+            "style": { "symbol": "emptyCircle" }
+        })
+    ],
+    options = &serde_json::json!({
+        "xLabel": "x [-]",
+        "yLabel": "y [-]",
+        "xMin": -5.0,
+        "xMax": 10.0,
+        "yMin": 0.0,
+        "yMax": 15.0
+    })
+);
+// 評価回数ごとの、それまでの最良値と既知の最小値との差。
+let mut best = f64::INFINITY;
+let gaps: Vec<[f64; 2]> = observations
+    .iter()
+    .enumerate()
+    .map(|(i, o)| {
+        best = best.min(o.value());
+        [(i + 1) as f64, best - exact]
+    })
+    .collect();
+emit_line_chart!(
+    &vec![
+        serde_json::json!({ "name": "最良値 − 最小値", "points": gaps, "style": { "step": "end" } })
+    ],
+    options = &serde_json::json!({
+        "xLabel": "目的の評価 [回]",
+        "yLabel": "最良値と既知の最小値の差 [-]",
+        "yType": "log",
+        "annotations": [
+            { "kind": "line", "axis": "x", "value": initial as f64, "label": "初期の観測の終わり" }
+        ]
+    })
+);
+let chosen = observations[report.best_observation()];
+let distance = minima
+    .iter()
+    .map(|m| (chosen.point()[0] - m[0]).hypot(chosen.point()[1] - m[1]))
+    .fold(f64::INFINITY, f64::min);
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let digits5 = serde_json::json!({ "significantDigits": 5 });
+emit_table_with_columns!(
+    serde_json::json!([
+        { "key": "0", "label": "終了理由" },
+        { "key": "1", "label": "探索の評価 [回]", "type": "integer" },
+        { "key": "2", "label": "完了したバッチ [回]", "type": "integer" },
+        { "key": "3", "label": "最良の観測の番号", "type": "integer" },
+        { "key": "4", "label": "最良の観測値 [-]", "type": "number", "format": digits5 },
+        { "key": "5", "label": "既知の最小値との差 [-]", "type": "number", "format": sci3 },
+        { "key": "6", "label": "最小点までの距離 [-]", "type": "number", "format": sci3 },
+        { "key": "7", "label": "信号の分散 σ² [-]", "type": "number", "format": digits5 }
+    ]),
+    vec![(
+        report.termination().to_string(),
+        report.objective_evaluations(),
+        report.completed_batches(),
+        report.best_observation(),
+        chosen.value(),
+        chosen.value() - exact,
+        distance,
+        variance
+    )],
+    metadata = serde_json::json!({ "id": "surrogate" })
+);
+emit_outcome!(
+    Outcome::partial("全てのバッチを終えた。最良の観測は大域的最小点の候補である")
+        .status(report.termination().to_string())
+        .diagnostic("既知の最小値との差", chosen.value() - exact, None)
+        .diagnostic(
+            "目的の評価",
+            (initial + report.objective_evaluations()) as f64,
+            None
+        )
+);
+```
+
+表の「既知の最小値との差」は、初期の 8 回と探索の評価を合わせた観測のうちの最良の観測値から既知の最小値を引いた値で、「最小点までの距離」は最良の観測と最も近い最小点の距離である。
+初期の観測値の標本分散は 1191 で、これを信号の分散にしている。
+差の図は、観測した値がそれまでの最良値を下回るたびに段を下りる。
+初期の観測の終わりを示す縦線より右で段が下りていれば、モデルが選んだ点が初期の観測より低い値を見つけたことになる。
+
+既定の期待改善量、$\ell = 5$、20 バッチでは、初期の 8 点の最良値と既知の最小値との差は 5.39 である。
+探索の評価が進むと差は 17 回目の評価で 0.41、25 回目で 0.014 まで下がり、そのあとの 3 回では下がらない。
+最良の観測は $(3\pi, 2.475)$ の近くの $(9.371, 2.421)$ で、最小点までの距離は 0.076 である。
+バッチを 30 に増やしても 38 回の評価で差は 0.014 のままで、モデルが選ぶ点は最小点の近くを詰めない。
+下側信頼限界 $\kappa = 2$ では 28 回目の評価で $(\pi, 2.275)$ の近くの点を選び、差は $5.3 \times 10^{-3}$ になる。
+改善の確率では差は 0.25 にとどまり、長さ尺度を 1 にすると 0.17、8 にすると 0.040 になる。
+4 バッチで止めると差は 3.5 で、初期の観測より低い点はまだ 1 回しか見つかっていない。
+固定した母数と獲得関数の選び方が、同じ評価回数での結果を左右する。
+探索が選ぶ点は、獲得関数を最大にする内側の局所ソルバー（ここでは Powell 法）と開始点のシードにも依存するので、表の値はこの構成での一例として解釈する。
+
+同じ関数で DIRECT は評価の上限 100 回（実際には 97 回）で差 $1.4 \times 10^{-3}$ に達した（[DIRECT の評価回数](oxref:optimize-direct-branin)）。
+サロゲートモデルの探索は 30 回足らずの評価で最小点から 0.1 以内の点を選べるが、最小値を細かく詰めるには、最良の観測から局所ソルバーを走らせるなどの局所最適化が要る。
+
+## まとめ
+
+サロゲートモデルによる探索は観測から kriging か RBF のモデルを当てはめ、獲得関数が最大の点を次に評価して、少ない評価で低い値を探す。
+期待改善量は予測平均の低さと不確かさの大きさを一つの値にまとめ、改善の確率と下側信頼限界はその釣り合いを別の形で決める。
+kriging の長さ尺度と信号の分散は推定されないので、利用者が目的の尺度に合わせて選び、結果がその選択に依存することを確かめる。
+`SurrogateHistory` の容量が観測の数と当てはめの計算コストの上限になり、`SearchBudgetCompleted` は成功ではない。
+最良の観測は既知の性質や別の方法で確かめ、必要なら局所ソルバーで詰める。
+
+## 次に読むページ
+
+- [局所モデルと kriging](../../../scioxide-interp/algorithms/local-models-and-kriging/)：サロゲートモデルに使う共分散の種類と、予測分散の計算と数値安定性を確かめる。
+- [DIRECT と SHGO による大域探索](../deterministic-and-surrogate-global/)：同じ Branin 関数で、乱数を使わない領域分割に必要な評価回数を比べる。
+- [CMA-ES](../cma-es/)：評価が安価な連続な黒箱関数で、探索分布の共分散を学ぶ方法を確かめる。
+- [CMA-ES・DIRECT・SHGO・サロゲートモデルの API](../../api/model-based-global-search/)：`SurrogateHistory`、`SurrogateSearchOptions`、獲得関数のトレイトの仕様を確かめる。

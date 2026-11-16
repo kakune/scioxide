@@ -1,0 +1,364 @@
+---
+title: "Estimating seismic arrival-time differences by cross-correlation"
+description: "Estimate arrival-time differences from noisy synthetic records at two stations using correlate's lag convention and parabolic interpolation, and compare error across SNR values with a linearized standard deviation."
+sidebar:
+  order: 440
+references:
+  signal-seismic-lag-estimate: "cross-correlation-and-parabolic-interpolation"
+  signal-seismic-error-model: "linearizing-estimation-error"
+---
+
+The arrival-time difference of the same seismic wave at two seismometers is a basic observation for estimating source direction and subsurface velocity structure.
+For similar waveforms, find the shift that best aligns one record with the other; this amounts to maximizing cross-correlation.
+This example estimates arrival-time differences from noisy synthetic records at two stations.
+Use repeated trials with different seeds to examine the sign of `correlate` lags, parabolic interpolation for delays finer than the sample interval, and noise-induced errors and large outliers.
+
+## Synthetic-record model
+
+Use sampling rate $f_s = 100$ Hz and record length $N = 512$ samples (5.12 s).
+Represent the arriving wave by a Gaussian-modulated cosine with carrier frequency $f_c = 5$ Hz and envelope standard deviation $\sigma_w = 0.08$ s:
+
+$$
+s(t) = e^{-t^2/(2\sigma_w^2)} \cos(2\pi f_c t)
+$$
+
+Its maximum amplitude is 1.
+This is a defined model of a short wave packet such as the onset of a P wave, rather than a reproduction of a real seismic waveform.
+The same packet reaches station A at $t_A = 1.5$ s and station B at $t_B = t_A + \tau$, with independent white Gaussian noise of standard deviation $\sigma$ added to each.
+
+$$
+a[n] = s(n/f_s - t_A) + e_a[n], \qquad b[n] = s(n/f_s - t_B) + e_b[n]
+$$
+
+Define SNR as $20 \log_{10}(1/\sigma)$, the ratio $1/\sigma$ of the packet's maximum amplitude to the noise standard deviation expressed in decibels.
+Generate the packet with `Waveform::GaussianPulse` from `scioxide_signal::waveform` and draw noise from `Normal` in `scioxide-random` with a specified seed.
+
+## Cross-correlation and parabolic interpolation
+
+`correlate(b, a)` arranges $c[\ell] = \sum_k b[k]\, a[k - \ell]$ in ascending lag order $\ell = -(N-1), \dots, N-1$, with lag 0 at index $N - 1$ ([Correlation lag ordering](oxref:signal-correlation-lags)).
+When $b$ contains a waveform delayed by $d$ samples relative to $a$, $c[\ell]$ peaks near $\ell = d$.
+Thus, compute lag $\ell^\ast = j^\ast - (N-1)$ from the maximizing index $j^\ast$ and set $\tau = \ell^\ast / f_s$; a positive value indicates later arrival at B. Swapping arguments to `correlate(a, b)` reverses the sign of the maximizing lag.
+
+Integer-lag resolution is the sample interval $1/f_s = 10$ ms.
+Taking the vertex of the parabola through the maximum and its neighboring points $c_- = c[j^\ast - 1]$, $c_0 = c[j^\ast]$, and $c_+ = c[j^\ast + 1]$ gives the sub-sample shift
+
+$$
+\delta = \frac{c_- - c_+}{2\,(c_- - 2c_0 + c_+)}, \qquad \hat\tau = \frac{\ell^\ast + \delta}{f_s}
+$$
+
+with $\lvert \delta \rvert \le 1/2$.
+The correlation peak is not parabolic and is close to a carrier cosine in this example, so $\delta$ retains a small bias even without noise.
+
+## Linearizing estimation error
+
+For small noise, a first-order expansion of the correlation peak's displacement gives the delay-estimate standard deviation
+
+$$
+\sigma_\tau \approx \sqrt{\frac{2\sigma^2}{\sum_n s'(t_n)^2}}
+$$
+
+
+Here $s'$ is the packet's time derivative and $t_n$ denotes times in station A's record.
+The derivation expands the maximum condition $c'(\ell) = 0$ around the true delay, retaining only products of noise and the wave packet.
+Each record's noise contributes one term with variance $\sigma^2 \sum s'^2$, producing the numerator $2\sigma^2$.
+A steeper wave packet (higher carrier frequency) gives a more precise delay for the same noise.
+
+The noise–noise product $\sum_k e_b[k]\, e_a[k-\ell]$ neglected by this approximation sums over all $N$ samples, so its variance is proportional to $N\sigma^4$.
+The wave-packet–noise term is proportional to $\sigma^2$, so as SNR decreases the noise–noise contribution grows and error exceeds the linearized prediction.
+At still lower SNR, a neighboring peak one carrier period $1/f_c = 0.2$ s away or a noise–noise correlation peak becomes the maximum, producing a large estimation outlier.
+Once outliers begin, root-mean-square error departs sharply from the linearized prediction.
+If approximate arrival times are known, cropping records around them before correlation reduces both noise–noise terms and outliers.
+
+The following block defines the model shared by the two cells.
+`record` creates a record from arrival time and noise standard deviation, while `estimate` returns the maximizing lag of `correlate(b, a)` and the parabolically interpolated delay [s].
+`predicted_sd` computes $\sigma_\tau$ above from the analytic derivative $s'(t)$ (an independent check).
+
+```rust
+//| id: signal-seismic-model
+//| kind: definitions
+//| title: "Synthetic seismic records and cross-correlation delay estimation"
+//| crates: [scioxide-core, scioxide-random, scioxide-signal]
+use scioxide_core::RealScalar;
+use scioxide_random::{Distribution, Normal, SplitMix64};
+use scioxide_signal::{Waveform, correlate, waveform};
+
+/// Sampling rate [Hz], record sample count, and arrival time at station A [s]
+pub(crate) const RATE: f64 = 100.0;
+pub(crate) const LENGTH: usize = 512;
+pub(crate) const ARRIVAL: f64 = 1.5;
+/// Packet carrier frequency [Hz] and envelope standard deviation [s]
+pub(crate) const CARRIER: f64 = 5.0;
+pub(crate) const WIDTH: f64 = 0.08;
+
+/// Compute noise standard deviation σ from SNR [dB] = 20 log₁₀(1/σ)
+pub(crate) fn noise_sd(snr_db: f64) -> f64 {
+    RealScalar::exp(-snr_db / 20.0 * core::f64::consts::LN_10)
+}
+
+/// Record of a packet arriving at arrival [s], plus white Gaussian noise with standard deviation noise
+pub(crate) fn record(
+    arrival: f64,
+    noise: f64,
+    rng: &mut SplitMix64,
+) -> Result<Vec<f64>, String> {
+    let pulse = Waveform::GaussianPulse {
+        frequency: CARRIER,
+        phase: 0.0,
+        sigma: WIDTH,
+    };
+    let times: Vec<f64> = (0..LENGTH).map(|n| n as f64 / RATE - arrival).collect();
+    let clean = waveform(pulse, &times).map_err(|e| e.to_string())?;
+    let normal = Normal::new(0.0, noise).map_err(|e| e.to_string())?;
+    clean
+        .iter()
+        .map(|s| Ok(s + normal.sample(rng).map_err(|e| e.to_string())?))
+        .collect()
+}
+
+/// Maximizing lag ℓ* [samples] of correlate(b, a) and parabolically interpolated delay [s]
+pub(crate) fn estimate(a: &[f64], b: &[f64]) -> Result<(i64, f64), String> {
+    let c = correlate(b, a).map_err(|e| e.to_string())?;
+    // Exclude endpoints when finding the maximum because neighboring points are needed
+    let j = (1..c.len() - 1).fold(1, |best, j| if c[j] > c[best] { j } else { best });
+    let lag = j as i64 - (a.len() as i64 - 1);
+    let (left, mid, right) = (c[j - 1], c[j], c[j + 1]);
+    let shift = 0.5 * (left - right) / (left - 2.0 * mid + right);
+    Ok((lag, (lag as f64 + shift) / RATE))
+}
+
+/// Linearized delay standard deviation [s]: √(2σ² / Σ s'(tₙ)²). s' is the analytic derivative
+pub(crate) fn predicted_sd(noise: f64) -> f64 {
+    let omega = core::f64::consts::TAU * CARRIER;
+    let slope: f64 = (0..LENGTH)
+        .map(|n| {
+            let t = n as f64 / RATE - ARRIVAL;
+            let envelope = RealScalar::exp(-0.5 * (t / WIDTH) * (t / WIDTH));
+            let carrier = RealScalar::cos(omega * t);
+            let derivative = -envelope
+                * (t / (WIDTH * WIDTH) * carrier + omega * RealScalar::sin(omega * t));
+            derivative * derivative
+        })
+        .sum();
+    RealScalar::sqrt(2.0 * noise * noise / slope)
+}
+```
+
+## Estimation from one pair of records
+
+The next cell creates two records from true delay $\tau$, SNR, and random seed, and estimates delay from `correlate(b, a)`.
+The first two charts show station A and B records with linked time axes.
+The third plots correlation against lag [s], with a vertical line at the true delay.
+The table lists the integer-lag delay, parabolically interpolated delay, error from truth, linearized standard deviation, and maximizing lag of `correlate(a, b)` with arguments swapped.
+
+```rust
+//| id: signal-seismic-single-record
+//| ref: signal-seismic-single-record
+//| title: "Estimate arrival-time difference from records at two stations"
+//| run: reactive
+//| uses: [signal-seismic-model]
+//| inputs:
+//|   delay: {"type":"range","label":"True delay τ [s]","description":"Time by which arrival at station B is later than at A.","min":0.5,"max":2.5,"step":0.001,"value":1.234}
+//|   snr_db: {"type":"range","label":"SNR [dB]","description":"Ratio of packet maximum amplitude to noise standard deviation.","min":-5,"max":40,"step":1,"value":20}
+//|   seed: {"type":"range","label":"Random seed [-]","description":"Determine the noise in the two records.","min":1,"max":200,"step":1,"value":100}
+//| cases:
+//|   - {"id":"noisy","label":"SNR = 0 dB","description":"Noise becomes as large as the packet, and error can exceed the linearized prediction.","inputs":{"snr_db":0}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"estimate","path":"/rows/0/1","equals":123}
+//|       - {"artifact":"estimate","path":"/rows/0/3","approx":{"value":1.234,"atol":0.003}}
+//|       - {"artifact":"estimate","path":"/rows/0/6","equals":-123}
+use scioxide_random::{SeedableRng, SplitMix64};
+use scioxide_signal::correlate;
+
+let noise = noise_sd(snr_db);
+let mut rng = SplitMix64::from_seed(seed.round() as u64);
+let a = record(ARRIVAL, noise, &mut rng)?;
+let b = record(ARRIVAL + delay, noise, &mut rng)?;
+let (lag, estimated) = estimate(&a, &b)?;
+// Swapping arguments reverses the sign of the maximizing lag
+let swapped = correlate(&a, &b).map_err(|e| e.to_string())?;
+let swapped_peak =
+    (0..swapped.len()).fold(
+        0,
+        |best, j| if swapped[j] > swapped[best] { j } else { best },
+    );
+let swapped_lag = swapped_peak as i64 - (b.len() as i64 - 1);
+
+let fixed4 = serde_json::json!({ "fractionDigits": 4 });
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "True delay τ [s]", "type": "number", "format": fixed4 },
+    { "key": "1", "label": "Maximizing lag ℓ* [samples]", "type": "integer" },
+    { "key": "2", "label": "ℓ*/f_s [s]", "type": "number", "format": fixed4 },
+    { "key": "3", "label": "Parabolic interpolation τ̂ [s]", "type": "number", "format": fixed4 },
+    { "key": "4", "label": "Error τ̂ − τ [ms]", "type": "number", "format": fixed2 },
+    { "key": "5", "label": "Linearized σ_τ [ms]", "type": "number", "format": fixed2 },
+    { "key": "6", "label": "correlate(a, b) lag [samples]", "type": "integer" }
+]);
+let row = (
+    delay,
+    lag,
+    lag as f64 / RATE,
+    estimated,
+    1000.0 * (estimated - delay),
+    1000.0 * predicted_sd(noise),
+    swapped_lag,
+);
+emit_table_with_columns!(
+    columns,
+    vec![row],
+    metadata = serde_json::json!({ "id": "estimate" })
+);
+
+let trace = |x: &[f64]| {
+    x.iter()
+        .enumerate()
+        .map(|(n, &v)| [n as f64 / RATE, v])
+        .collect::<Vec<_>>()
+};
+for (name, values) in [("Station A record a[n]", &a), ("Station B record b[n]", &b)] {
+    emit_line_chart!(
+        &vec![serde_json::json!({ "name": name, "points": trace(values) })],
+        options = &serde_json::json!({
+            "link": { "group": "seismic-time" },
+            "xLabel": "Time t [s]",
+            "yLabel": "Amplitude [-]",
+            "xMin": 0.0,
+            "xMax": LENGTH as f64 / RATE
+        })
+    );
+}
+let c = correlate(&b, &a).map_err(|e| e.to_string())?;
+let lags: Vec<[f64; 2]> = c
+    .iter()
+    .enumerate()
+    .map(|(j, &v)| [(j as f64 - (LENGTH as f64 - 1.0)) / RATE, v])
+    .collect();
+emit_line_chart!(
+    &vec![serde_json::json!({ "name": "c[ℓ] = correlate(b, a)", "points": lags })],
+    options = &serde_json::json!({
+        "xLabel": "Lag ℓ/f_s [s]",
+        "yLabel": "Correlation [-]",
+        "annotations": [{ "kind": "line", "axis": "x", "value": delay, "label": "True delay τ" }]
+    })
+);
+```
+
+At the defaults $\tau = 1.234$ s, SNR 20 dB, and seed 100, correlation peaks at lag 123 samples (1.23 s), and parabolic interpolation gives $\hat\tau = 1.2329$ s.
+The error is $-1.06$ ms, within the linearized standard deviation $\sigma_\tau = 1.63$ ms.
+With arguments swapped, `correlate(a, b)` peaks at lag $-123$, reversing only the sign.
+At SNR 40 dB, $\sigma_\tau$ drops to 0.16 ms and error becomes $-0.12$ ms.
+At SNR 0 dB, the packet is buried in noise, the maximizing lag moves to $-11$ samples, and error becomes $-1343$ ms.
+This outlier is orders of magnitude larger than the linearized $\sigma_\tau = 16$ ms, showing that peak heights alone cannot identify the correct correlation peak.
+
+## SNR and estimation error
+
+Because the error for one pair depends on randomness, assess its magnitude through repeated trials with different seeds.
+The next cell varies SNR over eight levels from 0 to 40 dB, independently generating $R$ record pairs and estimating their delays at each level.
+Fix the true delay at $\tau = 1.234$ s (123.4 samples, fractional part 0.4 sample).
+From each level's errors $e_i = \hat\tau_i - \tau$, calculate root mean square $\mathrm{RMS} = \sqrt{\overline{e^2}}$, its standard error $\mathrm{SE}(\overline{e^2}) / (2\,\mathrm{RMS})$, mean bias, and the count of outliers with $\lvert e_i \rvert > 0.1$ s (half a carrier period).
+The chart plots the ratio of RMS to the linearized prediction $\sigma_\tau$ with ±2 SE error bars, and a reference line at ratio 1 on the vertical axis.
+Because generation and correlation of $R$ pairs repeat for each SNR, run the cell with a button.
+
+```rust
+//| id: signal-seismic-snr-sweep
+//| ref: signal-seismic-snr-sweep
+//| title: "Compare delay-estimation error across SNR values with the linearized prediction"
+//| run: button
+//| uses: [signal-seismic-model]
+//| inputs:
+//|   trials: {"type":"range","label":"Trial count R [-]","description":"Number of record pairs generated at each SNR.","min":50,"max":200,"step":50,"value":100}
+//|   seed: {"type":"range","label":"Random seed [-]","description":"Determine the noise sequence across all trials.","min":1,"max":100,"step":1,"value":11}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"sweep","path":"/rows/0/5","range":{"min":50}}
+//|       - {"artifact":"sweep","path":"/rows/7/1","range":{"min":0.12,"max":0.21}}
+//|       - {"artifact":"sweep","path":"/rows/7/5","equals":0}
+use scioxide_random::{SeedableRng, SplitMix64};
+
+let delay = 1.234;
+let runs = trials.round() as usize;
+let mut rng = SplitMix64::from_seed(seed.round() as u64);
+let mut rows = Vec::new();
+let mut bars = Vec::new();
+for snr_db in [0.0_f64, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 40.0] {
+    let noise = noise_sd(snr_db);
+    let mut errors = Vec::with_capacity(runs);
+    for _ in 0..runs {
+        let a = record(ARRIVAL, noise, &mut rng)?;
+        let b = record(ARRIVAL + delay, noise, &mut rng)?;
+        errors.push(estimate(&a, &b)?.1 - delay);
+    }
+    let count = runs as f64;
+    let mean_square = errors.iter().map(|e| e * e).sum::<f64>() / count;
+    let spread = errors
+        .iter()
+        .map(|e| (e * e - mean_square).powi(2))
+        .sum::<f64>()
+        / (count - 1.0);
+    let rms = mean_square.sqrt();
+    // RMS standard error: SE(mean square) / (2 RMS) (delta method)
+    let rms_se = (spread / count).sqrt() / (2.0 * rms);
+    let bias = errors.iter().sum::<f64>() / count;
+    let skips = errors.iter().filter(|e| e.abs() > 0.1).count();
+    let predicted = predicted_sd(noise);
+    rows.push((
+        snr_db,
+        1000.0 * rms,
+        1000.0 * rms_se,
+        1000.0 * predicted,
+        1000.0 * bias,
+        skips,
+    ));
+    let ratio = rms / predicted;
+    let half = 2.0 * rms_se / predicted;
+    bars.push([snr_db, ratio, ratio - half, ratio + half]);
+}
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "SNR [dB]", "type": "number" },
+    { "key": "1", "label": "RMS error [ms]", "type": "number", "format": sci3 },
+    { "key": "2", "label": "RMS SE [ms]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "Linearized σ_τ [ms]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "Mean bias [ms]", "type": "number", "format": sci3 },
+    { "key": "5", "label": "Outliers |e| > 0.1 s [count]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "sweep" })
+);
+emit_chart!(serde_json::json!({
+    "kind": "errorbar",
+    "xLabel": "SNR [dB]",
+    "yLabel": "RMS error / linearized σ_τ [-]",
+    "yType": "log",
+    "series": [{ "name": "Ratio ±2 SE", "points": bars }],
+    "annotations": [{
+        "kind": "line",
+        "axis": "y",
+        "value": 1.0,
+        "label": "Linearized prediction",
+        "style": { "lineType": "dashed" }
+    }]
+}));
+```
+
+At the default $R = 100$ and seed 11, RMS error at 40 dB is $0.173 \pm 0.011$ ms (±1 SE), agreeing within 1 SE with the linearized $\sigma_\tau = 0.163$ ms.
+As SNR decreases, the RMS-error-to-prediction ratio departs from 1: 1.13 at 30 dB, 1.36 at 25 dB, 1.80 at 20 dB, and 2.17 at 15 dB, showing the growing contribution of noise–noise products.
+No outliers occur at 15 dB or above; mean bias at 30 and 40 dB has absolute value below 0.05 ms, smaller than the RMS.
+At 10 dB, 19 of 100 pairs are outliers and RMS error jumps to 473 ms; at 5 dB, 85 pairs are outliers, and at 0 dB, 95 pairs.
+The plotted ratio jumps from about 2 to about 90 between 15 and 10 dB, placing the lower limit of the linearization's range of validity between them.
+Setting $R = 200$ reduces SE by about a factor of $1/\sqrt 2$; ratios at levels of 15 dB or above remain unchanged within twice the SE.
+
+## Summary
+
+If subtracting $N - 1$ from the maximizing index of `correlate(b, a)` gives a positive lag, arrival at B is later than at A. Parabolic interpolation gives delays finer than the 10 ms sample interval, reaching an RMS error of 0.17 ms at 40 dB in this example.
+At high SNR, error can be estimated by the linearized $\sigma_\tau = \sqrt{2\sigma^2/\sum s'^2}$, but as SNR drops, noise–noise products make it larger than predicted.
+At still lower SNR, outliers that select neighboring or noise peaks increase error by orders of magnitude.
+Assess estimate reliability from the error distribution over repeated trials, and crop records around arrival times before correlation if needed.
+
+See [Convolution and correlation](../../algorithms/convolution-and-correlation/) for lag definitions and signs, and whether `correlate` uses direct summation or the FFT.
+See [Analytic signals and instantaneous envelopes with the Hilbert transform](../hilbert-envelope/) for obtaining envelopes of band-limited signals such as wave packets.

@@ -1,0 +1,566 @@
+---
+title: "Adaptive Mesh Refinement and Topological Correspondence"
+description: "Adaptive-mesh hierarchies rooted in structured grids and simplex meshes, one-level refinement and coarsening, induced refinement restoring 2:1 balance across faces, hanging vertices, edges, and faces and interface pieces, revision tokens and topological correspondence between revisions, and sharing with other chapters."
+sidebar:
+  order: 370
+references:
+  spatial-adaptive-hierarchy: "hierarchical-adaptive-mesh-structure"
+  spatial-adaptive-balance: "local-refinement-and-21-balancing"
+  spatial-adaptive-hanging: "hanging-vertices-edges-faces-and-interfaces"
+  spatial-adaptive-topology-relations: "topological-correspondence-and-generation-tracking"
+  spatial-shared-tessellation: "sharing-with-other-chapters"
+---
+
+When a partial differential equation's solution changes rapidly only in part of the domain, local refinement ($h$-refinement) subdivides cells only there and leaves other cells coarse.
+Each refinement or coarsening produces a new mesh with different cell counts and numbering.
+This page calls each such mesh a revision.
+We must distinguish which revision a field's values belong to and record how cells and faces correspond between revisions.
+Without a bound on the difference in refinement between neighboring cells, many fine faces can adjoin one coarse face, complicating discretization constraints.
+The adaptive mesh `AdaptiveMesh` in `scioxide-spatial` is immutable after construction; each refinement returns a new revision and a correspondence `TopologyMap` between revisions.
+This page explains their definitions, algorithms, complexity, APIs, and failure classifications, and checks the results by refining toward one point.
+Partitioning `MeshPartition` and repartitioning `RepartitionMap` for parallel computation are covered in [Adaptive mesh partitioning and repartitioning](../mesh-partition/).
+Formulas for transferring field values to a new revision lie outside this crate; [Sharing with other chapters](#sharing-with-other-chapters) explains the division of responsibilities.
+
+## Hierarchical adaptive mesh structure
+
+`AdaptiveMesh<S, D>` (where $S$ is the scalar type and $D$ is the spatial dimension) is a collection of trees (a forest), each rooted at a cell of the imported mesh.
+Construct roots in either of the following ways.
+
+- `AdaptiveMesh::from_structured(&cell_mesh, limits)` uses the segments, quadrilaterals, or hexahedra of a `CellMesh` as roots.
+  It inherits periodic seams and axis directions; face-incidence signs point outward from cells for every axis direction.
+- `AdaptiveMesh::from_simplex(&simplex_mesh, limits)` uses the positively oriented simplices of a `TriangleMesh` or `TetrahedronMesh` as roots.
+  It inherits all `SimplexMesh` checks.
+  Interval meshes (`D = 1`) are rejected with `InvalidInput` (`UnsupportedConfiguration`), so construct a one-dimensional adaptive mesh from `SegmentMesh` using `from_structured`.
+
+Refinement bisects edges, dividing a cell into $2^D$ children.
+A segment has 2 children, a quadrilateral or triangle 4, and a hexahedron or tetrahedron 8.
+`cell_kind()` returns whether a cell is a grid cell (`AdaptiveCellKind::Tensor`) or a simplex (`AdaptiveCellKind::Simplex`).
+
+Tree nodes have hierarchy IDs that remain unchanged across revisions.
+Children remain in the hierarchy after coarsening; refining the same cell again reuses children with the same IDs.
+Leaves are active cells; `active_cells()[i]` is the hierarchy ID of active cell $i$.
+Active cells follow a depth-first traversal in root order and then child order.
+Active cells, vertices, faces, and edges receive contiguous indices `0..count`, reassigned for each revision.
+Traverse trees with `parent(id)`, `children(id)`, `level(id)` (0 for roots), and `hierarchy_len()`.
+
+Vertex identity uses exact dyadic values of reference coordinates in root cells rather than rounded coordinates.
+`child_reference_vertices(id)` returns child vertices in the parent's reference cell as integers in units of $1/2$.
+`vertex_provenance(v)` expresses a vertex as the exact combination of root-mesh vertices
+
+$$
+v = \frac{1}{2^k} \sum_r w_r\, v_r
+$$
+
+and returns it as a sequence of pairs $(r, w_r)$ and $k$.
+Since the depth limit is at most 20, weights $w_r$ remain below $2^{64}$.
+
+Coordinates returned by `point(v)` are computed by taking pairwise midpoints of rounded parent-cell vertex coordinates; they need not match a single rounding of the combination above.
+If a new vertex's coordinate rounds to the same value as any contributing vertex (exhausting precision at that scale), `adapt` returns `InvalidInput`.
+Child-simplex orientation is tested exactly on rounded coordinates; degeneracy returns `InvalidInput`, while an orientation opposite to that in the reference cell returns `NumericalInstability`.
+`cell_measure` and `face_measure` compute lengths, areas, and volumes from rounded vertex coordinates.
+For grid cells, the product of coordinate widths along each axis uses the extended-range value `Scaled` with a separate exponent ([Exact accumulation and range-safe arithmetic](../../../scioxide-core/algorithms/range-safe-arithmetic/)), converting back to the scalar type only once at the end, so intermediate products neither overflow nor underflow.
+For simplex cells, the orientation determinant is accumulated exactly and rounded once, then divided by 2 for triangles or 6 for tetrahedra (the same computation as in [Simplex meshes](../simplex-meshes/)).
+A result not representable in the scalar type gives `NumericalInstability`.
+`cell_diameter` is the largest distance between vertices, with the sum of squares computed using `ScaledNorm` without overflow.
+
+A mesh is an immutable value, and `adapt` returns a new revision.
+Each revision has a `MeshToken`.
+The token comprises a mesh family (the imported original mesh and all revisions derived from it), a generation number, and a revision-specific identity.
+Import and `adapt` preserve the family, increment the generation by 1, and assign a new identity.
+Calling `adapt` twice on the same revision creates sibling revisions of the same generation, but their different identities prevent combining them.
+`is_compatible_with` is true only for tokens of the same revision, including clones of those tokens.
+Fields, boundary tags, topological correspondences, and partitions retain the token of the revision used at construction and check it in $O(1)$ when combined ([Mesh identity and generation tokens](oxref:spatial-mesh-identity-generations)).
+
+Resource limits are supplied through `AdaptationLimits` and inherited by every revision and partition.
+Exceeding a limit gives `ResourceLimit`; a limit of 0 rejects every operation using that resource.
+
+| Limit | Default | Quantity counted |
+|---|---|---|
+| `max_depth` | 20 | Refinement depth (a value above 20 gives `InvalidInput` on import) |
+| `max_cells` | 1,000,000 | Hierarchy nodes, including inactive nodes |
+| `max_entities` | 8,000,000 | Vertices, faces, and edges, counted separately |
+| `max_work` | $10^9$ | Work per operation (one unit for each copy, comparison, visit to a neighbor or ancestor, and output relation) |
+| `max_storage_bytes` | 256 MiB | Memory allocated by one operation |
+
+Import and refinement cost $O(N \log N)$, where $N$ is the number of hierarchy entities including inactive ones.
+
+## Local refinement and 2:1 balancing
+
+Specify refinement and coarsening with `AdaptationRequest`.
+
+| Field | Contents |
+|---|---|
+| `source` | `&MeshToken` of the revision on which markers were set |
+| `refine` | Hierarchy IDs of active cells to refine by one level |
+| `coarsen` | Hierarchy IDs of parents whose children are all to be merged into the parent. All children must be active and have no refinement markers |
+
+`mesh.adapt(request)` refines or coarsens marked cells by exactly one level and returns a new revision with the additional refinement needed for 2:1 balance.
+To supply cancellation or limits through an execution or solve context, call the same operation with `mesh.adapt_scoped(request, cx)`.
+Repeat `adapt` to refine by two or more levels.
+All markers are checked before anything is copied.
+
+- `InvalidInput` occurs if `source` is not this revision's token (including a sibling's token), markers are duplicated, a refinement marker is not an active cell, a coarsening marker is not a parent with all children active, or rounding collapses a new cell.
+- A marker ID at least `hierarchy_len()` gives `OutOfBounds`.
+- A child simplex whose orientation is reversed from the reference cell by rounding gives `NumericalInstability`.
+- A cell exceeding the depth limit or any other exceeded limit gives `ResourceLimit`.
+- Cancellation or a deadline reached in the execution context passed to `adapt_scoped` gives `ExecutionStopped`.
+  With a solve context, refining one cell counts toward the refinement limit, and one unit of work toward the node limit; exhausting either gives `ConvergenceFailure`.
+
+Failure leaves the original revision unchanged.
+With no markers, the result shares memory and its token with the original revision and constructs only an identity map.
+The resulting `AdaptationResult` contains the new revision `mesh`, inter-revision map `map`, additional refinements for balance `induced_refinements`, and work count `work`.
+
+### Mathematical condition for 2:1 balance
+
+For two active cells $K_1$ and $K_2$ sharing a face (including pairs across periodic seams),
+
+$$
+\lvert \operatorname{level}(K_1) - \operatorname{level}(K_2) \rvert \le 1
+$$
+
+the mesh is called 2:1 balanced when this inequality holds.
+The condition applies only to face-sharing pairs, not pairs sharing only a vertex or edge.
+
+Under balance, cells across a coarse face are only one level finer, so vertices they place within the coarse face can only be coarse-edge midpoints or the coarse-face center.
+Continuous finite elements constrain values at such vertices by interpolating values at the coarse-face vertices (hanging-vertex constraints).
+In two dimensions, every edge where cells meet is a face, so 2:1 balance lets constraints use only the two endpoints of a coarse edge without chains in which one constraint contains another.
+In three dimensions, balance applies only to face-sharing pairs, so cells sharing only an edge can differ by two or more levels, and constraints can form chains on that edge.
+
+`adapt` finds refinements that restore balance as follows.
+Since the original revision is balanced and markers change leaves by only one level, each original leaf undergoes at most one refinement for balance.
+
+1. Assign each cell a target depth reflecting its marker.
+2. For face-sharing pairs differing by more than one level, insert the shallower cell into a min-heap ordered by increasing hierarchy ID.
+3. Refine the cell removed from the heap, recheck its neighboring pairs, and insert newly violating cells.
+
+Each step refines the smallest currently violating ID, but a smaller ID may be inserted later, so `induced_refinements` need not be sorted.
+If a parent marked for coarsening requires refinement for balance, the entire request is rejected with `InvalidInput`.
+
+### Hanging vertices, edges, faces, and interfaces
+
+At boundaries between cells of different depths, fine-cell vertices, edges, and faces lie within coarse-cell faces.
+These are called hanging entities; `hanging_entities()` returns them as a sequence of `HangingEntity { kind, entity, coarse_face }`.
+`entity` is the vertex, edge, or face index; `coarse_face` is the index of the containing coarse face.
+`HangingEntityKind` has three variants.
+
+- `Vertex`: a vertex inside a coarse edge or coarse face.
+- `Edge`: an edge within a coarse face that is not an edge of the coarse cell.
+- `Face`: a fine face within a coarse face.
+
+In two dimensions, cell faces are edges, so a fine edge along a coarse edge counts as both `Edge` and `Face`.
+
+`interfaces()` returns boundaries between active cells and between active cells and the exterior as an `AdaptiveInterface` for each physical piece.
+Conforming internal faces, nonconforming faces, exterior boundaries, and periodic seams all produce pieces.
+Where a coarse face adjoins fine cells, it is split into one piece per fine face.
+
+- `left_cell` is the active cell on the left.
+- `right` is the right-hand `AdaptiveInterfaceSide { cell, face }`, or `None` at an exterior boundary.
+- `left_face` is the left cell's face containing the piece.
+  A coarse face can contain several pieces.
+- `piece_face` is the face constituting the piece itself: the finer of the two faces.
+  At a periodic seam, it uses a face on one side of the seam.
+- `left_sign` is `1` if the left cell's outward normal agrees with the piece's orientation, or `-1` if opposite.
+  `right_sign()` returns `-left_sign`, or `None` at an exterior boundary.
+- `periodic` is true for a piece on a periodic seam.
+
+Compute a finite-volume flux once per piece, multiply by `left_sign` and `right_sign()`, and add it to the cells on both sides; each piece's contributions then cancel.
+`cell_faces(i)` returns pairs of active cell $i$'s faces and signs indicating whether the right-handed normal defined by the face's vertex order points outward from the cell.
+
+## Topological correspondence and generation tracking
+
+The `TopologyMap` returned by `adapt` describes the correspondence of cells, vertices, faces, and edges between the original and new revisions.
+`source()` and `destination()` return the two tokens; `validate(source, destination)` returns `InvalidInput` if either differs.
+`cells()`, `vertices()`, `faces()`, and `edges()` are sequences of `EntityRelation`.
+Each element relates one original entity to one new entity; `Created` contains only a new entity, and `Removed` only an original entity.
+
+| `EntityRelation` | Meaning |
+|---|---|
+| `Unchanged { source, destination }` | The same entity, with only its index possibly changed |
+| `Refined { source, destination, orientation }` | The new entity is a proper subset of the original entity |
+| `Coarsened { source, destination, orientation }` | The original entity is a proper subset of the new entity |
+| `Created { destination }` | A new entity contained in no original entity of the same dimension |
+| `Removed { source }` | An original entity contained in no new entity of the same dimension |
+
+`orientation` is `1` when the orientations agree and `-1` when opposite; for cells it is always `1`.
+Each sequence is ordered first by original index, then by new index.
+An original entity with no relation receives one `Removed`; new entities without originals follow as `Created` in new-index order.
+One entity can have multiple relations: for example, a refined cell has one `Refined` per child.
+
+Vertex relations are limited to `Unchanged`, `Created`, and `Removed`; obtain new vertex positions with `vertex_provenance`.
+Face relations pair ancestors and descendants in the face hierarchy, without identifying the two sides of periodic seams.
+Active faces include both fine-cell faces and neighboring coarse-cell faces.
+Thus even refinement-only revisions can produce `Coarsened` from a fine face in the original revision to a coarse face still active in the new revision.
+Edge relations use exact containment.
+
+`TopologyMap` describes only topological correspondence and contains no weights for transferring field values.
+The caller constructs conservative cell-average transfers or nodal-value interpolation.
+`AmrCellTransfer` in `scioxide-pde` (which transfers piecewise-constant cell averages conservatively by volume) and `AmrNodalTransfer` are constructed from this map ([Adaptive refinement](../../../scioxide-pde/api/adaptive-refinement/)).
+
+## Sharing with other chapters
+
+Other crates use the meshes, triangulations, and partitions of `scioxide-spatial` directly without duplicating them.
+`scioxide-spatial` handles mesh topology, refinement, and revision checks; other crates build numerical operations on top.
+
+- For partial differential equations, `scioxide-pde` constructs finite-difference, finite-element, and finite-volume operators on structured grids and simplex meshes ([Multidimensional differences on structured grids](../../../scioxide-pde/algorithms/multidimensional-spatial-plans/), [Finite elements on simplex meshes](../../../scioxide-pde/algorithms/simplex-finite-elements/), [Multidimensional finite volumes](../../../scioxide-pde/algorithms/multidimensional-finite-volumes/)).
+  For adaptive refinement, error estimation `AmrEstimator` and marking `AmrMarking` produce markers `AmrMarks`, and `AmrMarks::request()` returns an `AdaptationRequest` borrowing them.
+  After `AdaptiveMesh::adapt`, transfer the field to the new revision with `TopologyMap` ([Adaptive refinement](../../../scioxide-pde/api/adaptive-refinement/)).
+- For scattered-data interpolation, `ScatteredValues` in `scioxide-interp` associates values with the site order of one `Delaunay`, reusing that triangulation for multiple value sets and interpolation methods ([Scattered-data interpolation with a shared triangulation](../../../scioxide-interp/algorithms/scattered-tessellations/)).
+- For simplex quadrature, `SimplexRule::integrate_mesh_cell_into` in `scioxide-integrate` reads and integrates cells of `TriangleMesh` and `TetrahedronMesh` without owning them ([Simplex and sphere quadrature rules](../../../scioxide-integrate/algorithms/simplex-and-sphere-rules/)).
+- For global optimization, SHGO in `scioxide-optimize` uses edges of the sample-point `Delaunay` triangulation to determine neighboring points ([Global search with DIRECT and SHGO](../../../scioxide-optimize/algorithms/deterministic-and-surrogate-global/)).
+
+Types pairing value arrays with a mesh (transfers in `scioxide-pde` or `ScatteredValues` in `scioxide-interp`) retain the token of the revision used at construction.
+Combining them with a different revision gives `InvalidInput` through an $O(1)$ check.
+
+## Counting induced refinements and hanging entities
+
+Divide the unit square into $2 \times 2$ root cells and repeatedly refine the deepest active cell having a chosen point as a vertex.
+The following definitions block supplies both cells on this page with `unit_square_mesh` to construct the root mesh, `refine_toward` for one refinement, and `refine_repeatedly` to repeat it and return every result.
+Set the depth limit to 8.
+
+```rust
+//| id: spatial-adaptive-corner-model
+//| kind: definitions
+//| title: "Adaptive mesh of the unit square and refinement toward one point"
+//| crates: [scioxide-core, scioxide-spatial]
+use scioxide_spatial::{
+    AdaptationLimits, AdaptationRequest, AdaptationResult, AdaptiveMesh, AxisTopology, CellMesh,
+    CoordinateAxis, Grid2d,
+};
+
+/// Adaptive mesh dividing the unit square into 2 × 2 root cells (depth limit 8).
+pub(crate) fn unit_square_mesh() -> Result<AdaptiveMesh<f64, 2>, String> {
+    let axis = CoordinateAxis::uniform(0.0, 1.0, 3).map_err(|e| e.to_string())?;
+    let bounded = [AxisTopology::Bounded; 2];
+    let grid = Grid2d::new([axis.clone(), axis], bounded).map_err(|e| e.to_string())?;
+    let roots = CellMesh::new(grid).map_err(|e| e.to_string())?;
+    AdaptiveMesh::from_structured(&roots, AdaptationLimits::new().with_max_depth(8))
+        .map_err(|e| e.to_string())
+}
+
+/// Refine the deepest active cell having target as a vertex (first in active-cell order for ties) by one level,
+/// and return its hierarchy ID and the result.
+pub(crate) fn refine_toward(
+    mesh: &AdaptiveMesh<f64, 2>,
+    target: [f64; 2],
+) -> Result<(usize, AdaptationResult<f64, 2>), String> {
+    let mut chosen: Option<(usize, u8)> = None;
+    for (index, &id) in mesh.active_cells().iter().enumerate() {
+        let level = mesh.level(id).map_err(|e| e.to_string())?;
+        for vertex in mesh.cell_vertices(index).map_err(|e| e.to_string())? {
+            let point = mesh.point(vertex).map_err(|e| e.to_string())?;
+            if *point.as_array() == target && chosen.is_none_or(|(_, best)| level > best) {
+                chosen = Some((id, level));
+            }
+        }
+    }
+    let (id, _) = chosen.ok_or("No cell has target as a vertex")?;
+    let request = AdaptationRequest {
+        source: mesh.mesh_token(),
+        refine: &[id],
+        coarsen: &[],
+    };
+    let result = mesh.adapt(request).map_err(|e| e.to_string())?;
+    Ok((id, result))
+}
+
+/// Return the root mesh and (refined ID, result) for each of steps refinements toward target.
+pub(crate) fn refine_repeatedly(
+    target: [f64; 2],
+    steps: usize,
+) -> Result<(AdaptiveMesh<f64, 2>, Vec<(usize, AdaptationResult<f64, 2>)>), String> {
+    let first = unit_square_mesh()?;
+    let mut history: Vec<(usize, AdaptationResult<f64, 2>)> = Vec::new();
+    for _ in 0..steps {
+        let current = history.last().map_or(&first, |(_, result)| &result.mesh);
+        let step = refine_toward(current, target)?;
+        history.push(step);
+    }
+    Ok((first, history))
+}
+```
+
+The next cell selects a refinement point and count, then tabulates each refined ID and its depth, active-cell count, additional refinements for balance, counts of each hanging-entity kind, total area minus 1, and revision generation.
+All vertex coordinates are dyadic fractions, so the total area should equal 1 exactly.
+The refinement point and count are passed to the next cell.
+
+```rust
+//| id: spatial-adaptive-mesh-epoch
+//| ref: spatial-adaptive-mesh-epoch
+//| title: "Repeat refinement toward one point to check induced refinement, hanging entities, and generations"
+//| run: reactive
+//| uses: [spatial-adaptive-corner-model]
+//| crates: [scioxide-core, scioxide-spatial]
+//| exports: [refinements, target]
+//| inputs:
+//|   steps: {"type":"range","label":"Refinement count","min":1,"max":6,"step":1,"value":3}
+//|   focus: {"type":"select","label":"Refinement focus point","options":["Center (1/2, 1/2)","Corner (0, 0)"],"value":"Center (1/2, 1/2)"}
+//| cases:
+//|   - {"id":"corner","label":"Corner (0, 0)","description":"Refinement at the corner adjoins only sibling cells, so no balancing refinement occurs.","inputs":{"focus":"Corner (0, 0)"}}
+//|   - {"id":"six-steps","label":"6 refinements","description":"With six refinements toward the center, three induced refinements are added each time from the third refinement onward.","inputs":{"steps":6}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"steps","path":"/rows/2/3","equals":28}
+//|       - {"artifact":"steps","path":"/rows/2/4","equals":"14, 3, 17"}
+//|       - {"artifact":"steps","path":"/rows/2/5","equals":12}
+//|       - {"artifact":"steps","path":"/rows/2/8","range":{"min":-1e-15,"max":1e-15}}
+//|       - {"artifact":"steps","path":"/rows/2/9","equals":4}
+//|   - case: corner
+//|     expect:
+//|       - {"artifact":"steps","path":"/rows/2/3","equals":13}
+//|       - {"artifact":"steps","path":"/rows/2/4","equals":""}
+//|   - case: six-steps
+//|     expect:
+//|       - {"artifact":"steps","path":"/rows/5/3","equals":64}
+//|       - {"artifact":"steps","path":"/rows/5/5","equals":36}
+use scioxide_spatial::HangingEntityKind;
+
+let target = if focus.starts_with("Corner") {
+    [0.0, 0.0]
+} else {
+    [0.5, 0.5]
+};
+let (first, history) = refine_repeatedly(target, steps as usize)?;
+let mut rows = Vec::new();
+let mut previous = &first;
+for (step, (id, result)) in history.iter().enumerate() {
+    // Check tokens to confirm that the map goes from the preceding revision to the new revision.
+    result
+        .map
+        .validate(previous.mesh_token(), result.mesh.mesh_token())
+        .map_err(|e| e.to_string())?;
+    let next = &result.mesh;
+    let hanging = next.hanging_entities();
+    let count = |kind| hanging.iter().filter(|h| h.kind == kind).count();
+    let mut area = 0.0;
+    for cell in 0..next.cell_count() {
+        area += next.cell_measure(cell).map_err(|e| e.to_string())?;
+    }
+    let induced: Vec<String> = result
+        .induced_refinements
+        .iter()
+        .map(|i| i.to_string())
+        .collect();
+    rows.push((
+        step + 1,
+        *id,
+        previous.level(*id).map_err(|e| e.to_string())?,
+        next.cell_count(),
+        induced.join(", "),
+        count(HangingEntityKind::Vertex),
+        count(HangingEntityKind::Edge),
+        count(HangingEntityKind::Face),
+        area - 1.0,
+        next.mesh_token().generation().get(),
+    ));
+    previous = next;
+}
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Step", "type": "integer" },
+    { "key": "1", "label": "Refined ID", "type": "integer" },
+    { "key": "2", "label": "Its depth", "type": "integer" },
+    { "key": "3", "label": "Active cells [count]", "type": "integer" },
+    { "key": "4", "label": "Induced refinement IDs" },
+    { "key": "5", "label": "Hanging vertices [count]", "type": "integer" },
+    { "key": "6", "label": "Hanging edges [count]", "type": "integer" },
+    { "key": "7", "label": "Hanging faces [count]", "type": "integer" },
+    { "key": "8", "label": "Total area − 1 [-]", "type": "number", "format": sci2 },
+    { "key": "9", "label": "Generation", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "steps" })
+);
+export!(refinements, steps as u64);
+export!(target, target);
+```
+
+With defaults (three refinements toward the center $(1/2, 1/2)$), the first step refines the lower-left root (ID 0), producing seven active cells.
+The second step refines ID 7 (depth 1), the child of ID 0 touching the center, and refines the right and upper roots (IDs 1 and 2) for balance.
+Root ID 3 shares only the center vertex with ID 7, so it is not refined at this step.
+The third step refines ID 11 at depth 2; induced refinements occur in order 14, 3, 17, which is not increasing.
+This happens because root ID 3 newly violates balance after ID 14 is refined first, and is removed before ID 17.
+There are 12 hanging vertices at the third step; in two dimensions, hanging-edge and hanging-face counts are equal, both 24.
+The total area is exactly 1 at every step.
+The revision importing a generation-0 `CellMesh` has generation 1, which increases by 1 with each refinement.
+
+For “Corner (0, 0),” refined cells adjoin siblings of the same depth or the original boundary, so no balancing refinement occurs and the active-cell count increases by 3 each time.
+For “6 refinements,” three induced refinements occur each time from the third step onward, producing 64 active cells and 36 hanging vertices.
+
+## Map relation counts and rejected requests
+
+The next cell repeats the same refinements as the preceding cell and counts the last step's `TopologyMap` relations by entity and kind.
+It then tries three things on the final revision.
+First, it requests refinement using the initial revision's token; second, it compares tokens of sibling revisions created by calling `adapt` twice with the same revision and markers; third, it requests coarsening for each parent with all children active, one at a time.
+The second table shows the old-token request's result, whether sibling generations are equal, whether sibling tokens are compatible, the number of parents tested for coarsening, the accepted count, and rejected parent IDs and rejection classifications.
+
+```rust
+//| id: spatial-adaptive-topology-map
+//| ref: spatial-adaptive-topology-map
+//| title: "Count topological correspondences of the last refinement and check old tokens, sibling revisions, and coarsening that breaks balance"
+//| run: reactive
+//| uses: [spatial-adaptive-corner-model]
+//| crates: [scioxide-core, scioxide-spatial]
+//| dependsOn:
+//|   epoch: spatial-adaptive-mesh-epoch
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"relations","path":"/rows/0/1","equals":12}
+//|       - {"artifact":"relations","path":"/rows/0/2","equals":16}
+//|       - {"artifact":"relations","path":"/rows/1/4","equals":16}
+//|       - {"artifact":"checks","path":"/rows/0/0","equals":"InvalidInput"}
+//|       - {"artifact":"checks","path":"/rows/0/1","equals":true}
+//|       - {"artifact":"checks","path":"/rows/0/2","equals":false}
+//|       - {"artifact":"checks","path":"/rows/0/3","equals":4}
+//|       - {"artifact":"checks","path":"/rows/0/5","equals":"3, 14, 17"}
+//|       - {"artifact":"checks","path":"/rows/0/6","equals":"InvalidInput"}
+use scioxide_spatial::{AdaptationRequest, EntityRelation};
+
+let steps = epoch["refinements"].as_u64().ok_or("Missing refinement count")?;
+let x = epoch["target"][0].as_f64().ok_or("Missing refinement point")?;
+let y = epoch["target"][1].as_f64().ok_or("Missing refinement point")?;
+let (first, history) = refine_repeatedly([x, y], steps as usize)?;
+let (_, last) = history.last().ok_or("No refinement performed")?;
+let (mesh, map) = (&last.mesh, &last.map);
+
+// Count the final refinement's map by entity and relation kind.
+let tally = |relations: &[EntityRelation]| {
+    let mut counts = [0_usize; 5];
+    for relation in relations {
+        let slot = match relation {
+            EntityRelation::Unchanged { .. } => 0,
+            EntityRelation::Refined { .. } => 1,
+            EntityRelation::Coarsened { .. } => 2,
+            EntityRelation::Created { .. } => 3,
+            EntityRelation::Removed { .. } => 4,
+        };
+        counts[slot] += 1;
+    }
+    counts
+};
+let lists = [
+    ("Cell", map.cells()),
+    ("Vertex", map.vertices()),
+    ("Face", map.faces()),
+    ("Edge", map.edges()),
+];
+let mut relation_rows = Vec::new();
+for (name, list) in lists {
+    let c = tally(list);
+    relation_rows.push((name, c[0], c[1], c[2], c[3], c[4]));
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "Entity" },
+    { "key": "1", "label": "Unchanged", "type": "integer" },
+    { "key": "2", "label": "Refined", "type": "integer" },
+    { "key": "3", "label": "Coarsened", "type": "integer" },
+    { "key": "4", "label": "Created", "type": "integer" },
+    { "key": "5", "label": "Removed", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    relation_rows,
+    metadata = serde_json::json!({ "id": "relations" })
+);
+
+// A request using the initial revision's token is rejected before checking markers.
+let stale = AdaptationRequest {
+    source: first.mesh_token(),
+    refine: &[0],
+    coarsen: &[],
+};
+let stale_kind = match mesh.adapt(stale) {
+    Ok(_) => "Accepted".to_string(),
+    Err(e) => format!("{:?}", e.kind()),
+};
+// Sibling revisions produced by adapting the same revision twice with the same markers cannot be combined, even when their generations agree.
+let request = AdaptationRequest {
+    source: mesh.mesh_token(),
+    refine: &mesh.active_cells()[..1],
+    coarsen: &[],
+};
+let first_sibling = mesh.adapt(request).map_err(|e| e.to_string())?;
+let second_sibling = mesh.adapt(request).map_err(|e| e.to_string())?;
+let (left, right) = (
+    first_sibling.mesh.mesh_token(),
+    second_sibling.mesh.mesh_token(),
+);
+let same_generation = left.generation() == right.generation();
+let compatible = left.is_compatible_with(right);
+// Try coarsening each parent whose children are all active. Parents that break 2:1 balance are rejected.
+let active = mesh.active_cells();
+let (mut candidates, mut accepted, mut rejected) = (0, 0, Vec::new());
+let mut kinds = std::collections::BTreeSet::new();
+for id in 0..mesh.hierarchy_len() {
+    let children = mesh.children(id).map_err(|e| e.to_string())?;
+    if children.is_empty() || !children.iter().all(|c| active.contains(c)) {
+        continue;
+    }
+    candidates += 1;
+    let request = AdaptationRequest {
+        source: mesh.mesh_token(),
+        refine: &[],
+        coarsen: &[id],
+    };
+    match mesh.adapt(request) {
+        Ok(_) => accepted += 1,
+        Err(e) => {
+            rejected.push(id.to_string());
+            kinds.insert(format!("{:?}", e.kind()));
+        }
+    }
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "Old-token request" },
+    { "key": "1", "label": "Sibling generations equal", "type": "boolean" },
+    { "key": "2", "label": "Sibling revisions compatible", "type": "boolean" },
+    { "key": "3", "label": "Parents tested for coarsening [count]", "type": "integer" },
+    { "key": "4", "label": "Accepted [count]", "type": "integer" },
+    { "key": "5", "label": "Rejected parent IDs" },
+    { "key": "6", "label": "Rejection classification" }
+]);
+let kinds: Vec<String> = kinds.into_iter().collect();
+let summary = vec![(
+    stale_kind,
+    same_generation,
+    compatible,
+    candidates,
+    accepted,
+    rejected.join(", "),
+    kinds.join(", "),
+)];
+emit_table_with_columns!(
+    columns,
+    summary,
+    metadata = serde_json::json!({ "id": "checks" })
+);
+```
+
+In the final default refinement (three steps toward the center), four cells with IDs 11, 14, 3, and 17 are refined, so the cell map contains 4 × 4 = 16 `Refined` relations and 12 unchanged `Unchanged` relations.
+The 16 new vertices are `Created`; all 27 original vertices are `Unchanged`.
+The face map contains 42 unchanged `Unchanged` relations, 44 `Refined` relations to refined faces, and 16 `Created` relations for faces newly formed inside refined cells, as well as four `Coarsened` relations.
+These pairs occur because an active fine-cell face in the preceding revision is part of a coarse face that remains active in the new revision; no coarsening has occurred.
+
+The request using the initial revision's token is rejected with `InvalidInput`.
+Sibling revisions have equal generations but incompatible tokens.
+Four parents have all children active; only ID 11, refined in the last step, accepts coarsening.
+Coarsening IDs 3, 14, or 17, which were refined for balance, would create neighbors differing by two levels, so all are rejected with `InvalidInput`.
+
+## Summary
+
+For problems requiring local refinement, import a structured grid or simplex mesh into `AdaptiveMesh`, put refinement and coarsening markers in `AdaptationRequest`, and call `adapt`.
+For two or more refinement levels, repeat `adapt` and inspect `induced_refinements` for additional refinements needed for balance.
+Construct discretization constraints and fluxes from `hanging_entities()` and `interfaces()`, remembering that in three dimensions balance does not bound depth differences between cells sharing only an edge.
+To transfer field values to a new revision, supply your own weights to the topological correspondence in `TopologyMap` or use transfers from `scioxide-pde`.
+Values belong only to the token of the revision used at construction; values carrying old or sibling revision tokens are rejected with `InvalidInput`, so structure processing accordingly.
+
+## Further reading
+
+- [Adaptive mesh partitioning and repartitioning](../mesh-partition/): examine how to partition active cells of a refined revision and use ghost cells and interfaces as communication units.
+- [Foundations of points, ranges, grids, and meshes](../geometry-grids-and-meshes/): examine `CellMesh` and simplex meshes used as roots, and checks between fields and `MeshToken`.
+- [Adaptive refinement](../../../scioxide-pde/api/adaptive-refinement/): examine the PDE adaptive-refinement workflow from error estimation and marking to constructing `AdaptationRequest` and transferring fields with `TopologyMap`.
+- [Scattered-data interpolation with a shared triangulation](../../../scioxide-interp/algorithms/scattered-tessellations/): see interpolation examples sharing one `Delaunay` among multiple value sets.
+- [Simplex and sphere quadrature rules](../../../scioxide-integrate/algorithms/simplex-and-sphere-rules/): examine quadrature directly integrating `TriangleMesh` cells.

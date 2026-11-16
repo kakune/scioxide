@@ -1,0 +1,661 @@
+---
+title: "Compare sparse grids, QMC, and MC with Genz test functions"
+description: "Compare errors against evaluation counts for dimension-adaptive sparse grids, randomized quasi-Monte Carlo, Monte Carlo, and adaptive Genz–Malik cubature using closed-form Genz test functions (oscillatory, product peak, and Gaussian), then repeat across seeds to check reported standard errors against actual errors."
+sidebar:
+  order: 455
+---
+
+Multidimensional integration methods have different strengths for different problems.
+Genz introduced test-function families with closed-form integrals and coefficients controlling oscillation frequency and localization, enabling comparisons under the same conditions (A. Genz, "Testing multidimensional integration routines", *Tools, Methods and Languages for Scientific and Engineering Computation*, North-Holland, 1984, 81–94).
+This example integrates three families over $[0, 1]^d$ and compares errors against evaluation counts for dimension-adaptive sparse grids (`SparseGridPlan`), adaptive Genz–Malik cubature (`CubaturePlan`), Monte Carlo (`MonteCarloIntegrator` and `RandomStreams`), and randomized quasi-Monte Carlo (`MonteCarloIntegrator` and `QmcReplicatePlan`).
+For the two stochastic methods, repeated runs with different seeds check whether reported standard errors (SEs) measure actual errors.
+
+See [sparse grids and randomized quasi-Monte Carlo](../../algorithms/sparse-grids-and-qmc/), [tensor-product rules and adaptive Genz–Malik cubature](../../algorithms/multidimensional-and-monte-carlo/), and [Monte Carlo estimators and statistics](../../algorithms/monte-carlo-integration/) for the algorithms.
+
+## Three test functions and their closed forms
+
+Consider the following three families with coefficients $a_i > 0$, locations $w_i \in [0, 1)$, and phase $u_1 \in [0, 1)$.
+
+$$
+\begin{aligned}
+f_{\mathrm{osc}}(\boldsymbol x) &= \cos\Bigl(2\pi u_1 + \sum_{i=1}^d a_i x_i\Bigr) &&\text{(oscillatory)}\\
+f_{\mathrm{peak}}(\boldsymbol x) &= \prod_{i=1}^d \frac{1}{a_i^{-2} + (x_i - w_i)^2} &&\text{(product peak)}\\
+f_{\mathrm{gauss}}(\boldsymbol x) &= \exp\Bigl(-\sum_{i=1}^d a_i^2 (x_i - w_i)^2\Bigr) &&\text{(Gaussian)}
+\end{aligned}
+$$
+
+The oscillatory family is a wave spread over the domain; larger $a_i$ gives faster oscillations along $x_i$.
+The product-peak and Gaussian families peak at $\boldsymbol w$; larger $a_i$ narrows the width along $x_i$ to about $1/a_i$.
+All three are real analytic.
+Of Genz's six families, this example omits the corner peak, the continuous family with discontinuous derivatives, and the discontinuous family with a discontinuous function.
+
+The product-peak and Gaussian families are products over coordinates, so their integrals are products of one-dimensional integrals.
+
+$$
+\int_0^1 \frac{dx}{a^{-2} + (x - w)^2} = a\bigl[\arctan(a(1 - w)) + \arctan(aw)\bigr],
+\qquad
+\int_0^1 e^{-a^2(x - w)^2}\,dx = \frac{\sqrt\pi}{2a}\bigl[\operatorname{erf}(a(1 - w)) + \operatorname{erf}(aw)\bigr]
+$$
+
+Writing $\cos\theta = \operatorname{Re} e^{i\theta}$ makes the oscillatory family a product of exponentials, giving
+
+$$
+\int_{[0,1]^d} f_{\mathrm{osc}}\,d\boldsymbol x = \operatorname{Re}\Bigl[e^{2\pi i u_1}\prod_{i=1}^d \frac{e^{ia_i} - 1}{ia_i}\Bigr],
+\qquad
+\frac{e^{ia} - 1}{ia} = \frac{\sin a}{a} + i\,\frac{2\sin^2(a/2)}{a}
+$$
+
+
+Computing the imaginary part with $2\sin^2(a/2)$ instead of $1 - \cos a$ avoids cancellation for small $a$.
+Compute the error function with scioxide-special's `erf` and inverse tangent and trigonometric functions with `RealScalar::atan` and related methods.
+
+## Normalize difficulty
+
+Following Genz, draw uniform random values $\tilde a_i$ in $(0, 1)$ and normalize $a_i$ as
+
+$$
+a_i = h\,\frac{\tilde a_i}{\sum_j \tilde a_j}, \qquad \sum_{i=1}^d a_i = h
+$$
+
+
+Call $h$ the difficulty; with fixed $h$, increasing $d$ reduces each axis's $a_i$ to order $h/d$.
+This separates difficulty due to increasing dimension from difficulty due to per-axis oscillation or sharpness.
+Draw $w_i$ and $u_1$ from the same generator, so the family, $d$, $h$, and problem seed determine the problem.
+The generator is scioxide-random's `Philox4x64`, and $\tilde a_i$ uses `next_open_float` to exclude 0.
+
+The product-peak integral changes by many orders of magnitude with $d$: for small $a_i$, each factor is of order $a_i^2$.
+Therefore use relative error $|Q - I|/|I|$ against closed form $I$ and relative SE obtained by dividing SE by $|I|$.
+For the oscillatory family, some problem seeds make $I$ close to 0, making relative errors appear large.
+
+The following definitions block is shared by three cells.
+`Family` represents the family, `Genz::new` generates coefficients with the normalization above, `value` evaluates $f(\boldsymbol x)$, and `exact` gives the closed form.
+`from_problem` reconstructs the same test function from the first cell's family, dimension, difficulty, and problem seed; `sample_estimate` performs one Monte Carlo or randomized-QMC estimate for later sections.
+
+```rust
+//| id: integrate-genz-model
+//| kind: definitions
+//| title: "Genz test functions and closed forms"
+//| crates: [scioxide-core, scioxide-integrate, scioxide-random, scioxide-special]
+use scioxide_core::{Budget, ExecutionContext, SciOxideError, Interval, RealScalar};
+use scioxide_integrate::{
+    IntegrationReport, MonteCarloIntegrator, MonteCarloOptions, MonteCarloStatistics, RandomStreams,
+};
+use scioxide_random::{
+    Philox4x64, QmcPlan, QmcReplicateOptions, QmcReplicatePlan, Rng, SeedableRng,
+};
+
+/// Genz test-function family.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum Family {
+    Oscillatory,
+    ProductPeak,
+    Gaussian,
+}
+
+impl Family {
+    /// Select a family from an input-option string.
+    pub(crate) fn parse(name: &str) -> Result<Self, String> {
+        match name {
+            "Oscillatory" => Ok(Self::Oscillatory),
+            "Product peak" => Ok(Self::ProductPeak),
+            "Gaussian" => Ok(Self::Gaussian),
+            _ => Err(format!("Unknown family: {name}")),
+        }
+    }
+}
+
+/// Test function f(x), coefficients a_i (Σ a_i = h), locations w_i, and phase u₁.
+pub(crate) struct Genz {
+    pub(crate) family: Family,
+    pub(crate) a: Vec<f64>,
+    pub(crate) w: Vec<f64>,
+    pub(crate) u: f64,
+}
+
+impl Genz {
+    /// Draw uniform a_i in (0, 1) from a generator seeded with seed, normalize to Σ a_i = h,
+    /// then draw w_i ∈ [0, 1) and u₁ ∈ [0, 1).
+    pub(crate) fn new(family: Family, d: usize, h: f64, seed: u64) -> Result<Self, SciOxideError> {
+        let mut rng = Philox4x64::from_seed(seed);
+        let raw = (0..d)
+            .map(|_| rng.next_open_float())
+            .collect::<Result<Vec<f64>, _>>()?;
+        let total: f64 = raw.iter().sum();
+        let a = raw.iter().map(|r| h * r / total).collect();
+        let w = (0..d)
+            .map(|_| rng.next_float())
+            .collect::<Result<Vec<f64>, _>>()?;
+        let u = rng.next_float()?;
+        Ok(Self { family, a, w, u })
+    }
+
+    /// Reconstruct the same test function from the family, dimension, difficulty, and problem seed exported by the first cell.
+    pub(crate) fn from_problem(problem: &serde_json::Value) -> Result<Self, String> {
+        let number = |key: &str| problem[key].as_f64().ok_or(format!("Missing {key}"));
+        let family = Family::parse(problem["family"].as_str().ok_or("Missing family")?)?;
+        let d = number("dimension")? as usize;
+        let seed = number("problem_seed")? as u64;
+        Self::new(family, d, number("difficulty")?, seed).map_err(|e| e.to_string())
+    }
+
+    /// Integrand f(x), x ∈ [0, 1]^d.
+    pub(crate) fn value(&self, x: &[f64]) -> f64 {
+        let terms = self.a.iter().zip(&self.w).zip(x);
+        match self.family {
+            Family::Oscillatory => {
+                let phase: f64 = self.a.iter().zip(x).map(|(a, x)| a * x).sum();
+                RealScalar::cos(<f64 as RealScalar>::TAU * self.u + phase)
+            }
+            Family::ProductPeak => terms
+                .map(|((a, w), x)| 1.0 / (1.0 / (a * a) + (x - w) * (x - w)))
+                .product(),
+            Family::Gaussian => {
+                let sum: f64 = terms.map(|((a, w), x)| a * a * (x - w) * (x - w)).sum();
+                RealScalar::exp(-sum)
+            }
+        }
+    }
+
+    /// Closed form (product of one-dimensional integrals).
+    pub(crate) fn exact(&self) -> Result<f64, SciOxideError> {
+        let pairs = self.a.iter().zip(&self.w);
+        match self.family {
+            Family::Oscillatory => {
+                // Re[e^{2πi u₁} Π (e^{i a} − 1)/(i a)].
+                // (e^{ia} − 1)/(ia) = sin a / a + i·2 sin²(a/2) / a.
+                let (sine, cosine) = RealScalar::sin_cos(<f64 as RealScalar>::TAU * self.u);
+                let (mut re, mut im) = (cosine, sine);
+                for &a in &self.a {
+                    let half = RealScalar::sin(0.5 * a);
+                    let (fr, fi) = (RealScalar::sin(a) / a, 2.0 * half * half / a);
+                    (re, im) = (re * fr - im * fi, re * fi + im * fr);
+                }
+                Ok(re)
+            }
+            Family::ProductPeak => Ok(pairs
+                .map(|(&a, &w)| a * (RealScalar::atan(a * (1.0 - w)) + RealScalar::atan(a * w)))
+                .product()),
+            Family::Gaussian => {
+                let root_pi = RealScalar::sqrt(<f64 as RealScalar>::PI);
+                let mut product = 1.0;
+                for (&a, &w) in pairs {
+                    let mass = scioxide_special::erf(a * (1.0 - w))? + scioxide_special::erf(a * w)?;
+                    product *= root_pi / (2.0 * a) * mass;
+                }
+                Ok(product)
+            }
+        }
+    }
+}
+
+/// Monte Carlo with n evaluations (replicates = 1), or randomized QMC (R randomizations of n/R Sobol points).
+/// Construct the Monte Carlo root generator and QMC randomization key from seed.
+pub(crate) fn sample_estimate(
+    model: &Genz,
+    n: usize,
+    replicates: usize,
+    seed: u64,
+) -> Result<(f64, Option<MonteCarloStatistics<f64>>, IntegrationReport<f64>), SciOxideError> {
+    let d = model.a.len();
+    let bounds = vec![Interval::new(0.0, 1.0)?; d];
+    // Match MonteCarloOptions samples and independent replicate count to QMC points per replicate and replicate count.
+    let options = MonteCarloOptions::default()
+        .with_samples(Budget::try_from(n / replicates)?)
+        .with_replicates(replicates);
+    let plan = MonteCarloIntegrator::new(&bounds, options)?;
+    let cx = ExecutionContext::sequential();
+    let mut workspace = plan.workspace(1, cx)?;
+    let f = |x: &[f64]| Ok(model.value(x));
+    let mut value = 0.0;
+    let report = if replicates == 1 {
+        let root = Philox4x64::from_seed(seed);
+        plan.integrate_into(&f, RandomStreams::new(&root, 0), &mut value, &mut workspace, cx)?
+    } else {
+        let sobol = QmcPlan::sobol(d)?;
+        let key = Philox4x64::from_key([seed, 0]);
+        let options = QmcReplicateOptions::default()
+            .with_replicates(replicates)
+            .with_points_per_replicate(n / replicates);
+        let qmc = QmcReplicatePlan::new(&sobol, &key, options)?;
+        plan.integrate_into(&f, &qmc, &mut value, &mut workspace, cx)?
+    };
+    Ok((value, workspace.statistics()[0].clone(), report))
+}
+```
+
+## Deterministic errors and error estimates
+
+Compare all four methods with the same evaluation limits $N = 2^k$ ($k = 6, 7, \dots, m$).
+First consider the two deterministic methods.
+
+- Sparse grid: dimension-adaptive Smolyak quadrature with nested Clenshaw–Curtis rules; set the evaluation limit (`with_max_evaluations`) and index-count limit of `SparseGridOptions` to $N$, and the maximum level (`with_max_level`) to $k - 1$ (one-dimensional node count $2^{k-1} + 1 \le N$).
+- Genz–Malik: adaptive cubature with an embedded degree-7/degree-5 pair, requiring $2^d + 2d^2 + 2d + 1$ evaluations per region (93 for $d = 5$).
+  Since evaluations grow as $2^d$ with $d$, compute only for $d \le 5$ and skip limits below one region's evaluation count.
+
+Give both an unattainable tolerance $10^{-13}$ and stop at the evaluation limit.
+Their termination is therefore `BudgetLimit(Evaluation)`, and returned values are estimates.
+The comparison measures how far errors decrease at the same evaluation count, rather than whether the tolerance is met.
+For functions with bounded mixed partial derivatives through order $r$, sparse-grid error decreases as $O\bigl(N^{-r}(\log N)^{(r + 1)(d - 1)}\bigr)$, and even faster for real-analytic functions.
+However, the logarithmic factor and per-axis oscillation or sharpness determine errors at practical $N$.
+Both methods return error estimates, but these are heuristic quantities derived from differences between neighboring rules (`ErrorReliability::Heuristic`).
+
+The next cell takes family, dimension $d$, difficulty $h$, evaluation-limit exponent $m$, and problem seed and tabulates relative errors and error estimates divided by $|I|$ at each limit.
+The final column is the estimate-to-actual-error ratio; a value above 1 indicates overestimation.
+This cell passes the problem settings and results to the next two cells.
+
+```rust
+//| id: integrate-genz-deterministic
+//| ref: integrate-genz-deterministic
+//| title: "Vary family, dimension, and difficulty to examine sparse-grid and Genz–Malik errors and estimates"
+//| run: button
+//| timeoutMs: 120000
+//| cache: inputs
+//| uses: [integrate-genz-model]
+//| crates: [scioxide-core, scioxide-integrate, scioxide-random, scioxide-special]
+//| exports: [family, dimension, difficulty, problem_seed, budget_exponent, curves, final_rows]
+//| inputs:
+//|   family: {"type":"select","label":"Test-function family","description":"Oscillations, sharp product peaks, and Gaussian peaks differ in smoothness and localization.","options":["Oscillatory","Product peak","Gaussian"],"value":"Gaussian"}
+//|   dimension: {"type":"range","label":"Dimension d [-]","description":"Compute Genz–Malik cubature only for d ≤ 5.","min":2,"max":10,"step":1,"value":5}
+//|   difficulty: {"type":"range","label":"Difficulty h = Σ a_i [-]","description":"Larger values give faster oscillations and sharper peaks.","min":1,"max":20,"step":1,"value":6}
+//|   budget_exponent: {"type":"range","label":"Evaluation-limit exponent m (2^m evaluations)","description":"Each method uses at most 2^m evaluations.","min":10,"max":14,"step":1,"value":12}
+//|   problem_seed: {"type":"range","label":"Problem seed [-]","description":"Select coefficients a_i, locations w_i, and phase u₁.","min":1,"max":100,"step":1,"value":7}
+//| cases:
+//|   - {"id":"oscillatory-10d","label":"Oscillatory, d = 10","description":"At d = 10, Genz–Malik is omitted, and sparse-grid relative error is about 4 × 10⁻⁶.","inputs":{"family":"Oscillatory","dimension":10}}
+//|   - {"id":"sharp-gauss","label":"Gaussian, h = 20","description":"For sharp peaks of width about 1/4, errors of order 10⁻⁴ remain even after 4096 evaluations.","inputs":{"difficulty":20}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/6/3","range":{"min":0,"max":1e-8}}
+//|       - {"artifact":"methods","path":"/rows/6/6","equals":"BudgetLimit(Evaluation)"}
+//|       - {"artifact":"methods","path":"/rows/12/0","equals":"Genz–Malik"}
+//|       - {"artifact":"methods","path":"/rows/12/3","range":{"min":1e-8,"max":1e-5}}
+//|       - {"artifact":"quantities","path":"/rows/0/1","approx":{"value":0.25460274404138317,"rtol":1e-12}}
+//|   - case: oscillatory-10d
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/6/0","equals":"Sparse grid"}
+//|       - {"artifact":"methods","path":"/rows/6/3","range":{"min":0,"max":1e-4}}
+//|   - case: sharp-gauss
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/6/3","range":{"min":1e-6,"max":1e-2}}
+//|       - {"artifact":"methods","path":"/rows/12/3","range":{"min":1e-5,"max":1e-2}}
+use scioxide_core::{Budget, ErrorTolerance, Interval, NormSelection};
+use scioxide_integrate::{CubaturePlan, SparseGridOptions, SparseGridPlan, SubdivisionOptions};
+
+let d = dimension as usize;
+let model = Genz::new(Family::parse(&family)?, d, difficulty, problem_seed as u64)
+    .map_err(|e| e.to_string())?;
+let exact = model.exact().map_err(|e| e.to_string())?;
+let f = |x: &[f64]| Ok(model.value(x));
+let bounds = vec![Interval::new(0.0, 1.0).map_err(|e| e.to_string())?; d];
+// Set an unattainable tolerance 10^-13 and stop at evaluation limit N.
+let tolerance =
+    ErrorTolerance::scalar(1e-13, 1e-13, NormSelection::Infinity).map_err(|e| e.to_string())?;
+// Genz–Malik evaluations per region: 2^d + 2d² + 2d + 1. Smaller limits cannot produce an initial estimate.
+let region = (1 << d) + 2 * d * d + 2 * d + 1;
+// curves[0]: sparse grid; curves[1]: Genz–Malik (evaluations, relative error).
+let mut curves: [Vec<[f64; 2]>; 2] = [Vec::new(), Vec::new()];
+// rows[i]: table rows for method i, displayed together by method.
+let (mut rows, mut final_rows) = ([Vec::new(), Vec::new()], Vec::new());
+for k in 6..=budget_exponent as u32 {
+    let n = 1_usize << k;
+    let budget = Budget::try_from(n).map_err(|e| e.to_string())?;
+    // Sparse grid: maximum level k − 1 satisfies 2^level + 1 ≤ N.
+    let options = SparseGridOptions::default()
+        .with_tolerance(tolerance.clone())
+        .with_max_level(k as usize - 1)
+        .with_max_indices(budget)
+        .with_max_evaluations(budget);
+    let plan = SparseGridPlan::new(d, options).map_err(|e| e.to_string())?;
+    let mut results = vec![(
+        "Sparse grid",
+        plan.integrate(&f, &bounds).map_err(|e| e.to_string())?,
+    )];
+    if d <= 5 && n >= region {
+        let options = SubdivisionOptions::default()
+            .with_tolerance(tolerance.clone())
+            .with_max_subdivisions(budget)
+            .with_max_evaluations(Some(budget));
+        let plan = CubaturePlan::new(&bounds, options).map_err(|e| e.to_string())?;
+        results.push(("Genz–Malik", plan.integrate(&f).map_err(|e| e.to_string())?));
+    }
+    for (index, (name, (value, report))) in results.into_iter().enumerate() {
+        // Relative error and error estimate divided by |I| compare differently scaled families on one scale.
+        let error = (value - exact).abs() / exact.abs();
+        let estimate = report.error_estimate().map(|e| e / exact.abs());
+        let ratio = estimate.map(|e| e / error);
+        let status = report.termination().to_string();
+        let evaluations = report.evaluations();
+        curves[index].push([evaluations as f64, error]);
+        rows[index].push((name, n, evaluations, error, estimate, ratio, status.clone()));
+        if k == budget_exponent as u32 {
+            final_rows.push((name, evaluations, value, error, estimate, status));
+        }
+    }
+}
+export!(family, &family);
+export!(dimension, &d);
+export!(difficulty, &difficulty);
+export!(problem_seed, &problem_seed);
+export!(budget_exponent, &budget_exponent);
+export!(curves, &curves);
+export!(final_rows, &final_rows);
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Method" },
+    { "key": "1", "label": "Limit N [evaluations]", "type": "integer" },
+    { "key": "2", "label": "Evaluations [count]", "type": "integer" },
+    { "key": "3", "label": "Relative error [-]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "Error estimate / |I| [-]", "type": "number", "format": sci3, "nullText": "None" },
+    { "key": "5", "label": "Estimate / actual error [-]", "type": "number", "format": sci3, "nullText": "—" },
+    { "key": "6", "label": "Termination status" }
+]);
+let rows: Vec<_> = rows.into_iter().flatten().collect();
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "methods" })
+);
+emit_table_with_columns!(
+    serde_json::json!([
+        { "key": "0", "label": "Quantity" },
+        { "key": "1", "label": "Value [-]", "type": "number", "format": { "significantDigits": 12 } }
+    ]),
+    vec![("Closed form I", exact)],
+    metadata = serde_json::json!({ "id": "quantities" })
+);
+```
+
+At the default inputs (Gaussian, $d = 5$, $h = 6$, $N \le 2^{12}$), the closed form is $I = 0.2546027$.
+Sparse-grid relative error falls from $6\times10^{-3}$ at $N = 64$ to $3\times10^{-10}$ at $N = 4096$; Genz–Malik gives $4\times10^{-7}$ at $N = 4096$.
+The sparse-grid error estimate ($6\times10^{-5}$ after dividing by $|I|$) is five orders of magnitude larger than actual error; the Genz–Malik estimate ($4\times10^{-4}$) is three orders larger.
+Both estimates are heuristic: they overestimate here but are not upper bounds.
+Genz–Malik has no row at limit 64 because even one region needs 93 evaluations; limits 128 and 256 cannot accommodate one split (186 evaluations), so it stops at 93.
+Sparse-grid errors are nonmonotonic, increasing from $9\times10^{-5}$ at $N = 128$ to $4\times10^{-4}$ at $N = 256$.
+Do not infer convergence solely from close results at neighboring limits.
+
+The `oscillatory-10d` case (oscillatory, $d = 10$) omits Genz–Malik, which needs $2^{10} + 221 = 1245$ evaluations per region.
+Sparse-grid relative error reaches $4\times10^{-6}$ after $4096$ evaluations.
+Normalization by $\sum a_i = h$ slows per-axis oscillation as $d$ increases, reducing the required resolution along each axis.
+In `sharp-gauss` (Gaussian, $h = 20$), peak widths narrow to about $1/a_i \approx 1/4$; at $N \approx 4000$, relative errors are $9\times10^{-5}$ for the sparse grid and $4\times10^{-4}$ for Genz–Malik.
+The sparse-grid relative error estimate is 7, five orders larger than actual error.
+
+## Compare stochastic methods
+
+The two stochastic methods are as follows.
+
+- Monte Carlo: average $N$ independent uniform samples and compute SE from sample variance.
+- Randomized QMC: use `QmcReplicatePlan` to independently randomize $N/8$ Sobol points eight times (linear scrambling and digital shifts), deriving the estimate and SE from the mean and variability of the eight estimates.
+  Match the sample count (`with_samples`) and independent replicate count (`with_replicates`) in `MonteCarloOptions` to the points per replicate and replicate count in `QmcReplicatePlan`.
+  A mismatch makes `integrate_into` return `InvalidInput`.
+
+Monte Carlo error is $\sigma_f/\sqrt N$, where $\sigma_f$ is the standard deviation of $f$, and decreases as $N^{-1/2}$ independently of dimension.
+For smooth $f$, QMC with scrambled Sobol points can have RMSE decreasing faster than $N^{-1}$ ($O(N^{-3/2}(\log N)^{(d-1)/2})$ in Owen's theory), but the $N$ needed to reach the asymptotic regime increases with $d$.
+
+The next cell takes the previous cell's problem, selects a sample seed, and runs Monte Carlo and randomized QMC with the same limits $N = 2^k$.
+The chart plots all four methods' relative errors (symbols) and the stochastic methods' relative SEs (dashed) against evaluation counts on logarithmic axes.
+The table gives all four methods at $N = 2^m$, including error-to-SE ratios for stochastic methods.
+
+```rust
+//| id: integrate-genz-convergence
+//| ref: integrate-genz-convergence
+//| title: "Vary the sample seed and compare four methods' errors against evaluation count"
+//| run: button
+//| timeoutMs: 120000
+//| uses: [integrate-genz-model]
+//| crates: [scioxide-core, scioxide-integrate, scioxide-random, scioxide-special]
+//| dependsOn:
+//|   problem: integrate-genz-deterministic
+//| inputs:
+//|   sample_seed: {"type":"range","label":"Sample seed [-]","description":"Select Monte Carlo random values and QMC randomization.","min":1,"max":100,"step":1,"value":1}
+//| cases:
+//|   - {"id":"other-seed","label":"Sample seed 2","description":"Changing the seed changes stochastic error curves but hardly changes the relative-SE slopes.","inputs":{"sample_seed":2}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/2/0","equals":"Monte Carlo"}
+//|       - {"artifact":"methods","path":"/rows/2/6","equals":"SampleBudgetCompleted"}
+//|       - {"artifact":"methods","path":"/rows/3/5","range":{"min":0,"max":5}}
+//|       - {"artifact":"methods","path":"/rows/3/3","range":{"min":1e-6,"max":1e-2}}
+//|   - case: other-seed
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/2/3","range":{"min":1e-5,"max":1e-1}}
+
+// Receive the problem, deterministic curves, and final rows from the first cell.
+let model = Genz::from_problem(&problem)?;
+let exact = model.exact().map_err(|e| e.to_string())?;
+let m = problem["budget_exponent"].as_f64().ok_or("Missing limit exponent")? as u32;
+let deterministic: [Vec<[f64; 2]>; 2] =
+    serde_json::from_value(problem["curves"].clone()).map_err(|e| e.to_string())?;
+let final_rows: Vec<(String, usize, f64, f64, Option<f64>, String)> =
+    serde_json::from_value(problem["final_rows"].clone()).map_err(|e| e.to_string())?;
+// Table row: (method, evaluations, estimate, relative error, relative error estimate or SE, error / SE, termination).
+let mut rows: Vec<_> = final_rows
+    .into_iter()
+    .map(|(name, n, value, error, estimate, status)| {
+        (name, n, value, error, estimate, None, status)
+    })
+    .collect();
+// curves[i]: Monte Carlo (0) and randomized QMC (1) (evaluations, relative error); se[i]: (evaluations, relative SE).
+let (mut curves, mut se) = ([Vec::new(), Vec::new()], [Vec::new(), Vec::new()]);
+for k in 6..=m {
+    let n = 1_usize << k;
+    // Monte Carlo uses N independent points; randomized QMC uses eight randomizations of N/8 Sobol points.
+    for (index, replicates) in [(0, 1), (1, 8)] {
+        let seed = sample_seed as u64;
+        let (value, statistics, report) =
+            sample_estimate(&model, n, replicates, seed).map_err(|e| e.to_string())?;
+        let statistics = statistics.ok_or("Missing statistics")?;
+        let error = (value - exact).abs() / exact.abs();
+        let relative_se = statistics.standard_error() / exact.abs();
+        let evaluations = report.evaluations();
+        curves[index].push([evaluations as f64, error]);
+        se[index].push([evaluations as f64, relative_se]);
+        if k == m {
+            let name = ["Monte Carlo", "Randomized QMC (R = 8)"][index].to_string();
+            let status = report.termination().to_string();
+            let ratio = Some(error / relative_se);
+            rows.push((name, evaluations, value, error, Some(relative_se), ratio, status));
+        }
+    }
+}
+// Relative errors use symbols and relative SEs dashed lines. Omit and count zero errors, which cannot appear on a logarithmic axis.
+let names = ["Sparse grid", "Genz–Malik", "Monte Carlo", "Randomized QMC (R = 8)"];
+let errors = deterministic.iter().chain(curves.iter());
+let mut excluded = 0_usize;
+let mut series = Vec::new();
+for (name, curve) in names.iter().zip(errors) {
+    let points: Vec<[f64; 2]> = curve.iter().copied().filter(|p| p[1] > 0.0).collect();
+    excluded += curve.len() - points.len();
+    let style = serde_json::json!({ "showSymbol": true });
+    series.push(serde_json::json!({ "name": name, "points": points, "style": style }));
+}
+for (name, points) in names[2..].iter().zip(&se) {
+    let style = serde_json::json!({ "lineType": "dashed" });
+    let label = format!("Relative SE of {name}");
+    series.push(serde_json::json!({ "name": label, "points": points, "style": style }));
+}
+emit_line_chart!(
+    &series,
+    options = &serde_json::json!({
+        "xLabel": "Evaluations [count]",
+        "yLabel": "Relative error and relative standard error [-]",
+        "xType": "log",
+        "yType": "log"
+    })
+);
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let sig3 = serde_json::json!({ "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Method" },
+    { "key": "1", "label": "Evaluations [count]", "type": "integer" },
+    { "key": "2", "label": "Estimate [-]", "type": "number", "format": { "significantDigits": 10 } },
+    { "key": "3", "label": "Relative error [-]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "Error estimate or SE / |I| [-]", "type": "number", "format": sci3, "nullText": "—" },
+    { "key": "5", "label": "Error / SE [-]", "type": "number", "format": sig3, "nullText": "—" },
+    { "key": "6", "label": "Termination status" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "methods" })
+);
+emit_text!(format!("Points omitted from the chart because error is 0: {excluded}"));
+```
+
+At the defaults and $N \approx 4000$, relative errors are $3\times10^{-10}$ for sparse grids, $4\times10^{-7}$ for Genz–Malik, $3\times10^{-4}$ for randomized QMC, and $3\times10^{-3}$ for Monte Carlo; both deterministic methods are orders of magnitude more accurate for this smooth integrand.
+Monte Carlo relative SE decreases from $0.108$ at $N = 64$ to $0.0138$ at $N = 4096$ with log-log slope about $-0.49$, following $N^{-1/2}$.
+Randomized-QMC relative SE decreases from $0.061$ to $3.3\times10^{-4}$ with slope about $-1.26$, faster than $N^{-1}$.
+Each method's relative errors (symbols) fluctuate around its dashed curve.
+A single run can have error-to-SE ratio 0.2 or 2.5, so one such curve cannot establish whether SE correctly measures error.
+The next cell checks this.
+
+Matching the previous cell's `oscillatory-10d` case gives errors for randomized QMC ($3\times10^{-4}$) and Monte Carlo ($7\times10^{-4}$) both above the sparse-grid error ($4\times10^{-6}$).
+Matching `sharp-gauss` gives $6\times10^{-3}$ for Monte Carlo and $4\times10^{-2}$ for randomized QMC, so randomized QMC has larger error for this seed.
+For localized peaks, sampling variability can change the ranking of stochastic methods.
+
+## Check reported standard errors
+
+A stochastic estimate is a random variable whose value changes with the seed.
+If reported SE correctly measures error, repeating estimates across seeds should give actual RMSE (the root mean square difference from the closed form) close to mean SE, and 95 % confidence intervals should contain the closed form about 95 % of the time.
+Intervals use Student's $t$ distribution with $N - 1$ degrees of freedom for Monte Carlo and 7 degrees of freedom from eight replicates for randomized QMC (the `MonteCarloOptions` default).
+The half-width is the $t$ quantile times SE, with SE derived from the estimator variance returned by `estimator_variance()`.
+For Monte Carlo, estimator variance is sample variance $s^2$ divided by $N$, giving $s^2/N$; for randomized QMC, it is the sample variance of eight estimates divided by 8.
+Since randomized-QMC SE comes from only eight values, each run's SE varies substantially, and interval widths expand accordingly.
+
+The next cell takes the first cell's problem (family, $d$, $h$, and problem seed), varies sample seeds as $s_0 + 1, s_0 + 2, \dots$, and repeats Monte Carlo and randomized QMC with $N = 2^k$ evaluations.
+Seed offset $s_0$ is also an input; changing it repeats the check with a different set of runs.
+The chart shows each run's estimate and 95 % confidence interval as an error bar, with the closed form marked by a horizontal line.
+The table gives coverage of the closed form, mean reported SE, actual RMSE, and their ratio.
+With 20 repeats, coverage varies by about $\sqrt{0.95\times0.05/20} \approx 0.05$ and estimated RMSE by about 16 % ($1/\sqrt{2\times20}$).
+
+```rust
+//| id: integrate-genz-replicates
+//| ref: integrate-genz-replicates
+//| title: "Vary sample seeds and count confidence intervals containing the closed form"
+//| run: button
+//| timeoutMs: 120000
+//| uses: [integrate-genz-model]
+//| crates: [scioxide-core, scioxide-integrate, scioxide-random, scioxide-special]
+//| dependsOn:
+//|   problem: integrate-genz-deterministic
+//| inputs:
+//|   repeat_exponent: {"type":"range","label":"Evaluations-per-run exponent k (N = 2^k)","description":"Evaluations used for one Monte Carlo or randomized-QMC estimate.","min":8,"max":12,"step":1,"value":10}
+//|   repeat_count: {"type":"range","label":"Repeats [count]","description":"Use sample seeds s₀ + 1, s₀ + 2, … in sequence.","min":10,"max":40,"step":5,"value":20}
+//|   seed_offset: {"type":"range","label":"Seed offset s₀ [-]","description":"Set run r's sample seed to s₀ + r to select a different set of repeats.","min":0,"max":1000,"step":100,"value":0}
+//| cases:
+//|   - {"id":"many-repeats","label":"N = 2¹², 40 repeats","description":"More repeats reduce variability in coverage and the RMSE / SE ratio.","inputs":{"repeat_exponent":12,"repeat_count":40}}
+//|   - {"id":"shifted-seeds","label":"Seed offset 500","description":"Another set of runs using seeds 501–520 also gives coverage and ratios within variation expected from the repeat count.","inputs":{"seed_offset":500}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/0/2","range":{"min":0.8,"max":1}}
+//|       - {"artifact":"methods","path":"/rows/1/2","range":{"min":0.8,"max":1}}
+//|       - {"artifact":"methods","path":"/rows/0/5","range":{"min":0.5,"max":1.5}}
+//|       - {"artifact":"methods","path":"/rows/1/5","range":{"min":0.5,"max":1.5}}
+//|   - case: many-repeats
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/0/2","range":{"min":0.85,"max":1}}
+//|       - {"artifact":"methods","path":"/rows/1/2","range":{"min":0.85,"max":1}}
+//|   - case: shifted-seeds
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/0/2","range":{"min":0.75,"max":1}}
+//|       - {"artifact":"methods","path":"/rows/1/2","range":{"min":0.75,"max":1}}
+//|       - {"artifact":"methods","path":"/rows/0/5","range":{"min":0.5,"max":1.6}}
+//|       - {"artifact":"methods","path":"/rows/1/5","range":{"min":0.5,"max":1.6}}
+use scioxide_core::RealScalar;
+
+// Receive the problem (family, dimension, difficulty, and problem seed) from the first cell.
+let model = Genz::from_problem(&problem)?;
+let exact = model.exact().map_err(|e| e.to_string())?;
+let n = 1_usize << repeat_exponent as u32;
+let repeats = repeat_count as usize;
+// bars[i]: method i's (run number, estimate, lower and upper endpoints of the 95 % interval).
+let (mut bars, mut covered) = ([Vec::new(), Vec::new()], [0_usize; 2]);
+let (mut se_sum, mut square_sum) = ([0.0_f64; 2], [0.0_f64; 2]);
+for r in 1..=repeats {
+    // Run r uses sample seed s₀ + r.
+    let seed = seed_offset as u64 + r as u64;
+    for (index, replicates) in [(0, 1), (1, 8)] {
+        let (value, statistics, _) =
+            sample_estimate(&model, n, replicates, seed).map_err(|e| e.to_string())?;
+        let mut statistics = statistics.ok_or("Missing statistics")?;
+        let interval = statistics
+            .confidence_interval()
+            .map_err(|e| e.to_string())?;
+        let (lower, upper) = (interval.lower(), interval.upper());
+        covered[index] += usize::from(lower <= exact && exact <= upper);
+        se_sum[index] += statistics.standard_error();
+        square_sum[index] += (value - exact) * (value - exact);
+        // Offset the two methods horizontally by 0.15 to keep their error bars from overlapping.
+        let x = r as f64 + if index == 0 { -0.15 } else { 0.15 };
+        bars[index].push([x, value, lower, upper]);
+    }
+}
+emit_chart!(serde_json::json!({
+    "kind": "errorbar",
+    "xLabel": "Run r (sample seed s₀ + r) [-]",
+    "yLabel": "Estimate and 95 % confidence interval [-]",
+    "series": [
+        { "name": "Monte Carlo", "points": bars[0] },
+        { "name": "Randomized QMC (R = 8)", "points": bars[1] }
+    ],
+    "annotations": [{ "kind": "line", "axis": "y", "value": exact, "label": "Closed form" }]
+}));
+let count = repeats as f64;
+let rows: Vec<_> = ["Monte Carlo", "Randomized QMC (R = 8)"]
+    .iter()
+    .enumerate()
+    .map(|(i, name)| {
+        let rmse = RealScalar::sqrt(square_sum[i] / count);
+        let mean_se = se_sum[i] / count;
+        (
+            *name,
+            n,
+            covered[i] as f64 / count,
+            mean_se,
+            rmse,
+            rmse / mean_se,
+        )
+    })
+    .collect();
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let sig3 = serde_json::json!({ "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Method" },
+    { "key": "1", "label": "Evaluations per run [count]", "type": "integer" },
+    { "key": "2", "label": "Fraction of intervals containing the closed form [-]", "type": "number", "format": fixed2 },
+    { "key": "3", "label": "Mean reported SE [-]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "Actual RMSE [-]", "type": "number", "format": sci3 },
+    { "key": "5", "label": "RMSE / mean SE [-]", "type": "number", "format": sig3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "methods" })
+);
+```
+
+At the defaults ($N = 2^{10}$, 20 repeats), coverage is 1.00 for Monte Carlo and 0.95 for randomized QMC.
+The ratio of RMSE to mean SE is 0.78 for Monte Carlo and 1.03 for randomized QMC, both within variation expected from the repeat count.
+The error bars show randomized-QMC intervals an order of magnitude narrower than Monte Carlo intervals, while retaining the same coverage.
+In `many-repeats` ($N = 2^{12}$, 40 repeats), coverages are 0.925 and 0.975, and ratios are 1.20 and 0.96.
+The `shifted-seeds` case using seeds 501–520 gives coverages 0.90 and 1.00 and ratios 1.15 and 1.20, again within variation expected from the repeat count.
+Reported SE can measure error for both randomized QMC and Monte Carlo.
+However, one run's SE is not an upper bound, and errors can exceed twice the SE.
+This probability is about 5 % for Monte Carlo with many degrees of freedom and about 9 % for randomized QMC with 7 degrees of freedom, from $P(|t_7| > 2)$ for the $t_7$ distribution.
+
+## Summary
+
+Genz test functions have closed forms and adjustable oscillation and sharpness through $\sum a_i = h$, enabling comparisons of multidimensional integration methods at the same evaluation count.
+For the default Gaussian case and `oscillatory-10d`, sparse grids give the smallest and Monte Carlo the largest errors at the same evaluation count; sparse grids remain favorable at $d = 10$.
+For the sharp peak in `sharp-gauss`, randomized QMC has larger error than Monte Carlo with this seed.
+Both deterministic error estimates are heuristic and may exceed actual error by many orders of magnitude; treat values stopped by `BudgetLimit(Evaluation)` as estimates.
+Use randomized QMC with the replicate and point counts of `QmcReplicatePlan` matched to `with_replicates` and `with_samples` in `MonteCarloOptions`; its SE agrees with actual RMSE over repeated seeds.
+Localized peaks or discontinuities can change which method is best, so combine evaluation-count comparisons with error estimates from stochastic SEs.
+
+## Further reading
+
+- [Sparse grids and randomized quasi-Monte Carlo](../../algorithms/sparse-grids-and-qmc/): examine Smolyak difference rules, dimension-adaptive refinement, and randomized-QMC replicate error estimation.
+- [Tensor-product rules and adaptive Genz–Malik cubature](../../algorithms/multidimensional-and-monte-carlo/) and [Monte Carlo estimators and statistics](../../algorithms/monte-carlo-integration/): examine Genz–Malik nodes and subdivision rules, Monte Carlo statistics, and interval construction.
+- [Adaptive Monte Carlo (VEGAS and MISER)](../../algorithms/adaptive-monte-carlo/): examine importance sampling and stratification that concentrate samples near localized peaks.

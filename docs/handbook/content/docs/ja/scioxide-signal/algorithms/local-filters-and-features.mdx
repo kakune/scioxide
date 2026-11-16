@@ -1,0 +1,671 @@
+---
+title: 局所フィルタとピークの検出
+description: 中央値・順位・Hampel・局所 Wiener の各フィルタと逐次処理、端点の延長、ピークの突出度と幅の定義と選別、Ricker ウェーブレットの尺度をまたぐリッジによるピークの検出を説明する。
+sidebar:
+  order: 365
+references:
+  signal-local-rank-filters: "局所順位統計量とロバストなフィルタ"
+  signal-hampel-filter: "hampel-フィルタによる外れ値の置換"
+  signal-local-wiener: "局所-wiener-フィルタ"
+  signal-local-filter-stream: "plan-と逐次処理"
+  signal-peak-geometry: "ピークの幾何と突出度"
+  signal-peak-selection: "ピークの選別と作業領域"
+  signal-ridge-detection: "尺度をまたぐリッジ"
+---
+
+前のページの平滑化は、ノイズが正規分布に近く、外れ値がないことを暗に仮定していた。
+スパイク状の外れ値や段差を含む信号では、最小二乗の当てはめは外れ値に引きずられ、段差をなまらせる。
+このページは、ウインドウの中の順位統計量や局所的な分散を使うロバストなフィルタと、信号の中の山（ピーク）を位置、突出度、幅で特徴づけて選ぶ方法を説明する。
+
+## 局所順位統計量とロバストなフィルタ
+
+半径 $r$ のウインドウ $W_i = \{x[i - r], \dots, x[i + r]\}$（大きさ $w = 2r + 1$）を各標本のまわりにとる。
+記録の外の標本は最も近い端の標本を繰り返す。
+`LocalFilterPlan::new(radius, kind)` は、`LocalFilter` で選んだ演算をこのウインドウに適用する Plan である。
+
+- `Median` はウインドウの中央値を返す。
+- `Rank { rank }` はウインドウを昇順に並べたときの 0 始まりの `rank` 番目の値を返す（`rank` は $w$ 未満）。
+  `rank = 0` は最小値フィルタ、`rank = w - 1` は最大値フィルタである。
+- `Hampel { threshold }` は外れ値と判定した標本だけを中央値で置き換える。
+- `Wiener { noise_variance }` は局所平均と局所分散から作る適応的な線形推定である。
+
+中央値、順位、Hampel のフィルタは整列したウインドウを保ち、ウインドウをずらすたびに 1 標本を入れ替える。
+最初のウインドウは $O(w \log w)$、以後は 1 標本あたり $O(w)$ である。
+出力は入力の標本そのものなので、丸め誤差を含まない。
+`LocalFilterPlan::order(offsets, rank)` は、狭義に増加する任意のオフセットの集合で順位フィルタを作る。
+オフセットは非対称でもよく、0 を含まなくてもよい。
+連続した整数の並びが $\lfloor \log_2 w \rfloor + 1$ 個より多い場合は、ウインドウごとに $O(w \log w)$ で並べ直す。
+ワンショット呼び出しの `median_filter(input, radius)` は `LocalFilterPlan::new(radius, LocalFilter::Median)` の `filter` と同じで、半径 0 は記録をそのまま返す。
+
+中央値フィルタは、幅が $r$ 以下の孤立したスパイクを除き、段差の位置を保つ。
+一方で、山の頂点や細い谷も削る。
+外れ値だけを狙って置き換え、それ以外の標本を変えないのが次の Hampel フィルタである。
+
+### Hampel フィルタによる外れ値の置換
+
+ウインドウの中央値 $m_i = \operatorname{median}(W_i)$ と中央値絶対偏差（MAD）
+
+$$
+\mathrm{MAD}_i = \operatorname{median}_{j = -r, \dots, r} \bigl| x[i + j] - m_i \bigr|
+$$
+
+を求める。
+$\hat\sigma_i = 1.4826\,\mathrm{MAD}_i$ は、正規分布に従うデータで標準偏差に一致する推定量である（$1.4826 \approx 1/\Phi^{-1}(3/4)$）。
+中心の標本は
+
+$$
+\bigl| x[i] - m_i \bigr| > \tau\,\hat\sigma_i
+$$
+
+のときだけ $m_i$ に置き換わる。
+しきい値と等しい偏差は置き換えない。
+$\tau \ge 0$ は `LocalFilter::Hampel { threshold }` で与え、$\tau = 3$ がよく使われる。
+ウインドウの過半数が同じ値で MAD が 0 になると、中央値と異なる中心の標本はすべて置き換わる。
+出力先を指定する API `filter_into` は、置き換えた標本の添字を昇順に `replacements` へ書き、その数を返す。
+
+### 局所 Wiener フィルタ
+
+ウインドウの局所平均を $\mu_i$、局所の母分散を $\sigma_i^2 = \frac{1}{w}\sum_j (x[i + j] - \mu_i)^2$ とする。
+信号を $x = s + e$（$e$ は分散 $\nu$ の白色雑音）とし、ウインドウの中で $s$ が平均 $\mu_i$、分散 $\sigma_i^2 - \nu$ の確率変数とみなせるとき、平均二乗誤差を最小にする線形推定は
+
+$$
+\hat s[i] = \mu_i + \max\!\left(0,\ 1 - \frac{\nu}{\sigma_i^2}\right) \bigl(x[i] - \mu_i\bigr)
+$$
+
+である。
+分散の大きい段差の近く（$\sigma_i^2 \gg \nu$）では入力がほぼそのまま残り、局所分散がノイズと同程度の平坦部（$\sigma_i^2 \le \nu$）では局所平均になる。
+$\nu = 0$ では出力は入力に等しい。
+局所 Wiener フィルタは補償つきの移動和で局所の積率を更新し、少なくとも $w$ 標本ごとに計算し直すので、$n$ 標本で償却 $O(n + w)$ である。
+ウインドウごとに積率を別々に計算した場合とは丸めが異なりうるが、一定のウインドウでは中心の標本をそのまま返す。
+
+`estimate_wiener_noise(input, radius)` は、全標本の局所の母分散の平均 $\nu = \frac{1}{n}\sum_i \sigma_i^2$ をノイズの分散の推定として返す。
+信号の変化も局所分散に含まれるので、この推定はノイズの分散より大きめになりやすい。
+空の入力は `InvalidInput` である。
+
+### Plan と逐次処理
+
+Plan の `filter(input)` は結果を確保して返し、`filter_into(input, output, replacements, workspace, cx)` は `workspace(input_len)` で準備した領域を使って書く。
+`filter_into` は失敗したとき出力を変えない。
+
+受信しながら処理する列には、`plan.stream()` が返す `LocalFilterStream` を使う。
+出力 $i$ は、`delay()`（最大の正のオフセット、中心のウインドウでは $r$）個の後の標本が届いた時点で書ける。
+`process_into(chunk, StreamChunk, output, replacements, workspace, cx)` は届いた分の出力を書き、`StreamProgress` で消費した数、書いた数、最初の出力の添字、置き換えた数を返す。
+出力の添字は元の記録にそろえ、遅延でずらさない。
+`StreamChunk::Final` を渡すと端の延長で残りを書き出し、`reset` までストリームを閉じる。
+ストリームはチャンクの分け方によらず、一括処理と同じ出力を返す。
+状態は値として持つので、`clone` で保存し、`clone_from` で確保せずに戻せる。
+
+次のセルは、段差と緩やかな正弦波からなる信号 $s_k$（200 標本）に標準偏差 0.1 の正規ノイズと、23 標本ごとに符号を交互にしたスパイクを加え、三つのフィルタを比べる。
+表は真の信号との RMS 誤差を全体と段差の近く（添字 95〜105）に分けて示し、Hampel フィルタが置き換えた数を並べる。
+2 つ目の表はHampel フィルタをウインドウごとに並べ替えて定義どおりに計算した結果との最大差と、`estimate_wiener_noise` の推定を示す。
+
+```rust
+//| id: signal-robust-filters
+//| ref: signal-robust-filters
+//| title: 中央値・Hampel・局所 Wiener フィルタによるスパイクとノイズの除去
+//| run: reactive
+//| crates: [scioxide-core, scioxide-random, scioxide-signal]
+//| inputs:
+//|   radius: {"type":"range","label":"ウインドウの半径 r [標本]","description":"ウインドウの大きさは 2r + 1。","min":1,"max":8,"step":1,"value":3}
+//|   threshold: {"type":"range","label":"Hampel のしきい値 τ [-]","description":"推定した標準偏差の何倍で外れ値とみなすか。","min":0,"max":6,"step":0.5,"value":3}
+//|   spike_amplitude: {"type":"range","label":"スパイクの振幅 [-]","description":"23 標本ごとに加える外れ値の大きさ。","min":0,"max":4,"step":0.5,"value":2}
+//|   seed: {"type":"range","label":"乱数のシード","description":"ノイズの実現値を選ぶ。","min":1,"max":20,"step":1,"value":3}
+//| cases:
+//|   - {"id":"no-spikes","label":"スパイクなし","description":"外れ値がないと、Hampel フィルタはほとんど置き換えない。","inputs":{"spike_amplitude":0}}
+//|   - {"id":"zero-threshold","label":"τ = 0","description":"しきい値 0 の Hampel フィルタは中央値フィルタに近づく。","inputs":{"threshold":0}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"check","path":"/rows/0/0","range":{"max":0}}
+//|       - {"artifact":"check","path":"/rows/0/1","range":{"min":8}}
+//|   - case: zero-threshold
+//|     expect:
+//|       - {"artifact":"check","path":"/rows/0/0","range":{"max":0}}
+use scioxide_core::ExecutionContext;
+use scioxide_random::{Distribution, Normal, SeedableRng, SplitMix64};
+use scioxide_signal::{LocalFilter, LocalFilterPlan, estimate_wiener_noise, median_filter};
+use std::f64::consts::PI;
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let n = 200_usize;
+let r = radius.round() as usize;
+// 真の信号（参照値。f64 の標準関数）: 添字 100 の段差と緩やかな正弦波。
+let clean: Vec<f64> = (0..n)
+    .map(|k| f64::from(u8::from(k >= 100)) + 0.3 * (2.0 * PI * k as f64 / 80.0).sin())
+    .collect();
+let noise = Normal::new(0.0, 0.1).map_err(|e| e.to_string())?;
+let mut rng = SplitMix64::from_seed(seed as u64);
+let mut input = Vec::with_capacity(n);
+for (k, &value) in clean.iter().enumerate() {
+    let spike = if k % 23 == 7 {
+        spike_amplitude * if (k / 23) % 2 == 0 { 1.0 } else { -1.0 }
+    } else {
+        0.0
+    };
+    input.push(value + spike + noise.sample(&mut rng).map_err(|e| e.to_string())?);
+}
+
+let median = median_filter(&input, r).map_err(|e| e.to_string())?;
+let hampel_plan =
+    LocalFilterPlan::new(r, LocalFilter::Hampel { threshold }).map_err(|e| e.to_string())?;
+let mut hampel = vec![0.0; n];
+let mut replaced = vec![0_usize; n];
+let mut workspace = hampel_plan.workspace(n).map_err(|e| e.to_string())?;
+let replaced_count = hampel_plan
+    .filter_into(
+        &input,
+        &mut hampel,
+        &mut replaced,
+        &mut workspace,
+        ExecutionContext::sequential(),
+    )
+    .map_err(|e| e.to_string())?;
+let noise_variance = estimate_wiener_noise(&input, r).map_err(|e| e.to_string())?;
+let wiener = LocalFilterPlan::new(r, LocalFilter::Wiener { noise_variance })
+    .and_then(|plan| plan.filter(&input))
+    .map_err(|e| e.to_string())?;
+
+// 独立な検算: 端を繰り返したウインドウを並べ替え、中央値と MAD から Hampel の判定を定義どおりに行う。
+let median_of = |values: &mut Vec<f64>| {
+    values.sort_by(f64::total_cmp);
+    values[values.len() / 2]
+};
+let mut hand_count = 0_usize;
+let mut hand_gap = 0.0_f64;
+for i in 0..n {
+    let mut window: Vec<f64> = (0..2 * r + 1)
+        .map(|j| input[(i + j).saturating_sub(r).min(n - 1)])
+        .collect();
+    let center = median_of(&mut window);
+    let mut deviations: Vec<f64> = window.iter().map(|x| (x - center).abs()).collect();
+    let scale = 1.4826 * median_of(&mut deviations);
+    let outlier = (input[i] - center).abs() > threshold * scale;
+    hand_count += usize::from(outlier);
+    let expected = if outlier { center } else { input[i] };
+    hand_gap = hand_gap.max((hampel[i] - expected).abs());
+}
+
+let rms = |values: &[f64], range: std::ops::Range<usize>| {
+    let count = range.len() as f64;
+    (range.map(|k| (values[k] - clean[k]).powi(2)).sum::<f64>() / count).sqrt()
+};
+let rows = vec![
+    ("入力", rms(&input, 0..n), rms(&input, 95..106), None),
+    ("中央値", rms(&median, 0..n), rms(&median, 95..106), None),
+    (
+        "Hampel",
+        rms(&hampel, 0..n),
+        rms(&hampel, 95..106),
+        Some(replaced_count),
+    ),
+    (
+        "局所 Wiener",
+        rms(&wiener, 0..n),
+        rms(&wiener, 95..106),
+        None,
+    ),
+];
+let columns = serde_json::json!([
+    { "key": "0", "label": "フィルタ" },
+    { "key": "1", "label": "RMS 誤差（全体）[-]", "type": "number", "format": sci3 },
+    { "key": "2", "label": "RMS 誤差（段差の近く）[-]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "置き換えた数 [個]", "type": "integer", "nullText": "—" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "filters" })
+);
+let check_columns = serde_json::json!([
+    { "key": "0", "label": "Hampel の定義どおりの計算との最大差 [-]", "type": "number", "format": sci3 },
+    { "key": "1", "label": "定義どおりに数えた置換 [個]", "type": "integer" },
+    { "key": "2", "label": "推定したノイズの分散 ν [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    check_columns,
+    vec![(hand_gap, hand_count, noise_variance)],
+    metadata = serde_json::json!({ "id": "check" })
+);
+
+let curve = |values: &[f64]| -> Vec<[f64; 2]> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(k, &v)| [k as f64, v])
+        .collect()
+};
+emit_chart!(serde_json::json!({
+    "kind": "xy",
+    "xLabel": "標本の添字 k [-]",
+    "yLabel": "値 [-]",
+    "yMin": -2.5,
+    "yMax": 3.5,
+    "layers": [
+        { "id": "input", "kind": "scatter", "name": "入力", "points": curve(&input) },
+        {
+            "id": "clean",
+            "kind": "line",
+            "name": "真の信号",
+            "points": curve(&clean),
+            "style": { "lineType": "dashed", "showSymbol": false }
+        },
+        { "id": "median", "kind": "line", "name": "中央値", "points": curve(&median) },
+        { "id": "hampel", "kind": "line", "name": "Hampel", "points": curve(&hampel) },
+        { "id": "wiener", "kind": "line", "name": "局所 Wiener", "points": curve(&wiener) }
+    ]
+}));
+```
+
+既定値（$r = 3$、$\tau = 3$、振幅 2、シード 3）では、入力の RMS 誤差 0.435 に対し、中央値フィルタは 0.100、Hampel フィルタは 0.165、局所 Wiener フィルタは 0.322 である。
+Hampel フィルタは 15 個の標本を置き換え、定義どおりの計算との最大差は 0 である。
+出力は入力の標本かウインドウの中央値なので、差は丸め誤差も含まずちょうど 0 になる。
+Hampel フィルタは外れ値と判定した標本だけを変えるので、残りの標本のノイズはそのまま残り、全体の RMS 誤差は中央値フィルタより大きい。
+局所 Wiener フィルタは外れ値を局所分散の大きな部分とみなすので、スパイクの近くで入力をほとんど残す。
+推定したノイズの分散 $\nu$ は 0.156 で、ノイズの分散 0.01 にスパイクと段差の寄与が加わった値である。
+
+段差の近く（添字 95〜105）の RMS 誤差は、中央値フィルタで 0.344、Hampel フィルタで 0.590 で、入力の 0.597 とほとんど変わらない。
+この区間には添字 99 のスパイクがある。
+Hampel フィルタのウインドウが段差をまたぐと MAD が段差の高さの程度まで大きくなり、しきい値 $\tau\hat\sigma_i$ がスパイクの振幅を超えるので、スパイクは外れ値と判定されない。
+中央値フィルタは判定を行わないので、このスパイクも除く。
+ケース「τ = 0」では、中央値と異なるすべての中心の標本が置き換わり（162 個）、Hampel フィルタの出力は中央値フィルタに一致する。
+ケース「スパイクなし」では、Hampel フィルタの置換は 8 個で、ノイズの裾にある標本だけが置き換わる。
+
+## ピークの幾何と突出度
+
+局所極大を拾うだけでは、小さなノイズが多数の偽のピークを生む。
+`find_peaks` は、すべての極大について、地形学に由来する突出度（prominence）と幅を測る。
+
+ピークは、同じ値が続く区間（平坦部）$x[s] = \dots = x[e]$ で、$0 < s \le e < n - 1$ かつ両隣 $x[s - 1]$、$x[e + 1]$ がどちらも低いものである。
+記録の両端の標本はピークにならない。
+代表の添字は平坦部の中点を下に丸めた $s + \lfloor (e - s)/2 \rfloor$ である。
+
+高さ $h$ のピークの突出度 $P$ は次のように決まる。
+
+1. 平坦部から左へ、$h$ より真に高い標本か記録の端に達するまで進み、その区間の最小値の位置を左の谷 `left_base` とする。
+   同じ最小値が複数あれば、ピークに最も近いものをとる。
+2. 右へも同様に進み、右の谷 `right_base` を決める。
+3. 突出度は $P = h - \max(x[\text{left\_base}], x[\text{right\_base}])$ で、高い方の谷を基準にする。
+
+幅は相対深さ $\rho \in [0, 1]$（`relative_height`）に対する高さ $h - \rho P$ の等高線で測る。
+平坦部から外へ向かって、等高線以下の最初の標本か谷に達するまで走査し、その標本と一つ内側の標本の間を線形補間して交点 `left_crossing`、`right_crossing` を求める。
+幅 `width` は交点の差で、標本単位の実数である。
+既定の $\rho = 1/2$ は突出度の半分の高さでの幅である。
+$\rho = 0$ では等高線がピークの高さになり、平坦部の幅は $e - s$ になる。
+
+谷と交点の探索は、512 標本までは外側への走査、それより遠い場合は最小値と最大値のセグメント木への問い合わせで行う。
+$n$ 標本の $p$ 個の極大の幾何は $O(n + p \log n)$ で求まる。
+
+### ピークの選別と作業領域
+
+`PeakOptions` は選別の条件を持つ。
+高さ（`with_height`）、突出度（`with_prominence`）、幅（`with_width`）は `Interval` の閉区間で与え、平坦部の標本数は `with_plateau_size((low, high))`（$0 < \text{low} \le \text{high}$）で与える。
+`with_distance(d)` は選んだピークどうしの最小間隔で、0 と 1 は間隔の条件を課さない。
+既定はすべてのピークを受け入れ、幅を突出度の半分で測る。
+
+区間の条件はすべてのピークに先に当て、残ったピークに間隔の条件を当てる。
+間隔の選別では高いピークから順に採り、同じ高さなら添字の小さい方を優先し、採ったピークから $d$ 標本未満の残りを除く。
+幾何は選別の前に測るので、選別でピークが除かれても残ったピークの谷や幅は変わらない。
+相対深さが $[0, 1]$ の外にあるか、平坦部の範囲が $0 < \text{low} \le \text{high}$ を満たさなければ `InvalidInput` を返す。
+
+`find_peaks(input)` は既定の条件、`find_peaks_with_options(input, options)` は指定した条件で、選んだピークを添字の昇順の `Vec<Peak>` で返す。
+どちらも `PeakWorkspace` と $\lfloor n/2 \rfloor$ 個の記録を確保する。
+出力先を指定する API `find_peaks_into(input, options, output, workspace, cx)` は、`PeakWorkspace::workspace(max_input_len)` で準備した領域を使って出力の先頭に書き、書いた数を返す。
+必要な大きさは `PeakWorkspace::workspace_requirements(max_input_len)` が `PeakRequirements` で返し、`try_reserve` で広げ、`check` で確かめる。
+`output` は選んだピークの数だけあればよい。
+
+`peak_properties(input, indices, relative_height)` は、平坦部の任意の添字を受け取り、そのピークの記録を入力の順に返す。
+記録は `find_peaks_with_options` がそのピークに返すものと同じである。
+内部の極大の平坦部にない添字は `InvalidInput` になる。
+出力先を指定する API `peak_properties_into` は作業領域を使わず、添字をすべて検査してから書くために各ピークを 2 回測る。
+
+次のセルは、傾いた基線の上に高さと幅の異なる 3 つの Gauss 形の山を置き、正規ノイズを加えたクロマトグラムを模した 400 標本の信号を作る。
+突出度の下限と最小間隔で選別し、選んだピークの突出度を定義どおりの走査で独立に計算して比べる。
+`peak_properties` に同じ添字を渡して、幅が一致することも確かめる。
+
+```rust
+//| id: signal-peak-prominence
+//| ref: signal-peak-prominence
+//| title: ノイズを含む信号のピークを突出度と間隔で選ぶ
+//| run: reactive
+//| crates: [scioxide-core, scioxide-random, scioxide-signal]
+//| inputs:
+//|   min_prominence: {"type":"range","label":"突出度の下限 [-]","description":"これより突出度の小さいピークを除く。","min":0,"max":1,"step":0.05,"value":0.3}
+//|   distance: {"type":"range","label":"最小間隔 d [標本]","description":"選んだピークどうしの最小の距離。","min":0,"max":60,"step":5,"value":10}
+//|   relative_height: {"type":"range","label":"幅を測る相対深さ ρ [-]","description":"突出度に対する、幅を測る等高線の深さ。","min":0,"max":1,"step":0.1,"value":0.5}
+//|   noise_level: {"type":"range","label":"ノイズの標準偏差 [-]","description":"正規ノイズの大きさ。","min":0,"max":0.2,"step":0.01,"value":0.05}
+//|   seed: {"type":"range","label":"乱数のシード","description":"ノイズの実現値を選ぶ。","min":1,"max":20,"step":1,"value":5}
+//| cases:
+//|   - {"id":"all-maxima","label":"選別なし","description":"条件を外すと、ノイズの極大がすべてピークになる。","inputs":{"min_prominence":0,"distance":0}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/1","equals":3}
+//|       - {"artifact":"summary","path":"/rows/0/2","range":{"max":0}}
+//|       - {"artifact":"summary","path":"/rows/0/3","range":{"max":0}}
+//|   - case: all-maxima
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/1","range":{"min":20}}
+//|       - {"artifact":"summary","path":"/rows/0/2","range":{"max":0}}
+use scioxide_core::{ExecutionContext, Interval};
+use scioxide_random::{Distribution, Normal, SeedableRng, SplitMix64};
+use scioxide_signal::{Peak, PeakOptions, PeakWorkspace, find_peaks_into, peak_properties};
+
+let fixed3 = serde_json::json!({ "fractionDigits": 3 });
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let n = 400_usize;
+// (中心, 高さ, 標準偏差) の 3 つの山と傾いた基線。値は参照用の f64 の標準関数で作る。
+let bumps = [(80.0, 1.0, 6.0), (200.0, 0.6, 15.0), (290.0, 1.4, 4.0)];
+let noise = Normal::new(0.0, noise_level.max(1e-12)).map_err(|e| e.to_string())?;
+let mut rng = SplitMix64::from_seed(seed as u64);
+let mut signal = Vec::with_capacity(n);
+for k in 0..n {
+    let t = k as f64;
+    let peaks: f64 = bumps
+        .iter()
+        .map(|&(c, a, s)| a * (-0.5 * ((t - c) / s).powi(2)).exp())
+        .sum();
+    let e = if noise_level > 0.0 {
+        noise.sample(&mut rng).map_err(|e| e.to_string())?
+    } else {
+        0.0
+    };
+    signal.push(0.2 + 0.001 * t + peaks + e);
+}
+
+let options = PeakOptions::default()
+    .with_prominence(Interval::new(min_prominence, f64::MAX).map_err(|e| e.to_string())?)
+    .with_distance(distance.round() as usize)
+    .with_relative_height(relative_height);
+// 作業領域は最大の入力長で 1 回準備し、出力は選ばれうる最大数 ⌊n/2⌋ を用意する。
+let mut workspace = PeakWorkspace::workspace(n).map_err(|e| e.to_string())?;
+let mut output = vec![Peak::default(); n / 2];
+let count = find_peaks_into(
+    &signal,
+    options,
+    &mut output,
+    &mut workspace,
+    ExecutionContext::sequential(),
+)
+.map_err(|e| e.to_string())?;
+let peaks = &output[..count];
+
+// 独立な検算: 定義どおりに左右へ走査し、真に高い標本の手前までの最小値から突出度を求める。
+let prominence_by_scan = |peak: &Peak<f64>| {
+    let h = signal[peak.index()];
+    let left = signal[..peak.plateau_start()]
+        .iter()
+        .rev()
+        .take_while(|&&x| x <= h)
+        .fold(f64::INFINITY, |m, &x| m.min(x));
+    let right = signal[peak.plateau_end() + 1..]
+        .iter()
+        .take_while(|&&x| x <= h)
+        .fold(f64::INFINITY, |m, &x| m.min(x));
+    h - left.max(right)
+};
+let scan_gap = peaks
+    .iter()
+    .map(|p| (p.prominence() - prominence_by_scan(p)).abs())
+    .fold(0.0, f64::max);
+let indices: Vec<usize> = peaks.iter().map(|p| p.index()).collect();
+let properties =
+    peak_properties(&signal, &indices, relative_height).map_err(|e| e.to_string())?;
+let width_gap = peaks
+    .iter()
+    .zip(&properties)
+    .map(|(a, b)| (a.width() - b.width()).abs())
+    .fold(0.0, f64::max);
+
+let summary_columns = serde_json::json!([
+    { "key": "0", "label": "極大の総数 [個]", "type": "integer" },
+    { "key": "1", "label": "選んだピーク [個]", "type": "integer" },
+    { "key": "2", "label": "走査による突出度との最大差 [-]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "peak_properties の幅との最大差 [標本]", "type": "number", "format": sci3 }
+]);
+let all_maxima = scioxide_signal::find_peaks(&signal)
+    .map_err(|e| e.to_string())?
+    .len();
+emit_table_with_columns!(
+    summary_columns,
+    vec![(all_maxima, count, scan_gap, width_gap)],
+    metadata = serde_json::json!({ "id": "summary" })
+);
+let rows: Vec<(usize, f64, f64, f64, usize, usize)> = peaks
+    .iter()
+    .take(12)
+    .map(|p| {
+        (
+            p.index(),
+            signal[p.index()],
+            p.prominence(),
+            p.width(),
+            p.left_base(),
+            p.right_base(),
+        )
+    })
+    .collect();
+let columns = serde_json::json!([
+    { "key": "0", "label": "添字 [-]", "type": "integer" },
+    { "key": "1", "label": "高さ [-]", "type": "number", "format": fixed3 },
+    { "key": "2", "label": "突出度 [-]", "type": "number", "format": fixed3 },
+    { "key": "3", "label": "幅 [標本]", "type": "number", "format": fixed3 },
+    { "key": "4", "label": "左の谷 [-]", "type": "integer" },
+    { "key": "5", "label": "右の谷 [-]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "peaks" })
+);
+
+let line: Vec<[f64; 2]> = signal
+    .iter()
+    .enumerate()
+    .map(|(k, &v)| [k as f64, v])
+    .collect();
+let marks: Vec<[f64; 2]> = peaks
+    .iter()
+    .map(|p| [p.index() as f64, signal[p.index()]])
+    .collect();
+emit_chart!(serde_json::json!({
+    "kind": "xy",
+    "xLabel": "標本の添字 k [-]",
+    "yLabel": "信号 [-]",
+    "layers": [
+        { "id": "signal", "kind": "line", "name": "信号", "points": line },
+        {
+            "id": "peaks",
+            "kind": "scatter",
+            "name": "選んだピーク",
+            "points": marks,
+            "style": { "symbol": "triangle" }
+        }
+    ]
+}));
+```
+
+既定値（突出度の下限 0.3、間隔 10、$\rho = 0.5$、ノイズ 0.05、シード 5）では、極大は全部で 127 個あり、選別で添字 80、198、289 の 3 つの山だけが残る。
+定義どおりの走査による突出度との差も、`peak_properties` の幅との差も 0 である。
+幅の広い 2 つ目の山（中心 200、標準偏差 15）の幅は 34.6 標本で、Gauss 形の半値全幅 $2\sqrt{2\ln 2}\,\sigma \approx 35.3$ 標本に近い。
+突出度は 0.723 で、山の高さ 0.6 とは異なる。
+突出度は高い方の谷から測るので、基線の傾きとノイズの分だけ山の高さからずれる。
+ケース「選別なし」では 127 個の極大がすべてピークとして返り、ノイズによる極大の突出度は 0.01〜0.2 程度にとどまる。
+突出度の下限はノイズの大きさを目安に決め、最小間隔は山の幅より短くする。
+
+## 尺度をまたぐリッジ
+
+山の幅がさまざまでノイズも大きいとき、決まった突出度のしきい値で選ぶのは難しい。
+`RidgePlan` は、幅の異なる Ricker ウェーブレット（メキシカンハット）で信号を変換し、多くの尺度にまたがって続く極大の列（リッジ）だけをピークとみなす。
+
+尺度 $a$（標本単位）での係数は
+
+$$
+c_a[i] = \sum_{|k| \le R} \psi_a(k)\,x[i + k], \qquad
+\psi_a(t) = \frac{2}{\sqrt{3a}\,\pi^{1/4}} \left(1 - \frac{t^2}{a^2}\right) e^{-t^2/(2a^2)}
+$$
+
+である。
+$R$ は核の半幅（すべての尺度で共通）で、$\psi_a$ は単位 $L^2$ ノルムを持ち、記録の外の標本は端の標本を繰り返す。
+各尺度で、内部の正の極大（平坦部の中点）を求め、粗い尺度から細かい尺度へ向かってつなぐ。
+強い極大から順に、最大移動量以内にあって、この尺度でまだ延びておらず、飛ばした尺度の数が許容内の最も近いリッジに加える。
+同じ距離なら強いリッジ、次に添字の小さいリッジを選び、どのリッジにも加わらない極大は新しいリッジを始める。
+最小の長さ以上のリッジについて、最も細かい尺度での極大を `RidgePeak` として返す。
+同じ標本で終わるリッジが複数あれば、最も細かい尺度、次に最も長いものを返す。
+
+`RidgeOptions` は、核の半幅 `with_support_radius`（既定 10）、つなぐ極大の最大移動量 `with_max_distance`（既定 1）、飛ばしてよい尺度の数 `with_max_gap`（既定 0）、返す最小の長さ `with_min_length`（既定 1）、つなぐ係数の下限 `with_min_strength`（既定 0）を持つ。
+信号対雑音比の基準は持たないので、最小の強さと最小の長さで代える。
+`RidgePlan::new(scales, options)` は正で狭義に増加する尺度から $K(2R + 1)$ 個の核の値を準備する。
+尺度が空か増加していない場合、半幅が 0 の場合、最小の長さが 0 か尺度の数を超える場合、最小の強さが負の場合は `InvalidInput` を返す。
+
+`RidgeRequirements` は `workspace_requirements(max_input_len)` が返す必要量で、リッジの記録は $\lfloor n/2 \rfloor K$ 個である。
+`RidgeWorkspace` は `plan.workspace(max_input_len)` で準備し、`find_peaks_into` は実行中に広げない。
+標準形式の `find_peaks(input)` は作業領域と出力を確保し、標本の添字の順に `Vec<RidgePeak>` を返す。
+変換は $O(nKR)$、つなぐ処理は尺度ごとに極大と開いたリッジの数 $m$ に対して $O(m \log m)$ である。
+`RidgePeak` は、最も細かい尺度での添字 `index`、その尺度の番号 `scale_index`、つないだ極大の数 `length`、その尺度での係数 `strength` を持つ。
+
+次のセルは、幅の狭い山（標準偏差 3 標本、添字 100）と広い山（標準偏差 12 標本、添字 220）に正規ノイズを加えた 320 標本の信号に、尺度 $a_j = 1.2^j$（$j = 0, \dots, 15$、1〜15.4 標本）の `RidgePlan` を適用する。
+核の半幅は 40 標本、最大移動量は 2 標本、飛ばしてよい尺度は 1 つとし、係数の下限と最小の長さを入力で選ぶ。
+返した各ピークの係数を、セルの中で核を定義どおりに足し合わせて独立に計算し、`strength` と比べる。
+すべての極大を返す `find_peaks` の個数も並べる。
+
+```rust
+//| id: signal-ridge-peaks
+//| ref: signal-ridge-peaks
+//| title: Ricker ウェーブレットのリッジによるピークの検出
+//| run: reactive
+//| crates: [scioxide-core, scioxide-random, scioxide-signal]
+//| inputs:
+//|   noise_level: {"type":"range","label":"ノイズの標準偏差 [-]","description":"正規ノイズの大きさ。","min":0,"max":0.3,"step":0.05,"value":0.1}
+//|   min_strength: {"type":"range","label":"係数の下限 [-]","description":"これより小さい係数の極大はリッジにつながない。","min":0,"max":0.5,"step":0.05,"value":0.3}
+//|   min_length: {"type":"range","label":"最小の長さ [尺度]","description":"返すリッジがつなぐ極大の最小数。","min":1,"max":16,"step":1,"value":8}
+//|   seed: {"type":"range","label":"乱数のシード","description":"ノイズの実現値を選ぶ。","min":1,"max":20,"step":1,"value":2}
+//| cases:
+//|   - {"id":"short-ridges","label":"最小の長さ 1","description":"短いリッジを許すと、ノイズの極大もピークになる。","inputs":{"min_length":1}}
+//|   - {"id":"no-strength","label":"係数の下限 0","description":"弱い極大もつなぐと、ノイズのリッジが長く延びる。","inputs":{"min_strength":0}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"counts","path":"/rows/0/1","equals":2}
+//|       - {"artifact":"ridges","path":"/rows/0/0","approx":{"value":100,"atol":3}}
+//|       - {"artifact":"ridges","path":"/rows/1/0","approx":{"value":220,"atol":5}}
+//|       - {"artifact":"ridges","path":"/rows/0/5","range":{"max":1e-12}}
+//|       - {"artifact":"ridges","path":"/rows/1/5","range":{"max":1e-12}}
+//|   - case: short-ridges
+//|     expect:
+//|       - {"artifact":"counts","path":"/rows/0/1","range":{"min":3}}
+//|   - case: no-strength
+//|     expect:
+//|       - {"artifact":"counts","path":"/rows/0/1","range":{"min":5}}
+use scioxide_core::ExecutionContext;
+use scioxide_random::{Distribution, Normal, SeedableRng, SplitMix64};
+use scioxide_signal::{RidgeOptions, RidgePeak, RidgePlan, find_peaks};
+use std::f64::consts::PI;
+
+let fixed3 = serde_json::json!({ "fractionDigits": 3 });
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let n = 320_usize;
+let noise = Normal::new(0.0, noise_level.max(1e-12)).map_err(|e| e.to_string())?;
+let mut rng = SplitMix64::from_seed(seed as u64);
+let mut signal = Vec::with_capacity(n);
+for k in 0..n {
+    let t = k as f64;
+    // 2 つの Gauss 形の山（参照値。f64 の標準関数）。
+    let clean = (-0.5 * ((t - 100.0) / 3.0).powi(2)).exp()
+        + (-0.5 * ((t - 220.0) / 12.0).powi(2)).exp();
+    let e = if noise_level > 0.0 {
+        noise.sample(&mut rng).map_err(|e| e.to_string())?
+    } else {
+        0.0
+    };
+    signal.push(clean + e);
+}
+
+let scales: Vec<f64> = (0..16).map(|j| 1.2_f64.powi(j)).collect();
+let radius = 40_usize;
+let options = RidgeOptions::default()
+    .with_support_radius(radius)
+    .with_max_distance(2)
+    .with_max_gap(1)
+    .with_min_strength(min_strength)
+    .with_min_length(min_length.round() as usize);
+let plan = RidgePlan::new(&scales, options).map_err(|e| e.to_string())?;
+let mut workspace = plan.workspace(n).map_err(|e| e.to_string())?;
+let mut output = vec![RidgePeak::default(); n];
+let count = plan
+    .find_peaks_into(
+        &signal,
+        &mut output,
+        &mut workspace,
+        ExecutionContext::sequential(),
+    )
+    .map_err(|e| e.to_string())?;
+
+// 独立な検算: Ricker 核を定義どおりに足し合わせ、端を繰り返した係数を求める。
+let ricker = |a: f64, t: f64| {
+    2.0 / ((3.0 * a).sqrt() * PI.powf(0.25))
+        * (1.0 - (t / a).powi(2))
+        * (-t * t / (2.0 * a * a)).exp()
+};
+let coefficient = |a: f64, i: usize| {
+    (-(radius as isize)..=radius as isize)
+        .map(|k| {
+            let j = (i as isize + k).clamp(0, n as isize - 1) as usize;
+            ricker(a, k as f64) * signal[j]
+        })
+        .sum::<f64>()
+};
+let rows: Vec<(usize, usize, f64, usize, f64, f64)> = output[..count]
+    .iter()
+    .map(|p| {
+        let scale = scales[p.scale_index()];
+        let direct = coefficient(scale, p.index());
+        (
+            p.index(),
+            p.scale_index(),
+            scale,
+            p.length(),
+            p.strength(),
+            (p.strength() - direct).abs() / direct.abs(),
+        )
+    })
+    .collect();
+let columns = serde_json::json!([
+    { "key": "0", "label": "添字 [-]", "type": "integer" },
+    { "key": "1", "label": "尺度の番号 [-]", "type": "integer" },
+    { "key": "2", "label": "尺度 a [標本]", "type": "number", "format": fixed3 },
+    { "key": "3", "label": "長さ [尺度]", "type": "integer" },
+    { "key": "4", "label": "係数 [-]", "type": "number", "format": fixed3 },
+    { "key": "5", "label": "直接和との相対差 [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "ridges" })
+);
+let all_maxima = find_peaks(&signal).map_err(|e| e.to_string())?.len();
+let count_columns = serde_json::json!([
+    { "key": "0", "label": "find_peaks の極大 [個]", "type": "integer" },
+    { "key": "1", "label": "リッジのピーク [個]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    count_columns,
+    vec![(all_maxima, count)],
+    metadata = serde_json::json!({ "id": "counts" })
+);
+```
+
+既定値（ノイズ 0.1、係数の下限 0.3、最小の長さ 8、シード 2）では、`find_peaks` は 98 個の極大を返すが、リッジによる検出は 2 個のピークだけを返す。
+狭い山は添字 101（尺度 1.2、長さ 15）、広い山は添字 223（尺度 2.99、長さ 10）で見つかり、係数は直接和と $10^{-15}$ 以下の相対差で一致する。
+広い山は細かい尺度で係数が下限に届かないので、リッジは尺度 3 付近で止まり、そこでの極大の位置はノイズで数標本ずれる。
+ノイズによる係数の標準偏差は約 0.1 なので、下限 0.3 を超えるノイズの極大は少なく、長いリッジにならない。
+ケース「最小の長さ 1」では長さ 1 のリッジも示され、ピークは 3 個になる。
+ケース「係数の下限 0」では弱い極大もつながり、細かい尺度から延びるノイズのリッジが長さ 8 以上に育って、ピークは 23 個になる。
+係数の下限はノイズの大きさから、最小の長さは本物の山が現れる尺度の範囲から決める。
+
+## まとめ
+
+外れ値を含む信号では、まず中央値フィルタか Hampel フィルタで外れ値を除き、Hampel フィルタは置き換えた添字で判定を確かめられる。
+局所 Wiener フィルタは局所分散に応じて平均と入力を混ぜ、ノイズの分散は `estimate_wiener_noise` で推定できるが、信号の変化を含む大きめの値になる。
+ピークは突出度、幅、最小間隔で選び、幾何は選別の前に測られるので、`peak_properties` で特定のピークを同じ規約で測り直せる。
+幅の異なる山をノイズの中から拾うには、Ricker ウェーブレットのリッジの長さで選ぶ。
+平坦な頂部の規約と Hampel フィルタの逐次処理は[平滑化・ピーク・外れ値の検算](../../examples/smoothing-peaks-and-outliers/)で、ノイズを減らしてから特徴を測る平滑化は[平滑化とトレンド除去](../smoothing-and-detrending/)で確かめる。

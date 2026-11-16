@@ -1,0 +1,636 @@
+---
+title: ループとチェックポイント
+description: 漸化式で書いたループを逆モードで微分するときのメモリ使用量、ループを 1 つの呼び出し文として記録する checkpointed_loop と LoopBody、二項チェックポイント（revolve）の前進回数の公式と動的計画法による確認、CheckpointSchedule の作り方と visit の手順、普通のループとの勾配・ヘッセ行列・ベクトル積・メモリ使用量の比較。
+sidebar:
+  order: 355
+references:
+  ad-checkpointed-loop: "checkpointed_loop-と-loopbody"
+  ad-binomial-checkpoint-cost: "二項チェックポイントの前進回数"
+  ad-checkpoint-schedule: "checkpointschedule-の作り方と-visit"
+  ad-checkpointed-vs-plain-loop: "チェックポイント付きのループと普通のループ"
+---
+
+時間発展や反復法のループを逆モードで微分すると、各ステップの状態を逆の順に使うので、ステップ数に比例するメモリか、状態を作り直す再計算のどちらかが要る。
+このページはループの逆走査に要るメモリ使用量、ループを 1 つの文として記録する `checkpointed_loop`、再計算の手順を決める `CheckpointSchedule` と、二項チェックポイントの前進回数を扱う。
+テープ、文、走査の用語は[逆モードとテープ](../reverse-mode-and-replay/)で定義している。
+ループの中の分岐は[分岐・マスク・表引き](../control-flow/)の規則に従う。
+
+## ループの逆走査とメモリ使用量
+
+時間発展や反復法は、状態 $u_k$ を同じ形の写像で更新する漸化式
+
+$$
+u_{k+1} = \Phi_k(u_k, p), \qquad k = 0, 1, \dots, l - 1
+$$
+
+で書ける。
+$p$ は全ステップで共通のパラメータで、$l$ はステップ数である。
+スカラーの目的 $L = g(u_l)$ について、逆モードは状態の随伴 $\bar u_k = \partial L / \partial u_k$ を末尾から
+
+$$
+\bar u_k = \Bigl(\frac{\partial \Phi_k}{\partial u}(u_k, p)\Bigr)^{\!\top} \bar u_{k+1}, \qquad
+\bar p \leftarrow \bar p + \Bigl(\frac{\partial \Phi_k}{\partial p}(u_k, p)\Bigr)^{\!\top} \bar u_{k+1}
+$$
+
+の順に求める。
+$k = l - 1, \dots, 0$ のどの段でも状態 $u_k$ での局所ヤコビ行列が要るので、前進で通った状態を逆の順に取り出せなければならない。
+
+`Var` の上で Rust の普通のループを回すと、すべてのステップの文がテープに残る。
+これは全ステップの局所情報を保存する方法（全保存）で、テープの長さはステップ数と 1 ステップの文の数の積に比例する。
+もう 1 つの方法は一部の状態（スナップショット）だけを保存し、必要になったら近くのスナップショットから前進をやり直す方法（チェックポイント）で、メモリを前進の再計算と交換する。
+
+## `checkpointed_loop` と `LoopBody`
+
+`LoopBody<S>` は 1 ステップ $u \leftarrow \Phi_k(u, p)$ を、すべての数値型に対して一度だけ書くトレイトである。
+`step<R: Real<S>>(&self, index, state, parameters)` は `state` をその場で 1 ステップ進め、本体のエラーはそのまま返す。
+`index` はステップの番号 $k$ で、時刻に依存する外力などに使える。
+ステップごとに変わるデータは本体の構造体に持たせる。
+
+`checkpointed_loop(body, steps, state, parameters, schedule)` は `body` を `steps` 回適用して `state` を最終状態にする。
+`body` は `Arc<B>` で渡し、`B` には `Send + Sync + 'static` が要る（テープが `Arc` を保持するため）。
+`schedule.steps()` が `steps` と違えば `DimensionMismatch` を返す。
+スナップショットの大きさが `usize` に収まらなければ `SizeOverflow`、作業領域やテープが保持するスケジュールの写しを確保できなければ `AllocationFailure` を返し、`body` のエラーはそのまま返る。
+`schedule` には `CheckpointSchedule::binomial` か `CheckpointSchedule::explicit` で作ったスケジュールを使う（作り方は[`CheckpointSchedule` の作り方と `visit`](#checkpointschedule-の作り方と-visit)で述べる）。
+
+数値型ごとの動作は次のとおりである。
+
+- `f32`・`f64`、`Lanes`、`Dual`、`MultiDual`、`Jet` は状態の写し（長さ $n$ の作業領域）の上で普通のループを実行し、`schedule` を使わない。
+  成功したときだけ写しを `state` に書き戻すので、本体のエラーや確保の失敗では `state` のどの成分も変わらない。
+  `Dual` は前進モードの導関数をそのまま保持する。
+- `Var` では、値の上でループを実行し、初期状態とパラメータから最終状態への呼び出し文を 1 つ記録する。
+  微分対象の入力がなければ文を記録せず、最終状態を微分対象外の値で返す。
+  本体は値の上で動くので、本体の中の折れ点は外側のテープの `kinks()` に数えられず、`KinkPolicy::Error` でも検出されない。
+- 逆走査（pullback）は `schedule` の手順（`CheckpointSchedule::visit`）に従う。
+  状態の復元・前進・保存は値の上で行い、逆にたどる 1 ステップだけを内側のテープに記録して走査する。
+  メモリは $(\text{slots} + 1) \times n$ 個のスナップショット（$n$ は状態の長さ）と、1 ステップ分のテープである。
+- 接ベクトルの走査（pushforward、`Linearization::jvp_into` など）は、初期状態から `Dual` でループを実行する。
+- `Tape<Dual<f64>>` では逆走査が `Dual` の算術で行われるので、ループを通したヘッセ行列・ベクトル積も求まる。
+
+逆走査は記録したときと同じ値を再計算で作り直すので、`step` は同じ引数に同じ結果を返す決定論的な関数でなければならない。
+
+`checkpointed_loop` は `Var` 以外の型では呼び出しごとに状態の写しを、テープでは記録のたびに状態とパラメータの値の写しを確保し、逆走査のたびにスナップショット、制御領域、内側のテープを確保する。
+接ベクトルの走査も `Dual` の状態を確保する。
+同じ関数を記録した温まったテープでも、これらの確保は残る（[テープのライフサイクルと再利用](../tape-lifecycle/)が述べる、確保しない再利用の例外である）。
+
+## 二項チェックポイントの前進回数
+
+一様なステップの鎖を限られた数のスナップショットで逆にたどる問題を考える。
+仮定は次の 3 つである。
+
+1. どのステップも前進の計算コストが等しく、再開に要る状態の大きさも等しい。
+2. スナップショットは初期状態を含めて $c$ 個まで持て、ほかに作業用のフレームが 1 つある。
+3. ステップを逆にたどる直前に、その入力状態からそのステップを前進させて局所情報を作る。
+
+仮定 3 の前進を除いて各ステップを高々 $r$ 回前進させてよいとき、$c$ 個のスナップショットで逆にたどれるステップ数の最大値は
+
+$$
+\beta(c, r) = \binom{c + r}{c}
+$$
+
+である。
+$r$ を反復数（repetition number）と呼ぶ。
+$\beta(c, r - 1) < l \le \beta(c, r)$ となる $r$ について、仮定 3 の前進を除いた前進回数の最小値は
+
+$$
+t(l, c) = r\,l - \beta(c + 1, r - 1) = r\,l - \binom{c + r}{c + 1}
+$$
+
+である（Griewank と Walther の revolve）。
+
+最小を与えるスケジュールは、最初のスナップショットを置く位置 $k$ で鎖を 2 つに分け、後半を $c - 1$ 個、前半を $c$ 個のスナップショットで再帰的に逆にたどる。
+したがって前進回数の最小値 $T(n, s)$（$s$ はスナップショットのスロット数）は、動的計画法
+
+$$
+T(n, s) = \min_{1 \le k < n} \bigl\{ k + T(k, s) + T(n - k, s - 1) \bigr\}, \qquad
+T(n, 0) = \frac{n(n + 1)}{2}, \quad T(1, s) = 1
+$$
+
+でも求まる。
+$T$ は仮定 3 の前進を含む回数で、$t(l, c) + l$ に等しい。
+$c = 1$（初期状態だけ）では $r = l - 1$ で、$t + l = (l - 1)l - \binom{l}{2} + l = l(l + 1)/2$ になり、ステップ $i$ を逆にたどるたびに初期状態から $i + 1$ ステップ前進する和と一致する。
+
+$c$ を増やすと $r$ は急に小さくなる。
+$\beta(c, c) = \binom{2c}{c}$ はおおよそ $4^c / \sqrt{\pi c}$ で増えるので、$c$ と $r$ をどちらも $\log l$ 程度に取れる。
+$l = 10^6$ でも $c = 12$ なら $r = 11$ で、前進回数は $t + l = 12\,l - \binom{23}{13} \approx 10.86\,l$ である。
+
+## `CheckpointSchedule` の作り方と `visit`
+
+`CheckpointSchedule::binomial(steps, slots)` は仮定 1〜3 のもとで前進回数を最小にする二項スケジュールを作る。
+`slots` は初期状態と作業フレームを除いたスナップショットの数で、$c = \text{slots} + 1$ である。
+`steps` − 1 を超える `slots` は使えないので `steps` − 1 に切り詰められ、`checkpoint_slots()` は切り詰めた値を返す。
+ただし `slots` が 64 を超えると、切り詰める前に `InvalidInput`（引数 `slots`、`OutOfRange`）を返す。
+前進回数が `usize` に収まらなければ `SizeOverflow` を返す。
+
+`CheckpointSchedule::explicit(steps, boundaries)` は、呼び出し側が選んだステップの境界にスナップショットを置く。
+`boundaries` は 0 から始まり、狭義に増加し、`steps` 未満でなければならない（`steps = 0` では `[0]`）。
+違反すると `InvalidInput`（引数 `boundaries`、`Inconsistent`）を返す。
+各ステップはそれ以前の最も近い境界から復元し、そのステップまで前進してから逆にたどる。
+したがって長さ $m$ の区間は $m(m + 1)/2$ 回の前進を要し、その合計を `forward_steps()` が返す。
+前進の回数に上限を設けたい呼び出し側は、この値を自分の上限と比べる。
+境界の状態は `visit` を使う側が保存しておく。
+`explicit` の `visit` は `Save` を出さない。
+
+`checkpointed_loop` は、`explicit` のスケジュールを受け取ると、逆走査の初めに初期状態から最後の境界まで前進して各境界の状態を保存し、それから `visit` の手順をたどる。
+そのため前進の回数は `forward_steps()` に最後の境界までの `boundaries.last()` 回を加えた数になる。
+境界が `[0]` だけの `explicit` は、`binomial(steps, 0)` と同じく初期状態だけから前進し直す手順になる。
+
+スケジュールは次の値を返す。
+
+- `forward_steps()` は鎖全体を逆にたどる前進の回数で、二項スケジュールでは $t(l, c) + l = (r + 1)\,l - \binom{c + r}{c + 1}$ である。
+  関数を記録するときに値の上でループを実行する分（新しいテープでは関数を 2 回実行するので 2 回分）は含まない。
+- `forward_steps_for(realized_steps)` は最初の `realized_steps` ステップだけを逆にたどるときの前進の回数である。
+  `realized_steps` が `steps()` を超えると `InvalidInput`（`OutOfRange`）を返す。
+- `steps()`、`checkpoint_slots()`、`boundaries()`（二項スケジュールでは `None`）は作ったときの値を返す。
+- `control_slots()` は `visit` に渡す制御領域の長さで、$5(\min(\text{slots}, 64) + 1)$ ワードである。
+
+`visit(realized_steps, control, visitor)` は、逆にたどる手順を `CheckpointAction` として 1 つずつ `visitor` に渡す。
+`control` は長さ `control_slots()` 以上の `u64` の作業領域で、短ければ `DimensionMismatch` を返す。
+`realized_steps` が `steps()` を超えると、最初の手順を渡す前に `InvalidInput`（`OutOfRange`）を返す。
+手順は再帰も確保もせずに作られ、ステップは最後から最初へ逆にたどられる。
+`visitor` のエラーはそのまま返る。
+
+`CheckpointAction` は次の 4 種類である。
+
+| 列挙子 | 意味 |
+|---|---|
+| `Restore { slot, step }` | スロット `slot`（0 は初期状態）の状態を、境界 `step` の状態として復元する |
+| `Advance { start, end }` | 状態を半開区間 `start..end` のステップだけ前進させる |
+| `Save { slot, step }` | 境界 `step` まで進んだ現在の状態をスロット `slot` に保存する |
+| `Reverse { step }` | 直前に前進させたステップ `step` を逆にたどる |
+
+次のセルはステップ数 $l$ について、`slots` を 0 から 16 まで変えた二項スケジュールの前進回数を、3 つの独立な方法と比べる。
+1 つ目は `visit` が渡す `Advance` の区間の長さの合計、2 つ目は上の閉形式（`u128` の整数演算）、3 つ目は動的計画法 $T(l, s)$（$s \le 8$）である。
+比較のため、同じ数のスナップショットを等間隔に置いた `explicit` の `forward_steps()` も並べる。
+この列は境界の状態を保存する前進を含まない。
+グラフはスナップショットの数 $c = 1, \dots, 32$ について、1 ステップあたりの前進回数 $\text{forward\_steps}/l$ を対数軸に描く。
+
+```rust
+//| id: ad-binomial-checkpoint
+//| ref: ad-binomial-checkpoint
+//| title: 二項チェックポイントの前進回数を閉形式と動的計画法で確かめる
+//| run: reactive
+//| crates: [scioxide-ad, scioxide-core]
+//| inputs:
+//|   total_steps: {"type":"range","label":"ステップ数 l","description":"逆にたどるループのステップ数。","min":2,"max":400,"step":1,"value":64}
+//| cases:
+//|   - {"id":"long","label":"l = 400","description":"等間隔の explicit と二項スケジュールの差が広がる。","inputs":{"total_steps":400}}
+//|   - {"id":"short","label":"l = 3","description":"slots は l − 1 = 2 に切り詰められる。","inputs":{"total_steps":3}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"schedules","path":"/rows/0/4","equals":2080}
+//|       - {"artifact":"schedules","path":"/rows/2/4","equals":322}
+//|       - {"artifact":"schedules","path":"/rows/5/4","equals":211}
+//|       - {"artifact":"schedules","path":"/rows/5/5","equals":211}
+//|       - {"artifact":"schedules","path":"/rows/5/6","equals":211}
+//|       - {"artifact":"schedules","path":"/rows/5/7","equals":211}
+//|       - {"artifact":"schedules","path":"/rows/2/8","equals":715}
+//|   - case: long
+//|     expect:
+//|       - {"artifact":"schedules","path":"/rows/0/4","equals":80200}
+//|       - {"artifact":"schedules","path":"/rows/6/6","equals":1714}
+//|       - {"artifact":"schedules","path":"/rows/6/7","equals":1714}
+//|       - {"artifact":"schedules","path":"/rows/6/8","equals":9090}
+//|   - case: short
+//|     expect:
+//|       - {"artifact":"schedules","path":"/rows/7/1","equals":2}
+//|       - {"artifact":"schedules","path":"/rows/7/4","equals":5}
+//|       - {"artifact":"schedules","path":"/rows/7/8","equals":3}
+use scioxide_ad::{CheckpointAction, CheckpointSchedule};
+use scioxide_core::SciOxideError;
+
+let l = total_steps as usize;
+// 独立検算 1: Griewank–Walther の閉形式。C(n, i+1) = C(n, i)(n − i)/(i + 1) は割り切れる。
+let binom = |n: u128, k: u128| (0..k).fold(1_u128, |b, i| b * (n - i) / (i + 1));
+let closed = |c: u128| {
+    let r = (0_u128..)
+        .find(|&r| binom(c + r, c) >= l as u128)
+        .unwrap_or(0);
+    (r, (r + 1) * l as u128 - binom(c + r, c + 1))
+};
+// 独立検算 2: 最初のスナップショットの位置 k についての動的計画法 T(n, s)。
+const MAX_DP: usize = 8;
+let mut best = vec![[0_usize; MAX_DP + 1]; l + 1];
+for n in 1..=l {
+    best[n][0] = n * (n + 1) / 2;
+    for s in 1..=MAX_DP {
+        best[n][s] = (1..n)
+            .map(|k| k + best[k][s] + best[n - k][s - 1])
+            .min()
+            .unwrap_or(1);
+    }
+}
+// 境界を c 個、等間隔に置いた explicit の前進回数。
+let uniform = |c: usize| -> Result<usize, SciOxideError> {
+    let boundaries: Vec<usize> = (0..c).map(|i| i * l / c).collect();
+    Ok(CheckpointSchedule::explicit(l, &boundaries)?.forward_steps())
+};
+let mut rows = Vec::new();
+for slots in [0, 1, 2, 3, 4, 6, 8, 16] {
+    let schedule = CheckpointSchedule::binomial(l, slots).map_err(|e| e.to_string())?;
+    let used = schedule.checkpoint_slots();
+    // visit が渡す Advance の区間の長さを数える。
+    let mut control = vec![0_u64; schedule.control_slots()];
+    let mut advanced = 0;
+    schedule
+        .visit(l, &mut control, |action| {
+            if let CheckpointAction::Advance { start, end } = action {
+                advanced += end - start;
+            }
+            Ok(())
+        })
+        .map_err(|e| e.to_string())?;
+    let (r, formula) = closed(used as u128 + 1);
+    let dp = (slots <= MAX_DP).then(|| best[l][slots]);
+    let explicit = uniform(used + 1).map_err(|e| e.to_string())?;
+    let forward = schedule.forward_steps();
+    rows.push((
+        slots,
+        used,
+        used + 1,
+        r as u64,
+        forward,
+        advanced,
+        formula as u64,
+        dp,
+        explicit,
+    ));
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "要求した slots", "type": "integer" },
+    { "key": "1", "label": "使う slots", "type": "integer" },
+    { "key": "2", "label": "スナップショット c", "type": "integer" },
+    { "key": "3", "label": "反復数 r", "type": "integer" },
+    { "key": "4", "label": "forward_steps() [回]", "type": "integer" },
+    { "key": "5", "label": "visit の Advance の合計 [回]", "type": "integer" },
+    { "key": "6", "label": "閉形式 (r+1)l − C(c+r, c+1) [回]", "type": "integer" },
+    { "key": "7", "label": "動的計画法 T(l, s) [回]", "type": "integer", "nullText": "s > 8 は省略" },
+    { "key": "8", "label": "等間隔の explicit の forward_steps() [回]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "schedules" })
+);
+
+// スナップショットの数 c ごとの 1 ステップあたりの前進回数。
+let (mut binomial_curve, mut explicit_curve) = (Vec::new(), Vec::new());
+for c in 1..=32.min(l) {
+    let forward = CheckpointSchedule::binomial(l, c - 1)
+        .map_err(|e| e.to_string())?
+        .forward_steps();
+    binomial_curve.push([c as f64, forward as f64 / l as f64]);
+    let explicit = uniform(c).map_err(|e| e.to_string())?;
+    explicit_curve.push([c as f64, explicit as f64 / l as f64]);
+}
+emit_line_chart!(
+    &vec![
+        serde_json::json!({
+            "name": "binomial",
+            "points": binomial_curve,
+            "style": { "showSymbol": true }
+        }),
+        serde_json::json!({
+            "name": "等間隔の explicit",
+            "points": explicit_curve,
+            "style": { "lineType": "dashed" }
+        })
+    ],
+    options = &serde_json::json!({
+        "xLabel": "スナップショットの数 c（初期状態を含む）",
+        "yLabel": "1 ステップあたりの前進回数 [回]",
+        "yType": "log"
+    })
+);
+```
+
+既定の $l = 64$ では、どの行でも `forward_steps()`、`visit` の `Advance` の合計、閉形式、動的計画法の最小値が一致する。
+初期状態だけ（$c = 1$）では $l(l + 1)/2 = 2080$ 回で、$c = 3$ で 322 回、$c = 7$ で 211 回、$c = 17$ で 173 回に下がる。
+$c = 17$ の反復数は $r = 2$ で、1 ステップあたりの前進は 2.7 回である。
+グラフの二項スケジュールの曲線は、$c = 1$ の $(l + 1)/2 = 32.5$ 回から $c = 10$ で 2.8 回まで急に下がり、その先はゆっくり減る。
+
+等間隔の `explicit` の列は、境界の状態を保存する前進を含まない前進回数である。
+長さ $l/c$ の区間ごとに 2 次の計算コストがかかるので、$c$ が小さいうちは二項スケジュールより大きい（$c = 3$ で 715 回と 322 回）。
+二項スケジュールの回数は初期状態からスナップショットの位置まで進む前進も含む。
+そのため $c$ が $l$ に近づくと、`explicit` の `forward_steps()` のほうが小さくなる（$c = 17$ で 154 回と 173 回）。
+`checkpointed_loop` で使うときは、これに境界を保存する前進（$c = 17$ では最後の境界 60 までの 60 回）が加わる。
+等間隔の `explicit` の 1 ステップあたりの前進回数はおおよそ $(l/c + 1)/2$ で、$c$ に反比例して下がる。
+
+$l = 400$ では差が広がり、$c = 9$ で二項スケジュールが 1714 回（$r = 4$）、等間隔の `explicit` が 9090 回である。
+$l = 3$ では `slots` が $l - 1 = 2$ に切り詰められ、`slots` が 2 以上の行はすべて $c = 3$、$(l - 1) + l = 5$ 回になる。
+
+## チェックポイント付きのループと普通のループ
+
+次の 2 つのセルはロジスティック方程式 $\dot y = r y (1 - y)$ を区間 $[0, 10]$ で陽的 Euler 法
+
+$$
+y_{k+1} = y_k + \Delta t\, r\, y_k (1 - y_k), \qquad \Delta t = 10/N
+$$
+
+で $N$ ステップ進め、$y_0 = 0.1$、$r = 0.8$ での最終値 $y_N$ を微分する。
+次の定義は 1 ステップの `LoopBody` と、点 $(y_0, r)$ から $y_N$ を普通のループか `checkpointed_loop` で求める `final_value` を与える。
+
+```rust
+//| id: ad-logistic-euler-model
+//| kind: definitions
+//| title: ロジスティック方程式の陽的 Euler 法のループ
+//| crates: [scioxide-ad, scioxide-core]
+use scioxide_ad::{CheckpointSchedule, LoopBody, Real, checkpointed_loop};
+use scioxide_core::SciOxideError;
+use std::sync::Arc;
+
+/// ẏ = r·y·(1 − y) の陽的 Euler 法の 1 ステップ。状態は [y]、パラメータは [r]。
+pub(crate) struct Logistic {
+    pub(crate) dt: f64,
+}
+
+impl LoopBody for Logistic {
+    fn step<R: Real>(
+        &self,
+        _: usize,
+        state: &mut [R],
+        parameters: &[R],
+    ) -> Result<(), SciOxideError> {
+        let y = state[0];
+        state[0] = y + parameters[0] * y * (-y + 1.0) * self.dt;
+        Ok(())
+    }
+}
+
+/// 点 x = [y₀, r] から steps ステップ後の y_N。
+/// schedule があれば checkpointed_loop、なければ普通のループで進める。
+pub(crate) fn final_value<R: Real>(
+    body: &Arc<Logistic>,
+    steps: usize,
+    x: &[R],
+    schedule: Option<&CheckpointSchedule>,
+) -> Result<R, SciOxideError> {
+    let mut y = [x[0]];
+    match schedule {
+        Some(schedule) => checkpointed_loop(body, steps, &mut y, &x[1..], schedule)?,
+        None => (0..steps).try_for_each(|k| body.step(k, &mut y, &x[1..]))?,
+    }
+    Ok(y[0])
+}
+```
+
+1 つ目のセルは勾配 $(\partial y_N / \partial y_0, \partial y_N / \partial r)$ を、テープの上の普通のループ、`checkpointed_loop`（`binomial(N, s)`）、前進モードの `MultiDual<f64, 2>` で求める。
+`MultiDual` は `checkpointed_loop` の中で普通のループを実行するので、テープとは独立な検算になる。
+1 つ目の表は勾配、外側のテープのワードの数と事前確保したバイト数、逆走査の前進回数（`forward_steps()`）を示し、2 つ目の表は普通のループのテープとの最大相対差を示す。
+
+```rust
+//| id: ad-checkpointed-logistic
+//| ref: ad-checkpointed-logistic
+//| title: ロジスティック方程式の Euler 法の勾配をチェックポイント付きのループで求める
+//| run: reactive
+//| uses: [ad-logistic-euler-model]
+//| crates: [scioxide-ad, scioxide-core]
+//| inputs:
+//|   steps: {"type":"range","label":"ステップ数 N","description":"区間 [0, 10] を N 等分する陽的 Euler 法のステップ数。","min":10,"max":2000,"step":10,"value":1000}
+//|   slots: {"type":"range","label":"スロット数 s","description":"CheckpointSchedule::binomial(N, s) の s（初期状態を除くスナップショットの数）。","min":0,"max":16,"step":1,"value":4}
+//| cases:
+//|   - {"id":"no-slots","label":"s = 0","description":"初期状態だけから前進し直すので、前進回数は N(N + 1)/2 になる。","inputs":{"slots":0}}
+//|   - {"id":"short","label":"N = 50、s = 16","description":"使えるスロットは多く、前進回数は 2N に近づく。","inputs":{"steps":50,"slots":16}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/1/1","approx":{"value":0.03313161610555647,"rtol":1e-12}}
+//|       - {"artifact":"methods","path":"/rows/1/2","approx":{"value":0.02977426183409466,"rtol":1e-12}}
+//|       - {"artifact":"methods","path":"/rows/0/3","equals":5003}
+//|       - {"artifact":"methods","path":"/rows/1/3","equals":8}
+//|       - {"artifact":"methods","path":"/rows/1/5","equals":7284}
+//|       - {"artifact":"agreement","path":"/rows/0/1","range":{"max":1e-14}}
+//|       - {"artifact":"agreement","path":"/rows/1/1","range":{"max":1e-13}}
+//|   - case: no-slots
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/1/5","equals":500500}
+//|       - {"artifact":"agreement","path":"/rows/0/1","range":{"max":1e-14}}
+//|   - case: short
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/0/3","equals":253}
+//|       - {"artifact":"methods","path":"/rows/1/5","equals":131}
+//|       - {"artifact":"agreement","path":"/rows/0/1","range":{"max":1e-14}}
+use scioxide_ad::{CheckpointSchedule, MultiDual, Tape, TapeOptions};
+use scioxide_core::ExecutionContext;
+use std::sync::Arc;
+
+let n = steps as usize;
+let body = Arc::new(Logistic {
+    dt: 10.0 / n as f64,
+});
+let schedule = CheckpointSchedule::binomial(n, slots as usize).map_err(|e| e.to_string())?;
+let cx = ExecutionContext::sequential();
+let point = [0.1, 0.8]; // [y₀, r]
+let mut rows = Vec::new();
+let mut gradients = Vec::new();
+for checkpoint in [None, Some(&schedule)] {
+    // 普通のループはすべてのステップの文を外側のテープに残す。
+    let mut tape = Tape::<f64>::new(TapeOptions::new());
+    let mut gradient = [0.0; 2];
+    tape.gradient_into(
+        |x| final_value(&body, n, x, checkpoint),
+        &point,
+        &mut gradient,
+        cx,
+    )
+    .map_err(|e| e.to_string())?;
+    let report = tape.report();
+    let name = match checkpoint {
+        Some(_) => "checkpointed_loop（Tape<f64>）",
+        None => "普通のループ（Tape<f64>）",
+    };
+    rows.push((
+        name,
+        gradient[0],
+        gradient[1],
+        Some(report.words()),
+        Some(report.reserved_bytes()),
+        checkpoint.map(|s| s.forward_steps()),
+    ));
+    gradients.push(gradient);
+}
+// 独立検算: MultiDual は checkpointed_loop の中で普通のループを実行する。
+let seeded = [
+    MultiDual::new(point[0], [1.0, 0.0]),
+    MultiDual::new(point[1], [0.0, 1.0]),
+];
+let tangent = final_value(&body, n, &seeded, Some(&schedule))
+    .map_err(|e| e.to_string())?
+    .gradient();
+rows.push((
+    "checkpointed_loop（MultiDual<f64, 2>）",
+    tangent[0],
+    tangent[1],
+    None,
+    None,
+    None,
+));
+let sci6 = serde_json::json!({ "notation": "scientific", "significantDigits": 6 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "方式" },
+    { "key": "1", "label": "∂y_N/∂y₀ [-]", "type": "number", "format": sci6 },
+    { "key": "2", "label": "∂y_N/∂r [-]", "type": "number", "format": sci6 },
+    { "key": "3", "label": "テープのワードの数 [ワード]", "type": "integer", "nullText": "テープなし" },
+    { "key": "4", "label": "事前確保したバイト数 [B]", "type": "integer", "nullText": "テープなし" },
+    { "key": "5", "label": "逆走査の前進回数 [回]", "type": "integer", "nullText": "なし" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "methods" })
+);
+
+// 普通のループのテープを基準にした最大相対差。
+let plain = gradients[0];
+let gap = |g: [f64; 2]| {
+    (0..2)
+        .map(|i| (g[i] - plain[i]).abs() / plain[i].abs())
+        .fold(0.0, f64::max)
+};
+let agreement = vec![
+    ("checkpointed_loop（Tape<f64>）", gap(gradients[1])),
+    ("checkpointed_loop（MultiDual<f64, 2>）", gap(tangent)),
+];
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let agreement_columns = serde_json::json!([
+    { "key": "0", "label": "方式" },
+    { "key": "1", "label": "普通のループとの最大相対差 [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    agreement_columns,
+    agreement,
+    metadata = serde_json::json!({ "id": "agreement" })
+);
+```
+
+既定の $N = 1000$、$s = 4$ では、`checkpointed_loop` の勾配が普通のループと同じビットになった（相対差 0）。
+この例では 1 ステップの中でパラメータ $r$ を 1 回しか使わないので、随伴を足す順序も普通のループと同じになる。
+一般には足す順序が違いうるので、丸めの範囲での一致と考える。
+`MultiDual` の勾配との相対差は $2.0 \times 10^{-15}$ である。
+
+外側のテープのワードの数は、普通のループが 5003 ワード（1 ステップ 5 ワード）、`checkpointed_loop` が 8 ワードである。
+8 ワードは定数と 2 つの入力のワード、呼び出し文の見出しと 2 つの引数と見出しの写し、最終状態の出力のワードである。
+事前確保したバイト数は 120180 B と 404 B で、逆走査の内側のテープはそのたびに作るので、この列には含まれない。
+その代わりに、逆走査は値の上で 7284 回（$7.3N$）のステップを前進し直す。
+$c = 5$、$r = 8$ で、閉形式 $9N - \binom{13}{6} = 7284$ と一致する。
+
+$s = 0$ にすると前進回数は $N(N + 1)/2 = 500500$ になり、勾配は変わらない。
+$N = 50$、$s = 16$ では前進回数は 131 回（$2.6N$）で、普通のループの 253 ワードのテープに対して 8 ワードで済む。
+
+2 つ目のセルは `Tape<Dual<f64>>` に $(y_0, r)$ と $r$ 方向の接ベクトル $(0, 1)$ を与え、勾配の $r$ 方向の微分、すなわちヘッセ行列・ベクトル積 $(\partial^2 y_N / \partial y_0 \partial r, \partial^2 y_N / \partial r^2)$ を普通のループと `checkpointed_loop` で求める。
+独立な検算はテープを使わない前進の上の前進 `Dual<Dual<f64>>` で、内側の方向を $y_0$ か $r$、外側の方向を $r$ にした 2 回の評価である。
+表は 2 つの成分、外側のテープのワードの数、`Dual<Dual<f64>>` の行を基準にした 2 つの成分の最大相対差を示す。
+
+```rust
+//| id: ad-checkpointed-logistic-hvp
+//| ref: ad-checkpointed-logistic-hvp
+//| title: チェックポイント付きのループを通したヘッセ行列・ベクトル積
+//| run: reactive
+//| uses: [ad-logistic-euler-model]
+//| crates: [scioxide-ad, scioxide-core]
+//| inputs:
+//|   steps: {"type":"range","label":"ステップ数 N","description":"区間 [0, 10] を N 等分する陽的 Euler 法のステップ数。","min":10,"max":2000,"step":10,"value":1000}
+//|   slots: {"type":"range","label":"スロット数 s","description":"CheckpointSchedule::binomial(N, s) の s（初期状態を除くスナップショットの数）。","min":0,"max":16,"step":1,"value":4}
+//| cases:
+//|   - {"id":"short","label":"N = 50、s = 16","description":"ステップが少なく、2 階の導関数の大きさも変わる。","inputs":{"steps":50,"slots":16}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"products","path":"/rows/1/2","approx":{"value":-0.29736070186236746,"rtol":1e-12}}
+//|       - {"artifact":"products","path":"/rows/0/3","equals":5003}
+//|       - {"artifact":"products","path":"/rows/1/3","equals":8}
+//|       - {"artifact":"products","path":"/rows/0/4","range":{"max":1e-12}}
+//|       - {"artifact":"products","path":"/rows/1/4","range":{"max":1e-12}}
+//|   - case: short
+//|     expect:
+//|       - {"artifact":"products","path":"/rows/1/2","approx":{"value":-0.27702146777241593,"rtol":1e-12}}
+//|       - {"artifact":"products","path":"/rows/1/4","range":{"max":1e-12}}
+use scioxide_ad::{CheckpointSchedule, Dual, Tape, TapeOptions, Var};
+use scioxide_core::ExecutionContext;
+use std::sync::Arc;
+
+let n = steps as usize;
+let body = Arc::new(Logistic {
+    dt: 10.0 / n as f64,
+});
+let schedule = CheckpointSchedule::binomial(n, slots as usize).map_err(|e| e.to_string())?;
+let cx = ExecutionContext::sequential();
+let point = [0.1, 0.8]; // [y₀, r]
+
+// 独立検算: Dual<Dual<f64>> の内側の方向を y₀ か r、外側の方向を r にする。
+let nested = |inner: usize| -> Result<f64, String> {
+    let x: Vec<Dual<Dual<f64>>> = (0..2)
+        .map(|i| {
+            let tangent = if i == inner { 1.0 } else { 0.0 };
+            let outer = if i == 1 { 1.0 } else { 0.0 };
+            Dual::new(Dual::new(point[i], tangent), Dual::new(outer, 0.0))
+        })
+        .collect();
+    let y = final_value(&body, n, &x, None).map_err(|e| e.to_string())?;
+    Ok(y.derivative().derivative())
+};
+let reference = [nested(0)?, nested(1)?];
+
+let mut rows = Vec::new();
+for checkpoint in [None, Some(&schedule)] {
+    // r 方向の接ベクトル (0, 1) をシードにしたテープの勾配の微分部分が H·(0, 1)。
+    let mut tape = Tape::<Dual<f64>>::new(TapeOptions::new());
+    let mut product = [Dual::new(0.0, 0.0); 2];
+    tape.gradient_into(
+        |x: &[Var<'_, Dual<f64>>]| final_value(&body, n, x, checkpoint),
+        &[Dual::new(point[0], 0.0), Dual::new(point[1], 1.0)],
+        &mut product,
+        cx,
+    )
+    .map_err(|e| e.to_string())?;
+    let hv = [product[0].derivative(), product[1].derivative()];
+    let gap = (0..2)
+        .map(|i| (hv[i] - reference[i]).abs() / reference[i].abs())
+        .fold(0.0, f64::max);
+    let name = match checkpoint {
+        Some(_) => "checkpointed_loop（Tape<Dual<f64>>）",
+        None => "普通のループ（Tape<Dual<f64>>）",
+    };
+    rows.push((name, hv[0], hv[1], Some(tape.report().words()), Some(gap)));
+}
+rows.push((
+    "前進の上の前進（Dual<Dual<f64>>）",
+    reference[0],
+    reference[1],
+    None,
+    None,
+));
+let sci6 = serde_json::json!({ "notation": "scientific", "significantDigits": 6 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "方式" },
+    { "key": "1", "label": "∂²y_N/∂y₀∂r [-]", "type": "number", "format": sci6 },
+    { "key": "2", "label": "∂²y_N/∂r² [-]", "type": "number", "format": sci6 },
+    { "key": "3", "label": "テープのワードの数 [ワード]", "type": "integer", "nullText": "テープなし" },
+    { "key": "4", "label": "相対差 [-]", "type": "number", "format": sci2, "nullText": "基準の行" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "products" })
+);
+```
+
+既定の $N = 1000$、$s = 4$ では、`checkpointed_loop` のヘッセ行列・ベクトル積 $(-0.330925, -0.297361)$ は普通のループと同じビットで、`Dual<Dual<f64>>` との最大相対差は $1.9 \times 10^{-15}$ である。
+外側のテープのワードの数は 1 階のときと同じ 5003 ワードと 8 ワードで、`Tape<Dual<f64>>` でも `checkpointed_loop` は呼び出し文 1 つで済む。
+$N = 50$、$s = 16$ では $(-0.316257, -0.277021)$ で、最大相対差は $5.3 \times 10^{-16}$ である。
+
+## まとめ
+
+長いループを `Var` で微分するときは、全保存の普通のループと、メモリをスナップショットと 1 ステップのテープに抑える `checkpointed_loop` を、`forward_steps()` が示す再計算の量で比べて選ぶ。
+二項スケジュールの前進回数は Griewank–Walther の最小値に 1 ステップ 1 回の前進を足した $(r + 1)\,l - \binom{c + r}{c + 1}$ で、スナップショットを数個増やすだけで $l(l + 1)/2$ から数 $l$ に下がる。
+`checkpointed_loop` の勾配は普通のループと丸めの範囲で一致し、`Tape<Dual<f64>>` ではループを通したヘッセ行列・ベクトル積も求まる。
+区間の分け方を呼び出し側で決めたいときは `explicit` を渡せる。
+その前進回数は `forward_steps()` に最後の境界までの前進を加えた数である。
+`checkpointed_loop` は記録と走査のたびに作業領域を確保するので、確保のない繰り返しが要る場面では普通のループと比べて選ぶ。
+
+## 次に読むページ
+
+- [折れ点と非有限値の扱い](../nonsmooth-and-nonfinite-policies/)：ループの中の `abs`・`max` が中点を返す規約と、普通のループで `KinkPolicy` が折れ点を検出する仕組みを確かめる。
+- [陰関数の微分](../implicit-functions/)：反復の履歴を記録せずに、解の感度を陰関数定理で求める方法を確かめる。
+- [テープのライフサイクルと再利用](../tape-lifecycle/)：外側のテープの容量と、確保しない再利用の条件を確かめる。

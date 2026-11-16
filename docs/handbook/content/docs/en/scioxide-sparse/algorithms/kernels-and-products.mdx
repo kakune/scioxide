@@ -1,0 +1,408 @@
+---
+title: "Matrix–vector and sparse matrix products"
+description: "Sparse matrix–vector algorithms and complexity, transpose and adjoint products, Standard and Exact rounding contracts and error bounds, sparse–dense products, symbolic and numeric phases of Gustavson-style sparse matrix multiplication (SpGEMM), and Plan reuse."
+sidebar:
+  order: 310
+references:
+  sparse-matrix-vector-product: "sparse-matrixvector-multiplication"
+  sparse-product-rounding: "rounding-contracts-and-error-bounds"
+  sparse-sparse-dense-product: "sparsedense-matrix-multiplication"
+  sparse-spgemm-phases: "symbolic-and-numeric-phases"
+  sparse-transpose-adjoint-product: "transpose-and-adjoint-products"
+  sparse-walk-count-experiment: "counting-walks-on-a-cycle-graph"
+---
+
+Krylov subspace methods compute $\mathbf{y} = \mathbf{A}\mathbf{x}$ at every iteration, and multigrid coarse-grid operators are built by the sparse matrix product $\mathbf{P}^{\mathsf{T}}\mathbf{A}\mathbf{P}$.
+Many sparse computations spend most of their time on these two kinds of products.
+This page explains sparse matrix–vector multiplication (SpMV), its algorithm and complexity, transpose and adjoint products, rounding contracts and error bounds, and sparse–dense multiplication.
+It then explains why and how sparse matrix–matrix multiplication (SpGEMM) separates symbolic and numeric phases.
+
+## Sparse matrix–vector multiplication
+
+For an $m \times n$ matrix $\mathbf{A}$ in CSR format, entry $i$ of $\mathbf{y} = \mathbf{A}\mathbf{x}$ sums only the stored entries of row $i$.
+
+$$
+y_i = \sum_{k = \mathrm{row\_ptr}[i]}^{\mathrm{row\_ptr}[i+1] - 1} a_k \, x_{c_k}, \qquad a_k = \mathrm{values}[k], \quad c_k = \mathrm{col\_indices}[k]
+$$
+
+Rows are independent, so the algorithm is a nested loop over rows, with $\mathrm{nnz}$ products and additions each.
+Including length and finiteness checks and output, the complexity is $O(m + n + \mathrm{nnz})$, proportional to stored entries rather than the dense-matrix cost $O(mn)$.
+Entries of $\mathbf{x}$ are read noncontiguously through column indices $c_k$, so actual speed also depends on memory-access locality.
+Bandwidth-reducing orderings ([orderings and coloring](../orderings-and-coloring/)) can also improve this locality.
+No function permutes the matrix itself; relabel indices using the `reverse_cuthill_mckee` permutation and reassemble it.
+
+`CsrMatrix`, `CscMatrix`, `BsrMatrix`, `DiaMatrix`, `SparseView`, and `SparseOperator` implement scioxide-core's `LinearOperator`, `AdjointOperator`, and `BlockOperator` (use `CooMatrix` through `view()`).
+`apply(x)` and `apply_adjoint(x)` return products in newly allocated arrays (views also provide `apply_transpose(x)`).
+`apply_into(x, y, workspace)` computes $\mathbf{y} = \mathbf{A}\mathbf{x}$, `apply_adjoint_into` computes $\mathbf{y} = \mathbf{A}^{\mathsf{H}}\mathbf{x}$, and `apply_block_into` computes $\mathbf{Y} = \mathbf{A}\mathbf{X}$ for multiple columns together.
+Workspace length must be at least the value returned by `apply_workspace_len()` and related methods: the row count for ordinary products and the column count for adjoint products.
+Every product checks lengths and input finiteness before computation and computes the entire result in workspace before copying it to output, so an unrepresentable-value failure also leaves output unchanged.
+
+### Transpose and adjoint products
+
+To compute $\mathbf{y} = \mathbf{A}^{\mathsf{T}}\mathbf{x}$ directly from CSR, accumulate entry $a_{ij}$ of row $i$ into $y_j$.
+
+$$
+y_j = \sum_{i : (i, j) \in \mathcal{S}(\mathbf{A})} a_{ij}\, x_i
+$$
+
+The `scioxide-sparse` CSR and CSC formats retain reverse-traversal indices ([sparse storage formats and assembly](../storage-and-assembly/)), allowing these sums to be grouped by output entry without constructing a transposed matrix.
+For complex matrices, distinguish the conjugating adjoint product $\mathbf{A}^{\mathsf{H}}\mathbf{x}$ from the nonconjugating transpose product $\mathbf{A}^{\mathsf{T}}\mathbf{x}$.
+Compute adjoint products with `AdjointOperator::apply_adjoint_into` and nonconjugating transpose products with `SparseView::apply_transpose_into` and `SparseOperator::apply_transpose_into` (workspace length equals the column count).
+They coincide for real matrices.
+
+For sparse–dense products and factorization solves, select the direction using the `SparseOperation` argument: `Normal` ($\mathbf{A}$), `Transpose` ($\mathbf{A}^{\mathsf{T}}$), or `Adjoint` ($\mathbf{A}^{\mathsf{H}}$).
+
+## Rounding contracts and error bounds
+
+Select product arithmetic with scioxide-core's `Accuracy`; the default is `Standard`.
+`SparseView::with_accuracy(Accuracy::Exact)` returns a borrowed operator `SparseOperator` bound to the selected precision, which can be passed directly to iterative solvers.
+All scioxide-core operator-trait implementations except `SparseOperator` compute with `Standard`.
+
+`Standard` sums each row's products using ordinary floating-point arithmetic.
+CSR, CSC, COO, and DIA accumulate products in four partial sums and combine them at the end.
+For a row dot product of $k$ terms, the componentwise error in the computed $\hat{y}_i$ is bounded by
+
+$$
+|\hat{y}_i - y_i| \le \gamma_{2k} \sum_{j} |a_{ij}\, x_j| + k\, u_{\mathrm{sub}}, \qquad \gamma_{2k} = \frac{2ku}{1 - 2ku} = \frac{k \varepsilon}{1 - k \varepsilon}
+$$
+
+as the error bound.
+Here $\varepsilon = 2^{-52}$ is double-precision machine epsilon, $u = \varepsilon/2$ the unit roundoff, $\gamma_k = ku/(1 - ku)$ the coefficient in [notation](oxref:sparse-notation), and $u_{\mathrm{sub}}$ the smallest subnormal of the output type multiplied by the rescaling factor; the bound is meaningful when $k \varepsilon < 1$.
+The contract bound for scioxide-core's `Accuracy` is $\gamma_{2k}$, roughly twice as loose as the standard dot-product bound $\gamma_k$.
+Since this bound is independent of summation order, the same formula holds when splitting into four partial sums.
+This bounds forward error in the computed dot product; the relative error satisfies
+
+$$
+\frac{|\hat{y}_i - y_i|}{|y_i|} \lesssim \gamma_{2k}\, \kappa_i, \qquad \kappa_i = \frac{\sum_j |a_{ij} x_j|}{\left|\sum_j a_{ij} x_j\right|}
+$$
+
+$\kappa_i$ is the dot-product condition number, which grows as positive and negative terms cancel.
+`Standard` recomputes a row using exact accumulation if any product overflows or falls below the normal range, or if the sum is nonfinite.
+Thus intermediate products or sums may temporarily leave the representable range without losing a representable final result.
+On the same configuration and implementation, `Standard` results are bitwise identical regardless of worker count.
+
+`Exact` accumulates each row's sum of products in a fixed-size exact state (`ProductSum`) and rounds once at the end.
+The result is the true dot product rounded once, with relative error at most unit roundoff $\varepsilon/2$ independently of $\kappa_i$, except when the result is subnormal.
+It is independent of summation order, worker count, and instruction set.
+Each product costs more than `Standard`, so choose it for strongly cancelling residuals or when reproducibility is needed.
+
+## Sparse–dense matrix multiplication
+
+`sparse_dense_into(matrix, operation, input, options, output, workspace, context)` is an API with a caller-provided destination that computes $\mathrm{op}(\mathbf{A})\mathbf{B}$ into `output` from sparse-matrix view `matrix` and column-major dense block `input`.
+It accepts views of every storage format and both real and complex scalars.
+Reserve workspace `SparseProductWorkspace` with `try_reserve` for the requirements returned by `SparseProductRequirements::sparse_dense(matrix, operation, right_hand_sides)`; it is not expanded during computation.
+Insufficient workspace is rejected with `DimensionMismatch`.
+All columns are computed in workspace before being copied to output together, leaving output unchanged on failure.
+Selecting a parallel policy in `with_execution_policy` of `SparseProductOptions` distributes columns across workers of the context's executor.
+
+## Sparse matrix–matrix multiplication
+
+Writing the product $\mathbf{C} = \mathbf{A}\mathbf{B}$ of $\mathbf{A} \in \mathbb{R}^{m \times p}$ and $\mathbf{B} \in \mathbb{R}^{p \times n}$ row by row, row $i$ of $\mathbf{C}$ is the linear combination of rows of $\mathbf{B}$
+
+$$
+\mathbf{c}_{i,:} = \sum_{k : (i, k) \in \mathcal{S}(\mathbf{A})} a_{ik}\, \mathbf{b}_{k,:}
+$$
+
+the expression above.
+Following this formula, Gustavson's algorithm takes entries $a_{ik}$ of a row of $\mathbf{A}$ for each row $i$ and accumulates entries of row $k$ of $\mathbf{B}$ in a work array.
+Each entry $(i, k)$ of row $i$ of $\mathbf{A}$ traverses row $k$ of $\mathbf{B}$ once, so the multiplication count is
+
+$$
+\mathrm{flops}(\mathbf{A}\mathbf{B}) = \sum_{i} \sum_{k : (i, k) \in \mathcal{S}(\mathbf{A})} \mathrm{nnz}(\mathbf{B}_{k,:}) = \sum_{k=0}^{p-1} \mathrm{nnz}(\mathbf{A}_{:,k})\, \mathrm{nnz}(\mathbf{B}_{k,:})
+$$
+
+Work is determined by the combination of column nonzero counts of $\mathbf{A}$ and row nonzero counts of $\mathbf{B}$, rather than input nonzero counts alone.
+Multiple products reaching the same $(i, j)$ combine into one entry, so output nonzeros $\mathrm{nnz}(\mathbf{C})$ cannot exceed this value but are unknown in advance.
+
+### Symbolic and numeric phases
+
+Ignoring numerical cancellation, the structure of $\mathbf{C}$ is
+
+$$
+\mathcal{S}(\mathbf{C}) = \{(i, j) : \text{some } k \text{ such that } (i, k) \in \mathcal{S}(\mathbf{A}),\ (k, j) \in \mathcal{S}(\mathbf{B})\}
+$$
+
+and depends solely on input structures, not values.
+Thus `SparseProductPlan::new(&a, &b)` first determines only the structure, retaining output row pointers and sorted column indices for each row (the symbolic phase).
+For each row it uses a length-$n$ array recording columns already added to output, so multiple paths to the same $(i, j)$ do not increase output storage.
+The work is $\mathrm{flops}(\mathbf{A}\mathbf{B})$ plus the cost of sorting column indices in each row.
+Stored zeros also enter the structure, and cancellation never changes the Plan structure.
+A Plan contains copies of only the structures of $\mathbf{A}$, $\mathbf{B}$, and $\mathbf{C}$, with no values.
+The detailed form `SparseProductPlan::with_options(&a, &b, SparseProductPlanOptions::new().with_max_output_entries(max_entries))` imposes an output-nonzero limit.
+Exceeding it returns `ResourceLimit` with the required total and limit, without allocating storage beyond the limit.
+
+The numeric API with a caller-provided destination `evaluate_into(&a, &b, options, &mut c, &mut workspace, context)` computes only values for $\mathbf{A}$, $\mathbf{B}$, and output $\mathbf{C}$ whose structures match the Plan exactly.
+Create output with `create_output()` as a matrix with the Plan's structure and zero values.
+Create workspace with `workspace(options)` or reserve it for `workspace_requirements(options)`.
+It contains per-worker column-to-position maps (length $n$), a row accumulation array, and candidate output values.
+Workspace is checked but never enlarged, so numeric computations allocate nothing after reservation.
+`Standard` accumulates each row with ordinary arithmetic, recomputing with exact accumulation only rows where products overflow or fall below the normal range, or sums become nonfinite.
+`Exact` accumulates every entry exactly and rounds once.
+All results are computed in workspace before copying to output; shape mismatch returns `DimensionMismatch`, structure mismatch `InvalidInput`, and an unrepresentable sum `NumericalInstability`, without changing output.
+When only values change, one Plan and workspace can be reused indefinitely.
+Select `Standard` or `Exact` through `with_accuracy` of `SparseProductOptions` for precision.
+Selecting a parallel policy with `with_execution_policy` distributes output rows across workers.
+For products involving transposes such as $\mathbf{A}^{\mathsf{T}}\mathbf{B}$, convert the result of `CsrMatrix::transpose` or `adjoint` to CSR before passing it in.
+
+For a single product, the standard form `CsrMatrix::multiply(&b)` creates the Plan, output, and workspace immediately and computes sequentially with `Standard` arithmetic.
+For `add`, `subtract`, and `hadamard` (entrywise multiplication) of the same type, sums and differences use the union of structures and entrywise products use their intersection, retaining positions that become exactly zero.
+Detailed forms such as `add_with_options` select treatment of exactly zero result values through `with_zero_policy` of `SparseArithmeticOptions::new()` and precision through `with_accuracy`.
+`SparseView::scaled(alpha)` returns `CsrMatrix` with all stored entries multiplied by $\alpha$; even at $\alpha = 0$, entries remain stored as zeros (select the zero policy with `scaled_with_options`).
+
+### Cycle-graph adjacency matrix
+
+The next two experiments use the adjacency matrix $\mathbf{A}$ of the $N$-vertex cycle graph $C_N$ (1 in both directions on edges $\{i, i+1 \bmod N\}$).
+Every row and column has two entries, giving $\mathrm{nnz}(\mathbf{A}) = 2N$.
+The following block defines what the two cells share.
+`cycle_adjacency` assembles $\mathbf{A}$ using `SparseBuilder`.
+
+```rust
+//| id: sparse-cycle-adjacency
+//| kind: definitions
+//| title: "Cycle-graph adjacency matrix"
+//| crates: [scioxide-core, scioxide-sparse]
+use scioxide_core::SciOxideError;
+use scioxide_sparse::{CsrMatrix, DuplicatePolicy, ExplicitZeroPolicy, SparseBuilder};
+
+/// Adjacency matrix of the N-vertex (N ≥ 3) cycle graph C_N. Place 1 in both directions on edge {i, i + 1 mod N}.
+pub(crate) fn cycle_adjacency(vertices: usize) -> Result<CsrMatrix<f64>, SciOxideError> {
+    let mut builder = SparseBuilder::new(vertices, vertices);
+    for i in 0..vertices {
+        builder.push(i, (i + 1) % vertices, 1.0)?;
+        builder.push((i + 1) % vertices, i, 1.0)?;
+    }
+    builder.finish_csr(DuplicatePolicy::Reject, ExplicitZeroPolicy::Drop)
+}
+```
+
+### Counting walks on a cycle graph
+
+For an undirected graph's adjacency matrix $\mathbf{A}$, $(\mathbf{A}^k)_{ij}$ counts walks of length $k$ from vertex $i$ to $j$.
+Entry $(i, j)$ of $\mathbf{A}^k = \mathbf{A}\,\mathbf{A}^{k-1}$ sums walks of length $k - 1$ from neighbors $l$ of $i$ to $j$.
+On $C_N$, every step advances by $\pm 1$, so the number of length-$k$ walks from vertex 0 to $j$ equals the number of ways to choose $+1$ for $t$ steps and $-1$ for $k - t$ steps satisfying $2t - k \equiv j \pmod N$, namely
+
+$$
+(\mathbf{A}^k)_{0j} = \sum_{\substack{0 \le t \le k \\ 2t - k \,\equiv\, j \!\!\pmod N}} \binom{k}{t}
+$$
+
+as the resulting count.
+The following cell builds Plans for $\mathbf{A}^j = \mathbf{A}\,\mathbf{A}^{j-1}$ ($j = 2, \dots, k$) using `SparseProductPlan` and computes their values.
+The first table shows the multiplication count $\mathrm{flops}$ (from the formula above), nonzeros $\mathrm{nnz}(\mathbf{A}^j)$, and the difference from dense matrix powers computed by a naive triple loop at each stage.
+The second table compares row 0 of $\mathbf{A}^k$ with sums of binomial coefficients.
+The inputs are vertex count $N$ (3–16) and walk length $k$ (2–10).
+Walk counts are integers at most $2^{10}$, so even `Standard` arithmetic introduces no rounding.
+
+```rust
+//| id: sparse-spgemm-walks
+//| ref: sparse-spgemm-walks
+//| title: "Counting cycle-graph walks by sparse matrix multiplication"
+//| run: reactive
+//| uses: [sparse-cycle-adjacency]
+//| crates: [scioxide-core, scioxide-sparse]
+//| inputs:
+//|   vertices: {"type":"range","label":"Cycle vertex count N","description":"Vertex count of cycle graph C_N.","min":3,"max":16,"step":1,"value":8}
+//|   walk_length: {"type":"range","label":"Walk length k","description":"Highest power of A to compute.","min":2,"max":10,"step":1,"value":4}
+//| cases:
+//|   - {"id":"odd-cycle","label":"N = 3, k = 4","description":"Odd cycles have no parity restriction; at N = 3, A² fills every position.","inputs":{"vertices":3}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"powers","path":"/rows/0/1","equals":32}
+//|       - {"artifact":"powers","path":"/rows/0/2","equals":24}
+//|       - {"artifact":"powers","path":"/rows/1/2","equals":32}
+//|       - {"artifact":"powers","path":"/rows/2/1","equals":64}
+//|       - {"artifact":"powers","path":"/rows/2/2","equals":32}
+//|       - {"artifact":"powers","path":"/rows/2/3","range":{"max":0}}
+//|       - {"artifact":"row-zero","path":"/rows/0/1","approx":{"value":6.0,"atol":1e-12}}
+//|       - {"artifact":"row-zero","path":"/rows/0/2","approx":{"value":6.0,"atol":1e-12}}
+//|       - {"artifact":"row-zero","path":"/rows/4/1","approx":{"value":2.0,"atol":1e-12}}
+//|   - case: odd-cycle
+//|     expect:
+//|       - {"artifact":"powers","path":"/rows/0/2","equals":9}
+//|       - {"artifact":"powers","path":"/rows/2/3","range":{"max":0}}
+//|       - {"artifact":"row-zero","path":"/rows/0/1","approx":{"value":6.0,"atol":1e-12}}
+//|       - {"artifact":"row-zero","path":"/rows/1/1","approx":{"value":5.0,"atol":1e-12}}
+use scioxide_core::ExecutionContext;
+use scioxide_sparse::{SparseProductOptions, SparseProductPlan};
+
+let (n, k) = (vertices as usize, walk_length as usize);
+let a = cycle_adjacency(n).map_err(|e| e.to_string())?;
+// Dense matrix A and its power D = A^j for independent checking.
+let mut dense_a = vec![0.0_f64; n * n];
+a.to_dense_into(&mut dense_a).map_err(|e| e.to_string())?;
+let mut dense_power = dense_a.clone();
+let (product, scope) = (SparseProductOptions::new(), ExecutionContext::sequential());
+let (mut power, mut rows) = (a.clone(), Vec::new());
+for j in 2..=k {
+    // Multiplication count: each entry (i, l) of A traverses row l of A^(j-1) once.
+    let ptr = power.row_ptr();
+    let flops: usize = a.col_indices().iter().map(|&l| ptr[l + 1] - ptr[l]).sum();
+    // Symbolic phase: build the structure of A^j from only the structures of A and A^(j-1).
+    let plan = SparseProductPlan::new(&a, &power).map_err(|e| e.to_string())?;
+    let mut next = plan.create_output().map_err(|e| e.to_string())?;
+    let mut workspace = plan.workspace(product).map_err(|e| e.to_string())?;
+    // Numeric phase.
+    plan.evaluate_into(&a, &power, product, &mut next, &mut workspace, scope)
+        .map_err(|e| e.to_string())?;
+    // Independent check: D ← A D by a naive dense triple loop.
+    let mut d = vec![0.0_f64; n * n];
+    for (r, c) in (0..n).flat_map(|r| (0..n).map(move |c| (r, c))) {
+        d[r * n + c] = (0..n).fold(0.0, |s, l| s + dense_a[r * n + l] * dense_power[l * n + c]);
+    }
+    dense_power = d;
+    let mut from_sparse = vec![0.0_f64; n * n];
+    next.to_dense_into(&mut from_sparse)
+        .map_err(|e| e.to_string())?;
+    let diff = from_sparse
+        .iter()
+        .zip(&dense_power)
+        .fold(0.0_f64, |m, (x, y)| m.max((x - y).abs()));
+    rows.push((j, flops, next.nnz(), diff));
+    power = next;
+}
+
+// Compare row 0 with binomial-coefficient sums (sum C(k, t) over t satisfying 2t − k ≡ j (mod N)).
+let binomial = |t: usize| (0..t).fold(1.0_f64, |c, s| c * (k - s) as f64 / (s + 1) as f64);
+let mut row_zero = Vec::new();
+for j in 0..n {
+    let count = (0..=k)
+        .filter(|&t| (2 * t + n * k - k) % n == j)
+        .fold(0.0_f64, |s, t| s + binomial(t));
+    row_zero.push((j, power.get(0, j).map_err(|e| e.to_string())?, count));
+}
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let count = serde_json::json!({ "fractionDigits": 0 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Length j", "type": "integer" },
+    { "key": "1", "label": "Multiplication count flops [count]", "type": "integer" },
+    { "key": "2", "label": "nnz(A^j) [count]", "type": "integer" },
+    { "key": "3", "label": "Maximum difference from dense matrix power [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "powers" })
+);
+let row_columns = serde_json::json!([
+    { "key": "0", "label": "Destination j", "type": "integer" },
+    { "key": "1", "label": "(A^k)₀ⱼ (sparse matrix product) [walks]", "type": "number", "format": count },
+    { "key": "2", "label": "Binomial-coefficient sum [walks]", "type": "number", "format": count }
+]);
+emit_table_with_columns!(
+    row_columns,
+    row_zero,
+    metadata = serde_json::json!({ "id": "row-zero" })
+);
+```
+
+At the defaults $N = 8$ and $k = 4$, nonzero counts are 24, 32, and 32 at $j = 2, 3, 4$, and every difference from dense matrix powers is 0.
+Length-$j$ walks reach $j + 1$ positions $-j, -j + 2, \dots, j$ from vertex 0, so while $j < N/2$, each row has $j + 1$ nonzeros and the total is $N(j + 1)$.
+At $j = N/2 = 4$, $+4$ and $-4$ coincide at vertex 4, leaving four entries per row.
+Since every column of $\mathbf{A}$ contains two entries, the multiplication count is $2\,\mathrm{nnz}(\mathbf{A}^{j-1})$, giving 32, 48, and 64 at $j = 2, 3, 4$.
+The difference from the nonzero count counts multiple walks combined into one entry; the symbolic phase removes these duplicates using an array of columns already added.
+Row 0 agrees with the binomial-coefficient sums.
+For example, $(\mathbf{A}^4)_{00} = \binom{4}{2} = 6$ and $(\mathbf{A}^4)_{02} = \binom{4}{3} = 4$; $(\mathbf{A}^4)_{04} = \binom{4}{4} + \binom{4}{0} = 2$ counts the two walks around the cycle in opposite directions.
+Odd cycles have no parity restriction, so the $j + 1$ positions $-j, -j + 2, \dots, j$ cover all $N$ vertices at $j \ge N - 1$.
+At $N = 3$, $\mathbf{A}^2$ fills every position and the nonzero count is $N^2 = 9$.
+
+### Reusing product Plans when only values change
+
+Plans depend only on structure, so the same Plan and workspace can serve matrices with different values.
+For the same cycle, the following cell builds a sequence of Plans for $\mathbf{A}^k$ once, then reuses them and their workspaces for $w\mathbf{A}$ with all edge weights changed to $w$ to compute $(w\mathbf{A})^k$.
+It replaces values with `copy_values_from` without repeating structural analysis.
+As a check, it shows the maximum relative difference from $(w\mathbf{A})^k = w^k \mathbf{A}^k$.
+The inputs are $N$, $k$, and weight $w$ (0.1–2).
+
+```rust
+//| id: sparse-spgemm-plan-reuse
+//| ref: sparse-spgemm-plan-reuse
+//| title: "Reusing product Plans for a matrix with changed weights"
+//| run: reactive
+//| uses: [sparse-cycle-adjacency]
+//| crates: [scioxide-core, scioxide-sparse]
+//| inputs:
+//|   vertices: {"type":"range","label":"Cycle vertex count N","description":"Vertex count of cycle graph C_N.","min":3,"max":16,"step":1,"value":8}
+//|   walk_length: {"type":"range","label":"Walk length k","description":"Highest power of A to compute.","min":2,"max":10,"step":1,"value":4}
+//|   weight: {"type":"range","label":"Edge weight w","description":"Weight shared by all edges.","min":0.1,"max":2.0,"step":0.1,"value":1.3}
+//| cases:
+//|   - {"id":"power-of-two","label":"w = 0.5","description":"Power-of-two weights make every operation exact, giving zero relative difference.","inputs":{"weight":0.5}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"reuse","path":"/rows/0/0","equals":3}
+//|       - {"artifact":"reuse","path":"/rows/0/1","equals":32}
+//|       - {"artifact":"reuse","path":"/rows/0/2","range":{"max":1e-15}}
+//|   - case: power-of-two
+//|     expect:
+//|       - {"artifact":"reuse","path":"/rows/0/2","range":{"max":0}}
+use scioxide_core::ExecutionContext;
+use scioxide_sparse::{SparseProductOptions, SparseProductPlan};
+
+let (n, k) = (vertices as usize, walk_length as usize);
+let a = cycle_adjacency(n).map_err(|e| e.to_string())?;
+let (product, scope) = (SparseProductOptions::new(), ExecutionContext::sequential());
+
+// Build the Plan sequence once and compute A^k.
+let (mut stages, mut power) = (Vec::new(), a.clone());
+for _ in 2..=k {
+    let plan = SparseProductPlan::new(&a, &power).map_err(|e| e.to_string())?;
+    let (mut next, mut workspace) = (
+        plan.create_output().map_err(|e| e.to_string())?,
+        plan.workspace(product).map_err(|e| e.to_string())?,
+    );
+    plan.evaluate_into(&a, &power, product, &mut next, &mut workspace, scope)
+        .map_err(|e| e.to_string())?;
+    stages.push((plan, workspace));
+    power = next;
+}
+
+// Change only values to w and compute (wA)^k with the same Plans and workspaces (without repeating structural analysis).
+let mut aw = a.clone();
+aw.copy_values_from(&vec![weight; a.nnz()])
+    .map_err(|e| e.to_string())?;
+let mut weighted = aw.clone();
+for (plan, workspace) in &mut stages {
+    let mut next = plan.create_output().map_err(|e| e.to_string())?;
+    plan.evaluate_into(&aw, &weighted, product, &mut next, workspace, scope)
+        .map_err(|e| e.to_string())?;
+    weighted = next;
+}
+let scale = weight.powi(k as i32); // Reference value w^k (f64 intrinsic method)
+let relative = weighted
+    .values()
+    .iter()
+    .zip(power.values())
+    .fold(0.0_f64, |m, (x, y)| {
+        m.max((x - scale * y).abs() / (scale * y))
+    });
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Reused Plans [count]", "type": "integer" },
+    { "key": "1", "label": "nnz((wA)^k) [count]", "type": "integer" },
+    { "key": "2", "label": "Maximum relative difference between (wA)^k and w^k A^k [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    vec![(stages.len(), weighted.nnz(), relative)],
+    metadata = serde_json::json!({ "id": "reuse" })
+);
+```
+
+At the defaults $N = 8$, $k = 4$, and $w = 1.3$, three Plans are reused and the relative difference $2.1 \times 10^{-16}$ is on the order of unit roundoff.
+Since $w = 1.3$ is not exactly representable in binary, $(w\mathbf{A})^k$ and $w^k\mathbf{A}^k$ round in different orders, producing this difference.
+Powers of two such as $w = 0.5$ and $w = 2$ make all operations exact, giving zero difference.
+
+## Summary
+
+Sparse matrix–vector multiplication costs $O(m + n + \mathrm{nnz})$, and the `scioxide-sparse` CSR and CSC formats also compute transpose and adjoint products without forming transposed matrices.
+Since `Standard` error is proportional to the dot-product condition number $\kappa_i$, select the once-rounded arithmetic `with_accuracy(Accuracy::Exact)` for strong cancellation or reproducibility.
+Sparse matrix–matrix work is determined by $\sum_k \mathrm{nnz}(\mathbf{A}_{:,k})\,\mathrm{nnz}(\mathbf{B}_{k,:})$, and output size is unknown in advance; for large products, bound the structure of `SparseProductPlan::with_options` using `with_max_output_entries`.
+When only values change, create a Plan and workspace once and repeat `evaluate_into`, avoiding repeated structural analysis and allocation.
+
+## Further reading
+
+- [Sparse triangular substitution and sparse LU factorization](../triangular-and-sparse-lu/): examine triangular substitution, a basic operation alongside matrix–vector multiplication, and the left-looking sparse LU factorization that uses it.
+- [Algebraic multigrid preconditioning](../algebraic-multigrid/): examine multigrid construction using sparse matrix products for coarse-grid operators $\mathbf{P}^{\mathsf{T}}\mathbf{A}\mathbf{P}$.
+- [Storage, assembly, and products](../../api/storage-and-products/): look up contracts for every product option, Plan, and workspace item.

@@ -1,0 +1,275 @@
+---
+title: "Multidimensional Fourier transforms"
+description: "Explain why multidimensional DFTs separate into one-dimensional transforms by axis, their cost, row-major storage and batch axes, and multidimensional plans reading strided views."
+sidebar:
+  order: 320
+references:
+  fft-multidimensional: "axis-separability-and-cost"
+  fft-row-major-batches: "row-major-storage-and-batch-axes"
+  fft-nd-plan: "multidimensional-plans"
+---
+
+Images, volume data, and records with time and channels are arrays with multiple axes.
+A multidimensional discrete Fourier transform (DFT) can be computed by applying a one-dimensional DFT successively along each selected axis.
+`scioxide-fft` specifies array shape and the sequence of transform axes separately, leaving unselected axes as independent batched transforms.
+This page derives axis separability and its cost, explains the correspondence between array storage and axes, and introduces plans reading strided views.
+[Multidimensional DCTs, DSTs, and workspaces](../multidimensional-dct-dst/) covers multidimensional DCT/DST plans and workspaces.
+[Multidimensional real FFTs and frequency reordering](../real-multidimensional-transforms/) covers packing only one real-array axis and reordering frequencies.
+
+## Axis separability and cost
+
+The DFT of a complex array $x_{\mathbf n}$ of shape $(N_0,\ldots,N_{D-1})$ along every axis is
+
+$$
+X_{\mathbf k}=\sum_{n_0=0}^{N_0-1}\cdots\sum_{n_{D-1}=0}^{N_{D-1}-1}
+x_{\mathbf n}\prod_{d=0}^{D-1}e^{-2\pi i k_dn_d/N_d}
+$$
+
+where $\mathbf n=(n_0,\ldots,n_{D-1})$ is the sample index and $\mathbf k$ the wavenumber index.
+Since the kernel factors into exponentials for each axis, taking sums from the inside one axis at a time gives a stage of one-dimensional DFTs along that axis for each combination of other-axis indices.
+In exact arithmetic, changing axis order leaves values unchanged.
+In floating-point arithmetic, intermediate rounding depends on order, so results may differ within rounding error.
+
+For total element count $V=\prod_dN_d$, the stage for axis $d$ performs $V/N_d$ FFTs of length $N_d$ and costs $O(V\log N_d)$.
+All axes cost $O(V\sum_d\log N_d)=O(V\log V)$; only the selected axis set $A$ costs $O(V\sum_{d\in A}\log N_d)$.
+Every axis may have arbitrary length; lengths with only prime factors 2, 3, 5, and 7 are fast ([Choosing fast lengths](oxref:fft-fast-lengths)).
+
+## Row-major storage and batch axes
+
+Convenience functions `fftn` and `ifftn` take a slice storing the array in row-major order (the last axis varies fastest), its shape `shape`, and transform-axis sequence `axes`.
+Real-array `rfftn` and `ihfftn` take the same arguments ([Multidimensional real FFTs and frequency reordering](../real-multidimensional-transforms/)).
+Element $\mathbf n$ is at position $\sum_dn_ds_d$, with strides $s_{D-1}=1$, $s_d=s_{d+1}N_{d+1}$.
+For example, element `(1, 2)` of shape `[2, 3]` is at position $1\cdot3+2=5$.
+Results are returned in a new `Vec` with the same shape and order.
+
+An axis omitted from `axes` is a batch axis: each value of its index selects an independent transform.
+Passing `axes = &[1, 2]` for shape `[batch, rows, columns]` performs a two-dimensional transform per batch.
+Axes are transformed in `axes` order.
+
+The normalization reference length is the product of selected axis lengths, excluding batch-axis lengths.
+Scaling the value range down by a power of 2 before transformation and restoring it afterward is also performed separately per batch.
+This prevents a batch with large values from forcing small values in another batch to be scaled down and lose low-order bits.
+
+Convenience-function errors are as follows.
+
+- A slice length differing from the shape's element count gives `DimensionMismatch`; a shape product exceeding `usize` gives `SizeOverflow`.
+- An axis index at least equal to the rank gives `OutOfBounds`; a duplicate axis gives `InvalidInput` (`Inconsistent`); selecting a length-0 axis gives `InvalidInput` (`Empty`).
+- NaN or infinite input gives `NonFinite`; result overflow from finite input gives `NumericalInstability` (`Overflow`).
+
+## Multidimensional plans
+
+Use a plan for repeated transforms of the same shape or for strided arrays.
+`FftNdPlanSpec::new(shape, axes, direction, normalization, layout)` copies and stores the shape and axes, returning `AllocationFailure` if the copies cannot be allocated.
+`FftNdPlan::new(spec)` validates axes and shape during preparation, with the same error classifications as convenience functions.
+`FftLayout::Real` and `FftLayout::Hermitian` require at least one selected axis.
+
+Input to `execute_into(input, output, scratch, context)` is `FftNdInput` and output is `FftNdOutput`, both converted from `NdView` and `NdViewMut`.
+Complex views become the `Complex` variant; real views become `Real`.
+A view shape differing from the plan gives `DimensionMismatch`; a variant incompatible with the layout and direction gives `InvalidInput` (`UnsupportedConfiguration`).
+Arbitrary view strides allow reading transposed storage or portions of padded arrays without copying.
+Input may also use zero strides to share the same element (`StridedLayout::new_broadcast`).
+Output `NdViewMut` verifies during construction that every element has a distinct position, so overlapping layouts cannot be outputs.
+[Packing real arrays](oxref:fft-real-nd-layout) covers input and output for real-array plans (`FftLayout::Real` and `Hermitian`).
+
+The workspace is the same `FftWorkspace` as for one-dimensional plans; allocate it with `plan.workspace(())` and query complex-value counts and bytes with `workspace_requirements(())`.
+Requirements are fixed at preparation: $O(V+\max_dN_d)$ complex values combining $V$ values for result assembly, temporary storage for gathering strided sequences, and the maximum workspace among per-axis one-dimensional transforms.
+Execution with sufficient workspace makes no heap allocation.
+Complex plans can transform arrays in place with `execute_in_place`.
+Errors leave output unchanged.
+
+### Comparing two-dimensional and per-axis one-dimensional transforms
+
+The following cell applies a two-dimensional `fftn` to the complex plane wave $x_{jk}=e^{2\pi i(2j/M+3k/N)}$ and compares it with successive one-dimensional `fft` transforms on rows and columns.
+It also checks that `fftn` selecting only axis 1 agrees with `fft` on each row, and compares results after changing the axis order to `[1, 0]` or reading the same array stored in column-major order through an `FftNdPlan` view with strides $(1,M)$.
+The plan receives `FftNdInput` and `FftNdOutput` converted from views (both `Complex` variants).
+It also applies unscaled `ifftn` to the `fftn` result and checks that the round trip gives $MN\,x$.
+These computations share FFT components and therefore are not independent accuracy checks.
+They are also compared with analytic values for this reason.
+The unscaled DFT has value $MN$ in the bin at wavenumber $(2,3)$ and 0 in every other bin.
+Plane-wave values are reference values constructed with `cos` and `sin` from `f64`.
+
+```rust
+//| id: fft-2d-separable
+//| ref: fft-2d-separable
+//| title: "Compare a two-dimensional FFT with per-axis one-dimensional FFTs"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-fft]
+//| inputs:
+//|   rows_count: {"type":"range","label":"Rows M","description":"Axis-0 length.","min":8,"max":32,"step":1,"value":16}
+//|   cols_count: {"type":"range","label":"Columns N","description":"Axis-1 length.","min":8,"max":32,"step":1,"value":16}
+//| cases:
+//|   - {"id":"odd-sizes","label":"M = 9, N = 15","description":"Odd-length axis. The length-15 FFT uses radix-3 and radix-5 stages.","inputs":{"rows_count":9,"cols_count":15}}
+//|   - {"id":"prime-sizes","label":"M = 11, N = 13","description":"Prime-length axes. Agreement also holds for lengths not divisible by 2, 3, 5, or 7.","inputs":{"rows_count":11,"cols_count":13}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"peak","path":"/rows/0/2","approx":{"value":256,"rtol":1e-12}}
+//|       - {"artifact":"peak","path":"/rows/0/3","equals":256}
+//|       - {"artifact":"errors","path":"/rows/0/2","range":{"max":1e-15}}
+//|       - {"artifact":"errors","path":"/rows/1/2","range":{"max":1e-15}}
+//|       - {"artifact":"errors","path":"/rows/2/2","range":{"max":1e-15}}
+//|       - {"artifact":"errors","path":"/rows/3/2","range":{"max":1e-15}}
+//|       - {"artifact":"errors","path":"/rows/4/2","range":{"max":1e-14}}
+//|       - {"artifact":"errors","path":"/rows/5/2","range":{"max":1e-14}}
+//|   - case: odd-sizes
+//|     expect:
+//|       - {"artifact":"peak","path":"/rows/0/3","equals":135}
+//|       - {"artifact":"errors","path":"/rows/1/2","range":{"max":1e-15}}
+//|       - {"artifact":"errors","path":"/rows/4/2","range":{"max":1e-14}}
+//|       - {"artifact":"errors","path":"/rows/5/2","range":{"max":1e-14}}
+//|   - case: prime-sizes
+//|     expect:
+//|       - {"artifact":"peak","path":"/rows/0/2","approx":{"value":143,"rtol":1e-12}}
+//|       - {"artifact":"errors","path":"/rows/1/2","range":{"max":1e-15}}
+//|       - {"artifact":"errors","path":"/rows/4/2","range":{"max":1e-14}}
+//|       - {"artifact":"errors","path":"/rows/5/2","range":{"max":1e-14}}
+use scioxide_core::{Complex, ExecutionContext, NdView, NdViewMut, StridedLayout};
+use scioxide_fft::{FftDirection, FftLayout, FftNdInput, FftNdOutput, FftNdPlan, FftNdPlanSpec};
+use scioxide_fft::{Normalization, fft, fftn, ifftn};
+
+let (m, n) = (rows_count.round() as usize, cols_count.round() as usize);
+let shape = [m, n];
+let norm = Normalization::Unscaled;
+let pi = std::f64::consts::PI;
+// Plane wave (reference values constructed with f64 cos and sin). Row-major element (j, k) is at position j·N + k.
+let mut matrix = Vec::with_capacity(m * n);
+for j in 0..m {
+    for k in 0..n {
+        let phase = 2.0 * pi * (2.0 * j as f64 / m as f64 + 3.0 * k as f64 / n as f64);
+        matrix.push(Complex::new(phase.cos(), phase.sin()));
+    }
+}
+let max_gap = |a: &[Complex<f64>], b: &[Complex<f64>]| {
+    a.iter()
+        .zip(b)
+        .map(|(p, q)| (*p - *q).norm())
+        .fold(0.0_f64, f64::max)
+};
+let direct = fftn(&matrix, &shape, &[0, 1], norm).map_err(|e| e.to_string())?;
+// Selecting only axis 1 gives independent batched transforms for each row.
+let rows_only = fftn(&matrix, &shape, &[1], norm).map_err(|e| e.to_string())?;
+// Axis composition: one-dimensional fft on each row, then one-dimensional fft on each column.
+let mut separable = Vec::with_capacity(m * n);
+for row in matrix.chunks_exact(n) {
+    separable.extend(fft(row, norm).map_err(|e| e.to_string())?);
+}
+let row_gap = max_gap(&rows_only, &separable);
+for k in 0..n {
+    let column: Vec<Complex<f64>> = (0..m).map(|j| separable[j * n + k]).collect();
+    let transformed = fft(&column, norm).map_err(|e| e.to_string())?;
+    for (j, value) in transformed.into_iter().enumerate() {
+        separable[j * n + k] = value;
+    }
+}
+let reversed = fftn(&matrix, &shape, &[1, 0], norm).map_err(|e| e.to_string())?;
+// Store the same array in column-major order (element (j, k) at position k·M + j), and read it through a view with strides (1, M).
+let transposed: Vec<Complex<f64>> = (0..m * n).map(|i| matrix[(i % m) * n + i / m]).collect();
+let strides = [1, m];
+let column_major = StridedLayout::new(&shape, &strides).map_err(|e| e.to_string())?;
+let spec = FftNdPlanSpec::new(
+    &shape,
+    &[0, 1],
+    FftDirection::Forward,
+    norm,
+    FftLayout::Complex,
+)
+.map_err(|e| e.to_string())?;
+let plan = FftNdPlan::<f64>::new(spec).map_err(|e| e.to_string())?;
+let mut workspace = plan.workspace(()).map_err(|e| e.to_string())?;
+let mut planned = vec![Complex::new(0.0, 0.0); m * n];
+// Complex views convert to FftNdInput::Complex and FftNdOutput::Complex.
+let input: FftNdInput<f64> = NdView::new(&transposed, column_major)
+    .map_err(|e| e.to_string())?
+    .into();
+let output: FftNdOutput<f64> = NdViewMut::row_major(&mut planned, &shape)
+    .map_err(|e| e.to_string())?
+    .into();
+plan.execute_into(
+    input,
+    output,
+    &mut workspace,
+    ExecutionContext::sequential(),
+)
+.map_err(|e| e.to_string())?;
+// Unscaled round trip: ifftn(fftn(x)) gives MN·x.
+let round_trip = ifftn(&direct, &shape, &[0, 1], norm).map_err(|e| e.to_string())?;
+// Independent check: wavenumber bin (2, 3) is MN, all others 0.
+let volume = (m * n) as f64;
+let exact: Vec<Complex<f64>> = (0..m * n)
+    .map(|i| Complex::new(if i == 2 * n + 3 { volume } else { 0.0 }, 0.0))
+    .collect();
+let scaled: Vec<Complex<f64>> = matrix.iter().map(|&z| z * volume).collect();
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let digits12 = serde_json::json!({ "significantDigits": 12 });
+let peak_columns = serde_json::json!([
+    { "key": "0", "label": "Rows M", "type": "integer" },
+    { "key": "1", "label": "Columns N", "type": "integer" },
+    { "key": "2", "label": "|X(2, 3)| [-]", "type": "number", "format": digits12 },
+    { "key": "3", "label": "Analytic value MN [-]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    peak_columns,
+    vec![(m, n, direct[2 * n + 3].norm(), m * n)],
+    metadata = serde_json::json!({ "id": "peak" })
+);
+let comparisons = vec![
+    ("fftn axes [1] versus each row's fft", row_gap),
+    (
+        "fftn axes [0, 1] versus composed row/column fft",
+        max_gap(&direct, &separable),
+    ),
+    (
+        "fftn axis orders [0, 1] versus [1, 0]",
+        max_gap(&direct, &reversed),
+    ),
+    (
+        "FftNdPlan reading column-major strides versus fftn",
+        max_gap(&direct, &planned),
+    ),
+    ("fftn versus analytic values", max_gap(&direct, &exact)),
+    (
+        "Unscaled ifftn(fftn(x)) versus MN·x",
+        max_gap(&round_trip, &scaled),
+    ),
+];
+let rows: Vec<(&str, f64, f64)> = comparisons
+    .into_iter()
+    .map(|(label, gap)| (label, gap, gap / volume))
+    .collect();
+let error_columns = serde_json::json!([
+    { "key": "0", "label": "Comparison" },
+    { "key": "1", "label": "Maximum absolute difference [-]", "type": "number", "format": sci3 },
+    { "key": "2", "label": "Difference / MN [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    error_columns,
+    rows,
+    metadata = serde_json::json!({ "id": "errors" })
+);
+```
+
+At the default 16×16, $|X_{2,3}|$ is $256=MN$; the maximum difference from analytic values is $1.4\times10^{-13}$ ($5.4\times10^{-16}$ after division by $MN$).
+`fftn` selecting only axis 1 matches `fft` on each row, giving difference 0.
+The composed row-and-column one-dimensional transforms differ from `fftn` by $1.4\times10^{-14}$ ($5.4\times10^{-17}$ after division by $MN$), on the scale of rounding error.
+Changing the axis order to `[1, 0]` gives the same difference.
+The plan reading column-major strides matches `fftn` bit for bit in this example.
+Unscaled `ifftn(fftn(x))` differs from $MN\,x$ by $8.5\times10^{-14}$ ($3.3\times10^{-16}$ after division by $MN$), consistent with the round-trip factor being the product $MN$ of selected axis lengths.
+For prime lengths 11×13 too, the composition difference is $1.8\times10^{-14}$, the analytic-value difference divided by $MN$ is $5.7\times10^{-16}$, and the round-trip difference divided by $MN$ remains $9.9\times10^{-16}$.
+
+
+A small difference from axis composition alone cannot rule out normalization or indexing mistakes shared by both computations.
+An equally small difference from analytic values also checks peak position and scale.
+
+## Summary
+
+Because the multidimensional DFT kernel factors by axis, successive one-dimensional FFTs on the selected axes compute it at cost $O(V\sum_{d\in A}\log N_d)$.
+Convenience functions read contiguous row-major slices and treat unselected axes as independent batches excluded from the normalization reference length.
+Use `FftNdPlan` and `FftWorkspace` for strided arrays or repeated transforms; view shapes and layout correspondence are fixed at preparation.
+Comparisons with both axis composition and analytic values allow normalization and indexing errors to be checked separately.
+
+## Further reading
+
+- [Multidimensional real FFTs and frequency reordering](../real-multidimensional-transforms/) examines packed axes and shapes in real arrays, validation of conjugate pairs on DC and Nyquist planes, and `fftshift_nd`.
+- [Multidimensional DCTs, DSTs, and workspaces](../multidimensional-dct-dst/) examines plans mixing types by axis and their separate real and complex workspaces.
+- [FFT plans, workspaces, and caches](../plans-workspaces-and-providers/) examines rules for reusing one-dimensional plans and workspaces.

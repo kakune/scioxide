@@ -1,0 +1,373 @@
+---
+title: "Exact Geometric Predicates"
+description: "Sign conventions for orient2d, orient3d, incircle, and insphere, why naive determinant signs fail, floating-point filters using Shewchuk error bounds and exact evaluation with dyadic rationals, N-dimensional orientation predicates, and term-count limits."
+sidebar:
+  order: 330
+references:
+  spatial-predicate-signs: "mathematical-definitions-of-geometric-predicates"
+  spatial-naive-determinant-failure: "why-naive-floating-point-computation-fails"
+  spatial-predicate-filter-exact: "floating-point-filtering-and-exact-evaluation"
+  spatial-simplex-predicate-workspace: "n-dimensional-simplex-predicates-and-workspaces"
+---
+
+Convex-hull, Delaunay, and Voronoi construction and mesh validation repeatedly ask whether point $c$ lies left of directed line $a \to b$ or point $d$ lies inside triangle $abc$'s circumcircle.
+These tests are determinant signs, but naive `f64` computation can reverse a sign through cancellation or turn a nonzero value into 0.
+Contradictory tests produce inconsistent adjacency, potentially making an algorithm loop indefinitely or fail partway through.
+Predicates in `scioxide-spatial` return determinant signs for the supplied floating-point coordinates as `PredicateSign`, unaffected by rounding.
+This page explains sign conventions, failures of naive computation, the two stages of floating-point filtering and exact evaluation, and arbitrary-dimensional orientation predicates.
+
+## Mathematical definitions of geometric predicates
+
+`PredicateSign` represents a determinant's sign: `Negative` (strictly negative), `Zero` (exactly 0), or `Positive` (strictly positive).
+`Zero` uses no tolerance or perturbation and is returned only for an exactly zero determinant.
+Pass coordinates by reference to fixed-size `f32` or `f64` arrays (`[S; 2]` in the plane, `[S; 3]` in space).
+Every predicate returns `NonFinite` for coordinates containing NaN or infinity.
+
+The orientation `orient2d(a, b, c)` of three planar points is the sign of
+
+$$
+\operatorname{orient2d}(a, b, c) = \det\begin{pmatrix} a_x & a_y & 1 \\ b_x & b_y & 1 \\ c_x & c_y & 1 \end{pmatrix} = (a_x - c_x)(b_y - c_y) - (a_y - c_y)(b_x - c_x)
+$$
+
+and is `Positive` for counterclockwise $a \to b \to c$, `Negative` for clockwise order, and `Zero` when the three points are collinear or two coincide.
+The value is twice triangle $abc$'s signed area; swapping two points reverses the sign.
+
+The orientation `orient3d(a, b, c, d)` of four spatial points is the sign of the $4 \times 4$ determinant with rows $[x, y, z, 1]$.
+When $a, b, c$ appears counterclockwise from above, $d$ below its plane gives `Positive`, above gives `Negative`, and coplanarity gives `Zero`.
+This is Shewchuk's convention: right-handed positive volume $\det(b - a, c - a, d - a) > 0$ corresponds to `Negative` of `orient3d` (the orientation required by tetrahedral meshes).
+
+`incircle(a, b, c, d)` is the sign of the determinant formed by lifting each point to paraboloid $z = x^2 + y^2$:
+
+$$
+\operatorname{incircle}(a, b, c, d) = \det\begin{pmatrix} a_x & a_y & a_x^2 + a_y^2 & 1 \\ b_x & b_y & b_x^2 + b_y^2 & 1 \\ c_x & c_y & c_x^2 + c_y^2 & 1 \\ d_x & d_y & d_x^2 + d_y^2 & 1 \end{pmatrix}
+$$
+
+For counterclockwise $a, b, c$, $d$ inside the circumcircle gives `Positive`, on the circle `Zero`, and outside `Negative`; clockwise order reverses these signs.
+$d$ below the plane through lifted points $abc$ corresponds to $d$ inside the circle.
+`insphere(a, b, c, d, e)` is the sign of the $5 \times 5$ determinant with rows $[x, y, z, x^2 + y^2 + z^2, 1]$; if `orient3d(a, b, c, d)` is `Positive`, $e$ inside the circumsphere gives `Positive`, on the sphere `Zero`, and outside `Negative`.
+If `orient3d(a, b, c, d)` is `Negative`, the signs reverse.
+If $a, b, c$ are collinear (or $a, b, c, d$ coplanar for `insphere`), no circle or sphere exists and the sign does not indicate inside or outside.
+Predicates compute neither centers nor radii, so rounding of constructed coordinates such as circumcenters does not affect their signs.
+
+## Why naive floating-point computation fails
+
+Naive `f64` computation of $\operatorname{orient2d}$ introduces relative errors around $2^{-53}$ in each term through rounding of differences such as $a_x - c_x$ and products.
+Here, the sum of absolute values of the expanded determinant terms is called the permanent.
+When the final subtraction nearly cancels two products, the absolute error remains around $2^{-53}$ times the permanent and can exceed the true value.
+The computed sign then loses meaning: it can oppose the true sign or become 0 for a truly nonzero value.
+
+For example, in units of $u = 2^{-53}$ (the floating-point spacing near $1/2$), take:
+
+$$
+a = \bigl(\tfrac12 + i u,\; \tfrac12 + j u\bigr), \quad b = (s, s), \quad c = (2s, 2s) \qquad (0 \le i, j < 64)
+$$
+
+The coordinates of $a$ are representable without rounding, and the true value is $\operatorname{orient2d}(a, b, c) = s\,u\,(j - i)$, so its sign equals that of $j - i$ and only the diagonal $i = j$ gives `Zero`.
+But in the naive expression $(b_x - a_x)(c_y - a_y) - (b_y - a_y)(c_x - a_x)$, low bits of $iu$ and $ju$ are lost while computing $b - a$ and $c - a$.
+Larger $s$ makes floating-point spacing near $b - a$ coarser relative to $u$, losing more information about the perturbation of $a$.
+Which $(i, j)$ produce zero or reversed signs depends on rounding of differences and products and is not monotonic in $s$.
+
+## Floating-point filtering and exact evaluation
+
+Predicates determine signs in two stages.
+
+1. **Floating-point filter.**
+   When every coordinate is zero or has absolute value in $[2^{-100}, 2^{100}]$, Shewchuk's stage-A formulas compute approximate determinant $\hat D$ and permanent $\hat P$ in `f64`.
+   Computation uses a matrix of differences translating the last point to the origin, so no column of ones appears.
+   With $u = 2^{-53}$, return the sign of $\hat D$ if $\lvert \hat D\rvert > c\,u\,\hat P$.
+   The coefficient $c$ is $3 + 16u$ for `orient2d`, $7 + 56u$ for `orient3d`, $10 + 96u$ for `incircle`, and $16 + 224u$ for `insphere`; $\lvert \hat D - D\rvert$ is proven not to exceed $c\,u\,\hat P$.
+   Restricting coordinate ranges prevents intermediate overflow and subnormals, so the error-bound proof applies directly.
+2. **Exact evaluation.**
+   If the filter cannot establish the sign (out-of-range coordinates or $\lvert \hat D\rvert$ not exceeding the bound), each coordinate is split into an integer significand times a power of two, and the determinant is accumulated exactly as a sum of Leibniz monomials.
+   Monomials containing a zero coordinate are skipped.
+   Positive and negative terms are added to separate fixed-length fixed-point arrays, which are compared at the end to determine the sign.
+   Array length is bounded by coordinate exponent ranges and term count, so evaluation runs on the stack without allocation.
+   Positive, negative, and exact zero are distinguished, giving correct signs for all finite `f32` and `f64` inputs, including subnormals.
+
+It does not use Shewchuk's adaptive B and C stages that progressively extend nonoverlapping floating-point expansions; an inconclusive filter proceeds directly to exact evaluation.
+The filter resolves most inputs; nearly degenerate configurations and out-of-range coordinates require exact evaluation.
+The filter never establishes `Zero`; `Zero` always comes from exact evaluation.
+
+These signs refer to the represented floating-point coordinates.
+Uncertainty in the shape before measurement or coordinate rounding remains; nearly collinear rounded points receive the sign of their rounded coordinates.
+Small values are not replaced by 0 using a tolerance, so the calling algorithm determines degeneracy handling, such as symbolic perturbation.
+
+## N-dimensional simplex predicates and workspaces
+
+Use `SimplexPredicateWorkspace` to determine simplex orientation in arbitrary dimension $d$.
+`SimplexPredicateWorkspace::new(d, max_terms)` constructs a workspace; `workspace.orient(&vertices)` returns the following for $d + 1$ vertices $v_0, \ldots, v_d$:
+
+$$
+\operatorname{sign} \det(v_1 - v_0, \ldots, v_d - v_0)
+$$
+
+This sign agrees with `orient2d` in two dimensions and opposes `orient3d` in three (because `Negative` of `orient3d` corresponds to right-handed positive volume).
+
+Exact evaluation expands the determinant into $(d + 1)!$ Leibniz terms, whose count grows rapidly with dimension ($3.6 \times 10^6$ terms at $d = 9$).
+`new` checks once at construction that the caller's term limit `max_terms` ([`Budget`](../../../scioxide-core/api/domains-tolerances-budgets/)) is at least $(d + 1)!$, returning `InvalidInput` otherwise.
+This limit is not an amount consumed on each call.
+The construction-time check ensures that each later exact evaluation by `orient` has at most $(d + 1)!$ terms.
+$d = 0$ also gives `InvalidInput`; size-computation overflow gives `SizeOverflow`, and workspace allocation failure gives `AllocationFailure`.
+The workspace holds $O(d^2 + 2^{\min(d + 1,\,10)})$ values; `orient` does not allocate.
+
+The floating-point filter is used when matrix order $d + 1$ is at most 10 and every coordinate is zero or has absolute value in $[2^{-40}, 2^{40}]$.
+The filter uses a recurrence computing each column-subset minor once, obtaining approximate determinant $\hat D$ and permanent $\hat P$ in $O((d + 1)\,2^{d + 1})$ operations.
+Error analysis gives $\lvert \hat D - D\rvert < 512\,u\,\hat P$, so it returns the sign of $\hat D$ when $\lvert \hat D\rvert > 512\,u\,\hat P$.
+Other cases and inconclusive signs use exact evaluation.
+A vertex count other than $d + 1$ or coordinate count other than $d$ returns `DimensionMismatch`; non-finite coordinates return `NonFinite`.
+
+## Naive and exact signs for three nearly collinear points
+
+The next cell compares naive `f64` determinant signs and `orient2d` signs with true sign $\operatorname{sign}(j - i)$ for the $64 \times 64$ configurations $a = (\tfrac12 + iu, \tfrac12 + ju)$, $b = (s, s)$, and $c = (2s, 2s)$ above.
+Two heatmaps use horizontal axis $i$ and vertical axis $j$, display signs with $-1, 0, 1$ colors, and share color range $[-1, 1]$.
+The correct plot is positive ($j > i$) above diagonal $i = j$, negative below, and zero only on the diagonal.
+The table shows counts for each method: signs matching the truth, false zeros for truly nonzero values, and reversed signs.
+
+```rust
+//| id: spatial-near-collinear-signs
+//| ref: spatial-near-collinear-signs
+//| title: "Compare naive determinant and orient2d signs for three nearly collinear points"
+//| run: reactive
+//| crates: [scioxide-spatial]
+//| outputLayout: columns
+//| inputs:
+//|   far_scale: {"type":"range","label":"Distant-point position s [-]","description":"b = (s, s), c = (2s, 2s)","min":4,"max":64,"step":4,"value":12}
+//| cases:
+//|   - {"id":"far","label":"s = 64","description":"The naive determinant has no sign reversals but incorrectly gives zero in 1986 cases. orient2d remains correct.","inputs":{"far_scale":64}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"counts","path":"/rows/1/1","equals":4096}
+//|       - {"artifact":"counts","path":"/rows/1/2","equals":0}
+//|       - {"artifact":"counts","path":"/rows/1/3","equals":0}
+//|       - {"artifact":"counts","path":"/rows/0/1","equals":1932}
+//|       - {"artifact":"counts","path":"/rows/0/3","equals":112}
+//|   - case: far
+//|     expect:
+//|       - {"artifact":"counts","path":"/rows/1/1","equals":4096}
+//|       - {"artifact":"counts","path":"/rows/0/2","equals":1986}
+//|       - {"artifact":"counts","path":"/rows/0/3","equals":0}
+use scioxide_spatial::{PredicateSign, orient2d};
+
+// u = 2⁻⁵³ is the floating-point spacing near 1/2; a's coordinates are representable without rounding.
+let u = f64::EPSILON / 2.0;
+let (b, c) = ([far_scale, far_scale], [2.0 * far_scale, 2.0 * far_scale]);
+let sign_of = |x: f64| {
+    if x > 0.0 {
+        PredicateSign::Positive
+    } else if x < 0.0 {
+        PredicateSign::Negative
+    } else {
+        PredicateSign::Zero
+    }
+};
+let level = |sign: PredicateSign| match sign {
+    PredicateSign::Negative => -1.0,
+    PredicateSign::Zero => 0.0,
+    PredicateSign::Positive => 1.0,
+};
+
+// counts[method] = (matches, false zeros, sign reversals). Method 0 is the naive formula; 1 is orient2d.
+let mut counts = [(0_usize, 0_usize, 0_usize); 2];
+let (mut naive_map, mut exact_map) = (Vec::new(), Vec::new());
+for i in 0..64 {
+    for j in 0..64 {
+        let a = [0.5 + i as f64 * u, 0.5 + j as f64 * u];
+        // True sign: det = s u (j − i).
+        let truth = sign_of(j as f64 - i as f64);
+        let naive = sign_of((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]));
+        let exact = orient2d(&a, &b, &c).map_err(|e| e.to_string())?;
+        for (count, sign) in counts.iter_mut().zip([naive, exact]) {
+            count.0 += usize::from(sign == truth);
+            count.1 += usize::from(sign == PredicateSign::Zero && truth != PredicateSign::Zero);
+            count.2 += usize::from(level(sign) * level(truth) < 0.0);
+        }
+        naive_map.push([i as f64, j as f64, level(naive)]);
+        exact_map.push([i as f64, j as f64, level(exact)]);
+    }
+}
+for (map, title) in [(naive_map, "Naive f64 determinant"), (exact_map, "orient2d")] {
+    emit_chart!(serde_json::json!({
+        "kind": "heatmap",
+        "title": title,
+        "data": map,
+        "xLabel": "a_x perturbation i [u = 2⁻⁵³]",
+        "yLabel": "a_y perturbation j [u]",
+        "colorScale": "diverging",
+        "center": 0.0,
+        "colorMin": -1.0,
+        "colorMax": 1.0,
+        "tooltip": true
+    }));
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "Method" },
+    { "key": "1", "label": "Matches true sign [cases]", "type": "integer" },
+    { "key": "2", "label": "False zeros [cases]", "type": "integer" },
+    { "key": "3", "label": "Sign reversals [cases]", "type": "integer" }
+]);
+let rows = vec![
+    ("Naive f64 determinant", counts[0].0, counts[0].1, counts[0].2),
+    ("orient2d", counts[1].0, counts[1].1, counts[1].2),
+];
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "counts" })
+);
+```
+
+With default $s = 12$, the naive determinant matches the true sign in only 1932 of 4096 cases, incorrectly gives zero in 2052, and reverses the sign in 112.
+The correct plot splits into two colored triangles above and below the diagonal; the naive plot has zeros extending $\lvert i - j\rvert = 46$ from the diagonal and opposite-color points within $\lvert i - j\rvert \le 14$.
+At $s = 64$ no reversals occur, but 1986 cases become zero; at $s = 4$, matches increase to 3596.
+`orient2d` returns the true sign for all 4096 cases at every $s$, with `Zero` only for the 64 diagonal cases.
+At $s = 12$, true magnitude $s\,u\,\lvert j - i\rvert$ is at most $8.4 \times 10^{-14}$ while the filter's error bound is $3u\hat P \approx 1.9 \times 10^{-13}$ ($\hat P \approx 2 \cdot 23.5 \cdot 12 = 564$), so exact evaluation determines the sign in many configurations.
+
+## Checking sign conventions and term-count limits
+
+The next cell checks sign conventions using the unit right triangle $a = (0, 0)$, $b = (1, 0)$, $c = (0, 1)$ and unit tetrahedron $a = 0$, $b = e_1$, $c = e_2$, $d = e_3$.
+The triangle's circumcircle has center $(\tfrac12, \tfrac12)$ and radius $\sqrt2/2$; the tetrahedron's circumsphere has center $(\tfrac12, \tfrac12, \tfrac12)$ and radius $\sqrt3/2$, so query points $(t, t)$ and $(t, t, t)$ lie inside for $0 < t < 1$, on the boundary for $t = 0, 1$, and outside otherwise.
+The first table compares each predicate's sign with the geometrically expected sign, checking reversal after vertex swaps and the sign of `SimplexPredicateWorkspace`.
+The second table shows workspace-construction results with term limits $(d + 1)! - 1$ and $(d + 1)!$ in dimension $d = 1, \ldots, 5$, and the orientation of standard simplex $0, e_1, \ldots, e_d$.
+
+```rust
+//| id: spatial-predicate-sign-conventions
+//| ref: spatial-predicate-sign-conventions
+//| title: "Predicate sign conventions, vertex swaps, N-dimensional orientation, and term-count limits"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-spatial]
+//| inputs:
+//|   position: {"type":"range","label":"Query-point position t [-]","description":"Query points are (t, t) and (t, t, t)","min":-0.5,"max":1.5,"step":0.25,"value":0.5}
+//| cases:
+//|   - {"id":"on-sphere","label":"t = 1","description":"The query points lie on the circumcircle and circumsphere; incircle and insphere return exactly Zero.","inputs":{"position":1}}
+//|   - {"id":"outside","label":"t = 1.5","description":"The query points lie outside, reversing the signs from the interior case.","inputs":{"position":1.5}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"signs","path":"/rows/0/1","equals":"Positive"}
+//|       - {"artifact":"signs","path":"/rows/1/1","equals":"Positive"}
+//|       - {"artifact":"signs","path":"/rows/2/1","equals":"Positive"}
+//|       - {"artifact":"signs","path":"/rows/3/1","equals":"Negative"}
+//|       - {"artifact":"signs","path":"/rows/4/1","equals":"Negative"}
+//|       - {"artifact":"signs","path":"/rows/5/1","equals":"Positive"}
+//|       - {"artifact":"signs","path":"/rows/6/1","equals":"Negative"}
+//|       - {"artifact":"signs","path":"/rows/7/1","equals":"Positive"}
+//|       - {"artifact":"budgets","path":"/rows/2/2","equals":"InvalidInput"}
+//|       - {"artifact":"budgets","path":"/rows/2/3","equals":"Positive"}
+//|   - case: on-sphere
+//|     expect:
+//|       - {"artifact":"signs","path":"/rows/2/1","equals":"Zero"}
+//|       - {"artifact":"signs","path":"/rows/6/1","equals":"Zero"}
+//|   - case: outside
+//|     expect:
+//|       - {"artifact":"signs","path":"/rows/2/1","equals":"Negative"}
+//|       - {"artifact":"signs","path":"/rows/6/1","equals":"Positive"}
+use scioxide_core::Budget;
+use scioxide_spatial::{
+    PredicateSign, SimplexPredicateWorkspace, incircle, insphere, orient2d, orient3d,
+};
+
+use PredicateSign::{Negative, Positive, Zero};
+let t = position;
+let (a, b, c, q) = ([0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [t, t]);
+let (o, p) = ([0.0; 3], [t; 3]);
+let (x, y, z) = ([1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]);
+// Expected signs: query points are inside for 0 < t < 1 and on the boundary for t = 0, 1.
+let (inside, reversed) = if t > 0.0 && t < 1.0 {
+    (Positive, Negative)
+} else if t == 0.0 || t == 1.0 {
+    (Zero, Zero)
+} else {
+    (Negative, Positive)
+};
+let six = Budget::try_from(6).map_err(|e| e.to_string())?;
+let twenty_four = Budget::try_from(24).map_err(|e| e.to_string())?;
+let mut plane = SimplexPredicateWorkspace::new(2, six).map_err(|e| e.to_string())?;
+let mut space = SimplexPredicateWorkspace::new(3, twenty_four).map_err(|e| e.to_string())?;
+let triangle: [&[f64]; 3] = [&a, &b, &c];
+let tetrahedron: [&[f64]; 4] = [&o, &x, &y, &z];
+let (circle, circle_swapped) = (incircle(&a, &b, &c, &q), incircle(&a, &c, &b, &q));
+let (sphere, sphere_swapped) = (insphere(&o, &x, &y, &z, &p), insphere(&o, &y, &x, &z, &p));
+let rows = [
+    ("orient2d(a, b, c)", orient2d(&a, &b, &c), Positive),
+    (
+        "SimplexPredicateWorkspace d = 2",
+        plane.orient(&triangle),
+        Positive,
+    ),
+    ("incircle(a, b, c, (t, t))", circle, inside),
+    ("incircle(a, c, b, (t, t))", circle_swapped, reversed),
+    (
+        "orient3d(0, e₁, e₂, e₃)",
+        orient3d(&o, &x, &y, &z),
+        Negative,
+    ),
+    (
+        "SimplexPredicateWorkspace d = 3",
+        space.orient(&tetrahedron),
+        Positive,
+    ),
+    ("insphere(0, e₁, e₂, e₃, (t, t, t))", sphere, reversed),
+    ("insphere(0, e₂, e₁, e₃, (t, t, t))", sphere_swapped, inside),
+];
+let mut table = Vec::new();
+for (label, sign, expected) in rows {
+    let sign = sign.map_err(|e| e.to_string())?;
+    table.push((label, format!("{sign:?}"), format!("{expected:?}")));
+}
+emit_table_with_columns!(
+    ["Predicate", "Sign", "Expected sign"],
+    table,
+    metadata = serde_json::json!({ "id": "signs" })
+);
+
+// Construct workspaces with term limits (d + 1)! − 1 and (d + 1)!, then read the orientation of standard simplex 0, e₁, …, e_d.
+let mut budgets = Vec::new();
+for d in 1..=5_usize {
+    let terms: usize = (1..=d + 1).product();
+    let short = Budget::try_from(terms - 1).map_err(|e| e.to_string())?;
+    let rejected = match SimplexPredicateWorkspace::new(d, short) {
+        Ok(_) => "Accepted".to_string(),
+        Err(error) => format!("{:?}", error.kind()),
+    };
+    let budget = Budget::try_from(terms).map_err(|e| e.to_string())?;
+    let mut workspace = SimplexPredicateWorkspace::new(d, budget).map_err(|e| e.to_string())?;
+    // Vertex k is the origin for k = 0 and unit vector e_k for k ≥ 1.
+    let unit = |k: usize| (1..=d).map(|axis| f64::from(u8::from(k == axis))).collect();
+    let vertices: Vec<Vec<f64>> = (0..=d).map(unit).collect();
+    let views: Vec<&[f64]> = vertices.iter().map(Vec::as_slice).collect();
+    let sign = workspace.orient(&views).map_err(|e| e.to_string())?;
+    budgets.push((d, terms, rejected, format!("{sign:?}")));
+}
+let budget_columns = serde_json::json!([
+    { "key": "0", "label": "Dimension d", "type": "integer" },
+    { "key": "1", "label": "(d + 1)! [terms]", "type": "integer" },
+    { "key": "2", "label": "new with limit (d + 1)! − 1" },
+    { "key": "3", "label": "orient with limit (d + 1)!" }
+]);
+emit_table_with_columns!(
+    budget_columns,
+    budgets,
+    metadata = serde_json::json!({ "id": "budgets" })
+);
+```
+
+With default $t = 0.5$, query points lie inside the circumcircle and circumsphere; `incircle` of the counterclockwise triangle returns `Positive`.
+The unit tetrahedron has `orient3d` equal to `Negative`, so `insphere` for an interior point also gives `Negative`; swapping $e_1$ and $e_2$ reverses both signs.
+`SimplexPredicateWorkspace` returns `Positive` in two dimensions, matching `orient2d`, and `Positive` in three dimensions, opposite to `orient3d`.
+At $t = 1$, query points lie on the circle and sphere; `incircle` and `insphere` return exactly `Zero`.
+In the second table, a limit just one term short of $(d + 1)!$ makes `new` return `InvalidInput`; exactly $(d + 1)!$ is accepted and the standard-simplex orientation is `Positive`.
+
+## Summary
+
+Determine orientation and circle/sphere membership using exact signs from `orient2d`, `orient3d`, `incircle`, and `insphere`, rather than rounded areas or circumcenter coordinates.
+`orient3d` follows Shewchuk's convention, assigning `Positive` to $d$ below $a, b, c$; right-handed positive volume corresponds to `Negative`, and `insphere` membership must be read together with the sign of `orient3d(a, b, c, d)`.
+Coordinates in $[2^{-100}, 2^{100}]$ first use a floating-point filter with an error bound; inconclusive signs are resolved by fixed-length exact expansion without allocation, avoiding the false zeros and reversals of naive determinants even near degeneracy.
+`Zero` is returned only for truly degenerate inputs, so algorithms decide collinearity and cocircularity handling, such as symbolic perturbation.
+Use `SimplexPredicateWorkspace` for arbitrary-dimensional orientation; checking term limit $(d + 1)!$ during construction makes subsequent tests allocation-free.
+
+## Further reading
+
+- [Convex hulls, Delaunay triangulations, and Voronoi diagrams](../delaunay-voronoi-and-hulls/): examine using these predicates to determine hull and Delaunay faces and resolve degeneracies such as cocircularity with symbolic perturbation.
+- [Simplex meshes](../simplex-meshes/): examine exact-predicate validation of cell orientations during simplex-mesh construction.
+- [Neighbor search with KD trees](../spatial-trees-and-distance/): examine rounding safety factors in searches comparing distance magnitudes rather than signs.

@@ -1,0 +1,830 @@
+---
+title: "FIR filter design and conversion to minimum phase"
+description: "The four linear-phase FIR types, design by window methods, frequency sampling, weighted least squares, and Remez exchange, checking equiripple behavior with the alternation theorem, and cepstral conversion to minimum phase."
+sidebar:
+  order: 315
+references:
+  signal-fir-linear-phase-types: "linear-phase-and-the-four-types"
+  signal-fir-window-method: "window-method"
+  signal-fir-frequency-sampling: "frequency-sampling"
+  signal-fir-least-squares: "weighted-least-squares"
+  signal-fir-remez: "remez-exchange-method"
+  signal-fir-applying: "applying-the-designed-coefficients"
+  signal-minimum-phase: "conversion-to-minimum-phase"
+---
+
+A finite impulse response (FIR) filter takes $n$ coefficients (taps) $h[0], \dots, h[n-1]$ and input $x$ and produces
+
+$$
+y[k] = \sum_{i=0}^{n-1} h[i]\, x[k-i]
+$$
+
+
+FIR design seeks $h$ whose frequency response approximates the desired amplitude specified for each band.
+This page covers the meaning of the linear-phase constraint, the quantities minimized by four design methods, interpreting Remez exchange termination status, and converting designed coefficients to minimum phase.
+
+Frequency $f$ is a ratio to the Nyquist frequency; $f = 1$ corresponds to half the sampling rate.
+Angular frequency is $\omega = \pi f$ [rad/sample].
+The frequency response evaluated at $z = e^{i\pi f}$ is
+
+$$
+H(f) = \sum_{i=0}^{n-1} h[i]\, e^{-i\pi f i}
+$$
+
+and `FirDesign::response(f)` computes this sum directly.
+Frequency unit conventions are shared throughout the chapter and collected in the [mathematics and algorithms overview](../).
+
+## Linear phase and the four types
+
+Let $c = (n-1)/2$.
+For even-symmetric coefficients $h[i] = h[n-1-i]$, write $H(f) = e^{-i\pi f c} A(f)$; for odd-symmetric coefficients $h[i] = -h[n-1-i]$, write $H(f) = i\, e^{-i\pi f c} A(f)$.
+Here $A(f)$ is the real **zero-phase amplitude**: $A(f) = \sum_i h[i] \cos(\pi f (c-i))$ for even symmetry and $A(f) = \sum_i h[i] \sin(\pi f (c-i))$ for odd symmetry.
+Since phase is linear in $f$, every frequency is delayed by the same $c$ samples.
+This property is called **linear phase** and is a primary reason to choose FIR when preserving waveform shape matters.
+
+Symmetry (`FirSymmetry::Even` or `Odd`) combined with the parity of $n$ determines four types.
+
+| Symmetry | Odd $n$ | Even $n$ |
+|---|---|---|
+| Even symmetry `Even` | Type I | Type II, $A(1) = 0$ |
+| Odd symmetry `Odd` | Type III, $A(0) = A(1) = 0$ | Type IV, $A(0) = 0$ |
+
+The cosine and sine values explain these forced zeros.
+For type II, $c - i$ is a half-integer, so $\cos(\pi(c-i)) = 0$ at $f = 1$.
+Odd symmetry gives $\sin 0 = 0$ at $f = 0$; for type III, $c - i$ is an integer, so $\sin(\pi(c-i)) = 0$ also at $f = 1$.
+Every design function returns `InvalidInput` if a nonzero desired amplitude is specified at a forced zero.
+Thus type I or IV suits high-pass filters, type III suits Hilbert transformers, and type IV suits differentiators.
+
+The number of independent coefficients $m$ is $\lceil n/2 \rceil$ for even symmetry and $\lfloor n/2 \rfloor$ for odd symmetry.
+Odd symmetry with $n = 1$ allows no coefficients and produces `InvalidInput`.
+
+Specify bands with `FirBand::new(lower, upper, desired_lower, desired_upper)`.
+On the closed interval $[\mathrm{lower}, \mathrm{upper}]$, desired zero-phase amplitude $D(f)$ varies linearly from `desired_lower` to `desired_upper`.
+Use `with_weight` to assign a positive weight $W$ (default 1).
+Intervals between bands are unconstrained transition bands.
+Empty bands, endpoints outside $[0, 1]$, `lower` ≥ `upper`, nonpositive weights, or bands not ordered increasingly produce `InvalidInput`; nonfinite values produce `NonFinite`.
+
+The design result `FirDesign` holds coefficients in convolution order (`coefficients`), symmetry, termination status (`termination`, `is_success`), exchange iterations (`iterations`), Remez weighted ripple (`weighted_ripple`) and final reference points (`extrema`), and a least-squares condition estimate (`condition_estimate`).
+`termination()` is the single authoritative design termination value; direct designs (window methods, frequency sampling, least squares) return `FirTermination::Completed` with zero iterations.
+`Completed` indicates only completion, without an accuracy claim.
+
+The following definitions block computes zero-phase amplitude $A(f)$ by direct summation of the formulas above, for independent checks in two cells on this page.
+It costs $O(n)$ per $f$ and is a reference calculation using `f64` intrinsic `cos` and `sin` methods.
+
+```rust
+//| id: signal-fir-amplitude
+//| kind: definitions
+//| title: "Zero-phase amplitude of a linear-phase FIR (reference direct summation)"
+//| crates: [scioxide-signal]
+/// Zero-phase amplitude A(f). Even symmetry: Σ h[i] cos(πf(c − i)); odd symmetry: Σ h[i] sin(πf(c − i)).
+/// f is the Nyquist ratio, c = (n − 1)/2. A reference calculation using f64 intrinsic methods.
+pub(crate) fn zero_phase_amplitude(taps: &[f64], antisymmetric: bool, f: f64) -> f64 {
+    let center = 0.5 * (taps.len() as f64 - 1.0);
+    taps.iter()
+        .enumerate()
+        .map(|(i, &h)| {
+            let angle = std::f64::consts::PI * f * (center - i as f64);
+            if antisymmetric {
+                h * angle.sin()
+            } else {
+                h * angle.cos()
+            }
+        })
+        .sum()
+}
+```
+
+## Window method
+
+An ideal low-pass filter (1 for $|f| \le f_c$, 0 elsewhere) has impulse response $\sin(\pi f_c k)/(\pi k)$, extending infinitely in both directions.
+The window method truncates the impulse response of an ideal response with bandwise constant desired amplitude $D_b$ to $n$ elements around center $c$, then applies a symmetric length-$n$ window $w$.
+For even symmetry,
+
+$$
+h[i] = w[i] \sum_b D_b \int_{l_b}^{u_b} \cos\bigl(\pi (c-i) f\bigr)\, df
+$$
+
+and for odd symmetry, replace cosine with sine ($[l_b, u_b]$ denotes the endpoints of band $b$).
+The integrals are computed in closed form, so $B$ bands cost $O(nB)$ plus window computation.
+
+The window method `design_fir_window(n, symmetry, bands, window, normalization)` ignores band weights and treats the desired amplitude between bands as zero.
+Bands with varying desired amplitude (`desired_lower` ≠ `desired_upper`) produce `InvalidInput` (`UnsupportedConfiguration`).
+Truncation corresponds to convolution with the window spectrum in frequency, so ripple near the cutoff depends mainly on the window family; increasing $n$ narrows the transition band.
+[Window functions and DPSS](../windows-and-dpss/) covers window families and properties.
+
+`FirNormalization::At { frequency, gain }` scales all coefficients after design to give $A(\mathrm{frequency}) = \mathrm{gain}$.
+For low-pass filters, `frequency: 0.0, gain: 1.0` sets DC gain to 1.
+A frequency outside $[0, 1]$ produces `InvalidInput`; zero amplitude at that frequency (including a type's forced zero) produces `DomainError`.
+`FirNormalization::None` leaves the scale unchanged.
+
+## Frequency sampling
+
+Frequency sampling `design_fir_frequency_sampling(n, symmetry, frequencies, amplitudes, mesh_size, window, normalization)` uses the piecewise-linear curve through nodes $(f_j, a_j)$ as desired amplitude $A(f)$.
+Nodes increase strictly from 0 to 1 and include both 0 and 1.
+It samples the linear-phase response $H_k = e^{-i\pi f_k c} A(f_k)$ (multiplied by $i$ for odd symmetry) on the length-$N$ (`mesh_size`) grid $f_k = 2k/N$, takes the first $n$ elements of a length-$N$ real inverse DFT, imposes symmetry, and applies a window.
+Setting the window to `None` gives a rectangular window.
+The computational cost is $O(N \log N)$.
+
+It matches the desired amplitude on grid points but does not control the response between them.
+$N$ must be even and at least $2n$; otherwise `InvalidInput` results.
+When $N$ is small relative to $n$, the ideal impulse response wraps in time.
+
+## Weighted least squares
+
+Weighted least squares `design_fir_least_squares(n, symmetry, bands)` minimizes the integrated squared error over the bands:
+
+$$
+E = \sum_b W_b \int_{l_b}^{u_b} \bigl(A(f) - D_b(f)\bigr)^2\, df
+$$
+
+
+Since $A$ is linear in $m$ independent coefficients, minimizing $E$ gives $m \times m$ normal equations.
+Their coefficients are integrals of cosine products, computed in closed form.
+Assembly costs $O(m^2 B)$, and solution with column-pivoted Householder QR costs $O(m^3)$.
+
+`condition_estimate()` returns an estimate of the 1-norm condition number of these normal equations.
+Wider transition bands and larger $m$ make the band-restricted cosine basis functions more alike, increasing the condition number.
+The estimate does not guarantee solution error.
+Numerical rank deficiency in the normal equations produces `NumericalInstability` (`LossOfSignificance`); underflow of the minimum-to-maximum weight ratio produces `NumericalInstability` (`Underflow`).
+Least-squares design reduces error energy but can leave large error peaks near the cutoff.
+
+## Remez exchange method
+
+The Remez exchange method (Parks–McClellan method) `design_fir_remez(n, symmetry, bands)` minimizes the maximum weighted error:
+
+$$
+\delta = \max_b \max_{f \in [l_b, u_b]} W_b \bigl| A(f) - D_b(f) \bigr|
+$$
+
+This is minimax approximation.
+
+For type I, $A(f) = \sum_{k=0}^{m-1} a_k \cos(k \pi f)$; setting $x = \cos(\pi f)$ makes $A$ a degree-$m-1$ polynomial in $x$.
+For types II–IV, factor $A(f) = Q(f) P(f)$, where $Q(f)$ is one of $\cos(\pi f/2)$, $\sin(\pi f)$, or $\sin(\pi f/2)$ and $P$ is a polynomial in $x$.
+Approximating $D/Q$ with weight $W Q$ turns every type into weighted polynomial minimax approximation.
+
+The **alternation theorem** (Chebyshev alternation theorem) states that the best approximation is unique and characterized by the following property.
+The bands contain at least $m + 1$ frequencies $f_0 < f_1 < \dots < f_m$ where weighted error $E(f) = W(f)\bigl(A(f) - D(f)\bigr)$ takes $\pm\delta$ with alternating signs.
+Since every error extremum has the same magnitude, this design is called **equiripple**.
+
+The exchange method satisfies this property iteratively.
+It builds a grid on the bands with spacing at most $1/((m+1) \cdot \mathrm{grid\_density})$, excluding the type's forced-zero points.
+Initial reference points divide the equilibrium measure on the bands (the asymptotic distribution of alternation points) equally.
+Each iteration computes $\delta$ by a barycentric formula so $E$ alternates between $\pm\delta$ at reference points, and represents the polynomial through reference values $D \mp \delta/W$ with barycentric interpolation.
+It then evaluates grid errors and selects alternating extrema of magnitude at least $|\delta|$ as new reference points.
+No dense linear system is solved, so each iteration costs $O(m^2 + gm)$ for $g$ grid points and uses $O(g + m)$ memory; `condition_estimate()` is `None`.
+
+When the spread of alternating errors (maximum minus minimum) meets tolerance, termination status is `FirTermination::Converged`.
+Reaching the iteration limit gives `IterationLimit`; failing to find $m + 1$ alternating grid extrema of magnitude at least $|\delta|$ gives `ExchangeStalled`.
+`weighted_ripple()` is the maximum weighted error measured on the grid, an estimate over the continuous bands rather than an upper bound.
+
+`RemezOptions` holds the iteration limit (default 64), grid density (default 32 points per independent coefficient per unit normalized frequency), and tolerance for the alternating error spread (default absolute $16\varepsilon$ and relative $\sqrt{\varepsilon}$, where $\varepsilon$ is machine epsilon).
+An iteration limit of 0 or grid density below 16 produces `InvalidInput`.
+There are three call forms.
+
+- `design_fir_remez` designs with default `RemezOptions` and returns `ConvergenceFailure` (`IterationLimit` or `Stagnation`) on nonconvergence.
+- `design_fir_remez_with_options` accepts `RemezOptions` and returns the final finite coefficients in `Ok` even on nonconvergence.
+  Treat coefficients as approximations when `termination()` is `IterationLimit` or `ExchangeStalled`.
+- `design_fir_remez_scoped` accepts an execution context or an outer solver's `SolveContext` as its final argument and counts exchange iterations against that scope's limit.
+  Reaching the scope limit produces `ConvergenceFailure`; cancellation and deadline expiry produce `ExecutionStopped`.
+
+`InvalidInput` results if a band has no grid points other than forced zeros, bands cannot be separated on the grid, or there are fewer than $m + 1$ grid points.
+
+## Comparing four design methods
+
+The next cell designs a type-I low-pass filter with the same specifications using four methods: 1 in passband $[0, 0.3]$ and 0 in stopband $[0.4, 1]$.
+The window method uses a Hamming window and ideal cutoff 0.35 at the transition-band midpoint; frequency sampling uses a length-1024 grid and rectangular window, with both normalizing DC gain to 1.
+Inputs are coefficient count $n$ and stopband weight $W$; the weight affects only least squares and Remez.
+Using direct sums from the definitions block on a grid with $\Delta f = 1/4000$, the table shows maximum passband deviation $\max|A - 1|$, maximum stopband amplitude $\max|A|$ and attenuation, maximum weighted error $\delta$, weighted integrated squared error $E$ from the trapezoidal rule, and the condition estimate.
+Remez minimizes $\delta$ and least squares minimizes $E$, so each should have the smallest value in its respective column.
+The plot shows magnitude response $|H|$ on a logarithmic axis, with vertical lines marking transition-band edges.
+
+```rust
+//| id: signal-fir-design-comparison
+//| ref: signal-fir-design-comparison
+//| title: "Design low-pass FIR filters with identical specifications using four methods"
+//| run: reactive
+//| uses: [signal-fir-amplitude]
+//| crates: [scioxide-signal]
+//| inputs:
+//|   taps: {"type":"range","label":"Coefficient count n","description":"Choose only odd values for type I.","min":21,"max":81,"step":4,"value":41}
+//|   stop_weight: {"type":"range","label":"Stopband weight W [-]","description":"Increase the importance of stopband error in least squares and Remez.","min":1,"max":30,"step":1,"value":10}
+//| cases:
+//|   - {"id":"short-equal-weight","label":"n = 21, W = 1","description":"With few coefficients and equal weights, every method has large errors near the transition band.","inputs":{"taps":21,"stop_weight":1}}
+//|   - {"id":"long","label":"n = 81, W = 10","description":"More coefficients deepen stopband attenuation and increase the least-squares condition number.","inputs":{"taps":81}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/3/1","equals":"Converged"}
+//|       - {"artifact":"methods","path":"/rows/3/5","approx":{"value":2.9779e-2,"rtol":1e-3}}
+//|       - {"artifact":"methods","path":"/rows/3/4","approx":{"value":50.52,"atol":0.05}}
+//|       - {"artifact":"methods","path":"/rows/2/6","approx":{"value":2.849e-5,"rtol":1e-3}}
+//|       - {"artifact":"methods","path":"/rows/3/6","approx":{"value":1.587e-4,"rtol":1e-3}}
+//|       - {"artifact":"methods","path":"/rows/2/7","approx":{"value":792.77,"rtol":1e-4}}
+//|       - {"artifact":"methods","path":"/rows/0/4","approx":{"value":22.16,"atol":0.05}}
+//|       - {"artifact":"methods","path":"/rows/0/7","equals":null}
+//|   - case: short-equal-weight
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/3/5","approx":{"value":5.555e-2,"rtol":1e-3}}
+//|       - {"artifact":"methods","path":"/rows/2/7","approx":{"value":16.94,"rtol":1e-3}}
+//|   - case: long
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/3/4","approx":{"value":80.19,"atol":0.05}}
+//|       - {"artifact":"methods","path":"/rows/2/4","approx":{"value":64.56,"atol":0.05}}
+//|       - {"artifact":"methods","path":"/rows/1/4","approx":{"value":32.03,"atol":0.05}}
+//|       - {"artifact":"methods","path":"/rows/2/7","approx":{"value":2.993e5,"rtol":1e-3}}
+use scioxide_signal::{
+    FirBand, FirDesign, FirNormalization, FirSymmetry, WindowKind,
+    design_fir_frequency_sampling, design_fir_least_squares, design_fir_remez,
+    design_fir_window,
+};
+
+let n = taps.round() as usize;
+let (pass_edge, stop_edge) = (0.3, 0.4);
+let bands = [
+    FirBand::new(0.0, pass_edge, 1.0, 1.0),
+    FirBand::new(stop_edge, 1.0, 0.0, 0.0).with_weight(stop_weight),
+];
+// The window method ignores weights. Place the ideal cutoff at the transition-band midpoint and set DC gain to 1
+let ideal = [FirBand::new(0.0, 0.5 * (pass_edge + stop_edge), 1.0, 1.0)];
+let unit_dc = FirNormalization::At {
+    frequency: 0.0,
+    gain: 1.0,
+};
+let even = FirSymmetry::Even;
+let knots = [0.0, pass_edge, stop_edge, 1.0];
+let designs: Vec<(&str, FirDesign<f64>)> = vec![
+    (
+        "Window method (Hamming)",
+        design_fir_window(n, even, &ideal, WindowKind::Hamming, unit_dc)
+            .map_err(|e| e.to_string())?,
+    ),
+    (
+        "Frequency sampling",
+        design_fir_frequency_sampling(
+            n,
+            even,
+            &knots,
+            &[1.0, 1.0, 0.0, 0.0],
+            1024,
+            None,
+            unit_dc,
+        )
+        .map_err(|e| e.to_string())?,
+    ),
+    (
+        "Weighted least squares",
+        design_fir_least_squares(n, even, &bands).map_err(|e| e.to_string())?,
+    ),
+    (
+        "Remez exchange method",
+        design_fir_remez(n, even, &bands).map_err(|e| e.to_string())?,
+    ),
+];
+
+// Independent check: evaluate A(f) by direct summation and measure bandwise errors (integrate E with the trapezoidal rule)
+let step = 1.0 / 4000.0;
+let mut rows = Vec::new();
+let mut series = Vec::new();
+for (name, design) in &designs {
+    let h = design.coefficients();
+    let (mut pass_dev, mut stop_max, mut energy) = (0.0_f64, 0.0_f64, 0.0);
+    for (lower, upper, desired, weight) in [
+        (0.0, pass_edge, 1.0, 1.0),
+        (stop_edge, 1.0, 0.0, stop_weight),
+    ] {
+        let count = ((upper - lower) / step).round() as usize;
+        for j in 0..=count {
+            let error = zero_phase_amplitude(h, false, lower + j as f64 * step) - desired;
+            let end = if j == 0 || j == count { 0.5 } else { 1.0 };
+            energy += end * step * weight * error * error;
+            if desired == 1.0 {
+                pass_dev = pass_dev.max(error.abs());
+            } else {
+                stop_max = stop_max.max(error.abs());
+            }
+        }
+    }
+    let attenuation = -20.0 * scioxide_core::RealScalar::log10(stop_max);
+    let weighted = pass_dev.max(stop_weight * stop_max);
+    let termination = format!("{:?}", design.termination());
+    rows.push((
+        name.to_string(),
+        termination,
+        pass_dev,
+        stop_max,
+        attenuation,
+        weighted,
+        energy,
+        design.condition_estimate(),
+    ));
+    let points: Vec<[f64; 2]> = (0..=800)
+        .map(|i| i as f64 / 800.0)
+        .map(|f| [f, zero_phase_amplitude(h, false, f).abs()])
+        .filter(|p| p[1] > 0.0)
+        .collect();
+    series.push(serde_json::json!({ "name": name, "points": points }));
+}
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed1 = serde_json::json!({ "fractionDigits": 1 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Method" },
+    { "key": "1", "label": "Termination status" },
+    { "key": "2", "label": "Maximum passband deviation [-]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "Maximum stopband amplitude [-]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "Stopband attenuation [dB]", "type": "number", "format": fixed1 },
+    { "key": "5", "label": "Maximum weighted error δ [-]", "type": "number", "format": sci3 },
+    { "key": "6", "label": "Weighted squared error E [-]", "type": "number", "format": sci3 },
+    { "key": "7", "label": "Condition estimate [-]", "type": "number", "format": sci3, "nullText": "Not solved" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "methods" })
+);
+emit_chart!(serde_json::json!({
+    "kind": "line",
+    "dataZoom": true,
+    "tooltip": true,
+    "series": series,
+    "xLabel": "Frequency f [Nyquist ratio]",
+    "yLabel": "Magnitude |H| [-]",
+    "yType": "log",
+    "yMin": 1e-6,
+    "yMax": 2.0,
+    "annotations": [
+        { "kind": "line", "axis": "x", "value": pass_edge, "label": "Passband edge" },
+        { "kind": "line", "axis": "x", "value": stop_edge, "label": "Stopband edge" }
+    ]
+}));
+```
+
+With the default $n = 41$ and $W = 10$, Remez has maximum weighted error $\delta = 2.98 \times 10^{-2}$, the smallest of the four, and stopband attenuation 50.5 dB.
+Maximum passband deviation $2.98 \times 10^{-2}$ equals ten times maximum stopband amplitude $2.98 \times 10^{-2}$ because the weighted error is equiripple.
+In contrast, least squares has the smallest weighted squared error $E$ at $2.85 \times 10^{-5}$, while Remez gives $1.59 \times 10^{-4}$, about 5.6 times larger.
+The two methods optimize different criteria; the preferred one depends on whether specifications use maximum error or error energy.
+The window method (22.2 dB) and frequency sampling (26.3 dB) ignore weights and give shallower stopband attenuation.
+
+Setting $n = 81$ deepens stopband attenuation to 53.6 dB for the window method, 64.6 dB for least squares, and 80.2 dB for Remez.
+Frequency sampling remains at 32.0 dB.
+With a rectangular window, ripple between grid points persists regardless of $n$.
+The least-squares normal-equation condition estimate increases from $16.9$ at $n = 21$ and $W = 1$ to $3.0 \times 10^{5}$ at $n = 81$.
+In the plot's stopband, Remez amplitude peaks align in height, while other methods' peaks decrease away from the cutoff.
+
+## Checking equiripple behavior with the alternation theorem
+
+The next cell checks the alternation theorem's conditions for the Remez result independently of the design.
+Choose from four designs.
+
+- Low-pass (type I): 1 in passband $[0, 0.2]$ and 0 in stopband $[0.3, 1]$ (weight 10)
+- Band-pass (type I): 0 on $[0, 0.15]$ and $[0.65, 1]$, 1 on $[0.25, 0.55]$
+- Hilbert transformer (type III): 1 on $[0.05, 0.95]$
+- Differentiator (type IV): $D(f) = \pi f$ on $[0, 0.9]$ (amplitude $\omega$ of $H = i\omega$)
+
+Inputs are independent coefficient count $m$ and iteration limit; $n$ is chosen by type as $2m - 1$ (I), $2m + 1$ (III), or $2m$ (IV).
+The options-based form `design_fir_remez_with_options` returns the final coefficients even when the iteration limit is reached.
+The check evaluates the bands on a dense grid with $\Delta f = 10^{-4}$ and extracts extrema of weighted error $E(f)$ whose magnitudes are at least 99% of the maximum.
+It counts whether there are at least $m + 1$ extrema with alternating signs, as required by the alternation theorem.
+The table also shows the relative difference between the grid ripple returned by the design and the maximum error measured on the dense grid.
+Dashed lines show $\pm$`weighted_ripple()`; markers show errors at the final reference points `extrema()`.
+The cell's final outcome comes from `FirTermination` (satisfied for `Converged`; partial for `IterationLimit` and `ExchangeStalled`, which return the final coefficients).
+
+```rust
+//| id: signal-fir-remez-alternation
+//| ref: signal-fir-remez-alternation
+//| title: "Check Remez equiripple behavior by counting alternation points"
+//| run: reactive
+//| uses: [signal-fir-amplitude]
+//| crates: [scioxide-signal]
+//| inputs:
+//|   design: {"type":"select","label":"Design","description":"Choose a combination of bands and type.","options":["Low-pass (type I)","Band-pass (type I)","Hilbert transformer (type III)","Differentiator (type IV)"],"value":"Low-pass (type I)"}
+//|   independent: {"type":"range","label":"Independent coefficient count m","description":"The alternation theorem requires at least m + 1 alternation points.","min":8,"max":32,"step":1,"value":16}
+//|   max_iterations: {"type":"range","label":"Iteration limit","description":"A small limit stops the exchange before convergence.","min":1,"max":64,"step":1,"value":64}
+//| cases:
+//|   - {"id":"bandpass","label":"Band-pass (type I)","description":"Alternation points span three bands.","inputs":{"design":"Band-pass (type I)"}}
+//|   - {"id":"hilbert","label":"Hilbert transformer (type III)","description":"A(0) = A(1) = 0 is forced, so place the band away from both endpoints.","inputs":{"design":"Hilbert transformer (type III)"}}
+//|   - {"id":"differentiator","label":"Differentiator (type IV)","description":"Approximate a linear desired amplitude.","inputs":{"design":"Differentiator (type IV)"}}
+//|   - {"id":"one-iteration","label":"One iteration","description":"The exchange stops at IterationLimit before completion, with too few alternation points.","inputs":{"max_iterations":1}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"alternation","path":"/rows/0/1","equals":17}
+//|       - {"artifact":"alternation","path":"/rows/0/2","equals":17}
+//|       - {"artifact":"alternation","path":"/rows/0/4","approx":{"value":8.4612e-2,"rtol":1e-4}}
+//|       - {"artifact":"alternation","path":"/rows/0/6","range":{"min":0,"max":3e-3}}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+//|   - case: bandpass
+//|     expect:
+//|       - {"artifact":"alternation","path":"/rows/0/2","equals":17}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+//|   - case: hilbert
+//|     expect:
+//|       - {"artifact":"alternation","path":"/rows/0/0","equals":33}
+//|       - {"artifact":"alternation","path":"/rows/0/2","equals":17}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+//|   - case: differentiator
+//|     expect:
+//|       - {"artifact":"alternation","path":"/rows/0/0","equals":32}
+//|       - {"artifact":"alternation","path":"/rows/0/2","equals":17}
+//|       - {"artifact":"alternation","path":"/rows/0/4","approx":{"value":7.0716e-5,"rtol":1e-3}}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+//|   - case: one-iteration
+//|     expect:
+//|       - {"artifact":"alternation","path":"/rows/0/2","range":{"min":0,"max":16}}
+//|       - {"path":"/outputs/2/state","equals":"partial"}
+//|       - {"path":"/outputs/2/status","equals":"IterationLimit"}
+use scioxide_signal::{
+    FirBand, FirSymmetry, FirTermination, RemezOptions, design_fir_remez_with_options,
+};
+
+let m = independent.round() as usize;
+let pi = std::f64::consts::PI;
+// Choose (n, symmetry, bands) for each design
+let (n, symmetry, bands) = match design.as_str() {
+    "Band-pass (type I)" => (
+        2 * m - 1,
+        FirSymmetry::Even,
+        vec![
+            FirBand::new(0.0, 0.15, 0.0, 0.0),
+            FirBand::new(0.25, 0.55, 1.0, 1.0),
+            FirBand::new(0.65, 1.0, 0.0, 0.0),
+        ],
+    ),
+    "Hilbert transformer (type III)" => (
+        2 * m + 1,
+        FirSymmetry::Odd,
+        vec![FirBand::new(0.05, 0.95, 1.0, 1.0)],
+    ),
+    "Differentiator (type IV)" => (
+        2 * m,
+        FirSymmetry::Odd,
+        vec![FirBand::new(0.0, 0.9, 0.0, 0.9 * pi)],
+    ),
+    _ => (
+        2 * m - 1,
+        FirSymmetry::Even,
+        vec![
+            FirBand::new(0.0, 0.2, 1.0, 1.0),
+            FirBand::new(0.3, 1.0, 0.0, 0.0).with_weight(10.0),
+        ],
+    ),
+};
+let options = RemezOptions::new().with_max_iterations(max_iterations.round() as usize);
+let result =
+    design_fir_remez_with_options(n, symmetry, &bands, options).map_err(|e| e.to_string())?;
+let h = result.coefficients();
+let odd = symmetry == FirSymmetry::Odd;
+let ripple = result
+    .weighted_ripple()
+    .ok_or("Remez returns a ripple value")?;
+
+// Independent check: evaluate E(f) = W (A − D) on a dense grid and collect extrema by band
+let weighted_error = |b: &FirBand<f64>, f: f64| {
+    let t = (f - b.lower()) / (b.upper() - b.lower());
+    let desired = b.desired_lower() + t * (b.desired_upper() - b.desired_lower());
+    b.weight() * (zero_phase_amplitude(h, odd, f) - desired)
+};
+let mut curves = Vec::new();
+let mut extrema: Vec<f64> = Vec::new();
+let mut largest = 0.0_f64;
+for b in &bands {
+    let count = ((b.upper() - b.lower()) / 1e-4).round() as usize;
+    let e: Vec<[f64; 2]> = (0..=count)
+        .map(|j| b.lower() + (b.upper() - b.lower()) * j as f64 / count as f64)
+        .map(|f| [f, weighted_error(b, f)])
+        .collect();
+    for j in 0..e.len() {
+        let left = if j == 0 { 0.0 } else { e[j - 1][1] };
+        let right = if j + 1 == e.len() { 0.0 } else { e[j + 1][1] };
+        let v = e[j][1];
+        if (v >= left && v >= right && v > 0.0) || (v <= left && v <= right && v < 0.0) {
+            extrema.push(v);
+        }
+        largest = largest.max(v.abs());
+    }
+    // Pass a curve subsampled every 10 points to the plot
+    curves.push(e.iter().step_by(10).copied().collect::<Vec<_>>());
+}
+// Order extrema at or above 99% by frequency; if signs repeat, retain the larger one
+let mut alternation: Vec<f64> = Vec::new();
+for &v in extrema.iter().filter(|v| v.abs() >= 0.99 * largest) {
+    match alternation.last_mut() {
+        Some(last) if last.signum() == v.signum() => {
+            *last = if v.abs() > last.abs() { v } else { *last }
+        }
+        _ => alternation.push(v),
+    }
+}
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Coefficient count n", "type": "integer" },
+    { "key": "1", "label": "Required alternation points m + 1", "type": "integer" },
+    { "key": "2", "label": "Alternation points found", "type": "integer" },
+    { "key": "3", "label": "Iterations", "type": "integer" },
+    { "key": "4", "label": "Grid ripple [-]", "type": "number", "format": sci3 },
+    { "key": "5", "label": "Dense-grid maximum error [-]", "type": "number", "format": sci3 },
+    { "key": "6", "label": "Relative difference [-]", "type": "number", "format": sci3 }
+]);
+let row = (
+    n,
+    m + 1,
+    alternation.len(),
+    result.iterations(),
+    ripple,
+    largest,
+    (largest - ripple) / ripple,
+);
+emit_table_with_columns!(
+    columns,
+    vec![row],
+    metadata = serde_json::json!({ "id": "alternation" })
+);
+
+// Overlay bandwise error curves and errors at the final reference points
+let mut layers: Vec<serde_json::Value> = curves
+    .iter()
+    .enumerate()
+    .map(|(k, e)| {
+        serde_json::json!({
+            "id": format!("band-{k}"),
+            "kind": "line",
+            "name": format!("Band {}", k + 1),
+            "points": e,
+            "style": { "showSymbol": false }
+        })
+    })
+    .collect();
+let reference: Vec<[f64; 2]> = result
+    .extrema()
+    .iter()
+    .filter_map(|&f| {
+        bands
+            .iter()
+            .find(|b| b.lower() <= f && f <= b.upper())
+            .map(|b| [f, weighted_error(b, f)])
+    })
+    .collect();
+layers.push(serde_json::json!({
+    "id": "reference",
+    "kind": "scatter",
+    "name": "Reference points",
+    "points": reference
+}));
+let dashed = serde_json::json!({ "lineType": "dashed" });
+emit_chart!(serde_json::json!({
+    "kind": "xy",
+    "xLabel": "Frequency f [Nyquist ratio]",
+    "yLabel": "Weighted error W(A − D) [-]",
+    "layers": layers,
+    "annotations": [
+        { "kind": "line", "axis": "y", "value": ripple, "label": "+δ", "style": dashed },
+        { "kind": "line", "axis": "y", "value": -ripple, "label": "−δ", "style": dashed }
+    ]
+}));
+
+let termination = result.termination();
+let outcome = if termination == FirTermination::Converged {
+    Outcome::satisfied("Alternating error spread meets tolerance")
+} else {
+    Outcome::partial("Stopped before exchange convergence")
+        .explanation("The coefficients approximate the final reference points and are not equiripple.")
+};
+emit_outcome!(
+    outcome
+        .status(format!("{termination:?}"))
+        .diagnostic("Iterations", result.iterations() as f64, None)
+        .diagnostic("Grid ripple", ripple, None)
+        .diagnostic(
+            "Missing alternation points",
+            (m + 1) as f64 - alternation.len().min(m + 1) as f64,
+            None
+        )
+);
+```
+
+The default low-pass design ($m = 16$, $n = 31$) reaches `Converged` in 4 iterations, and the dense grid yields 17 alternation points.
+This matches the alternation theorem's requirement $m + 1 = 17$.
+The grid ripple $8.461 \times 10^{-2}$ is 0.12% smaller than the maximum error $8.472 \times 10^{-2}$ measured on the dense grid.
+Grid points are slightly displaced from the true extrema, so `weighted_ripple()` slightly underestimates the maximum error on continuous bands.
+Band-pass, Hilbert transformer ($n = 33$), and differentiator ($n = 32$) designs also yield 17 alternation points, with relative differences of 0.07–0.16%.
+The differentiator ripple $7.07 \times 10^{-5}$ is small, but it is absolute error relative to $D(f) = \pi f$; relative error increases at low frequencies.
+
+Setting the iteration limit to 1 changes termination status to `IterationLimit` and the outcome to partial.
+Only one extremum then meets the 99% criterion, and error peaks have unequal heights.
+The final coefficients are returned as a finite approximation but have neither equiripple behavior nor optimality.
+
+## Applying the designed coefficients
+
+The coefficients of `FirDesign` are in convolution order.
+For one record, use `convolve(input, design.coefficients())` to obtain the full convolution of length $L + n - 1$.
+For repeated processing with the same coefficients or streaming in chunks, use the `PolyphasePlan` returned by `design.to_polyphase()`.
+Conversion costs $O(n)$ and maps coefficients to the sample type (real or complex).
+Linear-phase output is delayed by $c = (n-1)/2$ samples; subtract this delay to align its times with the input.
+[Convolution and correlation](../convolution-and-correlation/) and [Resampling](../resampling/) cover convolution conventions and streaming.
+
+## Conversion to minimum phase
+
+A filter whose $H(z) = \sum_k h[k] z^{-k}$ zeros all lie inside or on the unit circle is called **minimum phase**.
+Among causal FIR filters of the same length with identical magnitude response $|H|$, the minimum-phase filter maximizes cumulative energy $\sum_{j \le k} h[j]^2$ from the beginning for every $k$.
+It has less delay than a linear-phase filter, making it useful for real-time processing sensitive to latency.
+
+### Cepstral method
+
+For a minimum-phase sequence $h_{\min}$, the complex cepstrum $\hat h = \mathcal{F}^{-1}\{\log H_{\min}\}$ is causal (zero at negative indices).
+The real cepstrum $c = \mathcal{F}^{-1}\{\log |H|\}$ is the even part of $\hat h$, so folding $c$ onto positive indices recovers $\hat h$.
+`MinimumPhaseMethod::Homomorphic` performs this procedure on a length-$L$ FFT grid.
+
+1. Compute $c = \mathrm{IDFT}(\log M)$ from the logarithm of target magnitude $M$.
+2. Set $\hat c[0] = c[0]$, $\hat c[k] = 2c[k]$ for $0 < k < L/2$, $\hat c[L/2] = c[L/2]$, and all later entries to zero.
+3. Return the leading coefficients of $\mathrm{IDFT}(\exp(\mathrm{DFT}(\hat c)))$ and rotate so $h_{\min}[0]$ is positive real.
+
+A few length-$L$ FFTs give computational cost $O(L \log L)$.
+Finite $L$ causes cepstral wrapping, so the default $L$ is the smallest power of two at least $\max(200(N-1), N)$; the grid is not refined automatically.
+Both real and complex coefficients are accepted.
+
+Use `MinimumPhaseMethod::Hilbert` for real type-I linear-phase FIR filters of odd length at least 3 (such as equiripple designs).
+If minimum $A_{\min}$ of zero-phase amplitude $A$ is negative, it is lifted by $\delta = \max(0, -A_{\min})$; multiplying by normalization $\nu = \bigl(2/(\sqrt{A_{\max}+\delta} + \sqrt{2 - A_{\max} + \delta})\bigr)^2$ gives target magnitude $\sqrt{\nu (A + \delta)}$, and the discrete Hilbert transform of log magnitude supplies phase.
+It is limited to the `HalfLength` convention and checks input symmetry with tolerance `with_symmetry_tolerance`.
+
+### Conventions and magnitude zeros
+
+`MinimumPhaseConvention::SameLength` approximates $|H|$ with $N$ coefficients; `HalfLength` approximates $\sqrt{|H|}$ with $\lceil N/2 \rceil$ coefficients.
+For linear-phase filters, the `HalfLength` result is a minimum-phase spectral factor; passing through twice recovers the original magnitude.
+
+$\log M$ diverges at magnitude zeros.
+`SpectralZeroPolicy::Regularize { relative_floor }` replaces magnitudes whose ratio to the maximum falls below a floor with that floor (default $32\varepsilon$); `Reject { relative_threshold }` returns `InvalidInput` if any grid-point ratio is at or below the threshold.
+Thresholds and floors are limited to $(0, 1)$.
+
+### API and diagnostics
+
+The one-shot `minimum_phase(&h)` returns only coefficients with default settings (`Homomorphic`, `HalfLength`, default grid length, floor $32\varepsilon$).
+Use `minimum_phase_with_options(&h, options)` to choose the convention or grid and read diagnostics, receiving coefficients paired with `MinimumPhaseDiagnostics`.
+For repeated conversion of filters with the same length, prepare `MinimumPhasePlan::new(input_len, options)` once and pass workspace from `workspace(())` ($3L$ complex elements plus FFT workspace) to `reconstruct_into(input, output, workspace, cx)`.
+`reconstruct_into` leaves `output` unchanged on failure.
+
+Values in `MinimumPhaseDiagnostics` are grid-based estimates, not upper bounds on errors between grid points.
+
+- `fft_length()`: grid length $L$
+- `spectral_ratio()`: ratio of minimum to maximum target magnitude before flooring (0 means the grid sampled a zero)
+- `regularized_bins()` and `relative_floor()`: number of floored grid points and the floor used
+- `magnitude_error()`: maximum difference between result and target magnitudes divided by maximum target magnitude
+- `discarded_energy_fraction()`: energy fraction in omitted trailing coefficients
+- `hilbert_lift()` and `hilbert_normalization()`: $\delta$ and $\nu$ of the Hilbert method (0 and 1 for the cepstral method)
+
+Empty input produces `InvalidInput`, all-zero coefficients produce `DomainError`, an FFT length shorter than input produces `InvalidInput`, and an unrepresentable magnitude range produces `NumericalInstability`.
+
+### Converting a least-squares low-pass filter to minimum phase
+
+The next cell converts a least-squares type-I low-pass design (passband $[0, 0.3]$, stopband $[0.4, 1]$, stopband weight 10) to minimum phase with `minimum_phase_with_options`.
+Inputs are coefficient count $N$ and convention (checked selects `HalfLength`).
+As a check, direct sums compute frequency responses from the coefficients before and after conversion at 401 points; the maximum magnitude difference is shown relative to the original maximum magnitude (comparing the squared result magnitude for `HalfLength`).
+The plot compares cumulative partial energies of the minimum-phase sequence and its time reversal (a maximum-phase sequence with the same magnitude and zeros outside the unit circle).
+
+```rust
+//| id: signal-minimum-phase-fir
+//| ref: signal-minimum-phase-fir
+//| title: "Convert a linear-phase low-pass FIR to minimum phase"
+//| run: reactive
+//| crates: [scioxide-signal]
+//| inputs:
+//|   taps: {"type":"range","label":"Coefficient count N","description":"Length of an odd type-I linear-phase FIR.","min":21,"max":61,"step":4,"value":41}
+//|   half_length: {"type":"checkbox","label":"Half length (approximate √|H|)","description":"Return ⌈N/2⌉ coefficients with the HalfLength convention.","value":false}
+//| cases:
+//|   - {"id":"half-length","label":"HalfLength","description":"Approximate √|H| with 21 coefficients, increasing the magnitude difference.","inputs":{"half_length":true}}
+//|   - {"id":"short","label":"N = 21","description":"Fewer coefficients give a smaller least-squares condition number.","inputs":{"taps":21}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"conversion","path":"/rows/0/2","equals":41}
+//|       - {"artifact":"conversion","path":"/rows/0/3","equals":8192}
+//|       - {"artifact":"conversion","path":"/rows/0/5","approx":{"value":9.63e-6,"rtol":1e-2}}
+//|       - {"artifact":"conversion","path":"/rows/0/6","approx":{"value":2.11e-6,"rtol":1e-2}}
+//|       - {"artifact":"conversion","path":"/rows/0/7","approx":{"value":1.05e-7,"rtol":2e-2}}
+//|   - case: half-length
+//|     expect:
+//|       - {"artifact":"conversion","path":"/rows/0/2","equals":21}
+//|       - {"artifact":"conversion","path":"/rows/0/6","approx":{"value":2.53e-2,"rtol":1e-2}}
+//|   - case: short
+//|     expect:
+//|       - {"artifact":"conversion","path":"/rows/0/1","approx":{"value":79.49,"rtol":1e-3}}
+//|       - {"artifact":"conversion","path":"/rows/0/3","equals":4096}
+use scioxide_signal::{
+    FirBand, FirSymmetry, MinimumPhaseConvention, MinimumPhaseOptions,
+    design_fir_least_squares, minimum_phase_with_options,
+};
+
+let n = taps.round() as usize;
+// Passband [0, 0.3], stopband [0.4, 1] (Nyquist ratio). Increase stopband weight
+let band = |lower, upper, desired, weight| {
+    FirBand::new(lower, upper, desired, desired).with_weight(weight)
+};
+let design = design_fir_least_squares(
+    n,
+    FirSymmetry::Even,
+    &[band(0.0, 0.3, 1.0, 1.0), band(0.4, 1.0, 0.0, 10.0)],
+)
+.map_err(|e| e.to_string())?;
+let h = design.coefficients();
+
+let convention = if half_length {
+    MinimumPhaseConvention::HalfLength
+} else {
+    MinimumPhaseConvention::SameLength
+};
+let options = MinimumPhaseOptions::default().with_convention(convention);
+let (h_min, report) = minimum_phase_with_options(h, options).map_err(|e| e.to_string())?;
+
+// Independent check: compute frequency response by direct summation (reference calculation using f64 intrinsic methods)
+let response = |c: &[f64], f: f64| {
+    let (mut re, mut im) = (0.0, 0.0);
+    for (k, &b) in c.iter().enumerate() {
+        let phase = std::f64::consts::PI * f * k as f64;
+        re += b * phase.cos();
+        im -= b * phase.sin();
+    }
+    re.hypot(im)
+};
+let power = if half_length { 2 } else { 1 };
+let grid: Vec<f64> = (0..=400).map(|i| i as f64 / 400.0).collect();
+let peak = grid.iter().map(|&f| response(h, f)).fold(0.0_f64, f64::max);
+let magnitude_gap = grid
+    .iter()
+    .map(|&f| (response(&h_min, f).powi(power) - response(h, f)).abs())
+    .fold(0.0_f64, f64::max)
+    / peak;
+
+// Partial energy: minimum-phase sequence and its time reversal (maximum-phase sequence with the same magnitude)
+let total: f64 = h_min.iter().map(|x| x * x).sum();
+let partial = |c: &mut dyn Iterator<Item = f64>| {
+    let mut sum = 0.0;
+    c.enumerate()
+        .map(|(k, x)| {
+            sum += x * x;
+            [k as f64, sum / total]
+        })
+        .collect::<Vec<_>>()
+};
+let forward = partial(&mut h_min.iter().copied());
+let reversed = partial(&mut h_min.iter().rev().copied());
+
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "FIR termination status" },
+    { "key": "1", "label": "Normal-equation condition estimate [-]", "type": "number", "format": sci2 },
+    { "key": "2", "label": "Output coefficient count", "type": "integer" },
+    { "key": "3", "label": "FFT grid length L", "type": "integer" },
+    { "key": "4", "label": "Floored grid points", "type": "integer" },
+    { "key": "5", "label": "Diagnostic magnitude error [-]", "type": "number", "format": sci2 },
+    { "key": "6", "label": "Direct-sum magnitude difference [-]", "type": "number", "format": sci2 },
+    { "key": "7", "label": "Discarded energy fraction [-]", "type": "number", "format": sci2 }
+]);
+let row = (
+    format!("{:?}", design.termination()),
+    design.condition_estimate(),
+    h_min.len(),
+    report.fft_length(),
+    report.regularized_bins(),
+    report.magnitude_error(),
+    magnitude_gap,
+    report.discarded_energy_fraction(),
+);
+emit_table_with_columns!(
+    columns,
+    vec![row],
+    metadata = serde_json::json!({ "id": "conversion" })
+);
+emit_chart!(
+    serde_json::json!({
+        "kind": "line",
+        "dataZoom": true,
+        "tooltip": true,
+        "series": [
+            { "name": "Minimum phase", "points": forward },
+            { "name": "Time reversal (maximum phase)", "points": reversed, "style": { "lineType": "dashed" } }
+        ],
+        "xLabel": "Coefficient index k [-]",
+        "yLabel": "Cumulative energy fraction [-]",
+        "yMin": 0.0,
+        "yMax": 1.0
+    }),
+    metadata = serde_json::json!({ "id": "energy" })
+);
+```
+
+With the default $N = 41$ and `SameLength`, the FFT grid has 8192 points, diagnostic magnitude error is $9.6 \times 10^{-6}$, direct-sum magnitude difference is $2.1 \times 10^{-6}$ of the maximum, and discarded energy is $1.0 \times 10^{-7}$.
+The two errors use different grids (8192 and 401 points), so they differ, but both are small at the same order of magnitude, showing consistency between grid diagnostics and independent computation.
+The solid line (minimum phase) always lies above the dashed line (time reversal), showing energy concentrated at the beginning.
+The least-squares normal-equation condition estimate increases from $79$ at $N = 21$ to $7.9 \times 10^{2}$ at $N = 41$ and $2.0 \times 10^{4}$ at $N = 61$.
+
+Switching to `HalfLength` approximates $\sqrt{|H|}$ with 21 coefficients; the direct-sum magnitude difference rises to $2.5 \times 10^{-2}$ of the maximum (diagnostic magnitude error is $7.7 \times 10^{-2}$ on the $\sqrt{|H|}$ scale).
+The least-squares design changes the sign of zero-phase amplitude in the stopband, creating cusps in $\sqrt{|H|}$ that a short FIR cannot represent.
+In this case, choose the Hilbert method, which lifts zero-phase amplitude to nonnegative values before taking its square root, or choose `SameLength`.
+
+## Summary
+
+Each linear-phase FIR type has forced zeros: choose type I or IV for high-pass filters, type III for Hilbert transformers, and type IV for differentiators.
+Use Remez exchange for maximum-error specifications, weighted least squares for error energy, and window methods or frequency sampling for quick closed-form construction.
+For Remez, check `termination()` and read `weighted_ripple()` as a grid-based estimate; if needed, count alternation points on a dense grid to check equiripple behavior.
+To reduce delay, convert to minimum phase with `minimum_phase_with_options` and check magnitude errors with `MinimumPhaseDiagnostics` and an independent frequency response.
+[IIR filter design](../iir-design/) covers low-order filters with feedback, and [Window functions and DPSS](../windows-and-dpss/) covers window selection.

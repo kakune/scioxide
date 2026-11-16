@@ -1,0 +1,607 @@
+---
+title: "Duality of JVPs and VJPs"
+description: "Use planar articulated-arm forward kinematics to verify ⟨w, Jv⟩ = ⟨Jᵀw, v⟩ at the rounding scale with one-shot jvp and vjp and Linearization's jvp_into and vjp_into. Compare endpoint velocities and joint torques with closed forms and vary input and output dimensions to compare Jacobian assembly sweep counts for each JacobianMode."
+sidebar:
+  order: 410
+references:
+  ad-arm-velocity-force-duality: "duality-of-velocity-and-force"
+  ad-arm-product-api: "apis-for-forward-and-reverse-products"
+  ad-arm-jacobian-sweeps: "sweep-counts-for-assembling-a-jacobian"
+---
+
+Forward mode returns the product $\mathbf{J}\mathbf{v}$ of an input-side vector $\mathbf{v}$ and the Jacobian $\mathbf{J}$ (a Jacobian–vector product, JVP).
+Reverse mode returns the product $\mathbf{J}^\mathsf{T}\mathbf{w}$ with an output-side vector $\mathbf{w}$ (a vector–Jacobian product, VJP).
+Both compute their products without forming $\mathbf{J}$.
+They view the same linear map from its two sides; for any $\mathbf{v}$ and $\mathbf{w}$, $\langle \mathbf{w}, \mathbf{J}\mathbf{v} \rangle = \langle \mathbf{J}^\mathsf{T}\mathbf{w}, \mathbf{v} \rangle$ holds.
+
+For a robotic arm, $\mathbf{J}$ maps joint angular velocities to endpoint velocities, and $\mathbf{J}^\mathsf{T}$ maps endpoint forces to joint torques.
+The identity above is then the principle of virtual work: power from the loads computed at the endpoints equals that computed at the joints.
+This example uses planar articulated-arm forward kinematics to check JVP/VJP duality at the rounding-error scale and compare endpoint velocities and joint torques with closed forms.
+The latter half varies input and output counts to compare the sweep counts needed to assemble a full Jacobian for each `JacobianMode`.
+
+## Forward kinematics of a planar articulated arm
+
+Divide an arm of total length $L = 1$ m into $n$ links of length $\ell = L/n$ [m], connect them with revolute joints, and fix the base at the origin.
+The angle $\theta_j$ [rad] of joint $j$ ($j = 0, \dots, n-1$) is relative to the previous link; joint 0 is measured from the $x$ axis.
+The orientation of link $i$ is $\varphi_i = \sum_{j \le i} \theta_j$, and the position of the tip of link $i$ is
+
+$$
+\mathbf{p}_i = \sum_{j=0}^{i} \ell\,(\cos\varphi_j, \sin\varphi_j), \qquad i = 0, \dots, n - 1
+$$
+
+
+Set the base to $\mathbf{p}_{-1} = \mathbf{0}$.
+Arrange coordinates of the last $k$ link tips $\mathbf{p}_{n-k}, \dots, \mathbf{p}_{n-1}$ in the order $(x_{n-k}, y_{n-k}, \dots, x_{n-1}, y_{n-1})$ as output, defining the map $\mathbf{F}: \mathbb{R}^n \to \mathbb{R}^m$ ($m = 2k$).
+For $k = 1$, only the arm endpoint position is output.
+Choose a configuration with each joint bent by the same angle $\theta_j = \Theta/n$.
+At $\Theta = 0$ the arm extends straight along the $x$ axis; for $\Theta > 0$, joint positions form vertices of a regular polygon on a circle, curling more strongly as $\Theta$ increases (the endpoint returns to the base at $\Theta = 360°$).
+
+Rotating joint $j$ rotates all subsequent links together about $\mathbf{p}_{j-1}$.
+The Jacobian can therefore be written as
+
+$$
+\frac{\partial \mathbf{p}_i}{\partial \theta_j} =
+\begin{cases}
+\hat{\mathbf{z}} \times (\mathbf{p}_i - \mathbf{p}_{j-1}) = \bigl(-(y_i - y_{j-1}),\ x_i - x_{j-1}\bigr) & (j \le i) \\
+\mathbf{0} & (j > i)
+\end{cases}
+$$
+
+with units [m/rad].
+$\hat{\mathbf{z}} \times (\Delta x, \Delta y) = (-\Delta y, \Delta x)$ is a 90° rotation within the plane.
+Use this closed form as an independent check.
+
+The following block defines helpers shared by two cells.
+`arm` is the generic function corresponding to $\mathbf{F}$ and appends outputs to the supplied vector.
+`joints` computes base and link-tip positions; `arm_jacobian` computes the row-major closed-form $\mathbf{J}$ above, both as reference values using inherent `f64` methods.
+
+```rust
+//| id: ad-arm-model
+//| kind: definitions
+//| title: "Planar articulated-arm forward kinematics and closed-form Jacobian"
+//| crates: [scioxide-ad]
+use scioxide_ad::Real;
+
+/// Append the last tracked link-tip positions (x, y) [m] to out from joint angles θ [rad].
+pub(crate) fn arm<R: Real>(theta: &[R], link: f64, tracked: usize, out: &mut Vec<R>) {
+    let n = theta.len();
+    let mut angle = R::zero();
+    let (mut x, mut y) = (R::zero(), R::zero());
+    for (i, &joint) in theta.iter().enumerate() {
+        angle += joint;
+        let (sin, cos) = angle.sin_cos();
+        x += cos * link;
+        y += sin * link;
+        if i + tracked >= n {
+            out.push(x);
+            out.push(y);
+        }
+    }
+}
+
+/// Base p₋₁ = 0 and link-tip positions p₀, …, pₙ₋₁ [m]. Reference values (inherent f64 methods).
+pub(crate) fn joints(theta: &[f64], link: f64) -> Vec<[f64; 2]> {
+    let mut angle = 0.0;
+    let mut points = vec![[0.0, 0.0]];
+    for &joint in theta {
+        angle += joint;
+        let [x, y] = points[points.len() - 1];
+        points.push([x + link * angle.cos(), y + link * angle.sin()]);
+    }
+    points
+}
+
+/// Closed-form Jacobian (row-major, 2k × n): ∂pᵢ/∂θⱼ = ẑ × (pᵢ − pⱼ₋₁) for j ≤ i, zero for j > i.
+pub(crate) fn arm_jacobian(theta: &[f64], link: f64, tracked: usize) -> Vec<f64> {
+    let n = theta.len();
+    let points = joints(theta, link);
+    let mut jacobian = vec![0.0; 2 * tracked * n];
+    for (row, i) in (n - tracked..n).enumerate() {
+        for j in 0..=i {
+            // points[i + 1] = pᵢ, points[j] = pⱼ₋₁ (rotation center of joint j).
+            let dx = points[i + 1][0] - points[j][0];
+            let dy = points[i + 1][1] - points[j][1];
+            jacobian[2 * row * n + j] = -dy;
+            jacobian[(2 * row + 1) * n + j] = dx;
+        }
+    }
+    jacobian
+}
+```
+
+## Duality of velocity and force
+
+Let $\mathbf{v} \in \mathbb{R}^n$ contain joint angular velocities $\dot\theta_j$ [rad/s]; then $\mathbf{J}\mathbf{v}$ contains the velocities $\dot{\mathbf{p}}_i$ [m/s] of output points.
+Let $\mathbf{w} \in \mathbb{R}^m$ contain forces $\mathbf{f}_i$ [N] on output points; then component $j$ of $\mathbf{J}^\mathsf{T}\mathbf{w}$ is
+
+$$
+\tau_j = \sum_{i \ge j} (\mathbf{p}_i - \mathbf{p}_{j-1}) \times \mathbf{f}_i \quad [\mathrm{N\,m}]
+$$
+
+the torque produced by the loads about joint $j$ (sum over output points $i$, with $\mathbf{a} \times \mathbf{b} = a_x b_y - a_y b_x$).
+The two inner products are
+
+$$
+\langle \mathbf{w}, \mathbf{J}\mathbf{v} \rangle = \sum_i \mathbf{f}_i \cdot \dot{\mathbf{p}}_i, \qquad
+\langle \mathbf{J}^\mathsf{T}\mathbf{w}, \mathbf{v} \rangle = \sum_j \tau_j\,\dot\theta_j
+$$
+
+both expressing the power of the loads [W].
+
+Mathematically, this equality simply sums $\sum_{i,j} w_i J_{ij} v_j$, the definition of the transpose, in two different orders.
+Automatic differentiation computes $\mathbf{J}\mathbf{v}$ with a forward sweep in recording order and $\mathbf{J}^\mathsf{T}\mathbf{w}$ with a reverse sweep in reverse recording order, combining local partial derivatives in opposite directions.
+Agreement within rounding error supports the correctness of local-rule transposes, signs, and sweep order.
+However, agreement checks only one point and one pair of vectors and does not establish correctness at other points or directions.
+
+Both sides can be viewed as sums of products $w_i J_{ij} v_j$ computed in different orders with different rounding.
+Following inner-product error bounds (Higham, *Accuracy and Stability of Numerical Algorithms*, Chapter 3), a scale for the difference is the product of unit roundoff $u = 2^{-53}$ and
+
+$$
+S = \sum_{i,j} \lvert w_i J_{ij} v_j \rvert
+$$
+
+multiplied by a coefficient determined by term count and arithmetic depth.
+When cancellation gives $\lvert\langle \mathbf{w}, \mathbf{J}\mathbf{v} \rangle\rvert \ll S$, comparing the difference with power itself overestimates error; compare with $uS$ instead.
+
+This example uses $\dot\theta_j = (-1)^j$ rad/s as $\mathbf{v}$, rotating adjacent joints in opposite directions, and $\mathbf{w}$ representing a downward 1 N weight $\mathbf{f}_i = (0, -1)$ N at every output point.
+Then $\tau_j = -\sum_{i \ge j} (x_i - x_{j-1})$ N·m, the signed sum of horizontal distances from joint $j$ to each weight.
+Alternating signs in $\mathbf{v}$ cause cancellation in the power sum, making $\lvert\langle \mathbf{w}, \mathbf{J}\mathbf{v} \rangle\rvert$ smaller than $S$.
+
+## APIs for forward and reverse products
+
+`jvp(function, point, direction)` is a forward-mode one-shot call.
+It evaluates the function once with dual-number `Dual` inputs $x_j = p_j + d_j\,\varepsilon$ and returns output derivatives as a `scioxide_linalg::Vector`.
+The function takes `&[Dual<f64>]` and an empty vector and appends outputs to that vector.
+Cost is a small constant multiple of one evaluation, with input and output allocation.
+`direction.len() != point.len()` gives `DimensionMismatch`; errors returned by the function are propagated unchanged.
+
+`vjp(function, point, cotangent)` is a reverse-mode one-shot call, recording the function on a new tape, performing one reverse sweep, and returning $\mathbf{J}^\mathsf{T}\mathbf{w}$ as a `Vector`.
+Like `jvp`, the function appends outputs to a vector, but receives inputs as `Var` on a tape.
+A new tape is empty, so the first function execution counts statements and the second records after growing the tape (two executions on every call).
+A length of `cotangent` differing from the output count gives `DimensionMismatch`.
+
+`Tape::linearize(function, point, cx)` records a vector-valued function once on a tape and returns its linearization `Linearization` at that point.
+`Linearization` borrows the tape mutably and computes products as many times as needed from the same recording.
+`inputs()` returns input count $n$, `outputs()` output count $m$, and `values()` output values $\mathbf{F}(\mathbf{x})$.
+`jvp_into(direction, out, cx)` writes $\mathbf{J}\mathbf{v}$ using a tangent sweep propagating tangents in recording order; `vjp_into(cotangent, out, cx)` writes $\mathbf{J}^\mathsf{T}\mathbf{w}$ with a reverse sweep in reverse recording order.
+`jacobian_into(out, cx)` writes dense $\mathbf{J}$ in row-major order (outputs × inputs).
+Each product requires a sweep costing a small constant multiple of an evaluation; repeated use on the same tape allocates no memory from the second call onward (`jacobian_into` allocates workspace only on first use).
+Inconsistent array lengths give `DimensionMismatch`; failure leaves output unchanged.
+
+Both `jvp` and `jvp_into` use forward mode, but the former evaluates the function with `Dual` without a tape, while the latter sweeps a recording.
+Reverse mode uses storage for its recording, proportional to the recorded statement count.
+[Reverse mode and tapes](../../algorithms/reverse-mode-and-replay/) covers adjoint derivation and tape recording rules; [Forward mode and dual numbers](../../algorithms/forward-mode/) covers tangent rules.
+
+The next cell selects link count $n$ (2–40), output points (endpoint only, last half of link tips, or all link tips), and total bend angle $\Theta$ (0–360°), obtaining $\mathbf{J}\mathbf{v}$ with `jvp` and $\mathbf{J}^\mathsf{T}\mathbf{w}$ with `vjp_into` on a linearization at the same point to check duality.
+It also obtains $\mathbf{J}^\mathsf{T}\mathbf{w}$ with the one-shot `vjp` and compares it with `vjp_into`.
+The first chart shows the arm's shape and output points; the second shows joint torques $\tau_j$ from `vjp_into` (symbols) and closed forms (dashed).
+The first table shows both inner products, rounding scale $S$, and the difference divided by $uS$.
+The second table shows maximum differences for positions from `values()`, $\mathbf{J}\mathbf{v}$ from `jvp` and `jvp_into`, $\mathbf{J}^\mathsf{T}\mathbf{w}$ from `vjp` and `vjp_into`, and $\mathbf{J}$ from `jacobian_into`, against closed forms or other modes.
+Differences are divided by total length $L = 1$ m for positions, the maximum absolute-term sum $\max_i \sum_j \lvert J_{ij} v_j \rvert$ for $\mathbf{J}\mathbf{v}$, $\max_j \sum_i \lvert J_{ij} w_i \rvert$ for $\mathbf{J}^\mathsf{T}\mathbf{w}$, and the maximum entry for $\mathbf{J}$.
+Scaling products by term magnitudes keeps these ratios meaningful even in configurations where cancellation makes the product nearly zero (such as $\Theta = 360°$).
+The checks are that the difference divided by $uS$ remains on the order of 1 and all quantities agree with closed forms at the rounding-error level.
+
+```rust
+//| id: ad-arm-duality
+//| ref: ad-arm-duality
+//| title: "Duality of endpoint velocities and joint torques"
+//| run: reactive
+//| uses: [ad-arm-model]
+//| crates: [scioxide-ad, scioxide-core]
+//| inputs:
+//|   links: {"type":"range","label":"Link count n","description":"Input (joint angle) count. Total length remains 1 m.","min":2,"max":40,"step":1,"value":6}
+//|   tracked: {"type":"select","label":"Output points","description":"Determines output count m = 2k.","options":[{"label":"Endpoint only (k = 1)","value":"tip"},{"label":"Last half of link tips (k = ⌈n/2⌉)","value":"half"},{"label":"All link tips (k = n)","value":"all"}],"value":"tip"}
+//|   bend: {"type":"range","label":"Total bend angle Θ [deg]","description":"Bend each joint by Θ/n.","min":0,"max":360,"step":5,"value":90}
+//| cases:
+//|   - {"id":"all-points","label":"All link tips (m = 12)","description":"Outputs outnumber inputs; jacobian_into Auto selects tangent sweeps.","inputs":{"tracked":"all"}}
+//|   - {"id":"straight-arm","label":"n = 40, Θ = 0","description":"A straight arm gives simple closed forms for power and joint torques.","inputs":{"links":40,"bend":0}}
+//|   - {"id":"closed-arm","label":"Θ = 360°","description":"The endpoint returns to the base; cancellation makes power exactly zero.","inputs":{"bend":360}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"duality","path":"/rows/0/0","equals":2}
+//|       - {"artifact":"duality","path":"/rows/0/2","approx":{"value":-0.3219752754296894,"rtol":1e-14}}
+//|       - {"artifact":"duality","path":"/rows/0/3","approx":{"value":-0.3219752754296894,"rtol":1e-14}}
+//|       - {"artifact":"duality","path":"/rows/0/5","range":{"max":8}}
+//|       - {"artifact":"checks","path":"/rows/1/1","range":{"max":1e-15}}
+//|       - {"artifact":"checks","path":"/rows/3/1","equals":0}
+//|       - {"artifact":"checks","path":"/rows/4/1","range":{"max":1e-15}}
+//|       - {"artifact":"checks","path":"/rows/5/1","range":{"max":1e-15}}
+//|   - case: all-points
+//|     expect:
+//|       - {"artifact":"duality","path":"/rows/0/0","equals":12}
+//|       - {"artifact":"duality","path":"/rows/0/5","range":{"max":8}}
+//|       - {"artifact":"checks","path":"/rows/5/1","range":{"max":1e-15}}
+//|   - case: straight-arm
+//|     expect:
+//|       - {"artifact":"duality","path":"/rows/0/2","approx":{"value":-0.5,"rtol":1e-14}}
+//|       - {"artifact":"duality","path":"/rows/0/4","approx":{"value":20.5,"rtol":1e-14}}
+//|       - {"artifact":"duality","path":"/rows/0/5","range":{"max":8}}
+//|       - {"artifact":"checks","path":"/rows/4/1","range":{"max":1e-15}}
+//|   - case: closed-arm
+//|     expect:
+//|       - {"artifact":"duality","path":"/rows/0/2","range":{"min":-1e-15,"max":1e-15}}
+//|       - {"artifact":"duality","path":"/rows/0/4","approx":{"value":0.6666666666666666,"rtol":1e-14}}
+//|       - {"artifact":"duality","path":"/rows/0/5","range":{"max":8}}
+//|       - {"artifact":"checks","path":"/rows/2/1","range":{"max":1e-15}}
+use scioxide_ad::{Tape, TapeOptions, jvp, vjp};
+use scioxide_core::ExecutionContext;
+
+let n = links as usize;
+let k = match tracked.as_str() {
+    "tip" => 1,
+    "half" => n.div_ceil(2),
+    _ => n,
+};
+let m = 2 * k;
+// Arc configuration with total length 1 m and each joint bent by Θ/n.
+let link = 1.0 / n as f64;
+let theta = vec![bend * std::f64::consts::PI / 180.0 / n as f64; n];
+// v: angular velocities ±1 rad/s with adjacent joints rotating oppositely. w: downward 1 N load at each output point.
+let v: Vec<f64> = (0..n)
+    .map(|j| if j % 2 == 0 { 1.0 } else { -1.0 })
+    .collect();
+let w: Vec<f64> = (0..m)
+    .map(|r| if r % 2 == 0 { 0.0 } else { -1.0 })
+    .collect();
+
+// Forward-mode one-shot call: one Dual evaluation gives J v.
+let forward = jvp(
+    |x, out| {
+        arm(x, link, k, out);
+        Ok(())
+    },
+    &theta,
+    &v,
+)
+.map_err(|e| e.to_string())?;
+// Reverse-mode one-shot call: record on a new tape and reverse once to obtain Jᵀ w.
+let pulled = vjp(
+    |x, out| {
+        arm(x, link, k, out);
+        Ok(())
+    },
+    &theta,
+    &w,
+)
+.map_err(|e| e.to_string())?;
+
+// Record once on a tape and perform tangent and reverse sweeps on the same linearization.
+let cx = ExecutionContext::sequential();
+let mut tape = Tape::<f64>::new(TapeOptions::new());
+let mut linear = tape
+    .linearize(
+        |x, out| {
+            arm(x, link, k, out);
+            Ok(())
+        },
+        &theta,
+        cx,
+    )
+    .map_err(|e| e.to_string())?;
+let mut tangent = vec![0.0; m];
+linear
+    .jvp_into(&v, &mut tangent, cx)
+    .map_err(|e| e.to_string())?;
+let mut torque = vec![0.0; n];
+linear
+    .vjp_into(&w, &mut torque, cx)
+    .map_err(|e| e.to_string())?;
+let mut jacobian = vec![0.0; m * n];
+linear
+    .jacobian_into(&mut jacobian, cx)
+    .map_err(|e| e.to_string())?;
+let shape = (linear.outputs(), linear.inputs());
+let positions: Vec<f64> = linear.values().to_vec();
+
+// Duality: ⟨w, J v⟩ and ⟨Jᵀ w, v⟩. Rounding scale S = Σ |wᵢ Jᵢⱼ vⱼ|.
+let power_forward: f64 = w.iter().zip(forward.as_slice()).map(|(a, b)| a * b).sum();
+let power_reverse: f64 = torque.iter().zip(&v).map(|(a, b)| a * b).sum();
+let scale: f64 = (0..m)
+    .flat_map(|i| (0..n).map(move |j| (i, j)))
+    .map(|(i, j)| (w[i] * jacobian[i * n + j] * v[j]).abs())
+    .sum();
+let unit_roundoff = f64::EPSILON / 2.0;
+let ratio = (power_forward - power_reverse).abs() / (unit_roundoff * scale);
+
+// Independent check: construct J v and Jᵀ w from the closed-form Jacobian (f64 arithmetic).
+let exact = arm_jacobian(&theta, link, k);
+let exact_tangent: Vec<f64> = (0..m)
+    .map(|i| (0..n).map(|j| exact[i * n + j] * v[j]).sum())
+    .collect();
+let exact_torque: Vec<f64> = (0..n)
+    .map(|j| (0..m).map(|i| exact[i * n + j] * w[i]).sum())
+    .collect();
+let gap = |a: &[f64], b: &[f64]| {
+    a.iter()
+        .zip(b)
+        .fold(0.0_f64, |g, (x, y)| g.max((x - y).abs()))
+};
+// Difference scales: total length 1 m for positions, maximum absolute-term sum for products, maximum entry for J.
+// Product scales maxᵢ Σⱼ |Jᵢⱼ vⱼ| and maxⱼ Σᵢ |Jᵢⱼ wᵢ| remain nonzero even for nearly zero products from cancellation.
+let tangent_scale = (0..m)
+    .map(|i| (0..n).map(|j| (exact[i * n + j] * v[j]).abs()).sum::<f64>())
+    .fold(0.0_f64, f64::max);
+let torque_scale = (0..n)
+    .map(|j| (0..m).map(|i| (exact[i * n + j] * w[i]).abs()).sum::<f64>())
+    .fold(0.0_f64, f64::max);
+let entry_scale = exact.iter().fold(0.0_f64, |s, x| s.max(x.abs()));
+
+// Arm shape (closed-form joint positions) and output point positions returned by values().
+let shape_points = joints(&theta, link);
+let exact_positions: Vec<f64> = shape_points[n + 1 - k..]
+    .iter()
+    .flatten()
+    .copied()
+    .collect();
+let marked: Vec<[f64; 2]> = positions.chunks(2).map(|p| [p[0], p[1]]).collect();
+emit_chart!(serde_json::json!({
+    "kind": "xy",
+    "dataZoom": true,
+    "tooltip": true,
+    "xLabel": "x [m]",
+    "yLabel": "y [m]",
+    "xMin": -0.6,
+    "xMax": 1.05,
+    "yMin": -0.2,
+    "yMax": 0.9,
+    "layers": [
+        { "id": "arm", "kind": "line", "name": "Links (closed form)", "points": shape_points },
+        {
+            "id": "outputs",
+            "kind": "scatter",
+            "name": "Output points (values())",
+            "points": marked,
+            "style": { "symbol": "circle" }
+        }
+    ]
+}));
+
+let measured: Vec<[f64; 2]> = torque
+    .iter()
+    .enumerate()
+    .map(|(j, &t)| [j as f64, t])
+    .collect();
+let reference: Vec<[f64; 2]> = exact_torque
+    .iter()
+    .enumerate()
+    .map(|(j, &t)| [j as f64, t])
+    .collect();
+emit_chart!(serde_json::json!({
+    "kind": "xy",
+    "dataZoom": true,
+    "tooltip": true,
+    "xLabel": "Joint index j [-]",
+    "yLabel": "Load-induced joint torque τⱼ = (Jᵀw)ⱼ [N·m]",
+    "layers": [
+        {
+            "id": "closed-form",
+            "kind": "line",
+            "name": "τ (closed form)",
+            "points": reference,
+            "style": { "lineType": "dashed", "showSymbol": false }
+        },
+        {
+            "id": "vjp",
+            "kind": "scatter",
+            "name": "τ（vjp_into）",
+            "points": measured,
+            "style": { "symbol": "circle" }
+        }
+    ]
+}));
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let digits = serde_json::json!({ "significantDigits": 12 });
+let duality_columns = serde_json::json!([
+    { "key": "0", "label": "Outputs m", "type": "integer" },
+    { "key": "1", "label": "Inputs n", "type": "integer" },
+    { "key": "2", "label": "⟨w, Jv⟩（jvp）[W]", "type": "number", "format": digits },
+    { "key": "3", "label": "⟨Jᵀw, v⟩（vjp_into）[W]", "type": "number", "format": digits },
+    { "key": "4", "label": "Rounding scale S [W]", "type": "number", "format": sci3 },
+    { "key": "5", "label": "|Difference| / (u S) [-]", "type": "number", "format": { "significantDigits": 3 } }
+]);
+emit_table_with_columns!(
+    duality_columns,
+    vec![(shape.0, shape.1, power_forward, power_reverse, scale, ratio,)],
+    metadata = serde_json::json!({ "id": "duality" })
+);
+let check_columns = serde_json::json!([
+    { "key": "0", "label": "Compared quantities" },
+    { "key": "1", "label": "Maximum difference / reference magnitude [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    check_columns,
+    vec![
+        ("Position: values() and closed form", gap(&positions, &exact_positions)),
+        (
+            "Jv: jvp (Dual) and jvp_into (tape)",
+            gap(&tangent, forward.as_slice()) / tangent_scale
+        ),
+        (
+            "Jv: jvp and closed form",
+            gap(forward.as_slice(), &exact_tangent) / tangent_scale
+        ),
+        (
+            "Jᵀw: vjp (one-shot) and vjp_into",
+            gap(pulled.as_slice(), &torque) / torque_scale
+        ),
+        (
+            "Jᵀw: vjp_into and closed form",
+            gap(&torque, &exact_torque) / torque_scale
+        ),
+        (
+            "J: jacobian_into and closed form",
+            gap(&jacobian, &exact) / entry_scale
+        ),
+    ],
+    metadata = serde_json::json!({ "id": "checks" })
+);
+```
+
+At the defaults ($n = 6$, endpoint only, $\Theta = 90°$), $m = 2$; each joint is bent by 15°, placing the endpoint at $(0.550, 0.716)$ m.
+Both inner products are $-0.32198$ W and differ by 2 ulp.
+The rounding scale is $S = 1.352$ W; alternating signs in $\mathbf{v}$ make the inner-product magnitude about one quarter of $S$.
+The difference divided by $uS$ is 0.74, at the rounding-error level.
+Starting with torque $\tau_0 = -0.550$ N·m at the base (horizontal endpoint distance 0.550 m times weight 1 N), joint-torque magnitudes decrease toward the endpoint; the last link is vertical, making $\tau_5$ nearly zero (about $10^{-17}$ N·m).
+Values from `vjp_into` lie on the dashed closed form; all ratios in the second table are at most $2.1 \times 10^{-16}$.
+Positions from `values()` agree bit for bit with closed forms; $\mathbf{J}\mathbf{v}$ from `jvp` and `jvp_into` also agree bit for bit with each other, as do $\mathbf{J}^\mathsf{T}\mathbf{w}$ from `vjp` and `vjp_into`.
+
+Outputting all link tips gives $m = 12$, power $-1.5236$ W, and difference divided by $uS$ of 0.38.
+Here $m \ge n$, so the default `JacobianMode::Auto` of `jacobian_into` performs six tangent sweeps.
+For a straight arm with $n = 40$ and $\Theta = 0$, endpoint velocity is only in direction $y$; each adjacent joint pair contributes $-1/40$ W, giving total power $-0.5$ W.
+With $S = \sum_j (1 - j/40) = 20.5$ W, the difference divided by $uS$ is 0.05.
+
+At $n = 6$ and $\Theta = 360°$, the arm traces a regular hexagon and its endpoint returns to the base; cancellation makes endpoint velocity exactly zero, hence power zero.
+The computed inner products are $9.7 \times 10^{-17}$ W and $8.3 \times 10^{-17}$ W; dividing their difference by the inner-product magnitude gives 0.14, an apparently large relative difference.
+Using $S = 2/3$ W gives difference divided by $uS$ of 0.19, at the rounding-error level.
+
+## Sweep counts for assembling a Jacobian
+
+With $\mathbf{v} = \mathbf{e}_j$, the JVP returns column $j$ of $\mathbf{J}$; with $\mathbf{w} = \mathbf{e}_i$, the VJP returns row $i$.
+Thus dense $\mathbf{J}$ can be assembled with either $n$ tangent sweeps or $m$ reverse sweeps.
+A sweep in either direction costs a small constant multiple of evaluation, so selecting the smaller dimension requires $\min(m, n)$ sweeps.
+
+`JacobianMode`, selected with `TapeOptions::with_jacobian_mode`, determines the direction of `jacobian_into`.
+`Forward` performs one tangent sweep per input ($n$ total); `Reverse` performs one reverse sweep per output ($m$ total).
+The default `Auto` selects reverse sweeps for $m < n$ and tangent sweeps otherwise.
+At $m = n$ it selects tangent sweeps.
+The one-shot `jacobian(function, point)` uses `Auto` on a new tape and executes the function twice, like `vjp`.
+
+The next cell has no inputs; at configuration $\Theta = 90°$, it linearizes the same function on tapes in three modes for eight combinations of $(n, k)$, assembles $\mathbf{J}$ with `jacobian_into`, and compares it with closed forms.
+Sweep counts follow mode rules and are not counted inside the cell.
+Different summation orders can make `Forward` and `Reverse` results differ in the last digit; checking which agrees bit for bit with `Auto` reveals the direction actually chosen by `Auto`.
+The table's “Direction matching Auto result” gives this comparison; all difference columns are relative to the largest entry of $\mathbf{J}$.
+
+```rust
+//| id: ad-arm-jacobian-modes
+//| ref: ad-arm-jacobian-modes
+//| title: "Input/output dimensions and sweep counts for each JacobianMode"
+//| run: reactive
+//| uses: [ad-arm-model]
+//| crates: [scioxide-ad, scioxide-core]
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"modes","path":"/rows/0/6","equals":"Reverse"}
+//|       - {"artifact":"modes","path":"/rows/1/6","equals":"Forward"}
+//|       - {"artifact":"modes","path":"/rows/3/6","equals":"Reverse"}
+//|       - {"artifact":"modes","path":"/rows/4/6","equals":"Forward"}
+//|       - {"artifact":"modes","path":"/rows/6/6","equals":"Reverse"}
+//|       - {"artifact":"modes","path":"/rows/7/6","equals":"Forward"}
+//|       - {"artifact":"modes","path":"/rows/6/5","equals":32}
+//|       - {"artifact":"modes","path":"/rows/7/7","range":{"max":1e-14}}
+//|       - {"artifact":"modes","path":"/rows/7/8","range":{"max":1e-14}}
+use scioxide_ad::{JacobianMode, Tape, TapeOptions};
+use scioxide_core::ExecutionContext;
+
+let cx = ExecutionContext::sequential();
+let mut rows = Vec::new();
+for (n, k) in [
+    (4, 1),
+    (4, 4),
+    (16, 1),
+    (16, 4),
+    (16, 16),
+    (64, 1),
+    (64, 16),
+    (64, 64),
+] {
+    let m = 2 * k;
+    let link = 1.0 / n as f64;
+    let theta = vec![std::f64::consts::FRAC_PI_2 / n as f64; n];
+    let exact = arm_jacobian(&theta, link, k);
+    // Linearize the same function on tapes in three JacobianMode settings and assemble dense Jacobians.
+    let mut assembled = Vec::new();
+    for mode in [
+        JacobianMode::Auto,
+        JacobianMode::Forward,
+        JacobianMode::Reverse,
+    ] {
+        let mut tape = Tape::<f64>::new(TapeOptions::new().with_jacobian_mode(mode));
+        let mut linear = tape
+            .linearize(
+                |x, out| {
+                    arm(x, link, k, out);
+                    Ok(())
+                },
+                &theta,
+                cx,
+            )
+            .map_err(|e| e.to_string())?;
+        let mut jacobian = vec![0.0; m * n];
+        linear
+            .jacobian_into(&mut jacobian, cx)
+            .map_err(|e| e.to_string())?;
+        assembled.push(jacobian);
+    }
+    let size = exact.iter().fold(0.0_f64, |s, x| s.max(x.abs()));
+    let gap = |a: &[f64], b: &[f64]| {
+        a.iter()
+            .zip(b)
+            .fold(0.0_f64, |g, (x, y)| g.max((x - y).abs()))
+            / size
+    };
+    let worst = assembled
+        .iter()
+        .map(|j| gap(j, &exact))
+        .fold(0.0_f64, f64::max);
+    // Auto rule: m reverse sweeps if m < n; n tangent sweeps otherwise.
+    let rule = if m < n { "Reverse" } else { "Forward" };
+    let matched = match (assembled[0] == assembled[1], assembled[0] == assembled[2]) {
+        (true, true) => "Both (bitwise identical)",
+        (true, false) => "Forward",
+        (false, true) => "Reverse",
+        (false, false) => "Neither",
+    };
+    rows.push((
+        n,
+        m,
+        n,
+        m,
+        rule,
+        m.min(n),
+        matched,
+        gap(&assembled[1], &assembled[2]),
+        worst,
+    ));
+}
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Inputs n", "type": "integer" },
+    { "key": "1", "label": "Outputs m", "type": "integer" },
+    { "key": "2", "label": "Forward sweeps [count]", "type": "integer" },
+    { "key": "3", "label": "Reverse sweeps [count]", "type": "integer" },
+    { "key": "4", "label": "Auto direction" },
+    { "key": "5", "label": "Auto sweeps [count]", "type": "integer" },
+    { "key": "6", "label": "Direction matching Auto result" },
+    { "key": "7", "label": "Forward–Reverse difference [-]", "type": "number", "format": sci3 },
+    { "key": "8", "label": "Maximum difference from closed form [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "modes" })
+);
+```
+
+In all eight cases, `Forward` and `Reverse` differ in the last digit, and `Auto` agrees bit for bit with the direction specified by its rule.
+At $n = 64$, endpoint only ($m = 2$) needs two reverse sweeps, 16 tips ($m = 32$) need 32 reverse sweeps, and all tips ($m = 128$) need 64 tangent sweeps; each uses $\min(m, n)$ sweeps.
+At $n = 16$ and $k = 4$, $m = 8 < 16$ gives eight reverse sweeps; at $k = 16$, $m = 32$ gives 16 tangent sweeps.
+Differences between `Forward` and `Reverse` and from closed forms are all at most $7 \times 10^{-16}$; direction selection changes cost but not the accuracy level.
+
+## Summary
+
+`jvp` returns $\mathbf{J}\mathbf{v}$ with one forward evaluation and `Linearization::jvp_into` with one tangent sweep; `vjp` and `vjp_into` return $\mathbf{J}^\mathsf{T}\mathbf{w}$ with one reverse sweep.
+None forms $\mathbf{J}$, but one-shot `vjp` executes the function twice on a new tape per call; reuse a `linearize` recording when computing many products at the same point.
+Comparing the difference between $\langle \mathbf{w}, \mathbf{J}\mathbf{v} \rangle$ and $\langle \mathbf{J}^\mathsf{T}\mathbf{w}, \mathbf{v} \rangle$ with $uS = u\sum\lvert w_i J_{ij} v_j \rvert$ checks derivatives of a recorded function even without closed forms; a ratio on the order of 1 is within rounding error.
+For the arm, $\mathbf{J}^\mathsf{T}\mathbf{w}$ gives load-induced joint torques, and duality expresses the principle of virtual work.
+When a dense Jacobian is needed, `jacobian_into` assembles it with $\min(m, n)$ sweeps; fix the direction with `TapeOptions::with_jacobian_mode`.
+Reverse sweeps need fewer passes for few outputs, such as endpoint position only; tangent sweeps need fewer for few controls and many outputs.
+
+## Further reading
+
+- [Reverse mode and tapes](../../algorithms/reverse-mode-and-replay/): examine adjoint accumulation, tape recording rules, and product contracts on `Linearization`.
+- [Hessians and Hessian–vector products](../hessian-vector-product/): check Hessian–vector products from forward differentiation of gradients against dense Hessians and finite differences.
+- [Structural patterns and recovery of sparse derivatives](../../algorithms/sparse-derivatives/): examine coloring that groups structurally zero entries to assemble Jacobians in fewer than $\min(m, n)$ sweeps.
+- [Gradient and curvature of the Rosenbrock function](../rosenbrock-sensitivity/): examine how one reverse sweep gives the gradient for a single output.

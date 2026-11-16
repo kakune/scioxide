@@ -1,0 +1,387 @@
+---
+title: 作用素プロトコルとクロージャ作用素
+description: 行列を持たない線形作用素・随伴・一括適用・前処理・残差写像のプロトコル、適用のコンテキスト OperatorContext と密行列カーネルの受け渡し、クロージャから作る ClosureOperator と ClosurePreconditioner の段階的な書き込みと随伴の整合性の確認。
+sidebar:
+  order: 360
+references:
+  core-operator-protocols: "作用素プロトコルの共通規則"
+  core-operator-context: "求解の回数の集計と実行バックエンドの選択"
+  core-closure-operators: "クロージャから作る作用素と前処理"
+---
+
+偏微分方程式の離散化や大規模な最適化では、係数行列 $A$ を密な配列として持たずに積 $y = Ax$ だけを計算する方が、メモリ領域も計算量も少なく済む。
+`scioxide-core` は行列を持たない作用素の共通プロトコルをトレイトとして定め、反復解法などの上位クレートがその上に組み立てられるようにしている。
+型を定義するまでもない作用素と前処理は、クロージャから作れる。
+疎行列の非零構造 `StructuralPattern` と、疎なヤコビ行列を少ない評価回数で求めるための彩色 `ColoringSchedule` は[疎構造と列彩色](../sparse-structure-and-coloring/)で扱う。
+
+## 作用素プロトコルの共通規則
+
+Krylov 部分空間法や固有値解法は、行列の要素を読まず、ベクトルへの作用だけを使う。
+そのため作用素は密行列、疎行列、分解、クロージャのどれで実装してもよい。
+作用素のトレイトはどれもオブジェクト安全で、`&dyn LinearOperator<S>` のように渡せる。
+どのトレイトも次の 3 つの規則を共有する。
+
+1. 1 回の適用に必要な作業領域のスカラー数を、`apply_workspace_len()` などで正確に問い合わせられる。
+   呼び出し側はそれを事前に確保し、反復の中では確保しない。
+2. 実装は出力を変える前にすべての長さを検査し、合わなければ `DimensionMismatch` を返す。
+3. `apply_into_scoped`、`apply_adjoint_into_scoped`、`precondition_into_scoped` などの `_scoped` の付いたメソッドは、1 回の適用のコンテキストを受け取る。
+   作用素の評価そのもの（作用素なら `EvaluationRole::LinearOperator`、前処理なら `EvaluationRole::Preconditioner`）は、呼び出し側の解法が `record_provider` で先に許可を得て数える。
+   実装が数えるのは、残差の確認のような入れ子の追加作業だけである。
+   既定の実装は `_scoped` の付かないメソッドに委ねる。
+
+| トレイト | 主なメソッド | 意味 |
+|---|---|---|
+| `LinearOperator<S>` | `rows`、`cols`、`apply_workspace_len`、`apply_into`、`apply_into_scoped`、`apply_finite_into_scoped` | $y = A x$。入力の長さは `cols()`、出力の長さは `rows()` |
+| `AdjointOperator<S>` | `apply_adjoint_workspace_len`、`apply_adjoint_into`、`apply_adjoint_into_scoped`、`apply_adjoint_finite_into_scoped` | $y = A^{\mathsf{H}} x$（共役転置。実数では転置 $A^{\mathsf{T}}$）。入力の長さは `rows()`、出力の長さは `cols()` |
+| `BlockOperator<S>` | `apply_block_workspace_len`、`apply_block_into` | 列優先に並べた複数の右辺への一括適用 $Y = A X$ |
+| `Preconditioner<S>` | `dimension`、`precondition_workspace_len`、`precondition_into`、`precondition_into_scoped`、`precondition_block_workspace_len`、`precondition_block_into` | $y = M^{-1} x$。入力と出力の長さは `dimension()` |
+| `ResidualOperator<T>` | `input_dimension`、`output_dimension`、`residual_workspace_len`、`residual_into`、`residual_into_scoped` | 非線形の残差写像 $F(x)$ |
+| `JacobianOperator<T>` | `jvp_workspace_len`、`jvp_into`、`jvp_into_scoped` | ヤコビ行列とベクトルの積 $J(x)\,v$。行列を組み立てない |
+
+`apply_into_scoped` と `apply_adjoint_into_scoped` は `Invocation<()>` を返す。
+`Invocation::Evaluated` は出力に積が書かれたこと、`Invocation::BudgetExhausted` は上限が入れ子の追加作業を拒んだこと、`Invocation::ExecutionStopped` は取り消しか期限で止まったことを表す。
+`precondition_into_scoped`、`residual_into_scoped`、`jvp_into_scoped` は値を返さず、入れ子の作業が失敗したときにエラーを返す。
+残差とヤコビ行列の `_scoped` は、`OperatorContext` ではなく求解コンテキスト `SolveContext` を直接受け取る。
+複素数のスカラーでは、`JacobianOperator` のヤコビ行列は複素線形でなければならない。
+正則でない写像は実部と虚部を実数の座標として書く。
+
+`apply_finite_into_scoped` は、呼び出し側が入力の有限性と、成分の実部と虚部の大きさの上限 `maximum` を保証している場合に使う。
+実装は入力の有限性の検査を省いてよいが、長さと `maximum` は検査する。
+この場合の出力は解法の一時的なメモリ領域として扱われ、数値的な失敗で部分的に書き換わることがある。
+`maximum` が NaN か無限大なら `NonFinite`、負なら `InvalidInput`（理由は `InvalidInputReason::OutOfRange`）で拒否される。
+
+一括版の `apply_block_into` は、入力を `BlockVectorView`、出力を `BlockVectorViewMut`（[借用レイアウトとアフィン値](oxref:core-block-vectors)）で受け取る。
+行数を $m$、右辺の数を $r$ とすると、既定の実装が使う作業領域は $m r$ 個の一時出力バッファーと 1 列分の作業領域からなり、長さは `apply_block_workspace_len(r)` で求める（$r = 0$ なら 0）。
+各列の結果を一時出力バッファーにため、すべての列が成功してから出力に写すので、途中の列で失敗しても出力は変わらない。
+前処理の `precondition_block_into` も同じ形で動く。
+
+### 求解の回数の集計と実行バックエンドの選択
+
+`OperatorContext::new(&mut solve)` は、求解コンテキスト `SolveContext` を借用するだけのコンテキストを作る。
+`Deref` と `DerefMut` を通して、`SolveContext` の回数の集計メソッドをそのまま使える。
+`OperatorContext::with_kernels(&mut solve, &kernels)` は、呼び出し側のライブラリが選択済みの密行列カーネル（`DenseOperatorKernel`）を添え、作用素は `kernels()` でそれを取り出す。
+このカーネルは選択済みの実行バックエンドの選択（`dispatch()`）を返し、`apply_dense_into` で `DenseOperatorInput`（借用したメモリ領域 `data`、形 `shape`、ストライド `strides`、共役の有無 `conjugated`、成分の上限 `maximum`）とベクトルの積を計算する。
+カーネルは作用素の適用を数え直さない。
+作用素が別の作用素を適用するときは、`reborrow()` で同じ回数の集計とカーネルを子の適用に渡す。
+コンテキストを作ったり再借用したりしても、確保も作業の計上も起きない（回数の集計は[求解のライフサイクルと計算回数の管理](../solve-lifecycle-and-accounting/)で説明する）。
+scioxide-linalg の反復解法はこの経路を使い、作用素の内部の密行列積に呼び出し側と同じ振り分けを使わせる。
+
+## クロージャから作る作用素と前処理
+
+トレイトを実装する型を定義しなくても、クロージャから作用素と前処理を作れる。
+
+- `ClosureOperator::new(rows, cols, apply)` は、`apply(input, output)` の形のクロージャから `rows × cols` の `LinearOperator` を作る。
+  クロージャは `cols` 個の入力を受け取り、$A \cdot \mathrm{input}$ を `rows` 個の出力に書く。
+- `with_adjoint(adjoint)` は、`rows` 個の入力から $A^{\mathsf{H}} \cdot \mathrm{input}$ を `cols` 個の出力に書くクロージャを加える。
+  これで作用素は `AdjointOperator` も実装し、随伴を使う解法や感度計算に渡せる。
+- `ClosurePreconditioner::new(dimension, apply)` は、`dimension` 個の入力から $M^{-1} \cdot \mathrm{input}$ を `dimension` 個の出力に書くクロージャから `Preconditioner` を作る。
+
+どのクロージャも型は `Fn(&[S], &mut [S]) -> Result<(), SciOxideError>` である。
+スカラー型は `ClosureOperator::<f64, _>::new(…)` のように指定すれば、クロージャの引数に型注釈は要らない。
+
+### 段階的な書き込み
+
+クロージャが受け取る `output` は呼び出し側の出力ではなく作業領域である。
+`apply_into` などは長さを検査してからクロージャを呼び、クロージャが成功し、書かれた成分がすべて有限な場合だけ、作業領域の値を呼び出し側の出力に写す。
+
+- 作業領域の長さは出力の長さに等しい。
+  `apply_workspace_len()` は `rows`、`apply_adjoint_workspace_len()` は `cols`、`precondition_workspace_len()` は `dimension` を返す。
+- クロージャのエラーはそのまま返り、非有限な成分は `NonFinite`（`NonFiniteOrigin::Callback`）になる。
+  長さが合わなければ `DimensionMismatch` になる。
+  どの場合も呼び出し側の出力は変わらない。
+- クロージャ自身が作業用のメモリ領域を必要とするときは、取り込んだ `RefCell` などでクロージャが所有する。
+- `ClosureOperator` は `BlockOperator` も実装しているので、同じクロージャを `apply_block_into` で複数の右辺に適用できる。
+
+段階的な書き込みの計算コストは出力 1 本分のコピーと有限性の検査で、どちらも出力の長さに比例する。
+適用はヒープを確保しない。
+
+### 随伴の整合性
+
+`with_adjoint` に渡したクロージャが、`new` に渡したクロージャの随伴になっているかは検査されない。
+2 つのクロージャが食い違っていても、適用そのものはエラーにならない。
+随伴は内積の恒等式
+
+$$
+\langle w,\, A x \rangle = \langle A^{\mathsf{H}} w,\, x \rangle
+$$
+
+で特徴づけられるので、適当な $x$ と $w$ で両辺を計算すれば、実装の誤りを安く見つけられる。
+ここで $\langle u, v \rangle = \sum_i \overline{u_i}\, v_i$ である。
+両辺は丸め誤差の範囲で一致すればよい。
+
+次のセルは 3 点の値から隣どうしの差を作る $2 \times 3$ の前進差分に係数 $\gamma$ を掛けた作用素
+
+$$
+A = \gamma \begin{pmatrix} -1 & 1 & 0 \\ 0 & -1 & 1 \end{pmatrix}
+$$
+
+と、その転置をクロージャで定義する。
+入力は係数 $\gamma$（0.5 から 3）と、クロージャが NaN を返すかどうかである。
+$x = (1, 4, 9)$ に $A$ を、$w = (1, -2)$ に $A^{\mathsf{T}}$ を適用し、出力を手計算の参照値 $\gamma\,(3, 5)$ と $\gamma\,(-1, 3, -2)$ に並べる。
+$A x$ の出力はあらかじめ $-1$ で埋めておく。
+「クロージャが NaN を返す」を選ぶと、$A$ のクロージャが第 1 成分に NaN を書き、`apply_into` はエラーを返して出力は $-1$ のまま残る。
+1 つ目の表は作業領域の長さ、`apply_into` の結果、内積の恒等式の両辺を示す。
+左辺は `apply_into` が失敗したときは計算できないので、空欄になる。
+
+```rust
+//| id: core-closure-operator-staging
+//| ref: core-closure-operator-staging
+//| title: クロージャ作用素の随伴と失敗時の出力
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   gamma: {"type":"range","label":"係数 γ [-]","description":"A = γ × 前進差分の倍率。","min":0.5,"max":3,"step":0.5,"value":1.5}
+//|   inject_nan: {"type":"checkbox","label":"クロージャが NaN を返す","description":"A のクロージャが出力の第 1 成分に NaN を書き込む。","value":false}
+//| cases:
+//|   - {"id":"non-finite","label":"NaN を返す","description":"apply_into が NonFinite で失敗し、出力は -1 のまま残る。","inputs":{"inject_nan":true}}
+//|   - {"id":"scaled","label":"γ = 3","description":"出力と内積が γ に比例する。","inputs":{"gamma":3}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":2}
+//|       - {"artifact":"summary","path":"/rows/0/1","equals":3}
+//|       - {"artifact":"summary","path":"/rows/0/2","equals":"Ok"}
+//|       - {"artifact":"summary","path":"/rows/0/3","approx":{"value":-10.5,"atol":1e-12}}
+//|       - {"artifact":"summary","path":"/rows/0/4","approx":{"value":-10.5,"atol":1e-12}}
+//|       - {"artifact":"forward","path":"/rows/0/1","approx":{"value":4.5,"atol":1e-12}}
+//|       - {"artifact":"forward","path":"/rows/1/1","approx":{"value":7.5,"atol":1e-12}}
+//|       - {"artifact":"adjoint","path":"/rows/1/1","approx":{"value":4.5,"atol":1e-12}}
+//|   - case: non-finite
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/2","equals":"NonFinite"}
+//|       - {"artifact":"summary","path":"/rows/0/3","equals":null}
+//|       - {"artifact":"forward","path":"/rows/0/1","approx":{"value":-1,"atol":1e-12}}
+//|       - {"artifact":"forward","path":"/rows/1/1","approx":{"value":-1,"atol":1e-12}}
+//|       - {"artifact":"adjoint","path":"/rows/2/1","approx":{"value":-3,"atol":1e-12}}
+//|   - case: scaled
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/3","approx":{"value":-21,"atol":1e-12}}
+//|       - {"artifact":"summary","path":"/rows/0/4","approx":{"value":-21,"atol":1e-12}}
+//|       - {"artifact":"forward","path":"/rows/1/1","approx":{"value":15,"atol":1e-12}}
+use scioxide_core::{AdjointOperator, ClosureOperator, SciOxideErrorKind, LinearOperator};
+
+// A = γ [[-1, 1, 0], [0, -1, 1]]。クロージャは (input, output) を受け取る。
+let op = ClosureOperator::<f64, _>::new(2, 3, |x, y| {
+    y[0] = gamma * (x[1] - x[0]);
+    y[1] = if inject_nan {
+        f64::NAN
+    } else {
+        gamma * (x[2] - x[1])
+    };
+    Ok(())
+})
+.with_adjoint(|w, z| {
+    // Aᵀ w = γ (-w₀, w₀ - w₁, w₁)。
+    z[0] = -gamma * w[0];
+    z[1] = gamma * (w[0] - w[1]);
+    z[2] = gamma * w[1];
+    Ok(())
+});
+let x = [1.0, 4.0, 9.0];
+let w = [1.0, -2.0];
+let forward_len = op.apply_workspace_len().map_err(|e| e.to_string())?;
+let adjoint_len = op
+    .apply_adjoint_workspace_len()
+    .map_err(|e| e.to_string())?;
+let mut workspace = vec![0.0; forward_len.max(adjoint_len)];
+
+// 出力を -1 で埋めておき、失敗したときに書き換わらないことを見る。
+let mut y = [-1.0; 2];
+let applied = op.apply_into(&x, &mut y, &mut workspace[..forward_len]);
+let status = match &applied {
+    Ok(()) => "Ok",
+    Err(error) => match error.kind() {
+        SciOxideErrorKind::NonFinite => "NonFinite",
+        _ => "その他の分類",
+    },
+};
+let mut z = [0.0; 3];
+op.apply_adjoint_into(&w, &mut z, &mut workspace[..adjoint_len])
+    .map_err(|e| e.to_string())?;
+
+// 内積の恒等式 ⟨w, A x⟩ = ⟨Aᵀ w, x⟩ の両辺。
+let left = applied.is_ok().then(|| w[0] * y[0] + w[1] * y[1]);
+let right = z[0] * x[0] + z[1] * x[1] + z[2] * x[2];
+let digits = serde_json::json!({ "significantDigits": 6 });
+let summary_columns = serde_json::json!([
+    { "key": "0", "label": "apply_workspace_len()", "type": "integer" },
+    { "key": "1", "label": "apply_adjoint_workspace_len()", "type": "integer" },
+    { "key": "2", "label": "apply_into の結果" },
+    { "key": "3", "label": "⟨w, A x⟩ [-]", "type": "number", "format": digits, "nullText": "-" },
+    { "key": "4", "label": "⟨Aᵀ w, x⟩ [-]", "type": "number", "format": digits }
+]);
+emit_table_with_columns!(
+    summary_columns,
+    vec![(forward_len, adjoint_len, status, left, right)],
+    metadata = serde_json::json!({ "id": "summary" })
+);
+
+// 参照値（手計算）: A x = γ (4 - 1, 9 - 4)、Aᵀ w = γ (-1, 1 + 2, -2)。
+let forward_reference = [3.0 * gamma, 5.0 * gamma];
+let forward_rows: Vec<(usize, f64, f64)> =
+    (0..2).map(|i| (i, y[i], forward_reference[i])).collect();
+let forward_columns = serde_json::json!([
+    { "key": "0", "label": "成分 i", "type": "integer" },
+    { "key": "1", "label": "apply_into の出力 y_i [-]", "type": "number", "format": digits },
+    { "key": "2", "label": "参照値 γ (3, 5)_i [-]", "type": "number", "format": digits }
+]);
+emit_table_with_columns!(
+    forward_columns,
+    forward_rows,
+    metadata = serde_json::json!({ "id": "forward" })
+);
+let adjoint_reference = [-gamma, 3.0 * gamma, -2.0 * gamma];
+let adjoint_rows: Vec<(usize, f64, f64)> =
+    (0..3).map(|j| (j, z[j], adjoint_reference[j])).collect();
+let adjoint_columns = serde_json::json!([
+    { "key": "0", "label": "成分 j", "type": "integer" },
+    { "key": "1", "label": "apply_adjoint_into の出力 z_j [-]", "type": "number", "format": digits },
+    { "key": "2", "label": "参照値 γ (-1, 3, -2)_j [-]", "type": "number", "format": digits }
+]);
+emit_table_with_columns!(
+    adjoint_columns,
+    adjoint_rows,
+    metadata = serde_json::json!({ "id": "adjoint" })
+);
+```
+
+既定値 $\gamma = 1.5$ では、$A x = (4.5, 7.5)$ と $A^{\mathsf{T}} w = (-1.5, 4.5, -3)$ が参照値と一致する。
+作業領域の長さは $A$ の適用で 2、随伴の適用で 3 で、それぞれ出力の長さに等しい。
+内積は両辺とも $-10.5$（$= -7\gamma$）で、2 つのクロージャが互いの転置になっていることを確かめられる。
+$\gamma = 3$ では出力も内積も 2 倍になり、内積は $-21$ である。
+
+NaN を返すと `apply_into` の結果は `NonFinite` になる。
+第 0 成分はクロージャの中では正しく計算されているが出力に写されず、2 つの成分とも $-1$ のまま残る。
+随伴のクロージャは別に呼ばれるので、$A^{\mathsf{T}} w$ は変わらない。
+
+### クロージャの前処理と一括適用
+
+前処理 $M^{-1}$ は係数行列 $A$ の逆の近似を残差に掛けて、反復解法の収束を速くするための作用である。
+最も単純な Jacobi 前処理は $M = \mathrm{diag}(A)$ で、残差の各成分を対角要素 $d_i$ で割る。
+対角要素に 0 があると商が無限大になるので、段階的な書き込みが働く場面を作れる。
+
+次のセルは $d = (4, 2, d_2)$ の Jacobi 前処理を `ClosurePreconditioner` で作り、2 本の右辺 $r^{(0)} = (4, 2, 10)$ と $r^{(1)} = (8, -2, 5)$ に `precondition_block_into` で一括適用する。
+入力は最後の対角要素 $d_2$（0 から 8 の整数）である。
+出力のブロックはあらかじめ $-1$ で埋めておく。
+1 つ目の表は作業領域の長さと適用の結果、2 つ目の表は列 $j$ と成分 $i$ ごとの出力 $z^{(j)}_i$ と参照値 $r^{(j)}_i / d_i$ を示す。
+$d_2 = 0$ のときは参照値が定義できないので、その欄は空欄になる。
+
+```rust
+//| id: core-closure-preconditioner-block
+//| ref: core-closure-preconditioner-block
+//| title: クロージャの Jacobi 前処理を 2 本の右辺に一括適用する
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   last_diagonal: {"type":"range","label":"対角要素 d₂ [-]","description":"0 にすると商が無限大になり、適用が失敗する。","min":0,"max":8,"step":1,"value":5}
+//| cases:
+//|   - {"id":"zero-diagonal","label":"d₂ = 0","description":"第 0 列の商が無限大になり、ブロック全体が書き換わらない。","inputs":{"last_diagonal":0}}
+//|   - {"id":"large-diagonal","label":"d₂ = 8","description":"最後の成分だけが変わる。","inputs":{"last_diagonal":8}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":3}
+//|       - {"artifact":"summary","path":"/rows/0/1","equals":9}
+//|       - {"artifact":"summary","path":"/rows/0/2","equals":"Ok"}
+//|       - {"artifact":"block","path":"/rows/0/3","approx":{"value":1,"atol":1e-12}}
+//|       - {"artifact":"block","path":"/rows/2/3","approx":{"value":2,"atol":1e-12}}
+//|       - {"artifact":"block","path":"/rows/4/3","approx":{"value":-1,"atol":1e-12}}
+//|       - {"artifact":"block","path":"/rows/5/3","approx":{"value":1,"atol":1e-12}}
+//|   - case: zero-diagonal
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/2","equals":"NonFinite"}
+//|       - {"artifact":"block","path":"/rows/0/3","approx":{"value":-1,"atol":1e-12}}
+//|       - {"artifact":"block","path":"/rows/3/3","approx":{"value":-1,"atol":1e-12}}
+//|       - {"artifact":"block","path":"/rows/2/4","equals":null}
+//|   - case: large-diagonal
+//|     expect:
+//|       - {"artifact":"block","path":"/rows/2/3","approx":{"value":1.25,"atol":1e-12}}
+//|       - {"artifact":"block","path":"/rows/5/3","approx":{"value":0.625,"atol":1e-12}}
+use scioxide_core::{
+    BlockVectorView, BlockVectorViewMut, ClosurePreconditioner, SciOxideErrorKind, Preconditioner,
+};
+
+let diagonal = [4.0, 2.0, last_diagonal];
+// Jacobi 前処理 z = r / d。d₂ = 0 では商が無限大になる。
+let jacobi = ClosurePreconditioner::<f64, _>::new(3, |r, z| {
+    for ((slot, &value), &pivot) in z.iter_mut().zip(r).zip(&diagonal) {
+        *slot = value / pivot;
+    }
+    Ok(())
+});
+// 2 本の右辺を列優先に並べる: 列 0 = (4, 2, 10)、列 1 = (8, -2, 5)。
+let residuals = [4.0, 2.0, 10.0, 8.0, -2.0, 5.0];
+let single_len = jacobi
+    .precondition_workspace_len()
+    .map_err(|e| e.to_string())?;
+let block_len = jacobi
+    .precondition_block_workspace_len(2)
+    .map_err(|e| e.to_string())?;
+let mut workspace = vec![0.0; block_len];
+// 出力を -1 で埋めておき、失敗したときに書き換わらないことを見る。
+let mut solved = [-1.0; 6];
+let input = BlockVectorView::new(&residuals, 3, 2).map_err(|e| e.to_string())?;
+let mut output = BlockVectorViewMut::new(&mut solved, 3, 2).map_err(|e| e.to_string())?;
+let status = match jacobi.precondition_block_into(input, &mut output, &mut workspace) {
+    Ok(()) => "Ok",
+    Err(error) => match error.kind() {
+        SciOxideErrorKind::NonFinite => "NonFinite",
+        _ => "その他の分類",
+    },
+};
+let summary_columns = serde_json::json!([
+    { "key": "0", "label": "precondition_workspace_len()", "type": "integer" },
+    { "key": "1", "label": "precondition_block_workspace_len(2)", "type": "integer" },
+    { "key": "2", "label": "precondition_block_into の結果" }
+]);
+emit_table_with_columns!(
+    summary_columns,
+    vec![(single_len, block_len, status)],
+    metadata = serde_json::json!({ "id": "summary" })
+);
+
+let rows: Vec<(usize, usize, f64, f64, Option<f64>)> = (0..6)
+    .map(|index| {
+        let (j, i) = (index / 3, index % 3);
+        // 参照値（手計算の式）: r / d。d = 0 では定義しない。
+        let reference = (diagonal[i] != 0.0).then(|| residuals[index] / diagonal[i]);
+        (j, i, residuals[index], solved[index], reference)
+    })
+    .collect();
+let digits = serde_json::json!({ "significantDigits": 6 });
+let block_columns = serde_json::json!([
+    { "key": "0", "label": "列 j", "type": "integer" },
+    { "key": "1", "label": "成分 i", "type": "integer" },
+    { "key": "2", "label": "右辺 r [-]", "type": "number", "format": digits },
+    { "key": "3", "label": "出力 z [-]", "type": "number", "format": digits },
+    { "key": "4", "label": "参照値 r / d [-]", "type": "number", "format": digits, "nullText": "未定義" }
+]);
+emit_table_with_columns!(
+    block_columns,
+    rows,
+    metadata = serde_json::json!({ "id": "block" })
+);
+```
+
+既定値 $d_2 = 5$ では、出力は $z^{(0)} = (1, 1, 2)$、$z^{(1)} = (2, -1, 1)$ で参照値と一致する。
+1 本の適用の作業領域は 3 個、2 本の一括適用は一時出力バッファー $3 \times 2 = 6$ 個と合わせて 9 個である。
+$d_2 = 8$ では最後の成分だけが $1.25$ と $0.625$ に変わる。
+
+$d_2 = 0$ では第 0 列の最後の成分が $10 / 0$ で無限大になり、`precondition_block_into` は `NonFinite` を返す。
+第 0 列の最初の 2 成分はクロージャの中では正しく計算されているが、ブロックの 6 成分はすべて $-1$ のまま残る。
+失敗したあとに、一部の列だけが更新されたブロックは残らない。
+
+## まとめ
+
+行列を持たない作用素は `LinearOperator` などのトレイトとして実装し、必要な作業領域を事前に問い合わせて呼び出し側で確保する。
+求解の中で適用するときは `OperatorContext` を渡し、作用素の評価は呼び出し側が数え、実装は入れ子の追加作業だけを同じ集計に含める。
+型を定義するまでもない作用素と前処理は `ClosureOperator`（随伴は `with_adjoint`）と `ClosurePreconditioner` で作り、随伴の実装は内積の恒等式で確かめる。
+クロージャの作用素と一括版の `apply_block_into` は、結果を一時出力バッファーで検査してから出力に写すので、コールバックの失敗や非有限値で呼び出し側のベクトルが一部だけ書き換わることはない。
+
+## 次に読むページ
+
+- [疎構造と列彩色](../sparse-structure-and-coloring/)：ヤコビ行列を積ではなく要素として求めるときの非零構造と、評価回数を減らす列彩色を確かめる。
+- [整数組合せ論](../combinatorics/)：`Permutation` による並べ替えと、組合せの数え上げを確かめる。
+- [入れ子の求解・回数の集計・診断](../nested-solves-and-diagnostics/)：`_scoped` の付いたメソッドが `OperatorContext` を通して借用する `SolveContext` の回数の集計と、`_scoped` 関数の規約を確かめる。
+- [エラーの分類と詳細ビュー](../errors-and-diagnostic-views/)：セルに出た `NonFinite` や `InvalidInput` の詳細を `view()` で読む方法を確かめる。
+- [レイアウト・作用素・組合せの API](../../api/layouts-operators-combinatorics/)：作用素のトレイトとクロージャの型の全項目を引く。

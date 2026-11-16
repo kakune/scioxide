@@ -1,0 +1,532 @@
+---
+title: 2 次元 Poisson 行列の並べ替えとフィル
+description: 正方形の格子の 5 点差分ラプラシアンを自然順・RCM・AMD で並べ替えて Cholesky 分解し、帯幅・包絡・因子の非零の数・演算数とその増え方を比べ、包絡の定理、自然順の閉形式、厳密解で検算する。
+sidebar:
+  order: 410
+---
+
+2 次元の定常熱伝導や静電場の Poisson 方程式 $-\nabla^2 u = f$ を差分で離散化すると、未知数 $N$ の疎な対称正定値行列が得られる。
+Cholesky 分解で解くときのメモリと手間は、行列の非零の数ではなく因子のフィルで決まり、フィルは未知数の番号の付け方で大きく変わる。
+この例題では $n \times n$ 格子の 5 点差分ラプラシアンを三つの順序で並べ替えて分解し、帯幅、包絡、因子の非零の数、演算数を比べる。
+独立な検算として、包絡の定理による不等式、自然順のフィルの閉形式、厳密解が分かっている連立方程式を使う。
+
+同じ方程式の周期境界の問題は [2次元周期 Poisson 方程式のスペクトル解法](../../../scioxide-fft/examples/spectral-poisson/) で FFT により解き、差分の収束の次数は scioxide-pde の [Poisson 問題を保存則から格子収束まで追う](../../../scioxide-pde/examples/poisson-grid/) で調べる。
+
+## 5 点差分の行列
+
+正方形 $[0, 1]^2$ の内部に $n \times n$ 個の格子点を格子幅 $h = 1/(n + 1)$ で置き、境界で $u = 0$（Dirichlet 条件）とする。
+格子点 $(i, j)$（$0 \le i, j < n$、$i$ が格子の行、$j$ が列）の 5 点差分は
+
+$$
+4u_{i,j} - u_{i-1,j} - u_{i+1,j} - u_{i,j-1} - u_{i,j+1} = h^2 f_{i,j}
+$$
+
+で、境界の上の値は 0 とする。
+格子点を行優先に $k = in + j$ と番号付けした行列 $\mathbf{A} \in \mathbb{R}^{N \times N}$（$N = n^2$）は、対角が 4、左右の隣（$k \pm 1$）と上下の隣（$k \pm n$）が $-1$ の帯行列である。
+
+$\mathbf{A}$ の固有ベクトルは $\sin\frac{p\pi(i + 1)}{n + 1}\sin\frac{q\pi(j + 1)}{n + 1}$、固有値は
+
+$$
+\lambda_{pq} = 4\sin^2\frac{p\pi}{2(n + 1)} + 4\sin^2\frac{q\pi}{2(n + 1)}, \qquad p, q = 1, \dots, n
+$$
+
+で、どれも正なので $\mathbf{A}$ は対称正定値である。
+2 ノルムの条件数は $\kappa_2(\mathbf{A}) = \lambda_{nn}/\lambda_{11} = \cot^2\frac{\pi}{2(n + 1)}$ で、$n = 16$ では 116、$n = 48$ では 972 になる。
+
+次のブロックは三つのセルが共有する定義である。
+`PoissonGrid::new` が上の行列の組立て、`analyze` が選んだ順序（`GridOrdering`）での記号解析、`profile` が並べ替えた行列の帯幅と包絡（次の節で定義する）の計算に対応する。
+記号解析に与える因子の要素数の上限は $Nn = n^3$、バイト数の上限は 64 MiB とした。
+自然順のフィルは次の節で導く $n^3 - n^2 + n - 1$ で、この上限に収まり、ほかの二つの順序のフィルはそれより少ない（下の表）。
+因子と作業領域のメモリは要素数の上限の分だけ確保されるので、上限には必要な量に近い値を与える。
+順序を選ばずに AMD で分解するだけなら、準備を一括して行うコンストラクター `SparseCholesky::new` が上限を記号解析の予測した要素数にそろえる。
+Cholesky 分解は $\mathbf{L}\mathbf{D}\mathbf{L}^{\mathsf{H}}$ 分解で使う Schur 補行列の作業領域を使わないので、その上限は 0 にする。
+
+```rust
+//| id: sparse-poisson-model
+//| kind: definitions
+//| title: 5 点差分ラプラシアンと三つの順序の記号解析
+//| crates: [scioxide-core, scioxide-sparse]
+use scioxide_core::{SciOxideError, Permutation, Triangle};
+use scioxide_sparse::{
+    CsrMatrix, DuplicatePolicy, ExplicitZeroPolicy, SparseBuilder, SparseOrdering,
+    SparseSymmetricLimits, SparseSymmetricSymbolic, reverse_cuthill_mckee,
+};
+
+/// 未知数の番号付けの選び方。
+#[derive(Clone, Copy)]
+pub(crate) enum GridOrdering {
+    Natural,
+    ReverseCuthillMcKee,
+    MinimumDegree,
+}
+
+impl GridOrdering {
+    pub(crate) const ALL: [GridOrdering; 3] = [
+        Self::Natural,
+        Self::ReverseCuthillMcKee,
+        Self::MinimumDegree,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Natural => "自然順",
+            Self::ReverseCuthillMcKee => "RCM",
+            Self::MinimumDegree => "AMD",
+        }
+    }
+}
+
+/// 辺に n 個の内部格子点を持つ正方形の 5 点差分ラプラシアン（行優先の番号 k = in + j）。
+pub(crate) struct PoissonGrid {
+    pub(crate) side: usize,
+    pub(crate) matrix: CsrMatrix<f64>,
+}
+
+impl PoissonGrid {
+    pub(crate) fn new(side: usize) -> Result<Self, SciOxideError> {
+        let unknowns = side * side;
+        let mut builder = SparseBuilder::new(unknowns, unknowns);
+        for p in 0..unknowns {
+            builder.push(p, p, 4.0)?;
+            // 左右の隣は同じ格子の行に、上下の隣は同じ格子の列にある点に限る。
+            for q in [p.wrapping_sub(1), p + 1, p.wrapping_sub(side), p + side] {
+                if q < unknowns && (q / side == p / side || q % side == p % side) {
+                    builder.push(p, q, -1.0)?;
+                }
+            }
+        }
+        let matrix = builder.finish_csr(DuplicatePolicy::Reject, ExplicitZeroPolicy::Drop)?;
+        Ok(Self { side, matrix })
+    }
+
+    /// 選んだ順序で下三角を読む記号解析（因子の要素数の上限は N n）。
+    pub(crate) fn analyze(
+        &self,
+        ordering: GridOrdering,
+    ) -> Result<SparseSymmetricSymbolic, SciOxideError> {
+        let pattern = self.matrix.structural_pattern();
+        let rcm;
+        let chosen = match ordering {
+            GridOrdering::Natural => SparseOrdering::Natural,
+            GridOrdering::ReverseCuthillMcKee => {
+                rcm = reverse_cuthill_mckee(pattern)?;
+                SparseOrdering::Supplied(&rcm)
+            }
+            GridOrdering::MinimumDegree => SparseOrdering::FillReducing,
+        };
+        let limits = SparseSymmetricLimits::new(self.matrix.rows() * self.side, 0, 1 << 26);
+        SparseSymmetricSymbolic::analyze(pattern, chosen, Some(Triangle::Lower), limits)
+    }
+
+    /// 並べ替えた P A Pᵀ の帯幅 β と包絡の大きさ env = Σₖ (k − fₖ)。
+    pub(crate) fn profile(&self, permutation: &Permutation) -> (usize, usize) {
+        let (row_ptr, cols) = (self.matrix.row_ptr(), self.matrix.col_indices());
+        let new_of = permutation.old_to_new();
+        let (mut bandwidth, mut envelope) = (0, 0);
+        for (k, &old) in permutation.new_to_old().iter().enumerate() {
+            // 第 k 行の最初の非零の列 fₖ（対角を含むので fₖ ≤ k）。
+            let first = cols[row_ptr[old]..row_ptr[old + 1]]
+                .iter()
+                .fold(k, |f, &c| f.min(new_of[c]));
+            bandwidth = bandwidth.max(k - first);
+            envelope += k - first;
+        }
+        (bandwidth, envelope)
+    }
+}
+```
+
+## 帯幅・包絡・フィル
+
+行列の**帯幅**を $\beta = \max\{\lvert k - l \rvert : a_{kl} \ne 0\}$、第 $k$ 行の最初の非零の列を $f_k = \min\{l : a_{kl} \ne 0\}$ とし、**包絡**（プロファイル）の大きさを $\mathrm{env}(\mathbf{A}) = \sum_k (k - f_k)$ と定める。
+消去は行の最初の非零より左に非零を作らないので、Cholesky 因子の第 $k$ 行の非零は列 $f_k$ から $k$ の間にしか生じない（包絡の定理。
+[Reverse Cuthill–McKee 法と包絡](oxref:sparse-rcm-envelope)）。
+したがって、狭義下三角の因子の非零の数は
+
+$$
+\mathrm{nnz}(\mathbf{L}) \le \mathrm{env}(\mathbf{P}\mathbf{A}\mathbf{P}^{\mathsf{T}})
+$$
+
+を満たす。
+ここで $\mathbf{P}$ は並べ替えを表す置換行列である。
+
+自然順では、格子の第 0 行の点（$k < n$）は左隣だけを持つので $k - f_k = 1$（$k = 0$ では 0）、それ以外の点は真上の点を持つので $k - f_k = n$ である。
+したがって
+
+$$
+\mathrm{env}(\mathbf{A}) = (n - 1) + n(N - n) = n^3 - n^2 + n - 1
+$$
+
+となる。
+この包絡は消去で完全に埋まる。
+フィル路の定理（[消去グラフとフィル](oxref:sparse-elimination-graph-fill)）によれば、$l < k$ のとき因子の成分 $L_{kl}$ が 0 でないのは、$k$ と $l$ を番号が $l$ より小さい点だけを経由して結ぶ道があるときである。
+$k$ が格子の第 1 行以降にあり $k - n \le l < k$ なら、$k$ から真上の $k - n$ に移り、一つ上の格子の行に沿って $l$ の列まで進み、$l$ が $k$ と同じ格子の行にあるときは最後に真下の $l$ に降りる道がある。
+途中の点の番号はどれも $l$ より小さいので、包絡の内側はすべて因子の非零で埋まり、不等式は等号になる。
+よって自然順では $\mathrm{nnz}(\mathbf{L}) = n^3 - n^2 + n - 1 = O(N^{3/2})$ である。
+
+列 $l$ を消去するとき、Schur 補行列の更新には列の非零の数 $c_l$ に対して $c_l(c_l + 1)/2$ 回の積和がかかる。
+積と和を別に数えると、分解全体の浮動小数点演算数は主要項で $\sum_l c_l^2$ になる。
+自然順では $c_l \approx n$ なので、演算数は $Nn^2 = N^2$ に比例する。
+
+Reverse Cuthill–McKee（RCM）は幅優先探索の層ごとに番号を付けて帯幅と包絡を縮める。
+`reverse_cuthill_mckee` は次数の最小の点から探索を繰り返して疑似周辺頂点を始点に選ぶので、格子では隅から探索が始まる。
+すると層は反対角線の点の集まりになり、大きさが最大 $n$ になるので、帯幅は自然順と同じ $n$ 程度にとどまる。
+各点の行の包絡の幅はおよそその層の大きさなので、包絡は層の大きさの 2 乗の和、つまりおよそ $\frac{2}{3}n^3$ で、自然順と同じく $N^{3/2}$ に比例して増える。
+近似最小次数法（AMD）は帯を作らず、その時点で隣接する点の少ない点から消去するので、包絡は大きくなるが、フィルはずっと小さくなる。
+AMD は `SparseOrdering::FillReducing` で、直接分解の記号解析の既定である。
+
+格子の問題では入れ子分割（nested dissection）がフィル $O(N \log N)$、演算数 $O(N^{3/2})$ を達成する（George, 1973）。
+`scioxide-sparse` は入れ子分割を提供しないので、格子の分割から作った順序がある場合は `SparseOrdering::Supplied` で与える。
+
+## 三つの順序の比較
+
+次のセルは $n \times n$ 格子の行列を、自然順、RCM（`reverse_cuthill_mckee` の順序を `Supplied` で与える）、AMD（`FillReducing`）の三つの順序で `SparseSymmetricSymbolic::analyze` により解析し、`SparseCholesky::factor` で分解する。
+入力は格子の辺の点の数 $n$（8〜48）である。
+
+表の帯幅と包絡は、並べ替えた行列 $\mathbf{P}\mathbf{A}\mathbf{P}^{\mathsf{T}}$ の構造から独立に数えた値である。
+$\mathrm{nnz}(\mathbf{L})$ は記号解析が構造から予測した因子の非零の数（`cholesky_entries`）で、Cholesky の因子はちょうどこの数の要素を保存する。
+包絡との差 $\mathrm{env} - \mathrm{nnz}(\mathbf{L})$ が負にならないことが包絡の定理の検算で、最後の行は自然順の閉形式である。
+演算数の目安 $\sum_l c_l^2$ は、分解した因子の各列の非零を数えて求める。
+最後の列は厳密解 $\mathbf{x} = \mathbf{1}$ を持つ $\mathbf{A}\mathbf{x} = \mathbf{A}\mathbf{1}$ を解いた解 $\hat{\mathbf{x}}$ の誤差 $\lVert\hat{\mathbf{x}} - \mathbf{1}\rVert_\infty$ である。
+
+```rust
+//| id: sparse-poisson-reordering
+//| ref: sparse-poisson-reordering
+//| title: 2 次元 Poisson 行列の三つの順序による帯幅・包絡・フィル
+//| run: reactive
+//| uses: [sparse-poisson-model]
+//| crates: [scioxide-core, scioxide-sparse]
+//| inputs:
+//|   grid_n: {"type":"range","label":"格子の辺の点の数 n","description":"未知数の数は N = n²。","min":8,"max":48,"step":4,"value":16}
+//| cases:
+//|   - {"id":"large-grid","label":"n = 48","description":"自然順と AMD の因子の非零の比が 3.6 倍、演算数の比が約 6 倍に広がる。","inputs":{"grid_n":48}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"orderings","path":"/rows/0/1","equals":16}
+//|       - {"artifact":"orderings","path":"/rows/0/2","equals":3855}
+//|       - {"artifact":"orderings","path":"/rows/0/3","equals":3855}
+//|       - {"artifact":"orderings","path":"/rows/0/4","equals":0}
+//|       - {"artifact":"orderings","path":"/rows/1/3","equals":2840}
+//|       - {"artifact":"orderings","path":"/rows/2/3","equals":1885}
+//|       - {"artifact":"orderings","path":"/rows/2/4","range":{"min":0}}
+//|       - {"artifact":"orderings","path":"/rows/2/6","range":{"max":1e-13}}
+//|       - {"artifact":"orderings","path":"/rows/3/3","equals":3855}
+//|   - case: large-grid
+//|     expect:
+//|       - {"artifact":"orderings","path":"/rows/0/3","equals":108335}
+//|       - {"artifact":"orderings","path":"/rows/3/3","equals":108335}
+//|       - {"artifact":"orderings","path":"/rows/2/3","equals":30264}
+//|       - {"artifact":"orderings","path":"/rows/0/6","range":{"max":1e-12}}
+use scioxide_sparse::SparseCholesky;
+
+let grid = PoissonGrid::new(grid_n as usize).map_err(|e| e.to_string())?;
+let (n, unknowns) = (grid.side, grid.matrix.rows());
+// 厳密解 x = 1 に対する右辺 b = A1。
+let b = grid
+    .matrix
+    .apply(&vec![1.0; unknowns])
+    .map_err(|e| e.to_string())?;
+let mut rows = Vec::new();
+for ordering in GridOrdering::ALL {
+    let symbolic = grid.analyze(ordering).map_err(|e| e.to_string())?;
+    // 独立検算: P A Pᵀ の各行の最初の非零の列から帯幅と包絡を数える。
+    let (bandwidth, envelope) = grid.profile(symbolic.permutation());
+    let predicted = symbolic.cholesky_entries();
+    let factor =
+        SparseCholesky::factor(symbolic, grid.matrix.view()).map_err(|e| e.to_string())?;
+    // 列ごとの非零の数 c から、演算数の目安 Σ c² を求める。
+    let mut counts = vec![0usize; unknowns];
+    for (_, column, _) in factor.lower_entries() {
+        counts[column] += 1;
+    }
+    let flops: usize = counts.iter().map(|c| c * c).sum();
+    let x = factor.solve(&b).map_err(|e| e.to_string())?;
+    let error = x.iter().map(|v| (v - 1.0).abs()).fold(0.0_f64, f64::max);
+    let slack = envelope as i64 - predicted as i64;
+    rows.push((
+        ordering.label(),
+        bandwidth,
+        envelope,
+        predicted,
+        slack,
+        Some(flops),
+        Some(error),
+    ));
+}
+let closed = n * n * n - n * n + n - 1;
+rows.push(("自然順の閉形式", n, closed, closed, 0, None, None));
+
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "順序" },
+    { "key": "1", "label": "帯幅 β", "type": "integer" },
+    { "key": "2", "label": "包絡 env", "type": "integer" },
+    { "key": "3", "label": "nnz(L)", "type": "integer" },
+    { "key": "4", "label": "env − nnz(L)", "type": "integer" },
+    { "key": "5", "label": "演算数 Σ c²", "type": "integer", "nullText": "対象外" },
+    { "key": "6", "label": "誤差 ‖x̂ − 1‖∞ [-]", "type": "number", "format": sci2, "nullText": "対象外" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "orderings" })
+);
+```
+
+既定の $n = 16$（$N = 256$）では、自然順の帯幅は 16、包絡は 3855 で、因子の非零の数 3855 は閉形式 $n^3 - n^2 + n - 1$ と包絡の両方に一致し、$\mathrm{nnz}(\mathbf{L}) \le \mathrm{env}$ が等号で成り立つ。
+RCM は帯幅を 16 のまま保って包絡を 2840 に縮め、因子の非零の数も包絡と同じ 2840 になる。
+AMD の順序は帯を作らないので、帯幅は 228、包絡は 5824 とかえって大きいが、因子の非零の数は 1885 と最も少ない。
+AMD では包絡の定理の上界がゆるく、包絡との差が 3939 ある。
+演算数の目安 $\sum_l c_l^2$ は、自然順の 60335 に対して RCM が 35240、AMD が 19909 である。
+
+$n = 48$（$N = 2304$）にすると、因子の非零の数は自然順が 108335、RCM が 74824、AMD が 30264 になる。
+自然順と AMD の比は 3.6 倍、演算数の比は約 6 倍（5163279 と 869322）に広がる。
+
+解の誤差は $n = 16$ ではどの順序でも $3.3 \times 10^{-15}$ 以下、$n = 48$ でも $2.0 \times 10^{-14}$ 以下である。
+どちらも条件数と計算機イプシロンの積 $\kappa_2(\mathbf{A})\varepsilon$（$n = 16$ で $2.6 \times 10^{-14}$、$n = 48$ で $2.2 \times 10^{-13}$）より小さい。
+対称正定値行列の Cholesky 分解はどの対称な並べ替えでも後退安定なので（Higham, 2002）、誤差の大きさは順序ではなく条件数で決まり、並べ替えは解の精度をほとんど変えない。
+
+## フィルと格子の大きさ
+
+次のセルは $n = 4, 8, \dots, 48$ の 12 通りの格子を三つの順序で記号解析し、選んだ量を未知数 $N = n^2$ に対して両対数のグラフに描く。
+帯幅、包絡、$\mathrm{nnz}(\mathbf{L})$ はどれも構造だけで決まるので、数値分解はしない。
+三つの順序の値は記号を線でつなぎ、破線で自然順の閉形式（帯幅は $n$、包絡と $\mathrm{nnz}(\mathbf{L})$ は $n^3 - n^2 + n - 1$）を示す。
+両対数のグラフでは $N^a$ に比例する量は傾き $a$ の直線になる。
+表は $n = 24$ と $n = 48$ の値と、その間の傾き $\Delta\log(\text{量})/\Delta\log N$ を示す。
+
+```rust
+//| id: sparse-poisson-fill-growth
+//| ref: sparse-poisson-fill-growth
+//| title: 格子の大きさと帯幅・包絡・フィルの増え方
+//| run: reactive
+//| uses: [sparse-poisson-model]
+//| crates: [scioxide-core, scioxide-sparse]
+//| inputs:
+//|   quantity: {"type":"select","label":"縦軸の量","description":"記号解析の構造から決まる量を選ぶ。","options":["因子の非零 nnz(L)","包絡 env","帯幅 β"],"value":"因子の非零 nnz(L)"}
+//| cases:
+//|   - {"id":"envelope","label":"包絡 env","description":"AMD は因子の非零が最も少ないのに、包絡は最も大きい。","inputs":{"quantity":"包絡 env"}}
+//|   - {"id":"bandwidth","label":"帯幅 β","description":"自然順と RCM の帯幅は n のままで、AMD は帯を作らない。","inputs":{"quantity":"帯幅 β"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"slopes","path":"/rows/0/1","equals":13271}
+//|       - {"artifact":"slopes","path":"/rows/0/2","equals":108335}
+//|       - {"artifact":"slopes","path":"/rows/0/3","approx":{"value":1.5145752111459,"rtol":1e-12}}
+//|       - {"artifact":"slopes","path":"/rows/1/2","equals":74824}
+//|       - {"artifact":"slopes","path":"/rows/2/2","equals":30264}
+//|   - case: envelope
+//|     expect:
+//|       - {"artifact":"slopes","path":"/rows/0/2","equals":108335}
+//|       - {"artifact":"slopes","path":"/rows/1/2","equals":74824}
+//|   - case: bandwidth
+//|     expect:
+//|       - {"artifact":"slopes","path":"/rows/0/3","approx":{"value":0.5,"rtol":1e-14}}
+//|       - {"artifact":"slopes","path":"/rows/1/2","equals":48}
+use scioxide_core::RealScalar;
+
+let mut series: [Vec<[f64; 2]>; 3] = Default::default();
+let mut closed = Vec::new();
+for n in (1..=12).map(|i| 4 * i) {
+    let grid = PoissonGrid::new(n).map_err(|e| e.to_string())?;
+    let unknowns = (n * n) as f64;
+    for (index, ordering) in GridOrdering::ALL.into_iter().enumerate() {
+        let symbolic = grid.analyze(ordering).map_err(|e| e.to_string())?;
+        let (bandwidth, envelope) = grid.profile(symbolic.permutation());
+        let value = match quantity.as_str() {
+            "包絡 env" => envelope,
+            "帯幅 β" => bandwidth,
+            _ => symbolic.cholesky_entries(),
+        };
+        series[index].push([unknowns, value as f64]);
+    }
+    // 自然順の閉形式: 帯幅は n、包絡と nnz(L) は n³ − n² + n − 1。
+    let exact = match quantity.as_str() {
+        "帯幅 β" => n,
+        _ => n * n * n - n * n + n - 1,
+    };
+    closed.push([unknowns, exact as f64]);
+}
+
+let mut lines = vec![serde_json::json!({
+    "name": "自然順の閉形式",
+    "points": closed,
+    "style": { "lineType": "dashed", "showSymbol": false }
+})];
+let mut slopes = Vec::new();
+for (ordering, points) in GridOrdering::ALL.into_iter().zip(&series) {
+    lines.push(serde_json::json!({
+        "name": ordering.label(),
+        "points": points,
+        "style": { "showSymbol": true, "symbol": "circle" }
+    }));
+    // n = 24（6 番目）と n = 48（12 番目）の間の両対数の傾き。N の比は 4。
+    let (low, high) = (points[5][1], points[11][1]);
+    let slope = RealScalar::ln(high / low) / RealScalar::ln(4.0);
+    slopes.push((ordering.label(), low as usize, high as usize, slope));
+}
+emit_chart!(
+    serde_json::json!({
+        "kind": "line",
+        "dataZoom": true,
+        "tooltip": true,
+        "series": lines,
+        "xLabel": "未知数 N = n² [-]",
+        "yLabel": format!("{quantity} [-]"),
+        "xType": "log",
+        "yType": "log"
+    }),
+    metadata = serde_json::json!({ "id": "growth" })
+);
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "順序" },
+    { "key": "1", "label": "n = 24 の値", "type": "integer" },
+    { "key": "2", "label": "n = 48 の値", "type": "integer" },
+    { "key": "3", "label": "傾き [-]", "type": "number", "format": fixed2 }
+]);
+emit_table_with_columns!(
+    columns,
+    slopes,
+    metadata = serde_json::json!({ "id": "slopes" })
+);
+```
+
+既定の $\mathrm{nnz}(\mathbf{L})$ のグラフでは、自然順の記号が破線の閉形式の上に重なり、RCM の記号はその少し下にほぼ同じ傾きで並ぶ。
+$n = 24$ と $n = 48$ の間の傾きは自然順が 1.51、RCM が 1.49 で、$O(N^{3/2})$ の 1.5 に近い。
+AMD の傾きは 1.25 で、格子を大きくするほど自然順との差が開く。
+入れ子分割のフィル $N \log N$ なら同じ二つの格子の間の傾きは 1.14 で、AMD の傾きはこれより大きい。
+ただし傾きは二つの格子の間の値で、AMD のフィルの漸近的な増え方の次数を示すものではない。
+
+包絡を選ぶと、自然順と RCM の値は 12 通りの格子のすべてで $\mathrm{nnz}(\mathbf{L})$ と一致し、包絡が消去で完全に埋まることが格子の大きさによらず確かめられる。
+RCM の包絡は $n = 48$ で 74824 で、$\frac{2}{3}n^3 = 73728$ に近い。
+AMD の包絡は傾き 1.62 で自然順より速く増え、$n = 48$ では 220529 と自然順の 2 倍になる。
+帯幅を選ぶと、自然順と RCM はどちらも $n$ で傾きは 0.5 になり、AMD の帯幅は $n = 48$ で 2236 と $N = 2304$ に近い。
+
+## 因子の非零パターン
+
+次のセルは選んだ順序で分解した因子 $\mathbf{L}$ の非零の位置を、並べ替えた行列 $\mathbf{P}\mathbf{A}\mathbf{P}^{\mathsf{T}}$ の下三角にもある位置（1）と、フィルで新しく生じた位置（2）に分けて、行と列の添字を軸とするヒートマップに描く（0 は零、対角は 1 とする）。
+入力は格子の辺の点の数 $n$（4〜12）と順序である。
+順序を替えても図を比べやすいように、色の範囲は 0〜2 に固定した。
+表は $\mathbf{P}\mathbf{A}\mathbf{P}^{\mathsf{T}}$ の狭義下三角の非零のうち因子の非零の位置にあるものを数え、格子の辺の数 $2n(n - 1)$ と比べる。
+構造の上では消去が元の非零を消すことはないので、どの順序でも両者は等しい。
+
+```rust
+//| id: sparse-poisson-fill-pattern
+//| ref: sparse-poisson-fill-pattern
+//| title: 並べ替えた Poisson 行列の Cholesky 因子の非零パターン
+//| run: reactive
+//| uses: [sparse-poisson-model]
+//| crates: [scioxide-core, scioxide-sparse]
+//| inputs:
+//|   grid_n: {"type":"range","label":"格子の辺の点の数 n","description":"未知数の数は N = n²。","min":4,"max":12,"step":1,"value":8}
+//|   ordering: {"type":"select","label":"順序","description":"未知数の番号付けの方法。","options":["自然順","RCM","AMD"],"value":"自然順"}
+//| cases:
+//|   - {"id":"rcm","label":"RCM","description":"フィルは減るが、非零は帯の形のまま斜めに並ぶ。","inputs":{"ordering":"RCM"}}
+//|   - {"id":"amd","label":"AMD","description":"非零は帯の形にならず、後に消去する行に集まる。","inputs":{"ordering":"AMD"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"counts","path":"/rows/0/1","equals":112}
+//|       - {"artifact":"counts","path":"/rows/0/2","equals":112}
+//|       - {"artifact":"counts","path":"/rows/0/3","equals":343}
+//|       - {"artifact":"counts","path":"/rows/0/4","equals":455}
+//|   - case: rcm
+//|     expect:
+//|       - {"artifact":"counts","path":"/rows/0/1","equals":112}
+//|       - {"artifact":"counts","path":"/rows/0/3","equals":252}
+//|   - case: amd
+//|     expect:
+//|       - {"artifact":"counts","path":"/rows/0/1","equals":112}
+//|       - {"artifact":"counts","path":"/rows/0/3","equals":183}
+use scioxide_sparse::SparseCholesky;
+
+let grid = PoissonGrid::new(grid_n as usize).map_err(|e| e.to_string())?;
+let (n, unknowns) = (grid.side, grid.matrix.rows());
+let chosen = match ordering.as_str() {
+    "RCM" => GridOrdering::ReverseCuthillMcKee,
+    "AMD" => GridOrdering::MinimumDegree,
+    _ => GridOrdering::Natural,
+};
+let symbolic = grid.analyze(chosen).map_err(|e| e.to_string())?;
+let new_of = symbolic.permutation().old_to_new().to_vec();
+let factor = SparseCholesky::factor(symbolic, grid.matrix.view()).map_err(|e| e.to_string())?;
+// 0: 零、1: 元の行列の下三角にもある位置と対角、2: フィル。
+let mut cell = vec![0.0_f64; unknowns * unknowns];
+for (i, j, _) in factor.lower_entries() {
+    cell[i * unknowns + j] = 2.0;
+}
+let mut original = 0;
+for (r, c, _) in grid.matrix.iter() {
+    let (i, j) = (new_of[r].max(new_of[c]), new_of[r].min(new_of[c]));
+    if i > j && cell[i * unknowns + j] == 2.0 {
+        cell[i * unknowns + j] = 1.0;
+        original += 1;
+    }
+}
+let fill = cell.iter().filter(|&&v| v == 2.0).count();
+let mut data = Vec::new();
+for i in 0..unknowns {
+    data.push([i as f64, i as f64, 1.0]);
+    for j in 0..i {
+        data.push([j as f64, i as f64, cell[i * unknowns + j]]);
+    }
+}
+
+let columns = serde_json::json!([
+    { "key": "0", "label": "順序" },
+    { "key": "1", "label": "元の狭義下三角の非零", "type": "integer" },
+    { "key": "2", "label": "辺の数 2n(n − 1)", "type": "integer" },
+    { "key": "3", "label": "フィル", "type": "integer" },
+    { "key": "4", "label": "nnz(L)", "type": "integer" }
+]);
+let row = (
+    ordering.clone(),
+    original,
+    2 * n * (n - 1),
+    fill,
+    factor.factor_entries(),
+);
+emit_table_with_columns!(
+    columns,
+    vec![row],
+    metadata = serde_json::json!({ "id": "counts" })
+);
+emit_chart!(
+    serde_json::json!({
+        "kind": "heatmap",
+        "data": data,
+        "xLabel": "列 j（並べ替えたあと）[-]",
+        "yLabel": "行 i（並べ替えたあと）[-]",
+        "colorMin": 0.0,
+        "colorMax": 2.0,
+        "tooltip": true,
+        "style": { "animation": false }
+    }),
+    metadata = serde_json::json!({
+        "id": "pattern",
+        "title": "因子の非零（1: 元の成分と対角、2: フィル）"
+    })
+);
+```
+
+既定の $n = 8$ の自然順では、元の狭義下三角の非零 112 個（格子の辺の数 $2n(n - 1) = 112$）に対してフィルが 343 個生じ、$\mathrm{nnz}(\mathbf{L}) = 455 = n^3 - n^2 + n - 1$ になる。
+因子は格子の第 1 行以降の各行で対角の左の 8 列をすべて埋めた帯になる。
+RCM ではフィルが 252 個に減り、非零は帯の形を保ったまま斜めに並ぶ。
+AMD ではフィルは 183 個で、非零は帯の形にならない。
+元の 112 個とフィルの 183 個を合わせた因子の非零は 295 個で、配置には消去木に対応するブロック構造が現れる。
+
+## まとめ
+
+5 点差分の Poisson 行列では、自然順の Cholesky 因子が包絡を埋め尽くし、非零の数は $n^3 - n^2 + n - 1$ で $O(N^{3/2})$ に増える。
+RCM でも格子の帯幅は $n$ のままで、包絡とフィルは減っても増え方は自然順と変わらない。
+AMD は帯を作らずに隣接する点の少ない点から消去し、包絡はかえって大きいが、$n = 48$ で因子の非零の数を自然順の 28 %、演算数を 17 % に減らす。
+直接分解の記号解析の既定は AMD（`FillReducing`）なので、順序を指定しなければこの削減が得られる。
+フィルの量は記号解析の `cholesky_entries` で分解の前に分かるので、順序の比較やメモリの見積もりには数値分解は要らない。
+どの順序でも解の誤差は条件数に見合う丸めの程度に収まり、並べ替えで変わるのはメモリと手間で、精度はほとんど変わらない。
+
+## 次に読むページ
+
+- [抵抗回路網の節点解析と Foster の定理](../resistor-network/)：グラフのラプラシアンを節点解析の行列として解き、有効抵抗の恒等式で検算する。
+- [並べ替えと彩色](../../algorithms/orderings-and-coloring/)：消去グラフ、AMD、RCM、包絡の定理の数理を確かめる。
+- [疎 Cholesky 分解とブロック LDL 分解](../../algorithms/symmetric-factorizations/)：消去木と列の非零の数が分解の構造を決める仕組みを確かめる。

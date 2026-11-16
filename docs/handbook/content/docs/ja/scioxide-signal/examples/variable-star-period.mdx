@@ -1,0 +1,422 @@
+---
+title: 変光星の周期推定
+description: 不等間隔に観測した変光星の明るさから Lomb–Scargle 法で周期を推定し、日周のエイリアスと誤警報確率を、ノイズだけの模擬観測と比べて読む。
+sidebar:
+  order: 410
+references:
+  signal-variable-star-data: "合成データ"
+  signal-variable-star-fap: "誤警報確率"
+---
+
+こと座 RR 型の変光星は半日程度の周期で明るさを変える。
+地上の観測は夜にしかできず、天候で欠ける日もあるので、観測時刻は等間隔にならない。
+等間隔の標本を前提とする FFT のピリオドグラムはそのままでは使えないため、時刻ごとに正弦波を当てはめる Lomb–Scargle 法で周期を探す。
+この例題では、見つけたピークがノイズによる偶然のものではないかを、誤警報確率（FAP: false alarm probability）で評価する。
+方法の導出と API の規約は[スペクトル推定](../../algorithms/spectral-estimation/)の Lomb–Scargle 法の節で扱う。
+
+## 合成データ
+
+周期 $P = 0.567$ 日の変光星を、40 夜にわたり一晩 6 回、毎晩 0.25 日のウインドウの中の不規則な時刻に観測したとする。
+$j$ 番目の観測時刻 [日] は
+
+$$
+t_j = \lfloor j/6 \rfloor + 0.05 + 0.25\,\{ 0.6180339887498949\, j \} \qquad (j = 0, \dots, 239)
+$$
+
+で、$\{\cdot\}$ は小数部分である。
+係数 $0.618\ldots$ は黄金比の小数部分で、一晩の中の時刻を重ならないように散らす。
+時刻は夜の中では昇順に並ばず、最小は $t_0 = 0.05$ 日、最大は $t_{236} = 39.264$ 日である。
+
+明るさの変化 [等] は基本波と第 2 高調波の和に、標準偏差 $\sigma$ の Gauss ノイズ $\sigma g_j$ を加えた
+
+$$
+y_j = 0.3 \sin\left(\frac{2\pi t_j}{P}\right) + 0.1 \sin\left(\frac{4\pi t_j}{P} + 0.7\right) + \sigma g_j
+$$
+
+とする。
+$g_j$ はシードから作る標準正規乱数で、生成の規則は次のとおりである。
+
+1. 64 ビットの状態をシードで初期化し、splitmix64 で一様乱数 $u \in (0, 1)$ を作る（53 ビットの整数に $2^{-53}$ を掛け、$2^{-54}$ を足す）。
+2. 時刻の順 $j = 0, 1, \dots$ に、一様乱数を 2 個 $u_1$、$u_2$ の順に取り、Box–Muller 法 $g_j = \sqrt{-2\ln u_1}\cos(2\pi u_2)$ で変換する。
+
+scioxide-fft の[不等間隔観測の Fourier 和を NUFFT で求める](../../../scioxide-fft/examples/nonuniform-periodogram/)は、同じ時刻、同じ光度曲線、同じ乱数の規則（既定の $\sigma = 0.3$ 等、シード 2024）を使い、Fourier 和の精度と計算コストだけを扱う。
+
+次のブロックは二つのセルが共有する定義である。
+`observation_times` が $t_j$、`SplitMix` が乱数の規則、`light_curve` が $y_j$、`frequency_grid` が探索する周波数、`FalseAlarm` が後の節の誤警報確率の近似に対応する。
+乱数の変換と近似式は、参照値として `f64` の固有メソッドで評価する。
+
+```rust
+//| id: signal-variable-star-model
+//| kind: definitions
+//| title: 合成光度曲線と誤警報確率の近似
+//| crates: [scioxide-core, scioxide-special]
+use scioxide_core::SciOxideError;
+use scioxide_special::ln_gamma;
+
+/// 周期 P [日] と観測数 N。
+pub(crate) const PERIOD: f64 = 0.567;
+pub(crate) const OBSERVATIONS: usize = 240;
+/// 探索する周波数の上限 f_max [日⁻¹]。下限は 0.2 日⁻¹。
+pub(crate) const F_MAX: f64 = 4.0;
+
+/// 観測時刻 t_j = ⌊j/6⌋ + 0.05 + 0.25 {0.618… j} [日]。
+pub(crate) fn observation_times() -> Vec<f64> {
+    (0..OBSERVATIONS)
+        .map(|j| (j / 6) as f64 + 0.05 + 0.25 * (j as f64 * 0.618_033_988_749_894_9).fract())
+        .collect()
+}
+
+/// splitmix64 の一様乱数と Box–Muller 法の標準正規乱数。
+pub(crate) struct SplitMix {
+    state: u64,
+}
+
+impl SplitMix {
+    pub(crate) fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+    pub(crate) fn uniform(&mut self) -> f64 {
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        ((z ^ (z >> 31)) >> 11) as f64 / (1u64 << 53) as f64 + 0.5 / (1u64 << 53) as f64
+    }
+    pub(crate) fn gauss(&mut self) -> f64 {
+        let radius = (-2.0 * self.uniform().ln()).sqrt();
+        radius * (core::f64::consts::TAU * self.uniform()).cos()
+    }
+}
+
+/// 光度 y_j [等]: 基本波と第 2 高調波に σ g_j を加える。
+pub(crate) fn light_curve(times: &[f64], sigma: f64, seed: u64) -> Vec<f64> {
+    let mut rng = SplitMix::new(seed);
+    times
+        .iter()
+        .map(|&t| {
+            let phase = core::f64::consts::TAU * t / PERIOD;
+            let gauss = rng.gauss();
+            0.3 * phase.sin() + 0.1 * (2.0 * phase + 0.7).sin() + sigma * gauss
+        })
+        .collect()
+}
+
+/// 周波数 [日⁻¹] と、lomb_scargle に渡す角周波数 [rad/日]。
+pub(crate) fn frequency_grid(points: usize) -> (Vec<f64>, Vec<f64>) {
+    let step = (F_MAX - 0.2) / (points - 1) as f64;
+    let freqs: Vec<f64> = (0..points).map(|k| 0.2 + step * k as f64).collect();
+    let omegas = freqs.iter().map(|f| core::f64::consts::TAU * f).collect();
+    (freqs, omegas)
+}
+
+/// 浮動平均の正規化パワーに対する誤警報確率の近似。
+pub(crate) struct FalseAlarm {
+    n: f64,
+    baseline: f64,
+    effective: f64,
+    gamma: f64,
+}
+
+impl FalseAlarm {
+    /// T = max t − min t、T_eff = √(4π Var t)、γ(N − 1) = √(2/(N−1)) Γ((N−1)/2)/Γ((N−2)/2)。
+    pub(crate) fn new(times: &[f64]) -> Result<Self, SciOxideError> {
+        let n = times.len() as f64;
+        let max = times.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let min = times.iter().copied().fold(f64::INFINITY, f64::min);
+        let mean = times.iter().sum::<f64>() / n;
+        let variance = times.iter().map(|t| (t - mean).powi(2)).sum::<f64>() / n;
+        let ratio = ln_gamma((n - 1.0) / 2.0)? - ln_gamma((n - 2.0) / 2.0)?;
+        Ok(Self {
+            n,
+            baseline: max - min,
+            effective: (4.0 * core::f64::consts::PI * variance).sqrt(),
+            gamma: (2.0 / (n - 1.0)).sqrt() * ratio.exp(),
+        })
+    }
+    /// 単一周波数 p₁(z) = (1 − z)^((N−3)/2)。
+    pub(crate) fn single(&self, z: f64) -> f64 {
+        (1.0 - z).powf((self.n - 3.0) / 2.0)
+    }
+    /// 素朴な近似 1 − (1 − p₁)^M、M = f_max T。
+    pub(crate) fn naive(&self, z: f64) -> f64 {
+        -(F_MAX * self.baseline * (-self.single(z)).ln_1p()).exp_m1()
+    }
+    /// Baluev の近似 1 − (1 − p₁) e^(−τ)。小さな値の桁落ちを避けて (1 − e^(−τ)) + p₁ e^(−τ) と書く。
+    pub(crate) fn baluev(&self, z: f64) -> f64 {
+        let tau = self.gamma
+            * F_MAX
+            * self.effective
+            * (1.0 - z).powf((self.n - 4.0) / 2.0)
+            * ((self.n - 1.0) * z / 2.0).sqrt();
+        -(-tau).exp_m1() + self.single(z) * (-tau).exp()
+    }
+    /// Baluev の近似が level になるパワー（z について単調減少なので二分法）。
+    pub(crate) fn threshold(&self, level: f64) -> f64 {
+        let (mut lo, mut hi) = (0.0_f64, 1.0_f64);
+        for _ in 0..60 {
+            let mid = 0.5 * (lo + hi);
+            if self.baluev(mid) > level {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+}
+```
+
+## Lomb–Scargle 法の正規化パワー
+
+角周波数 $\omega$ ごとに、明るさ $y_j$ を定数と正弦・余弦の和 $c + a \cos \omega t_j + b \sin \omega t_j$ で最小二乗近似する（浮動平均）。
+定数だけのモデルの残差平方和を $\chi^2_0$、正弦波を加えたモデルの残差平方和を $\chi^2(\omega)$ とすると、`LombScargleNormalization::Normalized` のパワーは
+
+$$
+z(\omega) = \frac{\chi^2_0 - \chi^2(\omega)}{\chi^2_0} \in [0, 1]
+$$
+
+で、正弦波で説明できた分散の割合を表す。
+`lomb_scargle` は重み 1、浮動平均、正規化パワーの既定でこの値を計算し、計算量は標本数と周波数の数の積に比例する。
+周波数は角周波数 [rad/日] で渡す。
+
+観測が夜に限られるため、窓関数（観測時刻の並び）のスペクトルは 1 日⁻¹ の間隔で高いピークを持つ。
+真の周波数 $f_0 = 1/P = 1.764$ 日⁻¹ のほかに、$f_0 \pm 1$ 日⁻¹ の日周エイリアスにもパワーが現れる。
+
+## 誤警報確率
+
+周期的な信号がなく、ノイズが独立な Gauss ノイズ（等しい分散）であるという帰無仮説を考える。
+浮動平均のモデルでは、帰無仮説のもとで一つの周波数のパワー $z$ はベータ分布 $\mathrm{Beta}(1, (N-3)/2)$ に従い、$z$ を超える確率は
+
+$$
+p_1(z) = (1 - z)^{(N-3)/2}
+$$
+
+である（$N$ は標本数）。
+多くの周波数を調べて最大値をとると、偶然に大きな値が出る確率は増える。
+周波数の範囲 $f_{\max}$ と観測期間 $T = \max_j t_j - \min_j t_j$ から独立な周波数の数を $M \approx f_{\max} T$ と見積もる素朴な近似は
+
+$$
+\mathrm{FAP}_{\mathrm{naive}} \approx 1 - (1 - p_1)^M
+$$
+
+である。
+Baluev（2008）の近似は、観測時刻の分散から実効的な期間 $T_{\mathrm{eff}} = \sqrt{4\pi \operatorname{Var}(t)}$ を作り、
+
+$$
+\mathrm{FAP} \approx 1 - (1 - p_1(z))\, e^{-\tau(z)}, \qquad
+\tau(z) = \gamma(N-1)\, f_{\max} T_{\mathrm{eff}}\, (1 - z)^{(N-4)/2} \sqrt{\tfrac{(N-1) z}{2}}
+$$
+
+とする。
+$\gamma(n) = \sqrt{2/n}\, \Gamma(n/2) / \Gamma((n-1)/2)$ は 1 に近い補正である。
+$\tau$ は Davies の上界から導いた量なので、Baluev の近似は FAP を大きめに見積もる。
+どちらも帰無仮説のもとでの確率の近似であり、信号が存在する確率ではない。
+
+次のセルは、合成データから 0.2〜4 日⁻¹ の 1901 点でパワーを `lomb_scargle` で計算する。
+最大のピークの周波数・周期・パワーと、三つの確率と、Baluev の近似で FAP が 1 % になるパワーを表にする。
+$\Gamma$ の対数は `scioxide_special::ln_gamma` で評価する。
+
+```rust
+//| id: signal-variable-star-lomb-scargle
+//| ref: signal-variable-star-lomb-scargle
+//| title: 不等間隔の観測から変光星の周期と誤警報確率を求める
+//| run: reactive
+//| uses: [signal-variable-star-model]
+//| crates: [scioxide-signal]
+//| inputs:
+//|   noise_sigma: {"type":"range","label":"ノイズの標準偏差 σ [等]","description":"観測ごとに加える Gauss ノイズの大きさ。","min":0.1,"max":1.5,"step":0.1,"value":0.3}
+//|   seed: {"type":"integer","label":"乱数のシード","description":"ノイズの系列を変える。","min":1,"max":9999,"value":2024}
+//| cases:
+//|   - {"id":"quiet","label":"σ = 0.1 等","description":"ピークのパワーが上がり、推定周期が真値に近づく。","inputs":{"noise_sigma":0.1}}
+//|   - {"id":"noisy","label":"σ = 1.5 等","description":"最大のピークが別の周波数に移り、FAP が大きくなる。","inputs":{"noise_sigma":1.5}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"peak","path":"/rows/0/0","approx":{"value":1.762,"atol":0.0011}}
+//|       - {"artifact":"peak","path":"/rows/0/5","range":{"max":1e-10}}
+//|   - case: quiet
+//|     expect:
+//|       - {"artifact":"peak","path":"/rows/0/0","approx":{"value":1.764,"atol":0.0011}}
+//|   - case: noisy
+//|     expect:
+//|       - {"artifact":"peak","path":"/rows/0/5","range":{"min":0.1}}
+use scioxide_signal::lomb_scargle;
+
+let times = observation_times();
+let light = light_curve(&times, noise_sigma, seed as u64);
+let (freqs, omegas) = frequency_grid(1901);
+// ワンショット関数: 重み 1、浮動平均、正規化パワー
+let power = lomb_scargle(&times, &light, &omegas).map_err(|e| e.to_string())?;
+let best = (0..power.len())
+    .max_by(|&a, &b| power[a].total_cmp(&power[b]))
+    .ok_or("周波数がない")?;
+let z = power[best];
+let fap = FalseAlarm::new(&times).map_err(|e| e.to_string())?;
+let level = fap.threshold(0.01);
+
+let fixed3 = serde_json::json!({ "fractionDigits": 3 });
+let fixed4 = serde_json::json!({ "fractionDigits": 4 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "ピークの周波数 [日⁻¹]", "type": "number", "format": fixed3 },
+    { "key": "1", "label": "推定周期 [日]", "type": "number", "format": fixed4 },
+    { "key": "2", "label": "パワー z [-]", "type": "number", "format": fixed4 },
+    { "key": "3", "label": "p₁(z) [-]", "type": "number", "format": sci2 },
+    { "key": "4", "label": "素朴な FAP [-]", "type": "number", "format": sci2 },
+    { "key": "5", "label": "Baluev の FAP [-]", "type": "number", "format": sci2 },
+    { "key": "6", "label": "FAP 1 % のパワー [-]", "type": "number", "format": fixed4 }
+]);
+let row = (
+    freqs[best],
+    1.0 / freqs[best],
+    z,
+    fap.single(z),
+    fap.naive(z),
+    fap.baluev(z),
+    level,
+);
+emit_table_with_columns!(columns, vec![row], metadata = serde_json::json!({ "id": "peak" }));
+
+let curve: Vec<[f64; 2]> = freqs.iter().zip(&power).map(|(&f, &p)| [f, p]).collect();
+let f0 = 1.0 / PERIOD;
+emit_line_chart!(
+    &vec![serde_json::json!({ "name": "正規化パワー z", "points": curve })],
+    options = &serde_json::json!({
+        "xLabel": "周波数 f [日⁻¹]",
+        "yLabel": "正規化パワー z [-]",
+        "yMin": 0.0,
+        "yMax": 1.0,
+        "annotations": [
+            { "kind": "line", "axis": "x", "value": f0, "label": "真の周波数 1/P" },
+            { "kind": "line", "axis": "x", "value": f0 - 1.0, "label": "f₀ − 1" },
+            { "kind": "line", "axis": "x", "value": f0 + 1.0, "label": "f₀ + 1" },
+            { "kind": "line", "axis": "y", "value": level, "label": "FAP 1 %" }
+        ]
+    })
+);
+```
+
+既定の $\sigma = 0.3$ 等、シード 2024 では、最大のピークは 1.762 日⁻¹（周期 0.5675 日）にあり、真の周波数 1.7637 日⁻¹ との差は周波数の刻み 0.002 日⁻¹ 以内である。
+ピークのパワーは $z = 0.2933$ で、$p_1 = 1.4 \times 10^{-18}$、素朴な FAP は $2.2 \times 10^{-16}$、Baluev の FAP は $1.6 \times 10^{-15}$ である。
+Baluev の近似で FAP が 1 % になるパワー 0.0880 を大きく超えるので、ノイズによる偶然のピークとは考えにくい。
+図では $f_0 \pm 1$ 日⁻¹ の日周エイリアスにも低いピークが立つ。
+
+$\sigma = 0.1$ 等ではパワーが $z = 0.740$ に上がり、ピークは 1.764 日⁻¹（周期 0.5669 日）の格子点に来る。
+$\sigma = 1.5$ 等では最大のピークが 2.680 日⁻¹ に移り、$z = 0.0515$、Baluev の FAP は 0.55、素朴な FAP は 0.26 となって、このピークを周期の検出とはいえない。
+FAP が 1 % になるパワーは観測時刻、標本数、周波数の範囲だけで決まり、ノイズの大きさによらない。
+
+## ノイズだけの模擬観測による検算
+
+FAP の式は近似なので、同じ観測時刻にノイズだけを置いた模擬観測を多数作り、最大パワーの分布と比べる。
+同じ時刻と周波数で何度も計算するので、セルは手法オブジェクト `LombScargle` と 1 本分の作業領域（`workspace(1)`）を一度だけ用意し、出力先を指定する API `power_into` で模擬観測ごとに再利用する。
+計算時間を抑えるため、周波数の格子は前のセルの 2 倍の刻み（0.004 日⁻¹、951 点）にする。
+この刻みはピークの幅（約 $1/T \approx 0.025$ 日⁻¹）より十分細かいが、格子点がピークの頂点から外れる分だけ最大値はわずかに小さめに出る。
+$R$ 回の模擬観測のうち、最大パワーがしきい値 $z_c$ を超えた割合 $\hat q$ は FAP の推定値で、その標準誤差は $\sqrt{\hat q(1-\hat q)/R}$ である。
+正規化パワーは明るさの尺度によらないので、ノイズの標準偏差は 1 とする。
+図は超過割合を記号で、±2 標準誤差を帯で、二つの近似を破線で描く。
+
+```rust
+//| id: signal-variable-star-false-alarm
+//| ref: signal-variable-star-false-alarm
+//| title: ノイズだけの模擬観測で誤警報確率の近似を確かめる
+//| run: button
+//| uses: [signal-variable-star-model]
+//| crates: [scioxide-core, scioxide-signal]
+//| inputs:
+//|   realizations: {"type":"range","label":"模擬観測の回数 R","description":"ノイズだけの観測を作る回数。多いほど標準誤差が小さい。","min":20,"max":100,"step":20,"value":40}
+//|   seed: {"type":"integer","label":"乱数のシード","description":"模擬観測のノイズの系列を変える。","min":1,"max":9999,"value":7}
+//| cases:
+//|   - {"id":"many","label":"R = 100","description":"標準誤差が小さくなり、近似との差が読みやすい。","inputs":{"realizations":100}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"exceedance","path":"/rows/0/0","approx":{"value":0.04,"atol":1e-12}}
+//|       - {"artifact":"exceedance","path":"/rows/1/1","range":{"min":0.15,"max":0.6}}
+use scioxide_core::ExecutionContext;
+use scioxide_signal::{LombScargle, LombScargleOptions};
+
+let times = observation_times();
+// 計算時間を抑えるため、前のセルの 2 倍の刻み（951 点）で探す
+let (_, omegas) = frequency_grid(951);
+let periodogram = LombScargle::new(&times, &omegas, None, LombScargleOptions::default())
+    .map_err(|e| e.to_string())?;
+// 手法オブジェクトと 1 本分の作業領域を一度だけ用意し、模擬観測ごとに power_into で再利用する
+let mut work = periodogram.workspace(1).map_err(|e| e.to_string())?;
+let mut power = vec![0.0; omegas.len()];
+let mut rng = SplitMix::new(seed as u64);
+let r = realizations.round() as usize;
+let mut maxima = Vec::with_capacity(r);
+for _ in 0..r {
+    let noise: Vec<f64> = (0..times.len()).map(|_| rng.gauss()).collect();
+    periodogram
+        .power_into(&noise, &mut power, &mut work, ExecutionContext::sequential())
+        .map_err(|e| e.to_string())?;
+    maxima.push(power.iter().copied().fold(0.0_f64, f64::max));
+}
+
+let fap = FalseAlarm::new(&times).map_err(|e| e.to_string())?;
+let rows: Vec<(f64, f64, f64, f64, f64)> = [0.04, 0.05, 0.06, 0.07, 0.08, 0.09]
+    .iter()
+    .map(|&zc| {
+        let q = maxima.iter().filter(|&&m| m > zc).count() as f64 / r as f64;
+        let se = (q * (1.0 - q) / r as f64).sqrt();
+        (zc, q, se, fap.baluev(zc), fap.naive(zc))
+    })
+    .collect();
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let fixed3 = serde_json::json!({ "fractionDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "しきい値 z_c [-]", "type": "number", "format": fixed2 },
+    { "key": "1", "label": "模擬観測の超過割合 [-]", "type": "number", "format": fixed3 },
+    { "key": "2", "label": "標準誤差 [-]", "type": "number", "format": fixed3 },
+    { "key": "3", "label": "Baluev の FAP [-]", "type": "number", "format": fixed3 },
+    { "key": "4", "label": "素朴な FAP [-]", "type": "number", "format": fixed3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows.clone(),
+    metadata = serde_json::json!({ "id": "exceedance" })
+);
+
+let band: Vec<[f64; 4]> = rows
+    .iter()
+    .map(|&(z, q, se, _, _)| [z, q, q - 2.0 * se, q + 2.0 * se])
+    .collect();
+let observed: Vec<[f64; 2]> = rows.iter().map(|&(z, q, _, _, _)| [z, q]).collect();
+let grid: Vec<f64> = (0..=60).map(|i| 0.035 + 0.001 * i as f64).collect();
+let baluev: Vec<[f64; 2]> = grid.iter().map(|&z| [z, fap.baluev(z)]).collect();
+let naive: Vec<[f64; 2]> = grid.iter().map(|&z| [z, fap.naive(z)]).collect();
+let dashed = serde_json::json!({ "lineType": "dashed", "showSymbol": false });
+emit_chart!(serde_json::json!({
+    "kind": "xy",
+    "xLabel": "しきい値 z_c [-]",
+    "yLabel": "最大パワーが z_c を超える確率 [-]",
+    "xMin": 0.035,
+    "xMax": 0.095,
+    "yMin": 0.0,
+    "yMax": 1.0,
+    "layers": [
+        { "id": "band", "kind": "band", "name": "超過割合 ± 2 SE", "points": band },
+        { "id": "observed", "kind": "scatter", "name": "模擬観測の超過割合", "points": observed },
+        { "id": "baluev", "kind": "line", "name": "Baluev の近似", "points": baluev, "style": dashed },
+        { "id": "naive", "kind": "line", "name": "素朴な近似", "points": naive, "style": dashed }
+    ],
+    "dataZoom": true,
+    "tooltip": true
+}));
+```
+
+既定の $R = 40$、シード 7 では、しきい値 0.05 を超えた割合は $0.275 \pm 0.071$（±1 標準誤差）で、素朴な近似の 0.302 に近く、Baluev の近似 0.609 より小さい。
+$R = 100$ では $0.330 \pm 0.047$ で、同じ傾向である。
+しきい値 0.08 では Baluev の近似が 0.027、素朴な近似が 0.008、模擬観測は 100 回で $0.010 \pm 0.010$ である。
+Baluev の近似は Davies の上界に基づくので FAP を大きめに見積もり、FAP が小さい領域ほど実際の値に近づく。
+素朴な近似が模擬観測に近いのはこの観測時刻の並びでの結果で、一般に成り立つものではない。
+模擬観測は 1 回あたり 951 個の周波数と 240 個の標本の組を計算するので、$R = 40$ でも数秒かかる。
+
+## まとめ
+
+不等間隔の観測では、`lomb_scargle` に時刻と角周波数を渡し、正規化パワー $z$ を正弦波で説明できた分散の割合として解釈する。
+夜だけの観測は 1 日⁻¹ の間隔の日周エイリアスを作るので、最大のピークが真の周期とは限らず、ノイズが大きいとエイリアスやノイズのピークと入れ替わる。
+ピークの有意性は誤警報確率で評価し、単一周波数の確率 $p_1$ をそのまま使わずに、調べた周波数の範囲を考慮した近似を使う。
+保守的に判定するには Baluev の近似を使い、FAP が中程度の領域で値そのものが必要なら、同じ観測時刻のノイズだけの模擬観測と標準誤差の範囲で比べる。
+Lomb–Scargle 法の規約と等間隔の場合との関係は[スペクトル推定](../../algorithms/spectral-estimation/)、多数の周波数で Fourier 和を速く求める方法は scioxide-fft の[非一様 FFT](../../../scioxide-fft/algorithms/nonuniform-fft/) で確かめる。

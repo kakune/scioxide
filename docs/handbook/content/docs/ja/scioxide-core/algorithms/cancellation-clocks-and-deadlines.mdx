@@ -1,0 +1,217 @@
+---
+title: 取り消し・クロック・期限
+description: 実行コンテキストに注入する取り消し Cancellation、単調クロック Clock とその束縛 ClockBinding、期限 Deadline と時間上限を重ねる規則、stop_reason と check による停止理由の確認と優先順位、wasm でのクロックの制約。
+sidebar:
+  order: 325
+references:
+  core-wasm-clocks: "wasm-環境でのクロックと時間上限"
+  core-stop-reasons: "停止理由と確認の境界"
+  core-cancellation-injection: "取り消しクロック期限の注入"
+---
+
+反復解法や大きな配列の一括変換は、利用者の操作や制限時間に応じて、終わる前に止めたいことがある。
+`scioxide-core` は処理の区切りで停止要求を確認する。
+計算は作業の単位の境界で停止の要求を自分で確かめ、実行中のコールバックが外から打ち切られることはない。
+停止の要求は取り消しの合図か、単調なクロックの上の期限として実行コンテキスト `ExecutionContext` に注入する。
+このページは注入の方法、期限を重ねる規則、停止理由を確かめる 2 つのメソッドと確認の位置を説明する。
+実行コンテキストの作り方とエグゼキューターは[実行方針・分割・実行コンテキスト](oxref:core-execution-context)で扱う。
+
+## 取り消し・クロック・期限の注入
+
+実行コンテキストは作った直後には取り消しもクロックも期限も持たない。
+次のメソッドはコンテキストを値で受け取り、機能を加えたコンテキストを返す。
+
+- 取り消しは `with_cancellation(&token)` で注入する。
+  トレイト `Cancellation` の `is_cancelled()` で問い合わせ、実装 `CancellationToken` はスレッド安全なフラグで、`cancel()` で要求し、再利用前に `reset()` する。
+- クロックは `with_clock(&binding)` で注入する。
+  `Clock` トレイトの `now()` は単調時刻 `MonotonicInstant`（クロックごとの起点からの経過時間。
+  `duration_since_epoch()`、`checked_add`）を返し、`ClockBinding::new(&clock)` で関連付けたものを一つの起点として扱う。
+  同じクロックを包んでいても、別の束縛は別の起点とみなされ、コンテキストと異なる束縛を後から渡すと `CapabilityFailure` になる。
+  同じ束縛をもう一度渡した場合は、設定済みの期限がそのまま残る。
+  `now()` が返した失敗 `CapabilityError` は `CapabilityFailure` エラーとして呼び出し側に伝わる。
+- 期限は `with_deadline(Deadline::after(&binding, duration)?)`、`Deadline::at(&binding, instant)`、または `with_time_limit(duration)` で与える。
+  期限は既にある期限より早い場合だけ更新され、遅い期限で緩めることはできない。
+  `with_time_limit` はコンテキストのクロックの現在時刻から数え、クロックを登録していないコンテキストでは `CapabilityUnavailable` を返す。
+  長さ 0 の時間上限は有効で、すぐに期限切れになる。
+  `Deadline::after` と `with_time_limit` は、クロックが失敗するか期限の時刻が桁あふれすると `CapabilityFailure` を返す。
+
+分割の実行に渡される子のコンテキストは、親の取り消しと期限をそのまま引き継ぐ。
+
+## 停止理由と確認の境界
+
+止める要求は、アルゴリズムが状態の整った境界で確認したときに効く。
+期限は、クロックの現在時刻が期限の時刻以上になったときに成立する。
+`stop_reason()` は取り消しを先に、期限を後に確かめ、停止理由（`ExecutionStopReason::Cancelled` か `DeadlineReached`）を値として返すので、反復解法は部分結果を出力に反映してから終了できる。
+確かめる順序が決まっているので、両方が成り立つときに示される理由は `Cancelled` に決まる。
+取り消しが要求されていれば、`stop_reason()` はクロックを読まずに戻る。
+`check()` は同じ確認をして、停止していれば `ExecutionStopped` エラーを返す。
+どちらのメソッドも、期限の確認でクロックが失敗すれば `CapabilityFailure` を返す。
+実行中のコールバックが打ち切られることはなく、コールバックが戻るまで停止は観測されない。
+`scioxide-core` の一括変換 `transform_into` は分割ごとに最大 256 回のスカラー呼び出しの前に、軸方向の正規化と対数和は各レーンの前に確認し、どれも出力を書く直前にもう一度確認する。
+停止を観測した場合は出力を変えない。
+
+次のセルは 1 単位の作業ごとに 1 ms 進む手動のクロックを `Clock` として実装し、8 単位の作業の境界で `stop_reason()` を確かめる。
+入力は期限までの時間 $D$（1〜12 ms）と、取り消しを要求する単位の番号 $c$（1〜9。
+9 は要求しない）である。
+コンテキストには $D$ ms の時間上限を与えた後に 100 ms の時間上限を重ね、早い期限が残ることを確かめる。
+1 つ目の表は各境界でのクロック、取り消しの要求の有無、`stop_reason()` の表示名を示す。
+2 つ目の表は完了した単位の数、最後の境界での `check()` の分類、クロックのないコンテキストに時間上限を求めたときの分類を示す。
+検証するのは、完了した単位の数が $\min(D, c - 1, 8)$ に等しいことと、取り消しと期限が同時に成り立つ境界で取り消しが示されることである。
+
+```rust
+//| id: core-stop-reason-boundaries
+//| ref: core-stop-reason-boundaries
+//| title: 取り消しと期限を作業の境界で確かめる
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   deadline_ms: {"type":"range","label":"期限までの時間 D [ms]","description":"手動のクロックは作業 1 単位ごとに 1 ms 進む。9 以上なら 8 単位のうちに期限は来ない。","min":1,"max":12,"step":1,"value":5}
+//|   cancel_unit: {"type":"range","label":"取り消しを要求する単位 c","description":"この番号の単位を始める直前に取り消しを要求する。9 は要求しない。","min":1,"max":9,"step":1,"value":9}
+//| cases:
+//|   - {"id":"cancelled","label":"2 単位目の前に取り消し","description":"1 単位だけ完了し、理由は cancelled になる。","inputs":{"cancel_unit":2}}
+//|   - {"id":"both","label":"D = 3 ms、4 単位目の前に取り消し","description":"同じ境界で期限も過ぎているが、先に確かめる取り消しが示される。","inputs":{"deadline_ms":3,"cancel_unit":4}}
+//|   - {"id":"completed","label":"D = 12 ms、取り消しなし","description":"8 単位すべてが完了し、停止は観測されない。","inputs":{"deadline_ms":12}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"checks","path":"/rows/4/3","equals":null}
+//|       - {"artifact":"checks","path":"/rows/5/1","equals":5}
+//|       - {"artifact":"checks","path":"/rows/5/3","equals":"deadline reached"}
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":5}
+//|       - {"artifact":"summary","path":"/rows/0/1","equals":"ExecutionStopped"}
+//|       - {"artifact":"summary","path":"/rows/0/2","equals":"CapabilityUnavailable"}
+//|   - case: cancelled
+//|     expect:
+//|       - {"artifact":"checks","path":"/rows/1/3","equals":"cancelled"}
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":1}
+//|   - case: both
+//|     expect:
+//|       - {"artifact":"checks","path":"/rows/3/1","equals":3}
+//|       - {"artifact":"checks","path":"/rows/3/3","equals":"cancelled"}
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":3}
+//|   - case: completed
+//|     expect:
+//|       - {"artifact":"checks","path":"/rows/7/3","equals":null}
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":8}
+//|       - {"artifact":"summary","path":"/rows/0/1","equals":"Ok"}
+use core::sync::atomic::{AtomicU32, Ordering};
+use core::time::Duration;
+use scioxide_core::{
+    CancellationToken, CapabilityError, Clock, ClockBinding, ExecutionContext, SciOxideError,
+    SciOxideErrorKind, MonotonicInstant,
+};
+
+/// 手動のクロック。保持する値を起点からの経過時間 [ms] として返す。
+struct StepClock(AtomicU32);
+impl Clock for StepClock {
+    fn now(&self) -> Result<MonotonicInstant, CapabilityError> {
+        let elapsed = Duration::from_millis(u64::from(self.0.load(Ordering::Relaxed)));
+        Ok(MonotonicInstant::from_duration_since_epoch(elapsed))
+    }
+}
+
+const UNITS: u32 = 8;
+let cancel_at = cancel_unit as u32;
+let clock = StepClock(AtomicU32::new(0));
+let binding = ClockBinding::new(&clock);
+let token = CancellationToken::new();
+// D ms の時間上限の後に 100 ms を重ねる。早い方の期限が残る。
+let cx = ExecutionContext::sequential()
+    .with_cancellation(&token)
+    .with_clock(&binding)
+    .and_then(|cx| cx.with_time_limit(Duration::from_millis(deadline_ms as u64)))
+    .and_then(|cx| cx.with_time_limit(Duration::from_millis(100)))
+    .map_err(|e| e.to_string())?;
+
+let mut checks = Vec::new();
+let mut completed = 0_u32;
+for unit in 1..=UNITS {
+    if unit == cancel_at {
+        token.cancel();
+    }
+    // 単位の境界で確かめる。理由は値で返るので、完了した分を保ったまま終われる。
+    let reason = cx.stop_reason().map_err(|e| e.to_string())?;
+    let requested = if unit >= cancel_at {
+        "あり"
+    } else {
+        "なし"
+    };
+    let now = clock.0.load(Ordering::Relaxed);
+    checks.push((unit, now, requested, reason.map(|r| r.to_string())));
+    if reason.is_some() {
+        break;
+    }
+    // 1 単位の作業。クロックが 1 ms 進む。
+    clock.0.fetch_add(1, Ordering::Relaxed);
+    completed += 1;
+}
+
+let kind_name = |result: Result<(), SciOxideError>| match result.map_err(|e| e.kind()) {
+    Ok(()) => "Ok",
+    Err(SciOxideErrorKind::ExecutionStopped) => "ExecutionStopped",
+    Err(SciOxideErrorKind::CapabilityUnavailable) => "CapabilityUnavailable",
+    Err(_) => "その他の分類",
+};
+let check_columns = serde_json::json!([
+    { "key": "0", "label": "次に始める単位", "type": "integer" },
+    { "key": "1", "label": "クロック [ms]", "type": "integer" },
+    { "key": "2", "label": "取り消しの要求" },
+    { "key": "3", "label": "stop_reason() の表示", "nullText": "None（続行）" }
+]);
+emit_table_with_columns!(
+    check_columns,
+    checks,
+    metadata = serde_json::json!({ "id": "checks", "title": "境界での確認" })
+);
+// クロックを登録していないコンテキストは、時間上限を受け付けない。
+let without_clock = ExecutionContext::sequential().with_time_limit(Duration::from_millis(1));
+let summary_columns = serde_json::json!([
+    { "key": "0", "label": "完了した作業 [単位]", "type": "integer" },
+    { "key": "1", "label": "最後の境界での check()" },
+    { "key": "2", "label": "クロックのないコンテキストの with_time_limit" }
+]);
+emit_table_with_columns!(
+    summary_columns,
+    vec![(
+        completed,
+        kind_name(cx.check()),
+        kind_name(without_clock.map(|_| ())),
+    )],
+    metadata = serde_json::json!({ "id": "summary", "title": "停止の結果" })
+);
+```
+
+既定値（$D = 5$ ms、取り消しなし）では、5 単位が完了した後の 6 単位目の境界でクロックが 5 ms に達し、`stop_reason()` は `deadline reached`（`DeadlineReached`）を返す。
+後から重ねた 100 ms の時間上限は 5 ms の期限を緩めていない。
+同じ境界で `check()` を呼ぶと `ExecutionStopped` エラーになる。
+クロックを登録していない `ExecutionContext::sequential()` に時間上限を求めると、`CapabilityUnavailable` が返る。
+
+2 単位目の前に取り消しを要求すると、1 単位だけが完了し、理由は `cancelled`（`Cancelled`）になる。
+$D = 3$ ms で 4 単位目の前に取り消しを要求すると、その境界ではクロックが 3 ms で期限も過ぎているが、先に確かめる取り消しが示される。
+$D = 12$ ms で取り消しを要求しなければ、8 単位すべてが完了し、最後の `check()` は `Ok` を返す。
+$D = 8$ ms では 8 単位が完了するが、その時点でクロックが期限に達しているので、最後の `check()` は `ExecutionStopped` になる。
+出力を書く直前の確認が停止を観測するのは、このような場合である。
+
+## wasm 環境でのクロックと時間上限
+
+このハンドブックのセルは `wasm32-unknown-unknown` で実行される。
+標準のクロック `StdClock`（`std` 機能）は `std::time::Instant` に基づくので、この環境では使えない。
+そのため、セルでは実時間の時間上限を設定できない。
+取り消しと、自作の `Clock` による期限はこの環境でも動くので、上のセルは手動のクロックで期限の動作を確かめている。
+並列実行と処理装置の命令についての制約は[実行方針・分割・実行コンテキスト](oxref:core-wasm-execution-limits)にある。
+
+## まとめ
+
+停止の要求は `with_cancellation` の取り消しか、`with_clock` で束ねたクロックの上の期限（`with_deadline`、`with_time_limit`）として実行コンテキストに注入する。
+期限は重ねても早い方が残り、後から緩めることはできない。
+反復解法は作業の境界で `stop_reason()` を呼び、理由が返ったら受理済みの状態を出力に反映してから終える。
+エラーとして伝えるだけでよい場所では `check()` を使う。
+取り消しと期限が同時に成り立つときに示される理由は `Cancelled` である。
+クロックを登録していないコンテキストは時間上限を `CapabilityUnavailable` で拒むので、時間上限を使う前に `with_clock` を呼ぶ。
+
+## 次に読むページ
+
+- [実行方針・分割・実行コンテキスト](../execution-and-partitions/)：停止要求を伝える実行コンテキストの作り方と、分割を実行するエグゼキューターの仕様を確かめる。
+- [求解のライフサイクルと計算回数の管理](../solve-lifecycle-and-accounting/)：反復解法が停止を反復の境界で確かめる方法と、そのときの回数の集計を確かめる。
+- [エラーの分類と詳細ビュー](../errors-and-diagnostic-views/)：`ExecutionStopped`、`CapabilityUnavailable`、`CapabilityFailure` の詳細を `view()` で読む方法を確かめる。
+- [求解の回数の集計と実行の API](../../api/solve-and-execution/)：取り消し・クロック・期限の全項目を引く。

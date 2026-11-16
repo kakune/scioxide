@@ -1,0 +1,576 @@
+---
+title: クリロフ部分空間法と前処理
+description: Krylov 部分空間と残差多項式、CG の導出と A ノルム誤差の上界、真の残差の置換、MINRES・GMRES・BiCGSTAB の適用範囲と計算コスト、前処理と scioxide-sparse の Jacobi・不完全 Cholesky・多重格子、標準形式・オプション付き形式・出力先を指定する API の求解と終了理由、止まったときに返る反復解。
+sidebar:
+  order: 355
+references:
+  linalg-conjugate-gradient: "共役勾配法"
+  linalg-minres-gmres-bicgstab: "minresgmresbicgstab"
+  linalg-preconditioning: "前処理"
+  linalg-iterative-status: "反復の状態と停止したときの結果"
+---
+
+偏微分方程式を離散化した数万〜数百万元の疎な連立方程式 $Ax = b$ では、行列を分解すると非零成分が大きく増え（フィルイン）、メモリと演算が足りなくなることがある。
+Krylov 部分空間法は行列とベクトルの積だけを繰り返して近似解を改良するので、行列を作らずに作用だけを与える問題にも使える。
+このページでは主な Krylov 法の導出と収束の評価、前処理の役割、`scioxide-linalg` の反復解法の呼び出し方と、止まったときの結果の読み方を説明する。
+
+---
+
+## Krylov 部分空間と残差多項式
+
+初期値 $x_0$ と初期残差 $r_0 = b - Ax_0$ から作る Krylov 部分空間 $\mathcal{K}_k(A, r_0) = \operatorname{span}\{ r_0, A r_0, \dots, A^{k-1} r_0 \}$ の中から $x_k \in x_0 + \mathcal{K}_k$ を選ぶと、残差は $r_k = p_k(A)\, r_0$（$p_k$ は次数 $k$ 以下で $p_k(0) = 1$ の多項式）と書ける。
+各法はこの多項式を何らかの意味で最良に選ぶ方法として理解できる。
+残差の 2 ノルムを最小にする法（GMRES と、Hermitian な $A$ の MINRES）では、$A = V \Lambda V^{-1}$ と対角化できれば
+
+$$
+\lVert r_k \rVert_2 \le \kappa_2(V) \min_{p_k(0) = 1} \max_{\lambda \in \Lambda(A)} \lvert p_k(\lambda) \rvert \; \lVert r_0 \rVert_2
+$$
+
+が成り立つ（$\Lambda(A)$ は固有値の集合）。
+原点で 1 になり固有値の上で小さい多項式が低い次数で作れる行列ほど速く収束し、非正規な行列では $\kappa_2(V)$ も効く（Hermitian なら $V$ はユニタリで $\kappa_2(V) = 1$）。
+一回の反復の計算コストは行列とベクトルの積が 1〜2 回（疎行列なら 1 回あたり $O(\mathrm{nnz})$）と、長さ $n$ のベクトル演算である。
+
+反復解法が受け取るのは scioxide-core の `LinearOperator`（`&dyn LinearOperator<S>`）である。
+scioxide-sparse の `CsrMatrix`、密行列を有限性の検査済みにしたビュー `matrix.view().try_finite()?`（`FiniteMatrixView`）、`TridiagonalMatrix` や `BandedMatrix` のビュー（`.view()`。
+所有する構造行列そのものは作用素ではない）、関数で作用を与える `ClosureOperator` などが使える。
+
+## 共役勾配法
+
+$A$ が Hermitian 正定値なら、$x$ を解として $\phi(y) = \tfrac12 y^{\mathsf H} A y - \operatorname{Re}(b^{\mathsf H} y)$ は $\phi(y) - \phi(x) = \tfrac12 \lVert y - x \rVert_A^2$（$\lVert e \rVert_A^2 = e^{\mathsf H} A e$）を満たす。
+共役勾配法（CG）は誤差の $A$ ノルムを $x_0 + \mathcal{K}_k$ の上で最小にする $x_k$ を求める方法で、その条件は残差が部分空間に直交すること（Galerkin 条件 $r_k \perp \mathcal{K}_k$）である。
+探索方向を互いに $A$ 共役（$p_i^{\mathsf H} A p_j = 0$, $i \ne j$）に選ぶと、この最小化は方向ごとの一次元の最小化に分かれ、次の短い漸化式になる。
+
+$$
+\alpha_k = \frac{r_k^{\mathsf H} r_k}{p_k^{\mathsf H} A p_k}, \quad
+x_{k+1} = x_k + \alpha_k p_k, \quad
+r_{k+1} = r_k - \alpha_k A p_k, \quad
+\beta_k = \frac{r_{k+1}^{\mathsf H} r_{k+1}}{r_k^{\mathsf H} r_k}, \quad
+p_{k+1} = r_{k+1} + \beta_k p_k
+$$
+
+`CgSolver` の一回の反復は $A$ との積 1 回と前処理 $M^{-1}$ の作用 1 回（前処理は後の節）で、作業領域は長さ $n$ のベクトル 6 本である。
+このほかに漸化式の内積（前処理なしでは $p_k^{\mathsf H} A p_k$ と $r_{k+1}^{\mathsf H} r_{k+1}$）と、停止判定や丸め誤差の監視に使うノルムを計算する。
+内積は拡張した指数の範囲で作るので、$\lVert r \rVert_2^2$ が浮動小数点の範囲を超えても $x$ が表せる限り求解は失敗しない。
+
+誤差は $x - x_k = p_k(A)(x - x_0)$ と書けるので、固有値を含む区間 $[\lambda_{\min}, \lambda_{\max}]$ に合わせて平行移動した Chebyshev 多項式を $p_k$ の候補にすると、条件数 $\kappa = \kappa_2(A) = \lambda_{\max}/\lambda_{\min}$ に対して
+
+$$
+\frac{\lVert x - x_k \rVert_A}{\lVert x - x_0 \rVert_A} \le \frac{1}{T_k\!\left(\frac{\kappa + 1}{\kappa - 1}\right)} \le 2 \left( \frac{\sqrt{\kappa} - 1}{\sqrt{\kappa} + 1} \right)^{k}
+$$
+
+が成り立つ（$T_k$ は $k$ 次の Chebyshev 多項式）。
+これは厳密な計算での $A$ ノルムの相対誤差の上界で、相対誤差を $\tau$ にする反復回数はおよそ $\tfrac12 \sqrt{\kappa}\,\ln(2/\tau)$ である。
+停止判定に使う残差は $r_k = A(x - x_k)$ なので $\lVert r_k \rVert_2 / \lVert r_0 \rVert_2 \le \sqrt{\kappa}\, \lVert x - x_k \rVert_A / \lVert x - x_0 \rVert_A$ で、残差の比は誤差の $A$ ノルムの比より最大 $\sqrt{\kappa}$ 倍大きく出ることがあり、単調にも減らない。
+固有値がいくつかの塊に集まっていれば実際の収束は上界よりずっと速く、浮動小数点では方向の共役性が崩れて収束が遅れることがある。
+
+丸め誤差のもとでは、漸化式で更新した残差と真の残差 $b - Ax_k$ が少しずつずれる。
+`CgSolver` は 50 回ごとと収束を受理する前に真の残差を計算し直して置き換え、探索方向は捨てないので、漸化式を始め直さずに真の残差で収束を判定する。
+曲率 $p^{\mathsf H} A p$ が正でなくなれば $A$ が正定値でないとして終了理由 `Breakdown(NonPositiveCurvature)` で止まり、前処理の $r^{\mathsf H} M^{-1} r$ が正でなくなれば前処理が正定値でないとして `Breakdown(Preconditioner)` で止まる。
+どちらの場合も、返る解は[反復の状態と停止したときの結果](#反復の状態と停止したときの結果)の規約に従う。
+
+## MINRES・GMRES・BiCGSTAB
+
+| 解法 | 行列 | 最小化するもの | 一回の反復の計算コスト | 作業領域（長さ $n$ のベクトル） | 前処理 |
+|---|---|---|---|---|---|
+| `CgSolver` | Hermitian 正定値 | 誤差の $A$ ノルム | $A$ の積 1 回、$M^{-1}$ 1 回 | 6 本 | Hermitian 正定値な $M^{-1}$（両側） |
+| `MinresSolver` | Hermitian（不定値でもよい） | 残差の 2 ノルム（前処理つきでは $M^{-1}$ から決まるノルム） | $A$ の積 1 回、$M^{-1}$ 1 回 | 17 本 | Hermitian 正定値な $M^{-1}$（両側） |
+| `GmresSolver` | 一般の正方行列 | 再始動の区間内で残差の 2 ノルム | $A$ の積 1 回、$M^{-1}$ 1 回、区間の $j$ 本目の直交化 $O(jn)$ | 約 $3m$ 本 | 右から。反復ごとに変わってよい |
+| `BicgstabSolver` | 一般の正方行列 | 最小化しない（BiCG の一段と一次元の残差最小化の組） | $A$ の積 2 回、$M^{-1}$ 2 回 | 10 本 | 右から。解く間は固定 |
+
+MINRES は Lanczos 過程で作った三重対角の小さな問題を解いて、残差を最小にする。
+三項漸化式なのでメモリは反復回数によらず、真の残差と $\lVert A r \rVert_2$ を 50 回ごとと収束を受理する前に、$A$ の積 2 回を足して計算し直す。
+特異でも解を持つ系は正則な系と同じように収束し、前処理なしで解を持たない特異な系は、正規方程式の残差による判定（次のページの LSQR と同じ `with_normal_tolerance`）で最小二乗解を `LeastSquaresConverged` として返す。
+$A$ が Hermitian でないと検出した場合は、`InvalidInput`（`Inconsistent`）のエラーになる。
+
+GMRES は Arnoldi 過程で $\mathcal{K}_k$ の正規直交基底を作り、残差を最小にする解 $x_k = \operatorname{arg\,min}_{y \in x_0 + \mathcal{K}_k} \lVert b - Ay \rVert_2$ を選ぶ。
+部分空間は広がる一方なので残差は増えず、厳密な計算では高々 $n$ 回で解に達する。
+ただしメモリは $O(kn)$、直交化の演算は $O(k^2 n)$ と増えるので、$m$ 回ごとに基底を捨てて再始動する（GMRES($m$)、既定 $m = 30$、`with_restart` で変える）。
+再始動は収束を遅らせ、条件が悪いと停滞することがある。
+`GmresSolver` は前処理を作用させた方向 $z_j = M_j^{-1} v_j$ と像 $A z_j$ を組にして保持し、像を DGKS の判定付きの古典 Gram–Schmidt で正規直交化しながら方向にも同じ列操作を施して $AZ = Q$ を保ち、区間内の補正を $Z Q^{\mathsf H} r$ で得る。
+前処理は右からかけ（$x = x_0 + Z y$）、実際に作用させた方向を保持するので、前処理が反復ごとに変わってもよい（柔軟 GMRES）。
+直交化でノルムが機械イプシロンの水準まで縮んだ方向（しきい値は `with_rank_threshold` で変える）は従属とみなして捨て、Krylov 空間が収束の前に広がらなくなれば `Breakdown(ArnoldiInvariant)` で止まる。
+最小化される残差は元の系の残差 $b - Ax$ で、真の残差は各区間の終わり、50 回ごと、残差の推定が許容誤差を満たしたときに計算し直す。
+反復の上限は全区間の反復を合わせた回数である。
+
+BiCGSTAB は BiCG の一段に一次元の残差最小化（GMRES(1)）を組み合わせ、$A^{\mathsf H}$ を使わずに BiCG の収束を滑らかにする。
+漸化式の残差は 50 回ごとと収束を受理する前に真の残差で置き換え、影の残差 $\hat r = r_0$ と漸化式は保つ。
+影の残差との内積 $\hat r^{\mathsf H} r$ と $\hat r^{\mathsf H} v$ は、絶対値が $\varepsilon_{\mathrm{mach}}^2 \lVert \hat r \rVert_2 \lVert r \rVert_2$（後者は $\lVert v \rVert_2$）以下のときだけ破綻とみなし、`Breakdown(RecurrenceDenominator)` で止まる。
+`with_breakdown_restarts` で回数を許すと、最後に確かめた反復解から、その真の残差を新しい影の残差として漸化式を始め直す（既定は始め直さない）。
+
+## 前処理
+
+前処理は同じ解を持ち固有値の分布がよい系に問題を置き換える操作である。
+左前処理 $M^{-1}Ax = M^{-1}b$ は前処理した残差 $M^{-1}r$ を扱い、右前処理 $AM^{-1}y = b$（$x = M^{-1}y$）は元の残差 $r$ を扱う。
+CG の前処理は $M = LL^{\mathsf H}$ として $L^{-1}AL^{-\mathsf H}$ に CG を適用したのと同じ反復を、$L$ を作らずに $M^{-1}$ の作用だけで行う（両側の前処理）ので、$M$ も Hermitian 正定値でなければならず、上界の $\kappa$ は $\kappa(M^{-1}A)$ に置き換わる。
+$M = A$ なら一回で収束するが $M^{-1}$ の作用は元の問題と同じ難しさなので、前処理は $M^{-1}$ の作用の安さと $M^{-1}A$ の固有値の集まり方との釣り合いで選ぶ。
+
+| 前処理 | $M$ | 効果の目安 | scioxide-sparse の型と説明のページ |
+|---|---|---|---|
+| Jacobi（対角） | $\operatorname{diag}(A)$ | 行や列の尺度が大きく異なる行列で効く。対角が一定なら $A$ の定数倍で、反復回数は変わらない | `JacobiPreconditioner::new`（[不完全分解と反復法の前処理](oxref:sparse-jacobi-identity)） |
+| 不完全 Cholesky・不完全 LU | $A$ の非零パターン（IC(0)、ILU(0)）やフィルのレベル（ILU($k$)）の中だけで分解した因子の積 | 2 次元 Poisson 方程式では IC(0) でも $\kappa$ は格子幅 $h$ について $O(h^{-2})$ のままで、改善は定数倍 | `IncompleteFactor::ic0`、`IncompleteFactor::ilu0`。レベルや閾値は `IncompleteFactor` を `IncompleteMethod` で選ぶ（[不完全分解と反復法の前処理](../../../scioxide-sparse/algorithms/incomplete-factorizations/)） |
+| 代数的多重格子 | 平滑化と粗い空間での補正を組み合わせた V サイクル | 楕円型問題で反復回数を格子によらずほぼ一定にできる | `AmgPreconditioner::new`（[代数的多重格子による前処理](oxref:sparse-amg-smoothed-aggregation)。重なりのある Schwarz 前処理 `SchwarzPlan` は[重なりのある Schwarz 法](../../../scioxide-sparse/algorithms/overlapping-schwarz/)） |
+
+解法は前処理を保持せず、前処理は逆作用 $M^{-1}$ を与える scioxide-core の `Preconditioner` を `Preconditioning::Inverse(&p)` として求解の呼び出しごとに参照を渡し、前処理なしは `Preconditioning::None` を渡す。
+同じ値を、CG と MINRES は両側から（対称に）、GMRES・BiCGSTAB などの非対称な解法とブロック版は右から、Richardson 反復は左からかける。
+随伴の作用 $M^{-\mathsf H}$ も必要な BiCG と QMR には `Preconditioning::InverseAdjoint` を渡す。
+LSQR・LSMR と、行列の成分を使う Jacobi・Gauss–Seidel・SOR は前処理の引数を持たない。
+GMRES・LGMRES・GCROT とそのブロック版は作用させた方向を保持するので、前処理が作用ごとに変わってよく、その他の解法は求解の間は同じ線形の $M^{-1}$ を前提とする。
+
+## 反復の状態と停止したときの結果
+
+単一ベクトルの反復解法 16 種類（このページの 4 種類と、[次のページ](../advanced-krylov-and-stationary/)の BiCG・CGS・QMR・TFQMR・LSQR・LSMR・LGMRES・GCROT・Richardson・Jacobi・Gauss–Seidel・SOR）は、同じ三つの形で呼び出せる（形の名前は[作業領域・実行コンテキスト・試行記録](oxref:linalg-execution-forms)で定義する）。
+前処理の引数を持たない LSQR・LSMR・Jacobi・Gauss–Seidel・SOR では下の `preconditioning` を省き、$A$ を LSQR・LSMR は `AdjointOperator`、定常反復は `StationaryMatrix` で渡す。
+
+- 標準形式 `solver.solve(&a, &b)` は $x_0 = 0$ から前処理なしで解き、解のベクトルだけを返す。
+  成功しなかった求解は `ConvergenceFailure`（理由 `NestedSolver`。
+  診断に解法の名前、反復回数、残差を持つ）のエラーになる。
+- オプション付き形式 `solver.solve_with_options(&a, &b, preconditioning, x0)` は前処理と初期値（`None` なら 0）を受け取り、解・レポート・残差の履歴を入れた `IterativeSolveResult` を返す。
+  上限・停滞・破綻で止まっても `Ok` を返す。
+  標準形式はこの結果に `into_converged_solution()` をかけたものに等しく、このメソッドは取り消しと期限を `ExecutionStopped`、それ以外の不成功を `ConvergenceFailure` のエラーにする。
+- 出力先を指定する API `solver.solve_into(&a, &b, preconditioning, x.view_mut(), &mut ws, cx)` は $x$ の値を初期値として読み、結果を $x$ に書いてレポート `IterativeSolveReport` を返す。
+
+所有値を返す API（標準形式とオプション付き形式）は呼び出しのたびに作業領域を用意する。
+出力先を指定する API の作業領域 `IterativeWorkspace` は `solver.workspace(&IterativeWorkspaceRequest::operator(&a)?.with_preconditioner(preconditioning)?)` で作るか、`workspace_requirements` が返す `IterativeRequirements` で `try_reserve` しておく。
+要求 `IterativeWorkspaceRequest` は作用素の形と補助の長さだけを持ち、BiCG・QMR には `adjoint(&a)`、定常反復には `matrix(StationaryMatrix::Csr(&a))` などで作る。
+一つの作業領域はすべての反復解法に使え、同じ解法の系統と形の求解を繰り返す間は確保しない。
+`cx` に `ExecutionContext` を渡すと新しい求解の根になり、親の `&mut SolveContext` を渡すと作用素と前処理の評価回数を親の計算回数の上限に計上する子になる。
+反復の上限は解法の生成時の `Budget` と、`with_execution_options` で合成した `LinalgExecutionOptions` の反復の上限（あれば）のうち小さい方である。
+
+成否はレポートの `termination()` が返す終了理由 `LinearSolveTermination` だけで判定し、`is_success()` が真になるのは次の二つである。
+
+- `Converged`: 返した反復解から計算し直した真の残差が $\lVert b - Ax \rVert_2 \le \tau_{\mathrm{abs}} + \tau_{\mathrm{rel}} \lVert b \rVert_2$（$b = 0$ なら $\lVert b \rVert_2$ を 1 に置き換える）を満たした。
+  丸めの水準まで許容誤差を緩めることはない。
+- `LeastSquaresConverged`: 正規方程式の残差 $\lVert A^{\mathsf H} r \rVert_2$ が $\lVert A \rVert \lVert r \rVert_2$ に対する最小二乗の許容誤差を満たした（前処理なしの MINRES、LSQR、LSMR だけ）。
+
+収束条件を満たさない終了理由は `ConditionLimit`（`with_condition_limit` を設定した MINRES・LSQR・LSMR で、射影した問題の逆条件数の推定がしきい値を下回った）、`IterationLimit`、`EvaluationLimit`（作用素と前処理を評価する回数の上限）、`Stagnation`（更新が反復解を変えなかったか、真の残差を確かめた最良の値が次に述べる丸めの下限以下で、その検証で漸化式の残差が収束を示したか最良の値が改善しなかった）、`Breakdown(LinearSolveBreakdown)`、`ExecutionStopped(ExecutionStopReason)`（取り消しか期限）である。
+本書のセルの判定は成功を「満たした」、上限・停滞・停止を「部分的」（返った反復解は推定値）、破綻を「失敗」として示す。
+
+停滞の判定に使う丸めの下限は、全解法に共通の
+
+```text
+ε c (‖b‖₂ + ‖A (s∘x)‖₂),   c = 16（実数）、32（複素数）
+```
+
+である（$\varepsilon$ は機械イプシロン、$x$ は真の残差を確かめた反復解のうち残差が最小のもの、$s$ は成分が $\pm 1$ の固定の符号の列、$s \circ x$ は成分ごとの積）。
+$x$ を作業精度に丸めるだけで残差は $\varepsilon \lVert \lvert A \rvert \lvert x \rvert \rVert_2$ ほど変わり、$b - Ax$ を作る計算も同じだけ誤差を加える。
+解の近くでは積 $a_{ij}x_j$ が打ち消し合って $\lVert Ax \rVert_2$ が小さくなるので、符号を固定した $\lVert A(s \circ x) \rVert_2$ を $A$ との積 1 回で求めて $\lVert \lvert A \rvert \lvert x \rvert \rVert_2$ の代わりにし、この積も評価回数に数える。
+下限は最新の反復解ではなく、残差が最小の反復解で測る。
+漸化式の残差が一時的に大きく増えると、最新の反復解は解から遠く離れうる。
+一方、CG と BiCGSTAB は 50 回ごとの検査点で漸化式の残差を真の残差に置き換えるので、それまでに積もった丸め誤差は消え、漸化式は回復できる（Sleijpen と van der Vorst、1996）。
+残差がまだ減っている検証では下限と比べないので、悲観的な下限が進んでいる求解を止めることはない。
+反復ごとに真の残差を確かめる解法は 50 回ごとの検査点でだけ下限と比べ、GMRES 系は再始動の区間の終わりでだけ停滞を判定する。
+この下限は停滞の判定にだけ使い、収束の許容誤差は変えない。
+
+成功条件を満たしていない場合もオプション付き形式と出力先を指定する API は `Ok` を返し、真の残差を確かめた反復解（初期値を含む）のうち残差が最小のもの（同じなら後のもの）を返す。
+真の残差を確かめる前に止まった場合は初期値が残り、レポートの残差は `None` になる。
+ただし、初期残差を計算する前に評価回数の上限に達した場合は `ConvergenceFailure`（`EvaluationLimit`）のエラーになる。
+レポートの `true_residual()` は返した解の真の残差（$\lVert b \rVert_2$ で尺度化）、`trust()` は部分結果の信頼の区分（core の `PartialResultTrust`。
+[誤差と部分結果](../../../concepts/errors-and-partial-results/)を参照）で、成功した求解では `ResidualChecked`、それ以外では `Admissible` になる。
+`krylov()` は Krylov 法の診断 `KrylovDiagnostics` である。
+`KrylovDiagnostics` は MINRES・LSQR・LSMR では正規残差 `normal_residual()`、逆条件数の推定 `condition_estimate()`、方向の消失 `rank_loss_detected()`、再始動の数 `restarts()` のすべてを持ち、GMRES 系・BiCGSTAB・BiCG・CGS・QMR・TFQMR では後の二つだけを持つ（CG と定常反復では `None`）。
+
+`with_history(true)` で記録する残差の履歴は、最初が真の初期残差 $\lVert b - Ax_0 \rVert_2$ で、以後は完了した反復ごとに 1 個である。
+検査点の間の値は漸化式の残差か射影した問題の推定値（TFQMR は準最小残差の上界）で、検査点・収束・終了の値は真の残差である。
+出力先を指定する API では、作業領域の `last_attempt()` が直近に呼び出したときの試行記録（成否の区分 `Succeeded`・`Stopped`・`Failed`・`PreflightRejected` と評価回数）を、`last_accepted()` が返した反復解、残差の履歴と `IterativeProgress` を返す。
+上限や取り消しで止めたときの読み方は[取り消し・回数上限による停止と受理済み反復解の読み方](../../examples/accepted-state-and-cancellation/)で確かめる。
+
+次のブロックはこのページの二つのセルが共有する補助関数である。
+`termination_name` は終了理由を表す列挙子の名前を返し、`severity` は判定の順位（成功 0、上限・停滞・停止 1、破綻 2）を返す。
+`relative_difference` は参照解との相対差 $\lVert x - y \rVert_\infty / \lVert y \rVert_\infty$ を、`relative_history` は残差の履歴を $\lVert b \rVert_2$ で割ったグラフの点を作る。
+
+```rust
+//| id: linalg-krylov-termination-names
+//| kind: definitions
+//| title: 反復解法の終了理由・相対差・残差の履歴の補助関数
+//| crates: [scioxide-linalg]
+use scioxide_linalg::{LinearSolveBreakdown, LinearSolveTermination};
+
+/// 終了理由の列挙子名（表の列と判定の status に使う）。
+pub(crate) fn termination_name(termination: LinearSolveTermination) -> &'static str {
+    match termination {
+        LinearSolveTermination::Converged => "Converged",
+        LinearSolveTermination::LeastSquaresConverged => "LeastSquaresConverged",
+        LinearSolveTermination::ConditionLimit => "ConditionLimit",
+        LinearSolveTermination::IterationLimit => "IterationLimit",
+        LinearSolveTermination::EvaluationLimit => "EvaluationLimit",
+        LinearSolveTermination::Stagnation => "Stagnation",
+        LinearSolveTermination::Breakdown(cause) => match cause {
+            LinearSolveBreakdown::RecurrenceDenominator => "Breakdown(RecurrenceDenominator)",
+            LinearSolveBreakdown::NonPositiveCurvature => "Breakdown(NonPositiveCurvature)",
+            LinearSolveBreakdown::ArnoldiInvariant => "Breakdown(ArnoldiInvariant)",
+            LinearSolveBreakdown::Preconditioner => "Breakdown(Preconditioner)",
+        },
+        LinearSolveTermination::ExecutionStopped(_) => "ExecutionStopped",
+    }
+}
+
+/// 判定の順位：成功 0、上限・停滞・停止 1（返った反復解は推定値）、破綻 2。
+pub(crate) fn severity(termination: LinearSolveTermination) -> u8 {
+    match termination {
+        t if t.is_success() => 0,
+        LinearSolveTermination::Breakdown(_) => 2,
+        _ => 1,
+    }
+}
+
+/// 参照解 y との最大値ノルムの相対差 ‖x − y‖∞ / ‖y‖∞。
+pub(crate) fn relative_difference(x: &[f64], reference: &[f64]) -> f64 {
+    let scale = reference.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+    let gap = x
+        .iter()
+        .zip(reference)
+        .fold(0.0_f64, |acc, (p, q)| acc.max((p - q).abs()));
+    gap / scale
+}
+
+/// 残差の履歴を ‖b‖₂ で割った点 (k, ‖r_k‖₂/‖b‖₂)。0 は対数軸に描けないので除く。
+pub(crate) fn relative_history(history: Option<&[f64]>, rhs_norm: f64) -> Vec<[f64; 2]> {
+    history
+        .unwrap_or(&[])
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| **r > 0.0)
+        .map(|(k, r)| [k as f64, r / rhs_norm])
+        .collect()
+}
+```
+
+## 2 次元 Poisson 方程式での前処理の比較
+
+次のセルは $N \times N$ の内点を持つ単位正方形の 5 点差分の Poisson 方程式 $-\Delta u = 1$（$4u_{ij} - u_{i\pm1,j} - u_{i,j\pm1} = h^2$、$h = 1/(N+1)$、境界で $u = 0$）を、前処理なし・Jacobi・IC(0) の CG のオプション付き形式で解く。
+許容誤差は相対 $10^{-10}$、反復の上限は 5000 回である。
+表は $N = 8, 16, 24, 32$ の 12 回の求解について、反復回数、終了理由、真の相対残差と、疎 LU による直接解（`scioxide_sparse::solve`）との相対差（最大値ノルム）を示す。
+グラフは入力で選んだ $N$ での相対残差の履歴である。
+5 点差分の条件数は $\kappa \approx 4/(\pi h)^2$ なので、前処理なしの反復回数は $\sqrt{\kappa} \approx 2/(\pi h) \propto 1/h$、つまり $N$ に比例して増えると予想される。
+
+```rust
+//| id: linalg-cg-poisson-history
+//| ref: linalg-cg-poisson-history
+//| title: 2 次元 Poisson 方程式の CG と前処理
+//| run: button
+//| uses: [linalg-krylov-termination-names]
+//| crates: [scioxide-core, scioxide-linalg, scioxide-sparse]
+//| inputs:
+//|   grid: {"type":"range","label":"履歴を描く格子 N","description":"一辺の内点の数。未知数は N²。","min":8,"max":32,"step":8,"value":32}
+//| cases:
+//|   - {"id":"coarse-grid","label":"N = 8 の履歴","description":"粗い格子では IC(0) の反復回数が前処理なしより多い。","inputs":{"grid":8}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"iterations","path":"/rows/9/3","range":{"min":60,"max":72}}
+//|       - {"artifact":"iterations","path":"/rows/9/4","equals":"Converged"}
+//|       - {"artifact":"iterations","path":"/rows/10/3","range":{"min":60,"max":72}}
+//|       - {"artifact":"iterations","path":"/rows/11/3","range":{"min":30,"max":38}}
+//|       - {"artifact":"iterations","path":"/rows/11/5","range":{"max":1e-10}}
+//|       - {"artifact":"iterations","path":"/rows/11/6","range":{"max":1e-7}}
+//|   - case: coarse-grid
+//|     expect:
+//|       - {"artifact":"iterations","path":"/rows/0/3","range":{"min":8,"max":12}}
+//|       - {"artifact":"iterations","path":"/rows/2/3","range":{"min":11,"max":15}}
+//|       - {"artifact":"iterations","path":"/rows/2/6","range":{"max":1e-7}}
+use scioxide_core::{Budget, ResidualTolerance};
+use scioxide_linalg::{CgSolver, IterativeSolveResult, Preconditioning, Vector};
+use scioxide_sparse::{
+    CsrMatrix, ExplicitZeroPolicy, IncompleteFactor, JacobiPreconditioner, sparse_diagonals,
+};
+
+// 5 点差分の行列。未知数の番号は k = iN + j（行優先）で、隣接点は k ± 1 と k ± N。
+let poisson = |n: usize| -> Result<CsrMatrix<f64>, String> {
+    let size = n * n;
+    // 行の端（j = N − 1 と次の行の j = 0）をまたぐ ±1 の成分は 0（境界で u = 0）。
+    let side: Vec<f64> = (1..size)
+        .map(|k| if k % n == 0 { 0.0 } else { -1.0 })
+        .collect();
+    let vertical = vec![-1.0; size - n];
+    let offsets = [0, 1, -1, n as isize, -(n as isize)];
+    let diagonals = [&vec![4.0; size][..], &side, &side, &vertical, &vertical];
+    let a = sparse_diagonals(size, size, &offsets, &diagonals).map_err(|e| e.to_string())?;
+    // 0 の成分を落として、IC(0) が 5 点差分の非零パターンを使うようにする。
+    a.view()
+        .to_csr(ExplicitZeroPolicy::Drop)
+        .map_err(|e| e.to_string())
+};
+let tolerance = ResidualTolerance::new(0.0, 1e-10).map_err(|e| e.to_string())?;
+let budget = Budget::try_from(5000).map_err(|e| e.to_string())?;
+let solver = CgSolver::new(tolerance, budget).with_history(true);
+let names = ["前処理なし", "Jacobi", "IC(0)"];
+// 前処理は解法に保持させず、逆作用 M⁻¹ として呼び出しごとに参照を渡す。
+let solve = |a: &CsrMatrix<f64>,
+             b: &Vector<f64>,
+             kind: usize|
+ -> Result<IterativeSolveResult<f64>, String> {
+    let result = match kind {
+        1 => {
+            let jacobi = JacobiPreconditioner::new(a).map_err(|e| e.to_string())?;
+            solver.solve_with_options(a, b, Preconditioning::Inverse(&jacobi), None)
+        }
+        2 => {
+            let ic0 = IncompleteFactor::ic0(a).map_err(|e| e.to_string())?;
+            solver.solve_with_options(a, b, Preconditioning::Inverse(&ic0), None)
+        }
+        _ => solver.solve_with_options(a, b, Preconditioning::None, None),
+    };
+    result.map_err(|e| e.to_string())
+};
+let mut rows: Vec<(usize, f64, &str, usize, &str, Option<f64>, f64)> = Vec::new();
+let mut series = Vec::new();
+for n in [8_usize, 16, 24, 32] {
+    let a = poisson(n)?;
+    let h = 1.0 / (n + 1) as f64;
+    let b = Vector::from_vec(vec![h * h; n * n]);
+    // 独立な参照：疎 LU による直接解。
+    let direct = scioxide_sparse::solve(&a, b.as_slice()).map_err(|e| e.to_string())?;
+    let root_kappa = 2.0 / (std::f64::consts::PI * h);
+    for (kind, &name) in names.iter().enumerate() {
+        let result = solve(&a, &b, kind)?;
+        let report = result.report();
+        let difference = relative_difference(result.solution().as_slice(), &direct);
+        let residual = report.true_residual().map(|r| r.scaled_norm());
+        let termination = termination_name(report.termination());
+        rows.push((
+            n,
+            root_kappa,
+            name,
+            report.iterations(),
+            termination,
+            residual,
+            difference,
+        ));
+        if n == grid.round() as usize {
+            // ‖b‖₂ = h² N。
+            let points = relative_history(result.history(), h * h * n as f64);
+            series.push(serde_json::json!({ "name": name, "points": points }));
+        }
+    }
+}
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let fixed1 = serde_json::json!({ "fractionDigits": 1 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "格子 N", "type": "integer" },
+    { "key": "1", "label": "√κ の目安 2/(πh) [-]", "type": "number", "format": fixed1 },
+    { "key": "2", "label": "前処理" },
+    { "key": "3", "label": "反復回数 [回]", "type": "integer" },
+    { "key": "4", "label": "終了理由" },
+    { "key": "5", "label": "真の相対残差 [-]", "type": "number", "format": sci2, "nullText": "-" },
+    { "key": "6", "label": "直接解との相対差 [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "iterations" })
+);
+emit_line_chart!(
+    &series,
+    options = &serde_json::json!({
+        "xLabel": "反復回数 k [回]",
+        "yLabel": "相対残差 ‖r_k‖₂/‖b‖₂ [-]",
+        "yType": "log",
+        "annotations": [{ "kind": "line", "axis": "y", "value": 1e-10, "label": "許容誤差 1e-10" }]
+    })
+);
+```
+
+12 回の求解はすべて `Converged` で止まった。
+前処理なしの反復回数は $N = 8, 16, 24, 32$ で 10、31、49、66 回で、$N = 16$ 以降は $\sqrt{\kappa}$ の目安 $2/(\pi h)$ の約 3 倍を保って $1/h$ に比例して増える。
+この行列は対角がすべて 4 なので、Jacobi 前処理は $A$ を 1/4 倍するだけで、反復回数も残差の履歴も前処理なしと一致する。
+IC(0) は 13、20、27、34 回で、$N$ に比例して増える点は同じだが、増え方は前処理なしの約 4 割である（$N = 8$ では前処理なしの方が少ない）。
+真の相対残差はすべて $10^{-10}$ 以下で、直接解との相対差は最大で $3.6 \times 10^{-12}$ である。
+
+$N = 32$ の前処理なしの履歴は、50 回目の真の残差の置き換えをまたいでも滑らかに下がり、置き換えで漸化式が始め直されていないことが分かる。
+最初の数回で相対残差が 1 を超えて増える（$N = 32$ の前処理なしでは 2.7 倍）のは、CG が単調に減らすのが残差の 2 ノルムではなく誤差の $A$ ノルムだからで、増え方は CG の節の $\sqrt{\kappa} \approx 21$ 倍の範囲に収まっている。
+$N = 8$ の履歴では、IC(0) の相対残差が最初から単調に下がる。
+
+## 非対称な問題と再始動
+
+次のセルは一次元の移流拡散方程式 $-u'' + \mathrm{Pe}\, u' = 1$（$u(0) = u(1) = 0$）を中心差分で離散化した 100 元の非対称な三重対角系を、GMRES($m$)、再始動しない GMRES(100)、BiCGSTAB のオプション付き形式で解く。
+許容誤差は相対 $10^{-10}$ で、反復の上限は入力で選ぶ（GMRES では全区間の合計）。
+格子ペクレ数 $\mathrm{Pe}\, h / 2$ が 1 を超えると、行列は対角優位でなくなり、非正規性が強まる。
+参照解は `TridiagonalLuDecomposition` の標準形式（隣接行の部分ピボット付き三重対角 LU。
+零のピボットだけを拒否する）で求め、反復解との相対差（最大値ノルム）を独立な検算にする。
+表の最後の列は同じ求解を標準形式 `solve(&a, &b)` で呼んだ場合の結果で、オプション付き形式の結果に `into_converged_solution()` をかけて求める。
+グラフは相対残差の履歴で、判定はセル全体の結論として、三つとも成功なら「満たした」、上限で止まったものがあれば「部分的」、破綻があれば「失敗」とする。
+
+```rust
+//| id: linalg-gmres-convection
+//| ref: linalg-gmres-convection
+//| title: 移流拡散方程式の GMRES(m) と BiCGSTAB
+//| run: reactive
+//| uses: [linalg-krylov-termination-names]
+//| crates: [scioxide-core, scioxide-linalg]
+//| inputs:
+//|   peclet: {"type":"range","label":"ペクレ数 Pe [-]","description":"移流の強さ。格子ペクレ数は Pe h / 2。","min":0,"max":200,"step":5,"value":20}
+//|   restart: {"type":"range","label":"再始動の長さ m","description":"GMRES(m) が保持する Krylov 基底の数。","min":2,"max":100,"step":1,"value":20}
+//|   iteration_limit: {"type":"range","label":"反復の上限 [回]","description":"各解法の Budget。GMRES では全区間の合計。","min":50,"max":3000,"step":50,"value":3000}
+//| cases:
+//|   - {"id":"short-budget","label":"上限 200 回","description":"GMRES(20) が IterationLimit で止まり、標準形式はエラーになる。","inputs":{"iteration_limit":200}}
+//|   - {"id":"pure-diffusion","label":"Pe = 0","description":"対称な拡散だけでは GMRES(20) の再始動が収束を大きく遅らせる。","inputs":{"peclet":0}}
+//|   - {"id":"strong-convection","label":"Pe = 200","description":"格子ペクレ数が 1 に近いと、BiCGSTAB の残差は初期残差の 10³¹ 倍まで増えてから減り、GMRES(20) より多い 308 回で収束する。","inputs":{"peclet":200}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"runs","path":"/rows/0/1","equals":"Converged"}
+//|       - {"artifact":"runs","path":"/rows/0/2","range":{"min":330,"max":400}}
+//|       - {"artifact":"runs","path":"/rows/1/2","range":{"min":95,"max":105}}
+//|       - {"artifact":"runs","path":"/rows/2/4","range":{"max":1e-7}}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+//|   - case: short-budget
+//|     expect:
+//|       - {"artifact":"runs","path":"/rows/0/1","equals":"IterationLimit"}
+//|       - {"artifact":"runs","path":"/rows/0/5","equals":"ConvergenceFailure"}
+//|       - {"artifact":"runs","path":"/rows/0/4","range":{"min":1e-6,"max":1e-2}}
+//|       - {"path":"/outputs/2/state","equals":"partial"}
+//|   - case: pure-diffusion
+//|     expect:
+//|       - {"artifact":"runs","path":"/rows/0/2","range":{"min":2000,"max":2900}}
+//|       - {"artifact":"runs","path":"/rows/1/4","range":{"max":1e-7}}
+//|   - case: strong-convection
+//|     expect:
+//|       - {"artifact":"runs","path":"/rows/0/1","equals":"Converged"}
+//|       - {"artifact":"runs","path":"/rows/0/4","range":{"max":1e-6}}
+//|       - {"artifact":"runs","path":"/rows/0/2","range":{"min":200,"max":260}}
+//|       - {"artifact":"runs","path":"/rows/2/1","equals":"Converged"}
+//|       - {"artifact":"runs","path":"/rows/2/2","range":{"min":250,"max":400}}
+//|       - {"artifact":"runs","path":"/rows/2/3","range":{"max":1e-10}}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+use scioxide_core::{Budget, SciOxideErrorKind, ResidualTolerance};
+use scioxide_linalg::{
+    BicgstabSolver, GmresSolver, IterativeSolveResult, LinearSolveTermination, Preconditioning,
+    StructuredOperation, TridiagonalLuDecomposition, TridiagonalMatrix, Vector,
+};
+
+let (n, h) = (100_usize, 1.0 / 101.0); // 格子幅 h = 1/(n + 1)
+// (−u_{i−1} + 2u_i − u_{i+1})/h² + Pe (u_{i+1} − u_{i−1})/(2h) = 1
+let lower = vec![-1.0 / (h * h) - peclet / (2.0 * h); n - 1];
+let upper = vec![-1.0 / (h * h) + peclet / (2.0 * h); n - 1];
+let matrix =
+    TridiagonalMatrix::new(lower, vec![2.0 / (h * h); n], upper).map_err(|e| e.to_string())?;
+// 所有する三重対角行列は作用素ではないので、ビューを作用素として渡す。
+let a = matrix.view();
+let b = Vector::from_vec(vec![1.0; n]);
+let reference = TridiagonalLuDecomposition::factor(&matrix)
+    .and_then(|lu| lu.solve(StructuredOperation::Normal, &b))
+    .map_err(|e| e.to_string())?;
+let tolerance = ResidualTolerance::new(0.0, 1e-10).map_err(|e| e.to_string())?;
+let budget = Budget::try_from(iteration_limit.round() as usize).map_err(|e| e.to_string())?;
+let m = restart.round() as usize;
+let gmres = |m: usize| -> Result<IterativeSolveResult<f64>, String> {
+    let restart = Budget::try_from(m).map_err(|e| e.to_string())?;
+    GmresSolver::new(tolerance, budget)
+        .with_history(true)
+        .with_restart(restart)
+        .solve_with_options(&a, &b, Preconditioning::None, None)
+        .map_err(|e| e.to_string())
+};
+let bicgstab = BicgstabSolver::new(tolerance, budget)
+    .with_history(true)
+    .solve_with_options(&a, &b, Preconditioning::None, None)
+    .map_err(|e| e.to_string())?;
+let runs = [
+    (format!("GMRES({m})"), gmres(m)?),
+    (format!("GMRES({n})（再始動なし）"), gmres(n)?),
+    ("BiCGSTAB".to_string(), bicgstab),
+];
+let (mut rows, mut series) = (Vec::new(), Vec::new());
+for (name, result) in &runs {
+    let report = result.report();
+    let difference = relative_difference(result.solution().as_slice(), reference.as_slice());
+    // 標準形式 solve(&a, &b) はオプション付き形式の結果に into_converged_solution() をかけたものと同じ。
+    let plain = match result.clone().into_converged_solution() {
+        Ok(_) => "解を返す",
+        Err(e) if e.kind() == SciOxideErrorKind::ConvergenceFailure => "ConvergenceFailure",
+        Err(e) => return Err(e.to_string()),
+    };
+    let residual = report.true_residual().map(|r| r.scaled_norm());
+    let termination = termination_name(report.termination());
+    rows.push((
+        name.clone(),
+        termination,
+        report.iterations(),
+        residual,
+        difference,
+        plain,
+    ));
+    // ‖b‖₂ = √n。
+    let points = relative_history(result.history(), (n as f64).sqrt());
+    series.push(serde_json::json!({ "name": name, "points": points }));
+}
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "解法" },
+    { "key": "1", "label": "終了理由" },
+    { "key": "2", "label": "反復回数 [回]", "type": "integer" },
+    { "key": "3", "label": "真の相対残差 [-]", "type": "number", "format": sci2, "nullText": "-" },
+    { "key": "4", "label": "参照解との相対差 [-]", "type": "number", "format": sci2 },
+    { "key": "5", "label": "標準形式 solve の結果" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "runs" })
+);
+emit_line_chart!(
+    &series,
+    options = &serde_json::json!({
+        "xLabel": "反復回数 k [回]",
+        "yLabel": "相対残差 ‖r_k‖₂/‖b‖₂ [-]",
+        "yType": "log",
+        "annotations": [{ "kind": "line", "axis": "y", "value": 1e-10, "label": "許容誤差 1e-10" }]
+    })
+);
+// 判定はもっとも悪い終了理由で決める（同じ順位なら表の上の行）。
+let worst = runs
+    .iter()
+    .map(|(_, result)| result.report().termination())
+    .fold(LinearSolveTermination::Converged, |acc, t| {
+        if severity(t) > severity(acc) { t } else { acc }
+    });
+let outcome = match severity(worst) {
+    0 => Outcome::satisfied("三つの解法がすべて許容誤差を満たした"),
+    1 => Outcome::partial("反復の上限か停滞で止まった解法がある").explanation(
+        "止まった解法の解は真の残差が最小の検証済みの反復解で、推定値として扱う。",
+    ),
+    _ => Outcome::failed("漸化式が破綻した解法がある"),
+};
+let (first, last) = (runs[0].1.report(), runs[2].1.report());
+emit_outcome!(
+    outcome
+        .status(termination_name(worst))
+        .diagnostic("GMRES(m) の反復回数", first.iterations() as f64, None)
+        .diagnostic("BiCGSTAB の反復回数", last.iterations() as f64, None)
+        .diagnostic("格子ペクレ数 Pe h/2", peclet * h / 2.0, None)
+);
+```
+
+既定の $\mathrm{Pe} = 20$（格子ペクレ数 0.099）、$m = 20$ では三つとも `Converged` で止まり、GMRES(20) は 362 回、BiCGSTAB は 105 回かかる。
+再始動しない GMRES(100) は次元 $n = 100$ と同じ 100 回で収束し、厳密な計算では $n$ 回以内に解に達することと合っている。
+参照解との相対差は GMRES(100) が $1.3 \times 10^{-14}$ で、許容誤差の近くで止まる他の二つ（$3.7 \times 10^{-11}$ と $3.1 \times 10^{-11}$）より小さい。
+再始動は Krylov 基底を捨てるので、メモリを $O(mn)$ に抑える代わりに反復が増え、$m$ を変えたときの回数は単調とは限らない。
+たとえば $\mathrm{Pe} = 20$ で $m = 5, 10, 20, 30, 50$ とすると、回数は 486、375、362、386、617 回で、$m = 50$ が最も多い。
+
+$\mathrm{Pe} = 0$（対称な拡散だけ）では再始動しない GMRES が 50 回、BiCGSTAB が 64 回で収束する一方、GMRES(20) は 2445 回かかる。
+$\mathrm{Pe} = 200$（格子ペクレ数 0.99）では GMRES(20) が 230 回で収束し、BiCGSTAB も 308 回で収束するが、その経過は単調にはほど遠い。
+BiCGSTAB の残差は 1 回目から増え、68 回目に初期残差の $1.3 \times 10^{31}$ 倍に達してから減り、230 回目に初めて初期残差を下回る。
+250 回目の検査点のあとにも一時 $4.5 \times 10^{5}$ 倍まで増えてから、308 回目に収束する。
+50 回目から 200 回目までの検査点で確かめた真の残差もすべて初期残差より大きいので、残差が最小の反復解は初期値 $x = 0$ のままである。
+停滞の判定に使う丸めの下限はこの $x = 0$ で測るので $16\varepsilon \lVert b \rVert_2$ にとどまり、最良の相対残差 1 よりはるかに小さい。
+そのため増加の途中で `Stagnation` とは判定されず、求解は続いて真の相対残差 $9.4 \times 10^{-11}$（参照解との相対差 $1.9 \times 10^{-11}$）で `Converged` になる。
+破綻の判定は丸めに敏感で、同じ $\mathrm{Pe} = 200$ をネイティブ実行（SIMD の内積）で解くと、BiCGSTAB は最初の検査点の前の 43 回目に `Breakdown(RecurrenceDenominator)` で止まり、真の残差を確かめた唯一の反復解 $x = 0$ を返して判定は「失敗」になる。
+
+反復の上限を 200 回にすると、GMRES(20) は `IterationLimit` で止まり、オプション付き形式は真の相対残差 $2.7 \times 10^{-4}$ の反復解（参照解との相対差 $1.0 \times 10^{-4}$）を `Ok` で返し、判定は「部分的」になる。
+同じ求解を標準形式で呼ぶと、この結果は `ConvergenceFailure` のエラーになり、反復解は返らない。
+
+---
+
+## まとめ
+
+Krylov 部分空間法は行列とベクトルの積だけで解を改良し、収束の速さは固有値の分布で決まり、非正規な行列では固有ベクトルの条件数も効く。
+CG の $A$ ノルム誤差は厳密な計算で $2((\sqrt\kappa-1)/(\sqrt\kappa+1))^k$ 以下になるので、必要な反復回数は $\sqrt\kappa$ に比例すると見積もれ、停止判定の残差はその $\sqrt\kappa$ 倍まで大きく出うる。
+Hermitian 正定値なら CG、Hermitian 不定値なら MINRES、一般の行列なら GMRES($m$) か BiCGSTAB を選び、GMRES では再始動の長さとメモリの釣り合いを、BiCGSTAB では収束が単調でなく、残差が初期残差の何桁も上まで増えてから収束することもある点を考える。
+前処理は解法に持たせず `Preconditioning` として呼び出しごとに参照を渡し、$M^{-1}A$ の固有値を集めて反復を減らすが、対角が一定の行列の Jacobi のように効かない場合や、IC(0) のように定数倍しか改善しない場合がある。
+収束しなければエラーでよい場面では標準形式を、止まった反復解とレポートを読みたい場面ではオプション付き形式か出力先を指定する API を使い、`Ok` でも終了理由と真の残差を確かめる。
+
+## 次に読むページ
+
+- [双直交法・最小二乗 Krylov 法・定常反復](../advanced-krylov-and-stationary/)：QMR・LSQR・再利用 Krylov 法・SOR など、ここで扱わなかった反復法とその使いどころを確かめる。
+- [熱伝導率が不均一な棒と Jacobi 前処理付き CG](../../examples/preconditioned-cg/)：このページの Poisson 方程式では効かなかった Jacobi 前処理が、尺度の不均一な系で条件数を下げることを確かめる。
+- [取り消し・回数上限による停止と受理済み反復解の読み方](../../examples/accepted-state-and-cancellation/)：上限や取り消しで止まったときに返る解と、試行記録の読み方を例題で確かめる。

@@ -1,0 +1,248 @@
+---
+title: "Sparse structures and column coloring"
+description: "Canonical CSR nonzero structures through StructuralPattern and construction checks, Triangle and DiagonalKind storage conventions, column coloring for sparse Jacobians in one evaluation per color, ColoringSchedule validation, and two conflict relations."
+sidebar:
+  order: 365
+references:
+  core-csr-pattern: "canonical-csr-sparse-structures"
+  core-column-coloring: "jacobian-column-coloring"
+---
+
+Sparse matrix algorithms need the structure identifying stored positions before they need values.
+Reorderings and evaluation plans for sparse Jacobians can be determined from structure alone without reading values.
+`scioxide-core` provides nonzero structures `StructuralPattern`, triangular storage orientation `Triangle`, diagonal representation `DiagonalKind`, and validated colorings `ColoringSchedule` as types shared across crates.
+Coloring algorithms belong to scioxide-sparse; `scioxide-core` validates and retains supplied conflict-free colorings.
+[Operator protocols and closure operators](../operator-protocols-and-structure/) covers matrix-free operators using only products.
+
+## Canonical CSR sparse structures
+
+`StructuralPatternView` (borrowed) and `StructuralPattern` (owned) represent nonzero structure in compressed sparse row (CSR) format.
+Column indices for row $i$ are stored in `col_indices[row_ptr[i] .. row_ptr[i + 1]]`.
+A stored position belongs to the structure even when its value is zero.
+Construction checks the following conditions, returning `InvalidInput` (reason `InvalidInputReason::Malformed`) if any fails.
+
+- The row-start array `pointers` has length row count $+ 1$, starts at zero, and ends at the length of the column-index array `indices`.
+- `pointers` is nondecreasing.
+- Each row's column indices are below the column count, strictly ascending, and duplicate-free.
+
+If row count $+ 1$ does not fit `usize`, construction returns `SizeOverflow`.
+Unique ascending column order per row gives identical arrays for identical structures.
+Equality of `StructuralPattern` compares shapes and every index exactly.
+`view()` returns a borrowed view, while `StructuralPatternView::to_owned()` returns an owned copy.
+`try_reserve` and `try_assign` copy another structure while reusing allocated storage.
+
+Triangular storage specifies the stored half through `Triangle` (`Lower` includes the diagonal and below, `Upper` the diagonal and above) and the diagonal representation through `DiagonalKind`.
+`Triangle` refers to the stored half before applying a transpose or adjoint.
+`DiagonalKind::Explicit` stores diagonal values; triangular solves require nonzero diagonal entries.
+`DiagonalKind::Unit` assumes a unit diagonal without reading its values.
+Sparse triangular storage must then omit diagonal entries; dense and packed storage retain diagonal positions but do not read their values.
+Both enums are shared by scioxide-sparse's `SparseTriangular` and sparse symmetric factorizations, and scioxide-linalg's triangular and symmetric storage.
+
+## Jacobian column coloring
+
+Computing a sparse Jacobian $J$ of $m \times n$ by finite differences or forward-mode automatic differentiation naively requires $n$ evaluations in unit-vector directions $e_0, \ldots, e_{n-1}$.
+Columns with no shared nonzero row can combine directions in one evaluation without mixing the contributions of their nonzero entries.
+Assign columns colors $0, \ldots, p - 1$ so same-colored columns share no nonzero row.
+For the set $C_k$ of columns with color $k$, the sum
+
+$$
+d_k = \sum_{j \in C_k} e_j
+$$
+
+defines a direction whose evaluation $J d_k$ recovers every nonzero entry of all columns with color $k$.
+At row $i$, at most one column of $C_k$ has a structural nonzero; denoting it by $j$ gives $(J d_k)_i = J_{ij}$.
+Only $p$ evaluations are needed.
+This is Curtis–Powell–Reid column compression, corresponding to coloring a graph with columns as vertices (partial distance-two coloring of a bipartite graph).
+Every nonzero column in a row needs a distinct color, so color count $p$ is at least the maximum nonzeros per row.
+
+`ColoringSchedule::new(pattern, kind, colors)` takes one color index per column, validates conflict freedom, and forms groups with columns in ascending order per color.
+It does not compute colorings; it checks caller-supplied colorings.
+Colorings can be computed through scioxide-sparse's `derivative_coloring` and `distance_one_coloring` ([Reordering and coloring](oxref:sparse-coloring)).
+Choose the conflict relation through `ColoringKind`.
+
+- `ColoringKind::DerivativeColumns` requires different colors for columns with stored positions in a common row.
+  Use it for Jacobian column compression.
+- `ColoringKind::DistanceOne` treats a square structure as an undirected graph and requires different colors for adjacent vertices.
+  If $(i, j)$ or $(j, i)$ is stored and $i \ne j$, vertices $i$ and $j$ are adjacent (diagonal entries are ignored).
+
+`DistanceOne` checks only adjacency, allowing two nonadjacent columns to have the same color even if both have positions in one row.
+A `DistanceOne` coloring therefore need not satisfy column compression requirements.
+scioxide-differentiate's `ColoredJacobianPlan` rejects schedules other than `DerivativeColumns`.
+
+Color indices must be contiguous starting at zero.
+Coloring length mismatches, color indices at least the column count, conflicts, unused color indices, and `DistanceOne` on nonsquare structures produce `InvalidInput` (`Malformed`); allocation failures produce `AllocationFailure`.
+Validation takes time proportional to nonzeros plus rows plus columns, with temporary storage proportional to the color count.
+`groups()` returns column groups in color order, `colors()` each column's color, and `color_count()` the color count.
+A structure with no columns has zero colors.
+The schedule owns the supplied structure; `pattern()` returns its view, and `kind()` the conflict relation.
+`validate_pattern(view)` checks exact agreement with a subsequently supplied structure, returning `InvalidInput` (`Malformed`) on mismatch.
+
+The following cell constructs an $n \times n$ tridiagonal structure and validates colors given by column index modulo 3.
+The input is integer order $n$ (4–12).
+A tridiagonal row $i$ contains columns $i - 1$, $i$, and $i + 1$.
+Row 1 contains columns 0, 1, and 2, requiring three colors; coloring modulo 3 gives different colors to all three in every row, so three suffice.
+For comparison, coloring modulo 2 is rejected under `DerivativeColumns` because columns 0 and 2 share a color in row 1.
+Adjacent vertices of a tridiagonal graph differ by 1, so the same two-color assignment is accepted under `DistanceOne`.
+
+The cell also reconstructs the Jacobian using the coloring.
+Set entries to $J_{ij} = 10\,(i + 1) + (j + 1)$, compute three color products $J d_k$, and recover row $i$, column $j$ from $(J d_{c_j})_i$ ($c_j$ is column $j$'s color).
+The first table summarizes structure and coloring, the largest difference between recovered and original entries, and validation of the two-color assignment under both relations.
+The second lists columns per color returned by `groups()`.
+
+```rust
+//| id: core-coloring-schedule
+//| ref: core-coloring-schedule
+//| title: "Column coloring and Jacobian recovery for a tridiagonal structure"
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   matrix_size: {"type":"range","label":"Matrix order n","description":"An n × n tridiagonal structure.","min":4,"max":12,"step":1,"value":6}
+//| cases:
+//|   - {"id":"smallest","label":"n = 4","description":"Column counts by color become 2, 1, and 1.","inputs":{"matrix_size":4}}
+//|   - {"id":"largest","label":"n = 12","description":"The color count stays at 3 even with four times as many columns.","inputs":{"matrix_size":12}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":16}
+//|       - {"artifact":"summary","path":"/rows/0/1","equals":3}
+//|       - {"artifact":"summary","path":"/rows/0/2","equals":3}
+//|       - {"artifact":"summary","path":"/rows/0/3","equals":6}
+//|       - {"artifact":"summary","path":"/rows/0/4","approx":{"value":0,"atol":1e-12}}
+//|       - {"artifact":"summary","path":"/rows/0/5","equals":"InvalidInput"}
+//|       - {"artifact":"summary","path":"/rows/0/6","equals":"Accepted"}
+//|       - {"artifact":"groups","path":"/rows/1/1","equals":3}
+//|       - {"artifact":"groups","path":"/rows/2/0","equals":1}
+//|   - case: smallest
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":10}
+//|       - {"artifact":"summary","path":"/rows/0/2","equals":3}
+//|       - {"artifact":"summary","path":"/rows/0/4","approx":{"value":0,"atol":1e-12}}
+//|       - {"artifact":"groups","path":"/rows/2/0","equals":1}
+//|   - case: largest
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":34}
+//|       - {"artifact":"summary","path":"/rows/0/2","equals":3}
+//|       - {"artifact":"summary","path":"/rows/0/4","approx":{"value":0,"atol":1e-12}}
+//|       - {"artifact":"summary","path":"/rows/0/5","equals":"InvalidInput"}
+//|       - {"artifact":"summary","path":"/rows/0/6","equals":"Accepted"}
+//|       - {"artifact":"groups","path":"/rows/11/1","equals":11}
+use scioxide_core::{ColoringKind, ColoringSchedule, SciOxideErrorKind, StructuralPattern};
+
+let n = matrix_size as usize;
+let mut pointers = vec![0];
+let mut indices = Vec::new();
+for i in 0..n {
+    // Nonzero columns in row i: i-1, i, i+1 within range, in ascending order.
+    indices.extend(i.saturating_sub(1)..=(i + 1).min(n - 1));
+    pointers.push(indices.len());
+}
+let nnz = indices.len();
+// Color-count lower bound: maximum nonzeros per row.
+let max_row = pointers.windows(2).map(|w| w[1] - w[0]).max().unwrap_or(0);
+let pattern = StructuralPattern::new(n, n, pointers, indices).map_err(|e| e.to_string())?;
+
+let modulo3: Vec<usize> = (0..n).map(|j| j % 3).collect();
+let schedule = ColoringSchedule::new(pattern.clone(), ColoringKind::DerivativeColumns, modulo3)
+    .map_err(|e| e.to_string())?;
+let colors = schedule.colors();
+let view = schedule.pattern();
+let (row_ptr, col_indices) = (view.row_ptr(), view.col_indices());
+
+// Jacobian entries J_ij = 10 (i + 1) + (j + 1), used only at structural positions.
+let entry = |i: usize, j: usize| (10 * (i + 1) + j + 1) as f64;
+// Form (J d_k)_i for color direction d_k = Σ_{j ∈ C_k} e_j in compressed[k][i].
+let mut compressed = vec![vec![0.0_f64; n]; schedule.color_count()];
+for i in 0..n {
+    for &j in &col_indices[row_ptr[i]..row_ptr[i + 1]] {
+        compressed[colors[j]][i] += entry(i, j);
+    }
+}
+// Recover J_ij = (J d_{c_j})_i and take the largest difference from original entries.
+let mut worst = 0.0_f64;
+for i in 0..n {
+    for &j in &col_indices[row_ptr[i]..row_ptr[i + 1]] {
+        worst = worst.max((compressed[colors[j]][i] - entry(i, j)).abs());
+    }
+}
+
+// Validate the two-color assignment (j mod 2) under both conflict relations.
+let two_colors = |kind: ColoringKind| {
+    let modulo2: Vec<usize> = (0..n).map(|j| j % 2).collect();
+    match ColoringSchedule::new(pattern.clone(), kind, modulo2) {
+        Ok(_) => "Accepted",
+        Err(error) => match error.kind() {
+            SciOxideErrorKind::InvalidInput => "InvalidInput",
+            _ => "Other category",
+        },
+    }
+};
+let two_columns = two_colors(ColoringKind::DerivativeColumns);
+let two_adjacent = two_colors(ColoringKind::DistanceOne);
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let summary_columns = serde_json::json!([
+    { "key": "0", "label": "Nonzeros", "type": "integer" },
+    { "key": "1", "label": "Maximum nonzeros per row", "type": "integer" },
+    { "key": "2", "label": "Color count color_count() [evaluations]", "type": "integer" },
+    { "key": "3", "label": "Unit-vector evaluations [evaluations]", "type": "integer" },
+    { "key": "4", "label": "Maximum recovered-entry difference [-]", "type": "number", "format": sci3 },
+    { "key": "5", "label": "Validate two colors (j mod 2) with DerivativeColumns" },
+    { "key": "6", "label": "Validate two colors (j mod 2) with DistanceOne" }
+]);
+emit_table_with_columns!(
+    summary_columns,
+    vec![(
+        nnz,
+        max_row,
+        schedule.color_count(),
+        n,
+        worst,
+        two_columns,
+        two_adjacent,
+    )],
+    metadata = serde_json::json!({ "id": "summary" })
+);
+
+// groups() returns colors in order, with columns ascending within each group.
+let members: Vec<(usize, usize)> = schedule
+    .groups()
+    .enumerate()
+    .flat_map(|(k, group)| group.iter().map(move |&j| (k, j)))
+    .collect();
+let group_columns = serde_json::json!([
+    { "key": "0", "label": "Color k", "type": "integer" },
+    { "key": "1", "label": "Column j", "type": "integer" }
+]);
+emit_table_with_columns!(
+    group_columns,
+    members,
+    metadata = serde_json::json!({ "id": "groups" })
+);
+```
+
+At the default $n = 6$ there are 16 nonzeros, and the three colors attain the lower bound.
+Color 0 contains columns 0 and 3, color 1 columns 1 and 4, and color 2 columns 2 and 5, reducing six evaluations to three.
+The largest difference between recovered and original entries is zero.
+Only one column of a given color occurs in a row, so each product component is exactly one entry, introducing no addition rounding.
+The two-color assignment is rejected under `DerivativeColumns` with `InvalidInput` but accepted under `DistanceOne`.
+Although valid at distance one, those two colors mix entries from columns 0 and 2 in row 1 during column compression.
+
+At $n = 12$ the color count remains 3, and evaluation-count ratio $n / 3$ grows proportionally to $n$.
+At $n = 4$ column counts by color are 2, 1, and 1; when $n$ is not divisible by 3, color groups differ in size by one.
+Real finite difference evaluations introduce truncation and rounding errors, so recovered-entry accuracy depends on the formula and step size.
+Coloring reduces evaluation counts, not finite difference errors.
+
+## Summary
+
+Pass sparse structures through canonical CSR `StructuralPattern` with strictly ascending, duplicate-free column indices per row; invalid arrays are rejected at construction with `InvalidInput`.
+Triangular storage uses `Triangle` for the stored half and `DiagonalKind` for diagonal storage convention.
+Validating colors with `ColoringSchedule` (`DerivativeColumns`), requiring distinct colors for columns sharing a row, lets sparse Jacobians use one evaluation per color rather than per column.
+The color count cannot be below the maximum nonzeros per row.
+Distance-one coloring need not satisfy column compression requirements; choose the appropriate `ColoringKind` for the use.
+If structure may have changed after coloring, verify agreement with `validate_pattern` before using the schedule.
+
+## Further reading
+
+- [Reordering and coloring](oxref:sparse-coloring): Check greedy coloring algorithms and resulting color counts.
+- [Coloring-based sparse Jacobian compression](../../../scioxide-differentiate/algorithms/sparse-coloring/): Check finite difference Jacobian recovery with validated schedules and its errors.
+- [Operator protocols and closure operators](../operator-protocols-and-structure/): Check `JacobianOperator` using only products $J(x)\,v$ without assembling a Jacobian.
+- [Layout, operator, and combinatorics APIs](../../api/layouts-operators-combinatorics/): Look up all structure and coloring items.

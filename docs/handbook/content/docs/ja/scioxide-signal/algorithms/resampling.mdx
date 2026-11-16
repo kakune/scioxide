@@ -1,0 +1,628 @@
+---
+title: リサンプリング
+description: 有理比の多相 FIR によるリサンプリングと Kaiser ウインドウの既定の低域通過、出力の時刻原点と長さ、逐次処理、周期的な記録の Fourier リサンプリング、エイリアシングと計算量。
+sidebar:
+  order: 330
+references:
+  signal-rational-resampling: "補間と間引きの周波数領域"
+  signal-polyphase: "多相分解と計算量"
+  signal-resampling-filter: "既定の低域通過フィルタ"
+  signal-resample-alignment: "時刻原点と出力長"
+  signal-polyphase-stream: "逐次のリサンプリング"
+  signal-periodic-resampling: "周期的な記録の-fourier-リサンプリング"
+---
+
+標本化周波数 $f_s$ で記録した信号を、別の標本化周波数 $f_s' = f_s L / M$（$L$、$M$ は正の整数）の標本列に変換することをリサンプリングと呼ぶ。
+音声の 44.1 kHz と 48 kHz の変換（$L/M = 160/147$）や、測定の後で解析に合う間隔へそろえる処理がこれに当たる。
+連続時間の信号が Nyquist 周波数 $f_s/2$ より低い成分だけを持つなら、標本列から元の信号が一意に決まり、任意の時刻の値を求められる。
+実際のアルゴリズムはこの理想的な補間を有限長の FIR フィルタか、周期を仮定した DFT で近似する。
+このページでは`scioxide-signal` の二つの方法である多相 FIR による有理比の変換（`resample`、`PolyphasePlan`）と、周期的な記録の Fourier リサンプリング（`resample_periodic`、`FourierResamplePlan`）の原理、誤差、出力の位置、計算量を説明する。
+
+## 補間と間引きの周波数領域
+
+有理比 $L/M$ の変換は、$L$ 倍の補間、低域通過、$M$ 分の 1 の間引きの三段で考える。
+周波数は正規化した角周波数 $\omega$（rad/標本）で書き、$\omega = \pi$ がその標本化周波数の Nyquist 周波数である。
+
+$L$ 倍の補間では、各標本の後に $L-1$ 個の 0 を挿入する。
+挿入した列 $u[t]$ の DTFT は $U(e^{i\omega}) = X(e^{i\omega L})$ となり、元のスペクトルが周波数軸の上で $1/L$ に縮む。
+その結果、$[-\pi, \pi]$ の中に元のスペクトルの複製（像）が $L$ 個並ぶ。
+像を取り除いて本来の帯域だけを残すには、高い標本化周波数で遮断周波数 $\pi/L$ の低域通過フィルタを掛ける。
+0 の挿入で平均の振幅が $1/L$ になるので、フィルタの直流利得を $L$ にして振幅を戻す。
+
+$M$ 分の 1 の間引き $y[j] = v[jM]$ では、スペクトルが $M$ 倍に伸び、$M$ 個のずれた複製が重なる。
+
+$$
+Y(e^{i\omega}) = \frac{1}{M} \sum_{r=0}^{M-1} V\big(e^{i(\omega - 2\pi r)/M}\big)
+$$
+
+$v$ が $\pi/M$ より高い成分を持つと、その成分は低い周波数に折り返して区別できなくなる。
+これがエイリアシングで、間引きの前に遮断周波数 $\pi/M$ の低域通過フィルタを掛けて防ぐ。
+二つの条件をまとめると、高い標本化周波数での低域通過の遮断周波数は $\pi / \max(L, M)$、直流利得は $L$ である。
+これは入力と出力の Nyquist 周波数のうち低い方に当たる。
+
+## 多相分解と計算量
+
+`PolyphasePlan` は、入力 $x$ を $L$ 倍に補間し、高い標本化周波数の係数 $h[0], \dots, h[K-1]$ で畳み込み、$M$ 個ごとに残す。
+
+$$
+v[t] = \sum_{i} h[i]\, x\Big[\frac{t - i}{L}\Big], \qquad y[j] = v[t_0 + jM]
+$$
+
+和は $(t - i)/L$ が記録の添字（整数）になる $i$ だけを取り、時刻原点 $t_0$ は後の節の `ResampleAlignment` で決まる。
+0 を挿入した標本との積は 0 なので、$v[t]$ に効く係数は $i \equiv t \pmod L$ のものだけである。
+係数を $L$ 本の部分列 $h_p[k] = h[p + kL]$（$p = 0, \dots, L-1$）に分けると、各出力は一本の部分列と入力の内積になる。
+この分け方が多相分解で、部分列を多相成分と呼ぶ。
+多相の形は残す出力だけを計算するので、出力 1 標本あたりの積は約 $K/L$ 回で済み、0 との積も捨てる出力も計算しない。
+$L = M = 1$ では通常の因果的な FIR フィルタになる。
+
+各出力は $K/L$ 個程度の積の和なので、成分ごとの誤差は直接和の畳み込みと同じ $\gamma_{2m+8}$ の上界（[直接和と FFT の選択](oxref:signal-convolution-method)）に従う。
+リサンプリングの誤差の大部分は丸めではなく、有限長のフィルタが理想的な低域通過からずれることによる。
+
+## 既定の低域通過フィルタ
+
+`PolyphasePlan::rational_default(up, down, alignment)` は、まず比を最大公約数で約分し、約分した $L$、$M$ について次の低域通過を窓関数法で設計する。
+
+- 係数の数は $K = 2 \cdot 10 \max(L, M) + 1$ で、奇数長の対称（線形位相）の FIR である。
+- ウインドウは Kaiser ウインドウで、形の母数は $\beta = 5$ に固定されている。
+- 遮断周波数は高い標本化周波数の Nyquist 周波数の $1/\max(L, M)$ 倍で、直流利得は $L$ である。
+- 約分した比が $1/1$ なら、係数 $[1]$ の恒等フィルタになる。
+
+窓関数法の設計では、通過域と阻止域の誤差の最大値 $\delta$ がほぼ等しい。
+Kaiser の経験式は、$\beta$ と阻止域の減衰量 $A = -20 \log_{10} \delta$ [dB] を
+
+$$
+\beta = 0.1102\,(A - 8.7) \quad (A > 50), \qquad K - 1 \approx \frac{A - 7.95}{2.285\, \Delta\omega}
+$$
+
+で結ぶ。
+$\Delta\omega$ は高い標本化周波数での遷移帯の幅（rad/標本）である。
+$\beta = 5$ からは $A \approx 54$ dB、$\delta \approx 2 \times 10^{-3}$ が得られる。
+係数の数が $\max(L, M)$ に比例するので、遷移帯の幅は遮断周波数のおよそ 3 割で、比によらない。
+入力の Nyquist 周波数の近くの成分は遷移帯に入り、通過域の平坦さを保てない。
+もっと急な遮断や大きい減衰量が要るときは、`design_fir_window` などで設計した係数を `PolyphasePlan::rational` に渡す。
+
+組み立てたリサンプリングの振幅の利得は、入力の周波数 $\omega$ に対して $\lvert H(e^{i\omega/L}) \rvert / L$ である。
+間引きで折り返す成分も折り返した先の周波数でこの利得を持つ。
+
+次のセルは比 $L/M$ を選び、入力の Nyquist 周波数に対する比 $f$ の正弦波を `resample` で変換して、出力の振幅を測る。
+出力の両端の 50 標本を除き、折り返した後の周波数の正弦波を最小二乗で当てはめた振幅を、入力の振幅 1 に対する測った利得とする。
+独立な検算として、`PolyphasePlan::rational_default` の係数の DTFT から $\lvert H \rvert / L$ を直接計算し、破線で重ねる。
+表は遮断周波数の 0.8 倍以下の通過域と 1.2 倍以上の阻止域について、利得の 1 からのずれと最大の利得を示す。
+
+```rust
+//| id: signal-resampling-gain-curve
+//| ref: signal-resampling-gain-curve
+//| title: 既定の多相フィルタの利得を正弦波で測り係数の DTFT と比べる
+//| run: reactive
+//| crates: [scioxide-core, scioxide-signal]
+//| inputs:
+//|   ratio: {"type":"select","label":"比 L/M","description":"約分した比で係数の数と遮断周波数が決まる。","options":["3/2","2/3","5/4","4/5"],"value":"2/3"}
+//| cases:
+//|   - {"id":"upsample","label":"L/M = 3/2","description":"遮断周波数が入力の Nyquist 周波数に一致し、阻止域の行は空になる。","inputs":{"ratio":"3/2"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"bands","path":"/rows/0/0","equals":61}
+//|       - {"artifact":"bands","path":"/rows/0/2","range":{"max":5e-3}}
+//|       - {"artifact":"bands","path":"/rows/0/3","range":{"max":5e-3}}
+//|   - case: upsample
+//|     expect:
+//|       - {"artifact":"bands","path":"/rows/0/0","equals":61}
+//|       - {"artifact":"bands","path":"/rows/0/3","equals":null}
+use scioxide_core::RealScalar;
+use scioxide_signal::{PolyphasePlan, ResampleAlignment, resample};
+
+let (up, down) = match ratio.as_str() {
+    "3/2" => (3_usize, 2_usize),
+    "2/3" => (2, 3),
+    "5/4" => (5, 4),
+    _ => (4, 5),
+};
+let taps = PolyphasePlan::<f64>::rational_default(up, down, ResampleAlignment::Centered)
+    .map_err(|e| e.to_string())?
+    .coefficients()
+    .to_vec();
+// 遮断周波数（入力の Nyquist 周波数を 1 とする）
+let cutoff = up as f64 / up.max(down) as f64;
+// 周波数 g [周期/出力標本] の正弦波を最小二乗で当てはめた振幅（f64 の cos・sin は基底の計算）
+let amplitude = |values: &[f64], g: f64| {
+    let (mut cc, mut cs, mut ss, mut yc, mut ys) = (0.0, 0.0, 0.0, 0.0, 0.0);
+    for (j, &y) in values.iter().enumerate() {
+        let (s, c) = (core::f64::consts::TAU * g * j as f64).sin_cos();
+        (cc, cs, ss) = (cc + c * c, cs + c * s, ss + s * s);
+        (yc, ys) = (yc + y * c, ys + y * s);
+    }
+    let det = cc * ss - cs * cs;
+    let (a, b) = ((yc * ss - ys * cs) / det, (ys * cc - yc * cs) / det);
+    (a * a + b * b).sqrt()
+};
+let mut measured = Vec::new();
+let mut theory = Vec::new();
+for i in 0..60 {
+    let f = (i as f64 + 0.5) / 60.0;
+    let tone: Vec<f64> = (0..600)
+        .map(|k| RealScalar::sin(core::f64::consts::PI * f * k as f64))
+        .collect();
+    let output = resample(&tone, up, down).map_err(|e| e.to_string())?;
+    // 出力での周波数は (f/2)(M/L) 周期/標本で、間引きで [0, 1/2] に折り返す
+    let folded = (0.5 * f * down as f64 / up as f64).fract();
+    let interior = &output[50..output.len() - 50];
+    measured.push([f, amplitude(interior, folded.min(1.0 - folded))]);
+    // 独立な検算: 係数の DTFT |H(e^{iθ})| / L、θ = π f / L（f64 の cos・sin は参照値）
+    let theta = core::f64::consts::PI * f / up as f64;
+    let (re, im) = taps
+        .iter()
+        .enumerate()
+        .fold((0.0, 0.0), |(re, im), (n, h)| {
+            (
+                re + h * (theta * n as f64).cos(),
+                im - h * (theta * n as f64).sin(),
+            )
+        });
+    theory.push([f, (re * re + im * im).sqrt() / up as f64]);
+}
+let pass = measured
+    .iter()
+    .filter(|p| p[0] <= 0.8 * cutoff)
+    .fold(0.0_f64, |acc, p| acc.max((p[1] - 1.0).abs()));
+let stop = measured
+    .iter()
+    .filter(|p| p[0] >= 1.2 * cutoff)
+    .map(|p| p[1])
+    .fold(None, |acc: Option<f64>, g| {
+        Some(acc.map_or(g, |a| a.max(g)))
+    });
+let model = measured
+    .iter()
+    .zip(&theory)
+    .fold(0.0_f64, |acc, (m, t)| acc.max((m[1] - t[1]).abs()));
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "係数の数 K [-]", "type": "integer" },
+    { "key": "1", "label": "遮断周波数 [入力の Nyquist]", "type": "number" },
+    { "key": "2", "label": "通過域の |利得 − 1| の最大 [-]", "type": "number", "format": sci2 },
+    { "key": "3", "label": "阻止域の利得の最大 [-]", "type": "number", "format": sci2, "nullText": "範囲外" },
+    { "key": "4", "label": "測定と DTFT の差の最大 [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    columns,
+    vec![(taps.len(), cutoff, pass, stop, model)],
+    metadata = serde_json::json!({ "id": "bands" })
+);
+emit_line_chart!(
+    &vec![
+        serde_json::json!({
+            "name": "resample の測定値",
+            "points": measured,
+            "style": { "symbol": "circle" }
+        }),
+        serde_json::json!({
+            "name": "|H| / L（係数の DTFT）",
+            "points": theory,
+            "style": { "lineType": "dashed", "showSymbol": false }
+        }),
+    ],
+    options = &serde_json::json!({
+        "xLabel": "入力の周波数 f [入力の Nyquist 周波数]",
+        "yLabel": "振幅の利得 [-]",
+        "yType": "log",
+        "xMin": 0.0,
+        "xMax": 1.0,
+        "annotations": [
+            { "kind": "line", "axis": "x", "value": cutoff, "label": "遮断周波数" }
+        ]
+    })
+);
+```
+
+既定の $L/M = 2/3$ では、係数は $20 \cdot 3 + 1 = 61$ 個で、遮断周波数は入力の Nyquist 周波数の $2/3$（出力の Nyquist 周波数）にある。
+通過域の利得の 1 からのずれは最大 $1.7 \times 10^{-3}$、阻止域の利得は最大 $1.4 \times 10^{-3}$ で、Kaiser の経験式の $\delta \approx 2 \times 10^{-3}$ と同程度である。
+測った利得と係数の DTFT の差は最大 $3.4 \times 10^{-5}$ で、図の点は破線に重なる。
+図では遮断周波数の前後でおよそ $0.55$ から $0.78$ まで利得が下がり、この遷移帯の成分は弱まりながら低い周波数へ折り返す。
+$4/5$ では係数が 101 個に増えるが、遷移帯の幅は遮断周波数に対して同じ割合で、通過域のずれ $1.7 \times 10^{-3}$ と阻止域の利得 $1.0 \times 10^{-3}$ もほぼ変わらない。
+$3/2$ では遮断周波数が入力の Nyquist 周波数に一致するので阻止域の行は空になり、測定と DTFT の差は最大 $3.2 \times 10^{-2}$ に増える。
+入力の Nyquist 周波数の近くでは、補間でできる像（周波数 $2 - f$）も遷移帯を通って出力に残り、近い周波数の二つの成分が重なるからである。
+
+## 時刻原点と出力長
+
+有限の記録では、出力の最初の標本がどの時刻に当たるかと、何個の出力を返すかを決める必要がある。
+`ResampleAlignment` はこの二つを決め、$n$ 標本の記録、$K$ 個の係数、比 $L/M$ について次のように定める。
+
+| `ResampleAlignment` | 最初の出力（高い標本化周波数の添字） | 出力の数 | 条件 |
+|---|---|---|---|
+| `Causal` | $t_0$ = 間引きの位相 `phase` | FIR の末尾 $(n-1)L + K - 1$ までの $\lfloor ((n-1)L + K - 1 - t_0)/M \rfloor + 1$ 個 | なし |
+| `Centered` | $t_0 = (K-1)/2$（対称なフィルタの中心） | $\lceil nL/M \rceil$ 個 | 奇数長で厳密に対称な係数、`phase` は 0 |
+
+`Causal` は通常の因果的なフィルタと同じで、出力は線形位相の遅れ $(K-1)/2$（高い標本化周波数の標本）だけ入力より遅れ、FIR の末尾まで続く。
+`Centered` はフィルタの中心を時刻原点に移すので遅れが 0 になり、出力 $j$ は入力の時刻 $jM/L$（入力の標本間隔を単位とする）に当たる。
+空の記録の出力は 0 個である。
+`Centered` に偶数長か非対称な係数を渡すと、準備の時点で `InvalidInput` になる。
+
+ワンショット呼び出しの `resample(input, up, down)` は、`rational_default(up, down, ResampleAlignment::Centered)` の Plan を作って記録全体を変換する。
+`up == down` なら記録をそのまま返し、`up` か `down` が 0 なら `InvalidInput`（`OutOfRange`）、非有限の入力は `NonFinite`、出力の桁あふれは `NumericalInstability` になる。
+同じ比で何度も変換するときは Plan を一度作って再利用し、他の係数や位置合わせには `PolyphasePlan` のコンストラクターを使う。
+
+| コンストラクター | 係数 | 比の約分 | 主な用途 |
+|---|---|---|---|
+| `new(taps, up, down, phase, alignment)` | 呼び出し側 | しない | 間引きの位相を選ぶ場合 |
+| `fir(taps)` | 呼び出し側 | 比は 1/1 | 長さ $n + K - 1$ の通常の FIR |
+| `rational(taps, up, down, alignment)` | 呼び出し側 | 最大公約数で約分 | 自分で設計した低域通過 |
+| `rational_default(up, down, alignment)` | Kaiser ウインドウ $\beta = 5$ | 最大公約数で約分 | 標準的な変換 |
+
+Plan は係数を所有し、`coefficients()` は直流利得 $L$ を含む高い標本化周波数の係数を返す。
+`output_len(n)` は記録の長さ $n$ に対する出力の数を返す。
+所有値を返す API の `resample(input)` は出力と作業領域を確保し、出力先を指定する API の `resample_into(input, output, workspace, cx)` は `output` の先頭に `output_len(n)` 個を書く。
+作業領域は `workspace(SignalLayout::Contiguous(n))` で確保する。
+配列の一つの軸に沿った各レーンの変換は `resample_axis_into(input, axis, output, workspace, cx)` で行い、作業領域の要求は `SignalLayout::Axis { shape, axis }` で渡す。
+
+## 逐次のリサンプリング
+
+`plan.stream()` が返す `PolyphaseStream` は、Plan を借用し、後の出力に要る直近の $\lfloor (K-1)/L \rfloor + 1$ 個の入力を状態として所有する。
+`process_into(input, chunk, output, workspace, cx)` は、それまでの入力で決まる出力をすべて書く。
+`StreamChunk::Final` の呼び出しは、記録の末尾を 0 で延長して決まる残りの出力も書き、ストリームを `reset` まで閉じる。
+すべての呼び出しの出力をつなぐと、記録全体の `resample` の結果に一致する。
+
+`Centered` の出力は、フィルタの中心の後半 $(K-1)/2$ 個の係数が掛かる未来の入力を待つ。
+そのため、逐次処理では最初の出力が $(K-1)/(2L)$ 入力標本ほど遅れて現れ、その分は `Final` の呼び出しで書かれる。
+書く数は `output_len(input_len, chunk)` で事前に分かり、作業領域は `stream.workspace(max_input_len)` で一度だけ確保する。
+呼び出しはチャンクを不可分に処理し、失敗した呼び出しは状態と出力を変えない。
+
+次のセルはゆっくり変わる記録（$n$ 標本）を比 3/2 で `Causal` と `Centered` の二つの Plan により変換し、出力の数と時刻のずれを比べる。
+図の横軸は入力の標本間隔を単位とする時刻で、どちらの出力 $j$ も時刻 $2j/3$ に置いて入力と重ねる。
+さらに `Centered` の Plan のストリームに長さ 7 のチャンクで記録を流し、各呼び出しの出力数と通し番号を表にして、つないだ出力を一回の `resample` と比べる。
+
+```rust
+//| id: signal-resampling-alignment-stream
+//| ref: signal-resampling-alignment-stream
+//| title: 時刻原点の違いと逐次のリサンプリングを確かめる
+//| run: reactive
+//| crates: [scioxide-core, scioxide-signal]
+//| inputs:
+//|   record_length: {"type":"range","label":"記録の長さ n [標本]","description":"出力の数の式に入る記録の長さ。","min":20,"max":80,"step":1,"value":50}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"lengths","path":"/rows/0/1","equals":104}
+//|       - {"artifact":"lengths","path":"/rows/1/1","equals":75}
+//|       - {"artifact":"stream","path":"/rows/0/2","equals":0}
+use scioxide_core::{ExecutionContext, RealScalar};
+use scioxide_signal::{PolyphasePlan, ResampleAlignment, StreamChunk};
+
+let n = record_length.round() as usize;
+let record: Vec<f64> = (0..n)
+    .map(|k| RealScalar::sin(0.15 * k as f64) + 0.3 * RealScalar::cos(0.05 * k as f64))
+    .collect();
+let causal = PolyphasePlan::<f64>::rational_default(3, 2, ResampleAlignment::Causal)
+    .map_err(|e| e.to_string())?;
+let centered = PolyphasePlan::<f64>::rational_default(3, 2, ResampleAlignment::Centered)
+    .map_err(|e| e.to_string())?;
+let k = centered.coefficients().len();
+let late = causal.resample(&record).map_err(|e| e.to_string())?;
+let aligned = centered.resample(&record).map_err(|e| e.to_string())?;
+let lengths = vec![
+    ("Causal", late.len(), ((n - 1) * 3 + k - 1) / 2 + 1),
+    ("Centered", aligned.len(), (3 * n).div_ceil(2)),
+];
+let columns = serde_json::json!([
+    { "key": "0", "label": "位置合わせ" },
+    { "key": "1", "label": "出力の数 [標本]", "type": "integer" },
+    { "key": "2", "label": "表の式による数 [標本]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    lengths,
+    metadata = serde_json::json!({ "id": "lengths" })
+);
+
+// Centered の Plan のストリームに長さ 7 のチャンクで流す
+let mut stream = centered.stream().map_err(|e| e.to_string())?;
+let mut workspace = stream.workspace(7).map_err(|e| e.to_string())?;
+let mut streamed = Vec::new();
+let mut calls = Vec::new();
+for (index, chunk) in record.chunks(7).enumerate() {
+    let kind = if (index + 1) * 7 >= n {
+        StreamChunk::Final
+    } else {
+        StreamChunk::Partial
+    };
+    let mut output = vec![
+        0.0_f64;
+        stream
+            .output_len(chunk.len(), kind)
+            .map_err(|e| e.to_string())?
+    ];
+    let progress = stream
+        .process_into(
+            chunk,
+            kind,
+            &mut output,
+            &mut workspace,
+            ExecutionContext::sequential(),
+        )
+        .map_err(|e| e.to_string())?;
+    calls.push((
+        format!("{kind:?}"),
+        progress.consumed(),
+        progress.produced(),
+        progress.first_output_index(),
+    ));
+    streamed.extend_from_slice(&output);
+}
+let difference = streamed
+    .iter()
+    .zip(&aligned)
+    .fold(0.0_f64, |acc, (a, b)| acc.max((a - b).abs()));
+let columns = serde_json::json!([
+    { "key": "0", "label": "チャンクの種類" },
+    { "key": "1", "label": "消費 [標本]", "type": "integer" },
+    { "key": "2", "label": "出力 [標本]", "type": "integer" },
+    { "key": "3", "label": "最初の出力の通し番号 [-]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    calls,
+    metadata = serde_json::json!({ "id": "stream" })
+);
+emit_text!(format!(
+    "つないだ出力 {} 標本、一回の resample との最大差 {difference:.1e}",
+    streamed.len()
+));
+
+let at = |values: &[f64], scale: f64| {
+    values
+        .iter()
+        .enumerate()
+        .map(|(j, &v)| [scale * j as f64, v])
+        .collect::<Vec<_>>()
+};
+emit_line_chart!(
+    &vec![
+        serde_json::json!({
+            "name": "入力 x[k]",
+            "points": at(&record, 1.0),
+            "style": { "symbol": "circle" }
+        }),
+        serde_json::json!({ "name": "Centered の出力", "points": at(&aligned, 2.0 / 3.0) }),
+        serde_json::json!({ "name": "Causal の出力", "points": at(&late, 2.0 / 3.0) }),
+    ],
+    options = &serde_json::json!({
+        "xLabel": "時刻 [入力の標本間隔]",
+        "yLabel": "値 [-]"
+    })
+);
+```
+
+既定の $n = 50$ では、係数は $K = 61$ 個で、`Causal` は $\lfloor (49 \cdot 3 + 60)/2 \rfloor + 1 = 104$ 個、`Centered` は $\lceil 150/2 \rceil = 75$ 個の出力を返し、表の式と一致する。
+図では `Centered` の出力が入力の曲線に重なり、`Causal` の出力は $(K-1)/(2L) = 10$ 入力標本だけ右にずれ、先頭と末尾に 0 へ向かう過渡部分を持つ。
+ストリームの最初の呼び出し（7 標本）は何も書かず、14 標本を受け取った二回目で初めて 6 個を書く。
+その後は 1 回あたり 10 個か 11 個（$7 \times 3/2 = 10.5$）を書き、最後の 1 標本を渡す `Final` が残りの 16 個を書く。
+つないだ 75 個の出力は一回の `resample` と差 0 で一致する。
+
+## 周期的な記録の Fourier リサンプリング
+
+記録 $x[0], \dots, x[n-1]$ を、帯域の限られた周期 $n$ の信号の一周期とみなすと、DFT $X[k]$ から三角多項式による補間が一意に決まる。
+`resample_periodic(input, m)` は、この三角多項式を $m$ 個の点 $t_j = jn/m$（入力の標本間隔を単位とする）で評価する。
+
+$$
+y[j] = \frac{1}{n} \sum_{\lvert k \rvert < \min(n, m)/2} X[k]\, e^{2\pi i jk/m}, \qquad j = 0, \dots, m-1
+$$
+
+$m > n$ では DFT に 0 を詰めて長くし、補間は厳密な三角補間になる。
+$m < n$ では $\lvert k \rvert \ge m/2$ の成分を捨て、周期信号に理想的な低域通過を掛けたことになる。
+$\min(n, m)$ が偶数のときは、短い方の長さの Nyquist のビンを次のように扱う。
+$n < m$ では $X[n/2]$ を $Y[n/2]$ と $Y[m - n/2]$ に半分ずつ分け、$m < n$ では $Y[m/2] = X[m/2] + X[n - m/2]$ とする。
+この規則により、実数の入力からは実数の出力が得られる。
+計算量は FFT 二回分の $O(n \log n + m \log m)$ で、誤差は FFT の畳み込みと同じくノルムに比例する。
+
+記録が周期的でない場合、周期延長は端で不連続になる。
+その不連続は全周波数に広がる成分を持つので、三角補間は端の近くで振動する（Gibbs 現象）。
+多相 FIR は記録の外を 0 とみなすので、端の近くで別の誤差を持つ。
+どちらの方法も、端から離れた内部では誤差が小さくなる。
+
+`FourierResamplePlan::new(shape, axis, m, SignalExecutionOptions::new())` は、配列の一つの軸に沿って各レーンを $n$ から $m$ 標本へリサンプリングする Plan で、他の軸は独立なバッチである。
+FFT の Plan を準備時に作り、`resample_into(input, output, workspace, cx)` は形 `output_shape()` の出力に書く。
+作業領域は `workspace(())` で確保する。
+`axis` が階数以上の場合、その軸の長さが 0 の場合、$m = 0$ の場合は `InvalidInput` になる。
+`resample_periodic` は空の入力と $m = 0$ に `InvalidInput`（`Empty`）、非有限の入力に `NonFinite` を返す。
+
+次のセルは周期 $n$ の記録 $x[k] = \cos(2\pi k/n) + 0.5\sin(2\pi \cdot 3k/n) + 0.25\cos(2\pi \cdot 7k/n)$ を $m$ 点へリサンプリングする。
+参照値は、同じ三角級数のうち $m/2$ 以下の高調波だけを残した式を $t_j$ で評価した値で、$m < 14$ では第 7 高調波を、$m < 6$ では第 3 高調波も除く。
+`resample_periodic` と、記録とその符号を反転した列を二つのレーンに持つ `FourierResamplePlan` の結果を比べる。
+比 $m/n$ の多相 FIR（`resample`）も同じ参照値と比べ、時刻が記録の中央の半分 $[n/4, 3n/4]$ にある出力と全体の誤差を示す。
+傾斜を足すと記録は周期的でなくなり、参照値には傾斜を含む連続な関数の値を使う。
+
+```rust
+//| id: signal-fourier-resampling
+//| ref: signal-fourier-resampling
+//| title: 周期的な記録を Fourier リサンプリングと多相 FIR で比べる
+//| run: reactive
+//| crates: [scioxide-core, scioxide-signal]
+//| inputs:
+//|   input_length: {"type":"range","label":"入力の長さ n [標本]","description":"記録の一周期の標本数。","min":16,"max":64,"step":8,"value":32}
+//|   output_length: {"type":"range","label":"出力の長さ m [標本]","description":"n より大きければ補間、小さければ帯域の切り詰め。","min":4,"max":96,"step":2,"value":48}
+//|   ramp: {"type":"checkbox","label":"傾斜を足す（周期的でない記録）","description":"記録に 0.05 k の傾斜を加える。","value":false}
+//| cases:
+//|   - {"id":"truncate","label":"m = 10","description":"第 7 高調波を捨て、残りの成分は厳密に保つ。","inputs":{"output_length":10}}
+//|   - {"id":"ramp","label":"傾斜あり","description":"周期延長の不連続で端の誤差が増える。","inputs":{"ramp":true}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"errors","path":"/rows/0/2","range":{"max":1e-13}}
+//|       - {"artifact":"errors","path":"/rows/1/2","range":{"max":1e-13}}
+//|   - case: truncate
+//|     expect:
+//|       - {"artifact":"errors","path":"/rows/0/2","range":{"max":1e-13}}
+//|   - case: ramp
+//|     expect:
+//|       - {"artifact":"errors","path":"/rows/0/2","range":{"min":0.1}}
+use scioxide_core::{ExecutionContext, NdView, NdViewMut, StridedLayout};
+use scioxide_signal::{FourierResamplePlan, SignalExecutionOptions, resample, resample_periodic};
+
+let (n, m) = (
+    input_length.round() as usize,
+    output_length.round() as usize,
+);
+let slope = if ramp { 0.05 } else { 0.0 };
+// 高調波 (次数, 振幅, 余弦なら true)。f64 の cos・sin は参照値の計算に限る
+let harmonics = [(1.0, 1.0, true), (3.0, 0.5, false), (7.0, 0.25, true)];
+let value = |t: f64, limit: f64| {
+    harmonics
+        .iter()
+        .filter(|(h, _, _)| *h <= limit)
+        .map(|&(h, a, cosine)| {
+            let phase = core::f64::consts::TAU * h * t / n as f64;
+            if cosine {
+                a * phase.cos()
+            } else {
+                a * phase.sin()
+            }
+        })
+        .sum::<f64>()
+        + slope * t
+};
+let record: Vec<f64> = (0..n).map(|k| value(k as f64, f64::INFINITY)).collect();
+// 参照値: t_j = j n / m で、m/2 以下の高調波だけを残した式
+let reference: Vec<f64> = (0..m)
+    .map(|j| value(j as f64 * n as f64 / m as f64, m as f64 / 2.0))
+    .collect();
+
+let periodic = resample_periodic(&record, m).map_err(|e| e.to_string())?;
+// 二つのレーン（記録と符号を反転した列）を軸 1 に沿って変換する
+let lanes: Vec<f64> = record
+    .iter()
+    .copied()
+    .chain(record.iter().map(|v| -v))
+    .collect();
+let (in_shape, in_strides, out_shape, out_strides) = ([2, n], [n, 1], [2, m], [m, 1]);
+let plan = FourierResamplePlan::<f64>::new(&in_shape, 1, m, SignalExecutionOptions::new())
+    .map_err(|e| e.to_string())?;
+let mut workspace = plan.workspace(()).map_err(|e| e.to_string())?;
+let mut batch = vec![0.0_f64; 2 * m];
+plan.resample_into(
+    NdView::new(
+        &lanes,
+        StridedLayout::new(&in_shape, &in_strides).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?,
+    NdViewMut::new(
+        &mut batch,
+        StridedLayout::new(&out_shape, &out_strides).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?,
+    &mut workspace,
+    ExecutionContext::sequential(),
+)
+.map_err(|e| e.to_string())?;
+let polyphase = resample(&record, m, n).map_err(|e| e.to_string())?;
+
+let errors = |values: &[f64], sign: f64| {
+    // 内部は時刻 t_j が記録の中央の半分 [n/4, 3n/4] にある出力
+    let (mut inner, mut all) = (0.0_f64, 0.0_f64);
+    for (j, (v, r)) in values.iter().zip(&reference).enumerate() {
+        let error = (v - sign * r).abs();
+        let t = j as f64 * n as f64 / m as f64;
+        if 4.0 * t >= n as f64 && 4.0 * t <= 3.0 * n as f64 {
+            inner = inner.max(error);
+        }
+        all = all.max(error);
+    }
+    (inner, all)
+};
+let rows = vec![
+    ("resample_periodic", errors(&periodic, 1.0)),
+    (
+        "FourierResamplePlan（レーン 2、符号反転）",
+        errors(&batch[m..], -1.0),
+    ),
+    ("resample（多相 FIR）", errors(&polyphase, 1.0)),
+]
+.into_iter()
+.map(|(name, (inner, all))| (name, inner, all))
+.collect::<Vec<_>>();
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "方法" },
+    { "key": "1", "label": "中央の半分の最大誤差 [-]", "type": "number", "format": sci2 },
+    { "key": "2", "label": "全体の最大誤差 [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "errors" })
+);
+
+let curve: Vec<[f64; 2]> = (0..=400)
+    .map(|i| {
+        let t = n as f64 * i as f64 / 400.0;
+        [t, value(t, m as f64 / 2.0)]
+    })
+    .collect();
+let points = |values: &[f64]| {
+    values
+        .iter()
+        .enumerate()
+        .map(|(j, &v)| [j as f64 * n as f64 / m as f64, v])
+        .collect::<Vec<_>>()
+};
+emit_line_chart!(
+    &vec![
+        serde_json::json!({
+            "name": "参照の式",
+            "points": curve,
+            "style": { "lineType": "dashed", "showSymbol": false }
+        }),
+        serde_json::json!({
+            "name": "resample_periodic",
+            "points": points(&periodic),
+            "style": { "symbol": "circle" }
+        }),
+        serde_json::json!({
+            "name": "resample（多相 FIR）",
+            "points": points(&polyphase),
+            "style": { "symbol": "triangle" }
+        }),
+    ],
+    options = &serde_json::json!({
+        "xLabel": "時刻 t [入力の標本間隔]",
+        "yLabel": "値 [-]",
+        "xMin": 0.0,
+        "xMax": n as f64
+    })
+);
+```
+
+既定の $n = 32$、$m = 48$ では、`resample_periodic` の誤差は全体で $1.3 \times 10^{-15}$ で、丸めの範囲の三角補間になる。
+`FourierResamplePlan` の 2 本目のレーンも同じ誤差で、レーンが独立に変換されることを確かめられる。
+同じ比 3/2 の多相 FIR は、中央の半分で $2.8 \times 10^{-3}$、端を含めると $0.37$ の誤差を持つ。
+記録の外を 0 とみなすので、端の出力が 0 の側へ引かれるからである。
+$m = 10$ では第 7 高調波を捨てた参照値に対して $4.4 \times 10^{-16}$ の誤差で一致し、帯域の切り詰めが理想的な低域通過であることが分かる。
+傾斜を足すと周期延長が端で不連続になり、`resample_periodic` の誤差は中央の半分で $2.1 \times 10^{-2}$、全体で $0.49$ に増え、多相 FIR（中央の半分で $6.6 \times 10^{-3}$）より大きくなる。
+
+## 二つの方法の選び方
+
+多相 FIR は記録の外を 0 とみなし、任意の長さの記録と終わりのない入力を扱える。
+誤差はフィルタの通過域のリプルと遷移帯で決まり、既定の設計では通過域で約 $2 \times 10^{-3}$、入力の Nyquist 周波数の近くでは大きく減衰する。
+計算量は出力 1 標本あたり $K/L$ 回の積で、比が $L/M$ でも記録の長さに比例する。
+
+Fourier リサンプリングは記録全体を一周期とみなし、帯域の限られた周期信号では丸めの範囲で厳密である。
+任意の出力の長さ $m$ を指定でき、比が既約分数で大きな $L$、$M$ になる場合（$n = 1000$ から $m = 1001$ など）も計算コストは FFT の長さだけで決まる。
+一方で、周期的でない記録では端に Gibbs 現象が現れ、逐次の入力には使えない。
+
+| 条件 | 選ぶ方法 |
+|---|---|
+| 周期的な記録（一周期の波形、角度の格子） | `resample_periodic`、`FourierResamplePlan` |
+| 音声・計測などの非周期の記録、比が小さい整数比 | `resample`、`PolyphasePlan::rational_default` |
+| 減衰量や遷移帯を指定したい | `design_fir_window` などで係数を設計し `PolyphasePlan::rational` |
+| 終わりのない入力 | `PolyphasePlan::stream` |
+| 配列の一つの軸 | `PolyphasePlan::resample_axis_into`、`FourierResamplePlan` |
+
+## まとめ
+
+有理比 $L/M$ の変換は補間・低域通過・間引きの三段で、低域通過の遮断周波数は入力と出力の Nyquist 周波数の低い方、直流利得は $L$ である。
+`resample` はこの低域通過を Kaiser ウインドウ $\beta = 5$ の $20\max(L, M) + 1$ 個の係数で近似するので、通過域の誤差は $10^{-3}$ 程度で、Nyquist 周波数の近くの成分は遷移帯で弱まる。
+`Centered` は遅れのない出力 $\lceil nL/M \rceil$ 個、`Causal` は FIR の末尾までの出力を返すので、時刻の対応を位置合わせで確かめてから使う。
+逐次の入力には `PolyphaseStream` を使い、最後に `StreamChunk::Final` を渡して末尾の出力を書き出す。
+周期的な記録では `resample_periodic` が丸めの範囲で厳密な三角補間を与え、周期的でない記録では端の誤差に注意する。
+
+44.1 kHz と 48 kHz の変換で通過域の誤差と折り返しの抑圧量を測る例は[44.1 kHz と 48 kHz の変換とエイリアシング](../../examples/audio-sample-rate-conversion/)にある。
+窓関数法による低域通過の設計と Kaiser ウインドウの母数は[FIR の設計と最小位相](../fir-design-and-minimum-phase/)で詳しく扱う。

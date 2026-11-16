@@ -1,0 +1,387 @@
+---
+title: "Operator protocols and closure operators"
+description: "Protocols for matrix-free linear operators, adjoints, block application, preconditioning, and residual maps; OperatorContext and dense kernel borrowing; staged ClosureOperator and ClosurePreconditioner output and adjoint consistency checks."
+sidebar:
+  order: 360
+references:
+  core-operator-protocols: "shared-operator-protocol-rules"
+  core-operator-context: "solve-accounting-and-processor-dispatch"
+  core-closure-operators: "closure-based-operators-and-preconditioners"
+---
+
+In PDE discretization and large optimization, computing only products $y = Ax$ without storing coefficient matrix $A$ densely can reduce storage and work.
+`scioxide-core` defines shared matrix-free protocols as traits on which higher-level iterative solver crates are built.
+Operators and preconditioners too small to warrant a dedicated type can be constructed from closures.
+[Sparse structures and column coloring](../sparse-structure-and-coloring/) covers nonzero structures `StructuralPattern` and colorings `ColoringSchedule` for fewer sparse Jacobian evaluations.
+
+## Shared operator protocol rules
+
+Krylov subspace and eigenvalue methods use vector actions without reading matrix entries.
+Operators can therefore be implemented by dense matrices, sparse matrices, factorizations, or closures.
+All operator traits are object-safe and can be passed as `&dyn LinearOperator<S>`, for example.
+All share three rules.
+
+1. Query the exact scalar workspace requirement for one application through `apply_workspace_len()` or similar methods.
+   Callers allocate it in advance, avoiding allocation inside iteration.
+2. Implementations validate all lengths before modifying output, returning `DimensionMismatch` on mismatch.
+3. Methods with `_scoped`, such as `apply_into_scoped`, `apply_adjoint_into_scoped`, and `precondition_into_scoped`, receive a context for one application.
+   The caller's solver obtains admission and counts the application itself through `record_provider` (`EvaluationRole::LinearOperator` for operators, `EvaluationRole::Preconditioner` for preconditioners).
+   Implementations count only additional nested work, such as residual checks.
+   Default implementations delegate to methods without `_scoped`.
+
+| Trait | Main methods | Meaning |
+|---|---|---|
+| `LinearOperator<S>` | `rows`, `cols`, `apply_workspace_len`, `apply_into`, `apply_into_scoped`, `apply_finite_into_scoped` | $y = A x$. Input length `cols()`, output length `rows()` |
+| `AdjointOperator<S>` | `apply_adjoint_workspace_len`, `apply_adjoint_into`, `apply_adjoint_into_scoped`, `apply_adjoint_finite_into_scoped` | $y = A^{\mathsf{H}} x$ (conjugate transpose, or transpose $A^{\mathsf{T}}$ for reals). Input length `rows()`, output length `cols()` |
+| `BlockOperator<S>` | `apply_block_workspace_len`, `apply_block_into` | Block application $Y = A X$ to column-major right-hand sides |
+| `Preconditioner<S>` | `dimension`, `precondition_workspace_len`, `precondition_into`, `precondition_into_scoped`, `precondition_block_workspace_len`, `precondition_block_into` | $y = M^{-1} x$. Input and output length `dimension()` |
+| `ResidualOperator<T>` | `input_dimension`, `output_dimension`, `residual_workspace_len`, `residual_into`, `residual_into_scoped` | Nonlinear residual map $F(x)$ |
+| `JacobianOperator<T>` | `jvp_workspace_len`, `jvp_into`, `jvp_into_scoped` | Jacobian–vector product $J(x)\,v$ without matrix assembly |
+
+`apply_into_scoped` and `apply_adjoint_into_scoped` return `Invocation<()>`.
+`Invocation::Evaluated` means the product was written, `Invocation::BudgetExhausted` a limit rejected additional nested work, and `Invocation::ExecutionStopped` cancellation or a deadline stopped it.
+`precondition_into_scoped`, `residual_into_scoped`, and `jvp_into_scoped` return no value, reporting errors if nested work fails.
+Residual and Jacobian `_scoped` methods take solve context `SolveContext` directly rather than `OperatorContext`.
+For complex scalars, the Jacobian of `JacobianOperator` must be complex-linear.
+Represent nonholomorphic maps using real and imaginary parts as real coordinates.
+
+Use `apply_finite_into_scoped` when the caller guarantees finite input and absolute real/imaginary component bound `maximum`.
+Implementations may omit input finiteness checks but still validate lengths and `maximum`.
+Here output is temporary solver storage and may be partly modified on numerical failure.
+NaN or infinite `maximum` is rejected as `NonFinite`; negative values as `InvalidInput` (reason `InvalidInputReason::OutOfRange`).
+
+Block `apply_block_into` takes input `BlockVectorView` and output `BlockVectorViewMut` ([Borrowed layouts and affine values](oxref:core-block-vectors)).
+For $m$ rows and $r$ right-hand sides, default workspace contains $m r$ staging entries plus one column's workspace; query length with `apply_block_workspace_len(r)` (zero when $r = 0$).
+Results accumulate in staging and copy to output only after every column succeeds, so failure midway leaves output unchanged.
+Preconditioning's `precondition_block_into` follows the same form.
+
+### Solve accounting and processor dispatch
+
+`OperatorContext::new(&mut solve)` constructs a context borrowing only solve context `SolveContext`.
+Through `Deref` and `DerefMut`, it exposes `SolveContext` accounting methods unchanged.
+`OperatorContext::with_kernels(&mut solve, &kernels)` attaches a dense kernel (`DenseOperatorKernel`) already selected by the caller's library; operators retrieve it through `kernels()`.
+The kernel returns selected processor dispatch (`dispatch()`) and computes vector products through `apply_dense_into` with `DenseOperatorInput` (borrowed storage `data`, shape `shape`, strides `strides`, conjugation `conjugated`, component bound `maximum`).
+It does not recount operator applications.
+An operator applying another operator passes the same accounting and kernel through `reborrow()`.
+Context construction and reborrowing neither allocate nor count work ([Solve lifecycle and computation count management](../solve-lifecycle-and-accounting/) explains accounting).
+scioxide-linalg iterative solvers use this path so inner dense products share caller dispatch.
+
+## Closure-based operators and preconditioners
+
+Construct operators and preconditioners from closures without defining trait-implementing types.
+
+- `ClosureOperator::new(rows, cols, apply)` constructs an `rows × cols` `LinearOperator` from a closure of form `apply(input, output)`.
+  The closure takes `cols` inputs and writes $A \cdot \mathrm{input}$ to `rows` outputs.
+- `with_adjoint(adjoint)` adds a closure taking `rows` inputs and writing $A^{\mathsf{H}} \cdot \mathrm{input}$ to `cols` outputs.
+  The operator then also implements `AdjointOperator` and can support adjoint-based methods or sensitivity calculations.
+- `ClosurePreconditioner::new(dimension, apply)` constructs `Preconditioner` from a closure taking `dimension` inputs and writing $M^{-1} \cdot \mathrm{input}$ to `dimension` outputs.
+
+Every closure has type `Fn(&[S], &mut [S]) -> Result<(), SciOxideError>`.
+Specifying scalar type as in `ClosureOperator::<f64, _>::new(…)` avoids type annotations on closure arguments.
+
+### Staged writes
+
+The closure's `output` is workspace, not caller output.
+Methods such as `apply_into` validate lengths, invoke the closure, and copy workspace into caller output only after success with all components finite.
+
+- Workspace length equals output length.
+  `apply_workspace_len()` returns `rows`, `apply_adjoint_workspace_len()` returns `cols`, and `precondition_workspace_len()` returns `dimension`.
+- Closure errors propagate unchanged; non-finite components produce `NonFinite` (`NonFiniteOrigin::Callback`).
+  Length mismatches produce `DimensionMismatch`.
+  All preserve caller output.
+- Closures needing internal workspace own it through captured `RefCell` or similar storage.
+- `ClosureOperator` also implements `BlockOperator`, allowing the same closure to process multiple right-hand sides through `apply_block_into`.
+
+Staging costs one output-length copy and a finiteness scan, both linear in output length.
+Application allocates no heap storage.
+
+### Adjoint consistency
+
+The closure supplied to `with_adjoint` is not checked to be the adjoint of that supplied to `new`.
+Inconsistent closures do not themselves make application fail.
+The inner-product identity
+
+$$
+\langle w,\, A x \rangle = \langle A^{\mathsf{H}} w,\, x \rangle
+$$
+
+characterizes adjoints, so evaluating both sides with suitable $x$ and $w$ cheaply detects implementation errors.
+Here $\langle u, v \rangle = \sum_i \overline{u_i}\, v_i$.
+Both sides need only agree within rounding error.
+
+The following cell takes the $2 \times 3$ forward difference of three adjacent values, scaled by coefficient $\gamma$, defining the operator
+
+$$
+A = \gamma \begin{pmatrix} -1 & 1 & 0 \\ 0 & -1 & 1 \end{pmatrix}
+$$
+
+and its transpose as closures.
+Inputs are coefficient $\gamma$ (0.5–3) and whether the closure returns NaN.
+Apply $A$ to $x = (1, 4, 9)$ and $A^{\mathsf{T}}$ to $w = (1, -2)$, comparing output with hand-computed references $\gamma\,(3, 5)$ and $\gamma\,(-1, 3, -2)$.
+Initialize $A x$ output with $-1$.
+Selecting “closure returns NaN” makes the $A$ closure write NaN to component 1; `apply_into` returns an error with output still $-1$.
+The first table shows workspace lengths, the `apply_into` result, and both sides of the inner-product identity.
+The left side cannot be computed when `apply_into` fails, so it remains blank.
+
+```rust
+//| id: core-closure-operator-staging
+//| ref: core-closure-operator-staging
+//| title: "Closure operator adjoints and output on failure"
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   gamma: {"type":"range","label":"Coefficient γ [-]","description":"Multiplier of A = γ × forward difference.","min":0.5,"max":3,"step":0.5,"value":1.5}
+//|   inject_nan: {"type":"checkbox","label":"Closure returns NaN","description":"The A closure writes NaN to output component 1.","value":false}
+//| cases:
+//|   - {"id":"non-finite","label":"Return NaN","description":"apply_into fails with NonFinite, leaving output at -1.","inputs":{"inject_nan":true}}
+//|   - {"id":"scaled","label":"γ = 3","description":"Outputs and inner products scale with γ.","inputs":{"gamma":3}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":2}
+//|       - {"artifact":"summary","path":"/rows/0/1","equals":3}
+//|       - {"artifact":"summary","path":"/rows/0/2","equals":"Ok"}
+//|       - {"artifact":"summary","path":"/rows/0/3","approx":{"value":-10.5,"atol":1e-12}}
+//|       - {"artifact":"summary","path":"/rows/0/4","approx":{"value":-10.5,"atol":1e-12}}
+//|       - {"artifact":"forward","path":"/rows/0/1","approx":{"value":4.5,"atol":1e-12}}
+//|       - {"artifact":"forward","path":"/rows/1/1","approx":{"value":7.5,"atol":1e-12}}
+//|       - {"artifact":"adjoint","path":"/rows/1/1","approx":{"value":4.5,"atol":1e-12}}
+//|   - case: non-finite
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/2","equals":"NonFinite"}
+//|       - {"artifact":"summary","path":"/rows/0/3","equals":null}
+//|       - {"artifact":"forward","path":"/rows/0/1","approx":{"value":-1,"atol":1e-12}}
+//|       - {"artifact":"forward","path":"/rows/1/1","approx":{"value":-1,"atol":1e-12}}
+//|       - {"artifact":"adjoint","path":"/rows/2/1","approx":{"value":-3,"atol":1e-12}}
+//|   - case: scaled
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/3","approx":{"value":-21,"atol":1e-12}}
+//|       - {"artifact":"summary","path":"/rows/0/4","approx":{"value":-21,"atol":1e-12}}
+//|       - {"artifact":"forward","path":"/rows/1/1","approx":{"value":15,"atol":1e-12}}
+use scioxide_core::{AdjointOperator, ClosureOperator, SciOxideErrorKind, LinearOperator};
+
+// A = γ [[-1, 1, 0], [0, -1, 1]]. The closure takes (input, output).
+let op = ClosureOperator::<f64, _>::new(2, 3, |x, y| {
+    y[0] = gamma * (x[1] - x[0]);
+    y[1] = if inject_nan {
+        f64::NAN
+    } else {
+        gamma * (x[2] - x[1])
+    };
+    Ok(())
+})
+.with_adjoint(|w, z| {
+    // Aᵀ w = γ (-w₀, w₀ - w₁, w₁).
+    z[0] = -gamma * w[0];
+    z[1] = gamma * (w[0] - w[1]);
+    z[2] = gamma * w[1];
+    Ok(())
+});
+let x = [1.0, 4.0, 9.0];
+let w = [1.0, -2.0];
+let forward_len = op.apply_workspace_len().map_err(|e| e.to_string())?;
+let adjoint_len = op
+    .apply_adjoint_workspace_len()
+    .map_err(|e| e.to_string())?;
+let mut workspace = vec![0.0; forward_len.max(adjoint_len)];
+
+// Initialize output to -1 to observe that failure leaves it unchanged.
+let mut y = [-1.0; 2];
+let applied = op.apply_into(&x, &mut y, &mut workspace[..forward_len]);
+let status = match &applied {
+    Ok(()) => "Ok",
+    Err(error) => match error.kind() {
+        SciOxideErrorKind::NonFinite => "NonFinite",
+        _ => "Other category",
+    },
+};
+let mut z = [0.0; 3];
+op.apply_adjoint_into(&w, &mut z, &mut workspace[..adjoint_len])
+    .map_err(|e| e.to_string())?;
+
+// Both sides of ⟨w, A x⟩ = ⟨Aᵀ w, x⟩.
+let left = applied.is_ok().then(|| w[0] * y[0] + w[1] * y[1]);
+let right = z[0] * x[0] + z[1] * x[1] + z[2] * x[2];
+let digits = serde_json::json!({ "significantDigits": 6 });
+let summary_columns = serde_json::json!([
+    { "key": "0", "label": "apply_workspace_len()", "type": "integer" },
+    { "key": "1", "label": "apply_adjoint_workspace_len()", "type": "integer" },
+    { "key": "2", "label": "apply_into result" },
+    { "key": "3", "label": "⟨w, A x⟩ [-]", "type": "number", "format": digits, "nullText": "-" },
+    { "key": "4", "label": "⟨Aᵀ w, x⟩ [-]", "type": "number", "format": digits }
+]);
+emit_table_with_columns!(
+    summary_columns,
+    vec![(forward_len, adjoint_len, status, left, right)],
+    metadata = serde_json::json!({ "id": "summary" })
+);
+
+// Hand-computed references: A x = γ (4 - 1, 9 - 4), Aᵀ w = γ (-1, 1 + 2, -2).
+let forward_reference = [3.0 * gamma, 5.0 * gamma];
+let forward_rows: Vec<(usize, f64, f64)> =
+    (0..2).map(|i| (i, y[i], forward_reference[i])).collect();
+let forward_columns = serde_json::json!([
+    { "key": "0", "label": "Component i", "type": "integer" },
+    { "key": "1", "label": "apply_into output y_i [-]", "type": "number", "format": digits },
+    { "key": "2", "label": "Reference γ (3, 5)_i [-]", "type": "number", "format": digits }
+]);
+emit_table_with_columns!(
+    forward_columns,
+    forward_rows,
+    metadata = serde_json::json!({ "id": "forward" })
+);
+let adjoint_reference = [-gamma, 3.0 * gamma, -2.0 * gamma];
+let adjoint_rows: Vec<(usize, f64, f64)> =
+    (0..3).map(|j| (j, z[j], adjoint_reference[j])).collect();
+let adjoint_columns = serde_json::json!([
+    { "key": "0", "label": "Component j", "type": "integer" },
+    { "key": "1", "label": "apply_adjoint_into output z_j [-]", "type": "number", "format": digits },
+    { "key": "2", "label": "Reference γ (-1, 3, -2)_j [-]", "type": "number", "format": digits }
+]);
+emit_table_with_columns!(
+    adjoint_columns,
+    adjoint_rows,
+    metadata = serde_json::json!({ "id": "adjoint" })
+);
+```
+
+At the default $\gamma = 1.5$, $A x = (4.5, 7.5)$ and $A^{\mathsf{T}} w = (-1.5, 4.5, -3)$ match their references.
+Workspace length is 2 for $A$ and 3 for its adjoint, each matching output length.
+Both inner products equal $-10.5$ ($= -7\gamma$), confirming the closures are transposes of each other.
+At $\gamma = 3$, outputs and inner products double, with inner product $-21$.
+
+Returning NaN makes the `apply_into` result `NonFinite`.
+Component 0 is computed correctly inside the closure but is not copied; both output components remain $-1$.
+The adjoint closure is invoked separately, leaving $A^{\mathsf{T}} w$ unchanged.
+
+### Closure preconditioning and block application
+
+Preconditioning $M^{-1}$ applies an approximate inverse of coefficient matrix $A$ to residuals to accelerate iterative convergence.
+The simplest Jacobi preconditioner is $M = \mathrm{diag}(A)$, dividing each residual component by diagonal entry $d_i$.
+A zero diagonal gives an infinite quotient, demonstrating staged-write behavior.
+
+The following cell constructs Jacobi preconditioning for $d = (4, 2, d_2)$ through `ClosurePreconditioner` and applies it to right-hand sides $r^{(0)} = (4, 2, 10)$ and $r^{(1)} = (8, -2, 5)$ together through `precondition_block_into`.
+Input is the final diagonal entry $d_2$ (integer 0–8).
+Initialize the output block with $-1$.
+The first table shows workspace lengths and application outcome; the second shows output $z^{(j)}_i$ and reference $r^{(j)}_i / d_i$ by column $j$ and component $i$.
+At $d_2 = 0$ the reference is undefined, leaving the field blank.
+
+```rust
+//| id: core-closure-preconditioner-block
+//| ref: core-closure-preconditioner-block
+//| title: "Applying closure-based Jacobi preconditioning to two right-hand sides in a batch"
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   last_diagonal: {"type":"range","label":"Diagonal entry d₂ [-]","description":"Zero makes the quotient infinite and application fail.","min":0,"max":8,"step":1,"value":5}
+//| cases:
+//|   - {"id":"zero-diagonal","label":"d₂ = 0","description":"Column 0's quotient becomes infinite, leaving the entire block unchanged.","inputs":{"last_diagonal":0}}
+//|   - {"id":"large-diagonal","label":"d₂ = 8","description":"Only the final component changes.","inputs":{"last_diagonal":8}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":3}
+//|       - {"artifact":"summary","path":"/rows/0/1","equals":9}
+//|       - {"artifact":"summary","path":"/rows/0/2","equals":"Ok"}
+//|       - {"artifact":"block","path":"/rows/0/3","approx":{"value":1,"atol":1e-12}}
+//|       - {"artifact":"block","path":"/rows/2/3","approx":{"value":2,"atol":1e-12}}
+//|       - {"artifact":"block","path":"/rows/4/3","approx":{"value":-1,"atol":1e-12}}
+//|       - {"artifact":"block","path":"/rows/5/3","approx":{"value":1,"atol":1e-12}}
+//|   - case: zero-diagonal
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/2","equals":"NonFinite"}
+//|       - {"artifact":"block","path":"/rows/0/3","approx":{"value":-1,"atol":1e-12}}
+//|       - {"artifact":"block","path":"/rows/3/3","approx":{"value":-1,"atol":1e-12}}
+//|       - {"artifact":"block","path":"/rows/2/4","equals":null}
+//|   - case: large-diagonal
+//|     expect:
+//|       - {"artifact":"block","path":"/rows/2/3","approx":{"value":1.25,"atol":1e-12}}
+//|       - {"artifact":"block","path":"/rows/5/3","approx":{"value":0.625,"atol":1e-12}}
+use scioxide_core::{
+    BlockVectorView, BlockVectorViewMut, ClosurePreconditioner, SciOxideErrorKind, Preconditioner,
+};
+
+let diagonal = [4.0, 2.0, last_diagonal];
+// Jacobi preconditioning z = r / d. With d₂ = 0, a quotient becomes infinite.
+let jacobi = ClosurePreconditioner::<f64, _>::new(3, |r, z| {
+    for ((slot, &value), &pivot) in z.iter_mut().zip(r).zip(&diagonal) {
+        *slot = value / pivot;
+    }
+    Ok(())
+});
+// Store two right-hand sides column-major: column 0 = (4, 2, 10), column 1 = (8, -2, 5).
+let residuals = [4.0, 2.0, 10.0, 8.0, -2.0, 5.0];
+let single_len = jacobi
+    .precondition_workspace_len()
+    .map_err(|e| e.to_string())?;
+let block_len = jacobi
+    .precondition_block_workspace_len(2)
+    .map_err(|e| e.to_string())?;
+let mut workspace = vec![0.0; block_len];
+// Initialize output to -1 to observe that failure leaves it unchanged.
+let mut solved = [-1.0; 6];
+let input = BlockVectorView::new(&residuals, 3, 2).map_err(|e| e.to_string())?;
+let mut output = BlockVectorViewMut::new(&mut solved, 3, 2).map_err(|e| e.to_string())?;
+let status = match jacobi.precondition_block_into(input, &mut output, &mut workspace) {
+    Ok(()) => "Ok",
+    Err(error) => match error.kind() {
+        SciOxideErrorKind::NonFinite => "NonFinite",
+        _ => "Other category",
+    },
+};
+let summary_columns = serde_json::json!([
+    { "key": "0", "label": "precondition_workspace_len()", "type": "integer" },
+    { "key": "1", "label": "precondition_block_workspace_len(2)", "type": "integer" },
+    { "key": "2", "label": "precondition_block_into result" }
+]);
+emit_table_with_columns!(
+    summary_columns,
+    vec![(single_len, block_len, status)],
+    metadata = serde_json::json!({ "id": "summary" })
+);
+
+let rows: Vec<(usize, usize, f64, f64, Option<f64>)> = (0..6)
+    .map(|index| {
+        let (j, i) = (index / 3, index % 3);
+        // Hand-computed reference formula: r / d, undefined at d = 0.
+        let reference = (diagonal[i] != 0.0).then(|| residuals[index] / diagonal[i]);
+        (j, i, residuals[index], solved[index], reference)
+    })
+    .collect();
+let digits = serde_json::json!({ "significantDigits": 6 });
+let block_columns = serde_json::json!([
+    { "key": "0", "label": "Column j", "type": "integer" },
+    { "key": "1", "label": "Component i", "type": "integer" },
+    { "key": "2", "label": "Right-hand side r [-]", "type": "number", "format": digits },
+    { "key": "3", "label": "Output z [-]", "type": "number", "format": digits },
+    { "key": "4", "label": "Reference r / d [-]", "type": "number", "format": digits, "nullText": "Undefined" }
+]);
+emit_table_with_columns!(
+    block_columns,
+    rows,
+    metadata = serde_json::json!({ "id": "block" })
+);
+```
+
+At the default $d_2 = 5$, outputs $z^{(0)} = (1, 1, 2)$ and $z^{(1)} = (2, -1, 1)$ match references.
+One application needs three workspace entries; two-column block application adds $3 \times 2 = 6$ staging entries for nine in total.
+At $d_2 = 8$, only final components change to $1.25$ and $0.625$.
+
+At $d_2 = 0$, column 0's final component becomes infinite through $10 / 0$, and `precondition_block_into` returns `NonFinite`.
+Its first two components are computed correctly inside the closure, but all six block entries remain $-1$.
+Failure leaves no block with only some columns updated.
+
+## Summary
+
+Implement matrix-free operators through traits such as `LinearOperator`, querying workspace requirements before caller allocation.
+Pass `OperatorContext` inside solves; callers count operator evaluations, and implementations add only nested extra work to the same accounting.
+Use `ClosureOperator` (adjoint through `with_adjoint`) and `ClosurePreconditioner` for simple operators and preconditioners, verifying adjoints through the inner-product identity.
+Closure operators and block `apply_block_into` validate staged results before copying, so callback failures or non-finite values cannot partly modify caller vectors.
+
+## Further reading
+
+- [Sparse structures and column coloring](../sparse-structure-and-coloring/): Check nonzero structures and evaluation-reducing coloring when computing Jacobian entries instead of products.
+- [Integer combinatorics](../combinatorics/): Check reordering through `Permutation` and combinatorial counting.
+- [Nested solves, accounting, and diagnostics](../nested-solves-and-diagnostics/): Check accounting in `SolveContext` borrowed through `OperatorContext` by `_scoped` methods, and contracts of `_scoped` functions.
+- [Error categories and detailed views](../errors-and-diagnostic-views/): Check how to read `NonFinite` and `InvalidInput` details through `view()`.
+- [Layout, operator, and combinatorics APIs](../../api/layouts-operators-combinatorics/): Look up every operator trait and closure type item.

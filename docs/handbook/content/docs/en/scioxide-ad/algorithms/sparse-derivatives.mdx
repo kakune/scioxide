@@ -1,0 +1,812 @@
+---
+title: "Structural patterns and recovery of sparse derivatives"
+description: "Examine recorded Jacobian and Hessian structural patterns (jacobian_pattern, hessian_pattern) and the points where they apply, direct recovery by column coloring with scioxide_sparse::derivative_coloring, the contracts and function execution counts of sparse_jacobian_into and sparse_hessian_into, the one-shot sparse_jacobian and sparse_hessian calls, when results agree bit for bit with dense results, and how variable ordering changes the color count."
+sidebar:
+  order: 340
+references:
+  ad-structural-patterns: "structural-patterns-from-a-recording"
+  ad-sparse-recovery: "sparse-recovery-by-column-coloring"
+  ad-sparse-recovery-methods: "sparse_jacobian_into-and-sparse_hessian_into"
+  ad-sparse-hessian-executions: "sparse-hessian-recovery-and-function-execution-count"
+  ad-sparse-one-shot-methods: "one-shot-sparse_jacobian-and-sparse_hessian-calls"
+  ad-sparse-one-shot-check: "agreement-of-one-shot-calls-and-the-_into-route"
+---
+
+For functions whose components each depend on only a few variables, such as discretized differential equations, particle chains, and partially separable sums, most entries of the Jacobian $J$ or Hessian $H$ are structurally zero.
+A dense $m \times n$ matrix $J$ requires $n$ forward sweeps or $m$ reverse sweeps, and a dense $n \times n$ matrix $H$ requires $n$ Hessian–vector products.
+If the potentially nonzero positions are known, columns that never overlap in any row can share a seed, allowing all nonzeros to be recovered in as many sweeps as the number $p$ of groups.
+This page explains how to obtain potentially nonzero positions (the structural pattern) from a recording, the principle of recovery by column coloring and the functions in `scioxide-ad`, and how variable ordering changes the color count.
+[Reverse mode and tapes](../reverse-mode-and-replay/) explains `linearize` and forward sweeps, and [Second derivatives and Hessian operators](../second-order-derivatives/) explains Hessian–vector products and `hvp_into`.
+
+## Structural patterns from a recording
+
+Computing a sparse matrix with few directional derivatives first requires its set of potentially nonzero positions (the structural pattern).
+`Linearization` obtains this set by traversing the recording without using values at the evaluation point.
+The result is a `scioxide_core::StructuralPattern` (a CSR structure with column indices in ascending order in each row), allocated and returned on each call ([Sparse structure and column coloring](../../../scioxide-core/algorithms/sparse-structure-and-coloring/)).
+
+`jacobian_pattern()` returns an $m \times n$ pattern containing position $(i, j)$ whenever output $i$ depends on input $j$ through recorded statements.
+A single forward traversal propagates the set of inputs on which each value depends (its index domain) as the union of its arguments' sets.
+The outputs of a call statement (one statement recorded by `solve_into`, for example) are considered to depend on every input of that call.
+Because this is structural dependence, it also includes positions whose partial derivative happens to be zero at the evaluation point (such as $\partial/\partial x_0$ of $x_0 x_1$ at $x_1 = 0$).
+Operations involving only passive values (values independent of the inputs) are not recorded and create no dependence.
+
+`hessian_pattern()` returns an $n \times n$ pattern for a recording with exactly one output, and returns `DimensionMismatch` otherwise.
+It collects nonlinear interaction domains (Walther 2008) from only those statements on which the output depends.
+Writing the input set of an argument as $D(\cdot)$, each statement adds the following positions.
+
+- A nonlinear unary statement $\phi(a)$ (such as `exp` or `powi`) adds $D(a) \times D(a)$.
+- A product $a \cdot b$ adds $D(a) \times D(b)$ and $D(b) \times D(a)$.
+  A `dot` statement adds the same positions for each pair of multiplied components.
+- A nonlinear binary statement $\phi(a, b)$, a `combine` statement, or a call statement adds $U \times U$ for the union $U$ of all its arguments' sets.
+- Linear statements, such as sums, differences, constant multiples, and `select`, add nothing.
+
+The pattern always contains the true Hessian's nonzeros, but also includes positions that become zero by cancellation.
+For example, the true Hessian of $f = (x_0 + x_1)^2 - x_0^2 - 2x_0x_1$ is $\operatorname{diag}(0, 2)$, but the statement $(x_0 + x_1)^2$ adds $\{0, 1\}^2$, so the pattern contains every position of the $2 \times 2$ matrix.
+
+Because the tape records only branches actually taken, both patterns apply only at points taking the same branches as the recording point ([Branches, masks, and table lookup](../control-flow/)).
+It returns `AllocationFailure` if the pattern cannot be stored.
+
+## Sparse recovery by column coloring
+
+Columns $j$ and $k$ of an $m \times n$ matrix $J$ are structurally orthogonal if they are never simultaneously nonzero in any row.
+Partition the columns into colors $C_0, \dots, C_{p-1}$ so that all columns of a color are pairwise structurally orthogonal; then component $i$ of the product $J d_c$ with the compressed seed $d_c = \sum_{j \in C_c} e_j$ for color $c$ equals the entry $J_{ij}$ of the only column $j$ in $C_c$ that can be nonzero in row $i$.
+All nonzero entries can be read from $p$ directional derivatives, without subtraction or a linear solve (direct recovery, Curtis–Powell–Reid column compression).
+Since all nonzero columns in a row need different colors, the color count $p$ is at least the maximum number $\rho_{\max}$ of nonzeros per row.
+Finding the minimum number of colors is NP-hard (Coleman–Moré, 1983).
+
+`scioxide_sparse::derivative_coloring(pattern.view())` computes a distance-one coloring of the column intersection graph (the graph joining columns with positions in the same row) by a greedy method: it visits columns in ascending index order and assigns the smallest color not used by already colored columns with a position in the same row ([Orderings and coloring](../../../scioxide-sparse/algorithms/orderings-and-coloring/)).
+The result is a `ColoringSchedule` of kind `ColoringKind::DerivativeColumns`, with no guarantee of a minimum color count.
+The resulting color count depends on the column ordering.
+
+### sparse_jacobian_into and sparse_hessian_into
+
+- `Linearization::sparse_jacobian_into(coloring, values, context)` performs one forward sweep over the recording per color and writes the entries of $J$ to `values` in the CSR order of the pattern in `coloring`.
+  It does not execute the function again, so function executions are limited to the recording by `linearize`.
+  The pattern need only contain the pattern of $J$; extra positions receive zero.
+  Values agree bit for bit with the dense Jacobian obtained by columnwise forward sweeps (`jacobian_into` with `JacobianMode::Forward`).
+  They agree within rounding with the dense matrix obtained by rowwise reverse sweeps (`JacobianMode::Reverse`), because the accumulation order differs.
+- `sparse_hessian_into(function, point, coloring, values, context)` on `Tape<Dual<S>>` records the function once per color with seed $d_c$ and reads $H_{ij}$ directly from $(H d_{c(j)})_i$ ($c(j)$ is the color of column $j$).
+  A new tape adds one execution to count statements, so the function executes once more than the color count.
+  `coloring` must be a column coloring of a pattern containing the Hessian pattern (for example, `hessian_pattern()`).
+  Star coloring, which reduces colors using symmetry, and recovery by substitution are not provided, so $H_{ij}$ and $H_{ji}$ are read from separate recordings.
+- `hessian_pattern(function, point, context)` on `Tape<Dual<S>>` records the same closure as `sparse_hessian_into` once with zero direction and returns the Hessian pattern.
+  The pattern equals `Linearization::hessian_pattern` for the same function recorded on `Tape<S>`, and the tape remains in the same state as after `linearize`.
+  One tape and one closure suffice for the pattern, coloring, and `sparse_hessian_into`.
+
+Both products return `InvalidInput` (argument `coloring`, `UnsupportedConfiguration`) unless `coloring` is a coloring of kind `ColoringKind::DerivativeColumns` (the result of `derivative_coloring`).
+The distance-one coloring from `scioxide_sparse::distance_one_coloring` only gives adjacent vertices different colors, so two columns with nonzeros in the same row can share a color and their entries are added together during direct recovery.
+They return `DimensionMismatch` if the pattern is not $m \times n$ ($n \times n$ for the Hessian), or if the length of `values` differs from the nonzero count.
+Other failures are the same as for `jvp_into` and `hvp_into` respectively; on failure, `values` is unchanged.
+Arrays for arranging the values are allocated inside the tape on the first call, with no allocation on subsequent calls.
+If the pattern omits an actual nonzero, the missing entry is lost or mixed into another entry of the same color, without an error.
+
+### One-shot sparse_jacobian and sparse_hessian calls
+
+`sparse_jacobian(function, point)` records the function on a new `Tape<S>`, then performs `jacobian_pattern`, `derivative_coloring`, and `sparse_jacobian_into` in order, returning $J$ as a scioxide-sparse `CsrMatrix`.
+`sparse_hessian(function, point)` performs `hessian_pattern`, `derivative_coloring`, and `sparse_hessian_into` on a new `Tape<Dual<S>>` and returns $H$ as a `CsrMatrix`.
+Stored positions follow the pattern, with zeros at positions that cancel to zero.
+Values equal those from the `_into` route: `sparse_jacobian` agrees bit for bit with the dense Jacobian from columnwise forward sweeps, and `sparse_hessian` with `hessian`.
+Since `CsrMatrix` only holds finite values, any NaN or infinity in the recovered values returns `NonFinite` regardless of `NonFinitePolicy` (the `_into` forms write those values).
+For a function with no outputs, `sparse_jacobian` returns a $0 \times n$ matrix.
+Each call allocates a tape, pattern, coloring, and matrix; for repeated computations with the same structure, retain the pattern and coloring and call the `_into` form.
+
+## Band structure of a spring chain
+
+The cells on this page use the same nonlinear spring chain as [Second derivatives and Hessian operators](../second-order-derivatives/).
+Among $n$ variables $x_0, \dots, x_{n-1}$ on a line, connect each pair $(i, i + d)$ ($1 \le d \le b$) within reach $b$ by a spring with extension $u = x_{i+d} - x_i$ and energy $\varphi(u) = u^2 + u^4$.
+Let $E$ be the total energy and $F: \mathbb{R}^n \to \mathbb{R}^m$ the map collecting the spring tensions $\varphi'(u_k) = 2u_k + 4u_k^3$.
+Spring indices $k$ follow ascending $d$, then ascending $i$ for equal $d$; the spring count is $m = \sum_{d=1}^{b}(n - d)$.
+Let $D$ be the $m \times n$ difference matrix whose row for spring $k = (i, i + d)$ has $-1$ in column $i$ and $+1$ in column $i + d$; then $\nabla E = D^{\mathsf T} F$ and the following hold:
+
+$$
+J_F = \operatorname{diag}(\varphi''(u))\,D, \qquad
+J_{\nabla E} = H_E = D^{\mathsf T} \operatorname{diag}(\varphi''(u))\,D
+$$
+
+Here $\varphi''(u) = 2 + 12u^2$.
+
+Row $k$ of $J_F$ has nonzeros only in the two columns at the spring's endpoints; the matrix has $2m$ nonzeros in total.
+$H_E$ is banded with half-bandwidth $b$; entries with $1 \le |i - j| \le b$ are $-\varphi''(x_j - x_i)$, each diagonal entry is the sum of $\varphi''$ over springs containing $x_i$, and the nonzero count is $n + 2\sum_{d=1}^{b}(n - d) = n(2b + 1) - b(b + 1)$.
+In the column intersection graph, columns $j$ and $k$ of $J_F$ are joined when $1 \le |j - k| \le b$, and columns of $H_E$ when $1 \le |j - k| \le 2b$.
+Every pair among $b + 1$ consecutive columns ($2b + 1$ for $H_E$) is joined, so at least $b + 1$ colors are needed for $J_F$ and at least $2b + 1$ for $H_E$.
+Since $J_F$ has two nonzeros per row, this lower bound for $J_F$ is stronger than the bound from $\rho_{\max}$.
+The evaluation point is $x_i = 0.3 \sin(1.7\,i)$.
+
+The next definitions block writes $E$ as `chain_energy`, $F$ as `bond_tensions` and evaluation points as `chain_point` in generic functions working with all number types.
+`energy_gradient` is a manually written map for $\nabla E = D^{\mathsf T} F$, whose Jacobian is $H_E$.
+The argument `place` of `chain_energy` specifies where chain variable $i$ lies in the input vector and is used to experiment with variable ordering.
+`chain_placement` constructs this ordering (natural order or even indices first).
+`spring_curvature` and `chain_hessian_entry` independently check the result by computing $\varphi''$ and the entries of $H_E$ from closed forms in `f64`.
+
+```rust
+//| id: ad-sparse-spring-chain-model
+//| kind: definitions
+//| title: "Energy, tensions, gradient, and closed-form second derivatives of a nonlinear spring chain"
+//| crates: [scioxide-ad, scioxide-core]
+use scioxide_ad::Real;
+use scioxide_core::RealScalar;
+
+/// Evaluation points xᵢ = 0.3 sin(1.7 i) (input data).
+pub(crate) fn chain_point(n: usize) -> Vec<f64> {
+    (0..n)
+        .map(|i| 0.3 * RealScalar::sin(1.7 * i as f64))
+        .collect()
+}
+
+/// E(x) = Σ_{d=1}^{b} Σ_i φ(x_{i+d} − x_i), φ(u) = u² + u⁴.
+/// Chain variable i is at position place[i] in the input vector.
+pub(crate) fn chain_energy<R: Real>(x: &[R], reach: usize, place: &[usize]) -> R {
+    let n = place.len();
+    let mut total = R::zero();
+    for d in 1..=reach {
+        for i in 0..n.saturating_sub(d) {
+            let u = x[place[i + d]] - x[place[i]];
+            let u2 = u * u;
+            total = total + u2 + u2 * u2;
+        }
+    }
+    total
+}
+
+/// Input-vector position for chain variable i. Even indices first: x₀, x₂, …, x₁, x₃, ….
+pub(crate) fn chain_placement(n: usize, even_first: bool) -> Vec<usize> {
+    (0..n)
+        .map(|i| match (even_first, i % 2) {
+            (false, _) => i,
+            (true, 0) => i / 2,
+            (true, _) => (n + 1) / 2 + i / 2,
+        })
+        .collect()
+}
+
+/// Tension φ′(u) = 2u + 4u³.
+fn tension<R: Real>(u: R) -> R {
+    u * 2.0 + u * u * u * 4.0
+}
+
+/// Append tensions F_k = φ′(u_k) in ascending d, and ascending i within each d.
+pub(crate) fn bond_tensions<R: Real>(x: &[R], reach: usize, out: &mut Vec<R>) {
+    let n = x.len();
+    for d in 1..=reach {
+        for i in 0..n.saturating_sub(d) {
+            out.push(tension(x[i + d] - x[i]));
+        }
+    }
+}
+
+/// ∇E = Dᵀ F: add the tension of spring (i, i + d) to component i + d and subtract it from component i.
+pub(crate) fn energy_gradient<R: Real>(x: &[R], reach: usize, out: &mut Vec<R>) {
+    let (n, start) = (x.len(), out.len());
+    out.extend((0..n).map(|_| R::zero()));
+    for d in 1..=reach {
+        for i in 0..n.saturating_sub(d) {
+            let t = tension(x[i + d] - x[i]);
+            out[start + i + d] = out[start + i + d] + t;
+            out[start + i] = out[start + i] - t;
+        }
+    }
+}
+
+/// Closed form (independent check): φ″(x_j − x_i) = 2 + 12(x_j − x_i)² for spring (i, j).
+pub(crate) fn spring_curvature(x: &[f64], i: usize, j: usize) -> f64 {
+    let u = x[j] - x[i];
+    2.0 + 12.0 * u * u
+}
+
+/// Closed form (independent check): in chain indices, H_ij = −φ″(x_j − x_i) for 1 ≤ |i − j| ≤ b; the diagonal sums φ″.
+pub(crate) fn chain_hessian_entry(x: &[f64], reach: usize, i: usize, j: usize) -> f64 {
+    let n = x.len();
+    match i.abs_diff(j) {
+        0 => (1..=reach)
+            .map(|d| {
+                let right = if i + d < n {
+                    spring_curvature(x, i, i + d)
+                } else {
+                    0.0
+                };
+                let left = if i >= d {
+                    spring_curvature(x, i - d, i)
+                } else {
+                    0.0
+                };
+                right + left
+            })
+            .sum::<f64>(),
+        gap if gap <= reach => -spring_curvature(x, i.min(j), i.max(j)),
+        _ => 0.0,
+    }
+}
+```
+
+## Variable ordering and color count
+
+The next cell obtains the Hessian pattern of the spring-chain energy $E$ with `hessian_pattern` and examines the color count from `derivative_coloring` for half-bandwidths $b = 1, \dots, 8$.
+There are two variable orderings; “Even indices first” places the same chain in the input vector in the order $x_0, x_2, \dots, x_1, x_3, \dots$.
+The mathematical structure is the same; only row and column indices change.
+The number of variables is fixed at $n = 40$ (the third cell lets you examine the effect of changing $n$).
+There are no inputs.
+The chart and table show the color counts for both orderings and the lower bound $2b + 1$ from the maximum nonzeros per row.
+
+```rust
+//| id: ad-coloring-order
+//| ref: ad-coloring-order
+//| title: "Color count and variable ordering for a banded Hessian"
+//| run: reactive
+//| uses: [ad-sparse-spring-chain-model]
+//| crates: [scioxide-ad, scioxide-core, scioxide-sparse]
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"colors","path":"/rows/0/2","equals":3}
+//|       - {"artifact":"colors","path":"/rows/0/3","equals":4}
+//|       - {"artifact":"colors","path":"/rows/1/2","equals":5}
+//|       - {"artifact":"colors","path":"/rows/1/3","equals":6}
+//|       - {"artifact":"colors","path":"/rows/7/1","equals":17}
+//|       - {"artifact":"colors","path":"/rows/7/2","equals":17}
+//|       - {"artifact":"colors","path":"/rows/7/3","equals":18}
+use scioxide_ad::{Tape, TapeOptions};
+use scioxide_core::ExecutionContext;
+use scioxide_sparse::derivative_coloring;
+
+let n = 40;
+let cx = ExecutionContext::sequential();
+let point = chain_point(n);
+let mut rows = Vec::new();
+for reach in 1..=8_usize {
+    let mut counts = [0_usize; 2];
+    for (slot, even_first) in [false, true].into_iter().enumerate() {
+        // Obtain the Hessian pattern from an f64 recording and color its columns.
+        let place = chain_placement(n, even_first);
+        let mut tape = Tape::<f64>::new(TapeOptions::new());
+        let linear = tape
+            .linearize(
+                |x, y| {
+                    y.push(chain_energy(x, reach, &place));
+                    Ok(())
+                },
+                &point,
+                cx,
+            )
+            .map_err(|e| e.to_string())?;
+        let pattern = linear.hessian_pattern().map_err(|e| e.to_string())?;
+        counts[slot] = derivative_coloring(pattern.view())
+            .map_err(|e| e.to_string())?
+            .color_count();
+    }
+    rows.push((reach, 2 * reach + 1, counts[0], counts[1]));
+}
+let line = |name: &str, column: usize| {
+    let points: Vec<[f64; 2]> = rows
+        .iter()
+        .map(|row| [row.0 as f64, [row.1, row.2, row.3][column] as f64])
+        .collect();
+    serde_json::json!({ "name": name, "points": points })
+};
+let mut bound = line("Lower bound 2b + 1", 0);
+bound["style"] = serde_json::json!({ "lineType": "dashed" });
+emit_line_chart!(
+    &vec![line("Natural order", 1), line("Even indices first", 2), bound],
+    options = &serde_json::json!({
+        "xLabel": "Half-bandwidth b [-]",
+        "yLabel": "Color count [-]",
+        "yIncludeZero": true
+    })
+);
+let columns = serde_json::json!([
+    { "key": "0", "label": "Half-bandwidth b", "type": "integer" },
+    { "key": "1", "label": "Lower bound 2b + 1", "type": "integer" },
+    { "key": "2", "label": "Color count (natural order)", "type": "integer" },
+    { "key": "3", "label": "Color count (even indices first)", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "colors" })
+);
+```
+
+In natural order, the color count equals the lower bound $2b + 1$ for every $b = 1, \dots, 8$, so the greedy method gives the minimum color count for this structure.
+The greedy method in natural order assigns color $j \bmod (2b + 1)$ to column $j$; columns of the same color are at least $2b + 1$ apart, avoiding collisions in every row.
+Switching to “Even indices first” preserves the structure and lower bound $2b + 1$, but for $n = 40$ the greedy color count exceeds the bound by one for every $b$.
+The change in color count with variable ordering for the same structure is a concrete example of the greedy method's lack of a minimum-color guarantee.
+
+## Agreement of sparse Jacobians with dense results
+
+The next cell computes sparse Jacobians for the tension map $F$ and gradient map $\nabla E$ using `jacobian_pattern`, `derivative_coloring`, and `sparse_jacobian_into`.
+It records the same map on tapes with `JacobianMode::Forward` (columnwise forward sweeps) and `JacobianMode::Reverse` (rowwise reverse sweeps), comparing sparse values bit for bit with dense values from `jacobian_into` on each tape.
+Inputs are the number of variables $n$ (10 to 120) and spring reach $b$ (1 to 8); variables are in natural order.
+For each map and dense-matrix assembly method, the table shows the row count, nonzero count, color count, number of entries differing in bits from dense values, maximum difference, and relative differences from the closed forms $J_F = \operatorname{diag}(\varphi'')\,D$ and $H_E$.
+The closed forms are computed by `spring_curvature` and `chain_hessian_entry` in the definitions block.
+
+```rust
+//| id: ad-sparse-jacobian-recovery
+//| ref: ad-sparse-jacobian-recovery
+//| title: "Sparse Jacobian recovery and bitwise comparison with dense results"
+//| run: reactive
+//| uses: [ad-sparse-spring-chain-model]
+//| crates: [scioxide-ad, scioxide-core, scioxide-sparse]
+//| inputs:
+//|   masses: {"type":"range","label":"Number of variables n","min":10,"max":120,"step":10,"value":40}
+//|   reach: {"type":"range","label":"Spring reach b","description":"Connect x_i and x_{i+d} (1 ≤ d ≤ b) with a spring.","min":1,"max":8,"step":1,"value":2}
+//| cases:
+//|   - {"id":"nearest","label":"b = 1","description":"Each diagonal entry has two contributions, giving bitwise agreement even with dense reverse-sweep values.","inputs":{"reach":1}}
+//|   - {"id":"wide-band","label":"n = 120, b = 8","description":"Recover tensions with 9 colors and the gradient with 17 colors.","inputs":{"masses":120,"reach":8}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"recovery","path":"/rows/0/2","equals":77}
+//|       - {"artifact":"recovery","path":"/rows/0/3","equals":154}
+//|       - {"artifact":"recovery","path":"/rows/0/4","equals":3}
+//|       - {"artifact":"recovery","path":"/rows/0/5","equals":0}
+//|       - {"artifact":"recovery","path":"/rows/1/5","equals":0}
+//|       - {"artifact":"recovery","path":"/rows/2/3","equals":194}
+//|       - {"artifact":"recovery","path":"/rows/2/4","equals":5}
+//|       - {"artifact":"recovery","path":"/rows/2/5","equals":0}
+//|       - {"artifact":"recovery","path":"/rows/3/5","range":{"min":1}}
+//|       - {"artifact":"recovery","path":"/rows/3/6","approx":{"value":0,"atol":1e-13}}
+//|       - {"artifact":"recovery","path":"/rows/0/7","approx":{"value":0,"atol":1e-15}}
+//|       - {"artifact":"recovery","path":"/rows/2/7","approx":{"value":0,"atol":1e-15}}
+//|   - case: nearest
+//|     expect:
+//|       - {"artifact":"recovery","path":"/rows/0/4","equals":2}
+//|       - {"artifact":"recovery","path":"/rows/2/4","equals":3}
+//|       - {"artifact":"recovery","path":"/rows/2/5","equals":0}
+//|       - {"artifact":"recovery","path":"/rows/3/5","equals":0}
+//|       - {"artifact":"recovery","path":"/rows/2/7","approx":{"value":0,"atol":1e-15}}
+//|   - case: wide-band
+//|     expect:
+//|       - {"artifact":"recovery","path":"/rows/0/4","equals":9}
+//|       - {"artifact":"recovery","path":"/rows/2/4","equals":17}
+//|       - {"artifact":"recovery","path":"/rows/2/5","equals":0}
+//|       - {"artifact":"recovery","path":"/rows/3/5","range":{"min":1}}
+//|       - {"artifact":"recovery","path":"/rows/2/7","approx":{"value":0,"atol":1e-15}}
+use scioxide_ad::{JacobianMode, Tape, TapeOptions};
+use scioxide_core::ExecutionContext;
+use scioxide_sparse::derivative_coloring;
+
+let (n, b) = (masses as usize, reach as usize);
+let cx = ExecutionContext::sequential();
+let point = chain_point(n);
+// List endpoints of spring k = (i, i + d) in the bond_tensions order (for the closed-form check).
+let bonds: Vec<(usize, usize)> = (1..=b)
+    .flat_map(|d| (0..n - d).map(move |i| (i, i + d)))
+    .collect();
+let (forward, reverse) = (JacobianMode::Forward, JacobianMode::Reverse);
+let mut rows = Vec::new();
+for (tensions, mode) in [
+    (true, forward),
+    (true, reverse),
+    (false, forward),
+    (false, reverse),
+] {
+    let mut tape = Tape::<f64>::new(TapeOptions::new().with_jacobian_mode(mode));
+    let mut linear = tape
+        .linearize(
+            |x, y| {
+                if tensions {
+                    bond_tensions(x, b, y);
+                } else {
+                    energy_gradient(x, b, y);
+                }
+                Ok(())
+            },
+            &point,
+            cx,
+        )
+        .map_err(|e| e.to_string())?;
+    // Dense J: Forward assembles by columnwise forward sweeps; Reverse by rowwise reverse sweeps.
+    let m = linear.outputs();
+    let mut dense = vec![0.0; m * n];
+    linear
+        .jacobian_into(&mut dense, cx)
+        .map_err(|e| e.to_string())?;
+    // Sparse J: color the structural pattern's columns and read nonzeros with one forward sweep per color.
+    let pattern = linear.jacobian_pattern().map_err(|e| e.to_string())?;
+    let view = pattern.view();
+    let schedule = derivative_coloring(view).map_err(|e| e.to_string())?;
+    let mut values = vec![0.0; view.col_indices().len()];
+    linear
+        .sparse_jacobian_into(&schedule, &mut values, cx)
+        .map_err(|e| e.to_string())?;
+    // Closed form (independent check): row k = (i, j) of J_F has −φ″ in column i and φ″ in column j. J_∇E is H_E.
+    let exact = |r: usize, c: usize| {
+        if !tensions {
+            return chain_hessian_entry(&point, b, r, c);
+        }
+        let (i, j) = bonds[r];
+        match c {
+            c if c == j => spring_curvature(&point, i, j),
+            c if c == i => -spring_curvature(&point, i, j),
+            _ => 0.0,
+        }
+    };
+    let (mut differ, mut gap, mut closed, mut scale) = (0_usize, 0.0_f64, 0.0_f64, 0.0_f64);
+    for r in 0..m {
+        for e in view.row_ptr()[r]..view.row_ptr()[r + 1] {
+            let (c, value) = (view.col_indices()[e], values[e]);
+            differ += usize::from(value.to_bits() != dense[r * n + c].to_bits());
+            gap = gap.max((value - dense[r * n + c]).abs());
+            closed = closed.max((value - exact(r, c)).abs());
+            scale = scale.max(exact(r, c).abs());
+        }
+    }
+    let map = if tensions { "Tensions F" } else { "Gradient ∇E" };
+    let sweep = match mode {
+        JacobianMode::Forward => "Columnwise forward sweeps",
+        _ => "Rowwise reverse sweeps",
+    };
+    let entries = view.col_indices().len();
+    let colors = schedule.color_count();
+    rows.push((map, sweep, m, entries, colors, differ, gap, closed / scale));
+}
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Map" },
+    { "key": "1", "label": "Dense J assembly" },
+    { "key": "2", "label": "Row count m", "type": "integer" },
+    { "key": "3", "label": "Nonzero count", "type": "integer" },
+    { "key": "4", "label": "Color count", "type": "integer" },
+    { "key": "5", "label": "Entries differing in bits from dense values [count]", "type": "integer" },
+    { "key": "6", "label": "max |sparse − dense| [-]", "type": "number", "format": sci3 },
+    { "key": "7", "label": "Relative difference from closed form [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "recovery" })
+);
+```
+
+At the defaults $n = 40$ and $b = 2$, the tension $F$ Jacobian is $77 \times 40$ with 154 nonzeros and can be recovered in 3 colors, matching the lower bound $b + 1$.
+Assembling dense $J_F$ by columns requires 40 forward sweeps and by rows requires 77 reverse sweeps, whereas sparse recovery needs only 3 forward sweeps.
+The Jacobian $H_E$ of the gradient $\nabla E$ has 194 nonzeros and can be recovered in 5 colors, matching the lower bound $2b + 1$.
+For both maps, sparse values agree bit for bit with dense values assembled by columnwise forward sweeps, and the relative difference from the closed form is at most $1.9 \times 10^{-16}$.
+Against dense values assembled by rowwise reverse sweeps, tensions agree bit for bit, but for the gradient 11 of 194 entries differ in the last digit, with maximum difference $3.6 \times 10^{-15}$.
+All differing entries lie on the diagonal.
+A diagonal entry of $H_E$ sums contributions from up to $2b$ springs containing $x_i$; forward sweeps add this sum in recording order and reverse sweeps in reverse order.
+Rounding can therefore differ for entries with at least three terms.
+Off-diagonal entries and tension entries each consist of one spring's contribution and have the same bits in either sweep.
+
+At $b = 1$, diagonal entries have at most two terms, and a two-term sum does not depend on addition order, so dense reverse-sweep values also agree bit for bit.
+At $n = 120$ and $b = 8$, tensions use 9 colors and the gradient 17; 80 of the gradient's 1,968 entries differ from dense reverse-sweep values.
+The maximum difference $2.1 \times 10^{-14}$ is at the rounding level for diagonal entries of magnitude about 56.
+At the defaults, both cases, and both endpoints of the inputs, the relative difference from the closed form is at most $4 \times 10^{-16}$ and sparse values have the same bits as dense columnwise forward-sweep values.
+
+## Sparse Hessian recovery and function execution count
+
+The next cell computes and compares the Hessian by sparse coloring recovery and dense `hessian` computation for the selected $n$, $b$, and ordering.
+Inputs are the number of variables $n$ (20 to 120), half-bandwidth $b$ (1 to 8), and variable ordering.
+The table shows the nonzero count and its closed form $n(2b + 1) - b(b + 1)$, maximum nonzeros per row, color count, function execution count, difference from the dense result, relative difference from the closed-form Hessian, and asymmetry $\max|H_{ij} - H_{ji}|$ of the dense result.
+Function executions are counted inside the function.
+The closed-form Hessian is computed by `chain_hessian_entry` in the definitions block.
+
+```rust
+//| id: ad-sparse-coloring-cost
+//| ref: ad-sparse-coloring-cost
+//| title: "Sparse Hessian recovery by coloring and recording count"
+//| run: reactive
+//| uses: [ad-sparse-spring-chain-model]
+//| crates: [scioxide-ad, scioxide-core, scioxide-sparse]
+//| inputs:
+//|   masses: {"type":"range","label":"Number of variables n","min":20,"max":120,"step":10,"value":60}
+//|   reach: {"type":"range","label":"Half-bandwidth b","description":"x_i and x_{i+d} (1 ≤ d ≤ b) interact.","min":1,"max":8,"step":1,"value":2}
+//|   ordering: {"type":"select","label":"Variable ordering","options":["Natural order","Even indices first"],"value":"Natural order"}
+//| cases:
+//|   - {"id":"even-first","label":"Even indices first","description":"The same structure uses one additional color.","inputs":{"ordering":"Even indices first"}}
+//|   - {"id":"wide-band","label":"n = 120, b = 8","description":"17 colors, about one seventh of the 120 dense recordings.","inputs":{"masses":120,"reach":8}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":294}
+//|       - {"artifact":"summary","path":"/rows/0/1","equals":294}
+//|       - {"artifact":"summary","path":"/rows/0/3","equals":5}
+//|       - {"artifact":"summary","path":"/rows/0/4","equals":6}
+//|       - {"artifact":"summary","path":"/rows/0/5","equals":61}
+//|       - {"artifact":"summary","path":"/rows/0/6","equals":0}
+//|       - {"artifact":"summary","path":"/rows/0/7","approx":{"value":0,"atol":1e-14}}
+//|   - case: even-first
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":294}
+//|       - {"artifact":"summary","path":"/rows/0/3","equals":6}
+//|       - {"artifact":"summary","path":"/rows/0/6","equals":0}
+//|       - {"artifact":"summary","path":"/rows/0/7","approx":{"value":0,"atol":1e-14}}
+//|   - case: wide-band
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":1968}
+//|       - {"artifact":"summary","path":"/rows/0/3","equals":17}
+//|       - {"artifact":"summary","path":"/rows/0/5","equals":121}
+//|       - {"artifact":"summary","path":"/rows/0/7","approx":{"value":0,"atol":1e-14}}
+use scioxide_ad::{Dual, Tape, TapeOptions, Var, hessian};
+use scioxide_core::ExecutionContext;
+use scioxide_sparse::derivative_coloring;
+use std::cell::Cell;
+
+let (n, b) = (masses as usize, reach as usize);
+let cx = ExecutionContext::sequential();
+let point = chain_point(n);
+// Place values of the same chain at input-vector positions place[i] in the selected ordering.
+let place = chain_placement(n, ordering == "Even indices first");
+let mut input = vec![0.0; n];
+for (i, &p) in place.iter().enumerate() {
+    input[p] = point[i];
+}
+let mut tape = Tape::<f64>::new(TapeOptions::new());
+let linear = tape
+    .linearize(
+        |x, y| {
+            y.push(chain_energy(x, b, &place));
+            Ok(())
+        },
+        &input,
+        cx,
+    )
+    .map_err(|e| e.to_string())?;
+let pattern = linear.hessian_pattern().map_err(|e| e.to_string())?;
+let view = pattern.view();
+let schedule = derivative_coloring(view).map_err(|e| e.to_string())?;
+// Compute sparse values with one recording per color and dense H with one per unit direction, counting function executions.
+let calls = Cell::new(0_usize);
+let mut second = Tape::<Dual<f64>>::new(TapeOptions::new());
+let mut values = vec![0.0; view.col_indices().len()];
+second
+    .sparse_hessian_into(
+        |x: &[Var<'_, Dual<f64>>]| {
+            calls.set(calls.get() + 1);
+            Ok(chain_energy(x, b, &place))
+        },
+        &input,
+        &schedule,
+        &mut values,
+        cx,
+    )
+    .map_err(|e| e.to_string())?;
+let sparse_calls = calls.replace(0);
+let dense = hessian(
+    |x| {
+        calls.set(calls.get() + 1);
+        Ok(chain_energy(x, b, &place))
+    },
+    &input,
+)
+.map_err(|e| e.to_string())?;
+let dense = dense.as_slice();
+let (mut sparse_gap, mut closed_gap, mut scale, mut asymmetry) =
+    (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
+for r in 0..n {
+    for e in view.row_ptr()[r]..view.row_ptr()[r + 1] {
+        sparse_gap = sparse_gap.max((values[e] - dense[r * n + view.col_indices()[e]]).abs());
+    }
+}
+// The closed form uses chain indices (i, j), so compare it with input-vector positions (place[i], place[j]).
+for i in 0..n {
+    for j in 0..n {
+        let (r, c) = (place[i], place[j]);
+        let exact = chain_hessian_entry(&point, b, i, j);
+        closed_gap = closed_gap.max((dense[r * n + c] - exact).abs());
+        scale = scale.max(exact.abs());
+        asymmetry = asymmetry.max((dense[r * n + c] - dense[c * n + r]).abs());
+    }
+}
+let max_row = view
+    .row_ptr()
+    .windows(2)
+    .map(|w| w[1] - w[0])
+    .max()
+    .unwrap_or(0);
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Pattern nonzero count", "type": "integer" },
+    { "key": "1", "label": "Closed form n(2b + 1) − b(b + 1)", "type": "integer" },
+    { "key": "2", "label": "Maximum nonzeros per row", "type": "integer" },
+    { "key": "3", "label": "Color count", "type": "integer" },
+    { "key": "4", "label": "Function executions for sparse recovery [count]", "type": "integer" },
+    { "key": "5", "label": "Function executions for hessian [count]", "type": "integer" },
+    { "key": "6", "label": "max |sparse − dense| [-]", "type": "number", "format": sci3 },
+    { "key": "7", "label": "Relative difference from closed form [-]", "type": "number", "format": sci3 },
+    { "key": "8", "label": "max |H_ij − H_ji| [-]", "type": "number", "format": sci3 }
+]);
+let row = (
+    view.col_indices().len(),
+    n * (2 * b + 1) - b * (b + 1),
+    max_row,
+    schedule.color_count(),
+    sparse_calls,
+    calls.get(),
+    sparse_gap,
+    closed_gap / scale,
+    asymmetry,
+);
+emit_table_with_columns!(
+    columns,
+    vec![row],
+    metadata = serde_json::json!({ "id": "summary" })
+);
+```
+
+At the defaults $n = 60$ and $b = 2$, the 294 nonzeros match the closed form, and there are 5 colors.
+Sparse recovery executes the function 6 times and `hessian` 61 times.
+Each includes one execution to count statements on a new tape; the recordings used for values number 5 and 60 respectively.
+Sparse values agree bit for bit with the corresponding entries of `hessian`, and their relative difference from the closed form is $1.9 \times 10^{-16}$.
+In this chain, both endpoints of every spring containing $x_i$ are within $b$ of $i$; a valid coloring has at most one column of color $c$ (call it $j$) within that range (the pattern of row $i$).
+Thus the tangent received by a spring containing $x_i$ when recorded with the seed for color $c$ equals that received when recorded with unit direction $e_j$, and $(H d_c)_i$ uses the same operations as $(H e_j)_i$.
+The dense result's asymmetry is also zero.
+`hessian` does not symmetrize, so for general functions rounding differences can remain between $H_{ij}$ and $H_{ji}$.
+
+“Even indices first” increases the color count to 6 and function executions to 7, but recovered values still agree bit for bit with the dense result as in natural order.
+At $n = 120$ and $b = 8$, there are 1,968 nonzeros and 17 colors, reducing recordings to about one seventh of the 120 dense recordings.
+The natural-order color count is $2b + 1$ independently of $n$, so the larger $n$ becomes, the more recordings coloring saves.
+
+## Agreement of one-shot calls and the _into route
+
+The next cell uses the spring chain in natural order to compare the one-shot `sparse_jacobian` (tensions $F$) and `sparse_hessian` (energy $E$) with the manually assembled pattern, coloring, and `_into` route.
+The Hessian route performs `hessian_pattern`, `derivative_coloring`, and `sparse_hessian_into` on one `Tape<Dual<f64>>` and also compares its pattern with `Linearization::hessian_pattern` from a `Tape<f64>` recording.
+Inputs are the number of variables $n$ and spring reach $b$.
+For each comparison the table shows the nonzero count, color count, whether patterns (row offsets and column indices) agree, and the number of entries whose value bits differ.
+The final row shows the result of passing the distance-one coloring from `distance_one_coloring` to `sparse_hessian_into` on the same tape.
+
+```rust
+//| id: ad-sparse-one-shot
+//| ref: ad-sparse-one-shot
+//| title: "Compare one-shot sparse_jacobian and sparse_hessian with the _into route"
+//| run: reactive
+//| uses: [ad-sparse-spring-chain-model]
+//| crates: [scioxide-ad, scioxide-core, scioxide-sparse]
+//| inputs:
+//|   masses: {"type":"range","label":"Number of variables n","min":10,"max":120,"step":10,"value":40}
+//|   reach: {"type":"range","label":"Spring reach b","description":"Connect x_i and x_{i+d} (1 ≤ d ≤ b) with a spring.","min":1,"max":8,"step":1,"value":2}
+//| cases:
+//|   - {"id":"wide-band","label":"n = 120, b = 8","description":"The Hessian uses 17 colors and distance-one coloring uses 9.","inputs":{"masses":120,"reach":8}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"one-shot","path":"/rows/0/1","equals":154}
+//|       - {"artifact":"one-shot","path":"/rows/0/3","equals":"Equal"}
+//|       - {"artifact":"one-shot","path":"/rows/0/4","equals":0}
+//|       - {"artifact":"one-shot","path":"/rows/1/1","equals":194}
+//|       - {"artifact":"one-shot","path":"/rows/1/3","equals":"Equal"}
+//|       - {"artifact":"one-shot","path":"/rows/1/4","equals":0}
+//|       - {"artifact":"one-shot","path":"/rows/2/3","equals":"Equal"}
+//|       - {"artifact":"one-shot","path":"/rows/3/3","equals":"InvalidInput"}
+//|   - case: wide-band
+//|     expect:
+//|       - {"artifact":"one-shot","path":"/rows/1/2","equals":17}
+//|       - {"artifact":"one-shot","path":"/rows/1/4","equals":0}
+//|       - {"artifact":"one-shot","path":"/rows/3/3","equals":"InvalidInput"}
+use scioxide_ad::{Dual, Tape, sparse_hessian, sparse_jacobian};
+use scioxide_core::{ColoringSchedule, ExecutionContext, StructuralPattern};
+use scioxide_sparse::{CsrMatrix, derivative_coloring, distance_one_coloring};
+
+/// For a one-shot CSR and a pattern/value pair, compare patterns and count values with differing bits.
+fn compare(one: &CsrMatrix<f64>, pattern: &StructuralPattern, values: &[f64]) -> (bool, usize) {
+    let view = pattern.view();
+    let same = one.row_ptr() == view.row_ptr() && one.col_indices() == view.col_indices();
+    let differ =
+        core::iter::zip(one.values(), values).filter(|(a, b)| a.to_bits() != b.to_bits());
+    (same, differ.count())
+}
+
+let (n, b) = (masses as usize, reach as usize);
+let cx = ExecutionContext::sequential();
+let (point, place) = (chain_point(n), chain_placement(n, false));
+let label = |same: bool| if same { "Equal" } else { "Different" };
+
+// Tensions F: one-shot call versus linearize → jacobian_pattern → coloring → sparse_jacobian_into.
+let one = sparse_jacobian(
+    |x, y| {
+        bond_tensions(x, b, y);
+        Ok(())
+    },
+    &point,
+)
+.map_err(|e| e.to_string())?;
+let mut tape = Tape::<f64>::default();
+let mut linear = tape
+    .linearize(
+        |x, y| {
+            bond_tensions(x, b, y);
+            Ok(())
+        },
+        &point,
+        cx,
+    )
+    .map_err(|e| e.to_string())?;
+let pattern = linear.jacobian_pattern().map_err(|e| e.to_string())?;
+let colors = derivative_coloring(pattern.view()).map_err(|e| e.to_string())?;
+let mut values = vec![0.0; pattern.view().col_indices().len()];
+linear
+    .sparse_jacobian_into(&colors, &mut values, cx)
+    .map_err(|e| e.to_string())?;
+let (same, differ) = compare(&one, &pattern, &values);
+let (name, k) = ("sparse_jacobian (tensions F)", Some(colors.color_count()));
+let mut rows = vec![(name, one.nnz(), k, label(same), Some(differ))];
+
+// Energy E: one-shot call versus hessian_pattern → coloring → sparse_hessian_into on one Tape<Dual<f64>>.
+let one =
+    sparse_hessian(|x| Ok(chain_energy(x, b, &place)), &point).map_err(|e| e.to_string())?;
+let mut second = Tape::<Dual<f64>>::default();
+let pattern = second
+    .hessian_pattern(|x| Ok(chain_energy(x, b, &place)), &point, cx)
+    .map_err(|e| e.to_string())?;
+let colors = derivative_coloring(pattern.view()).map_err(|e| e.to_string())?;
+let distance_one = distance_one_coloring(pattern.view()).map_err(|e| e.to_string())?;
+let mut values = vec![0.0; pattern.view().col_indices().len()];
+let mut recover = |coloring: &ColoringSchedule| {
+    second.sparse_hessian_into(
+        |x| Ok(chain_energy(x, b, &place)),
+        &point,
+        coloring,
+        &mut values,
+        cx,
+    )
+};
+// Distance-one coloring is rejected and values remains unchanged.
+let rejected = match recover(&distance_one) {
+    Ok(()) => "Success".to_string(),
+    Err(e) => format!("{:?}", e.kind()),
+};
+recover(&colors).map_err(|e| e.to_string())?;
+let (same, differ) = compare(&one, &pattern, &values);
+let (name, k) = ("sparse_hessian (energy E)", Some(colors.color_count()));
+rows.push((name, one.nnz(), k, label(same), Some(differ)));
+
+// Linearization::hessian_pattern for the same E recorded on Tape<f64>.
+let mut plain = Tape::<f64>::default();
+let recorded = plain
+    .linearize(
+        |x, y| {
+            y.push(chain_energy(x, b, &place));
+            Ok(())
+        },
+        &point,
+        cx,
+    )
+    .and_then(|linear| linear.hessian_pattern())
+    .map_err(|e| e.to_string())?;
+let name = "Tape<Dual<f64>>::hessian_pattern and Linearization::hessian_pattern";
+rows.push((
+    name,
+    recorded.view().col_indices().len(),
+    None,
+    label(recorded == pattern),
+    None,
+));
+let (name, k) = (
+    "sparse_hessian_into with distance_one_coloring",
+    Some(distance_one.color_count()),
+);
+rows.push((name, one.nnz(), k, &rejected, None));
+let columns = serde_json::json!([
+    { "key": "0", "label": "Comparison" },
+    { "key": "1", "label": "Nonzero count", "type": "integer" },
+    { "key": "2", "label": "Color count", "type": "integer", "nullText": "−" },
+    { "key": "3", "label": "Pattern (result kind in the final row)" },
+    { "key": "4", "label": "Entries with differing value bits [count]", "type": "integer", "nullText": "−" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "one-shot" })
+);
+```
+
+At the defaults $n = 40$ and $b = 2$, `sparse_jacobian` recovers 154 nonzeros in 3 colors and `sparse_hessian` recovers 194 nonzeros in 5 colors; both patterns equal those of the `_into` route and all values have the same bits.
+The pattern from `Tape<Dual<f64>>::hessian_pattern` equals `Linearization::hessian_pattern` from a `Tape<f64>` recording.
+Distance-one coloring colors the graph of $H_E$ (joining vertices with $1 \le |i - j| \le b$) with $b + 1 = 3$ colors.
+In this coloring, columns $i$ and $i + b + 1$ of the same color share a nonzero in row $i + 1$, and direct recovery would add their entries together, so `sparse_hessian_into` checks the coloring kind and returns `InvalidInput`.
+The result is the same at $n = 120$ and $b = 8$: tensions use 9 colors, the Hessian 17, and distance-one coloring 9.
+
+## Summary
+
+For a sparse Jacobian or Hessian, obtain the pattern with `jacobian_pattern` or `hessian_pattern`, respectively, color it with `derivative_coloring`, and check that the color count is sufficiently smaller than $n$ before recovering with `sparse_jacobian_into` or `sparse_hessian_into`.
+Patterns apply only at points taking the same branches as the recording point and also include positions that become zero by cancellation.
+Because greedy color counts depend on variable ordering, give interacting variables nearby indices in banded problems and compare the color count with lower bounds ($\rho_{\max}$ or the number of mutually joined columns).
+`sparse_jacobian_into` performs one forward sweep per color without reexecuting the function; values agree bit for bit with the dense `JacobianMode::Forward` matrix and within rounding with the dense `JacobianMode::Reverse` matrix.
+`sparse_hessian_into` records the function once per color, so a new tape executes the function once more than the color count.
+For a single computation, `sparse_jacobian` and `sparse_hessian` perform the same procedure in one call and return a `CsrMatrix`; only colorings from `derivative_coloring` are accepted.
+
+## Further reading
+
+- [Taylor jets and higher-order coefficients](../taylor-jets/): examine Taylor arithmetic for directional derivatives above second order and mixed coefficients in two variables.
+- [Branches, masks, and table lookup](../control-flow/): use branch and mask rules to determine the range of points where a recorded pattern can be reused.
+- [Sparse Hessian recovery by coloring](../../examples/sparse-hessian-chain/): examine `hessian_pattern` and recovery by coloring in a physical example.
+- [Orderings and coloring](../../../scioxide-sparse/algorithms/orderings-and-coloring/): examine the definitions and computational cost of `derivative_coloring` and distance-one coloring.

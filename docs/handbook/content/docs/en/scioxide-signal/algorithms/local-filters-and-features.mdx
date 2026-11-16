@@ -1,0 +1,671 @@
+---
+title: "Local filters and peak detection"
+description: "Explain median, rank, Hampel, and local Wiener filters and streaming, endpoint extension, peak prominence and width definitions and selection, and peak detection through Ricker wavelet ridges across scales."
+sidebar:
+  order: 365
+references:
+  signal-local-rank-filters: "local-order-statistics-and-robust-filters"
+  signal-hampel-filter: "replacing-outliers-with-a-hampel-filter"
+  signal-local-wiener: "local-wiener-filters"
+  signal-local-filter-stream: "plans-and-streaming"
+  signal-peak-geometry: "peak-geometry-and-prominence"
+  signal-peak-selection: "peak-selection-and-workspace"
+  signal-ridge-detection: "ridges-across-scales"
+---
+
+Smoothing on the preceding page implicitly assumed nearly Gaussian noise without outliers.
+For signals with spike outliers or steps, least-squares fits are pulled toward outliers and blur steps.
+This page explains robust filters based on window order statistics or local variance, and methods that characterize and select signal peaks by position, prominence, and width.
+
+## Local order statistics and robust filters
+
+Take a window $W_i = \{x[i - r], \dots, x[i + r]\}$ of radius $r$ (size $w = 2r + 1$) around each sample.
+Samples outside the record repeat the nearest endpoint sample.
+`LocalFilterPlan::new(radius, kind)` is a plan applying the operation selected by `LocalFilter` to this window.
+
+- `Median` returns the window median.
+- `Rank { rank }` returns the value at zero-based position `rank` in the sorted window (`rank` must be less than $w$).
+  `rank = 0` gives a minimum filter, and `rank = w - 1` a maximum filter.
+- `Hampel { threshold }` replaces only samples classified as outliers with the median.
+- `Wiener { noise_variance }` gives an adaptive linear estimate from local mean and variance.
+
+Median, rank, and Hampel filters retain a sorted window and replace one sample on each shift.
+The first window costs $O(w \log w)$; later samples cost $O(w)$ each.
+Outputs are input samples themselves and introduce no rounding error.
+`LocalFilterPlan::order(offsets, rank)` creates a rank filter from an arbitrary strictly increasing set of offsets.
+Offsets may be asymmetric and need not include zero.
+When there are more than $\lfloor \log_2 w \rfloor + 1$ runs of consecutive integers, each window is sorted anew in $O(w \log w)$.
+The one-shot call `median_filter(input, radius)` equals `filter` on `LocalFilterPlan::new(radius, LocalFilter::Median)`; radius zero returns the record unchanged.
+
+The median filter removes isolated spikes of width at most $r$ and preserves step locations.
+It also removes peak tips and narrow valleys.
+The following Hampel filter targets outliers for replacement and leaves other samples unchanged.
+
+### Replacing outliers with a Hampel filter
+
+Compute the window median $m_i = \operatorname{median}(W_i)$ and median absolute deviation (MAD):
+
+$$
+\mathrm{MAD}_i = \operatorname{median}_{j = -r, \dots, r} \bigl| x[i + j] - m_i \bigr|
+$$
+
+
+$\hat\sigma_i = 1.4826\,\mathrm{MAD}_i$ estimates the standard deviation consistently for Gaussian data ($1.4826 \approx 1/\Phi^{-1}(3/4)$).
+Replace the center sample with the median only when
+
+$$
+\bigl| x[i] - m_i \bigr| > \tau\,\hat\sigma_i
+$$
+
+where the replacement value is $m_i$.
+Deviations equal to the threshold are not replaced.
+Specify $\tau \ge 0$ through `LocalFilter::Hampel { threshold }`; $\tau = 3$ is commonly used.
+If a majority of window samples are equal, giving MAD zero, every center sample differing from the median is replaced.
+The caller-provided-output API `filter_into` writes replaced sample indices in ascending order to `replacements` and returns their count.
+
+### Local Wiener filters
+
+Let $\mu_i$ be the window's local mean and $\sigma_i^2 = \frac{1}{w}\sum_j (x[i + j] - \mu_i)^2$ its local population variance.
+For a signal $x = s + e$ ($e$ is white noise of variance $\nu$), if $s$ within the window is modeled as a random variable with mean $\mu_i$ and variance $\sigma_i^2 - \nu$, the linear estimate minimizing mean squared error is
+
+$$
+\hat s[i] = \mu_i + \max\!\left(0,\ 1 - \frac{\nu}{\sigma_i^2}\right) \bigl(x[i] - \mu_i\bigr)
+$$
+
+
+Near high-variance steps ($\sigma_i^2 \gg \nu$), the input is nearly unchanged; in flat regions with local variance comparable to noise ($\sigma_i^2 \le \nu$), the output is the local mean.
+For $\nu = 0$, output equals input.
+The local Wiener filter updates local moments with compensated moving sums and recomputes them at least every $w$ samples, giving amortized cost $O(n + w)$ for $n$ samples.
+Rounding may differ from computing moments independently per window, but a constant window returns the center sample unchanged.
+
+`estimate_wiener_noise(input, radius)` returns the mean local population variance $\nu = \frac{1}{n}\sum_i \sigma_i^2$ over all samples as a noise variance estimate.
+Because local variance also includes signal changes, this estimate tends to exceed the noise variance.
+Empty input gives `InvalidInput`.
+
+### Plans and streaming
+
+The plan's `filter(input)` allocates and returns results; `filter_into(input, output, replacements, workspace, cx)` writes using storage prepared by `workspace(input_len)`.
+`filter_into` leaves output unchanged on failure.
+
+For sequences processed as they arrive, use the `LocalFilterStream` returned by `plan.stream()`.
+Output $i$ becomes writable after `delay()` later samples arrive (the largest positive offset, equal to $r$ for a centered window).
+`process_into(chunk, StreamChunk, output, replacements, workspace, cx)` writes available outputs and returns `StreamProgress` with counts consumed, produced, and replaced, plus the first output index.
+Output indices align with the original record and are not shifted by the delay.
+Passing `StreamChunk::Final` flushes remaining outputs through endpoint extension and closes the stream until `reset`.
+The stream returns the same output as batch processing regardless of chunk boundaries.
+State is held as a value, so save it with `clone` and restore it without allocation with `clone_from`.
+
+The following cell compares three filters on a signal $s_k$ of a step plus a slow sinusoid (200 samples), with Gaussian noise of standard deviation 0.1 and alternating-sign spikes every 23 samples.
+The table shows RMS errors against the true signal over the whole record and near the step (indices 95–105), alongside the Hampel replacement count.
+The second table shows the maximum difference from a Hampel computation sorting each window and applying the definition directly, plus the estimate from `estimate_wiener_noise`.
+
+```rust
+//| id: signal-robust-filters
+//| ref: signal-robust-filters
+//| title: "Remove spikes and noise with median, Hampel, and local Wiener filters"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-random, scioxide-signal]
+//| inputs:
+//|   radius: {"type":"range","label":"Window radius r [samples]","description":"Window size is 2r + 1.","min":1,"max":8,"step":1,"value":3}
+//|   threshold: {"type":"range","label":"Hampel threshold τ [-]","description":"Multiple of estimated standard deviation used to classify outliers.","min":0,"max":6,"step":0.5,"value":3}
+//|   spike_amplitude: {"type":"range","label":"Spike amplitude [-]","description":"Magnitude of outliers added every 23 samples.","min":0,"max":4,"step":0.5,"value":2}
+//|   seed: {"type":"range","label":"Random seed","description":"Choose the noise realization.","min":1,"max":20,"step":1,"value":3}
+//| cases:
+//|   - {"id":"no-spikes","label":"No spikes","description":"Without outliers, the Hampel filter replaces few samples.","inputs":{"spike_amplitude":0}}
+//|   - {"id":"zero-threshold","label":"τ = 0","description":"A zero-threshold Hampel filter approaches a median filter.","inputs":{"threshold":0}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"check","path":"/rows/0/0","range":{"max":0}}
+//|       - {"artifact":"check","path":"/rows/0/1","range":{"min":8}}
+//|   - case: zero-threshold
+//|     expect:
+//|       - {"artifact":"check","path":"/rows/0/0","range":{"max":0}}
+use scioxide_core::ExecutionContext;
+use scioxide_random::{Distribution, Normal, SeedableRng, SplitMix64};
+use scioxide_signal::{LocalFilter, LocalFilterPlan, estimate_wiener_noise, median_filter};
+use std::f64::consts::PI;
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let n = 200_usize;
+let r = radius.round() as usize;
+// True signal (reference using standard f64 functions): step at index 100 plus a slow sinusoid.
+let clean: Vec<f64> = (0..n)
+    .map(|k| f64::from(u8::from(k >= 100)) + 0.3 * (2.0 * PI * k as f64 / 80.0).sin())
+    .collect();
+let noise = Normal::new(0.0, 0.1).map_err(|e| e.to_string())?;
+let mut rng = SplitMix64::from_seed(seed as u64);
+let mut input = Vec::with_capacity(n);
+for (k, &value) in clean.iter().enumerate() {
+    let spike = if k % 23 == 7 {
+        spike_amplitude * if (k / 23) % 2 == 0 { 1.0 } else { -1.0 }
+    } else {
+        0.0
+    };
+    input.push(value + spike + noise.sample(&mut rng).map_err(|e| e.to_string())?);
+}
+
+let median = median_filter(&input, r).map_err(|e| e.to_string())?;
+let hampel_plan =
+    LocalFilterPlan::new(r, LocalFilter::Hampel { threshold }).map_err(|e| e.to_string())?;
+let mut hampel = vec![0.0; n];
+let mut replaced = vec![0_usize; n];
+let mut workspace = hampel_plan.workspace(n).map_err(|e| e.to_string())?;
+let replaced_count = hampel_plan
+    .filter_into(
+        &input,
+        &mut hampel,
+        &mut replaced,
+        &mut workspace,
+        ExecutionContext::sequential(),
+    )
+    .map_err(|e| e.to_string())?;
+let noise_variance = estimate_wiener_noise(&input, r).map_err(|e| e.to_string())?;
+let wiener = LocalFilterPlan::new(r, LocalFilter::Wiener { noise_variance })
+    .and_then(|plan| plan.filter(&input))
+    .map_err(|e| e.to_string())?;
+
+// Independent check: sort windows with repeated endpoints and apply the Hampel definition using the median and MAD.
+let median_of = |values: &mut Vec<f64>| {
+    values.sort_by(f64::total_cmp);
+    values[values.len() / 2]
+};
+let mut hand_count = 0_usize;
+let mut hand_gap = 0.0_f64;
+for i in 0..n {
+    let mut window: Vec<f64> = (0..2 * r + 1)
+        .map(|j| input[(i + j).saturating_sub(r).min(n - 1)])
+        .collect();
+    let center = median_of(&mut window);
+    let mut deviations: Vec<f64> = window.iter().map(|x| (x - center).abs()).collect();
+    let scale = 1.4826 * median_of(&mut deviations);
+    let outlier = (input[i] - center).abs() > threshold * scale;
+    hand_count += usize::from(outlier);
+    let expected = if outlier { center } else { input[i] };
+    hand_gap = hand_gap.max((hampel[i] - expected).abs());
+}
+
+let rms = |values: &[f64], range: std::ops::Range<usize>| {
+    let count = range.len() as f64;
+    (range.map(|k| (values[k] - clean[k]).powi(2)).sum::<f64>() / count).sqrt()
+};
+let rows = vec![
+    ("Input", rms(&input, 0..n), rms(&input, 95..106), None),
+    ("Median", rms(&median, 0..n), rms(&median, 95..106), None),
+    (
+        "Hampel",
+        rms(&hampel, 0..n),
+        rms(&hampel, 95..106),
+        Some(replaced_count),
+    ),
+    (
+        "Local Wiener",
+        rms(&wiener, 0..n),
+        rms(&wiener, 95..106),
+        None,
+    ),
+];
+let columns = serde_json::json!([
+    { "key": "0", "label": "Filter" },
+    { "key": "1", "label": "RMS error (whole record) [-]", "type": "number", "format": sci3 },
+    { "key": "2", "label": "RMS error (near step) [-]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "Replacement count [-]", "type": "integer", "nullText": "—" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "filters" })
+);
+let check_columns = serde_json::json!([
+    { "key": "0", "label": "Maximum difference from direct Hampel definition [-]", "type": "number", "format": sci3 },
+    { "key": "1", "label": "Replacements counted from definition [-]", "type": "integer" },
+    { "key": "2", "label": "Estimated noise variance ν [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    check_columns,
+    vec![(hand_gap, hand_count, noise_variance)],
+    metadata = serde_json::json!({ "id": "check" })
+);
+
+let curve = |values: &[f64]| -> Vec<[f64; 2]> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(k, &v)| [k as f64, v])
+        .collect()
+};
+emit_chart!(serde_json::json!({
+    "kind": "xy",
+    "xLabel": "Sample index k [-]",
+    "yLabel": "Value [-]",
+    "yMin": -2.5,
+    "yMax": 3.5,
+    "layers": [
+        { "id": "input", "kind": "scatter", "name": "Input", "points": curve(&input) },
+        {
+            "id": "clean",
+            "kind": "line",
+            "name": "True signal",
+            "points": curve(&clean),
+            "style": { "lineType": "dashed", "showSymbol": false }
+        },
+        { "id": "median", "kind": "line", "name": "Median", "points": curve(&median) },
+        { "id": "hampel", "kind": "line", "name": "Hampel", "points": curve(&hampel) },
+        { "id": "wiener", "kind": "line", "name": "Local Wiener", "points": curve(&wiener) }
+    ]
+}));
+```
+
+With defaults ($r = 3$, $\tau = 3$, amplitude 2, seed 3), the input RMS error is 0.435, compared with 0.100 for the median filter, 0.165 for Hampel, and 0.322 for local Wiener.
+The Hampel filter replaces 15 samples and differs from the direct definition by a maximum of zero.
+Outputs are input samples or window medians, so the difference is exactly zero without rounding error.
+The Hampel filter changes only classified outliers; noise in other samples remains, giving a larger whole-record RMS error than the median filter.
+The local Wiener filter treats outliers as regions of high local variance and leaves input nearly intact near spikes.
+Estimated noise variance $\nu$ is 0.156, combining the noise variance 0.01 with contributions from spikes and the step.
+
+Near the step (indices 95–105), RMS errors are 0.344 for the median filter and 0.590 for Hampel, the latter nearly unchanged from the input's 0.597.
+This interval contains a spike at index 99.
+When the Hampel window straddles the step, MAD grows to roughly the step height; threshold $\tau\hat\sigma_i$ exceeds spike amplitude, so the spike is not classified as an outlier.
+The median filter makes no such classification and removes this spike as well.
+In the “τ = 0” case, all center samples differing from their window median are replaced (162 samples), making Hampel output equal to median-filter output.
+In the “No spikes” case, Hampel replaces 8 samples, affecting only samples in the noise tails.
+
+## Peak geometry and prominence
+
+Simply finding local maxima produces many false peaks from small noise fluctuations.
+`find_peaks` measures prominence, a concept from topography, and width for every maximum.
+
+A peak is a constant-valued interval (plateau) $x[s] = \dots = x[e]$ with $0 < s \le e < n - 1$ and both neighbors $x[s - 1]$ and $x[e + 1]$ lower.
+Record endpoint samples are not peaks.
+The representative index is the plateau midpoint rounded down, $s + \lfloor (e - s)/2 \rfloor$.
+
+Prominence $P$ of a peak of height $h$ is defined as follows.
+
+1. Move left from the plateau until reaching a sample strictly higher than $h$ or the record end; the position of the minimum over that interval is the left base `left_base`.
+   If the minimum occurs more than once, choose the one nearest the peak.
+2. Proceed similarly to the right to find the right base `right_base`.
+3. Prominence is $P = h - \max(x[\text{left\_base}], x[\text{right\_base}])$, referenced to the higher base.
+
+Width is measured at contour height $h - \rho P$ for relative depth $\rho \in [0, 1]$ (`relative_height`).
+Scan outward from the plateau until reaching the first sample at or below the contour or the base, then linearly interpolate between that sample and its inward neighbor to find `left_crossing` and `right_crossing`.
+The width `width` is the crossing difference, a real value in sample units.
+The default $\rho = 1/2$ measures width at half prominence.
+For $\rho = 0$, the contour equals peak height and the plateau width is $e - s$.
+
+Bases and crossings are found by outward scans for up to 512 samples and by queries to minimum and maximum segment trees beyond that.
+Geometry for $p$ maxima in $n$ samples costs $O(n + p \log n)$.
+
+### Peak selection and workspace
+
+`PeakOptions` holds selection criteria.
+Height (`with_height`), prominence (`with_prominence`), and width (`with_width`) use closed `Interval` intervals; plateau sample counts use `with_plateau_size((low, high))` ($0 < \text{low} \le \text{high}$).
+`with_distance(d)` specifies the minimum distance between selected peaks; 0 and 1 impose no spacing condition.
+Defaults accept all peaks and measure width at half prominence.
+
+Interval criteria are applied to all peaks first, followed by the distance criterion on survivors.
+Distance selection takes higher peaks first, favoring smaller indices for equal heights, and removes remaining peaks less than $d$ samples from an accepted peak.
+Geometry is measured before selection, so removing peaks does not alter surviving peaks' bases or widths.
+Relative depth outside $[0, 1]$ or a plateau-size range violating $0 < \text{low} \le \text{high}$ gives `InvalidInput`.
+
+`find_peaks(input)` uses default criteria and `find_peaks_with_options(input, options)` specified criteria; both return selected peaks as a `Vec<Peak>` in ascending index order.
+Both allocate `PeakWorkspace` and $\lfloor n/2 \rfloor$ peak records.
+The caller-provided-output API `find_peaks_into(input, options, output, workspace, cx)` uses storage prepared with `PeakWorkspace::workspace(max_input_len)`, writes to the beginning of output, and returns the count written.
+`PeakWorkspace::workspace_requirements(max_input_len)` returns required sizes as `PeakRequirements`; grow storage with `try_reserve` and verify it with `check`.
+`output` only needs room for the selected peaks.
+
+`peak_properties(input, indices, relative_height)` accepts any index on a plateau and returns that peak's record in input order.
+The record matches what `find_peaks_with_options` returns for that peak.
+An index outside an interior maximum plateau gives `InvalidInput`.
+The caller-provided-output API `peak_properties_into` uses no workspace and measures each peak twice to validate all indices before writing.
+
+The following cell creates a 400-sample signal resembling a chromatogram, with three Gaussian peaks of different heights and widths on a sloping baseline plus Gaussian noise.
+Select by minimum prominence and minimum distance, then independently compute prominence of each selected peak by directly scanning according to its definition.
+Pass the same indices to `peak_properties` to check matching widths as well.
+
+```rust
+//| id: signal-peak-prominence
+//| ref: signal-peak-prominence
+//| title: "Select noisy signal peaks by prominence and distance"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-random, scioxide-signal]
+//| inputs:
+//|   min_prominence: {"type":"range","label":"Minimum prominence [-]","description":"Remove peaks with smaller prominence.","min":0,"max":1,"step":0.05,"value":0.3}
+//|   distance: {"type":"range","label":"Minimum distance d [samples]","description":"Minimum distance between selected peaks.","min":0,"max":60,"step":5,"value":10}
+//|   relative_height: {"type":"range","label":"Relative depth for width ρ [-]","description":"Depth of the width contour relative to prominence.","min":0,"max":1,"step":0.1,"value":0.5}
+//|   noise_level: {"type":"range","label":"Noise standard deviation [-]","description":"Gaussian noise magnitude.","min":0,"max":0.2,"step":0.01,"value":0.05}
+//|   seed: {"type":"range","label":"Random seed","description":"Choose the noise realization.","min":1,"max":20,"step":1,"value":5}
+//| cases:
+//|   - {"id":"all-maxima","label":"No selection","description":"Removing criteria makes every noise maximum a peak.","inputs":{"min_prominence":0,"distance":0}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/1","equals":3}
+//|       - {"artifact":"summary","path":"/rows/0/2","range":{"max":0}}
+//|       - {"artifact":"summary","path":"/rows/0/3","range":{"max":0}}
+//|   - case: all-maxima
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/1","range":{"min":20}}
+//|       - {"artifact":"summary","path":"/rows/0/2","range":{"max":0}}
+use scioxide_core::{ExecutionContext, Interval};
+use scioxide_random::{Distribution, Normal, SeedableRng, SplitMix64};
+use scioxide_signal::{Peak, PeakOptions, PeakWorkspace, find_peaks_into, peak_properties};
+
+let fixed3 = serde_json::json!({ "fractionDigits": 3 });
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let n = 400_usize;
+// Three peaks (center, height, standard deviation) and a sloping baseline. Reference values use standard f64 functions.
+let bumps = [(80.0, 1.0, 6.0), (200.0, 0.6, 15.0), (290.0, 1.4, 4.0)];
+let noise = Normal::new(0.0, noise_level.max(1e-12)).map_err(|e| e.to_string())?;
+let mut rng = SplitMix64::from_seed(seed as u64);
+let mut signal = Vec::with_capacity(n);
+for k in 0..n {
+    let t = k as f64;
+    let peaks: f64 = bumps
+        .iter()
+        .map(|&(c, a, s)| a * (-0.5 * ((t - c) / s).powi(2)).exp())
+        .sum();
+    let e = if noise_level > 0.0 {
+        noise.sample(&mut rng).map_err(|e| e.to_string())?
+    } else {
+        0.0
+    };
+    signal.push(0.2 + 0.001 * t + peaks + e);
+}
+
+let options = PeakOptions::default()
+    .with_prominence(Interval::new(min_prominence, f64::MAX).map_err(|e| e.to_string())?)
+    .with_distance(distance.round() as usize)
+    .with_relative_height(relative_height);
+// Prepare workspace once for the maximum input length and output for at most ⌊n/2⌋ selected peaks.
+let mut workspace = PeakWorkspace::workspace(n).map_err(|e| e.to_string())?;
+let mut output = vec![Peak::default(); n / 2];
+let count = find_peaks_into(
+    &signal,
+    options,
+    &mut output,
+    &mut workspace,
+    ExecutionContext::sequential(),
+)
+.map_err(|e| e.to_string())?;
+let peaks = &output[..count];
+
+// Independent check: scan left and right from the definition, using minima before strictly higher samples to compute prominence.
+let prominence_by_scan = |peak: &Peak<f64>| {
+    let h = signal[peak.index()];
+    let left = signal[..peak.plateau_start()]
+        .iter()
+        .rev()
+        .take_while(|&&x| x <= h)
+        .fold(f64::INFINITY, |m, &x| m.min(x));
+    let right = signal[peak.plateau_end() + 1..]
+        .iter()
+        .take_while(|&&x| x <= h)
+        .fold(f64::INFINITY, |m, &x| m.min(x));
+    h - left.max(right)
+};
+let scan_gap = peaks
+    .iter()
+    .map(|p| (p.prominence() - prominence_by_scan(p)).abs())
+    .fold(0.0, f64::max);
+let indices: Vec<usize> = peaks.iter().map(|p| p.index()).collect();
+let properties =
+    peak_properties(&signal, &indices, relative_height).map_err(|e| e.to_string())?;
+let width_gap = peaks
+    .iter()
+    .zip(&properties)
+    .map(|(a, b)| (a.width() - b.width()).abs())
+    .fold(0.0, f64::max);
+
+let summary_columns = serde_json::json!([
+    { "key": "0", "label": "Total maxima [-]", "type": "integer" },
+    { "key": "1", "label": "Selected peaks [-]", "type": "integer" },
+    { "key": "2", "label": "Maximum difference from scanned prominence [-]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "Maximum difference from peak_properties width [samples]", "type": "number", "format": sci3 }
+]);
+let all_maxima = scioxide_signal::find_peaks(&signal)
+    .map_err(|e| e.to_string())?
+    .len();
+emit_table_with_columns!(
+    summary_columns,
+    vec![(all_maxima, count, scan_gap, width_gap)],
+    metadata = serde_json::json!({ "id": "summary" })
+);
+let rows: Vec<(usize, f64, f64, f64, usize, usize)> = peaks
+    .iter()
+    .take(12)
+    .map(|p| {
+        (
+            p.index(),
+            signal[p.index()],
+            p.prominence(),
+            p.width(),
+            p.left_base(),
+            p.right_base(),
+        )
+    })
+    .collect();
+let columns = serde_json::json!([
+    { "key": "0", "label": "Index [-]", "type": "integer" },
+    { "key": "1", "label": "Height [-]", "type": "number", "format": fixed3 },
+    { "key": "2", "label": "Prominence [-]", "type": "number", "format": fixed3 },
+    { "key": "3", "label": "Width [samples]", "type": "number", "format": fixed3 },
+    { "key": "4", "label": "Left base [-]", "type": "integer" },
+    { "key": "5", "label": "Right base [-]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "peaks" })
+);
+
+let line: Vec<[f64; 2]> = signal
+    .iter()
+    .enumerate()
+    .map(|(k, &v)| [k as f64, v])
+    .collect();
+let marks: Vec<[f64; 2]> = peaks
+    .iter()
+    .map(|p| [p.index() as f64, signal[p.index()]])
+    .collect();
+emit_chart!(serde_json::json!({
+    "kind": "xy",
+    "xLabel": "Sample index k [-]",
+    "yLabel": "Signal [-]",
+    "layers": [
+        { "id": "signal", "kind": "line", "name": "Signal", "points": line },
+        {
+            "id": "peaks",
+            "kind": "scatter",
+            "name": "Selected peaks",
+            "points": marks,
+            "style": { "symbol": "triangle" }
+        }
+    ]
+}));
+```
+
+With defaults (minimum prominence 0.3, distance 10, $\rho = 0.5$, noise 0.05, seed 5), there are 127 maxima in total; selection retains only the three peaks at indices 80, 198, and 289.
+Both the difference from directly scanned prominence and the difference from `peak_properties` widths are zero.
+The broad second peak (center 200, standard deviation 15) has width 34.6 samples, close to its Gaussian full width at half maximum $2\sqrt{2\ln 2}\,\sigma \approx 35.3$ samples.
+Its prominence is 0.723, different from the peak height 0.6.
+Prominence is measured from the higher base, so baseline slope and noise shift it from peak height.
+The “No selection” case returns all 127 maxima as peaks; noise maxima have prominences around 0.01–0.2.
+Set minimum prominence based on noise magnitude and minimum distance shorter than peak width.
+
+## Ridges across scales
+
+A fixed prominence threshold is difficult to choose when peak widths vary and noise is large.
+`RidgePlan` transforms the signal with Ricker wavelets (Mexican hats) of different widths and identifies only maxima persisting across many scales (ridges) as peaks.
+
+Coefficients at scale $a$ (in samples) are
+
+$$
+c_a[i] = \sum_{|k| \le R} \psi_a(k)\,x[i + k], \qquad
+\psi_a(t) = \frac{2}{\sqrt{3a}\,\pi^{1/4}} \left(1 - \frac{t^2}{a^2}\right) e^{-t^2/(2a^2)}
+$$
+
+
+Here, $R$ is the kernel half-width shared by all scales, $\psi_a$ has unit $L^2$ norm, and samples outside the record repeat endpoint samples.
+At each scale, find positive interior maxima (plateau midpoints) and connect them from coarse to fine scales.
+Starting with stronger maxima, append each to the nearest ridge within the maximum distance that has not yet been extended at this scale and whose skipped-scale count remains within the limit.
+For equal distances, prefer the stronger ridge and then the smaller index; a maximum joining no ridge starts a new one.
+For ridges meeting the minimum length, return the maximum at their finest scale as a `RidgePeak`.
+If multiple ridges end at the same sample, return the one with the finest scale, then the longest length.
+
+`RidgeOptions` holds kernel half-width `with_support_radius` (default 10), maximum displacement for connected maxima `with_max_distance` (default 1), permitted skipped scales `with_max_gap` (default 0), minimum returned length `with_min_length` (default 1), and minimum connected coefficient `with_min_strength` (default 0).
+There is no signal-to-noise ratio criterion; use minimum strength and length instead.
+`RidgePlan::new(scales, options)` prepares $K(2R + 1)$ kernel values from positive, strictly increasing scales.
+Empty or nonincreasing scales, zero half-width, a minimum length of zero or greater than the scale count, or negative minimum strength gives `InvalidInput`.
+
+`RidgeRequirements` contains the requirements returned by `workspace_requirements(max_input_len)`, including $\lfloor n/2 \rfloor K$ ridge records.
+Prepare `RidgeWorkspace` with `plan.workspace(max_input_len)`; `find_peaks_into` does not grow it during execution.
+The standard `find_peaks(input)` form allocates workspace and output and returns `Vec<RidgePeak>` in sample-index order.
+Transformation costs $O(nKR)$; connecting costs $O(m \log m)$ per scale for $m$ maxima and open ridges.
+`RidgePeak` holds finest-scale index `index`, its scale number `scale_index`, connected maximum count `length`, and coefficient `strength` at that scale.
+
+The following cell applies `RidgePlan` at scales $a_j = 1.2^j$ ($j = 0, \dots, 15$, 1–15.4 samples) to a 320-sample signal containing a narrow peak (standard deviation 3 samples, index 100) and a broad peak (standard deviation 12 samples, index 220) plus Gaussian noise.
+Kernel half-width is 40 samples, maximum displacement 2 samples, and one skipped scale is permitted; inputs select minimum coefficient and length.
+Independently compute each returned peak's coefficient by summing the kernel directly from its definition within the cell and compare with `strength`.
+Also show the count from `find_peaks`, which returns all maxima.
+
+```rust
+//| id: signal-ridge-peaks
+//| ref: signal-ridge-peaks
+//| title: "Detect peaks with Ricker wavelet ridges"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-random, scioxide-signal]
+//| inputs:
+//|   noise_level: {"type":"range","label":"Noise standard deviation [-]","description":"Gaussian noise magnitude.","min":0,"max":0.3,"step":0.05,"value":0.1}
+//|   min_strength: {"type":"range","label":"Minimum coefficient [-]","description":"Do not connect maxima with smaller coefficients to ridges.","min":0,"max":0.5,"step":0.05,"value":0.3}
+//|   min_length: {"type":"range","label":"Minimum length [scales]","description":"Minimum number of connected maxima in a returned ridge.","min":1,"max":16,"step":1,"value":8}
+//|   seed: {"type":"range","label":"Random seed","description":"Choose the noise realization.","min":1,"max":20,"step":1,"value":2}
+//| cases:
+//|   - {"id":"short-ridges","label":"Minimum length 1","description":"Allowing short ridges also admits noise maxima as peaks.","inputs":{"min_length":1}}
+//|   - {"id":"no-strength","label":"Minimum coefficient 0","description":"Connecting weak maxima lets noise ridges extend further.","inputs":{"min_strength":0}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"counts","path":"/rows/0/1","equals":2}
+//|       - {"artifact":"ridges","path":"/rows/0/0","approx":{"value":100,"atol":3}}
+//|       - {"artifact":"ridges","path":"/rows/1/0","approx":{"value":220,"atol":5}}
+//|       - {"artifact":"ridges","path":"/rows/0/5","range":{"max":1e-12}}
+//|       - {"artifact":"ridges","path":"/rows/1/5","range":{"max":1e-12}}
+//|   - case: short-ridges
+//|     expect:
+//|       - {"artifact":"counts","path":"/rows/0/1","range":{"min":3}}
+//|   - case: no-strength
+//|     expect:
+//|       - {"artifact":"counts","path":"/rows/0/1","range":{"min":5}}
+use scioxide_core::ExecutionContext;
+use scioxide_random::{Distribution, Normal, SeedableRng, SplitMix64};
+use scioxide_signal::{RidgeOptions, RidgePeak, RidgePlan, find_peaks};
+use std::f64::consts::PI;
+
+let fixed3 = serde_json::json!({ "fractionDigits": 3 });
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let n = 320_usize;
+let noise = Normal::new(0.0, noise_level.max(1e-12)).map_err(|e| e.to_string())?;
+let mut rng = SplitMix64::from_seed(seed as u64);
+let mut signal = Vec::with_capacity(n);
+for k in 0..n {
+    let t = k as f64;
+    // Two Gaussian peaks (reference using standard f64 functions).
+    let clean = (-0.5 * ((t - 100.0) / 3.0).powi(2)).exp()
+        + (-0.5 * ((t - 220.0) / 12.0).powi(2)).exp();
+    let e = if noise_level > 0.0 {
+        noise.sample(&mut rng).map_err(|e| e.to_string())?
+    } else {
+        0.0
+    };
+    signal.push(clean + e);
+}
+
+let scales: Vec<f64> = (0..16).map(|j| 1.2_f64.powi(j)).collect();
+let radius = 40_usize;
+let options = RidgeOptions::default()
+    .with_support_radius(radius)
+    .with_max_distance(2)
+    .with_max_gap(1)
+    .with_min_strength(min_strength)
+    .with_min_length(min_length.round() as usize);
+let plan = RidgePlan::new(&scales, options).map_err(|e| e.to_string())?;
+let mut workspace = plan.workspace(n).map_err(|e| e.to_string())?;
+let mut output = vec![RidgePeak::default(); n];
+let count = plan
+    .find_peaks_into(
+        &signal,
+        &mut output,
+        &mut workspace,
+        ExecutionContext::sequential(),
+    )
+    .map_err(|e| e.to_string())?;
+
+// Independent check: sum the Ricker kernel from its definition with repeated endpoints to obtain coefficients.
+let ricker = |a: f64, t: f64| {
+    2.0 / ((3.0 * a).sqrt() * PI.powf(0.25))
+        * (1.0 - (t / a).powi(2))
+        * (-t * t / (2.0 * a * a)).exp()
+};
+let coefficient = |a: f64, i: usize| {
+    (-(radius as isize)..=radius as isize)
+        .map(|k| {
+            let j = (i as isize + k).clamp(0, n as isize - 1) as usize;
+            ricker(a, k as f64) * signal[j]
+        })
+        .sum::<f64>()
+};
+let rows: Vec<(usize, usize, f64, usize, f64, f64)> = output[..count]
+    .iter()
+    .map(|p| {
+        let scale = scales[p.scale_index()];
+        let direct = coefficient(scale, p.index());
+        (
+            p.index(),
+            p.scale_index(),
+            scale,
+            p.length(),
+            p.strength(),
+            (p.strength() - direct).abs() / direct.abs(),
+        )
+    })
+    .collect();
+let columns = serde_json::json!([
+    { "key": "0", "label": "Index [-]", "type": "integer" },
+    { "key": "1", "label": "Scale index [-]", "type": "integer" },
+    { "key": "2", "label": "Scale a [samples]", "type": "number", "format": fixed3 },
+    { "key": "3", "label": "Length [scales]", "type": "integer" },
+    { "key": "4", "label": "Coefficient [-]", "type": "number", "format": fixed3 },
+    { "key": "5", "label": "Relative difference from direct sum [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "ridges" })
+);
+let all_maxima = find_peaks(&signal).map_err(|e| e.to_string())?.len();
+let count_columns = serde_json::json!([
+    { "key": "0", "label": "find_peaks maxima [-]", "type": "integer" },
+    { "key": "1", "label": "Ridge peaks [-]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    count_columns,
+    vec![(all_maxima, count)],
+    metadata = serde_json::json!({ "id": "counts" })
+);
+```
+
+With defaults (noise 0.1, minimum coefficient 0.3, minimum length 8, seed 2), `find_peaks` returns 98 maxima, while ridge detection returns only 2 peaks.
+The narrow peak is found at index 101 (scale 1.2, length 15), and the broad peak at index 223 (scale 2.99, length 10); coefficients agree with direct sums to relative differences at most $10^{-15}$.
+The broad peak's coefficient falls below the threshold at fine scales, so its ridge stops near scale 3, where noise displaces the maximum by a few samples.
+The noise coefficient standard deviation is about 0.1, so few noise maxima exceed 0.3 and they do not form long ridges.
+The “Minimum length 1” case also shows ridges of length 1, giving 3 peaks.
+The “Minimum coefficient 0” case connects weak maxima; noise ridges extending from fine scales grow to length at least 8, giving 23 peaks.
+Set minimum coefficient from noise magnitude and minimum length from the range of scales at which real peaks appear.
+
+## Summary
+
+For signals with outliers, first remove them with a median or Hampel filter; Hampel replacement indices let you inspect its decisions.
+The local Wiener filter mixes local mean and input according to local variance; `estimate_wiener_noise` estimates noise variance but tends to overestimate it by including signal changes.
+Select peaks by prominence, width, and minimum distance; geometry is measured before selection, so `peak_properties` can remeasure specific peaks under the same conventions.
+To find peaks of varying widths in noise, select by Ricker wavelet ridge length.
+See [Checking smoothing, peaks, and outliers](../../examples/smoothing-peaks-and-outliers/) for plateau conventions and Hampel streaming, and [Smoothing and detrending](../smoothing-and-detrending/) for reducing noise before measuring features.

@@ -1,0 +1,273 @@
+---
+title: "External FFT implementations and CPU instruction sets"
+description: "Explain external FFT injection through FftProvider, SciOxide's checks and implementer obligations, provider resource limits, and CPU instruction-set and execution-policy selection."
+sidebar:
+  order: 313
+references:
+  fft-providers: "injecting-an-external-fft-implementation"
+  fft-provider-contract: "scioxide-checks-and-implementer-responsibilities"
+  fft-provider-limits: "resource-limits"
+  fft-execution-environment: "cpu-instruction-sets-and-execution-policies"
+---
+
+[FFT plans, workspaces, and caches](../plans-workspaces-and-providers/) showed how plans are prepared from contexts without retaining them afterward.
+This page explains placing an external FFT implementation in the preparation context to delegate the plan's complex FFTs to it.
+Readers using external libraries or accelerators should examine the boundary between SciOxide's checks and implementer obligations.
+Finally, it explains instruction-set and execution-policy selection for SciOxide's own CPU implementations.
+
+## Injecting an external FFT implementation
+
+To use an external FFT, implement `FftProvider`, add it to a preparation context with `FftPlanningContext::with_provider(execution, provider, policy)`, and pass that context to `build` or `cache.plan`.
+The context borrows the provider and cannot outlive it.
+A plan retains no context, so a prepared plan also holds no provider reference.
+The plan shares externally prepared state as `Arc<dyn FftProviderPlan<S>>`; the caller supplies execution workspace.
+
+Complex FFTs of length at least 2 inside a plan are offered to the provider first.
+This includes inner complex FFTs of real, multidimensional, DCT/DST, chirp Z, nonuniform Fourier, and FFTLog transforms; the same context can be passed to `build` for any transform.
+When a declined length is computed by CPU Rader or Bluestein, the inner convolution FFT is not offered to the provider.
+
+- `FftProvider::prepare(length, policy, limits, context)` prepares unscaled transforms in both directions for that length and returns `Ok(Some(plan))`, or declines the length with `Ok(None)`.
+  `Err` propagates directly as a preparation failure rather than falling back to the CPU implementation.
+- `FftProviderPolicy::Preferred` prepares declined lengths with SciOxide's CPU implementation; `Required` gives `InvalidInput` (`UnsupportedConfiguration`).
+  The specification's `FftBackendStrategy` selects the CPU implementation for declined lengths.
+- `FftProviderPlan::execute(direction, data, scratch, context)` computes an unscaled DFT in place.
+  Exponent signs are $-$ for `Forward` and $+$ for `Inverse`, matching the [DFT definition](oxref:fft-dft-definition).
+- `workspace_len()` declares the required complex workspace count, `plan_bytes()` retained bytes, and `preparation_bytes()` peak simultaneously live preparation bytes (at least `plan_bytes()`).
+- `diagnostics()` is the value shown in plan diagnostics, constructed with `FftPlanDiagnostics::for_provider(stage_count)`.
+  The plan's `diagnostics().algorithm()` then returns `Provider`, and `resolved_backends()` returns `FftBackend::Provider`.
+
+## SciOxide checks and implementer responsibilities
+
+Responsibility for each check is assigned between the external implementation and SciOxide.
+SciOxide performs the following.
+
+- Check cancellation and deadlines before calling the provider and after `prepare` returns (`ExecutionStopped`).
+- Prepare declined lengths with a CPU implementation according to `FftProviderPolicy`, or give `InvalidInput`.
+- Compare declared workspace and storage against limits ([Resource limits](#resource-limits)).
+- Scale input down by a power of 2 before execution, then restore its scale and apply normalization afterward.
+- Return NaN or infinite results as `NonFinite` (origin `Callback`).
+- Propagate `Err` returned by `execute` directly to the caller and discard the contents of `data`.
+  Every failure leaves the caller's output unchanged.
+
+Implementers must meet the following obligations, which SciOxide does not check.
+
+- `execute` computes the unscaled DFT with the sign convention above.
+  Result accuracy is not checked.
+- `FftProviderPlan` is shared across threads through `Send + Sync`, so it does not allocate or mutate state during execution.
+- A prepared plan owns all its state and retains no preparation context.
+- `execute` assumes workspace contents are unspecified on entry.
+- `execute` accepts every execution context (including `ExecutionContext::sequential()`) and completes all work before returning.
+  Processor requirements are checked during preparation.
+- `prepare` respects `limits` before allocating and uses only capabilities reported by `context`.
+
+The tested range in [Cost and rounding error](oxref:fft-cost-and-accuracy) for SciOxide CPU implementations does not apply to external implementations.
+A plan using an external implementation has the accuracy of that implementation.
+
+## Resource limits
+
+`FftProviderLimits` limits provider `preparation_bytes` (simultaneously live preparation bytes) and `workspace_bytes` (workspace bytes required by the prepared plan), both defaulting to `usize::MAX`.
+`with_provider_limits` replaces limits with their minimum against current values, so repeated calls only tighten them.
+The provider must respect limits before allocating; SciOxide rechecks declared sizes after preparation.
+A declaration exceeding limits gives `ResourceLimit`; `preparation_bytes()` below `plan_bytes()` gives `InvalidInput` (`OutOfRange`).
+The prepared plan's `workspace_requirements(()).byte_limit()` applies the limit to the provider portion and adds the storage used by SciOxide itself.
+
+The following cell builds a provider wrapping a pair of unscaled length-8 SciOxide plans in place of an external library.
+The provider accepts only length 8 and shares prepared state without allocating new storage.
+Using the selected policy, it prepares a length-8 complex transform, a length-6 complex transform, and a length-16 real transform (whose inner complex FFT has length 8).
+Transforming an all-ones sequence with `Orthonormal` gives DC bin $\sqrt N$, providing an independent check.
+For a tight limit, supply `workspace_bytes` with 64 bytes, smaller than the provider workspace (16 complex values, 256 bytes).
+
+```rust
+//| id: fft-provider-fallback
+//| ref: fft-provider-fallback
+//| title: "Examine how external-implementation policy and limits change preparation results"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-fft]
+//| inputs:
+//|   policy: {"type":"select","label":"FftProviderPolicy","description":"Choose how to handle lengths declined by the provider.","options":["Preferred","Required"],"value":"Preferred"}
+//|   tight_limit: {"type":"checkbox","label":"Limit workspace_bytes to 64 bytes","value":false}
+//| cases:
+//|   - {"id":"required","label":"Required","description":"Preparation for declined length 6 gives InvalidInput.","inputs":{"policy":"Required"}}
+//|   - {"id":"tight-limit","label":"64-byte limit","description":"Preparation for accepted lengths gives ResourceLimit.","inputs":{"tight_limit":true}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"provider","path":"/rows/0/2","equals":"Provider"}
+//|       - {"artifact":"provider","path":"/rows/1/2","equals":"Cpu(Scalar)"}
+//|       - {"artifact":"provider","path":"/rows/2/2","equals":"Provider"}
+//|       - {"artifact":"provider","path":"/rows/0/4","approx":{"value":2.8284271247461903,"rtol":1e-14}}
+//|       - {"artifact":"provider","path":"/rows/2/4","approx":{"value":4,"rtol":1e-14}}
+//|   - case: required
+//|     expect:
+//|       - {"artifact":"provider","path":"/rows/1/2","equals":"InvalidInput"}
+//|       - {"artifact":"provider","path":"/rows/1/4","equals":null}
+//|   - case: tight-limit
+//|     expect:
+//|       - {"artifact":"provider","path":"/rows/0/2","equals":"ResourceLimit"}
+//|       - {"artifact":"provider","path":"/rows/1/2","equals":"Cpu(Scalar)"}
+use scioxide_core::{Complex, ExecutionContext, ExecutionPolicy, SciOxideError};
+use scioxide_fft::{
+    FftDirection, FftLayout, FftPlan, FftPlanDiagnostics, FftPlanSpec, FftPlanningContext,
+    FftProvider, FftProviderLimits, FftProviderPlan, FftProviderPolicy, HermitianSpectrum,
+    Normalization,
+};
+use std::sync::Arc;
+
+// External-library substitute: a pair of unscaled length-8 plans
+#[derive(Debug)]
+struct Pair {
+    forward: FftPlan<f64>,
+    inverse: FftPlan<f64>,
+    scratch: usize,
+}
+impl FftProviderPlan<f64> for Pair {
+    fn workspace_len(&self) -> usize {
+        self.scratch
+    }
+    fn plan_bytes(&self) -> usize {
+        self.forward.plan_bytes() + self.inverse.plan_bytes()
+    }
+    fn preparation_bytes(&self) -> usize {
+        self.plan_bytes()
+    }
+    fn diagnostics(&self) -> FftPlanDiagnostics {
+        FftPlanDiagnostics::for_provider(self.forward.diagnostics().stage_count())
+    }
+    fn execute(
+        &self,
+        direction: FftDirection,
+        data: &mut [Complex<f64>],
+        scratch: &mut [Complex<f64>],
+        context: ExecutionContext<'_>,
+    ) -> Result<(), SciOxideError> {
+        let plan = match direction {
+            FftDirection::Forward => &self.forward,
+            FftDirection::Inverse => &self.inverse,
+        };
+        plan.execute_in_place(data, scratch, context)
+    }
+}
+struct Adapter(Arc<Pair>);
+impl FftProvider<f64> for Adapter {
+    fn prepare(
+        &self,
+        length: usize,
+        _: ExecutionPolicy,
+        _: FftProviderLimits,
+        _: ExecutionContext<'_>,
+    ) -> Result<Option<Arc<dyn FftProviderPlan<f64>>>, SciOxideError> {
+        // Accept only length 8, declining all others with Ok(None).
+        // Only share prepared state, without allocating new storage.
+        Ok((length == 8).then(|| Arc::clone(&self.0) as Arc<dyn FftProviderPlan<f64>>))
+    }
+}
+
+let cx = ExecutionContext::sequential();
+let unscaled = |direction| {
+    let spec = FftPlanSpec::new(8, direction, Normalization::Unscaled, FftLayout::Complex);
+    FftPlan::<f64>::build(spec, cx)
+};
+let forward = unscaled(FftDirection::Forward).map_err(|e| e.to_string())?;
+let scratch = forward
+    .workspace_requirements(())
+    .map_err(|e| e.to_string())?
+    .complex_len();
+let inverse = unscaled(FftDirection::Inverse).map_err(|e| e.to_string())?;
+let adapter = Adapter(Arc::new(Pair {
+    forward,
+    inverse,
+    scratch,
+}));
+let rule = if policy == "Required" {
+    FftProviderPolicy::Required
+} else {
+    FftProviderPolicy::Preferred
+};
+let limits = FftProviderLimits {
+    preparation_bytes: usize::MAX,
+    workspace_bytes: if tight_limit { 64 } else { usize::MAX },
+};
+let planning =
+    FftPlanningContext::with_provider(cx, &adapter, rule).with_provider_limits(limits);
+let mut rows = Vec::new();
+for (n, layout) in [
+    (8, FftLayout::Complex),
+    (6, FftLayout::Complex),
+    (16, FftLayout::Real),
+] {
+    let spec = FftPlanSpec::new(n, FftDirection::Forward, Normalization::Orthonormal, layout);
+    // Show preparation failures as row results using e.kind()
+    let (outcome, dc) = match FftPlan::<f64>::build(spec, planning) {
+        Ok(plan) => {
+            let backends: Vec<String> =
+                plan.resolved_backends().map(|b| format!("{b:?}")).collect();
+            let mut work = plan.workspace(()).map_err(|e| e.to_string())?;
+            let dc = if layout == FftLayout::Complex {
+                let mut data = vec![Complex::new(1.0, 0.0); n];
+                plan.execute_in_place(&mut data, &mut work, cx)
+                    .map_err(|e| e.to_string())?;
+                data[0].re
+            } else {
+                let mut bins = HermitianSpectrum::zeros(n).map_err(|e| e.to_string())?;
+                plan.execute_into(&vec![1.0; n], &mut bins, &mut work, cx)
+                    .map_err(|e| e.to_string())?;
+                bins.bins()[0].re
+            };
+            (backends.join(", "), Some(dc))
+        }
+        Err(e) => (format!("{:?}", e.kind()), None),
+    };
+    rows.push((n, format!("{layout:?}"), outcome, (n as f64).sqrt(), dc));
+}
+let digits = serde_json::json!({ "significantDigits": 15 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "N", "type": "integer" },
+    { "key": "1", "label": "Layout" },
+    { "key": "2", "label": "resolved_backends() or error classification" },
+    { "key": "3", "label": "Check √N [-]", "type": "number", "format": digits },
+    { "key": "4", "label": "DC bin [-]", "type": "number", "format": digits, "nullText": "Not prepared" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "provider" })
+);
+```
+
+With default `Preferred`, the length-8 complex transform and inner length-8 FFT of the length-16 real transform use `Provider`; declined length 6 is prepared with `Cpu(Scalar)`.
+Every DC bin agrees with $\sqrt N$ within rounding (a 1-ulp difference for length 8).
+The provider returns unscaled results; SciOxide applies the $1/\sqrt N$ factor for `Orthonormal`.
+Selecting `Required` makes length-6 preparation give `InvalidInput`.
+At a 64-byte limit, the provider's declared 256-byte workspace exceeds the limit, so lengths 8 and 16 give `ResourceLimit` during preparation.
+Declined length 6 is prepared with the CPU implementation regardless of the limit.
+
+## CPU instruction sets and execution policies
+
+CPU FFT implementations include a portable scalar kernel, x86-64 AVX2 with FMA, and AArch64 NEON.
+`FftBackendStrategy::Automatic` uses AVX2/FMA or NEON when reported by the context, and the scalar kernel otherwise.
+`Required(backend)` requires that implementation; if the context does not report it, preparation fails with `InvalidInput` (`UnsupportedConfiguration`).
+In a context with an external implementation, the requested instruction set applies only to declined lengths and is first checked when a CPU implementation is actually prepared.
+There is no AVX-512 FFT implementation, so `Required(KernelBackend::Avx512)` fails on every host regardless of external implementations.
+Without feature `std`, `new` also prepares the scalar kernel.
+
+Execution policy (`ExecutionPolicy`) determines whether the context's executor processes work in parallel.
+Parallel work covers early stages of sufficiently long complex FFTs, assigning independent contiguous intervals to separate workers.
+Partitioning depends on the plan and worker count, so results do not depend on thread scheduling order.
+Short transforms run sequentially regardless of policy.
+
+This book's cells run sequentially on wasm32 and prepare with `ExecutionContext::sequential()`, so they use the scalar kernel.
+`usize` is 32-bit.
+Using `FftPlan::new` natively may select AVX2/FMA or similar kernels, changing rounding order and potentially the last digits of results.
+
+## Summary
+
+An external FFT implementation is borrowed through `FftPlanningContext::with_provider` only during preparation; the plan shares prepared state through `Arc`.
+`FftProviderPolicy` determines declined-length handling and `FftProviderLimits` storage limits; SciOxide rechecks declared sizes after preparation.
+SciOxide handles normalization, value-range scaling, non-finite detection, and preserving output on failure; implementers are responsible for unscaled-DFT correctness and accuracy and allocation-free execution.
+CPU instruction sets are selected from context capabilities; cell results use the scalar kernel.
+
+## Further reading
+
+- [FFT plans, workspaces, and caches](../plans-workspaces-and-providers/) examines workspace and cache rules for plans without external implementations.
+- [FFT algorithms and arbitrary lengths](../planner-and-arbitrary-lengths/) examines CPU algorithms for declined lengths and their tested error ranges.
+- [API guide](../../api/) lists types including `FftProvider`, `FftProviderPlan`, and `FftPlanningContext`.

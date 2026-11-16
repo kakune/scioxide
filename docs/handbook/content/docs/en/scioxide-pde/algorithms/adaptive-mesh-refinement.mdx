@@ -1,0 +1,637 @@
+---
+title: "Error-estimator-based adaptive refinement"
+description: "Conforming nodal spaces with hanging-node constraints, scalar diffusion assembly on adaptive meshes, residual a posteriori estimators and effectivity indices, Dörfler marking, and coarsening candidates."
+sidebar:
+  order: 365
+references:
+  pde-amr-diffusion: "diffusion-assembly-and-solution"
+  pde-amr-hanging-constraints: "hanging-node-constraints-and-conforming-spaces"
+  pde-amr-loop: "adaptive-refinement-cycle"
+  pde-amr-marking: "dörfler-marking"
+  pde-amr-nodal-field: "prolongation-matrix-and-reduced-system"
+  pde-amr-residual-estimator: "residual-error-estimator"
+---
+
+For problems whose solution derivatives diverge at corners or material interfaces, errors on uniformly refined meshes decrease only slowly with the number of degrees of freedom.
+Adaptive mesh refinement (AMR) estimates the error distribution from the computed solution and refines only cells with large errors.
+Each refinement creates a new mesh with changed cell counts and numbering.
+Following the `scioxide-spatial` chapter, each mesh is called a revision here too.
+
+Among the `Amr*` items in `scioxide-pde`, this page explains nodal spaces, diffusion assembly, error estimators, and marking mathematically, with two cells for examination.
+[Field transfer between adaptive mesh revisions](../adaptive-field-transfer/) covers transfers before and after refinement.
+Mesh hierarchies, refinement, 2:1 balance, and topology correspondence between revisions belong to `AdaptiveMesh` in `scioxide-spatial` and are covered in [Adaptive mesh refinement and topology correspondence](../../../scioxide-spatial/algorithms/adaptive-mesh-and-shared-tessellation/).
+[Corner singularities and adaptive refinement on an L-shaped domain](../../examples/l-shaped-amr/) measures convergence rates for an L-shaped corner singularity.
+
+## Adaptive refinement cycle
+
+Adaptive refinement repeats four stages (solve–estimate–mark–refine).
+
+1. Solve: compute discrete solution $u_h$ on the current revision's mesh.
+2. Estimate: compute error indicator $\eta_K$ for each cell $K$.
+3. Mark: select cells to refine (and cell families to coarsen).
+4. Refine: create a new revision following the marks and transfer fields and boundary labels to it.
+
+| Stage | Responsible types | Owning crate |
+|---|---|---|
+| Nodal spaces and constraints | `AmrSpace`, `AmrOrder`, `AmrOptions`, `AmrLimits`, `AmrMap` | `scioxide-pde` |
+| Assembly | `AmrDiffusionPlan`, `AmrDiffusionData`, `AmrBoundaryTags` | `scioxide-pde` |
+| Solve | Linear solvers such as conjugate gradients (CG) and algebraic multigrid | `scioxide-linalg`, `scioxide-sparse` |
+| Estimate | `AmrResidual`, `AmrEstimator`, `AmrEstimatorWorkspace`, `AmrIndicators` | `scioxide-pde` |
+| Mark | `AmrMarking`, `AmrMarks` | `scioxide-pde` |
+| Refine | `AdaptiveMesh::adapt`, `TopologyMap` | `scioxide-spatial` |
+| Transfer | `AmrCellTransfer`, `AmrNodalTransfer`, `AmrMassSolve`, `AmrProjectionReport`, `AmrTransferWorkspace` | `scioxide-pde` |
+
+The user calls each stage in order.
+The library does not run the cycle automatically; the caller also decides when to stop (estimator below tolerance or degree-of-freedom limit reached).
+`AdaptiveMesh` is immutable after construction, so replace the old revision, space, labels, and fields only after all new ones have been created.
+If any stage fails, the old revision and its associated values remain usable.
+[Field transfer between adaptive mesh revisions](../adaptive-field-transfer/) explains field and label transfer.
+
+## Hanging-node constraints and conforming spaces
+
+The problem is scalar diffusion on domain $\Omega\subset\mathbb{R}^D$ ($D=1,2,3$).
+
+$$
+-\nabla\cdot(k\nabla u)=f \quad\text{in }\Omega,\qquad k>0 \text{ is cellwise constant}
+$$
+
+Impose Dirichlet, natural (specified flux), or Robin boundary conditions.
+[FDM, FEM, and FVM for elliptic problems](oxref:pde-fem-weak-form) and [Finite elements on simplex meshes](../simplex-finite-elements/) derive weak forms and piecewise-polynomial bases.
+
+`AmrOrder` selects the nodal field type.
+`P1` uses linear polynomials from triangle or tetrahedron vertex values, `P2` uses quadratics from vertex and edge-midpoint values, and `Q1` uses multilinear polynomials from segment, quadrilateral, or hexahedron vertices.
+Use `P1` or `P2` for simplex meshes and `Q1` for grid cells; a mismatched combination makes `AmrSpace` preparation return `InvalidInput`.
+
+### Hanging nodes
+
+When cells of different refinement levels share a face, fine-cell vertices or edge midpoints lie inside the coarse face.
+These are hanging nodes (called hanging vertices in the `scioxide-spatial` chapter).
+Leaving hanging-node values free makes functions discontinuous across the coarse–fine interface and outside $H^1$.
+Instead determine hanging-node values from basis functions on the coarse face.
+
+$$
+u_j=\sum_{i\in\mathcal{M}(j)} w_{ji}\,u_i,\qquad w_{ji}=\phi_i^{\text{coarse}}(x_j)
+$$
+
+Here $x_j$ is the hanging-node location, $\mathcal{M}(j)$ the coarse-face nodes (master nodes), and $\phi_i^{\text{coarse}}$ the coarse-cell basis functions.
+For P1 on a 2:1-balanced two-dimensional mesh, each hanging node is a coarse-edge midpoint whose value is the average of the endpoint values.
+In three dimensions, cells sharing only an edge can differ by at least two levels, creating chains where master nodes are themselves hanging ([Hanging vertices, edges, faces, and interfaces](oxref:spatial-adaptive-hanging)).
+
+`AmrSpace` constructs constraints at every coarse–fine interface during preparation.
+Weights are coarse-cell basis values at node reference coordinates; entries at most $64\varepsilon$ are dropped, then normalized to sum to 1 ($\varepsilon$ is machine epsilon).
+A sum below $1/2$, cyclic constraints, or constraints from multiple faces differing by more than $1024\varepsilon$ returns `InvalidInput`.
+Chains are expanded by substituting master-node constraints, so all resulting weights multiply independent nodes.
+
+### Prolongation matrix and reduced system
+
+For the full-node vector $\mathbf{u}$ (including hanging nodes) and independent-node values $\mathbf{x}$, constraints are $\mathbf{u}=P\mathbf{x}$.
+$P$ is a prolongation matrix with identity rows at independent nodes and weight rows $w_{ji}$ at hanging nodes.
+The conforming space is the range of $P$, with stiffness matrix $P^{\mathsf T}AP$ and load $P^{\mathsf T}\mathbf{F}$.
+$P^{\mathsf T}$ distributes hanging-node loads to master nodes; it does not restrict nodal values.
+
+`AmrSpace::constraints` returns $P$ as `AmrMap`.
+`AmrMap` contains a canonical CSR matrix of real weights (`matrix()`), acting on real and complex vectors as `LinearOperator` ($P\mathbf{x}$) and `AdjointOperator` ($P^{\mathsf T}\mathbf{y}$).
+`full_dofs` returns full-node count, `independent_dofs` independent-node count (including Dirichlet nodes), and `independent_nodes` the full-node indices of independent nodes in ascending order.
+Full nodes place vertices first, followed by edge midpoints for P2.
+`node_point` returns node coordinates, `cell_dofs` cell node indices, and `evaluate(cell, reference, values)` values at cell reference coordinates and gradients in physical coordinates, without allocation.
+`validate_field` checks full-node constraint satisfaction using rowwise tolerance $256\varepsilon$ times the value scale.
+This checks constraint consistency, not approximation error.
+
+To store nodal values as `scioxide-spatial` fields, use `AmrNodalField` (owned) and `AmrNodalFieldView` (borrowed).
+Both contain vertex fields and, only for P2, edge fields; `Field` in `scioxide-spatial` carries mesh revision and layout tags.
+`AmrSpace::pack_into` packs a view into a full-node vector; `AmrSpace::field` allocates fields from a full-node vector in the reverse direction.
+The `view` of `AmrNodalField` returns a view without allocation, while `into_parts` separates vertex and edge fields.
+
+### Preparation choices and limits
+
+`AmrSpace::new(mesh, order)` prepares with default `AmrOptions`.
+Defaults are quadrature exact through polynomial degree 6, geometry reciprocal condition threshold $64\varepsilon$, and sequential execution.
+`AmrOptions::with_quadrature_degree` selects quadrature degree.
+Simplex cells use the same positive-weight simplex rules as conforming finite elements, accepting degrees 2–7 for P1 and 4–7 for P2 to support consistent mass.
+Grid cells use products of $\lceil(\text{degree}+1)/2\rceil$-point Gauss–Legendre rules in each axis, accepting degrees 2–31.
+`with_minimum_reciprocal_condition` selects the geometry reciprocal condition threshold (between $0$ and $1$), and `with_execution_policy` selects row and cell parallelism (up to 32 workers).
+Nodal spaces on meshes with periodic seams are unsupported and return `InvalidInput`.
+Cell maps assume straight edges; curved-cell geometry is unsupported.
+
+`AmrLimits::new(max_dofs, max_entries, max_quadrature_nodes, max_work, max_storage_bytes)` specifies limits for one preparation.
+In order, these are node or cell counts, constraint or matrix entries (including temporary triplets), nodes in one quadrature rule, visits/comparisons/reductions, and cumulative requested allocation bytes.
+All default to `usize::MAX`, excluding existing prepared values and caller inputs.
+Exceeding a limit gives an `ResourceLimit` error naming the quantity (such as `amr_dofs` or `amr_work`), required amount, and limit.
+`AmrSpace::build(…, scope)` prepares as one solve-scoped operation, respecting the scope's node limit, cancellation, and deadline.
+Reaching the scope's node or evaluation limit returns a `ConvergenceFailure` error with the evaluation-budget report.
+`preparation_storage_bound` returns the cumulative allocation bound actually admitted during preparation.
+
+## Diffusion assembly and solution
+
+`AmrDiffusionData` is the source-term $f$ trait; `source(cell, point)` returns its value at physical coordinate `point` in active cell `cell`.
+Boundary types and data use the same `BoundaryCondition` as other discretizations.
+Assign exterior-face labels with `AmrBoundaryTags::new(mesh, entries)`.
+`entries` consists of (face index, label) pairs, requiring exactly one label per exterior face; duplicates, out-of-range indices, and interior faces give `InvalidInput`.
+`TaggedBoundaries::adaptive(mesh, tags, components, conditions)` associates conditions with labels.
+
+`AmrDiffusionPlan::new(space, diffusion, boundaries, data)` prepares local cell stiffness and loads, Robin face mass and loads, and Dirichlet values.
+`diffusion` is a cell field requiring positive finite values.
+Only scalar equations are supported; a boundary component count other than 1 or a negative or complex Robin coefficient gives `InvalidInput`.
+Independent nodes on Dirichlet faces receive boundary-data values; hanging-node values follow from constraints.
+Assembly replaces Dirichlet rows and columns by identity and moves known-value contributions to the right-hand side, giving a symmetric system.
+
+$$
+\begin{pmatrix}A_{II}&0\\0&I\end{pmatrix}
+\begin{pmatrix}\mathbf{x}_I\\\mathbf{x}_D\end{pmatrix}
+=\begin{pmatrix}\mathbf{b}_I-A_{ID}\,\mathbf{g}\\\mathbf{g}\end{pmatrix}
+$$
+
+$A_{II}$ denotes non-Dirichlet rows and columns of $P^{\mathsf T}AP$, and $\mathbf{g}$ denotes Dirichlet values.
+For $k>0$ with a Dirichlet face or a positive-coefficient Robin face, the matrix is symmetric positive definite and supports CG.
+
+`unknowns` returns unknown count (independent nodes), `rhs` the right-hand side, and `prescribed_values` independent-node Dirichlet values (`None` where absent).
+The Plan itself implements `LinearOperator` and `AdjointOperator`, computing the action without forming the matrix.
+`assemble_csr` builds the same matrix in CSR from the same local forms, allowing Jacobi preconditioning or algebraic multigrid.
+The linear solver owns convergence checks, preconditioning, and gauges ([Conjugate gradients](oxref:linalg-conjugate-gradient)).
+Extending solved $\mathbf{x}$ to full nodes with `constraints().apply_into` gives $\mathbf{u}$ including hanging nodes.
+
+## Residual error estimator
+
+The estimator measures how much discrete solution $u_h$ fails to satisfy the equation inside cells and on faces.
+Error $e=u-u_h$ satisfies the following error equation for every test function $v$.
+
+$$
+\int_\Omega k\nabla e\cdot\nabla v
+=\sum_K\int_K R_K\,v-\sum_{F\,\text{interior}}\int_F J_F\,v+\sum_{F\subset\Gamma_N}\int_F\bigl(g-k\nabla u_h\cdot n\bigr)v
+$$
+
+$R_K=f+\nabla\cdot(k\nabla u_h)$ is the cell residual, $J_F$ the difference (jump) of flux $k\nabla u_h\cdot n_F$ across face $F$, and $\Gamma_N$ the natural and Robin boundaries.
+On Robin boundaries, replace $g$ by $g-\alpha u_h$.
+This follows by integration by parts on each element.
+When Dirichlet data lie in the discrete space, Galerkin orthogonality allows subtracting quasi-interpolant $I_hv$ from $v$; using $\Vert v-I_hv\Vert_K\le Ch_K\Vert\nabla v\Vert$ and $\Vert v-I_hv\Vert_F\le Ch_F^{1/2}\Vert\nabla v\Vert$ gives the energy-error upper bound
+
+$$
+\Vert k^{1/2}\nabla e\Vert\le C_{\mathrm{rel}}\,\eta,\qquad
+\eta^2=\sum_K\eta_K^2
+$$
+
+See Verfürth (2013).
+Conversely, bubble functions bound $\eta_K$ above by errors near $K$ and data oscillation.
+Constant $C_{\mathrm{rel}}$ depends on mesh shape regularity, and the implementation does not compute it.
+Thus $\eta$ is an indicator of error distribution and decay, not an error upper bound.
+The ratio $\eta/\Vert k^{1/2}\nabla e\Vert$ is called the effectivity index.
+For P1 in the L-shaped example, this lies in 2.47–3.98 at default inputs and rises to 4.21 with a degree-of-freedom limit of 5000.
+
+`AmrEstimator` computes the following indicator.
+
+$$
+\eta_K^2=\frac{h_K^2}{k_K}\Vert R_K\Vert_K^2
++\frac12\sum_{F\subset\partial K,\ \text{interior}}\frac{h_F}{k_F}\Vert J_F\Vert_F^2
++\sum_{F\subset\partial K\cap\Gamma_N}\frac{h_K}{k_K}\Vert g-k\nabla u_h\cdot n\Vert_F^2
+$$
+
+$h_K$ is cell diameter (maximum vertex distance), $h_F$ the smaller diameter of the two cells adjacent to a face, and $k_F$ the larger diffusion coefficient on either side.
+Interior-face contributions are split equally between adjacent cells; Dirichlet faces contribute nothing.
+Coarse–fine faces are evaluated once for each fine-side fragment.
+P1 and Q1 (axis-aligned boxes) basis functions are harmonic, so $\nabla\cdot(k\nabla u_h)$ is $0$ and the cell residual contains only $f$.
+The estimator targets shape-regular scalar elliptic problems; it claims neither coefficient-ratio-independent bounds nor quadrature-error guarantees or applicability to systems.
+
+`AmrResidual` is the trait supplying quantities read by the estimator.
+`volume(cell, point)` returns $R_K$, `flux(cell, point, normal)` returns $k\nabla u_h\cdot n$ on the specified cell side, and `boundary_flux(face, point, normal)` returns prescribed exterior flux (`None` for Dirichlet, $g-\alpha u_h$ for Robin).
+`AmrDiffusionPlan::residual(values)` creates this trait implementation from a constraint-satisfying full-node vector.
+For other equations, implement this trait or import independently computed squared cell indicators with `AmrIndicators::from_squared(mesh, values)`.
+
+`AmrEstimator::new(space, diffusion)` prepares weights $h_K^2/k_K$ and $h_F/k_F$ (use `with_options(…, limits)` to specify limits).
+`workspace` explicitly allocates workspace `AmrEstimatorWorkspace`; subsequent `estimate_into(provider, output, workspace, scope)` does not allocate within the library.
+Work is proportional to the number of cells and faces.
+Evaluation budgets allocated to cells and faces are independent of worker count, and failure leaves `output` unchanged.
+`AmrIndicators::new(mesh)` allocates a zero result associated with the revision.
+`volume`, `interior`, and `boundary` return the three squared contributions, `squared` their per-cell sum, and `global` the square root of the total, $\eta$.
+`mesh_token` checks revisions; passing old-revision indicators to new-revision marking is rejected.
+
+## Dörfler marking
+
+Marking is a rule for selecting cells with large indicators.
+`AmrMarking` implements Dörfler's bulk criterion.
+For fraction $\theta\in(0,1]$, choose a cell set of minimum cardinality satisfying
+
+$$
+\sum_{K\in\mathcal{M}}\eta_K^2\ge\theta\sum_{K}\eta_K^2
+$$
+
+The selected cell set is $\mathcal{M}$.
+Sorting indicators in descending order and adding from the top until the sum reaches fraction $\theta$ gives minimum cardinality.
+Ties use ascending hierarchical IDs, making the result deterministic.
+For $n$ cells, the cost is $O(n\log n)$.
+
+Smaller $\theta$ refines fewer cells per step and increases the number of cycles.
+At $\theta=1$, cells are added until reaching the total, so most cells are marked and refinement becomes nearly uniform.
+With Dörfler marking and newest vertex bisection, a weighted sum of energy error and estimator is proven to contract by a fixed factor at every cycle (Cascón–Kreuzer–Nochetto–Siebert 2008).
+If $\theta$ is sufficiently small, convergence is also optimal in degrees of freedom (Stevenson 2007; Cascón–Kreuzer–Nochetto–Siebert 2008).
+`scioxide-spatial` uses regular edge-midpoint refinement with hanging nodes, so that proof does not apply directly.
+The example measures convergence rates instead.
+
+`AmrMarking::new(theta)` constructs the rule and `mark(mesh, indicators)` returns `AmrMarks`.
+Use `mark_with_options(…, limits)` for limits and `mark_scoped(…, limits, scope)` for scoped calls.
+$\theta$ and coarsening thresholds are checked during marking; $\theta$ outside $(0,1]$ or a negative or nonfinite threshold gives `InvalidInput`.
+If the indicator total is exactly 0, nothing is marked.
+Even rounding-scale positive indicators trigger marking, so the caller decides to stop by comparing $\eta$ with tolerance.
+
+Adding `with_coarsen_threshold(threshold)` makes coarsening candidates of parents whose children are all active, unmarked for refinement, and have root-sum-square indicators at most `threshold`.
+`scioxide-spatial` checks whether coarsening breaks 2:1 balance; any request including a parent requiring refinement for balance is rejected entirely ([Local refinement and 2:1 balancing](oxref:spatial-adaptive-balance)).
+In `AmrMarks`, `refine` contains hierarchical IDs of leaves to refine, `coarsen` parent IDs to coarsen, and `request()` returns a borrowed `AdaptationRequest` for the same revision.
+Maximum-fraction and fixed-fraction marking are not provided.
+For such rules, the caller selects IDs from `AmrIndicators::squared` values and constructs `AdaptationRequest` directly.
+
+The next two cells refine the bottom-left corner of a $4\times4$ unit-square triangular mesh twice, testing on a revision with hanging nodes.
+The definitions block contains mesh construction and exterior-face labeling functions.
+
+```rust
+//| id: pde-amr-unit-square-model
+//| kind: definitions
+//| title: "Unit-square triangular mesh and refinement toward a corner"
+//| crates: [scioxide-core, scioxide-spatial, scioxide-pde]
+use scioxide_core::RealScalar;
+use scioxide_pde::AmrBoundaryTags;
+use scioxide_spatial::{AdaptationLimits, AdaptationRequest, AdaptiveMesh, Point, TriangleMesh};
+
+/// Adaptive mesh dividing the unit square into n × n squares, each split diagonally into two triangles.
+pub(crate) fn unit_square_mesh(n: usize) -> Result<AdaptiveMesh<f64, 2>, String> {
+    let mut points = Vec::new();
+    for j in 0..=n {
+        for i in 0..=n {
+            let p = Point::new([i as f64 / n as f64, j as f64 / n as f64]);
+            points.push(p.map_err(|e| e.to_string())?);
+        }
+    }
+    let mut cells = Vec::new();
+    for j in 0..n {
+        for i in 0..n {
+            let a = j * (n + 1) + i;
+            cells.push([a, a + 1, a + n + 2]);
+            cells.push([a, a + n + 2, a + n + 1]);
+        }
+    }
+    let mesh = TriangleMesh::new(points, cells).map_err(|e| e.to_string())?;
+    AdaptiveMesh::from_simplex(&mesh, AdaptationLimits::new()).map_err(|e| e.to_string())
+}
+
+/// New revision refining by one level every active cell whose centroid lies within radius of the origin.
+fn refine_corner(mesh: &AdaptiveMesh<f64, 2>, radius: f64) -> Result<AdaptiveMesh<f64, 2>, String> {
+    let mut refine = Vec::new();
+    for (cell, &id) in mesh.active_cells().iter().enumerate() {
+        let mut centroid = [0.0; 2];
+        for vertex in mesh.cell_vertices(cell).map_err(|e| e.to_string())? {
+            let p = mesh.point(vertex).map_err(|e| e.to_string())?;
+            centroid[0] += p.as_array()[0] / 3.0;
+            centroid[1] += p.as_array()[1] / 3.0;
+        }
+        if RealScalar::hypot(centroid[0], centroid[1]) < radius {
+            refine.push(id);
+        }
+    }
+    let request = AdaptationRequest {
+        source: mesh.mesh_token(),
+        refine: &refine,
+        coarsen: &[],
+    };
+    let result = mesh.adapt(request).map_err(|e| e.to_string())?;
+    Ok(result.mesh)
+}
+
+/// Revision refining corner (0, 0) of a 4 × 4 mesh twice with radii 0.3 and 0.15.
+pub(crate) fn corner_mesh() -> Result<AdaptiveMesh<f64, 2>, String> {
+    refine_corner(&refine_corner(&unit_square_mesh(4)?, 0.3)?, 0.15)
+}
+
+/// Assign label 0 to all exterior faces.
+pub(crate) fn exterior_tags(mesh: &AdaptiveMesh<f64, 2>) -> Result<AmrBoundaryTags<2>, String> {
+    let entries: Vec<(usize, u32)> = mesh
+        .interfaces()
+        .iter()
+        .filter(|interface| interface.right.is_none())
+        .map(|interface| (interface.left_face, 0))
+        .collect();
+    AmrBoundaryTags::new(mesh, &entries).map_err(|e| e.to_string())
+}
+
+/// Squared indicators η_K² from the first cell, in active-cell order.
+#[derive(serde::Deserialize)]
+pub(crate) struct Estimate {
+    pub(crate) squared: Vec<f64>,
+}
+```
+
+The first cell solves $-\Delta u=0$ with a polynomial exact solution as Dirichlet data, showing nodal errors and estimator $\eta$.
+If the exact solution belongs to the nodal space and constraint weights are correct, the discrete solution agrees within rounding and $\eta$ is also at rounding scale.
+Quadratic $x^2-y^2$ belongs to P2 but not P1, so default P1 retains error and $\eta$.
+Inputs are nodal degree and exact solution; cellwise $\eta_K^2$ is passed to the next cell.
+
+```rust
+//| id: pde-amr-hanging-reproduction
+//| ref: pde-amr-hanging-reproduction
+//| title: "Reproduce polynomial solutions on a hanging-node mesh and compute the estimator"
+//| run: reactive
+//| uses: [pde-amr-unit-square-model]
+//| crates: [scioxide-core, scioxide-spatial, scioxide-pde, scioxide-linalg]
+//| exports: [squared]
+//| inputs:
+//|   order: {"type":"select","label":"Nodal degree","options":["P1","P2"],"value":"P1"}
+//|   solution: {"type":"select","label":"Exact solution u","options":["x² − y²","1 + 2x − y"],"value":"x² − y²"}
+//| cases:
+//|   - {"id":"p1-linear","label":"P1 and 1 + 2x − y","description":"The linear function belongs to P1 and is reproduced within rounding, including hanging nodes.","inputs":{"solution":"1 + 2x − y"}}
+//|   - {"id":"p2-quadratic","label":"P2 and x² − y²","description":"P2 contains quadratics and reproduces them including hanging edge midpoints.","inputs":{"order":"P2"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"reproduction","path":"/rows/0/1","equals":35}
+//|       - {"artifact":"reproduction","path":"/rows/0/2","equals":31}
+//|       - {"artifact":"reproduction","path":"/rows/0/5","range":{"min":0,"max":1e-12}}
+//|       - {"artifact":"reproduction","path":"/rows/0/6","approx":{"value":1.5625e-2,"rtol":1e-9}}
+//|       - {"artifact":"reproduction","path":"/rows/0/7","approx":{"value":0.71167,"rtol":1e-4}}
+//|   - case: p1-linear
+//|     expect:
+//|       - {"artifact":"reproduction","path":"/rows/0/6","range":{"min":0,"max":1e-12}}
+//|       - {"artifact":"reproduction","path":"/rows/0/7","range":{"min":0,"max":1e-12}}
+//|   - case: p2-quadratic
+//|     expect:
+//|       - {"artifact":"reproduction","path":"/rows/0/1","equals":117}
+//|       - {"artifact":"reproduction","path":"/rows/0/2","equals":105}
+//|       - {"artifact":"reproduction","path":"/rows/0/6","range":{"min":0,"max":1e-12}}
+//|       - {"artifact":"reproduction","path":"/rows/0/7","range":{"min":0,"max":1e-12}}
+use scioxide_core::{Budget, ExecutionContext, SciOxideError, LinearOperator, ResidualTolerance};
+use scioxide_linalg::{CgSolver, IterativeWorkspace, Preconditioning, Vector};
+use scioxide_pde::{
+    AmrDiffusionData, AmrDiffusionPlan, AmrEstimator, AmrIndicators, AmrOrder, AmrSpace,
+    BoundaryCondition, BoundaryData, BoundaryPoint, TaggedBoundaries,
+};
+use scioxide_spatial::{Cell, Field};
+
+// Source f = 0 (both exact solutions are harmonic).
+struct Harmonic;
+impl AmrDiffusionData<f64, f64, 2> for Harmonic {
+    fn source(&self, _cell: usize, _point: [f64; 2]) -> Result<f64, SciOxideError> {
+        Ok(0.0)
+    }
+}
+
+let mesh = corner_mesh()?;
+let order = if order == "P2" {
+    AmrOrder::P2
+} else {
+    AmrOrder::P1
+};
+let quadratic = solution.starts_with('x');
+let exact = move |p: [f64; 2]| {
+    if quadratic {
+        p[0] * p[0] - p[1] * p[1]
+    } else {
+        1.0 + 2.0 * p[0] - p[1]
+    }
+};
+let space = AmrSpace::new(&mesh, order).map_err(|e| e.to_string())?;
+let data = BoundaryData::time_invariant(move |p: BoundaryPoint<f64, 2>| Ok(exact(p.point)));
+let conditions = vec![BoundaryCondition::dirichlet(0, data)];
+let tags = exterior_tags(&mesh)?;
+let boundaries =
+    TaggedBoundaries::adaptive(&mesh, &tags, 1, conditions).map_err(|e| e.to_string())?;
+let diffusion = Field::<f64, Cell, 2>::new(&mesh, vec![1.0; mesh.cell_count()])
+    .map_err(|e| e.to_string())?;
+let plan = AmrDiffusionPlan::new(&space, diffusion.view(), &boundaries, &Harmonic)
+    .map_err(|e| e.to_string())?;
+
+// Pass the Plan to CG as a matrix-free operator (Dirichlet elimination gives a symmetric positive definite system).
+let rhs = Vector::from_vec(plan.rhs().to_vec());
+let mut x = Vector::zeros(rhs.len()).map_err(|e| e.to_string())?;
+let tolerance = ResidualTolerance::new(1e-13, 1e-13).map_err(|e| e.to_string())?;
+let solver = CgSolver::new(
+    tolerance,
+    Budget::try_from(2000).map_err(|e| e.to_string())?,
+);
+let mut work = IterativeWorkspace::new();
+let report = solver
+    .solve_into(
+        &plan,
+        &rhs,
+        Preconditioning::None,
+        x.view_mut(),
+        &mut work,
+        ExecutionContext::sequential(),
+    )
+    .map_err(|e| e.to_string())?;
+
+// Extend independent values to all nodes (constraints determine hanging nodes), then compare with exact nodal values.
+let mut full = vec![0.0; space.full_dofs()];
+let mut scratch = full.clone();
+space
+    .constraints()
+    .apply_into(x.as_slice(), &mut full, &mut scratch)
+    .map_err(|e| e.to_string())?;
+// Compute maximum errors separately for independent and hanging nodes.
+let (mut independent_error, mut hanging_error) = (0.0_f64, 0.0_f64);
+for (node, value) in full.iter().enumerate() {
+    let point = space.node_point(node).map_err(|e| e.to_string())?;
+    let error = (value - exact(point)).abs();
+    if space.independent_nodes().binary_search(&node).is_ok() {
+        independent_error = independent_error.max(error);
+    } else {
+        hanging_error = hanging_error.max(error);
+    }
+}
+
+// Residual estimator.
+let mut indicators = AmrIndicators::new(&mesh).map_err(|e| e.to_string())?;
+let residual = plan.residual(&full).map_err(|e| e.to_string())?;
+let estimator = AmrEstimator::new(&space, diffusion.view()).map_err(|e| e.to_string())?;
+let mut workspace = estimator.workspace().map_err(|e| e.to_string())?;
+estimator
+    .estimate_into(
+        &residual,
+        &mut indicators,
+        &mut workspace,
+        ExecutionContext::sequential(),
+    )
+    .map_err(|e| e.to_string())?;
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Active cells [count]", "type": "integer" },
+    { "key": "1", "label": "Full nodes [count]", "type": "integer" },
+    { "key": "2", "label": "Independent nodes [count]", "type": "integer" },
+    { "key": "3", "label": "CG iterations [count]", "type": "integer" },
+    { "key": "4", "label": "CG termination reason" },
+    { "key": "5", "label": "Maximum independent-node error [-]", "type": "number", "format": sci3 },
+    { "key": "6", "label": "Maximum hanging-node error [-]", "type": "number", "format": sci3 },
+    { "key": "7", "label": "Estimator η [-]", "type": "number", "format": sci3 }
+]);
+let rows = vec![(
+    mesh.cell_count(),
+    space.full_dofs(),
+    space.independent_dofs(),
+    report.iterations(),
+    format!("{:?}", report.termination()),
+    independent_error,
+    hanging_error,
+    indicators.global(),
+)];
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "reproduction" })
+);
+let squared: Vec<f64> = indicators.squared().collect();
+export!(squared, &squared);
+```
+
+With default P1 and $x^2-y^2$, 31 of 35 full nodes are independent, leaving 4 hanging nodes.
+CG reaches `Converged` in 4 iterations.
+Independent-node error is $1.1\times10^{-16}$, with error $1.5625\times10^{-2}=1/64$ remaining only at hanging nodes.
+This equals the error $h^2/4$ from replacing a quadratic at the midpoint of a coarse edge of length $h=1/4$ by endpoint linear interpolation.
+Estimator $\eta=0.712$ indicates remaining error through face-flux jumps.
+
+Changing to linear $1+2x-y$ reduces errors at every node, including hanging nodes, to at most $4.4\times10^{-16}$ and reduces $\eta$ to $5.3\times10^{-15}$.
+For P2 and $x^2-y^2$, 12 of 117 full nodes are hanging (4 vertices and 8 edge midpoints), errors are at most $2.2\times10^{-15}$, and $\eta$ is $6.2\times10^{-14}$.
+Rounding-scale hanging-node errors in both cases where the exact solution belongs to the space verify the constraint weights.
+
+The next cell imports the previous cell's $\eta_K^2$ into an identically shaped mesh using `AmrIndicators::from_squared`, marks with Dörfler's rule, and refines.
+Inputs are fraction $\theta$ and coarsening threshold.
+The plot shows cumulative fractions of descending indicators; cells up to the intersection with the $\theta$ line are marked.
+The table shows mark count, indicator fraction of marked cells, coarsening candidates, and `adapt` results.
+
+```rust
+//| id: pde-amr-dorfler-marking
+//| ref: pde-amr-dorfler-marking
+//| title: "Dörfler fraction marking and construction of a new revision"
+//| run: reactive
+//| uses: [pde-amr-unit-square-model]
+//| crates: [scioxide-core, scioxide-spatial, scioxide-pde]
+//| dependsOn:
+//|   estimate: {cell: pde-amr-hanging-reproduction, type: Estimate}
+//| inputs:
+//|   theta: {"type":"range","label":"Fraction θ [-]","min":0.1,"max":1.0,"step":0.1,"value":0.5}
+//|   coarsen: {"type":"select","label":"Coarsening threshold","options":["None","0.01","0.1"],"value":"None"}
+//| cases:
+//|   - {"id":"theta-one","label":"θ = 1","description":"Add until reaching the total, marking 42 cells except two at rounding scale.","inputs":{"theta":1.0}}
+//|   - {"id":"coarsen","label":"Coarsening threshold 0.1","description":"Two child families become coarsening candidates and form a new revision together with refinement marks.","inputs":{"coarsen":"0.1"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"marking","path":"/rows/0/1","equals":12}
+//|       - {"artifact":"marking","path":"/rows/0/2","approx":{"value":0.5236,"atol":1e-4}}
+//|       - {"artifact":"marking","path":"/rows/0/6","equals":80}
+//|   - case: theta-one
+//|     expect:
+//|       - {"artifact":"marking","path":"/rows/0/1","equals":42}
+//|   - case: coarsen
+//|     expect:
+//|       - {"artifact":"marking","path":"/rows/0/3","equals":2}
+//|       - {"artifact":"marking","path":"/rows/0/6","equals":74}
+use scioxide_pde::{AmrIndicators, AmrMarking};
+
+let mesh = corner_mesh()?;
+let indicators =
+    AmrIndicators::from_squared(&mesh, &estimate.squared).map_err(|e| e.to_string())?;
+let mut marking = AmrMarking::new(theta);
+if let Ok(threshold) = coarsen.parse::<f64>() {
+    marking = marking.with_coarsen_threshold(threshold);
+}
+let marks = marking
+    .mark(&mesh, &indicators)
+    .map_err(|e| e.to_string())?;
+
+// Fraction of total indicator in marked cells (active-cell indices are obtained from hierarchical IDs).
+let total: f64 = estimate.squared.iter().sum();
+let mut selected = 0.0;
+for (cell, id) in mesh.active_cells().iter().enumerate() {
+    if marks.refine().binary_search(id).is_ok() {
+        selected += estimate.squared[cell];
+    }
+}
+
+// Cumulative fraction of descending indicators.
+let mut sorted = estimate.squared.clone();
+sorted.sort_by(|a, b| b.total_cmp(a));
+let mut running = 0.0;
+let mut curve = Vec::new();
+for (k, value) in sorted.iter().enumerate() {
+    running += value;
+    curve.push([(k + 1) as f64, running / total]);
+}
+emit_line_chart!(
+    &vec![
+        serde_json::json!({ "name": "Cumulative fraction", "points": curve, "style": { "step": "end" } })
+    ],
+    options = &serde_json::json!({
+        "xLabel": "Cell count k in descending order [count]",
+        "yLabel": "Sum of largest k η_K² / Σ η_K² [-]",
+        "yMin": 0.0,
+        "yMax": 1.0,
+        "annotations": [
+            { "kind": "line", "axis": "y", "value": theta, "label": "θ" },
+            { "kind": "line", "axis": "x", "value": marks.refine().len() as f64, "label": "Mark count" }
+        ]
+    })
+);
+
+// spatial restores 2:1 balance and creates a new revision. Incompatible coarsening rejects the entire request.
+let adapted = mesh.adapt(marks.request());
+let (cells, induced, result) = match &adapted {
+    Ok(next) => (
+        Some(next.mesh.cell_count()),
+        Some(next.induced_refinements.len()),
+        "Accepted".to_string(),
+    ),
+    Err(error) => (None, None, format!("{:?}", error.kind())),
+};
+let fixed3 = serde_json::json!({ "fractionDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Active cells [count]", "type": "integer" },
+    { "key": "1", "label": "Refinement marks [count]", "type": "integer" },
+    { "key": "2", "label": "Indicator fraction of marked cells [-]", "type": "number", "format": fixed3 },
+    { "key": "3", "label": "Coarsening marks [count]", "type": "integer" },
+    { "key": "4", "label": "adapt result" },
+    { "key": "5", "label": "Refinements for balance [count]", "type": "integer", "nullText": "—" },
+    { "key": "6", "label": "New revision active cells [count]", "type": "integer", "nullText": "—" }
+]);
+let rows = vec![(
+    mesh.cell_count(),
+    marks.refine().len(),
+    selected / total,
+    marks.coarsen().len(),
+    result,
+    induced,
+    cells,
+)];
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "marking" })
+);
+```
+
+With default $\theta=0.5$, the 12 largest-indicator cells among 44 are marked and account for 52.4 % of $\eta^2$.
+The largest 16 $\eta_K^2$ are equal within rounding (each $0.0221$), so the cumulative plot initially grows at constant slope.
+Rounding-scale differences determine which 12 of these 16 cells are marked.
+`adapt` accepts the request without additional balancing refinements, producing 80 active cells in the new revision.
+
+At $\theta=1$, 42 cells are marked.
+The remaining two cells have $\eta_K^2$ of order $10^{-31}$; the accumulated sum reaches the total within rounding before adding them, leaving them unmarked.
+With coarsening threshold 0.1, two child families become candidates and combine with refinement marks to produce a revision with 74 cells.
+At threshold 0.01, no family qualifies, so there are no coarsening candidates.
+
+## References
+
+- W. Dörfler, "A convergent adaptive algorithm for Poisson's equation", *SIAM J. Numer. Anal.* 33 (1996), 1106–1124.
+- R. Verfürth, *A Posteriori Error Estimation Techniques for Finite Element Methods*, Oxford University Press, 2013.
+- J. M. Cascón, C. Kreuzer, R. H. Nochetto, K. G. Siebert, "Quasi-optimal convergence rate for an adaptive finite element method", *SIAM J. Numer. Anal.* 46 (2008), 2524–2550.
+- R. Stevenson, "Optimality of a standard adaptive finite element method", *Found. Comput. Math.* 7 (2007), 245–269.
+
+## Summary
+
+`AmrSpace` constrains hanging nodes through prolongation $P$ and constructs a symmetric system of form $P^{\mathsf T}AP$, allowing existing linear solvers such as CG on adaptive meshes.
+Reproduction within rounding in a space containing the exact solution checks constraint weights and boundary handling.
+Estimator $\eta$ omits the constant and is not an error upper bound, so allow for the effectivity index when comparing with tolerance.
+Dörfler fraction $\theta$ balances refinement per cycle against cycle count; the caller decides when to stop.
+Coarsening candidates are accepted only after passing `scioxide-spatial`'s 2:1-balance check.
+
+## Further reading
+
+- [Field transfer between adaptive mesh revisions](../adaptive-field-transfer/): transfer cell averages and nodal fields across refinement and coarsening and examine conserved quantities.
+- [Corner singularities and adaptive refinement on an L-shaped domain](../../examples/l-shaped-amr/): compare uniform and adaptive convergence rates and effectivity indices for a reentrant-corner singularity.
+- [Adaptive mesh refinement and topology correspondence](../../../scioxide-spatial/algorithms/adaptive-mesh-and-shared-tessellation/): examine hierarchies, 2:1 balance, hanging entities, and revision maps.
+- [Adaptive refinement API](../../api/adaptive-refinement/): inspect specifications of the `Amr*` items.

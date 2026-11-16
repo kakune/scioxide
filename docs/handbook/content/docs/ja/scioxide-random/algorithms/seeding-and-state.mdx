@@ -1,0 +1,255 @@
+---
+title: シード・状態の保存・失敗時の状態
+description: シードから根の状態を作る規則とシードの衝突、エントロピー源と seed_sequence、GRN2 形式の状態の保存と復元、スナップショット、失敗した一括生成の状態方針 StatePolicy。
+sidebar:
+  order: 307
+references:
+  random-prng-seeding: "シードと初期状態"
+  random-prng-save-restore: "状態の保存と復元"
+  random-prng-batch-state-policy: "一括生成の状態方針"
+---
+
+生成器の列を再現するには、どの状態から始めたかと、どこまで進めたかを押さえればよい。
+このページはシードから最初の状態（根）を作る規則、状態をバイト列やメモリに保存して戻す方法、一括生成が途中で失敗したときに生成器がどこに残るかを説明する。
+生成器ごとの漸化式は[生成器の種類](oxref:random-prng-families)、再現性が保たれる範囲は[再現性の範囲](oxref:random-algorithms-reproducibility)にある。
+
+## シードと初期状態
+
+`SeedableRng` はシードから生成器を作るトレイトで、二つの関数を持つ。
+`from_seed(seed: u64)` は 64 ビットのシードから根の状態を決め、位置 0 の生成器を返す。
+同じ型に同じシードを渡せば、同じ根から同じワードの列が出る。
+`seed_from_entropy(source)` は呼び出し側が渡した `scioxide_core::EntropySource` から 8 バイトを読み、リトルエンディアンの `u64` として `from_seed` に渡す。
+エントロピー源が 8 バイトを埋められなければ `CapabilityFailure` を返し、OS や大域状態のエントロピーへは切り替えない。
+SciOxide はこの引数以外からエントロピーを読まない。
+
+シードから根の状態への写像は生成器ごとに異なる。
+
+| 生成器 | シードの使い方 |
+|---|---|
+| `SplitMix64`、`Lcg64` | シードをそのまま状態にする |
+| `Pcg64` | 参照実装の `pcg_setseq` に従い、既定の増分にシードを足して一回進める |
+| `Xoshiro256StarStar`、`Xoshiro128StarStar` | シードから始めた `SplitMix64` の出力を 4 ワード（`Xoshiro128StarStar` は 2 ワードを 32 ビットずつに分けて）使う。全零なら置き換える |
+| `Mrg32k3a` | `SplitMix64` の出力を各成分の法で割った剰余を使い、全零の成分を避ける。6 ワードを直接与えるときは `from_state_words` を使う |
+| `Philox4x64`、`Threefry4x64` | `SplitMix64` の出力を鍵にする（Philox は 2 ワード、Threefry は 4 ワード）。鍵を直接与えるときは `from_key` を使う |
+| `Mt19937` | 下位 32 ビットを mt19937ar の `init_genrand` で 624 ワードに広げる。配列の鍵は `from_seed_words` で与える |
+| `Taus2`、`Taus113`、`Mrg`、`Cmrg` | 下位 32 ビット（0 は 1）を 69069 倍の合同法 $x \leftarrow 69069\,x \bmod 2^{32}$ で広げ、出力を数語（`Taus2` と `Mrg` は 6 ワード、`Cmrg` は 7 ワード、`Taus113` は 10 ワード）捨ててから根にする。`Taus2` と `Taus113` は最小値を下回るレジスタを引き上げる |
+| `Gfsr4` | 下位 32 ビット（0 は 4357）から始めた 69069 倍の合同法の最上位ビットで 16,384 ワードを作り、一次独立なワードを組み込んだうえで、漸化式が参照する 9,689 ワードを環に残す |
+| `Ranlux` | シードを $2\,147\,483\,563$ で割った剰余（0 は 314159265）から、James の方法（$x \leftarrow 40014\,x \bmod 2\,147\,483\,563$）で 24 ワードを作る |
+| `Ranlxs`、`Ranlxd` | 下位 31 ビット（0 は 1）から 31 ビットのシフトレジスタで 12 ワードを作る |
+
+古典的な生成器はシードを 32 ビット以下の値に縮めてから使うので、異なる `u64` のシードが同じ列になりうる。
+たとえば `Mt19937` では $s$ と $s + 2^{32}$ が同じ状態を作り、`Ranlxs` と `Ranlxd` では下位 31 ビットの等しいシードが同じ状態を作る。
+`Ranlux` は 64 ビットすべてを剰余の計算に使うが、$2\,147\,483\,563$ を法として合同なシードは同じ状態を作る。
+シードの 64 ビットすべてを使うのは、`SplitMix64`、`Lcg64`、`Pcg64` と、`SplitMix64` の出力から状態を作る生成器である。
+
+`seed_from_entropy` で作った生成器は使ったシードを返さない。
+実行を後で再現したいときは、エントロピーから自分で `u64` を作って記録してから `from_seed` に渡すか、作った直後の状態を `export_state` で保存する。
+
+`seed_sequence(seed, n)` は、`seed` から始めた `SplitMix64` の最初の $n$ 個の出力をシードとして返す。
+得られるシードは互いに異なり再現できるが、もとのシード以上のエントロピーは持たない。
+$n = 0$ は `InvalidInput` である。
+別々のシードから作った生成器の列が重ならないことは、シードが異なるだけでは保証されない。
+並列の系列が必要なときは、分割を持つ生成器の `split` や `substream` を使う（[系列のスキップ・ジャンプ・分割](oxref:random-prng-advance-jump-split)）。
+
+## 状態の保存と復元
+
+`SerializableState` は状態を持ち運べるバイト列にするトレイトである。
+`export_state` は状態を `GRN2` 形式のバイト列（バージョン 1）にし、生成器は進めない。
+`import_state` はバイト列から新しい生成器を作り、`restore_state` は同じ系列の生成器をその状態に書き戻す。
+`export_state_into` は呼び出し側が用意した長さ `STATE_BYTES` の領域に書き、長さが違えば `DimensionMismatch` を返して領域を変えない。
+`export_state_into` と `import_state` はメモリ領域を確保しない。
+
+バイト列は先頭 16 バイトの見出し（`GRN2` の 4 バイト、形式のバージョン、アルゴリズムのタグ、アルゴリズムのバージョン、リトルエンディアンを示すバイト、フラグ、事前確保の 2 バイト、内容の長さ）、根の状態、現在の状態（`Pcg64` は増分も）、系列のセレクター、位置（カウンター型では鍵、セレクター、経路、位置）、末尾の CRC-32C からなる。
+値はすべて固定幅のリトルエンディアンなので、バイト列はプラットフォーム、ポインタ幅、標本に使う浮動小数点型に依存しない。
+位置を追跡していない生成器は、位置の代わりにそのことをフラグで記録する。
+
+`import_state` は次のバイト列を `InvalidInput` で拒否する。
+
+- 長さ、先頭の `GRN2`、CRC-32C、フラグや事前確保バイト、状態の値の範囲が正しくないもの（理由 `Malformed`）。
+- 形式のバージョンやアルゴリズムのバージョンが対応外のもの、知らないタグを持つもの（理由 `UnsupportedConfiguration`）。
+- 別のアルゴリズムのタグを持つもの（理由 `Inconsistent`）。
+
+CRC-32C はフラグや状態の値の検査より先に照合されるので、内容の偶然の破損は意味の誤りではなく CRC の不一致（`Malformed`）として示される。
+ただし先頭の `GRN2`、形式のバージョン、アルゴリズムのタグ、内容の長さは CRC より先に検査する。
+CRC は改ざんに対する認証はしない。
+
+`restore_state` は、系列の識別子 `StreamIdentity`（アルゴリズム、根の状態、セレクターの組）が一致しないバイト列を `Inconsistent` で拒否し、失敗したときは生成器を変えない。
+位置は識別子に含まれないので、同じ系列の前の位置にも後ろの位置にも戻せる。
+別の系列に切り替えるときは `import_state` を使う。
+
+プロセスの中で一時的に状態を戻すだけなら、`SnapshotGenerator` のスナップショットで足りる。
+`snapshot` は状態を写して生成器を進めず、`restore_snapshot` はそれを書き戻す。
+組み込みの生成器、`BoundedSubstream`、QMC のカーソル `QmcSequence` は `SnapshotGenerator` を実装する。
+組み込みの生成器のスナップショットは状態の複製で、取るときも戻すときも失敗せず、メモリ領域を確保しない。
+
+## 一括生成の状態方針
+
+一括生成の途中で失敗すると、生成器はすでにいくつかのワードを消費している。
+状態方針はその消費を残すか取り消すかを決める。
+`StatePolicy` は外部から実装できない（sealed）トレイトで、実装は `AdvanceOnError` と `Rollback` の二つだけである。
+`SamplingPolicy::advance_on_error` と `SamplingPolicy::rollback` はそれを出力方針 `OutputPolicy` と組にし、`latin_hypercube_into` と `PoissonDisk::generate_into` は状態方針の型を直接取る。
+所有した出力を返す形（`sample_n`、`sample_indices`、`QuasiRng::points` など）は状態方針を取らず、失敗すると生成器を進めたまま残す。
+
+`AdvanceOnError` は何も保存せず、失敗した時点までに読んだワードを消費したまま残す。
+失敗の後の生成器は成功した標本と失敗した標本が使ったワードの分だけ進んでいる。
+`Rollback` は一括生成の前に `SnapshotGenerator::snapshot` で状態を写し、失敗したら `restore_snapshot` で戻す。
+失敗の後の生成器は呼び出し前と同じ位置にあり、次の読み出しは呼び出し前に読んだ場合と同じワードを返す。
+所有値を返す API の失敗で生成器を戻したいときは、呼び出し側がスナップショットを取っておき、失敗したら書き戻す。
+
+状態方針は出力方針と独立で、`Rollback` を選んでも `Incremental` が書いた標本は出力に残る。
+空の一括生成はスナップショットを取らず、ワードも消費しない。
+パニックは捕まえないので、状態方針はエラーとして返った失敗だけに働く。
+出力方針の詳細は[標本の一括生成と状態の扱い](oxref:random-algorithms-batches-and-state)にある。
+
+次のセルは残り $L$ 遷移の `BoundedSubstream` から一様分布の標本を $n$ 個作り、`sample_n_into` に渡す出力方針と状態方針の四つの組と、所有した出力を返す `sample_n` を比べる。
+`BoundedSubstream` は決まった遷移数を超える読み出しを `OutOfBounds` で拒む系列で、失敗を確実に起こすために使う（[範囲付きの系列](oxref:random-prng-bounded-partitions)）。
+`sample_n` は、そのまま呼ぶ場合と、呼び出し前のスナップショットで失敗後に戻す場合の二通りを示す。
+入力は $L$（1〜12）、$n$（1〜12）、シードである。
+$n > L$ なら $L + 1$ 個目の標本で範囲外の読み出しが起き、一括生成は失敗する。
+表は結果の分類、書き換わった出力の個数、呼び出し後の位置を示す。
+出力は前もって $-1$ で埋めておき、$[0, 1)$ の値に変わった個数を数える。
+
+```rust
+//| id: random-batch-state-policy
+//| ref: random-batch-state-policy
+//| title: 失敗した一括生成が出力と生成器に残すものを方針ごとに比べる
+//| run: reactive
+//| crates: [scioxide-core, scioxide-random]
+//| inputs:
+//|   available: {"type":"range","label":"系列に残る遷移数 L [遷移]","description":"BoundedSubstream が読ませる遷移の数。","min":1,"max":12,"step":1,"value":5}
+//|   requested: {"type":"range","label":"一括生成の標本数 n [個]","description":"n > L なら L + 1 個目で失敗する。","min":1,"max":12,"step":1,"value":8}
+//|   seed: {"type":"range","label":"乱数のシード [-]","min":1,"max":1000,"step":1,"value":3}
+//| cases:
+//|   - {"id":"enough-words","label":"L = 8、n = 8","description":"範囲が足りると、どの方針でも 8 個を書いて位置は 8 になる。","inputs":{"available":8,"requested":8}}
+//|   - {"id":"one-word","label":"L = 1、n = 12","description":"1 個目だけ作れて 2 個目で失敗する。","inputs":{"available":1,"requested":12}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"policies","path":"/rows/0/2","equals":"OutOfBounds"}
+//|       - {"artifact":"policies","path":"/rows/0/3","equals":0}
+//|       - {"artifact":"policies","path":"/rows/0/4","equals":0}
+//|       - {"artifact":"policies","path":"/rows/1/3","equals":0}
+//|       - {"artifact":"policies","path":"/rows/1/4","equals":5}
+//|       - {"artifact":"policies","path":"/rows/2/3","equals":5}
+//|       - {"artifact":"policies","path":"/rows/2/4","equals":0}
+//|       - {"artifact":"policies","path":"/rows/3/3","equals":5}
+//|       - {"artifact":"policies","path":"/rows/3/4","equals":5}
+//|       - {"artifact":"policies","path":"/rows/4/3","equals":0}
+//|       - {"artifact":"policies","path":"/rows/4/4","equals":5}
+//|       - {"artifact":"policies","path":"/rows/5/4","equals":0}
+//|   - case: enough-words
+//|     expect:
+//|       - {"artifact":"policies","path":"/rows/0/2","equals":"成功"}
+//|       - {"artifact":"policies","path":"/rows/0/3","equals":8}
+//|       - {"artifact":"policies","path":"/rows/1/4","equals":8}
+//|       - {"artifact":"policies","path":"/rows/4/3","equals":8}
+//|   - case: one-word
+//|     expect:
+//|       - {"artifact":"policies","path":"/rows/2/3","equals":1}
+//|       - {"artifact":"policies","path":"/rows/3/4","equals":1}
+use scioxide_random::{
+    BitGenerator, BoundedSubstream, Distribution, OutputPolicy, Pcg64, SamplingPolicy,
+    SamplingRequest, SeedableRng, SnapshotGenerator, StatePolicy, Uniform,
+};
+
+type Stream = BoundedSubstream<Pcg64>;
+// (呼び出し, 状態方針, 結果, 書き換わった出力 [個], 呼び出し後の位置 [遷移])
+type Row = (String, String, String, usize, u64);
+
+fn outcome<T>(result: &Result<T, scioxide_core::SciOxideError>) -> String {
+    match result {
+        Ok(_) => "成功".to_string(),
+        Err(e) => format!("{:?}", e.kind()),
+    }
+}
+
+fn position(stream: &Stream) -> Result<u64, String> {
+    let tracked = stream.position().ok_or("位置が追跡されていない")?;
+    u64::try_from(tracked).map_err(|e| e.to_string())
+}
+
+// 呼び出し側の出力に書く形。-1 で埋めた出力のうち [0, 1) に変わった個数を数える。
+fn into_caller<P: StatePolicy<Stream>>(
+    stream: &mut Stream,
+    n: usize,
+    policy: SamplingPolicy<P>,
+) -> Result<(String, usize), String> {
+    let law = Uniform::new(0.0_f64, 1.0).map_err(|e| e.to_string())?;
+    let mut workspace = policy
+        .workspace(SamplingRequest::scalars(n))
+        .map_err(|e| e.to_string())?;
+    let mut output = vec![-1.0_f64; n];
+    let result = law.sample_n_into(stream, policy, &mut output, &mut workspace);
+    let written = output.iter().filter(|&&x| x >= 0.0).count();
+    Ok((outcome(&result), written))
+}
+
+let (len, n) = (available.round() as u64, requested.round() as usize);
+let base = Pcg64::from_seed(seed.round() as u64);
+let fresh = || BoundedSubstream::for_chunk(&base, 0, len).map_err(|e| e.to_string());
+let mut rows: Vec<Row> = Vec::new();
+for output in [OutputPolicy::Atomic, OutputPolicy::Incremental] {
+    let call = format!("sample_n_into（{output:?}）");
+    let mut stream = fresh()?;
+    let (result, written) = into_caller(&mut stream, n, SamplingPolicy::rollback(output))?;
+    let at = position(&stream)?;
+    rows.push((call.clone(), "Rollback".into(), result, written, at));
+    let mut stream = fresh()?;
+    let policy = SamplingPolicy::advance_on_error(output);
+    let (result, written) = into_caller(&mut stream, n, policy)?;
+    let at = position(&stream)?;
+    rows.push((call, "AdvanceOnError".into(), result, written, at));
+}
+// 所有した出力を返す形は、成功したときだけ Vec を返し、失敗すると消費したワードを残す。
+let law = Uniform::new(0.0_f64, 1.0).map_err(|e| e.to_string())?;
+let mut stream = fresh()?;
+let result = law.sample_n(&mut stream, n);
+let written = result.as_ref().map_or(0, Vec::len);
+let (call, policy) = ("sample_n".to_string(), "なし（消費を残す）".to_string());
+rows.push((call, policy, outcome(&result), written, position(&stream)?));
+// 所有値を返す API で生成器を戻すには、呼び出し前にスナップショットを取り、失敗したら書き戻す。
+let mut stream = fresh()?;
+let snapshot = stream.snapshot().map_err(|e| e.to_string())?;
+let result = law.sample_n(&mut stream, n);
+if result.is_err() {
+    stream.restore_snapshot(snapshot);
+}
+let written = result.as_ref().map_or(0, Vec::len);
+let call = "snapshot → sample_n → restore_snapshot".to_string();
+let policy = "呼び出し側で復元".to_string();
+rows.push((call, policy, outcome(&result), written, position(&stream)?));
+let columns = serde_json::json!([
+    { "key": "0", "label": "呼び出し" },
+    { "key": "1", "label": "状態方針" },
+    { "key": "2", "label": "結果" },
+    { "key": "3", "label": "書き換わった出力 [個]", "type": "integer" },
+    { "key": "4", "label": "呼び出し後の位置 [遷移]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "policies" })
+);
+```
+
+既定の入力（$L = 5$、$n = 8$）では、どの呼び出しも 6 個目の標本で `OutOfBounds` になる。
+`Atomic` は出力を一つも書き換えず、`Incremental` は完了した 5 個を書く。
+`Rollback` を選ぶと位置は 0 に戻り、`AdvanceOnError` では 5 のまま残る。
+二つの方針は独立に選べるので、`Incremental` と `Rollback` の組は「出力に 5 個が残り、生成器は呼び出し前に戻る」状態を作る。
+`sample_n` は失敗すると出力を返さず、生成器は消費した 5 遷移の分だけ進んだまま残る。
+呼び出し前に取ったスナップショットを失敗後に書き戻すと、位置は 0 に戻る。
+$L = 8$、$n = 8$ ではどの組も 8 個を作り、位置は 8 になる。
+`Rollback` で戻した生成器から同じ一括生成をやり直すと、失敗する前と同じ標本の列が先頭から出る。
+
+## まとめ
+
+同じ型と同じシードからは同じ列が出るが、古典的な生成器はシードを 32 ビット以下に縮めるので、64 ビットのシードの違いがそのまま列の違いになるとは限らない。
+エントロピー源から作った生成器を後で再現するには、シードを自分で記録するか、作った直後の状態を `export_state` で保存する。
+プロセスをまたぐ保存には `GRN2` 形式のバイト列を、同じプロセスの中で戻すだけならスナップショットを使い分けられる。
+失敗した一括生成の後に同じ位置から再試行したいときは `sample_n_into` に `SamplingPolicy::rollback` を渡すか、所有値を返す API の前にスナップショットを取り、消費したワードを数えたいときは `SamplingPolicy::advance_on_error` を選ぶ。
+
+## 次に読むページ
+
+- [系列のスキップ・ジャンプ・分割](../advance-jump-split/)：シードをずらす代わりに、重ならない並列の系列を作る方法を確かめる。
+- [標本の一括生成と状態の扱い](oxref:random-algorithms-batches-and-state)：出力方針と作業領域の規則を確かめる。
+- [生成器と系列の API](../../api/engines-and-streams/)：`SeedableRng`、`SerializableState`、`SnapshotGenerator` の仕様を引く。

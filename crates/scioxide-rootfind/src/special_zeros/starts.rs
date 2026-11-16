@@ -1,0 +1,288 @@
+//! Tabulated starting values of the first zeros. Every returned zero is
+//! refined and checked independently of these values.
+//!
+//! The values were computed in high-precision arithmetic at 160 and 240
+//! decimal digits and are checked against the `special_zero_starts.tsv` test
+//! data, including the switch to asymptotic expansions.
+pub(super) const J0: [f64; 8] = [
+    f64::from_bits(0x40033d152e971b40),
+    f64::from_bits(0x4016148f5b2c2e45),
+    f64::from_bits(0x40214eb56cccdeca),
+    f64::from_bits(0x40279544008272b6),
+    f64::from_bits(0x402ddca13ef271d2),
+    f64::from_bits(0x403212313f8a19f6),
+    f64::from_bits(0x4035362dd173f792),
+    f64::from_bits(0x40385a3b930156dd),
+];
+pub(super) const J1: [f64; 8] = [
+    f64::from_bits(0x400ea75575af6f09),
+    f64::from_bits(0x401c0ff5f3b47250),
+    f64::from_bits(0x402458d0d0bdfc29),
+    f64::from_bits(0x402aa5baf310e5a2),
+    f64::from_bits(0x4030787b360508c5),
+    f64::from_bits(0x40339da8e7416ca4),
+    f64::from_bits(0x4036c294e3d4d8ac),
+    f64::from_bits(0x4039e7570dcea106),
+];
+pub(super) const J25: [f64; 8] = [
+    f64::from_bits(0x40170dc83f69f856),
+    f64::from_bits(0x402230a5533a4a71),
+    f64::from_bits(0x4028a55884d63e73),
+    f64::from_bits(0x402f077a0bbc5d0a),
+    f64::from_bits(0x4032b064afc409d2),
+    f64::from_bits(0x4035da9780456f95),
+    f64::from_bits(0x4039034712171e32),
+    f64::from_bits(0x403c2af6e343213d),
+];
+pub(super) const JP1: [f64; 8] = [
+    f64::from_bits(0x3ffd757d1fec8a3a),
+    f64::from_bits(0x40155365bc032467),
+    f64::from_bits(0x402112980f0b88a1),
+    f64::from_bits(0x40276979797ee5ac),
+    f64::from_bits(0x402dba284a17ac59),
+    f64::from_bits(0x403203f9a24e6527),
+    f64::from_bits(0x40352a1424a1a9fa),
+    f64::from_bits(0x40384fb31dee1635),
+];
+pub(super) const Y0: [f64; 8] = [
+    f64::from_bits(0x3fec982eb8d417ea),
+    f64::from_bits(0x400fa9534d98569c),
+    f64::from_bits(0x401c581dc4e72103),
+    f64::from_bits(0x402471d735a47d58),
+    f64::from_bits(0x402ab8e1c4a1e74a),
+    f64::from_bits(0x4030803c74003214),
+    f64::from_bits(0x4033a42cdf5febd7),
+    f64::from_bits(0x4036c832fd77ac07),
+];
+pub(super) const Y1: [f64; 8] = [
+    f64::from_bits(0x400193bed4dff243),
+    f64::from_bits(0x4015b7fe4e87b02e),
+    f64::from_bits(0x40213127ae6169b4),
+    f64::from_bits(0x40277f9138d43206),
+    f64::from_bits(0x402dcb7d88de848b),
+    f64::from_bits(0x40320b1c695f1e3b),
+    f64::from_bits(0x40353025492188cd),
+    f64::from_bits(0x403854fa303820ca),
+];
+pub(super) const AI: [f64; 8] = [
+    f64::from_bits(0xc002b471a873adf9),
+    f64::from_bits(0xc0105a0f6b48f9c0),
+    f64::from_bits(0xc016150da2b52089),
+    f64::from_bits(0xc01b2596ce396d64),
+    f64::from_bits(0xc01fc6caf47ef4f9),
+    f64::from_bits(0xc0220b98e484a6ea),
+    f64::from_bits(0xc0241491bb3642b8),
+    f64::from_bits(0xc026045d4c2b82d5),
+];
+pub(super) const AIP: [f64; 8] = [
+    f64::from_bits(0xbff04cf9dbe9edbf),
+    f64::from_bits(0xc009fc4f039344f5),
+    f64::from_bits(0xc01347c8166df3c8),
+    f64::from_bits(0xc018a73a0b1eabdd),
+    f64::from_bits(0xc01d7d1c08cafb1c),
+    f64::from_bits(0xc020fa1aeee64a03),
+    f64::from_bits(0xc023122660d1c0a7),
+    f64::from_bits(0xc0250e2980e8a723),
+];
+pub(super) const BI: [f64; 8] = [
+    f64::from_bits(0xbff2c7878426b20d),
+    f64::from_bits(0xc00a2b32f72ec62a),
+    f64::from_bits(0xc01352acf0d5f3b2),
+    f64::from_bits(0xc018adedb760fe7d),
+    f64::from_bits(0xc01d81cdeb2507ae),
+    f64::from_bits(0xc020fbe0b81e2020),
+    f64::from_bits(0xc023138e36b45dc1),
+    f64::from_bits(0xc0250f50d2ba0431),
+];
+pub(super) const BIP: [f64; 8] = [
+    f64::from_bits(0xc0025b03313bc73a),
+    f64::from_bits(0xc0104ae92aec65db),
+    f64::from_bits(0xc0160cb177560f95),
+    f64::from_bits(0xc01b200ba6b84c98),
+    f64::from_bits(0xc01fc2be33c98033),
+    f64::from_bits(0xc0220a06d47b225a),
+    f64::from_bits(0xc024134cef1b38f8),
+    f64::from_bits(0xc026034f1324f03b),
+];
+pub(super) const BER: [f64; 8] = [
+    f64::from_bits(0x4006ca956d2a7427),
+    f64::from_bits(0x401cf48fb4eb9c9c),
+    f64::from_bits(0x40275911c018d237),
+    f64::from_bits(0x40301d1284dca3bf),
+    f64::from_bits(0x40348dfc55cc5795),
+    f64::from_bits(0x4038ff11a2ee3511),
+    f64::from_bits(0x403d703e44ccad52),
+    f64::from_bits(0x4040f0bc6e8b2217),
+];
+pub(super) const BEI: [f64; 8] = [
+    f64::from_bits(0x40141ada73a00aeb),
+    f64::from_bits(0x4022e92b03d5ef6d),
+    f64::from_bits(0x402bc9773d651763),
+    f64::from_bits(0x4032557ff093f4e8),
+    f64::from_bits(0x4036c6833086fb28),
+    f64::from_bits(0x403b37a5c4cfc8c7),
+    f64::from_bits(0x403fa8da324aaab1),
+    f64::from_bits(0x40420d0ce098af0f),
+];
+pub(super) const KER: [f64; 8] = [
+    f64::from_bits(0x3ffb7f26e705a52e),
+    f64::from_bits(0x401882557628a172),
+    f64::from_bits(0x4025203a06d3d7fc),
+    f64::from_bits(0x402e0160566428a5),
+    f64::from_bits(0x4033719df787c438),
+    f64::from_bits(0x4037e2b54c90891a),
+    f64::from_bits(0x403c53e31aa01cc1),
+    f64::from_bits(0x4040628f37d846b6),
+];
+pub(super) const KEI: [f64; 8] = [
+    f64::from_bits(0x400f513d4010d191),
+    f64::from_bits(0x4020b03e44778f0b),
+    f64::from_bits(0x402990ab54a0fa4c),
+    f64::from_bits(0x4031391ff27275c3),
+    f64::from_bits(0x4035aa25fcc1924b),
+    f64::from_bits(0x403a1b4a1727c68b),
+    f64::from_bits(0x403e8c7f708f7f5b),
+    f64::from_bits(0x40417edfcc6eda80),
+];
+pub(super) const BERP: [f64; 8] = [
+    f64::from_bits(0x401827a3ce437a8a),
+    f64::from_bits(0x402506fc26d631af),
+    f64::from_bits(0x402defd8140d8900),
+    f64::from_bits(0x40336ae630bacd83),
+    f64::from_bits(0x4037dd430c550e1d),
+    f64::from_bits(0x403c4f4eaef90450),
+    f64::from_bits(0x404060957500d07d),
+    f64::from_bits(0x4042997488cc770d),
+];
+pub(super) const BEIP: [f64; 8] = [
+    f64::from_bits(0x400e2e6f577980bc),
+    f64::from_bits(0x40208fdda3b295e2),
+    f64::from_bits(0x40297bfac29da1f8),
+    f64::from_bits(0x40313184be4b0ca0),
+    f64::from_bits(0x4035a4220263579b),
+    f64::from_bits(0x403a1650595f9479),
+    f64::from_bits(0x403e88416626ccb8),
+    f64::from_bits(0x40417d068277545d),
+];
+pub(super) const KERP: [f64; 8] = [
+    f64::from_bits(0x400553a3d03b1628),
+    f64::from_bits(0x401cb040c84317d3),
+    f64::from_bits(0x402743adef64e6d6),
+    f64::from_bits(0x403015475e60d543),
+    f64::from_bits(0x403487da8b0ff0fa),
+    f64::from_bits(0x4038fa039326516c),
+    f64::from_bits(0x403d6bf17e57bc09),
+    f64::from_bits(0x4040eedd8e8bd3a8),
+];
+pub(super) const KEIP: [f64; 8] = [
+    f64::from_bits(0x4013ba2ce8d51642),
+    f64::from_bits(0x4022cee03e0d74dc),
+    f64::from_bits(0x402bb76f0e27690b),
+    f64::from_bits(0x40324ea2e2b09d46),
+    f64::from_bits(0x4036c0f88cea2951),
+    f64::from_bits(0x403b33002801f404),
+    f64::from_bits(0x403fa4d9e7c1db0d),
+    f64::from_bits(0x40420b4b364e188e),
+];
+pub(super) const ERF: [[f64; 2]; 8] = [
+    [
+        f64::from_bits(0x3ff735b94b42e3ac),
+        f64::from_bits(0x3ffe1857aff4c71e),
+    ],
+    [
+        f64::from_bits(0x4001f50febdd2f37),
+        f64::from_bits(0x4004eebef2864d4c),
+    ],
+    [
+        f64::from_bits(0x4006b7ca276ca183),
+        f64::from_bits(0x400967afb481cf17),
+    ],
+    [
+        f64::from_bits(0x400aaf0609be7eb6),
+        f64::from_bits(0x400d2b5d78b0c679),
+    ],
+    [
+        f64::from_bits(0x400e26ec640624b6),
+        f64::from_bits(0x40103e276a6ace07),
+    ],
+    [
+        f64::from_bits(0x4010a2d079fcb5ee),
+        f64::from_bits(0x4011be0670d044f8),
+    ],
+    [
+        f64::from_bits(0x401210b6085e035d),
+        f64::from_bits(0x40131f2daacf6e55),
+    ],
+    [
+        f64::from_bits(0x401364525427ffed),
+        f64::from_bits(0x40146806b231d73b),
+    ],
+];
+pub(super) const FRESNEL_C: [[f64; 2]; 8] = [
+    [
+        f64::from_bits(0x3ffbe60fe0c400f6),
+        f64::from_bits(0x3fd39129cce1e89f),
+    ],
+    [
+        f64::from_bits(0x400536307309839d),
+        f64::from_bits(0x3fd02f94126eb8c5),
+    ],
+    [
+        f64::from_bits(0x400a90188e4483fc),
+        f64::from_bits(0x3fccaa81c52a3221),
+    ],
+    [
+        f64::from_bits(0x400f0181155ee6cb),
+        f64::from_bits(0x3fca352a44f9c6d3),
+    ],
+    [
+        f64::from_bits(0x401171baa275a9d6),
+        f64::from_bits(0x3fc867dda4633fd3),
+    ],
+    [
+        f64::from_bits(0x401330c0150a2a42),
+        f64::from_bits(0x3fc700ac1344fa44),
+    ],
+    [
+        f64::from_bits(0x4014ca659ca6cfe0),
+        f64::from_bits(0x3fc5dd6826592533),
+    ],
+    [
+        f64::from_bits(0x401646b7b4b2ae8a),
+        f64::from_bits(0x3fc4ea3e50d7eb8b),
+    ],
+];
+pub(super) const FRESNEL_S: [[f64; 2]; 8] = [
+    [
+        f64::from_bits(0x400012f55718460e),
+        f64::from_bits(0x3fd2779199981bac),
+    ],
+    [
+        f64::from_bits(0x4006aaf61c7c0cf7),
+        f64::from_bits(0x3fcf44bd1fffa75c),
+    ],
+    [
+        f64::from_bits(0x400bbd81fc3d0565),
+        f64::from_bits(0x3fcbf791728d7b24),
+    ],
+    [
+        f64::from_bits(0x401002a3defacc8c),
+        f64::from_bits(0x3fc9b57c840057fd),
+    ],
+    [
+        f64::from_bits(0x4011e591e0ec43b9),
+        f64::from_bits(0x3fc8062e001a5f36),
+    ],
+    [
+        f64::from_bits(0x40139a4b6f92c7f1),
+        f64::from_bits(0x3fc6b26eff12289a),
+    ],
+    [
+        f64::from_bits(0x40152bfa3ab8274b),
+        f64::from_bits(0x3fc59caf9d914900),
+    ],
+    [
+        f64::from_bits(0x4016a1e6bcf9b7de),
+        f64::from_bits(0x3fc4b366eb8f02d2),
+    ],
+];

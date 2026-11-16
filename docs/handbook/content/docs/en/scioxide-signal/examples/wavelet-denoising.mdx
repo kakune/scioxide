@@ -1,0 +1,509 @@
+---
+title: "Wavelet denoising and perfect reconstruction"
+description: "Add white noise to test signals with jumps and smooth regions, estimate noise magnitude by MAD from orthogonal-wavelet detail coefficients, and shrink coefficients with the universal threshold. Check zero-threshold round-trip error, SNR improvement, and differences between families."
+sidebar:
+  order: 430
+---
+
+When removing noise from measured waveforms, moving averages and low-pass filters also round off jumps and sharp features.
+This occurs because noise and signal bands overlap when a signal combines smooth regions and abrupt changes.
+In a wavelet transform, smooth regions concentrate into a few large coefficients, while white noise spreads thinly across all coefficients.
+Shrinking small coefficients toward 0 and resynthesizing can reduce noise while retaining jumps.
+This example implements Donoho–Johnstone shrinkage (wavelet shrinkage) with `WaveletPlan` and measures its effect through error against the noise-free signal.
+
+## Test signals and noise
+
+Sample time $t \in [0, 1)$ s at $N = 1024$ points (sampling rate 1024 Hz), using the following two test signals.
+Amplitudes are dimensionless.
+Both are defined for this page after forms used by Donoho and Johnstone; no agreement with the source values is claimed.
+
+- HeaviSine: $f(t) = 4\sin(4\pi t) - \mathrm{sgn}(t - 0.3) - \mathrm{sgn}(0.72 - t)$.
+  A smooth sinusoid with two jumps of height 2 at $t = 0.3$ and $t = 0.72$.
+- Blocks: $f(t) = \sum_{j=1}^{11} h_j\,K(t - t_j)$, $K(u) = (1 + \mathrm{sgn}\,u)/2$.
+  Jump locations are $t_j = 0.10, 0.13, 0.15, 0.23, 0.25, 0.40, 0.44, 0.65, 0.76, 0.78, 0.81$ and heights are $h_j = 4, -5, 3, -4, 5, -4.2, 2.1, 4.3, -3.1, 2.1, -4.2$, giving a piecewise-constant signal.
+
+Both have $f(0) = 0$ and approach 0 as $t \to 1$, so a periodic boundary introduces no endpoint jump.
+Observations are $y_i = f(t_i) + \sigma\varepsilon_i$, where $\varepsilon_i$ are independent standard normal variates.
+
+## Orthogonal transforms and noise coefficients
+
+An orthonormal wavelet transform $W$ is an orthogonal matrix, so coefficients $W\sigma\varepsilon$ of white noise $\sigma\varepsilon$ are also independent normal variates with variance $\sigma^2$.
+This holds when orthogonal families (`Haar` and `Daubechies`) are used with periodic boundaries on a record whose length $N$ is a power of two.
+For biorthogonal families the transform is not orthogonal, so noise-coefficient variances vary by level and the coefficients are not independent.
+
+Finest-level detail coefficients are almost 0 in smooth parts of the signal and consist mainly of noise.
+Thus estimate the noise standard deviation from their median absolute value (MAD, median absolute deviation) as
+
+$$
+\hat\sigma = \frac{\operatorname{median}\lvert d^{(1)}_j \rvert}{\Phi^{-1}(3/4)},
+\qquad \Phi^{-1}(3/4) \approx 0.6745
+$$
+
+where $\Phi$ is the standard normal cumulative distribution function.
+Using a median limits the influence of the few large coefficients at jumps.
+
+## Universal threshold and shrinkage
+
+The probability that the maximum absolute value of $N$ independent $N(0, \sigma^2)$ variates does not exceed $\sigma\sqrt{2\ln N}$ approaches 1 as $N \to \infty$.
+Use this value as the universal threshold $\lambda = \hat\sigma\sqrt{2\ln N}$ and shrink detail coefficients $d$ by
+
+$$
+\eta_{\mathrm{soft}}(d) = \mathrm{sgn}(d)\,\max(\lvert d \rvert - \lambda, 0),
+\qquad
+\eta_{\mathrm{hard}}(d) = d\,[\,\lvert d \rvert > \lambda\,]
+$$
+
+These are soft and hard thresholding.
+Soft thresholding also reduces retained coefficients by $\lambda$, giving smoother estimates but shrinking amplitudes.
+Hard thresholding preserves retained coefficients and hence amplitudes, but estimates change discontinuously as near-threshold coefficients are retained or removed.
+At $N = 1024$, $\sqrt{2\ln N} \approx 3.72$.
+Do not shrink the final approximation coefficients.
+
+Write the threshold as $c\lambda$ and expose its multiplier $c$ as a control.
+At $c = 0$, shrinkage does nothing, so synthesis reproduces the observation $y$ unchanged.
+Round-trip error without removing coefficients checks perfect reconstruction of the transform.
+
+The following block defines functions shared by this page's two cells.
+`test_signal` gives the two test signals above, `noisy_record` generates observations using seeded normal variates, and `denoise` combines five-level decomposition with periodic boundaries, MAD estimation of $\hat\sigma$, threshold shrinkage, and synthesis.
+Before shrinkage, `denoise` also measures round-trip error without removing coefficients.
+
+```rust
+//| id: signal-wavelet-denoising-model
+//| kind: definitions
+//| title: "Test signals and wavelet coefficient shrinkage"
+//| crates: [scioxide-core, scioxide-random, scioxide-signal]
+use scioxide_random::{Distribution, Normal, SeedableRng, SplitMix64};
+use scioxide_signal::{WaveletFamily, WaveletOptions, WaveletPlan};
+
+/// Sample count N (a power of two) and decomposition level count.
+pub(crate) const SAMPLES: usize = 1024;
+pub(crate) const LEVELS: usize = 5;
+
+/// Test signal f(t), t ∈ [0, 1).
+pub(crate) fn test_signal(name: &str, t: f64) -> f64 {
+    let sign = |x: f64| {
+        if x > 0.0 {
+            1.0
+        } else if x < 0.0 {
+            -1.0
+        } else {
+            0.0
+        }
+    };
+    if name == "HeaviSine" {
+        // Use f64 inherent methods to generate reference values.
+        4.0 * (4.0 * std::f64::consts::PI * t).sin() - sign(t - 0.3) - sign(0.72 - t)
+    } else {
+        const POSITIONS: [f64; 11] = [
+            0.1, 0.13, 0.15, 0.23, 0.25, 0.4, 0.44, 0.65, 0.76, 0.78, 0.81,
+        ];
+        const HEIGHTS: [f64; 11] = [4.0, -5.0, 3.0, -4.0, 5.0, -4.2, 2.1, 4.3, -3.1, 2.1, -4.2];
+        POSITIONS
+            .iter()
+            .zip(HEIGHTS)
+            .map(|(&position, height)| height * (1.0 + sign(t - position)) / 2.0)
+            .sum()
+    }
+}
+
+/// Select WaveletFamily from the family name.
+pub(crate) fn family(name: &str) -> WaveletFamily {
+    match name {
+        "Haar" => WaveletFamily::Haar,
+        "Daubechies(4)" => WaveletFamily::Daubechies(4),
+        "Daubechies(8)" => WaveletFamily::Daubechies(8),
+        _ => WaveletFamily::BiorthogonalSpline(303),
+    }
+}
+
+/// Observations y_i = f(t_i) + σ ε_i. ε_i are standard normal variates with seed seed.
+pub(crate) fn noisy_record(clean: &[f64], sigma: f64, seed: u64) -> Result<Vec<f64>, String> {
+    let mut rng = SplitMix64::from_seed(seed);
+    let noise = Normal::new(0.0, sigma).map_err(|e| e.to_string())?;
+    clean
+        .iter()
+        .map(|&f| Ok(f + noise.sample(&mut rng).map_err(|e| e.to_string())?))
+        .collect()
+}
+
+/// Shrinkage result and diagnostics.
+pub(crate) struct Denoised {
+    pub(crate) estimate: Vec<f64>,
+    pub(crate) finest: Vec<f64>,
+    pub(crate) sigma_hat: f64,
+    pub(crate) threshold: f64,
+    pub(crate) kept: usize,
+    pub(crate) details: usize,
+    pub(crate) round_trip: f64,
+}
+
+/// Five-level decomposition, MAD estimate σ̂, shrinkage at threshold factor·σ̂√(2 ln N), and synthesis.
+pub(crate) fn denoise(
+    family: WaveletFamily,
+    noisy: &[f64],
+    factor: f64,
+    hard: bool,
+) -> Result<Denoised, String> {
+    let options = WaveletOptions::new();
+    let plan =
+        WaveletPlan::<f64>::new(family, noisy.len(), LEVELS, options).map_err(|e| e.to_string())?;
+    let mut coefficients = plan.analyze(noisy).map_err(|e| e.to_string())?;
+    // Zero-threshold round trip: synthesize without removing coefficients and measure the maximum difference from observations.
+    let restored = plan.synthesize(&coefficients).map_err(|e| e.to_string())?;
+    let round_trip = restored
+        .iter()
+        .zip(noisy)
+        .fold(0.0_f64, |acc, (a, b)| acc.max((a - b).abs()));
+    // The first entry of levels() is the finest level. Estimate σ from the median absolute detail coefficient.
+    let level = plan.levels()[0];
+    let start = level.detail_offset();
+    let finest = coefficients[start..start + level.band_len()].to_vec();
+    let mut magnitudes: Vec<f64> = finest.iter().map(|d| d.abs()).collect();
+    magnitudes.sort_by(f64::total_cmp);
+    let m = magnitudes.len();
+    let median = if m % 2 == 1 {
+        magnitudes[m / 2]
+    } else {
+        0.5 * (magnitudes[m / 2 - 1] + magnitudes[m / 2])
+    };
+    // Dividing by Φ⁻¹(3/4) gives a consistent estimator of the normal distribution's standard deviation.
+    let sigma_hat = median / 0.674_489_750_196_081_7;
+    let threshold = factor * sigma_hat * (2.0 * (noisy.len() as f64).ln()).sqrt();
+    // Keep the final approximation (at the start) and shrink only details.
+    let approximation = plan.approximation_len();
+    let mut kept = 0;
+    for d in &mut coefficients[approximation..] {
+        let shrunk = if d.abs() <= threshold {
+            0.0
+        } else if hard {
+            *d
+        } else {
+            d.signum() * (d.abs() - threshold)
+        };
+        kept += usize::from(shrunk != 0.0);
+        *d = shrunk;
+    }
+    let estimate = plan.synthesize(&coefficients).map_err(|e| e.to_string())?;
+    Ok(Denoised {
+        estimate,
+        finest,
+        sigma_hat,
+        threshold,
+        kept,
+        details: coefficients.len() - approximation,
+        round_trip,
+    })
+}
+```
+
+## Denoising one observation
+
+The next cell adds noise of magnitude $\sigma$ to the selected test signal, applies shrinkage, and compares with the noise-free signal $f$.
+Inputs are the test signal, noise standard deviation $\sigma$, random seed, family, threshold multiplier $c$, and threshold type.
+Measure error by root-mean-square error (RMSE) $\sqrt{\frac1N\sum_i(\hat f_i - f_i)^2}$ and signal-to-noise ratio $\mathrm{SNR} = 10\log_{10}\left(\sum_i f_i^2 / \sum_i (\hat f_i - f_i)^2\right)$ [dB].
+The upper chart shows observations (points), the noise-free signal (dashed), and the estimate (solid); the lower shows finest-level detail coefficients and thresholds $\pm c\lambda$ on the same time axis.
+Plot detail coefficient $d^{(1)}_j$ at time $t = 2j/N$.
+
+```rust
+//| id: signal-wavelet-denoising
+//| ref: signal-wavelet-denoising
+//| title: "Compare wavelet shrinkage of a test signal with the noise-free signal"
+//| run: reactive
+//| uses: [signal-wavelet-denoising-model]
+//| crates: [scioxide-core, scioxide-random, scioxide-signal]
+//| inputs:
+//|   signal_name: {"type":"select","label":"Test signal","options":["HeaviSine","Blocks"],"value":"HeaviSine"}
+//|   sigma: {"type":"range","label":"Noise standard deviation σ [-]","min":0.1,"max":2,"step":0.1,"value":0.5}
+//|   seed: {"type":"range","label":"Random seed","min":1,"max":100,"step":1,"value":11}
+//|   family_name: {"type":"select","label":"Family","options":["Haar","Daubechies(4)","Daubechies(8)","BiorthogonalSpline(303)"],"value":"Daubechies(8)"}
+//|   factor: {"type":"range","label":"Threshold multiplier c [-]","description":"Threshold is c σ̂ √(2 ln N). At 0, no shrinkage is applied.","min":0,"max":1.5,"step":0.05,"value":1}
+//|   rule: {"type":"select","label":"Threshold type","options":["Soft threshold","Hard threshold"],"value":"Soft threshold"}
+//| cases:
+//|   - {"id":"no-threshold","label":"c = 0 (no shrinkage)","description":"The estimate equals the observation, and its RMSE equals the observation RMSE.","inputs":{"factor":0}}
+//|   - {"id":"blocks-haar","label":"Blocks, Haar, hard threshold","description":"A piecewise-constant signal concentrates in a few Haar coefficients, and hard thresholding preserves jump heights.","inputs":{"signal_name":"Blocks","family_name":"Haar","rule":"Hard threshold"}}
+//|   - {"id":"hard","label":"Hard threshold","description":"Retained coefficients are not shrunk, giving smaller RMSE than soft thresholding.","inputs":{"rule":"Hard threshold"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"noise","path":"/rows/0/1","approx":{"value":0.5,"atol":0.05}}
+//|       - {"artifact":"errors","path":"/rows/0/0","approx":{"value":0.5,"atol":0.03}}
+//|       - {"artifact":"errors","path":"/rows/0/1","range":{"max":0.25}}
+//|       - {"artifact":"errors","path":"/rows/0/4","range":{"max":1e-13}}
+//|   - case: no-threshold
+//|     expect:
+//|       - {"artifact":"noise","path":"/rows/0/3","equals":992}
+//|       - {"artifact":"errors","path":"/rows/0/4","range":{"max":1e-13}}
+//|   - case: blocks-haar
+//|     expect:
+//|       - {"artifact":"errors","path":"/rows/0/1","range":{"max":0.3}}
+//|   - case: hard
+//|     expect:
+//|       - {"artifact":"errors","path":"/rows/0/1","range":{"max":0.25}}
+let clean: Vec<f64> = (0..SAMPLES)
+    .map(|i| test_signal(&signal_name, i as f64 / SAMPLES as f64))
+    .collect();
+let noisy = noisy_record(&clean, sigma, seed as u64)?;
+let result = denoise(family(&family_name), &noisy, factor, rule == "Hard threshold")?;
+
+// Error metrics (aggregated using f64 inherent methods).
+let rmse = |values: &[f64]| {
+    let sum: f64 = values
+        .iter()
+        .zip(&clean)
+        .map(|(v, f)| (v - f).powi(2))
+        .sum();
+    (sum / SAMPLES as f64).sqrt()
+};
+let power: f64 = clean.iter().map(|f| f * f).sum::<f64>() / SAMPLES as f64;
+let snr = |error: f64| 10.0 * (power / (error * error)).log10();
+let (noisy_rmse, estimate_rmse) = (rmse(&noisy), rmse(&result.estimate));
+
+let fixed4 = serde_json::json!({ "significantDigits": 4 });
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let noise_columns = serde_json::json!([
+    { "key": "0", "label": "σ (true) [-]", "type": "number", "format": fixed4 },
+    { "key": "1", "label": "MAD estimate σ̂ [-]", "type": "number", "format": fixed4 },
+    { "key": "2", "label": "Threshold c λ [-]", "type": "number", "format": fixed4 },
+    { "key": "3", "label": "Retained detail coefficients [count]", "type": "integer" },
+    { "key": "4", "label": "Total detail coefficients [count]", "type": "integer" }
+]);
+let noise_row = (
+    sigma,
+    result.sigma_hat,
+    result.threshold,
+    result.kept,
+    result.details,
+);
+emit_table_with_columns!(
+    noise_columns,
+    vec![noise_row],
+    metadata = serde_json::json!({ "id": "noise" })
+);
+let error_columns = serde_json::json!([
+    { "key": "0", "label": "Observation RMSE [-]", "type": "number", "format": fixed4 },
+    { "key": "1", "label": "Estimate RMSE [-]", "type": "number", "format": fixed4 },
+    { "key": "2", "label": "Observation SNR [dB]", "type": "number", "format": fixed2 },
+    { "key": "3", "label": "Estimate SNR [dB]", "type": "number", "format": fixed2 },
+    { "key": "4", "label": "Zero-threshold round-trip error [-]", "type": "number", "format": sci2 }
+]);
+let error_row = (
+    noisy_rmse,
+    estimate_rmse,
+    snr(noisy_rmse),
+    snr(estimate_rmse),
+    result.round_trip,
+);
+emit_table_with_columns!(
+    error_columns,
+    vec![error_row],
+    metadata = serde_json::json!({ "id": "errors" })
+);
+
+let time = |i: usize| i as f64 / SAMPLES as f64;
+let series = |values: &[f64]| -> Vec<[f64; 2]> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| [time(i), v])
+        .collect()
+};
+emit_chart!(serde_json::json!({
+    "kind": "xy",
+    "dataZoom": true,
+    "tooltip": true,
+    "link": { "group": "denoise-time" },
+    "xLabel": "Time t [s]",
+    "yLabel": "Amplitude [-]",
+    "xMin": 0.0,
+    "xMax": 1.0,
+    "layers": [
+        { "id": "noisy", "kind": "scatter", "name": "Observations y", "points": series(&noisy) },
+        {
+            "id": "clean",
+            "kind": "line",
+            "name": "Noise-free signal f",
+            "points": series(&clean),
+            "style": { "lineType": "dashed" }
+        },
+        { "id": "estimate", "kind": "line", "name": "Estimate", "points": series(&result.estimate) }
+    ]
+}));
+let finest: Vec<[f64; 2]> = result
+    .finest
+    .iter()
+    .enumerate()
+    .map(|(j, &d)| [time(2 * j), d])
+    .collect();
+emit_chart!(serde_json::json!({
+    "kind": "scatter",
+    "dataZoom": true,
+    "tooltip": true,
+    "link": { "group": "denoise-time" },
+    "series": [{ "name": "Finest-level detail coefficients d⁽¹⁾", "points": finest }],
+    "xLabel": "Time t [s]",
+    "yLabel": "Detail coefficient [-]",
+    "xMin": 0.0,
+    "xMax": 1.0,
+    "annotations": [
+        { "kind": "line", "axis": "y", "value": result.threshold, "label": "+cλ" },
+        { "kind": "line", "axis": "y", "value": -result.threshold, "label": "−cλ" }
+    ]
+}));
+```
+
+With the defaults HeaviSine, $\sigma = 0.5$, seed 11, `Daubechies(8)`, soft thresholding, and $c = 1$, the MAD estimate is $\hat\sigma = 0.4618$ and the threshold is $\lambda = 1.720$.
+Only 5 of the 992 detail coefficients remain; the others become 0.
+Estimate RMSE decreases from the observation's $0.4929$ to $0.1651$, and SNR increases from $15.93$ dB to $25.43$ dB.
+The round-trip error without coefficient removal is $6.2\times10^{-15}$, so denoising comes entirely from shrinkage.
+In the lower chart, only one of the 512 finest-level detail coefficients, near $t \approx 0.13$, lies outside the $\pm\lambda$ band; the other four of the five retained coefficients are at coarser levels.
+This coefficient is at a location with no signal feature, where noise has exceeded the threshold.
+The universal threshold is chosen so that the probability of all noise-only coefficients lying within it approaches 1 as $N \to \infty$; a few exceedances can occur at finite $N$.
+
+At $c = 0$, shrinkage does nothing, all 992 coefficients remain, and estimate RMSE equals the observation RMSE $0.4929$.
+At $c = 1.5$, only one coefficient remains and RMSE increases to $0.1811$.
+Too high a threshold removes signal details along with noise.
+Hard thresholding retains the same five coefficients without shrinking them, giving RMSE $0.1515$ and SNR $26.18$ dB.
+At $\sigma = 2$, observation RMSE $1.972$ decreases to $0.3751$, improving SNR by $14.4$ dB.
+
+Processing Blocks with the same `Daubechies(8)` and soft thresholding reduces RMSE only from $0.4929$ to $0.4601$.
+With a long filter, jumps in a piecewise-constant signal spread over many coefficients, each reduced by $\lambda$ under soft thresholding.
+With `Haar` and hard thresholding, jumps concentrate in a few large coefficients that remain unchanged, giving RMSE $0.2187$ and increasing SNR from $13.98$ dB to $21.04$ dB.
+With `BiorthogonalSpline(303)`, the estimate $\hat\sigma = 0.3587$ is below the true $0.5$.
+A biorthogonal analysis high-pass filter does not have unit norm, so the standard deviation of finest-level noise coefficients is not $\sigma$.
+
+## Differences between families
+
+Because one observation depends on randomness, compare families by averaging over many seeds.
+For the selected test signal and $\sigma$, the next cell generates $R$ observations with seeds $s_0, s_0 + 1, \dots, s_0 + R - 1$, applying eight combinations of four families and two threshold types ($c = 1$).
+For each method, the table shows mean estimate RMSE and its standard error (sample standard deviation $/\sqrt{R}$), mean $\hat\sigma$, and mean SNR improvement.
+All eight methods share observations with the same seeds, so differences between methods do not include noise differences between observations.
+The last column counts observations in which each method achieved the smallest RMSE.
+
+```rust
+//| id: signal-wavelet-denoising-families
+//| ref: signal-wavelet-denoising-families
+//| title: "Compare four families and two threshold types over many observations"
+//| run: reactive
+//| uses: [signal-wavelet-denoising-model]
+//| crates: [scioxide-core, scioxide-random, scioxide-signal]
+//| inputs:
+//|   signal_name: {"type":"select","label":"Test signal","options":["HeaviSine","Blocks"],"value":"Blocks"}
+//|   sigma: {"type":"range","label":"Noise standard deviation σ [-]","min":0.1,"max":2,"step":0.1,"value":0.5}
+//|   repetitions: {"type":"range","label":"Observation count R [-]","min":10,"max":40,"step":10,"value":20}
+//|   first_seed: {"type":"range","label":"First seed s₀","min":1,"max":100,"step":1,"value":1}
+//| cases:
+//|   - {"id":"heavisine","label":"HeaviSine","description":"For a signal with many smooth regions, Daubechies RMSE is about half that of Haar.","inputs":{"signal_name":"HeaviSine"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"families","path":"/rows/1/1","equals":"Hard threshold"}
+//|       - {"artifact":"families","path":"/rows/1/2","range":{"max":0.25}}
+//|   - case: heavisine
+//|     expect:
+//|       - {"artifact":"families","path":"/rows/2/2","range":{"max":0.2}}
+let names = [
+    "Haar",
+    "Daubechies(4)",
+    "Daubechies(8)",
+    "BiorthogonalSpline(303)",
+];
+let clean: Vec<f64> = (0..SAMPLES)
+    .map(|i| test_signal(&signal_name, i as f64 / SAMPLES as f64))
+    .collect();
+let count = repetitions.round() as usize;
+let rmse = |values: &[f64]| {
+    let sum: f64 = values
+        .iter()
+        .zip(&clean)
+        .map(|(v, f)| (v - f).powi(2))
+        .sum();
+    (sum / SAMPLES as f64).sqrt()
+};
+// Eight methods: soft thresholding (hard = false) and hard thresholding (hard = true) for each family.
+let methods: Vec<(&str, bool)> = names
+    .iter()
+    .flat_map(|&name| [(name, false), (name, true)])
+    .collect();
+// errors[method][observation], gains[method][observation] (SNR improvement [dB]), and sigmas[method][observation].
+let mut errors = vec![Vec::with_capacity(count); methods.len()];
+let mut gains = vec![Vec::with_capacity(count); methods.len()];
+let mut sigmas = vec![Vec::with_capacity(count); methods.len()];
+let mut wins = vec![0_usize; methods.len()];
+for r in 0..count {
+    let noisy = noisy_record(&clean, sigma, first_seed as u64 + r as u64)?;
+    let noisy_rmse = rmse(&noisy);
+    let mut best = (0, f64::INFINITY);
+    for (k, &(name, hard)) in methods.iter().enumerate() {
+        let result = denoise(family(name), &noisy, 1.0, hard)?;
+        let error = rmse(&result.estimate);
+        errors[k].push(error);
+        gains[k].push(20.0 * (noisy_rmse / error).log10());
+        sigmas[k].push(result.sigma_hat);
+        if error < best.1 {
+            best = (k, error);
+        }
+    }
+    wins[best.0] += 1;
+}
+let mean = |values: &[f64]| values.iter().sum::<f64>() / values.len() as f64;
+let standard_error = |values: &[f64]| {
+    let m = mean(values);
+    let variance = values.iter().map(|v| (v - m).powi(2)).sum::<f64>() / (values.len() - 1) as f64;
+    (variance / values.len() as f64).sqrt()
+};
+let rows: Vec<_> = methods
+    .iter()
+    .enumerate()
+    .map(|(k, &(name, hard))| {
+        (
+            name.to_string(),
+            if hard { "Hard threshold" } else { "Soft threshold" }.to_string(),
+            mean(&errors[k]),
+            standard_error(&errors[k]),
+            mean(&sigmas[k]),
+            mean(&gains[k]),
+            wins[k],
+        )
+    })
+    .collect();
+let fixed4 = serde_json::json!({ "significantDigits": 4 });
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Family" },
+    { "key": "1", "label": "Threshold" },
+    { "key": "2", "label": "Mean RMSE [-]", "type": "number", "format": fixed4 },
+    { "key": "3", "label": "RMSE standard error [-]", "type": "number", "format": fixed4 },
+    { "key": "4", "label": "Mean σ̂ [-]", "type": "number", "format": fixed4 },
+    { "key": "5", "label": "Mean SNR improvement [dB]", "type": "number", "format": fixed2 },
+    { "key": "6", "label": "Smallest-RMSE count [count]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "families" })
+);
+```
+
+At the defaults Blocks, $\sigma = 0.5$, $R = 20$, and $s_0 = 1$, `Haar` with hard thresholding has the lowest RMSE, $0.2134 \pm 0.0041$ (mean ± standard error), and wins in all 20 observations.
+Soft thresholding with the same `Haar` gives $0.3696$, while hard thresholding with `Daubechies(4)` and `Daubechies(8)` gives $0.2888$ and $0.3266$; differences are at least 15 standard errors.
+Soft-thresholded `Daubechies(8)` gives $0.4533$, barely below the observation RMSE of about 0.49.
+Mean $\hat\sigma$ for `BiorthogonalSpline(303)` is $0.4066$, about 20% below the orthogonal families' $0.50$–$0.52$.
+Its threshold is reduced by the same factor, so interpret this family's result as shrinkage outside the assumptions of the universal threshold.
+
+For HeaviSine the ranking changes: hard-thresholded `Daubechies(4)` has the lowest RMSE, $0.1497 \pm 0.0035$, and wins in 14 of 20 observations.
+Hard-thresholded `Daubechies(8)` gives $0.1627$; soft-thresholded `Daubechies(4)` and `Daubechies(8)` give $0.1654$ and $0.1732$; `Haar` reaches only $0.3216$ with soft thresholding and $0.2727$ with hard thresholding.
+A smooth sinusoid gives almost zero Daubechies detail coefficients because of vanishing moments, while Haar approximates it with steps, leaving many coefficients.
+For Blocks at $\sigma = 0.1$, soft-thresholded `Daubechies(4)` and `Daubechies(8)` have negative SNR improvement: shrinkage increases error.
+At low noise, the bias from shrinking signal coefficients with soft thresholding exceeds the noise removed.
+
+## Summary
+
+With orthogonal wavelets and periodic boundaries, white-noise coefficients are independent normal variates of equal variance, allowing noise estimation from the MAD of finest-level details and shrinkage with the universal threshold.
+Round-trip error without shrinkage ($c = 0$) is at the rounding-error level, confirming that denoising comes entirely from shrinkage.
+Estimation error depends on signal shape, family, and threshold together: Haar suits piecewise-constant signals, while Daubechies with vanishing moments suits signals with many smooth regions.
+For biorthogonal families, noise-coefficient variance is not $\sigma^2$, violating the assumptions of MAD estimation of $\sigma$ and the universal threshold.
+Soft thresholding shrinks amplitudes; hard thresholding preserves them but is sensitive to which coefficients are retained, so choose according to the objective.
+
+See [Discrete wavelet transforms](../../algorithms/wavelets/) for family definitions, coefficient ordering, and boundary handling.
+Read [Smoothing and detrending](../../algorithms/smoothing-and-detrending/) to compare with smoothing the same record using local polynomials.

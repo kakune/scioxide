@@ -1,0 +1,513 @@
+---
+title: 超弾性と整合接線
+description: 圧縮性 neo-Hooke 材料のひずみエネルギーと応力、平面応力の局所求解、死荷重の離散残差と荷重増分、Newton–Krylov 法による求解、整合接線の一度だけの評価と再利用。
+sidebar:
+  order: 356
+references:
+  pde-hyperelastic-neo-hooke: "neo-hooke-材料"
+  pde-hyperelastic-residual: "離散の残差と荷重増分"
+  pde-hyperelastic-linearization: "整合接線と線形化の再利用"
+---
+
+ゴム、生体組織、発泡材は、数十パーセントを超える伸び縮みでも弾性的に戻る。
+このような大きな変形では、[弾性体の有限要素](../elasticity/)の小ひずみと線形の Hooke 則は使えない。
+このページでは超弾性（ひずみエネルギー密度から応力が決まる弾性）の neo-Hooke 材料を `HyperelasticityPlan` で離散化し、残差と整合接線を Newton–Krylov 法に渡して解く方法を説明する。
+メッシュ、境界条件、縮約（`ElasticityKinematics`）、要素（`ElasticityFormulation`）、材料（`IsotropicElasticMaterial`）の選び方は線形弾性と同じである。
+
+## neo-Hooke 材料
+
+変形の前の物体の点 $X$ が変形の後に $x=X+u(X)$ へ移るとする。
+大きな変形は参照配置の座標で微分した変形勾配
+
+```text
+F = I + ∇u,   J = det F,   I₁ = tr(Fᵀ F)
+```
+
+で表す。
+$J$ は体積比で、$J>0$ でなければ要素が裏返る。
+$I_1$ は伸びの大きさを表す不変量で、剛体回転では変わらない。
+
+`HyperelasticityPlan` は圧縮性の neo-Hooke 材料で、ひずみエネルギー密度は
+
+```text
+W(F) = μ/2 · (J^(−2/3) I₁ − 3) + K/2 · (J − 1)²
+```
+
+である。
+第 1 項は体積を変えない変形の寄与、第 2 項は体積変化の寄与で、$\mu$ と $K$ は小さな変形でのせん断弾性率と体積弾性率になる。
+変位 0 の状態での接線は線形弾性の Hooke 則の剛性と一致する。
+応力は参照配置の面積あたりの力である第 1 Piola–Kirchhoff 応力 $P=\partial W/\partial F$ と、変形後の面積あたりの力である Cauchy 応力 $\sigma=PF^{\mathsf T}/J$ で表す。
+`MixedP2P1` では第 2 項を $p(J-1)-p^2/(2K)$ に置き換え、P1 の圧力 $p$ で体積の拘束を弱い形で課す。
+$J\le0$ の変形では、材料の評価が定義域のエラー（`DomainError`）を返す。
+
+平面ひずみでは $F_{zz}=1$ とする。
+平面応力では、厚さ方向の Piola 応力 $P_{zz}(F_{zz})$ が 0 になる伸び $F_{zz}$ を求積点ごとに解く。
+面内の変形を固定すると、面内の行列式が正なら $P_{zz}$ は $F_{zz}$ について単調に増える。
+そこで `scioxide-rootfind` の区間探索（$F_{zz}=1$ から一定の倍率で広げる）で根を挟み、保護付き Newton 法で求める。
+`PlaneStressOptions` がこの局所求解の設定である。
+`new()` と `Default` は区間の拡張と Newton 反復をそれぞれ 64 回まで、相対許容誤差を $64\varepsilon$ とする。
+`with_max_iterations` と `with_tolerance` で変え、許容誤差は $(0,1)$ の値でなければ Plan の準備が `InvalidInput` を返す。
+この検査は `LinearElasticityPlan` の準備でも行う。
+根を挟めないときや Newton 法が許容誤差に達しないときは、評価がエラー（後者は `ConvergenceFailure`）を返す。
+
+## 離散の残差と荷重増分
+
+荷重は参照配置で向きと大きさが決まる死荷重で、物体力と牽引力は線形弾性と同じ `body` と `TaggedBoundaries` で与える。
+変位の基底関数を $\phi_i$、物体力と牽引力による荷重ベクトルを $\ell_i=\ell(\phi_i)$、Dirichlet の値を $g_i$ とすると、離散の残差は
+
+```text
+R_i(x) = ∫_Ω P(F(x)) : ∇φ_i dX − ℓ_i   （自由な自由度）
+R_i(x) = x_i − g_i                     （Dirichlet の自由度）
+```
+
+である。
+自由な自由度の残差では Dirichlet の自由度に $x_i$ ではなく $g_i$ を代入して変形を求める。
+Plan は不変で、非線形の反復と受理した状態は呼び出し側の解法が持つ。
+`ResidualOperator`（`residual_into`）と `JacobianOperator`（`jvp_into`）を実装するので、`scioxide-rootfind` の `NewtonKrylovProblem::with_jacobian(&plan)` にそのまま渡せる。
+
+残差が $g_i$ を代入するので、初期値を 0 にすると Dirichlet の節点に隣接する要素だけが大きく変形する。
+境界の変位が要素の大きさに比べて大きいと、その要素で $J\le0$ になり、初期点の残差の評価がエラーになる。
+Newton–Krylov 法は途中の試行点の定義域のエラーなら刻みを縮めて続けるが、初期点のエラーはそのまま返す。
+このようなときは、境界の値を少しずつ変え、前の段の解を次の段の初期値にする荷重増分法を使う。
+
+`energy` は積分した $W$（`internal`）、死荷重の処理（`external_work`）、その差（`potential`）を持つ `ElasticityEnergy` を返し、`stress` は変形勾配、Piola 応力、Cauchy 応力を持つ `ElasticityStress` を返す。
+どちらも与えた状態の値をそのまま使い、Dirichlet の値を代入しない。
+平面応力では局所求解が入るので、`energy_scoped`、`stress_scoped`、`assemble_tangent_csr_scoped` で呼び出し側のスコープに計算量を計上できる。
+
+次のブロックは、このページのセルが共有する長方形の板のメッシュと辺のタグである。
+[弾性体の有限要素](../elasticity/)のブロックと同じ内容で、定義はページごとにしか共有できないので再掲する。
+
+```rust
+//| id: pde-hyperelastic-plate
+//| kind: definitions
+//| title: 長方形の板の三角形メッシュと辺のタグ
+//| crates: [scioxide-core, scioxide-pde, scioxide-spatial]
+use scioxide_core::SciOxideError;
+use scioxide_pde::{BoundaryCondition, TaggedBoundaries};
+use scioxide_spatial::{Point, SimplexBoundaryTags, TriangleMesh};
+
+/// 長方形 [0, a] × [0, b] を nx × ny の長方形に分け、各長方形を 2 つの三角形にする。
+/// 頂点の番号は j (nx + 1) + i。
+pub(crate) fn plate_mesh(
+    a: f64,
+    b: f64,
+    nx: usize,
+    ny: usize,
+) -> Result<TriangleMesh<f64>, SciOxideError> {
+    let mut points = Vec::new();
+    for j in 0..=ny {
+        for i in 0..=nx {
+            points.push(Point::new([
+                a * i as f64 / nx as f64,
+                b * j as f64 / ny as f64,
+            ])?);
+        }
+    }
+    let mut cells = Vec::new();
+    for j in 0..ny {
+        for i in 0..nx {
+            let v = j * (nx + 1) + i;
+            cells.push([v, v + 1, v + nx + 2]);
+            cells.push([v, v + nx + 2, v + nx + 1]);
+        }
+    }
+    TriangleMesh::new(points, cells)
+}
+
+/// 外部面のタグは左辺 x = 0 が 1、右辺 x = a が 2、下辺 y = 0 が 3、上辺 y = b が 4。
+pub(crate) fn plate_boundaries(
+    mesh: &TriangleMesh<f64>,
+    a: f64,
+    b: f64,
+    conditions: Vec<BoundaryCondition<f64, f64, 2, u32>>,
+) -> Result<TaggedBoundaries<f64, f64, 2>, SciOxideError> {
+    let mut faces = Vec::new();
+    for face in mesh.boundary_faces() {
+        let v = mesh.face_vertices(face)?;
+        let [x0, y0] = *mesh.points()[v[0]].as_array();
+        let [x1, y1] = *mesh.points()[v[1]].as_array();
+        let (x, y) = (0.5 * (x0 + x1), 0.5 * (y0 + y1));
+        let tag = if x < 1e-9 * a {
+            1
+        } else if x > (1.0 - 1e-9) * a {
+            2
+        } else if y < 1e-9 * b {
+            3
+        } else {
+            4
+        };
+        faces.push((face, tag));
+    }
+    let tags = SimplexBoundaryTags::new(mesh, faces)?;
+    TaggedBoundaries::new(mesh, &tags, 2, conditions)
+}
+```
+
+次のセルは平面ひずみの板（20 mm × 10 mm、$\mu=1$ MPa のゴム）を 2×1 の長方形の 4 つの三角形に分け、$x$ 方向に $\lambda$ 倍に伸縮する。
+左右の辺で $u_x$ を、上下の辺で $u_y=0$ を与えるので、厳密解は一様な変形 $F=\mathrm{diag}(\lambda,1,1)$、$J=\lambda$ である。
+$F$ の余因子の $xx$ 成分は 1 なので、Cauchy 応力は
+
+```text
+σ_xx = μ λ^(−2/3) (λ − (λ² + 2) / (3λ)) + K (λ − 1)
+```
+
+になり、小ひずみの Hooke 則では $(K+4\mu/3)(\lambda-1)$ である。
+$\lambda$ を 1 から 0.1 ずつ 0.7 と 1.5 まで変え、各段で前の段の解を初期値に Newton–Krylov 法で解く。
+各段の終了理由は表に残し、全ての段が成功したかをセルの結論にする。
+
+```rust
+//| id: pde-hyperelastic-confined-stretch
+//| ref: pde-hyperelastic-confined-stretch
+//| title: 拘束した一軸の伸縮を neo-Hooke 超弾性で解き、解析的な応力と比べる
+//| run: button
+//| uses: [pde-hyperelastic-plate]
+//| crates: [scioxide-core, scioxide-pde, scioxide-rootfind, scioxide-spatial]
+//| inputs:
+//|   neo_bulk_ratio: {"type":"range","label":"体積弾性率とせん断弾性率の比 K/μ [-]","description":"体積変化に対する硬さを変える。","min":1,"max":50,"step":1,"value":5}
+//|   neo_formulation: {"type":"select","label":"要素","description":"変位だけの P2 か、混合 P2/P1 かを選ぶ。","options":[{"label":"P2 変位","value":"p2"},{"label":"混合 P2/P1","value":"mixed"}],"value":"p2"}
+//| cases:
+//|   - {"id":"stiff-bulk","label":"K/μ = 50","description":"体積変化が支配し、λ = 1.5 の応力は 25.42 MPa、Hooke 則との差は 1 % になる。","inputs":{"neo_bulk_ratio":50}}
+//|   - {"id":"mixed","label":"混合 P2/P1","description":"圧力を未知数に加えても同じ解析解を再現する。","inputs":{"neo_formulation":"mixed"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"stretch","path":"/rows/0/3","approx":{"value":-2.1160967,"rtol":1e-7}}
+//|       - {"artifact":"stretch","path":"/rows/7/3","approx":{"value":2.9239682,"rtol":1e-7}}
+//|       - {"artifact":"stretch","path":"/rows/7/5","approx":{"value":3.1666667,"rtol":1e-7}}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+//|       - {"path":"/outputs/2/diagnostics/0/value","range":{"min":5,"max":8}}
+//|   - case: stiff-bulk
+//|     expect:
+//|       - {"artifact":"stretch","path":"/rows/7/3","approx":{"value":25.423968,"rtol":1e-7}}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+//|   - case: mixed
+//|     expect:
+//|       - {"artifact":"stretch","path":"/rows/0/3","approx":{"value":-2.1160967,"rtol":1e-7}}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+use scioxide_core::{ResidualTolerance, StepTolerance};
+use scioxide_pde::{
+    BoundaryCondition, BoundaryData, ElasticityFormulation, ElasticityKinematics,
+    ElasticityOptions, HyperelasticityPlan, IsotropicElasticMaterial, SimplexFemGeometry,
+    SimplexFemOrder,
+};
+use scioxide_rootfind::{NewtonKrylovOptions, NewtonKrylovProblem, NewtonKrylovSolver};
+
+// ゴムを想定し μ = 1 MPa。板 20 mm × 10 mm を平面ひずみで x 方向に λ 倍に伸縮する。
+let (a, b, mu) = (20.0, 10.0, 1.0);
+let bulk = neo_bulk_ratio * mu;
+let material = IsotropicElasticMaterial::new(mu, bulk).map_err(|e| e.to_string())?;
+let formulation = if neo_formulation == "mixed" {
+    ElasticityFormulation::MixedP2P1
+} else {
+    ElasticityFormulation::Displacement(SimplexFemOrder::P2)
+};
+let options = NewtonKrylovOptions::default()
+    .with_residual_tolerance(ResidualTolerance::new(1e-12, 1e-10).map_err(|e| e.to_string())?)
+    .with_step_tolerance(StepTolerance::new(1e-13, 1e-13).map_err(|e| e.to_string())?);
+let solver = NewtonKrylovSolver::new(options).map_err(|e| e.to_string())?;
+let (mut rows, mut fe, mut exact, mut hooke) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+let (mut failures, mut most) = (0, 0);
+let (mut worst, mut last) = (None, None);
+// 荷重増分法: λ = 1 から 0.1 ずつ離れる順に解き、前の解を次の初期値にする。
+for (steps, sign) in [(3, -1.0), (5, 1.0)] {
+    let mut previous: Option<Vec<f64>> = None;
+    for step in 1..=steps {
+        let stretch = 1.0 + sign * 0.1 * f64::from(step);
+        // 左右の辺で u_x を、上下の辺で u_y を与える。F = diag(λ, 1, 1) が厳密解になる。
+        let conditions = vec![
+            BoundaryCondition::dirichlet(1, BoundaryData::zero()).for_component(0),
+            BoundaryCondition::natural(1, BoundaryData::zero()).for_component(1),
+            BoundaryCondition::dirichlet(2, BoundaryData::constant((stretch - 1.0) * a))
+                .for_component(0),
+            BoundaryCondition::natural(2, BoundaryData::zero()).for_component(1),
+            BoundaryCondition::natural(3, BoundaryData::zero()).for_component(0),
+            BoundaryCondition::dirichlet(3, BoundaryData::zero()).for_component(1),
+            BoundaryCondition::natural(4, BoundaryData::zero()).for_component(0),
+            BoundaryCondition::dirichlet(4, BoundaryData::zero()).for_component(1),
+        ];
+        let mesh = plate_mesh(a, b, 2, 1).map_err(|e| e.to_string())?;
+        let boundaries =
+            plate_boundaries(&mesh, a, b, conditions).map_err(|e| e.to_string())?;
+        let plan = HyperelasticityPlan::new(
+            mesh,
+            SimplexFemGeometry::Affine,
+            material,
+            &boundaries,
+            &|_| Ok([0.0; 2]),
+            ElasticityOptions::new(ElasticityKinematics::PlaneStrain, formulation),
+        )
+        .map_err(|e| e.to_string())?;
+        let initial = previous.take().unwrap_or(vec![0.0; plan.unknowns()]);
+        let result = solver
+            .solve(&NewtonKrylovProblem::with_jacobian(&plan), &initial)
+            .map_err(|e| e.to_string())?;
+        previous = Some(result.point().to_vec());
+        if !result.is_success() {
+            failures += 1;
+            worst = Some(result.termination());
+        }
+        last = Some(result.termination());
+        most = most.max(result.iterations());
+        let sigma = plan
+            .stress(0, [1.0 / 3.0; 2], result.point())
+            .map_err(|e| e.to_string())?
+            .cauchy()[0][0];
+        // 解析解: σ_xx = μ λ^(−2/3) (λ − (λ² + 2)/(3λ)) + K (λ − 1)。小ひずみの Hooke 則は (K + 4μ/3)(λ − 1)。
+        let neo = mu
+            * stretch.powf(-2.0 / 3.0)
+            * (stretch - (stretch * stretch + 2.0) / (3.0 * stretch))
+            + bulk * (stretch - 1.0);
+        let linear = (bulk + 4.0 * mu / 3.0) * (stretch - 1.0);
+        rows.push((
+            stretch,
+            result.iterations(),
+            result.termination().to_string(),
+            sigma,
+            neo,
+            linear,
+        ));
+        fe.push([stretch, sigma]);
+        exact.push([stretch, neo]);
+        hooke.push([stretch, linear]);
+    }
+}
+rows.sort_by(|p, q| p.0.total_cmp(&q.0));
+fe.sort_by(|p, q| p[0].total_cmp(&q[0]));
+let sig6 = serde_json::json!({ "significantDigits": 6 });
+emit_table_with_columns!(
+    serde_json::json!([
+        { "key": "0", "label": "伸び λ [-]", "type": "number" },
+        { "key": "1", "label": "Newton 反復 [回]", "type": "integer" },
+        { "key": "2", "label": "終了理由" },
+        { "key": "3", "label": "有限要素の σ_xx [MPa]", "type": "number", "format": sig6 },
+        { "key": "4", "label": "neo-Hooke の解析解 [MPa]", "type": "number", "format": sig6 },
+        { "key": "5", "label": "Hooke 則 [MPa]", "type": "number", "format": sig6 }
+    ]),
+    rows,
+    metadata = serde_json::json!({ "id": "stretch" })
+);
+let dashed = serde_json::json!({ "lineType": "dashed", "showSymbol": false });
+emit_chart!(
+    serde_json::json!({
+        "kind": "xy",
+        "dataZoom": true,
+        "tooltip": true,
+        "xLabel": "伸び λ [-]",
+        "yLabel": "Cauchy 応力 σ_xx [MPa]",
+        "layers": [
+            { "id": "fe", "kind": "scatter", "name": "有限要素", "points": fe },
+            {
+                "id": "neo",
+                "kind": "line",
+                "name": "neo-Hooke の解析解",
+                "points": exact,
+                "style": dashed
+            },
+            { "id": "hooke", "kind": "line", "name": "Hooke 則", "points": hooke, "style": dashed }
+        ]
+    }),
+    metadata = serde_json::json!({ "id": "curve" })
+);
+// 全ての段の終了理由を表に残し、結論は成功しなかった段の数で決める。
+// status は成功しなかった最後の段、全て成功したときは最後の段の終了理由。
+let status = worst.or(last).map(|t| t.to_string()).unwrap_or_default();
+let label = if failures == 0 {
+    Outcome::satisfied("全ての伸びで Newton–Krylov 法が収束した")
+} else {
+    Outcome::partial(format!("{failures} 個の伸びで収束しなかった"))
+};
+emit_outcome!(
+    label
+        .status(status)
+        .diagnostic("最大の Newton 反復", most as f64, None)
+        .diagnostic("収束しなかった段", failures as f64, None)
+);
+```
+
+既定の $K/\mu=5$ では、全ての段で Newton–Krylov 法が 6 回の反復で `ResidualTolerance` に達し、有限要素の応力は解析解と $10^{-12}$ 程度の相対差で一致する。
+一様な変形は P2 の変位で厳密に表せるので、この差は非線形の許容誤差による。
+$\lambda=1.5$ の応力は 2.924 MPa で Hooke 則の 3.167 MPa より 8 % 小さく、$\lambda=0.7$ では $-2.116$ MPa で Hooke 則の $-1.900$ MPa より 11 % 大きい。
+グラフでは、点が neo-Hooke の破線に乗り、$\lambda=1$ から離れるほど Hooke 則の破線から離れる。
+$K/\mu=50$ では体積変化の項が支配し、$\lambda=1.5$ の応力は 25.42 MPa で、Hooke 則との差は 1 % になる。
+このとき反復は 7〜9 回に増える。
+
+## 整合接線と線形化の再利用
+
+Newton 法が 2 次収束するには、離散の残差を正確に微分した接線（整合接線）が要る。
+neo-Hooke の接線は $\partial^2W/\partial F\,\partial F$ を解析的に求めたもので、平面応力では局所求解の $F_{zz}$ を静的縮約で消す。
+Dirichlet の行は単位行列の行で、自由な行は Dirichlet の自由度の方向を含まない。
+接線は対称なので、随伴の積（`PdeAdjointJacobian` の `vjp_into`）は Jacobian 積と同じである。
+
+`jvp_into` は呼ぶたびに全ての求積点で材料の応答を計算し直す。
+同じ状態で何度も積を取るとき（Krylov 法の内部反復、前処理の構築）は、`linearization_workspace` で `HyperelasticityLinearizationWorkspace` を一度確保し、`linearize(point, &mut workspace, scope)` で接線を一度だけ評価して CSR 行列に保つ。
+作業領域のメモリ領域は $O(\text{セル数}\times\text{局所未知数}^2+\text{CSR の要素数})$ で、状態を変えて `linearize` し直しても確保しない。
+評価の計算量は $O(\text{セル数}\times\text{求積点数}\times\text{局所未知数}^2)$ である。
+
+`linearize` が返す `SimplexLinearization` は線形化点（`point`）と評価済みの CSR（`matrix`）をコピーせずに借用する。
+`LinearOperator` と `AdjointOperator` を実装し、積は格納要素数に比例する計算量で、作業領域のほかに確保をしない。
+`assemble_csr_into(output)` は同じ構造の CSR に値をコピーし、構造が違えば出力を変えずにエラーを返す。
+ビューが生きている間は状態と作業領域が借用されるので、作業領域を更新して古い接線を読むことはない。
+`SimplexLinearization` は単体メッシュの有限要素で共通の型で、`NavierStokesPlan::linearize` も返す（[非圧縮流れ](../incompressible-flow/)）。
+一度だけ明示的な行列が要るときは、呼ぶたびに確保する `assemble_tangent_csr` を使う。
+
+次のセルは一様な伸び $\lambda$ に小さな乱れを加えた釣り合っていない状態で接線を評価し、保存した接線の積 $Lv$ を `jvp_into` の積 $Jv$ と、残差の中心差分 $(R(x+hv)-R(x-hv))/(2h)$ と比べる。
+中心差分の誤差は、打ち切り誤差が $O(h^2)$、丸め誤差が $O(\varepsilon/h)$ なので、$h$ が $\varepsilon^{1/3}\approx6\times10^{-6}$ に残差とその 3 階微分の大きさの比で決まる係数を掛けた程度のときに最も小さくなる。
+
+```rust
+//| id: pde-hyperelastic-tangent-check
+//| ref: pde-hyperelastic-tangent-check
+//| title: 保存した接線を Jacobian 積と残差の中心差分で照合する
+//| run: reactive
+//| uses: [pde-hyperelastic-plate]
+//| crates: [scioxide-core, scioxide-pde, scioxide-spatial]
+//| inputs:
+//|   tangent_stretch: {"type":"range","label":"伸び λ [-]","description":"線形化する状態の一様な伸びを変える。","min":0.7,"max":1.5,"step":0.05,"value":1.25}
+//|   tangent_kinematics: {"type":"select","label":"二次元の縮約","description":"平面応力では厚さ方向の伸びを求積点ごとに解く。","options":[{"label":"平面ひずみ","value":"strain"},{"label":"平面応力","value":"stress"}],"value":"strain"}
+//| cases:
+//|   - {"id":"plane-stress","label":"平面応力","description":"局所求解と静的縮約を含む接線でも、中心差分との差は h² に比例して減る。","inputs":{"tangent_kinematics":"stress"}}
+//|   - {"id":"compressed","label":"λ = 0.7","description":"圧縮した状態でも保存した接線と Jacobian 積は丸め誤差の範囲で一致する。","inputs":{"tangent_stretch":0.7}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"products","path":"/rows/0/2","range":{"max":1e-13}}
+//|       - {"artifact":"difference","path":"/rows/2/1","range":{"max":1e-6}}
+//|   - case: plane-stress
+//|     expect:
+//|       - {"artifact":"products","path":"/rows/0/2","range":{"max":1e-12}}
+//|       - {"artifact":"difference","path":"/rows/2/1","range":{"max":1e-5}}
+//|   - case: compressed
+//|     expect:
+//|       - {"artifact":"products","path":"/rows/0/2","range":{"max":1e-13}}
+use scioxide_core::{ExecutionContext, JacobianOperator, LinearOperator, ResidualOperator};
+use scioxide_pde::{
+    BoundaryCondition, BoundaryData, ElasticityFormulation, ElasticityKinematics,
+    ElasticityOptions, HyperelasticityPlan, IsotropicElasticMaterial, SimplexFemGeometry,
+    SimplexFemOrder,
+};
+
+let (a, b) = (20.0, 10.0);
+let material = IsotropicElasticMaterial::new(1.0, 5.0).map_err(|e| e.to_string())?;
+let kinematics = if tangent_kinematics == "stress" {
+    ElasticityKinematics::PlaneStress
+} else {
+    ElasticityKinematics::PlaneStrain
+};
+// 左辺で u_x = 0、下辺で u_y = 0 のローラー。他は牽引力 0。
+let conditions = vec![
+    BoundaryCondition::dirichlet(1, BoundaryData::zero()).for_component(0),
+    BoundaryCondition::natural(1, BoundaryData::zero()).for_component(1),
+    BoundaryCondition::natural(2, BoundaryData::zero()),
+    BoundaryCondition::natural(3, BoundaryData::zero()).for_component(0),
+    BoundaryCondition::dirichlet(3, BoundaryData::zero()).for_component(1),
+    BoundaryCondition::natural(4, BoundaryData::zero()),
+];
+let mesh = plate_mesh(a, b, 4, 2).map_err(|e| e.to_string())?;
+let boundaries = plate_boundaries(&mesh, a, b, conditions).map_err(|e| e.to_string())?;
+let options = ElasticityOptions::new(
+    kinematics,
+    ElasticityFormulation::Displacement(SimplexFemOrder::P2),
+);
+let plan = HyperelasticityPlan::new(
+    mesh,
+    SimplexFemGeometry::Affine,
+    material,
+    &boundaries,
+    &|_| Ok([0.0; 2]),
+    options,
+)
+.map_err(|e| e.to_string())?;
+// 釣り合っていない状態: 一様な伸び u_x = (λ − 1) x に小さな乱れを加える。
+let (n, nodes) = (plan.unknowns(), plan.displacement_nodes());
+let mut point = vec![0.0; n];
+for node in 0..nodes {
+    let p = plan.node_point(node).map_err(|e| e.to_string())?;
+    point[node] = (tangent_stretch - 1.0) * p[0] + 0.01 * (0.3 * p[1]).sin();
+    point[nodes + node] = 0.01 * (0.2 * p[0]).cos();
+}
+let direction: Vec<f64> = (0..n).map(|i| ((i % 7) as f64 - 3.0) / 100.0).collect();
+let mut workspace = plan.linearization_workspace().map_err(|e| e.to_string())?;
+let tangent = plan
+    .linearize(&point, &mut workspace, ExecutionContext::sequential())
+    .map_err(|e| e.to_string())?;
+let mut stored = vec![0.0; n];
+let mut scratch = vec![0.0; tangent.apply_workspace_len().map_err(|e| e.to_string())?];
+tangent
+    .apply_into(&direction, &mut stored, &mut scratch)
+    .map_err(|e| e.to_string())?;
+let mut product = vec![0.0; n];
+let mut work = vec![0.0; plan.jvp_workspace_len().map_err(|e| e.to_string())?];
+plan.jvp_into(&point, &direction, &mut product, &mut work)
+    .map_err(|e| e.to_string())?;
+let size = stored.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+let gap = |other: &[f64]| {
+    stored
+        .iter()
+        .zip(other)
+        .fold(0.0_f64, |m, (s, o)| m.max((s - o).abs()))
+        / size
+};
+let products = vec![(tangent.matrix().nnz(), size, gap(&product))];
+// 中心差分 (R(x + h v) − R(x − h v)) / (2h) と保存した接線の積の差。
+let mut rows = Vec::new();
+let mut residual_work = vec![0.0; plan.residual_workspace_len().map_err(|e| e.to_string())?];
+for h in [1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8] {
+    let mut sides = [vec![0.0; n], vec![0.0; n]];
+    for (side, sign) in sides.iter_mut().zip([1.0, -1.0]) {
+        let moved: Vec<f64> = point
+            .iter()
+            .zip(&direction)
+            .map(|(p, v)| p + sign * h * v)
+            .collect();
+        plan.residual_into(&moved, side, &mut residual_work)
+            .map_err(|e| e.to_string())?;
+    }
+    let difference: Vec<f64> = (0..n)
+        .map(|i| (sides[0][i] - sides[1][i]) / (2.0 * h))
+        .collect();
+    rows.push((h, gap(&difference)));
+}
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+emit_table_with_columns!(
+    serde_json::json!([
+        { "key": "0", "label": "CSR の格納要素数 [-]", "type": "integer" },
+        { "key": "1", "label": "‖Lv‖∞ [N/mm]", "type": "number", "format": sci3 },
+        { "key": "2", "label": "‖Lv − Jv‖∞ / ‖Lv‖∞ [-]", "type": "number", "format": sci3 }
+    ]),
+    products,
+    metadata = serde_json::json!({ "id": "products" })
+);
+emit_table_with_columns!(
+    serde_json::json!([
+        { "key": "0", "label": "差分の刻み h [mm]", "type": "number", "format": sci3 },
+        { "key": "1", "label": "中心差分との相対差 [-]", "type": "number", "format": sci3 }
+    ]),
+    rows,
+    metadata = serde_json::json!({ "id": "difference" })
+);
+```
+
+既定の $\lambda=1.25$ の平面ひずみでは、$Lv$ と $Jv$ の相対差は $3\times10^{-16}$ で、保存した接線が `jvp_into` と同じ演算を表す。
+中心差分との相対差は、$h=10^{-2}$ の $3.0\times10^{-8}$ から $h=10^{-3}$ の $3.0\times10^{-10}$ へ、$h$ を 1/10 にするごとに 1/100 になり、接線の誤差ではなく差分の打ち切り誤差が見えている。
+$h=10^{-4}$ で最小の $4.9\times10^{-11}$ になり、それより小さな $h$ では丸め誤差で増える。
+平面応力でも同じ傾向で、局所求解の $F_{zz}$ を含めた接線が整合している。
+接線の式に誤りがあれば、差は $h$ を小さくしても $h^2$ に比例して減らず、ある値で止まる。
+
+## まとめ
+
+`HyperelasticityPlan` は圧縮性 neo-Hooke 材料の残差と整合接線を提供し、求解は `NewtonKrylovProblem::with_jacobian` などの呼び出し側の非線形解法が受け持つ。
+Dirichlet の値は残差の評価で直接代入されるので、境界の変位が大きいときは荷重増分法で初期点を定義域に保つ。
+平面応力では求積点ごとに厚さ方向の伸びを解き、その許容誤差と反復の上限を `PlaneStressOptions` で決める。
+同じ状態の接線を何度も使うときは `linearize` で一度だけ評価し、`SimplexLinearization` を Krylov 法や前処理に渡す。
+接線の正しさは、中心差分の誤差が $h^2$ に比例して減ることで確かめられる。
+
+## 次に読むページ
+
+- [弾性体の有限要素](../elasticity/)：小ひずみの弱形式、平面ひずみと平面応力の縮約、体積ロッキングと混合形を確かめる。
+- [片持ち梁のたわみとロッキング](../../examples/cantilever-beam/)：線形弾性の要素ごとの精度を、曲げの厳密解で比べる。
+- [Newton–Krylov 法](../../../scioxide-rootfind/algorithms/matrix-free-newton-krylov/)：超弾性の求解に使った非線形解法の大域化と停止条件を調べる。
+- [弾性体と非圧縮流れの API](../../api/elasticity-and-incompressible-flow/)：Plan、作業領域、出力の型の仕様を一覧で引く。
+
+## 参考文献
+
+- J. Bonet, R. D. Wood, *Nonlinear Continuum Mechanics for Finite Element Analysis*, 2nd ed., Cambridge University Press (2008).
+- P. Wriggers, *Nonlinear Finite Element Methods*, Springer (2008).

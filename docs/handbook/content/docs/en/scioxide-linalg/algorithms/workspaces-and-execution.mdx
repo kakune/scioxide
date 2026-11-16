@@ -1,0 +1,649 @@
+---
+title: "Workspaces, execution contexts, and attempt records"
+description: "Definitions and selection of one-shot functions, standard and options forms, APIs with caller-provided output, scoped APIs, Plans, and method objects; reserving LinalgWorkspace from requests and requirements and factorization-specific request types; eigenvalue buffers; roles of execution options and contexts; output and attempt records after cancellation or iteration limits; and low-level backend components."
+sidebar:
+  order: 310
+references:
+  linalg-execution-forms: "call-forms"
+  linalg-workspace-reservation: "reserving-workspace-from-requests"
+  linalg-execution-options: "execution-control-options-and-contexts"
+  linalg-attempt-records: "cancellation-limits-and-attempt-records"
+  linalg-backend-components: "low-level-backend-components"
+  linalg-eigenvalue-buffers: "eigenvalue-output-buffers"
+---
+
+Allocating working storage on every repeated factorization inside time evolution or optimization adds allocation time and failure opportunities separately from computation.
+`scioxide-linalg` offers call forms matching the amount of control needed; callers can also own working storage as a `LinalgWorkspace`.
+This page defines the call forms used in this chapter, explains workspace reservation and where to set execution limits and capabilities, and describes what remains when computation stops.
+Shared SciOxide concepts and reproducibility are explained in [Execution forms, workspaces, and reproducibility](../../../concepts/workspaces-and-reproducibility/).
+
+## Call forms
+
+This chapter names argument/result forms as follows.
+Standard forms and forms with options are collectively called APIs returning owned values.
+APIs returning owned values and one-shot functions allocate result storage themselves and execute sequentially on `ExecutionContext::sequential_native()`.
+With `std`, this context dispatches to kernels using runtime-detected CPU instructions; without `std`, it uses portable scalar kernels, and it has no clock, cancellation, or random source.
+In the table, “rejection” means a computed solution is not approved for commitment as output (not accepted); termination reasons are values describing how a solve ended, such as `DirectSolveTermination` or `LinearSolveTermination`.
+
+| Form | Examples | Accepts | Returns | Rejection and non-convergence | Execution context |
+|---|---|---|---|---|---|
+| One-shot function | `solve(&a, &b)`, `least_squares`, `solve_triangular`, `solve_structured`, `matrix_function`, `solve_sylvester`, `solve_lyapunov`, `solve_riccati` | Problem data only | Answer, such as a solution vector | Error | `sequential_native()` |
+| Standard form | `LuDecomposition::factor(&a)`, `lu.solve(&b)`, `solve(a, b)` of `CgSolver`, `x.norm2()` | Problem data only; uses default options | Allocated result; solves return only a solution | Error | `sequential_native()` |
+| Form with options | `factor_with_options(&a, &options)`, `lu.solve_with_options(&b, &accept)`, `solve_with_options(a, b, preconditioning, x0)` | Data and options last | Allocated result; solves return a result and report | Termination reason in an `Ok` result | `sequential_native()` |
+| API with caller-provided output | `factor_into(&a, &options, &mut factor, &mut ws, cx)`, `lu.solve_into(&b, &accept, out, &mut ws, cx)` | Inputs including options, output, workspace, context, in that order | Writes output; solves return a report | Report termination reason; rejected solves leave output unchanged | Supplied context |
+| Scoped API | `x.norm2_scoped(&options, cx)`, `lu.condition_estimate_scoped(&options, &mut ws, cx)` | Inputs, options, workspace if any, context last | Value | Error | Supplied context |
+
+A one-shot function is a free function that solves a problem once and returns only the answer.
+It constructs internal factorizations or Plans with settings defined by that function.
+For example, `solve(&a, &b)` solves $Ax = b$ by partial-pivoted LU with `RankPolicy::Exact` (rejecting only exactly zero pivots); `least_squares` finds a minimum-norm solution by column-pivoted QR with `RankPolicy::DimensionScaledEpsilon`.
+Because partial results cannot be returned, unaccepted solutions and non-converged computations become errors.
+
+A standard form is a method of a factorization or solver type accepting only problem data and using default options.
+Standard-form `solve` on factorization types such as `LuDecomposition` returns a solution `Vector` and converts rejected solutions to errors with `DirectSolveTermination::require_accepted`.
+Rank deficiency gives `Singular`; rejection for other reasons gives `NumericalInstability`.
+An exception is `solve` on matrix-equation Plans such as `SylvesterPlan`: it accepts no options but returns a result with a report like the form with options.
+Standard-form `solve(a, b)` for the 16 single-vector iterative solvers starts at zero without preconditioning and returns `ConvergenceFailure` if it ends without meeting tolerance.
+
+Forms with options have names ending in `_with_options` and take options last, allowing selection of accuracy tier `Accuracy::Exact` or a byte limit.
+On factorization types, `solve_with_options(&b, &DirectSolveOptions)` returns a `DirectSolveResult` with solution and report; a policy-rejected solution is an `Ok` result without a solution, rather than an error.
+`into_accepted()` converts this result to a solution or error by the standard form's rules.
+`DirectSolveOptions::default()` assesses acceptance using only `RankPolicy::Exact`, with no condition lower bound or backward-error computation.
+Iterative-solver `solve_with_options(a, b, preconditioning, x0)` accepts preconditioning and an initial value; even at iteration or evaluation limits, it returns the termination reason and the iterate with smallest verified residual in an `Ok` result.
+Contexts for APIs returning owned values have no clock, so options setting `with_time_limit` are rejected with `CapabilityUnavailable` before computation.
+
+APIs with caller-provided output have names ending in `_into` and accept output, workspace, and context prepared by the caller.
+Updates using the output's current values as input have names containing `_in_place` and take arguments in the same order.
+APIs with caller-provided output return errors without changing output on failure; policy-rejected direct solves record their termination reason in a report and leave output unchanged.
+
+Scoped APIs have names ending in `_scoped` and perform value-returning operations such as norms or condition estimates, rather than array-returning operations, within the caller's context.
+Iterative operations count their iterations toward the calling solve; even constant-cost kernels have this form when they can use the context's BLAS provider ([Dense kernels](oxref:linalg-dense-kernels)).
+Parallel executors, cancellation, deadlines, and external BLAS providers are accessed through contexts, so only APIs with caller-provided output and scoped APIs can use them.
+
+A Plan is a type whose name ends in `Plan`, precomputing and retaining reusable data at construction.
+At construction, `MatrixFunctionPlan` computes the Schur form of $A$ ($A$ itself for exponentials), `HouseholderMinimumNormPlan` computes a complete orthogonal decomposition truncated at numerical rank, and `TriangularPlan` checks finiteness and diagonal entries and records maximum entry magnitude, each once.
+A method object holds only validated settings, receiving the problem's operator or data and their dimensions on each call.
+Examples are `ExponentialAction`, `FunctionAction`, `LobpcgSolver`, `PartialSpectrumSolver`, `PartialSvdSolver`, `RandomizedLowRank`, `OneNormEstimator`, `IterativeRefinement`, and iterative solvers such as `CgSolver`.
+With no precomputed data, one value can be reused for problems of different sizes.
+`BorderedSystem` borrows and checks the operator and null-space bases at construction, so it is not a method object.
+Methods of Plans and method objects follow the same naming rules as the table, for example `apply` and `apply_into` of `ExponentialAction`.
+
+Use a one-shot function for one computation needing only the answer, or a standard-form factorization when reusing the same matrix factorization.
+Use a form with options to read termination reasons, rank, condition estimates, or residuals, or to choose `Exact` or byte limits.
+Use APIs with caller-provided output and scoped APIs to eliminate allocations inside iteration, use parallel execution, cancellation or deadlines, or access external BLAS.
+
+## Reserving workspace from requests
+
+Workspace size is determined by an operation-specific request.
+A request is a value containing only operation kind, shape, and execution options, without matrix entries or execution capabilities.
+The necessary lengths computed from a request are called requirements.
+
+1. Construct a request.
+   Use operation-specific constructors, such as `LuWorkspaceRequest::factor(n, &options)`, `solve`, or `solve_matrix` for LU.
+2. Query requirements.
+   Passing a request to an associated function of the operation's type, such as `LuDecomposition::<f64>::workspace_requirements(&request)`, returns `LinalgRequirements`.
+3. Prepare workspace.
+   `LuDecomposition::<f64>::workspace(&request)` returns a workspace allocated to meet the requirements.
+   For an existing workspace, `ws.try_reserve(&requirements)` allocates only what is missing.
+4. Check without allocation.
+   `ws.check(&requirements)` returns `Capacity::Sufficient` (ready to execute) or `Capacity::NeedsGrowth` (allocation needed).
+
+`LinalgRequirements` contains lengths for regions such as scalar, real, index, `Exact` accumulator, and extended-range storage, plus the options' byte limit.
+`scalar_len()` returns scalar-region length; `required_bytes::<S>()` returns total bytes for scalar type `S`.
+Both return `SizeOverflow` if size arithmetic does not fit in `usize`; the latter returns `ResourceLimit` if the byte limit is exceeded.
+For successive operations in one workspace, take the maximum per region with `a.max(&b)` and reserve once (the stricter byte limit remains).
+Reservation does not shrink retained capacity; the byte limit includes capacity remaining from earlier operations, and allocation failure gives `AllocationFailure`.
+`ws.reservation_bytes(&requirements)` returns bytes that would be retained after reservation without allocating; `ws.retained_bytes()` returns currently retained bytes.
+Factor-result storage is separate from workspace: for LU, reserve `LuDecomposition::empty()` in advance with `try_reserve(n)`, check with `check(n)`, and obtain its size with `factor_storage_bytes(n)`.
+
+There are two kinds of request types.
+Requests implementing the sealed trait `LinalgWorkspaceRequest<S>` can be passed directly to `LinalgWorkspace::<S>::workspace_requirements(&request)` and `LinalgWorkspace::<S>::workspace(&request)`.
+User types cannot implement this trait, so every request follows the same reservation rules.
+Other requests are accepted by `workspace_requirements` and `workspace` of the table's “Type returning requirements”; different request kinds cannot be confused (passing a generalized-eigenvalue request to an ordinary-eigenvalue buffer is a compile error).
+
+| Computation | Request type (constructors) | Type returning requirements | Workspace |
+|---|---|---|---|
+| Dense products and vector operations | `DenseWorkspaceRequest` (`vector`, `in_place_vector`, `vector_pair`, `product`, `triangular_product`, `triangular_solve`, `structured`, `rank_two`) | `LinalgWorkspace` (sealed trait) | `LinalgWorkspace` |
+| Operator norms, materialization, products, Kronecker and block-diagonal solves | `OperatorWorkspaceRequest` (`norm`, `materialize`, `block`, `kronecker_solve`, `block_diagonal_solve`) | `LinalgWorkspace` (sealed trait) | `LinalgWorkspace` |
+| Subspace bases, principal angles, orthogonal Procrustes | `SubspaceBasisWorkspaceRequest` (`orth`, `null_space`), `SubspaceAnglesWorkspaceRequest`, `ProcrustesWorkspaceRequest` (`new`) | `LinalgWorkspace` (sealed trait) | `LinalgWorkspace` |
+| LU, Cholesky, LDLᴴ | `LuWorkspaceRequest`, `CholeskyWorkspaceRequest`, `LdlWorkspaceRequest`（`factor`, `solve`, `solve_matrix`） | `LuDecomposition`, `CholeskyDecomposition`, `LdlDecomposition` | `LinalgWorkspace` |
+| Householder QR and LQ | `HouseholderWorkspaceRequest` (`factor`, `solve`, `solve_matrix`, `damped_solve`, `q_matrix`, `apply_q`, `reconstruct`, `with_residual`) | `HouseholderDecomposition` | `LinalgWorkspace` |
+| RQ, QR updates | `RqWorkspaceRequest`, `QrUpdateWorkspaceRequest` (`new`) | `RqDecomposition`, `QrUpdateDecomposition` | `LinalgWorkspace` |
+| SVD | `SvdWorkspaceRequest`（`new`, `solve`, `pseudoinverse`） | `SvdValues`, `ThinSvdDecomposition`, `SvdDecomposition` | `LinalgWorkspace` |
+| GSVD, CS decomposition, polar decomposition | `GsvdWorkspaceRequest`, `CsdWorkspaceRequest`, `PolarWorkspaceRequest` (`new`) | `GsvdDecomposition`, `CsdDecomposition`, `PolarDecomposition` | `LinalgWorkspace` |
+| General eigenvalues | `GeneralEigenWorkspaceRequest` (`new`) | `GeneralEigenvaluesBuffer`, `GeneralEigenDecomposition` | `LinalgWorkspace` (scalar type `Complex<R>`) |
+| Hermitian and generalized Hermitian eigenvalues | `HermitianEigenWorkspaceRequest` (`new`, `tridiagonal`), `GeneralizedHermitianEigenWorkspaceRequest` (`new`) | `HermitianEigenvaluesBuffer`, `HermitianEigenDecomposition`, `HermitianEigenFirstComponents`, `GeneralizedHermitianEigenvaluesBuffer`, `GeneralizedHermitianEigenDecomposition` | `LinalgWorkspace` |
+| Schur, generalized Schur (QZ) | `SchurWorkspaceRequest`, `GeneralizedSchurWorkspaceRequest` (`new`, `reorder`) | `SchurDecomposition`, `GeneralizedSchurDecomposition` | `LinalgWorkspace` |
+| Structured matrices: banded, tridiagonal, triangular, Toeplitz, and others | `StructuredWorkspaceRequest` (`factor`, `solve`, `solve_matrix`, `with_dense_fallback`) | `BandedLuDecomposition`, `BandedCholeskyDecomposition`, `TridiagonalLuDecomposition`, Plans `CyclicTridiagonalPlan`, `TriangularPlan`, `StructuredSolvePlan` | `LinalgWorkspace` |
+| Matrix functions | Enum `MatrixFunctionWorkspaceRequest` (`Evaluate`, `Frechet`, `Condition`) | Methods of Plan `MatrixFunctionPlan` | `LinalgWorkspace` (scalar type `Complex<R>`) |
+| Bordered systems | Enum `BorderedSystemWorkspaceRequest` (`PrepareRhs`, `Diagnose`) | Methods of `BorderedSystem` | `LinalgWorkspace` |
+| Iterative solvers | `IterativeWorkspaceRequest` (`operator`, `adjoint`, `matrix`, `with_right_hand_sides`, `with_preconditioner`, `with_recycle_space`) | Methods of each solver, such as `CgSolver` | `IterativeWorkspace` |
+| Krylov-subspace recycling | `KrylovRecycleWorkspaceRequest` (`new`) | `KrylovRecycleSpace` | `KrylovRecycleWorkspace` |
+| Iterative refinement | `RefinementWorkspaceRequest` (`new`, `with_right_hand_sides`) | Methods of method object `IterativeRefinement` | `RefinementWorkspace` |
+
+Some Plans and method objects have no request type.
+`SylvesterPlan`, `LyapunovPlan`, `RiccatiPlan`, and sparse `SparsePowerPlan` and `SparseFunctionPlan` have dimensions fixed at construction and accept `()` instead of a request.
+`HouseholderMinimumNormPlan` accepts the right-hand-side count; method objects for operator actions and partial spectra accept the operator and column count ([Applying matrix functions to vectors and method objects](../operator-actions-and-partial-spectra/)).
+
+Parallel execution has packing storage per worker, so requirements grow with the worker count permitted by the execution policy.
+`DenseWorkspaceRequest` and request types for LU, Cholesky, LDL, Householder, RQ, QR updates, SVD, Hermitian and generalized Hermitian eigenvalues, GSVD, polar decomposition, subspace bases, principal angles, and Procrustes can cap that count with `with_worker_bound(workers)`.
+For the same request types, `with_provider_packing()` also includes storage for repacking entire operands for an external BLAS provider; `for_context(&cx)` determines both from the context's worker count and presence of a BLAS provider.
+The accuracy tier comes from options passed to the request, not the context.
+
+Owned workspaces (`LinalgWorkspace::new()`) automatically allocate missing capacity during preparation of calls with caller-provided output.
+`LinalgWorkspace::from_scalar_slice`, borrowing a caller's scalar slice, cannot grow and returns `DimensionMismatch` if scalar capacity is insufficient or the operation needs non-scalar regions.
+With workspace and output meeting requirements, SciOxide numerical processing performs no allocation.
+Allocation by parallel executors and injected BLAS providers follows their own contracts.
+
+The following cell factors and solves tridiagonal matrices $A_s = \operatorname{tridiag}(-1,\ 2 + s,\ -1)$ for changing shifts $s = 0, 1, \dots$ using the same workspace.
+Inputs are order $n$ (2–200) and solve count (1–8); the right-hand side is $b = (1, \dots, 1)$.
+The first table shows factorization and solve requirements, their combined `max` requirements, and the size of factor storage separate from workspace.
+The second shows `check` before and after reservation and the result with an insufficient borrowed slice of length 1 for solution.
+For each shift, the third table lists post-solve `check`, bytes retained by workspace and factors, solve termination reason with caller-provided output, difference from one-shot `solve`, and relative residual $\lVert b - A_s x \rVert_\infty / (\lVert A_s \rVert_\infty \lVert x \rVert_\infty + \lVert b \rVert_\infty)$.
+The relative residual independently checks a manually computed tridiagonal product; unchanged retained bytes show that no allocation occurred after reservation.
+
+```rust
+//| id: linalg-workspace-reuse
+//| ref: linalg-workspace-reuse
+//| title: "Reserve LU workspace once and solve repeatedly"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-linalg]
+//| inputs:
+//|   order: {"type":"range","label":"Degree n","description":"Order of coefficient matrix tridiag(−1, 2 + s, −1).","min":2,"max":200,"step":1,"value":50}
+//|   repeats: {"type":"range","label":"Solve count","description":"Number of solves in the same workspace with shifts s = 0, 1, … .","min":1,"max":8,"step":1,"value":4}
+//| cases:
+//|   - {"id":"order-two","label":"n = 2","description":"Even at small orders, retained bytes remain unchanged after reservation.","inputs":{"order":2}}
+//|   - {"id":"large","label":"n = 200, 8 solves","description":"Even eight solves at large order need only one initial reservation.","inputs":{"order":200,"repeats":8}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"sizes","path":"/rows/2/1","equals":13416}
+//|       - {"artifact":"states","path":"/rows/0/0","equals":"NeedsGrowth"}
+//|       - {"artifact":"states","path":"/rows/0/1","equals":"Sufficient"}
+//|       - {"artifact":"states","path":"/rows/0/2","equals":"DimensionMismatch"}
+//|       - {"artifact":"solves","path":"/rows/3/1","equals":"Sufficient"}
+//|       - {"artifact":"solves","path":"/rows/3/4","equals":"Accepted"}
+//|       - {"artifact":"solves","path":"/rows/3/5","range":{"max":0}}
+//|       - {"artifact":"solves","path":"/rows/3/6","range":{"max":1e-15}}
+//|       - {"path":"/outputs/3/state","equals":"satisfied"}
+//|   - case: order-two
+//|     expect:
+//|       - {"artifact":"sizes","path":"/rows/2/1","equals":12}
+//|       - {"artifact":"solves","path":"/rows/0/6","range":{"max":1e-15}}
+//|       - {"path":"/outputs/3/state","equals":"satisfied"}
+//|   - case: large
+//|     expect:
+//|       - {"artifact":"solves","path":"/rows/7/1","equals":"Sufficient"}
+//|       - {"artifact":"solves","path":"/rows/7/6","range":{"max":1e-15}}
+//|       - {"path":"/outputs/3/state","equals":"satisfied"}
+use scioxide_core::{Capacity, ExecutionContext, SciOxideErrorKind};
+use scioxide_linalg::{DirectSolveOptions, DirectSolveTermination, LinalgExecutionOptions};
+use scioxide_linalg::{LinalgRequirements, LinalgWorkspace, LuDecomposition, LuWorkspaceRequest};
+use scioxide_linalg::{Matrix, Vector, solve};
+
+let n = order.round() as usize;
+let options = LinalgExecutionOptions::new();
+// Default acceptance uses only RankPolicy::Exact, with no condition lower bound or backward-error computation.
+let accept = DirectSolveOptions::default();
+let capacity = |c: Capacity| match c {
+    Capacity::Sufficient => "Sufficient",
+    Capacity::NeedsGrowth => "NeedsGrowth",
+};
+let lu_requirements = |request: LuWorkspaceRequest| {
+    LuDecomposition::<f64>::workspace_requirements(&request).map_err(|e| e.to_string())
+};
+// Obtain factor and solve requirements, combine with max, and reserve once.
+let factor_req = lu_requirements(LuWorkspaceRequest::factor(n, &options))?;
+let solve_req = lu_requirements(LuWorkspaceRequest::solve(n, &options))?;
+let both = factor_req.max(&solve_req);
+let sizes = |name: &'static str, r: &LinalgRequirements| -> Result<_, String> {
+    let scalars = r.scalar_len().map_err(|e| e.to_string())?;
+    Ok((
+        name,
+        Some(scalars),
+        r.required_bytes::<f64>().map_err(|e| e.to_string())?,
+    ))
+};
+let factor_bytes =
+    LuDecomposition::<f64>::factor_storage_bytes(n).map_err(|e| e.to_string())?;
+let size_rows = vec![
+    sizes("Factorization", &factor_req)?,
+    sizes("Solve", &solve_req)?,
+    sizes("max (both)", &both)?,
+    ("Factor storage (outside workspace)", None, factor_bytes),
+];
+let columns = serde_json::json!([
+    { "key": "0", "label": "Requirements" },
+    { "key": "1", "label": "Scalar-region length [elements]", "type": "integer", "nullText": "－" },
+    { "key": "2", "label": "Required bytes [B]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    size_rows,
+    metadata = serde_json::json!({ "id": "sizes" })
+);
+
+let mut workspace = LinalgWorkspace::<f64>::new();
+let before = capacity(workspace.check(&both).map_err(|e| e.to_string())?);
+workspace.try_reserve(&both).map_err(|e| e.to_string())?;
+let after = capacity(workspace.check(&both).map_err(|e| e.to_string())?);
+// Reserve factor storage in advance too.
+let mut factor = LuDecomposition::<f64>::empty();
+factor.try_reserve(n).map_err(|e| e.to_string())?;
+let termination_name = |t: DirectSolveTermination| match t {
+    DirectSolveTermination::Accepted => "Accepted",
+    DirectSolveTermination::RankDeficient => "RankDeficient",
+    _ => "Other rejection",
+};
+let b = Vector::from_vec(vec![1.0_f64; n]);
+let mut x = Vector::<f64>::zeros(n).map_err(|e| e.to_string())?;
+// Call the API with caller-provided output using the same dispatch as APIs returning owned values (sequential_native).
+let cx = ExecutionContext::sequential_native();
+let (mut rows, mut accepted, mut worst) = (Vec::new(), true, 0.0_f64);
+for k in 0..repeats.round() as usize {
+    let s = k as f64;
+    // Arrange A_s = tridiag(−1, 2 + s, −1) in row-major order.
+    let entry = |index: usize| match (index / n).abs_diff(index % n) {
+        0 => 2.0 + s,
+        1 => -1.0,
+        _ => 0.0,
+    };
+    let a =
+        Matrix::from_vec(n, n, (0..n * n).map(entry).collect()).map_err(|e| e.to_string())?;
+    LuDecomposition::factor_into(&a, &options, &mut factor, &mut workspace, cx)
+        .map_err(|e| e.to_string())?;
+    let report = factor
+        .solve_into(&b, &accept, x.view_mut(), &mut workspace, cx)
+        .map_err(|e| e.to_string())?;
+    accepted &= report.termination().is_success();
+    // Difference from an independent one-shot solution.
+    let reference = solve(&a, &b).map_err(|e| e.to_string())?;
+    let xs = x.as_slice();
+    let gap = xs
+        .iter()
+        .zip(reference.as_slice())
+        .fold(0.0_f64, |m, (p, q)| m.max((p - q).abs()));
+    // Relative residual using a manually computed tridiagonal product (independent verification). ‖A_s‖∞ is the maximum row sum; ‖b‖∞ = 1.
+    let (mut residual, mut a_norm) = (0.0_f64, 0.0_f64);
+    for i in 0..n {
+        let left = if i > 0 { xs[i - 1] } else { 0.0 };
+        let right = if i + 1 < n { xs[i + 1] } else { 0.0 };
+        residual = residual.max((1.0 - (-left + (2.0 + s) * xs[i] - right)).abs());
+        a_norm = a_norm.max(2.0 + s + f64::from(u8::from(i > 0) + u8::from(i + 1 < n)));
+    }
+    let x_norm = xs.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+    let relative = residual / (a_norm * x_norm + 1.0);
+    worst = worst.max(relative);
+    let check = capacity(workspace.check(&both).map_err(|e| e.to_string())?);
+    let retained = workspace.retained_bytes().map_err(|e| e.to_string())?;
+    let kept = factor.retained_bytes().map_err(|e| e.to_string())?;
+    rows.push((
+        k,
+        check,
+        retained,
+        kept,
+        termination_name(report.termination()),
+        gap,
+        relative,
+    ));
+}
+// A workspace borrowing the caller's length-1 slice cannot grow.
+let mut scratch = [0.0_f64; 1];
+let mut lent = LinalgWorkspace::from_scalar_slice(&mut scratch);
+let lent_result = match factor.solve_into(&b, &accept, x.view_mut(), &mut lent, cx) {
+    Ok(_) => "Ok".to_string(),
+    Err(e) if e.kind() == SciOxideErrorKind::DimensionMismatch => "DimensionMismatch".to_string(),
+    Err(e) => e.to_string(),
+};
+let states = serde_json::json!([
+    { "key": "0", "label": "check before reservation" },
+    { "key": "1", "label": "check after reservation" },
+    { "key": "2", "label": "Solve with borrowed length-1 slice" }
+]);
+let state_rows = vec![(before, after, lent_result)];
+emit_table_with_columns!(
+    states,
+    state_rows,
+    metadata = serde_json::json!({ "id": "states" })
+);
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Shift s", "type": "integer" },
+    { "key": "1", "label": "check after solution" },
+    { "key": "2", "label": "Workspace retained [B]", "type": "integer" },
+    { "key": "3", "label": "Factors retained [B]", "type": "integer" },
+    { "key": "4", "label": "Termination reason" },
+    { "key": "5", "label": "Difference from solve [-]", "type": "number", "format": sci2 },
+    { "key": "6", "label": "Relative residual [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "solves" })
+);
+let outcome = if accepted {
+    Outcome::satisfied("Solutions for all shifts were accepted")
+} else {
+    Outcome::failed("Some solutions were not accepted")
+};
+let status = if accepted {
+    "Accepted"
+} else {
+    "RankDeficient"
+};
+emit_outcome!(
+    outcome
+        .status(status)
+        .diagnostic("Maximum relative residual", worst, None)
+);
+```
+
+At default $n = 50$, factorization requires 107,928 B and solution 4,000 B; because they also use different regions, their per-region `max` totals 111,128 B, larger than either alone.
+Factor storage uses another 40,600 B separately from workspace.
+Wasm indices are 32-bit, so index storage uses fewer bytes than 64-bit native execution (native `max` is 111,728 B and factors 40,800 B).
+Before reservation, `check` is `NeedsGrowth`; afterward it remains `Sufficient` for every shift, and retained workspace and factor bytes stay unchanged.
+Passing the same `sequential_native()` as APIs returning owned values makes caller-output and one-shot `solve` use the same kernels and computation order, giving solution difference 0.
+Relative residuals are of order $10^{-16}$, small as expected from LU backward stability.
+Forward error also scales with the condition number.
+For $s \ge 1$, $A_s$ is strictly diagonally dominant with $\kappa_\infty(A_s) \le (4 + s)/s$, so forward error is also small; for $s = 0$, the conditioning of $\operatorname{tridiag}(-1, 2, -1)$ grows with $n^2$ (about $10^3$ at $n = 50$), so forward error can exceed relative residual by about three orders of magnitude.
+An insufficient borrowed slice returns `DimensionMismatch` instead of allocating.
+At $n = 2$, or after eight solves at $n = 200$, retained bytes do not grow after reservation.
+
+## Eigenvalue output buffers
+
+Values-only APIs with caller-provided output write results into caller-owned buffers.
+There are three: `GeneralEigenvaluesBuffer<R>` for complex eigenvalues of general square matrices, `HermitianEigenvaluesBuffer<R>` for real eigenvalues of Hermitian or real symmetric tridiagonal matrices, and `GeneralizedHermitianEigenvaluesBuffer<R>` for real eigenvalues of Hermitian definite pairs $(A, B)$.
+Create an empty buffer with `empty()`, or obtain one by splitting an owned result such as `HermitianEigenvaluesResult` with `into_parts()` into value storage and report `EigenReport`.
+Pass it as in `HermitianEigenvaluesBuffer::compute_into(&a, input, &options, &mut values, &mut ws, cx)` (`tridiagonal_into` for tridiagonal matrices); values change only on success, which returns `EigenReport`, and failure leaves the buffer unchanged.
+Prepare workspace with the same type's `workspace::<S>(&request)`; once buffer and workspace have grown to that order, later calls do not allocate.
+General-eigenvalue buffer workspaces use complex scalar type `Complex<R>` even for real input.
+
+## Execution control: options and contexts
+
+Execution settings separate limits fixed before computation from capabilities borrowed at call time.
+Store the former in `LinalgExecutionOptions` and access the latter through a context.
+
+| Value | Contents | How to pass it |
+|---|---|---|
+| `LinalgExecutionOptions` | Execution policy `with_execution_policy` (`ExecutionPolicy`, default `Auto`), accuracy tier `with_accuracy` ([`Standard` and `Exact`](oxref:linalg-accuracy-levels)), elapsed-time limit `with_time_limit`, workspace byte limit `with_byte_limit`, iteration limit `with_iteration_budget` | Dense operations and factorizations accept it directly. Options such as `DirectSolveOptions` and those for eigenvalues, matrix functions, or refinement compose it once with `with_execution_options` and otherwise hold only mathematical settings such as rank policy or tolerance |
+| `Estimation` | Whether to compute optional diagnostics such as reorder conditioning, closed-loop stability, or direct-solve residuals (`Skip` or `Estimate`) | Options for each family; `Skip` leaves the report field empty |
+| `ExecutionContext` (scioxide-core) | Parallel executor, cancellation (`with_cancellation`), clock and deadlines, processor capabilities for instruction-set detection | Last argument of APIs with caller-provided output and scoped APIs |
+| `LinalgExecutionContext` | The above capabilities plus instruction-set kernel dispatch and a BLAS provider (`with_blas`) | Construction from `ExecutionContext` creates a new solve root; from a parent's `&mut SolveContext` it creates a child sharing the parent's counts. Dispatch is selected once at construction and preserved when borrowed into another call with `reborrow` |
+
+Execution policy caps the workers usable by APIs with caller-provided output; workers themselves come from the context's executor, so APIs returning owned values run sequentially under every policy.
+`LinalgExecutionContext::sequential()` uses portable scalar kernels and has no clock, cancellation, or BLAS provider.
+`LinalgExecutionContext::with_iteration_budget` caps iterative solvers running in that context at the smaller of its limit and the solver's own.
+Calling twice preserves the smaller limit, also retained across `reborrow`.
+This limit applies only to that solve's own scope, changing neither its parent's iteration limit nor limits of nested solves it launches (nested iterations count in their own scopes).
+
+Iteration counting and default limits are algorithm-specific.
+Values-only SVD permits $100k$ dqds transformations; SVD with vectors permits $30k$ QR sweeps ($30k(1 + \lceil \log_2 \lceil k/32 \rceil \rceil)$ for divide-and-conquer), with $k = \min(m, n)$.
+Dense-eigenvalue QR and QZ iterations permit $30n$ steps; Hermitian divide-and-conquer and bisection allow more.
+GSVD and CS allow 40 Jacobi sweeps; partial eigenvalue, partial singular-value, and LOBPCG methods allow 100 restarts or outer iterations; refinement allows 10 corrections per right-hand side.
+Iterative solvers use the smaller of their own `max_iterations` and this limit; operator actions, 1-norm estimation, and randomized low-rank approximation have no default iteration limit.
+Noniterative kernels such as products do not count iterations.
+This handbook's cells run sequentially on Wasm, so parallel execution and `StdClock` are unavailable and elapsed-time limits cannot be set.
+Cancellation signals are available.
+
+## Cancellation, limits, and attempt records
+
+Direct methods and kernels return `ExecutionStopped` errors for cancellation or deadlines too, leaving caller-provided output unchanged.
+Forms with options and caller-provided output for iterative solvers, partial spectra, operator actions, and refinement return accepted values in `Ok` even on limits or cancellation, indicating the stop through the termination reason ([Cancellation, count limits, and accepted iterates](../../examples/accepted-state-and-cancellation/)).
+Dense eigenvalue and SVD iterations return `ConvergenceFailure` errors at limits without partial results.
+
+Factorizations (LU, Cholesky, LDL, QR and variants), SVD, GSVD, CS and polar decompositions, eigenvalues and Schur or QZ, matrix functions, matrix equations, condition estimates, subspaces, structured matrices, and operator norms start a solve epoch in workspace and record its result in the `AttemptRecord` from `ws.last_attempt()`.
+The record holds the outcome, its own iteration counts (`counts().own()`), and nested-computation counts (`counts().nested()`).
+The result `outcome()` (`AttemptOutcome`) is `PreflightRejected` for checking rejection before the epoch starts, `Succeeded` for success, `Stopped` for cancellation, deadline, iteration or evaluation limits, and `Failed` for other numerical failures.
+A limit or cancellation is recorded as `Stopped` even when returning `Err`, distinguishing it from `Failed`.
+Intermediate numerical values are not recorded; dense kernels such as products start no epoch and leave no attempt record.
+
+The following cell examines what remains when a matrix product, a constant-cost kernel, stops.
+It multiplies $40 \times 40$ identity matrices with cancelled and normal contexts using caller-provided output, then invokes the form with options with a time limit.
+There are no inputs.
+The table shows result classification, whether output prefilled with 7 changed, and workspace attempt records for all three calls.
+
+```rust
+//| id: linalg-kernel-cancellation
+//| ref: linalg-kernel-cancellation
+//| title: "Output and attempt records of products stopped by cancellation or time limits"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-linalg]
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"products","path":"/rows/0/1","equals":"ExecutionStopped"}
+//|       - {"artifact":"products","path":"/rows/0/2","equals":"Unchanged"}
+//|       - {"artifact":"products","path":"/rows/0/3","equals":"No record"}
+//|       - {"artifact":"products","path":"/rows/1/1","equals":"Ok"}
+//|       - {"artifact":"products","path":"/rows/1/2","equals":"Written"}
+//|       - {"artifact":"products","path":"/rows/2/1","equals":"CapabilityUnavailable"}
+use core::time::Duration;
+use scioxide_core::{CancellationToken, ExecutionContext, SciOxideError, SciOxideErrorKind};
+use scioxide_linalg::{DenseWorkspaceRequest, LinalgExecutionOptions, LinalgWorkspace, Matrix};
+
+// Convert error kind() to a variant-name string.
+let kind_name = |result: Result<(), SciOxideError>| match result.map_err(|e| e.kind()) {
+    Ok(()) => "Ok",
+    Err(SciOxideErrorKind::ExecutionStopped) => "ExecutionStopped",
+    Err(SciOxideErrorKind::CapabilityUnavailable) => "CapabilityUnavailable",
+    Err(_) => "Other errors",
+};
+let n = 40_usize;
+let a = Matrix::<f64>::identity(n).map_err(|e| e.to_string())?;
+let options = LinalgExecutionOptions::new();
+let request = DenseWorkspaceRequest::product(n, n, n, &options);
+let mut workspace = LinalgWorkspace::<f64>::workspace(&request).map_err(|e| e.to_string())?;
+let mut rows = Vec::new();
+let token = CancellationToken::new();
+for cancelled in [true, false] {
+    if cancelled {
+        token.cancel();
+    } else {
+        token.reset();
+    }
+    // Prefill output with 7 and check whether the call changed it.
+    let mut out = Matrix::from_vec(n, n, vec![7.0_f64; n * n]).map_err(|e| e.to_string())?;
+    let cx = ExecutionContext::sequential().with_cancellation(&token);
+    let result = a
+        .view()
+        .mul_mat_into(&a, &options, out.view_mut(), &mut workspace, cx);
+    let unchanged = out.as_slice().iter().all(|&v| v == 7.0);
+    // Products start no epoch and leave no attempt record.
+    let record = if workspace.last_attempt().is_some() {
+        "Recorded"
+    } else {
+        "No record"
+    };
+    rows.push((
+        if cancelled {
+            "Caller-provided output, cancelled context"
+        } else {
+            "Caller-provided output, normal context"
+        },
+        kind_name(result),
+        if unchanged {
+            "Unchanged"
+        } else {
+            "Written"
+        },
+        record,
+    ));
+}
+// Contexts for APIs returning owned values have no clock, so time limits are rejected before computation.
+let timed = options.with_time_limit(Duration::from_secs(1));
+let owned = a.view().mul_mat_with_options(&a, &timed).map(|_| ());
+rows.push((
+    "Form with options, 1 s time limit",
+    kind_name(owned),
+    "(no output argument)",
+    "(no workspace argument)",
+));
+let columns = serde_json::json!([
+    { "key": "0", "label": "Product call" },
+    { "key": "1", "label": "Result" },
+    { "key": "2", "label": "Output" },
+    { "key": "3", "label": "Attempt record" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "products" })
+);
+```
+
+With a cancelled context, the product returns `ExecutionStopped` and leaves the output's 7s unchanged.
+With a normal context, the same call succeeds and writes output; neither product starts an epoch, so neither leaves an attempt record.
+The product with options and a time limit is rejected before computation with `CapabilityUnavailable` because its owned-value API context has no clock.
+
+The next cell examines what dense SVD leaves after an iteration limit.
+Values-only `SvdValues` repeats dqds transformations after bidiagonalization and counts them against the iteration limit.
+The input is an iteration limit (1–240); the matrix is $40 \times 40$ with deterministic pseudorandom entries in $[-0.5, 0.5)$.
+The table shows result classification for the caller-output API `compute_into`, whether output singular values changed, and attempt outcome and iteration counts.
+For verification, compare the largest singular value with one independently computed by standard-form `SvdValues::compute` under its default limit.
+The final outcome follows the attempt record: satisfied for `Succeeded`, otherwise failed because no singular values are committed.
+
+```rust
+//| id: linalg-svd-iteration-limit
+//| ref: linalg-svd-iteration-limit
+//| title: "Output and attempt records of SVD stopped at an iteration limit"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-linalg]
+//| inputs:
+//|   iteration_budget: {"type":"range","label":"SVD iteration limit [count]","description":"Maximum dqds transformations for singular values of the 40×40 matrix.","min":1,"max":240,"step":1,"value":100}
+//| cases:
+//|   - {"id":"enough","label":"Limit 240","description":"A sufficient limit gives Succeeded and records the required transformation count.","inputs":{"iteration_budget":240}}
+//|   - {"id":"one","label":"Limit 1","description":"At limit 1, execution stops after the first transformation without writing singular values.","inputs":{"iteration_budget":1}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"svd","path":"/rows/0/0","equals":"ConvergenceFailure"}
+//|       - {"artifact":"svd","path":"/rows/0/1","equals":"Unchanged"}
+//|       - {"artifact":"svd","path":"/rows/0/2","equals":"Stopped"}
+//|       - {"artifact":"svd","path":"/rows/0/3","equals":100}
+//|       - {"artifact":"svd","path":"/rows/0/4","equals":null}
+//|       - {"path":"/outputs/1/state","equals":"failed"}
+//|   - case: enough
+//|     expect:
+//|       - {"artifact":"svd","path":"/rows/0/2","equals":"Succeeded"}
+//|       - {"artifact":"svd","path":"/rows/0/3","range":{"min":100,"max":240}}
+//|       - {"artifact":"svd","path":"/rows/0/4","range":{"max":1e-14}}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+//|   - case: one
+//|     expect:
+//|       - {"artifact":"svd","path":"/rows/0/3","equals":1}
+//|       - {"path":"/outputs/1/state","equals":"failed"}
+use scioxide_core::{AttemptOutcome, AttemptRecord, Budget, ExecutionContext, SciOxideErrorKind};
+use scioxide_linalg::{LinalgExecutionOptions, Matrix, SvdValues, SvdWorkspaceRequest};
+
+let outcome_name = |r: Option<&AttemptRecord<()>>| match r.map(|r| r.outcome()) {
+    None => "No record",
+    Some(AttemptOutcome::PreflightRejected) => "PreflightRejected",
+    Some(AttemptOutcome::Failed) => "Failed",
+    Some(AttemptOutcome::Stopped) => "Stopped",
+    Some(AttemptOutcome::Succeeded) => "Succeeded",
+    Some(_) => "Other outcome", // AttemptOutcome is #[non_exhaustive]
+};
+let n = 40_usize;
+// Deterministic pseudorandom entries in [-0.5, 0.5).
+let entries = (0..n * n).map(|k| ((k * 7919 + 13) % 1009) as f64 / 1009.0 - 0.5);
+let a = Matrix::from_vec(n, n, entries.collect()).map_err(|e| e.to_string())?;
+let budget = Budget::try_from(iteration_budget.round() as usize).map_err(|e| e.to_string())?;
+let options = LinalgExecutionOptions::new().with_iteration_budget(budget);
+let request = SvdWorkspaceRequest::new(n, n, &options);
+let mut workspace = SvdValues::<f64>::workspace::<f64>(&request).map_err(|e| e.to_string())?;
+let mut values = SvdValues::<f64>::empty();
+let cx = ExecutionContext::sequential();
+let result = SvdValues::compute_into(&a, &options, &mut values, &mut workspace, cx);
+let kind = match result.map_err(|e| e.kind()) {
+    Ok(_) => "Ok",
+    Err(SciOxideErrorKind::ConvergenceFailure) => "ConvergenceFailure",
+    Err(_) => "Other errors",
+};
+let record = workspace.last_attempt();
+let iterations = record.map(|r| r.counts().own().iterations());
+// Verification: relative difference from the largest singular value computed independently by the standard form with default limit (100k).
+let reference = SvdValues::compute(&a)
+    .map_err(|e| e.to_string())?
+    .singular_values()[0];
+let gap = values
+    .singular_values()
+    .first()
+    .map(|&s| (s - reference).abs() / reference);
+let written = if values.singular_values().is_empty() {
+    "Unchanged"
+} else {
+    "Written"
+};
+let rows = vec![(kind, written, outcome_name(record), iterations, gap)];
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Result" },
+    { "key": "1", "label": "Output singular values" },
+    { "key": "2", "label": "Attempt record" },
+    { "key": "3", "label": "Iterations [count]", "type": "integer", "nullText": "－" },
+    { "key": "4", "label": "Largest singular-value relative difference [-]", "type": "number", "format": sci2, "nullText": "－" }
+]);
+emit_table_with_columns!(columns, rows, metadata = serde_json::json!({ "id": "svd" }));
+let outcome = if record.is_some_and(|r| r.outcome() == AttemptOutcome::Succeeded) {
+    Outcome::satisfied("SVD converged within the iteration limit")
+} else {
+    Outcome::failed("SVD stopped at the iteration limit without committing singular values")
+        .explanation("The attempt record is Stopped, but dense SVD writes no intermediate values to the output.")
+};
+let outcome =
+    outcome
+        .status(outcome_name(record))
+        .diagnostic("Upper bound", budget.get() as f64, None);
+let outcome = match iterations {
+    Some(count) => outcome.diagnostic("Recorded iterations", count as f64, None),
+    None => outcome,
+};
+emit_outcome!(outcome);
+```
+
+At default limit 100, SVD returns `ConvergenceFailure`.
+Output singular values remain empty and unchanged; the attempt is `Stopped`, indicating a limit stop, with iteration count 100 matching the limit.
+A limit of at least 156 gives `Succeeded`; the recorded 156 transformations are what this matrix required (about four per singular value).
+The largest singular value then matches the independent standard-form value in Wasm (relative difference 0); native vector-instruction environments also differ by less than $10^{-15}$.
+A limit of 1 stops after the first transformation and records one iteration.
+Without an explicit limit, the default is $100k = 4000$ transformations, rarely exhausted by ordinary matrices.
+
+## Low-level backend components
+
+`scioxide_linalg::backend` exposes low-level components used inside iterations by other SciOxide crates.
+Components in this namespace depart from some of the preceding rules.
+Errors may partially modify right-hand sides or working storage; these components do not apply rank policies, diagnose residuals or conditioning, or count solves.
+They do check storage sizes, non-finite values, and exactly zero pivots.
+Applications normally use this chapter's other types, such as `LuDecomposition` and `TridiagonalLuDecomposition`.
+
+`backend::lu::LuFactor<S>` is an equilibrated partial-pivoted LU $P D_r A D_c = LU$ for repeated refactorization of matrices of the same order ($D_r, D_c$ are diagonal power-of-two scalings).
+`LuFactor::new(order)` prepares storage up to order `order` in $O(n^2)$; `try_reserve(order)` increases capacity without changing current factors.
+`factor(matrix, cx)` performs the same equilibrated blocked elimination as `LuDecomposition` within reserved capacity without allocation, rejecting matrices beyond capacity with `ResourceLimit` and exactly zero pivots with `Singular`.
+Failed factorization invalidates the previous factors.
+`solve_into(rhs, output, cx)` solves by $O(n^2)$ substitution and writes only finite results to output.
+Neither the original matrix nor condition estimates are retained, so the caller determines solution acceptance.
+Componentwise backward error is of order $\gamma_{6n} \lvert L \rvert \lvert U \rvert = 3n\varepsilon/(1 - 3n\varepsilon) \cdot \lvert L \rvert \lvert U \rvert$, with pivot growth entering through $\lvert L \rvert \lvert U \rvert$.
+
+`backend::dense::DenseOperatorWorkspace<T>` holds a row-major matrix together with a verified upper bound on entry magnitudes.
+`new(rows, cols)` allocates a zero matrix; `update(fill)` fills every entry with NaN before invoking `fill` to write entries, then checks finiteness once.
+Unwritten or non-finite entries give an error; no operator reference is available until a successful `update`.
+`operator()` returns a reference to `FiniteMatrixView` without rereading entries, avoiding allocation and repeated finiteness checks in iterations repeatedly replacing values of a same-shaped operator such as a Jacobian.
+Updates cost $O(mn)$ and operator borrowing $O(1)$; updates and products allocate nothing after construction, and product arithmetic and accuracy match `FiniteMatrixView`.
+
+This namespace also contains tridiagonal factors (`backend::tridiagonal`), Hessenberg components (`backend::hessenberg`), and bordered-bidiagonal factors (`backend::bordered_bidiagonal`).
+
+---
+
+## Summary
+
+One-shot functions and standard forms return answers and convert failure to errors; forms with options return termination reasons and reports in `Ok`, so choose according to the information needed.
+Only APIs with caller-provided output and scoped APIs accept contexts; use them for parallel execution, cancellation, deadlines, external BLAS, or allocation-free iteration.
+Pass workspaces reserved from operation-specific requests and requirements to APIs with caller-provided output; combine operations with `LinalgRequirements::max` for one reservation, and separately reserve factor storage with each type's `try_reserve`.
+Owned workspaces allocate missing capacity automatically, while borrowed slices cannot grow and return `DimensionMismatch`; workspace construction therefore selects whether allocation is allowed.
+Direct methods and kernels return errors without changing output when stopped; computations starting epochs record outcome and iterations in `last_attempt()`, distinguishing limit stops (`Stopped`) from numerical failures (`Failed`) even for `Err`.
+
+## Further reading
+
+- [LU, Cholesky, and LDL factorizations and direct-solution acceptance](../direct-and-structured-solvers/): examine direct methods using the workspace reserved here and solution-acceptance checks.
+- [Eigenvalue problems](../eigenproblems/): examine `compute_into` with eigenvalue output buffers and interpretation of report `EigenReport`.
+- [Krylov subspace methods and preconditioning](../krylov-and-preconditioning/): examine solver workspace `IterativeWorkspace` and accepted iterates returned in `Ok` after stopping.
+- [External BLAS provider contract](../blas-provider/): examine which calls use storage reserved with `with_provider_packing` and `for_context`.

@@ -1,0 +1,605 @@
+---
+title: "Sparse reaction–diffusion Jacobians with coloring"
+description: "Compute a one-dimensional finite-difference Brusselator Jacobian with derivative_coloring and ColoredJacobianPlan; compare colors with row-nonzero lower and bandwidth upper bounds, evaluations with dense differences, and entries with analytic Jacobians."
+sidebar:
+  order: 420
+---
+
+Implicit time integration of spatially discretized reaction–diffusion equations needs Jacobians for Newton stages.
+Each grid equation depends only on local and neighboring unknowns, giving sparse Jacobians.
+Coloring groups structurally orthogonal columns for simultaneous perturbation ([Sparse-Jacobian compression by coloring](../../algorithms/sparse-coloring/)), making calls depend on colors rather than grid size.
+This example computes sparse Jacobians of a diffusive Brusselator with `ColoredJacobianPlan`.
+Compare color counts with theoretical bounds, calls with dense differences, and values with analytic Jacobians.
+
+## Diffusive Brusselator
+
+The Brusselator, proposed by Prigogine and Lefever (1968), models autocatalytic reactions whose intermediate concentrations $u$ and $v$ may oscillate.
+Adding diffusion gives a stiff test problem used in Hairer and Wanner's *Solving Ordinary Differential Equations II*.
+On $x \in [0, 1]$, dimensionless concentrations $u(x, t)$ and $v(x, t)$ obey the following.
+
+$$
+\frac{\partial u}{\partial t} = 1 + u^2 v - 4 u + \alpha \frac{\partial^2 u}{\partial x^2},
+\qquad
+\frac{\partial v}{\partial t} = 3 u - u^2 v + \alpha \frac{\partial^2 v}{\partial x^2}.
+$$
+
+This specializes general $A + u^2 v - (B + 1) u$ and $B u - u^2 v$ to $A = 1$ and $B = 3$, with reaction-only equilibrium $(u, v) = (A, B/A) = (1, 3)$.
+Use Hairer and Wanner's diffusion $\alpha = 0.02$, fixing endpoint values to equilibrium $u = 1$ and $v = 3$.
+
+## Spatial discretization and Jacobians
+
+At $N$ interior nodes $x_i = i\,\Delta x$ ($i = 1, \dots, N$, $\Delta x = 1/(N + 1)$), replace second derivatives by central $(w_{i-1} - 2 w_i + w_{i+1})/\Delta x^2$.
+Insert boundary values at $w_0$ and $w_{N+1}$.
+This gives ODE system $\dot{\mathbf{w}} = \mathbf{F}(\mathbf{w})$ with $2N$ unknowns.
+Setting $D = \alpha/\Delta x^2 = \alpha (N + 1)^2$, the two equations at grid point $i$ are
+
+$$
+F_{u,i} = 1 + u_i^2 v_i - 4 u_i + D (u_{i-1} - 2 u_i + u_{i+1}),
+\qquad
+F_{v,i} = 3 u_i - u_i^2 v_i + D (v_{i-1} - 2 v_i + v_{i+1})
+$$
+
+with nonzero partials as follows.
+
+$$
+\frac{\partial F_{u,i}}{\partial u_i} = 2 u_i v_i - 4 - 2D, \quad \frac{\partial F_{u,i}}{\partial v_i} = u_i^2, \quad \frac{\partial F_{u,i}}{\partial u_{i \pm 1}} = D,
+$$
+
+$$
+\frac{\partial F_{v,i}}{\partial u_i} = 3 - 2 u_i v_i, \quad \frac{\partial F_{v,i}}{\partial v_i} = -u_i^2 - 2D, \quad \frac{\partial F_{v,i}}{\partial v_{i \pm 1}} = D.
+$$
+
+Diffusion couples only neighboring values of the same component, giving at most four nonzeros per row.
+Endpoint-grid rows lack one neighbor and have three, totaling $4 \cdot 2N - 4 = 8N - 4$ nonzeros.
+
+Evaluate at smooth state $u_i = 1 + 0.5 \sin(\pi x_i)$ and $v_i = 3 - 0.5 \sin(\pi x_i)$ matching boundary values.
+Moving away from equilibrium $(1, 3)$ makes diagonal Jacobian entries differ by grid point.
+
+The following definitions serve two cells.
+In `Brusselator`, `rhs` represents $\mathbf{F}$, `coupling` represents $D$, `state` gives the evaluation point, `exact` gives the partial derivatives above, and `pattern` gives the nonzero positions.
+`interleaved` selects unknown ordering in the next section.
+
+```rust
+//| id: differentiate-brusselator-model
+//| kind: definitions
+//| title: "Diffusive Brusselator right-hand side, points, analytic Jacobian, and structure"
+//| crates: [scioxide-core]
+use scioxide_core::{SciOxideError, RealScalar, StructuralPattern};
+
+/// Discretization with cells interior points and diffusion alpha.
+/// If interleaved is true, order (u₁, v₁, u₂, v₂, …); otherwise (u₁, …, u_N, v₁, …, v_N).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Brusselator {
+    pub(crate) cells: usize,
+    pub(crate) alpha: f64,
+    pub(crate) interleaved: bool,
+}
+
+impl Brusselator {
+    /// Unknown count 2N.
+    pub(crate) fn unknowns(&self) -> usize {
+        2 * self.cells
+    }
+
+    /// Unknown index for component s (0 for u, 1 for v) and zero-based grid i.
+    pub(crate) fn index(&self, s: usize, i: usize) -> usize {
+        if self.interleaved {
+            2 * i + s
+        } else {
+            s * self.cells + i
+        }
+    }
+
+    /// Component and grid point for unknown k.
+    pub(crate) fn split(&self, k: usize) -> (usize, usize) {
+        if self.interleaved {
+            (k % 2, k / 2)
+        } else {
+            (k / self.cells, k % self.cells)
+        }
+    }
+
+    /// Diffusion coupling D = α/Δx² = α (N + 1)².
+    pub(crate) fn coupling(&self) -> f64 {
+        let intervals = (self.cells + 1) as f64;
+        self.alpha * intervals * intervals
+    }
+
+    /// Right-hand side F(w); neighbors outside the interior use boundary u = 1, v = 3.
+    pub(crate) fn rhs(&self, w: &[f64], y: &mut [f64]) -> Result<(), SciOxideError> {
+        let (n, d) = (self.cells, self.coupling());
+        let neighbor = |s: usize, i: Option<usize>| match i {
+            Some(i) if i < n => w[self.index(s, i)],
+            _ => [1.0, 3.0][s],
+        };
+        for i in 0..n {
+            let (u, v) = (w[self.index(0, i)], w[self.index(1, i)]);
+            let lap_u = neighbor(0, i.checked_sub(1)) - 2.0 * u + neighbor(0, Some(i + 1));
+            let lap_v = neighbor(1, i.checked_sub(1)) - 2.0 * v + neighbor(1, Some(i + 1));
+            y[self.index(0, i)] = 1.0 + u * u * v - 4.0 * u + d * lap_u;
+            y[self.index(1, i)] = 3.0 * u - u * u * v + d * lap_v;
+        }
+        Ok(())
+    }
+
+    /// Point u_i = 1 + 0.5 sin(πx_i), v_i = 3 − 0.5 sin(πx_i), x_i = i/(N + 1).
+    pub(crate) fn state(&self) -> Vec<f64> {
+        let mut w = vec![0.0; self.unknowns()];
+        for i in 0..self.cells {
+            let x = (i + 1) as f64 / (self.cells + 1) as f64;
+            let bump = 0.5 * RealScalar::sin(std::f64::consts::PI * x);
+            w[self.index(0, i)] = 1.0 + bump;
+            w[self.index(1, i)] = 3.0 - bump;
+        }
+        w
+    }
+
+    /// Reference: analytic ∂F_row/∂w_col from the partials above.
+    pub(crate) fn exact(&self, w: &[f64], row: usize, col: usize) -> f64 {
+        let ((s, i), (t, j)) = (self.split(row), self.split(col));
+        let (u, v, d) = (w[self.index(0, i)], w[self.index(1, i)], self.coupling());
+        match (s, t, i.abs_diff(j)) {
+            (0, 0, 0) => 2.0 * u * v - 4.0 - 2.0 * d,
+            (0, 1, 0) => u * u,
+            (1, 0, 0) => 3.0 - 2.0 * u * v,
+            (1, 1, 0) => -u * u - 2.0 * d,
+            (s, t, 1) if s == t => d,
+            _ => 0.0,
+        }
+    }
+
+    /// Nonzeros: row (s, i) depends on u_i, v_i, and same-component neighbors.
+    pub(crate) fn pattern(&self) -> Result<StructuralPattern, SciOxideError> {
+        let (mut row_ptr, mut col_indices) = (vec![0], Vec::new());
+        for row in 0..self.unknowns() {
+            let (s, i) = self.split(row);
+            let mut cols = vec![self.index(0, i), self.index(1, i)];
+            cols.extend(i.checked_sub(1).map(|k| self.index(s, k)));
+            cols.extend((i + 1 < self.cells).then(|| self.index(s, i + 1)));
+            // StructuralPattern accepts ascending columns per row.
+            cols.sort_unstable();
+            col_indices.extend(cols);
+            row_ptr.push(col_indices.len());
+        }
+        StructuralPattern::new(self.unknowns(), self.unknowns(), row_ptr, col_indices)
+    }
+
+    /// Absolute errors of sparse entries in pattern-storage order against analytic values.
+    pub(crate) fn entry_errors(
+        &self,
+        w: &[f64],
+        pattern: &StructuralPattern,
+        values: &[f64],
+    ) -> Vec<f64> {
+        let view = pattern.view();
+        let (row_ptr, col_indices) = (view.row_ptr(), view.col_indices());
+        (0..self.unknowns())
+            .flat_map(|row| (row_ptr[row]..row_ptr[row + 1]).map(move |k| (row, k)))
+            .map(|(row, k)| (values[k] - self.exact(w, row, col_indices[k])).abs())
+            .collect()
+    }
+
+    /// Maximum dense error against analytic values, row-major at row·2N + col.
+    pub(crate) fn dense_error(&self, w: &[f64], values: &[f64]) -> f64 {
+        let n = self.unknowns();
+        (0..n * n)
+            .map(|k| (values[k] - self.exact(w, k / n, k % n)).abs())
+            .fold(0.0, f64::max)
+    }
+}
+```
+
+## Lower and upper color bounds
+
+Columns sharing a nonzero row must have different colors, so all nonzero columns in a row differ.
+Color count $p$ is therefore at least maximum row nonzeros $\rho_{\max}$.
+Here $\rho_{\max} = 4$; for example, columns $u_i$, $u_{i+1}$, $v_{i+1}$, and $u_{i+2}$ sharing row $F_{u,i+1}$ need distinct colors.
+
+Bandwidth gives an upper bound.
+If $J_{ij} \ne 0$ only when $\lvert i - j \rvert \le \beta$, columns sharing a nonzero row differ in index by at most $2\beta$.
+Coloring column $j$ with $j \bmod (2\beta + 1)$ is therefore conflict-free, giving $p \le 2\beta + 1$ ([Orderings and coloring](../../../scioxide-sparse/algorithms/orderings-and-coloring/#color-counts-for-banded-matrices)).
+Fully populated bands attain this minimum color count; zeros within bands may allow fewer colors.
+
+Unknown ordering changes bandwidth and greedy coloring.
+
+- **Interleaved** $(u_1, v_1, u_2, v_2, \dots)$: indices of $u_i$ and $u_{i+1}$ differ by 2, giving bandwidth $\beta = 2$ and five-color upper bound.
+- **By component** $(u_1, \dots, u_N, v_1, \dots, v_N)$: indices of $u_i$ and $v_i$ differ by $N$, giving $\beta = N$ and an unhelpful bandwidth bound.
+
+Simultaneous row and column permutation preserves the column-intersection graph and $\rho_{\max}$.
+But scioxide-sparse `derivative_coloring` greedily visits columns in ascending index and uses the smallest available color, so reordered visits may change counts.
+Component ordering visits all $u$ columns first.
+$u_j$ conflicts with $u_{j \pm 1}$ and $u_{j \pm 2}$, so $u$ columns cycle through three colors.
+Nonendpoint $v_j$ conflicts with all three colors of $u_{j-1}$, $u_j$, $u_{j+1}$; $v$ columns also conflict within index distance 2, needing three new colors, six total.
+Endpoint $v_1$ and $v_N$ have only two neighboring $u$, allowing the remaining $u$ color.
+
+## Structure and coloring
+
+The next cell constructs structure for selected $N$ and ordering, coloring columns with `derivative_coloring`.
+The table shows structural lower bound $\rho_{\max}$, bandwidth $\beta$, upper bound $\min(2\beta + 1, 2N)$, and actual colors.
+The figure colors nonzero positions by column color, with columns (perturbed unknowns) horizontal and rows (equations) vertical.
+No repeated color per row shows same-color columns never share a row.
+Pass $N$, ordering, and column colors to the next cell.
+
+```rust
+//| id: differentiate-brusselator-pattern
+//| ref: differentiate-brusselator-pattern
+//| title: "Brusselator Jacobian structure and column coloring"
+//| run: reactive
+//| uses: [differentiate-brusselator-model]
+//| crates: [scioxide-core, scioxide-sparse]
+//| exports: [cells, interleaved, colors]
+//| inputs:
+//|   cells: {"type":"range","label":"Interior grid points N","description":"Unknown count is 2N.","min":5,"max":40,"step":5,"value":20}
+//|   layout: {"type":"select","label":"Unknown ordering","description":"Changes column visitation and greedy color counts.","options":["Interleaved (u₁, v₁, u₂, …)","By component (u₁, …, u_N, v₁, …)"],"value":"Interleaved (u₁, v₁, u₂, …)"}
+//| cases:
+//|   - {"id":"componentwise","label":"Component ordering","description":"Lower bound remains 4, but bandwidth grows to N and greedy coloring uses 6.","inputs":{"layout":"By component (u₁, …, u_N, v₁, …)"}}
+//|   - {"id":"fine-grid","label":"N = 40","description":"Even with 80 unknowns, colors remain 4.","inputs":{"cells":40}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"structure","path":"/rows/0/1","equals":156}
+//|       - {"artifact":"structure","path":"/rows/0/2","equals":4}
+//|       - {"artifact":"structure","path":"/rows/0/3","equals":2}
+//|       - {"artifact":"structure","path":"/rows/0/4","equals":5}
+//|       - {"artifact":"structure","path":"/rows/0/5","equals":4}
+//|   - case: componentwise
+//|     expect:
+//|       - {"artifact":"structure","path":"/rows/0/2","equals":4}
+//|       - {"artifact":"structure","path":"/rows/0/3","equals":20}
+//|       - {"artifact":"structure","path":"/rows/0/5","equals":6}
+//|   - case: fine-grid
+//|     expect:
+//|       - {"artifact":"structure","path":"/rows/0/1","equals":316}
+//|       - {"artifact":"structure","path":"/rows/0/5","equals":4}
+use scioxide_sparse::derivative_coloring;
+
+let model = Brusselator {
+    cells: cells as usize,
+    alpha: 0.02,
+    interleaved: layout.starts_with("Interleaved"),
+};
+let n = model.unknowns();
+let pattern = model.pattern().map_err(|e| e.to_string())?;
+let schedule = derivative_coloring(pattern.view()).map_err(|e| e.to_string())?;
+let view = pattern.view();
+let (row_ptr, col_indices) = (view.row_ptr(), view.col_indices());
+// Lower bound ρ_max (maximum row nonzeros) and bandwidth β = max |row − col|.
+let lower = row_ptr.windows(2).map(|r| r[1] - r[0]).max().unwrap_or(0);
+let beta = (0..n)
+    .flat_map(|row| {
+        col_indices[row_ptr[row]..row_ptr[row + 1]]
+            .iter()
+            .map(move |&col| row.abs_diff(col))
+    })
+    .max()
+    .unwrap_or(0);
+let structure = vec![(
+    n,
+    col_indices.len(),
+    lower,
+    beta,
+    (2 * beta + 1).min(n),
+    schedule.color_count(),
+)];
+let columns = serde_json::json!([
+    { "key": "0", "label": "Unknowns 2N", "type": "integer" },
+    { "key": "1", "label": "Nonzeros", "type": "integer" },
+    { "key": "2", "label": "Lower bound ρ_max", "type": "integer" },
+    { "key": "3", "label": "Bandwidth β", "type": "integer" },
+    { "key": "4", "label": "Upper bound min(2β + 1, 2N)", "type": "integer" },
+    { "key": "5", "label": "Colors", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    structure,
+    metadata = serde_json::json!({ "id": "structure" })
+);
+// Color nonzero (column, row) by column color; reverse vertical ordering to place the first row at the top.
+let names: Vec<String> = (0..n)
+    .map(|k| {
+        let (s, i) = model.split(k);
+        format!("{}{}", ["u", "v"][s], i + 1)
+    })
+    .collect();
+let mut data = Vec::new();
+for row in 0..n {
+    for &col in &col_indices[row_ptr[row]..row_ptr[row + 1]] {
+        data.push(serde_json::json!([
+            col,
+            n - 1 - row,
+            schedule.colors()[col]
+        ]));
+    }
+}
+let rows_top_down: Vec<&String> = names.iter().rev().collect();
+emit_chart!(
+    serde_json::json!({
+        "kind": "heatmap",
+        "data": data,
+        "xCategories": names,
+        "yCategories": rows_top_down,
+        "xLabel": "Column, perturbed unknown",
+        "yLabel": "Row, equation",
+        "colorMin": 0.0,
+        "colorMax": 5.0,
+        "tooltip": true,
+        "style": { "animation": false }
+    }),
+    metadata = serde_json::json!({
+        "id": "coloring",
+        "title": "Jacobian nonzeros and column colors 0–5"
+    })
+);
+export!(cells, model.cells);
+export!(interleaved, model.interleaved);
+export!(colors, schedule.colors().to_vec());
+```
+
+At default $N = 20$ with interleaving, there are 40 unknowns, 156 nonzeros, bandwidth $\beta = 2$, and upper bound 5.
+Greedy coloring uses the lower-bound four colors.
+The figure cycles $u$ columns through 0, 2, 1, 3 and $v$ columns through 1, 3, 0, 2 with period 4.
+Component ordering leaves lower bound 4 but increases bandwidth to $\beta = 20$ and uses six colors as explained above.
+The figure shows $v_1$ and $v_{20}$ using color 2 of $u$.
+At $N = 40$, unknowns grow to 80 and nonzeros to 316, but colors remain 4.
+
+## Colored Jacobians and analytic values
+
+The next cell receives $N$, ordering, and colors, reconstructs coloring with `ColoringSchedule::new`, then computes Jacobians with `ColoredJacobianPlan` and default `AdaptiveDifference`.
+`ColoringSchedule::new` checks same-color row conflicts, independently confirming that received colors fit the structure.
+The table shows calls, termination, maximum analytic error, maximum estimate, and entries where actual error exceeds estimate.
+Analytic comparison is independent of the Plan, using hand-derived expressions in `exact`.
+This cell follows producer inputs and has none of its own.
+
+```rust
+//| id: differentiate-brusselator-coloring
+//| ref: differentiate-brusselator-coloring
+//| title: "Brusselator colored Jacobians versus analytic values"
+//| run: reactive
+//| uses: [differentiate-brusselator-model]
+//| crates: [scioxide-core, scioxide-differentiate]
+//| dependsOn:
+//|   coloring: differentiate-brusselator-pattern
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"accuracy","path":"/rows/0/0","equals":25}
+//|       - {"artifact":"accuracy","path":"/rows/0/1","equals":"Converged"}
+//|       - {"artifact":"accuracy","path":"/rows/0/2","range":{"max":1e-12}}
+//|       - {"artifact":"accuracy","path":"/rows/0/3","range":{"max":1e-12}}
+//|       - {"artifact":"accuracy","path":"/rows/0/4","equals":0}
+use scioxide_core::{ColoringKind, ColoringSchedule};
+use scioxide_differentiate::{AdaptiveDifference, ColoredJacobianPlan};
+
+let cells = coloring["cells"].as_u64().ok_or("No grid-point count")? as usize;
+let interleaved = coloring["interleaved"].as_bool().ok_or("No ordering")?;
+let colors: Vec<usize> =
+    serde_json::from_value(coloring["colors"].clone()).map_err(|e| e.to_string())?;
+let model = Brusselator {
+    cells,
+    alpha: 0.02,
+    interleaved,
+};
+let w = model.state();
+let pattern = model.pattern().map_err(|e| e.to_string())?;
+let schedule = ColoringSchedule::new(pattern.clone(), ColoringKind::DerivativeColumns, colors)
+    .map_err(|e| e.to_string())?;
+let plan = ColoredJacobianPlan::new(&schedule, AdaptiveDifference::default())
+    .map_err(|e| e.to_string())?;
+let result = plan
+    .evaluate(|x: &[f64], y: &mut [f64]| model.rhs(x, y), &w, None)
+    .map_err(|e| e.to_string())?;
+let values = result.values().ok_or("Sparse Jacobian not published")?;
+let estimates = result.errors().ok_or("Error estimate not published")?;
+// Independent check: compare CSR-order values and estimates entrywise with analytic values.
+let errors = model.entry_errors(&w, &pattern, values);
+let worst = errors.iter().fold(0.0_f64, |a, &b| a.max(b));
+let largest_estimate = estimates.iter().fold(0.0_f64, |a, &b| a.max(b));
+let exceeded = errors.iter().zip(estimates).filter(|(e, s)| e > s).count();
+let report = result.report();
+let accuracy = vec![(
+    report.evaluations(),
+    report.termination().to_string(),
+    worst,
+    largest_estimate,
+    exceeded,
+)];
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Evaluations [count]", "type": "integer" },
+    { "key": "1", "label": "Termination reason" },
+    { "key": "2", "label": "Maximum analytic error [-]", "type": "number", "format": sci2 },
+    { "key": "3", "label": "Maximum estimated error [-]", "type": "number", "format": sci2 },
+    { "key": "4", "label": "Entries with error > estimate", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    accuracy,
+    metadata = serde_json::json!({ "id": "accuracy" })
+);
+```
+
+Default four colors use 25 calls and termination `Converged`.
+Maximum error $7.1 \times 10^{-15}$ is below maximum estimate $6.6 \times 10^{-14}$, and no entry exceeds its estimate.
+Selecting component ordering gives six colors and 37 calls, without changed errors.
+At $N = 40$, calls remain 25, maximum error is $2.8 \times 10^{-14}$, and maximum estimate $2.3 \times 10^{-13}$.
+
+## Evaluation-count breakdown
+
+`ColoredJacobianPlan` evaluates the base value $\mathbf{F}(\mathbf{w})$ once, then evaluates points with all columns of each color perturbed together at every level.
+Each level has two points; color $c$ with $L_c$ levels gives calls $1 + 2 \sum_c L_c$.
+Default level limit $L = 16$ bounds calls by $1 + 32p$.
+Bounds and one-sided columns still give two points per level and the same bound ([Sparse-Jacobian compression by coloring](../../algorithms/sparse-coloring/)).
+
+A column converges after two consecutive levels at which both the current estimate's error estimate and the best estimate's error estimate are below $\sqrt{\varepsilon}(1 + \lvert J_{ij} \rvert)$ ([Step and stopping rules](oxref:differentiate-stopping-rules)).
+Estimates start at level 2, requiring at least 3 levels.
+This system converges in that minimum three.
+Same-color columns share no rows, so each row changes with only one unknown.
+Each component of $\mathbf{F}$ is at most quadratic in any one unknown ($u_i^2 v_i$ quadratic in $u_i$, linear in $v_i$), giving zero central truncation and immediate table agreement.
+Calls are therefore $1 + 2 \cdot 3 \cdot p$: 25 with four colors, 37 with six.
+
+Dense adaptive `AdaptiveDifference::jacobian` perturbs columns separately, requiring $1 + 6 \cdot 2N = 12N + 1$ calls at the same three levels.
+Dense fixed central `FiniteDifference::jacobian` needs only $2 \cdot 2N + 1 = 4N + 1$ calls but provides no error estimates.
+
+## Grid points and evaluation counts
+
+The next cell varies $N$ from 5 to 80, comparing evaluation counts and maximum errors against the analytic Jacobian for coloring, dense adaptive differences, and dense fixed central differences.
+Unknowns are interleaved; diffusion $\alpha$ is an input.
+The chart plots counts logarithmically.
+
+```rust
+//| id: differentiate-brusselator-scaling
+//| ref: differentiate-brusselator-scaling
+//| title: "Colored and dense counts and errors versus grid size"
+//| run: reactive
+//| uses: [differentiate-brusselator-model]
+//| crates: [scioxide-core, scioxide-differentiate, scioxide-sparse]
+//| inputs:
+//|   alpha: {"type":"select","label":"Diffusion α","description":"Change coupling D = α(N + 1)².","options":["0.002","0.02","0.2"],"value":"0.02"}
+//| cases:
+//|   - {"id":"strong-diffusion","label":"α = 0.2","description":"Tenfold D leaves counts unchanged; colored errors grow with D but remain rounding-sized relative to diagonal 2D.","inputs":{"alpha":"0.2"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"counts","path":"/rows/0/3","equals":25}
+//|       - {"artifact":"counts","path":"/rows/0/5","equals":21}
+//|       - {"artifact":"counts","path":"/rows/4/1","approx":{"value":131.22,"rtol":1e-12}}
+//|       - {"artifact":"counts","path":"/rows/4/2","equals":4}
+//|       - {"artifact":"counts","path":"/rows/4/3","equals":25}
+//|       - {"artifact":"counts","path":"/rows/4/4","equals":961}
+//|       - {"artifact":"counts","path":"/rows/4/5","equals":321}
+//|       - {"artifact":"counts","path":"/rows/4/6","range":{"max":1e-11}}
+//|       - {"artifact":"counts","path":"/rows/4/7","range":{"max":1e-11}}
+//|       - {"artifact":"counts","path":"/rows/4/8","range":{"min":1e-11,"max":1e-9}}
+//|   - case: strong-diffusion
+//|     expect:
+//|       - {"artifact":"counts","path":"/rows/4/1","approx":{"value":1312.2,"rtol":1e-12}}
+//|       - {"artifact":"counts","path":"/rows/4/3","equals":25}
+//|       - {"artifact":"counts","path":"/rows/4/4","equals":961}
+//|       - {"artifact":"counts","path":"/rows/4/6","range":{"max":1e-11}}
+//|       - {"artifact":"counts","path":"/rows/4/8","range":{"min":1e-11,"max":1e-9}}
+use scioxide_differentiate::{AdaptiveDifference, ColoredJacobianPlan, FiniteDifference};
+use scioxide_sparse::derivative_coloring;
+
+let alpha: f64 = alpha.parse().map_err(|_| "Cannot read diffusion")?;
+let (mut rows, mut points) = (Vec::new(), [Vec::new(), Vec::new(), Vec::new()]);
+for cells in [5_usize, 10, 20, 40, 80] {
+    let model = Brusselator {
+        cells,
+        alpha,
+        interleaved: true,
+    };
+    let (n, w) = (model.unknowns(), model.state());
+    let f = |x: &[f64], y: &mut [f64]| model.rhs(x, y);
+    let pattern = model.pattern().map_err(|e| e.to_string())?;
+    let schedule = derivative_coloring(pattern.view()).map_err(|e| e.to_string())?;
+    let adaptive = AdaptiveDifference::default();
+    let colored = ColoredJacobianPlan::new(&schedule, adaptive.clone())
+        .and_then(|plan| plan.evaluate(f, &w, None))
+        .map_err(|e| e.to_string())?;
+    let dense = adaptive
+        .jacobian(f, &w, n, None)
+        .map_err(|e| e.to_string())?;
+    let central = FiniteDifference::default()
+        .jacobian(f, &w, n, None, None)
+        .map_err(|e| e.to_string())?;
+    // Independent check: maximum analytic errors; sparse values are CSR-order and dense row-major.
+    let sparse = colored.values().ok_or("Sparse Jacobian not published")?;
+    let sparse_error = model
+        .entry_errors(&w, &pattern, sparse)
+        .into_iter()
+        .fold(0.0_f64, f64::max);
+    let dense_values = dense.values().ok_or("Dense Jacobian not published")?;
+    let central_values = central
+        .values()
+        .ok_or("Central Jacobian not published")?;
+    let counts = [
+        colored.report().evaluations(),
+        dense.report().evaluations(),
+        central.report().evaluations(),
+    ];
+    for (series, count) in points.iter_mut().zip(counts) {
+        series.push([cells as f64, count as f64]);
+    }
+    rows.push((
+        cells,
+        model.coupling(),
+        schedule.color_count(),
+        counts[0],
+        counts[1],
+        counts[2],
+        sparse_error,
+        model.dense_error(&w, dense_values),
+        model.dense_error(&w, central_values),
+    ));
+}
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let sig3 = serde_json::json!({ "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "N", "type": "integer" },
+    { "key": "1", "label": "Coupling D [-]", "type": "number", "format": sig3 },
+    { "key": "2", "label": "Colors", "type": "integer" },
+    { "key": "3", "label": "Colored [count]", "type": "integer" },
+    { "key": "4", "label": "Dense adaptive [count]", "type": "integer" },
+    { "key": "5", "label": "Dense central [count]", "type": "integer" },
+    { "key": "6", "label": "Colored error [-]", "type": "number", "format": sci2 },
+    { "key": "7", "label": "Dense adaptive error [-]", "type": "number", "format": sci2 },
+    { "key": "8", "label": "Dense central error [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "counts" })
+);
+let names = ["Colored Jacobian", "Dense adaptive differences", "Dense central"];
+let series: Vec<_> = names
+    .iter()
+    .zip(points)
+    .map(|(name, points)| {
+        serde_json::json!({ "name": name, "points": points, "style": { "showSymbol": true } })
+    })
+    .collect();
+emit_chart!(
+    serde_json::json!({
+        "kind": "line",
+        "series": series,
+        "xLabel": "Interior grid points N [-]",
+        "yLabel": "Evaluations [count]",
+        "xType": "log",
+        "yType": "log",
+        "dataZoom": true,
+        "tooltip": true
+    }),
+    metadata = serde_json::json!({ "id": "evaluations" })
+);
+```
+
+Every $N$ uses four colors and constant 25 calls.
+Evaluation counts for dense adaptive ($12N + 1$) and central ($4N + 1$) differences grow with $N$, giving straight lines of slope 1 on the log–log chart.
+At $N = 5$ there are only 10 unknowns, making colored 25 calls exceed dense central 21.
+Coloring saves calls when $1 + 6p < 4N + 1$, or $N > 6$ for four colors.
+One call costs proportionally to $N$, making one Jacobian cost $O(N)$ colored or $O(N^2)$ dense.
+
+Colored and dense adaptive errors are identical, $1.7 \times 10^{-13}$ even at $N = 80$.
+Both extrapolate identical columns with identical steps.
+Dense central errors $5 \times 10^{-11}$–$9 \times 10^{-11}$ exceed them by over two orders.
+With zero truncation here, both errors arise from rounding.
+Fixed central step $h = \varepsilon^{1/3} \max(1, \lvert w_j \rvert)$ divides rounded function errors by $h$, leaving order $\varepsilon^{2/3} \approx 3.7 \times 10^{-11}$ ([Rounding, noise, and optimal step size](oxref:differentiate-optimal-step)).
+Adaptive methods start at large $0.5 \max(1, \lvert w_j \rvert)$; quadratics have no truncation even there, so only rounding decreases.
+
+At $\alpha = 0.2$, $D$ grows tenfold without changing any count.
+Colored errors rise to $1.8 \times 10^{-12}$ at $N = 80$, but relative to diagonal $2D \approx 2.6 \times 10^{3}$ remain about $10^{-15}$, at rounding scale.
+Dense central errors are nearly independent of $D$.
+
+## Summary
+
+Brusselator Jacobians have at most four nonzeros per row, giving lower color bound $\rho_{\max} = 4$; interleaved bandwidth $\beta = 2$ also gives upper bound 5.
+`derivative_coloring` attains four colors interleaved and six by component; small-bandwidth ordering is therefore useful with greedy coloring.
+`ColoredJacobianPlan` takes $1 + 2\sum_c L_c$ calls, here constant 25 independent of grid size, matching analytic Jacobians within rounding.
+With few unknowns dense central calls are fewer; compare $1 + 6p$ and $4N + 1$ to decide on coloring here.
+For values without estimates, one-shot `sparse_jacobian` performs the same computation and turns termination other than `Converged` into errors.
+
+## Further reading
+
+- [Sparse-Jacobian compression by coloring](../../algorithms/sparse-coloring/): examine bounded column nodes and contamination from omitted nonzeros.
+- [Orderings and coloring](../../../scioxide-sparse/algorithms/orderings-and-coloring/): examine greedy coloring and fully populated band color counts in scioxide-sparse.
+- [Reaction-rate sensitivity under nonnegative concentration constraints](../bounded-concentration/): examine zero-concentration boundary nodes in another chemical example.

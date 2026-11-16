@@ -1,0 +1,670 @@
+---
+title: "Global polynomial, Hermite, and Neville interpolation"
+description: "Construct global interpolants and node families, add nodes with Newton differences, use Hermite osculatory interpolation, estimate errors with Neville tables, and interpolate diagonal Bulirsch–Stoer rationals."
+sidebar:
+  order: 305
+references:
+  interp-barycentric-construction: "constructing-barycentric-interpolants"
+  interp-close-nodes-weights: "clustered-nodes-and-barycentric-weights"
+  interp-global-node-choice: "global-interpolation-and-node-selection"
+  interp-hermite: "hermite-osculatory-interpolation"
+  interp-neville: "nevilles-recursive-algorithm"
+  interp-neville-error-and-rational-extrapolation: "neville-estimates-and-rational-extrapolation"
+  interp-newton-divided-differences: "newton-divided-differences-and-sequential-nodes"
+---
+
+Global interpolation passes one function through every sample.
+The degree-at-most-$n$ polynomial through $n+1$ distinct nodes is unique, but representation changes preparation, update, and evaluation complexity and rounding.
+This page covers construction and selection of scioxide-interp global interpolants.
+[Polynomial interpolation, divided differences, and Chebyshev nodes](../../../scioxide-poly/algorithms/interpolation-and-chebyshev/) derives barycentric formulas, proves remainder formulas, and discusses Lebesgue constants and Runge behavior; their results are used here.
+
+## Global interpolation and node selection
+
+From nodes $x_0 < x_1 < \dots < x_n$ and values $y_i = f(x_i)$, construct degree-at-most-$n$ polynomial $p_n$ satisfying $p_n(x_i) = y_i$.
+For $f$ continuously differentiable $n+1$ times, the error is the following remainder.
+
+$$
+f(x) - p_n(x) = \frac{f^{(n+1)}(\xi)}{(n+1)!}\,\omega(x),
+\qquad \omega(x) = \prod_{j=0}^{n}(x - x_j)
+$$
+
+
+$\xi$ lies inside the smallest interval containing $x$ and all nodes and depends on $x$.
+Error magnitude is the product of high derivatives of $f$ and node polynomial $\omega$ determined solely by geometry.
+
+Perturbing samples by at most $\eta$ changes interpolants by at most $\Lambda_n \eta$ over the interval.
+$\Lambda_n$ is the Lebesgue constant, measuring sample-error amplification.
+It grows exponentially in $n$ at uniform nodes and logarithmically at Chebyshev nodes: $\Lambda_n$.
+Choose node families before increasing degree.
+
+### Constructing barycentric interpolants
+
+`BarycentricInterpolator::new(x, y)` constructs an interpolant using the second barycentric formula:
+
+$$
+p_n(x) = \frac{\sum_{j=0}^{n} \dfrac{w_j}{x - x_j}\, y_j}{\sum_{j=0}^{n} \dfrac{w_j}{x - x_j}},
+\qquad w_j = \frac{1}{\prod_{k \ne j}(x_j - x_k)}
+$$
+
+
+Nodes `x` must increase strictly; callers sort them.
+To reject near-duplicates too, pass separation with `SampleOptions` to `with_options(x, y, options)`.
+General weights $w_j$ take $O(n^2)$ to compute and are stored after division by a common factor.
+That factor cancels between numerator and denominator, preserving values while avoiding overflow.
+
+For known families, constructors generate closed-form nodes and weights in $O(n)$ from values and endpoints `lower` and `upper`.
+
+| Constructor | Nodes, at least two | Endpoints | Weights up to common factor |
+|---|---|---|---|
+| `from_equispaced(values, lower, upper)` | Uniform | Included | $(-1)^j \binom{n}{j}$ |
+| `from_chebyshev_roots(values, lower, upper)` | Zeros of Chebyshev $T_{n+1}$ | Excluded | $(-1)^j \sin\frac{(2j+1)\pi}{2n+2}$ |
+| `from_chebyshev_lobatto(values, lower, upper)` | Extrema of $T_n$, Chebyshev–Lobatto nodes | Included | $(-1)^j \delta_j$, with $\delta_j = 1/2$ at ends and 1 inside |
+
+These weights correspond to $\cos$ ordering on $[-1, 1]$ (Berrut–Trefethen 2004); ascending reordering changes only a common sign.
+Affine mapping to $[\mathrm{lower}, \mathrm{upper}]$ likewise multiplies weights by a common factor without changing values.
+
+Generated nodes ascend; arrange values accordingly.
+A single value uses the interval midpoint for every family.
+Empty values, `lower > upper`, or degenerate one-point intervals with at least two nodes, preventing strict increase, give `InvalidInput`.
+Nonfinite ends give `NonFinite`; unrepresentable generated nodes or normalized weights, including underflow to zero, give `NumericalInstability`.
+Uniform constructors accelerate weights but do not cure high-degree uniform-node ill-conditioning.
+
+Evaluation domains span minimum to maximum nodes.
+Chebyshev-zero families exclude endpoints; evaluation there requires explicit extrapolation such as `MethodDefined`.
+In `SampleOptions`, separation `NodeSeparation` defaults to `Exact` rejecting equal adjacent nodes; `Tolerant(tol)` also rejects gaps at most $\tau_{\mathrm{abs}} + \tau_{\mathrm{rel}}\max(|x_i|,|x_{i+1}|)$.
+Queries matching nodes under the same separation return their exact samples.
+Near-node rejection avoids ill-conditioned inputs but guarantees no accuracy for accepted inputs.
+
+Supply same-shaped `AffineValue` values: real, complex, arrays, or vectors.
+Components are stored per node and evaluated by identical real kernels, matching individual scalar interpolation.
+One point costs $O(nd)$ for $d$ components without allocation.
+Evaluation references the nearest node's term and first subtracts its value, retaining accuracy nearby.
+Compensated sums are used; term overflow or underflow triggers recomputation of the full sum with extended exponent range.
+`evaluate_with_derivative` returns values and first derivatives in one scan; `evaluate_with_derivative_into` writes the same to caller outputs/workspace.
+`Differentiable::gradient` and `derivative_at` return derivatives alone.
+Outside-domain `Clamp` gives zero derivative on that axis.
+Global polynomials do not implement per-call integral `Integrable`.
+Prepare a primitive once with `prepare_antiderivative()`, costing $O(n^2 d)$ work and $O(nd)$ storage, then repeat queries in $O(nd)$.
+
+## Newton divided differences and sequential nodes
+
+Newton form suits samples added as measurements or simulations proceed.
+
+$$
+p_n(x) = c_0 + c_1 (x - x_0) + c_2 (x - x_0)(x - x_1) + \dots + c_n \prod_{j=0}^{n-1} (x - x_j)
+$$
+
+Coefficients $c_k$ equal divided differences $f[x_0, \dots, x_k]$ defined by this recurrence.
+
+$$
+f[x_i] = y_i, \quad f[x_i, \dots, x_{i+k}] = \frac{f[x_{i+1}, \dots, x_{i+k}] - f[x_i, \dots, x_{i+k-1}]}{x_{i+k} - x_i}
+$$
+
+The mean-value property $f[x_0,\dots,x_k] = f^{(k)}(\eta)/k!$, with $\eta$ in the smallest interval containing all the nodes, lets coefficient scales indicate high derivative magnitudes.
+`NewtonInterpolator::new(x, y)` constructs a divided-difference table from strictly increasing nodes in $O(n^2 d)$; `coefficients()` returns divided differences with components grouped by node.
+Horner evaluation of nested products costs $O(nd)$, omitting derivatives for value-only queries.
+Intermediate overflow or underflow switches to extended exponents.
+
+Appending node $x_{n+1}$ leaves existing $c_0, \dots, c_n$ unchanged.
+Obtain new $c_{n+1} = f[x_0, \dots, x_{n+1}]$ from initial $v = y_{n+1}$ by repeating $v \leftarrow (v - c_k)/(x_{n+1} - x_k)$ in order $k = 0, \dots, n$.
+`NewtonInterpolator::insert_point(x, y)` returns a new right-appended model without changing the original.
+New nodes must exceed and be separated from the last under construction separation `NodeSeparation` in `SampleOptions`.
+Both computing coefficients and copying existing state cost $O(nd)$ work and storage.
+The supplied value is consumed as a new shape template, requiring no `Clone` on value types.
+Every failure, including allocation, returns `Result`.
+Left or interior insertion is not provided; reconstruct with `new`.
+
+## Hermite osculatory interpolation
+
+Some samples include both values $y_i = f(x_i)$ and first derivatives $y_i' = f'(x_i)$, such as orbital positions and velocities.
+Hermite interpolation imposes at all $n+1$ nodes
+
+$$
+p(x_i) = y_i, \quad p'(x_i) = y_i' \quad (i = 0, \dots, n)
+$$
+
+these $2n + 2$ conditions on a polynomial through degree $2n + 1$.
+Conditions and coefficients have equal counts.
+A degree-at-most-$2n+1$ polynomial with homogeneous $p(x_i) = p'(x_i) = 0$ has $n+1$ double zeros, $2n+2$ in total, so it must vanish; existence and uniqueness follow.
+
+Apply the divided-difference recurrence to repeated nodes $z = (x_0, x_0, x_1, x_1, \dots)$; first-order divided differences of equal nodes have form $0/0$.
+Its limit is $f[x_i, x_i] = \lim_{h \to 0} f[x_i, x_i + h] = f'(x_i)$; insert derivative sample $y_i'$ and fill the rest normally.
+These are confluent divided differences.
+For $f$ continuously differentiable $2n+2$ times, the error follows.
+
+$$
+f(x) - p(x) = \frac{f^{(2n+2)}(\xi)}{(2n+2)!} \prod_{i=0}^{n} (x - x_i)^2
+$$
+
+The squared node polynomial makes both error and its slope vanish at nodes.
+
+[`HermiteInterpolator::new(x, y, dy)`](https://docs.rs/scioxide-interp/0.1.0/scioxide_interp/struct.HermiteInterpolator.html#method.new) constructs these doubled-node divided differences in $O(n^2 d)$ and evaluates the Newton form in $O(nd)$.
+`dy` matches `y`'s shape; supply coordinate derivatives $dy/dx$ in physical units.
+For temperature and heat flux, convert Fourier $q = -k\,dT/dx$ to $dT/dx = -q/k$ first.
+Only values and first derivatives are accepted, not higher-derivative samples.
+Implements `Differentiable`; prepare integrals through `prepare_antiderivative()`.
+
+### Derivative samples and added points
+
+The next cell interpolates $f(x) = \sin x$ at $n$ uniform nodes on $[0, \pi]$, comparing three interpolants.
+Here node count $n$ corresponds to $n+1$ above.
+Hermite therefore satisfies $2n$ conditions at degree at most $2n-1$.
+First is value-only $n$-point interpolation, built from one-point `NewtonInterpolator` by repeated right-appending `insert_point`.
+Second is `HermiteInterpolator` using values and derivatives $\cos x_i$.
+Third supplies the same $2n$ conditions with values alone at $2n$ uniform nodes through `from_equispaced`.
+Input $n$ controls nodes; outputs give maximum errors over 401 points on $[0, \pi]$ and remainder bounds, insertion checks, and error curves.
+All derivatives of $\sin x$ have magnitude at most 1, bounding each error by maximum node-polynomial magnitude divided by a factorial.
+Check divided differences of the model extended by `insert_point` against those constructed all at once by `new`, and compare Hermite nodal derivatives with $\cos x_i$.
+Compute samples and references with `RealScalar::sin` and `RealScalar::cos`.
+
+```rust
+//| id: interp-hermite-newton
+//| ref: interp-hermite-newton
+//| title: "Check Hermite derivative samples and added nodes"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-interp]
+//| inputs:
+//|   node_count: {"type":"range","label":"Nodes n","description":"Uniform nodes on [0, π]; Hermite uses 2n conditions.","min":2,"max":7,"step":1,"value":3}
+//| cases:
+//|   - {"id":"two-nodes","label":"n = 2","description":"Cubic Hermite uses only endpoint values and slopes.","inputs":{"node_count":2}}
+//|   - {"id":"seven-nodes","label":"n = 7","description":"Added nodes rapidly reduce Hermite and 2n-node errors.","inputs":{"node_count":7}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"errors","path":"/rows/0/2","approx":{"value":5.600950026045326e-2,"rtol":1e-9}}
+//|       - {"artifact":"errors","path":"/rows/1/2","approx":{"value":2.787065555906243e-3,"rtol":1e-9}}
+//|       - {"artifact":"errors","path":"/rows/1/3","approx":{"value":3.090732589464992e-3,"rtol":1e-9}}
+//|       - {"artifact":"errors","path":"/rows/2/2","approx":{"value":1.3129573681472662e-3,"rtol":1e-9}}
+//|       - {"artifact":"checks","path":"/rows/0/0","range":{"max":1e-15}}
+//|       - {"artifact":"checks","path":"/rows/0/1","range":{"max":1e-15}}
+//|   - case: two-nodes
+//|     expect:
+//|       - {"artifact":"errors","path":"/rows/0/2","approx":{"value":1.0,"atol":1e-12}}
+//|       - {"artifact":"errors","path":"/rows/1/2","approx":{"value":0.21460183660255172,"rtol":1e-9}}
+//|       - {"artifact":"errors","path":"/rows/1/1","equals":4}
+//|   - case: seven-nodes
+//|     expect:
+//|       - {"artifact":"errors","path":"/rows/1/2","approx":{"value":1.1774470287662098e-11,"rtol":1e-4}}
+//|       - {"artifact":"errors","path":"/rows/2/2","approx":{"value":1.705045826749796e-11,"rtol":1e-4}}
+//|       - {"artifact":"checks","path":"/rows/0/0","range":{"max":1e-15}}
+use scioxide_core::RealScalar;
+use scioxide_interp::{
+    BarycentricInterpolator, HermiteInterpolator, NewtonInterpolator, Univariate,
+};
+use std::f64::consts::PI;
+
+let n = node_count as usize;
+let grid = |count: usize| -> Vec<f64> {
+    (0..count)
+        .map(|i| PI * i as f64 / (count - 1) as f64)
+        .collect()
+};
+let x = grid(n);
+let y: Vec<f64> = x.iter().map(|&v| RealScalar::sin(v)).collect();
+let dy: Vec<f64> = x.iter().map(|&v| RealScalar::cos(v)).collect();
+// 1. Build n-node values from a one-node model, appending rightward
+let mut grown = NewtonInterpolator::new(vec![x[0]], vec![y[0]]).map_err(|e| e.to_string())?;
+for i in 1..n {
+    grown = grown.insert_point(x[i], y[i]).map_err(|e| e.to_string())?;
+}
+// 2. Degree-2n − 1 Hermite satisfying 2n value/derivative conditions
+let hermite =
+    HermiteInterpolator::new(x.clone(), y.clone(), dy.clone()).map_err(|e| e.to_string())?;
+// 3. Uniform 2n-value interpolation supplying the same number of conditions
+let wide: Vec<f64> = grid(2 * n).iter().map(|&v| RealScalar::sin(v)).collect();
+let lagrange =
+    BarycentricInterpolator::from_equispaced(wide, 0.0, PI).map_err(|e| e.to_string())?;
+
+// Independent check: node polynomial ω and bound max|ω|/k! from |f^(k)| ≤ 1
+let omega = |nodes: &[f64], t: f64| nodes.iter().map(|&v| t - v).product::<f64>();
+let factorial = |k: usize| (1..=k).map(|i| i as f64).product::<f64>();
+let wide_nodes = grid(2 * n);
+let mut maxima = [0.0_f64; 6];
+let mut curves = [Vec::new(), Vec::new(), Vec::new()];
+for i in 0..=400 {
+    let t = PI * i as f64 / 400.0;
+    let exact = RealScalar::sin(t);
+    let errors = [
+        (grown.value_at(t).map_err(|e| e.to_string())? - exact).abs(),
+        (hermite.value_at(t).map_err(|e| e.to_string())? - exact).abs(),
+        (lagrange.value_at(t).map_err(|e| e.to_string())? - exact).abs(),
+    ];
+    let w = omega(&x, t).abs();
+    let products = [w, w * w, omega(&wide_nodes, t).abs()];
+    for k in 0..3 {
+        maxima[k] = maxima[k].max(errors[k]);
+        maxima[k + 3] = maxima[k + 3].max(products[k]);
+        // Nodal zero errors cannot be plotted logarithmically; plot positive values only
+        if errors[k] > 0.0 {
+            curves[k].push([t, errors[k]]);
+        }
+    }
+}
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Method" },
+    { "key": "1", "label": "Conditions", "type": "integer" },
+    { "key": "2", "label": "Maximum error [-]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "Remainder bound [-]", "type": "number", "format": sci3 }
+]);
+let rows = vec![
+    (
+        "n values, Newton",
+        n,
+        maxima[0],
+        maxima[3] / factorial(n),
+    ),
+    (
+        "n values and derivatives, Hermite",
+        2 * n,
+        maxima[1],
+        maxima[4] / factorial(2 * n),
+    ),
+    (
+        "2n values, uniform",
+        2 * n,
+        maxima[2],
+        maxima[5] / factorial(2 * n),
+    ),
+];
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "errors" })
+);
+
+// Independent check: insert_point versus new differences, Hermite slopes versus cos x_i
+let direct = NewtonInterpolator::new(x.clone(), y).map_err(|e| e.to_string())?;
+let mut coefficient_gap = 0.0_f64;
+for (a, b) in grown.coefficients().iter().zip(direct.coefficients()) {
+    coefficient_gap = coefficient_gap.max((a - b).abs());
+}
+let mut slope_gap = 0.0_f64;
+for (&node, &slope) in x.iter().zip(&dy) {
+    let derivative = hermite.derivative_at(node).map_err(|e| e.to_string())?;
+    slope_gap = slope_gap.max((derivative - slope).abs());
+}
+let check_columns = serde_json::json!([
+    { "key": "0", "label": "Maximum divided-difference mismatch [-]", "type": "number", "format": sci3 },
+    { "key": "1", "label": "Maximum nodal-slope mismatch [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    check_columns,
+    vec![(coefficient_gap, slope_gap)],
+    metadata = serde_json::json!({ "id": "checks" })
+);
+let [newton_curve, hermite_curve, lagrange_curve] = curves;
+emit_line_chart!(
+    &vec![
+        serde_json::json!({ "name": "n values only", "points": newton_curve }),
+        serde_json::json!({ "name": "Hermite, 2n conditions", "points": hermite_curve }),
+        serde_json::json!({ "name": "2n values only", "points": lagrange_curve }),
+    ],
+    options = &serde_json::json!({
+        "xLabel": "Position x [rad]",
+        "yLabel": "Absolute error against sin x [-]",
+        "yType": "log"
+    })
+);
+```
+
+At default $n = 3$ (nodes $0, \pi/2, \pi$), maximum errors are $5.60 \times 10^{-2}$ for three values, $2.79 \times 10^{-3}$ Hermite, and $1.31 \times 10^{-3}$ for six uniform values, all inside remainder bounds.
+Hermite bound $3.09 \times 10^{-3}$ is close to actual error.
+Hermite and six-point fits use equal conditions and comparable error scales but differently shaped curves.
+Hermite errors are small near nodes, $2.9 \times 10^{-4}$ at $x = \pi/2 - 0.2$, and larger between them, $2.7 \times 10^{-3}$ at $x = \pi/4$.
+Its node polynomial $\prod (x - x_i)^2$ decreases quadratically near nodes.
+Six uniform conditions spread over the interval, giving small $3.4 \times 10^{-4}$ at $x = \pi/4$ but maxima near endpoints.
+Divided differences of the model extended by `insert_point` match those from `new` within $5.6 \times 10^{-17}$; Hermite nodal slopes match $\cos x_i$ within $2.2 \times 10^{-16}$.
+
+At $n = 2$, cubic Hermite interpolation uses only endpoint values and slopes, with maximum error $0.215$ at $x = \pi/2$.
+This is one piece of piecewise cubic Hermite ([PCHIP, cubic splines, and Akima](../pchip-and-splines/)).
+Two-value interpolation is line $p = 0$ with error 1 at $x = \pi/2$.
+At $n = 7$, Hermite errors fall to $1.18 \times 10^{-11}$ and fourteen-point to $1.71 \times 10^{-11}$.
+Uniform fourteen-point endpoint errors grow, giving Hermite a smaller maximum.
+
+## Clustered nodes and barycentric weights
+
+The next cell quadratically interpolates $f(x) = e^x$ through three nodes $\{0, \delta, 1\}$ with `BarycentricInterpolator`, varying $\delta$ from 0.001 to 0.5.
+Dimensionless spacing $\delta$ controls outputs: maximum errors over 241 points on $[0,1]$, lower/upper remainder bounds, maximum/minimum absolute weight ratio, and error curves.
+Weights are $w_0 = 1/\delta$, $w_1 = -1/(\delta(1-\delta))$, and $w_2 = 1/(1-\delta)$, giving exact ratio $1/\delta$.
+There are two independent checks.
+A hand-built Newton form from the same three divided differences measures evaluation-rounding differences.
+Remainders use $f''' = e^x$ satisfying $1 \le f'''(\xi) \le e$ over $[0,1]$, bounding each error between $|\omega(x)|/6$ and $e\,|\omega(x)|/6$.
+Samples and references use `RealScalar::exp`.
+
+```rust
+//| id: interp-close-nodes
+//| ref: interp-close-nodes
+//| title: "Vary close-node spacing and global errors"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-interp]
+//| inputs:
+//|   node_spacing: {"type":"range","label":"Close-node spacing δ [-]","description":"Change distance between 0 and δ.","min":0.001,"max":0.5,"step":0.001,"value":0.1}
+//| cases:
+//|   - {"id":"nearly-coincident","label":"δ = 0.001","description":"Weight ratios reach 1000 and representation differences grow.","inputs":{"node_spacing":0.001}}
+//|   - {"id":"equispaced","label":"δ = 0.5","description":"Uniform three-node ratios are 2.","inputs":{"node_spacing":0.5}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","approx":{"value":3.3510954653589664e-2,"rtol":1e-9}}
+//|       - {"artifact":"summary","path":"/rows/0/1","approx":{"value":2.103780864197531e-2,"rtol":1e-9}}
+//|       - {"artifact":"summary","path":"/rows/0/2","approx":{"value":5.7186692942080154e-2,"rtol":1e-9}}
+//|       - {"artifact":"summary","path":"/rows/0/3","range":{"max":1e-14}}
+//|       - {"artifact":"summary","path":"/rows/0/4","approx":{"value":10.0,"rtol":1e-12}}
+//|   - case: nearly-coincident
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","approx":{"value":3.821601832241606e-2,"rtol":1e-9}}
+//|       - {"artifact":"summary","path":"/rows/0/3","range":{"max":1e-12}}
+//|       - {"artifact":"summary","path":"/rows/0/4","approx":{"value":1000.0,"rtol":1e-12}}
+//|   - case: equispaced
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","approx":{"value":1.4420665911631936e-2,"rtol":1e-9}}
+//|       - {"artifact":"summary","path":"/rows/0/4","approx":{"value":2.0,"rtol":1e-12}}
+use scioxide_core::RealScalar;
+use scioxide_interp::{BarycentricInterpolator, Univariate};
+
+let nodes = vec![0.0_f64, node_spacing, 1.0];
+let values: Vec<f64> = nodes.iter().map(|&x| RealScalar::exp(x)).collect();
+let interp =
+    BarycentricInterpolator::new(nodes.clone(), values.clone()).map_err(|e| e.to_string())?;
+
+// Independent check 1: hand-built Newton quadratic divided differences through the same points
+let d1 = (values[1] - values[0]) / (nodes[1] - nodes[0]);
+let d2 = ((values[2] - values[1]) / (nodes[2] - nodes[1]) - d1) / (nodes[2] - nodes[0]);
+let newton = |x: f64| values[0] + d1 * (x - nodes[0]) + d2 * (x - nodes[0]) * (x - nodes[1]);
+// Independent check 2: remainder f'''(ξ) ω(x) / 3! and 1 ≤ f'''(ξ) ≤ e
+let omega = |x: f64| (x - nodes[0]) * (x - nodes[1]) * (x - nodes[2]);
+let e = RealScalar::exp(1.0_f64);
+
+let (mut error_curve, mut lower_curve, mut upper_curve) = (Vec::new(), Vec::new(), Vec::new());
+let (mut maximum_error, mut maximum_omega, mut form_gap) = (0.0_f64, 0.0_f64, 0.0_f64);
+let mut omitted = 0_usize;
+for i in 0..=240 {
+    let x = i as f64 / 240.0;
+    let p = interp.value_at(x).map_err(|e| e.to_string())?;
+    let error = (p - RealScalar::exp(x)).abs();
+    let w = omega(x).abs();
+    maximum_error = maximum_error.max(error);
+    maximum_omega = maximum_omega.max(w);
+    form_gap = form_gap.max((p - newton(x)).abs());
+    // Count and exclude nodal zero errors and ω from logarithmic axes
+    if error > 0.0 && w > 0.0 {
+        error_curve.push([x, error]);
+        lower_curve.push([x, w / 6.0]);
+        upper_curve.push([x, e * w / 6.0]);
+    } else {
+        omitted += 1;
+    }
+}
+let magnitudes: Vec<f64> = interp.weights().iter().map(|w| w.abs()).collect();
+let largest = magnitudes.iter().copied().fold(0.0_f64, f64::max);
+let smallest = magnitudes.iter().copied().fold(f64::INFINITY, f64::min);
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Maximum e^x error [-]", "type": "number", "format": sci3 },
+    { "key": "1", "label": "Lower max|ω|/6 [-]", "type": "number", "format": sci3 },
+    { "key": "2", "label": "Upper e·max|ω|/6 [-]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "Maximum Newton-form difference [-]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "Largest/smallest absolute weights [-]", "type": "number", "format": sci3 },
+    { "key": "5", "label": "Points excluded from logarithmic axes", "type": "integer" }
+]);
+let row = (
+    maximum_error,
+    maximum_omega / 6.0,
+    e * maximum_omega / 6.0,
+    form_gap,
+    largest / smallest,
+    omitted,
+);
+emit_table_with_columns!(
+    columns,
+    vec![row],
+    metadata = serde_json::json!({ "id": "summary" })
+);
+emit_line_chart!(
+    &vec![
+        serde_json::json!({"name": "Absolute interpolation error", "points": error_curve}),
+        serde_json::json!({
+            "name": "Lower |ω|/6",
+            "points": lower_curve,
+            "style": {"lineType": "dashed"}
+        }),
+        serde_json::json!({
+            "name": "Upper e|ω|/6",
+            "points": upper_curve,
+            "style": {"lineType": "dashed"}
+        }),
+    ],
+    options = &serde_json::json!({
+        "xLabel": "Position x [-]",
+        "yLabel": "Absolute e^x interpolation error [-]",
+        "yType": "log",
+        "annotations": [{"kind": "line", "axis": "x", "value": node_spacing, "label": "Node δ"}]
+    })
+);
+```
+
+At default $\delta = 0.1$, maximum $e^x$ error $3.35 \times 10^{-2}$ lies between remainder lower $2.10 \times 10^{-2}$ and upper $5.72 \times 10^{-2}$.
+The difference from the manually constructed Newton form is $1.1 \times 10^{-15}$, and the barycentric weight ratio is $1/\delta = 10$.
+At $\delta = 0.001$, ratios grow to $10^{3}$ and representation differences to $9.8 \times 10^{-14}$, negligible against interpolation error $3.82 \times 10^{-2}$.
+Uniform $\delta = 0.5$ has weight ratio 2 and maximum error $1.44 \times 10^{-2}$.
+Every selectable $\delta$ has maxima between both bounds.
+Error curves run between dashed bounds and are determined by $|\omega(x)|$ shape, hence node geometry.
+Clustering enlarges weight ratios and rounding, but most error here is interpolation truncation.
+
+## Neville's recursive algorithm
+
+For values at one $x$ alone, Neville avoids constructing coefficients.
+Let $P_{i, j}$ be the value at $x$ of degree-$j - i$ interpolation through subset $\{x_i, \dots, x_j\}$; this recurrence holds.
+
+$$
+P_{i, j} = \frac{(x_j - x) P_{i, j-1} + (x - x_i) P_{i+1, j}}{x_j - x_i}, \qquad P_{i,i} = y_i
+$$
+
+Right-side polynomials agree at shared $x_{i+1}, \dots, x_{j-1}$ and weights retain one each at $x = x_i$ and $x = x_j$, so the left interpolates all $x_i, \dots, x_j$.
+The triangular table of $P_{i,j}$ in $j - i$ order is Neville's table.
+
+Following Stoer–Bulirsch and Numerical Recipes, scioxide-interp updates adjacent-degree differences instead of full table values:
+
+$$
+C_{m,i} = P_{i,i+m} - P_{i,i+m-1}, \qquad D_{m,i} = P_{i,i+m} - P_{i+1,i+m}
+$$
+
+
+With $w = C_{m-1,i+1} - D_{m-1,i}$, $C_{m,i} = (x_i - x)\,w/(x_i - x_{i+m})$ and $D_{m,i} = (x_{i+m} - x)\,w/(x_i - x_{i+m})$.
+Starting from a sample, add one $C$ or $D$ each degree to follow one table path to the all-node value.
+$C$ extends right; $D$ extends left.
+
+Start at the nearest node.
+Binary-search ascending nodes for bracketing neighbors and choose nearer, left on ties.
+Outside queries start at the nearer endpoint.
+Only those two distances are compared, correctly ordering even extreme coordinates with one overflowed distance.
+Choose paths through the table center.
+At each degree, if unused nodes left are fewer than right, add $C$ and extend right; otherwise add $D$ and extend left.
+Exact arithmetic is path-independent, but nearby starts and central paths keep corrections and rounding small.
+
+`NevilleInterpolator::new(nodes, values)` stores checked samples only, rebuilding tables per query.
+Each point costs $O(n^2 d)$ and uses two $O(n)$ workspace tables.
+Supplied-workspace `evaluate_into` and `evaluate_with_error_into` allocate nothing.
+Queries matching nodes under `NodeSeparation` return samples directly without tables.
+Derivatives/integrals are unavailable; use barycentric or Newton when needed.
+For many fixed-sample queries, pointwise $O(nd)$ `BarycentricInterpolator` is faster.
+
+## Neville estimates and rational extrapolation
+
+`evaluate_with_error(point, policy)` returns interpolated values paired with absolute final corrections per component.
+This form allocates outputs and workspace per call.
+`evaluate_with_error_into(point, policy, value_out, error_out, workspace)` writes both to caller outputs without allocation.
+The final correction subtracts interpolation on $n$ nodes omitting one endpoint from the full $n+1$-node value.
+The omitted endpoint is the side added last by the path.
+This estimates degree-$n-1$ error; using it for full-degree error assumes rapid reduction as degree rises.
+It is therefore no upper bound.
+Nodes and single samples return zero corrections.
+Extrapolation or nearby singularities may greatly underestimate actual errors, as the next cell shows.
+
+[`BulirschStoerInterpolator`](https://docs.rs/scioxide-interp/0.1.0/scioxide_interp/struct.BulirschStoerInterpolator.html) uses the same table shape, start, and path for diagonal rational rather than polynomial interpolation.
+From $N$ samples, numerator and denominator differ in degree by at most one: numerator $\lfloor (N-1)/2 \rfloor$ and denominator $\lceil (N-1)/2 \rceil$.
+Sample count determines degrees, so constructors take no numerator/denominator degrees.
+Stoer–Bulirsch rational updates use $r = (x - x_i)/(x - x_{i+m})$ and $t = r\,D_{m-1,i}$ as follows.
+
+$$
+\phi = \frac{C_{m-1,i+1} - D_{m-1,i}}{t - C_{m-1,i+1}}, \qquad
+D_{m,i} = C_{m-1,i+1}\,\phi, \qquad C_{m,i} = t\,\phi
+$$
+
+
+Denominator zeros represent poles, sometimes approximating pole/asymptote behavior with fewer samples than polynomials.
+Bulirsch and Stoer used this rational interpolation to extrapolate a sequence of numerical solutions at step sizes $h$ to $h \to 0$.
+For the same use, outside-node $h = 0$ requires explicit `MethodDefined` or `BoundedContinue`.
+
+Updates are nonlinear in samples, so each real component has its own table.
+Point evaluation costs $O(n^2 d)$ without allocation with supplied workspace.
+No derivatives or integrals are provided.
+Zero update denominator $t - C_{m-1,i+1}$, at poles or nonexistent rational interpolants of that degree, gives `NumericalInstability` (`Breakdown`).
+Default `Exact` recognizes exact zero; `Tolerant` also uses tolerance scaled by the larger magnitude of the two subtracted quantities.
+When both inputs $C_{m-1,i+1}$ and $D_{m-1,i}$ vanish for locally constant samples, set new corrections to zero to avoid $0/0$.
+For example, type-$(1,1)$ rational $(a + bx)/(1 + cx)$ through $(0,1), (1,-1), (2,1)$ has conditions $x = 0$ and $x = 2$ forcing $a = 1$ and $b = c$, making $r$ constant 1.
+Even $b = c = -1$ degenerates to $(1-x)/(1-x)$, unable to take $-1$ at $x = 1$.
+This rational interpolant does not exist; evaluation at $x = 0.5$ encounters a zero update denominator at the degree-one stage and gives this error.
+Rationals do not make extrapolation inherently safe; interior poles destroy continuity too.
+For estimating poles and residues, use [rational approximation](../rational-approximation/), `aaa`, and diagnostics.
+
+## Comparing Neville estimates with rationals
+
+The next cell interpolates $f(x) = \tan x$ on $[0, 1.4]$ with $n$ uniform nodes ($n = 2, \dots, 16$), comparing three quantities at $x$.
+They are actual `NevilleInterpolator` error, estimate from `evaluate_with_error`, and actual `BulirschStoerInterpolator` error.
+$\tan x$ has pole $x = \pi/2 \approx 1.571$ only 0.17 beyond the right endpoint.
+Input $x$ [rad] varies from 0 to 1.5; values above 1.4 extrapolate through `MethodDefined`.
+References use `RealScalar::tan`.
+The table shows row $n = 4, 8, 12, 16$; the chart shows all $n$.
+Exclude zero errors where $x$ matches nodes from logarithmic axes and show counts below the table.
+
+```rust
+//| id: interp-neville-bulirsch-tan
+//| ref: interp-neville-bulirsch-tan
+//| title: "Compare Neville estimates and rational interpolation near poles"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-interp]
+//| inputs:
+//|   query: {"type":"range","label":"Query x [rad]","description":"Above 1.4 extrapolates.","min":0,"max":1.5,"step":0.01,"value":1.3}
+//| cases:
+//|   - {"id":"extrapolation","label":"x = 1.5, extrapolation","description":"Outside, Neville estimates greatly understate errors.","inputs":{"query":1.5}}
+//|   - {"id":"interior","label":"x = 0.7","description":"Interior points farther from poles give closer estimates.","inputs":{"query":0.7}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"errors","path":"/rows/1/0","equals":8}
+//|       - {"artifact":"errors","path":"/rows/1/1","approx":{"value":7.317848134900018e-2,"rtol":1e-9}}
+//|       - {"artifact":"errors","path":"/rows/1/2","approx":{"value":1.524535592970919e-2,"rtol":1e-9}}
+//|       - {"artifact":"errors","path":"/rows/1/3","approx":{"value":1.4247905388842241e-6,"rtol":1e-6}}
+//|       - {"artifact":"errors","path":"/rows/2/3","range":{"max":1e-11}}
+//|   - case: extrapolation
+//|     expect:
+//|       - {"artifact":"errors","path":"/rows/3/1","approx":{"value":1.6095865341076294,"rtol":1e-9}}
+//|       - {"artifact":"errors","path":"/rows/3/2","approx":{"value":7.596854446390892e-2,"rtol":1e-9}}
+//|       - {"artifact":"errors","path":"/rows/3/3","range":{"max":1e-10}}
+//|   - case: interior
+//|     expect:
+//|       - {"artifact":"errors","path":"/rows/1/1","approx":{"value":1.856547396346775e-3,"rtol":1e-9}}
+//|       - {"artifact":"errors","path":"/rows/1/2","approx":{"value":2.309902413592295e-3,"rtol":1e-9}}
+use scioxide_core::RealScalar;
+use scioxide_interp::{
+    BulirschStoerInterpolator, ExtrapolationPolicy, Interpolant, NevilleInterpolator,
+};
+
+// Queries above 1.4 extend polynomial/rational representations unchanged
+let policy = ExtrapolationPolicy::MethodDefined;
+let exact = RealScalar::tan(query);
+let (mut actual, mut estimated, mut rational) = (Vec::new(), Vec::new(), Vec::new());
+let mut rows = Vec::new();
+let mut omitted = 0_usize;
+for n in 2..=16_usize {
+    let x: Vec<f64> = (0..n).map(|i| 1.4 * i as f64 / (n - 1) as f64).collect();
+    let y: Vec<f64> = x.iter().map(|&v| RealScalar::tan(v)).collect();
+    let neville = NevilleInterpolator::new(x.clone(), y.clone()).map_err(|e| e.to_string())?;
+    // Receive values and estimates from one table calculation
+    let (value, estimate) = neville
+        .evaluate_with_error([query], policy)
+        .map_err(|e| e.to_string())?;
+    let ratio = BulirschStoerInterpolator::new(x, y)
+        .map_err(|e| e.to_string())?
+        .evaluate([query], policy)
+        .map_err(|e| e.to_string())?;
+    let (error, rational_error) = ((value - exact).abs(), (ratio - exact).abs());
+    for (series, quantity) in [
+        (&mut actual, error),
+        (&mut estimated, estimate),
+        (&mut rational, rational_error),
+    ] {
+        if quantity > 0.0 {
+            series.push([n as f64, quantity]);
+        } else {
+            omitted += 1;
+        }
+    }
+    if n % 4 == 0 {
+        rows.push((n, error, estimate, rational_error));
+    }
+}
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Nodes n", "type": "integer" },
+    { "key": "1", "label": "Neville actual error [-]", "type": "number", "format": sci3 },
+    { "key": "2", "label": "Neville estimate [-]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "Bulirsch–Stoer actual error [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "errors" })
+);
+emit_text!(&format!("Zero values omitted logarithmically: {omitted}"));
+emit_line_chart!(
+    &vec![
+        serde_json::json!({
+            "name": "Neville actual error",
+            "points": actual,
+            "style": {"showSymbol": true}
+        }),
+        serde_json::json!({
+            "name": "Neville estimate",
+            "points": estimated,
+            "style": {"showSymbol": true, "lineType": "dotted"}
+        }),
+        serde_json::json!({
+            "name": "Bulirsch–Stoer actual error",
+            "points": rational,
+            "style": {"showSymbol": true}
+        }),
+    ],
+    options = &serde_json::json!({
+        "xLabel": "Nodes n [-]",
+        "yLabel": "Absolute error against tan x [-]",
+        "yType": "log"
+    })
+);
+```
+
+At default $x = 1.3$ and $n = 8$, Neville actual error $7.32 \times 10^{-2}$ has estimate $1.52 \times 10^{-2}$, about one fifth.
+At $n = 12$, actual $3.20 \times 10^{-3}$ has larger estimate $8.66 \times 10^{-3}$.
+Bulirsch–Stoer errors there drop rapidly from $1.42 \times 10^{-6}$ at $n = 8$ to $2.17 \times 10^{-12}$ at $n = 12$, showing pole-representing denominators' benefit.
+At extrapolated $x = 1.5$, even $n = 16$ gives Neville error 1.61 versus estimate $7.60 \times 10^{-2}$, under one twentieth.
+Bulirsch–Stoer extrapolation error $4.62 \times 10^{-12}$ at $n = 16$ benefits from a single nearby $\tan$ pole easily represented by low-degree denominators, without a general guarantee.
+At pole-distant $x = 0.7$ and $n = 8$, actual $1.86 \times 10^{-3}$ has estimate $2.31 \times 10^{-3}$, a close factor 1.24.
+Pole distance greatly exceeds spacing there; each degree reduces errors by roughly constant ratios, satisfying estimate assumptions.
+$x = 0$ is shared by every node set; all errors vanish and the chart is empty.
+
+## Summary
+
+Choose families before degrees; for Chebyshev nodes construct weights with `from_chebyshev_roots` or `from_chebyshev_lobatto` in $O(n)$.
+Sort general nodes strictly for `BarycentricInterpolator::new`; read values/derivatives together with `evaluate_with_derivative`, or allocation-free `evaluate_with_derivative_into`; prepare repeated integrals with `prepare_antiderivative`.
+Choose `NewtonInterpolator::insert_point` for right-appended samples and `HermiteInterpolator` for derivative samples, placing Hermite nodes with quadratic near-node error decay in mind.
+Neville estimates are not bounds and may greatly understate errors near singularities or in extrapolation; pair them with independent-point checks.
+`BulirschStoerInterpolator` supports near-pole interpolation and step extrapolation, but pole queries give `Breakdown`.
+
+## Further reading
+
+- [Polynomial interpolation, divided differences, and Chebyshev nodes](../../../scioxide-poly/algorithms/interpolation-and-chebyshev/): derive remainders and Lebesgue constants and compare uniform and Chebyshev errors.
+- [Rational approximation and pole diagnostics](../rational-approximation/): estimate poles and residues with AAA and identify Froissart doublets.
+- [Floater–Hormann interpolation and Padé approximation](../floater-hormann-and-pade/): examine rational interpolation without uniform-node ill-conditioning and Taylor approximations.
+- [PCHIP, cubic splines, and Akima](../pchip-and-splines/): choose monotonicity or smoothness through piecewise cubics instead of global polynomials.

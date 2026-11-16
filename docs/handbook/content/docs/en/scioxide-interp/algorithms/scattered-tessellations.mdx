@@ -1,0 +1,462 @@
+---
+title: "Scattered interpolation with shared triangulations"
+description: "Delaunay/value correspondence, nearest, simplex-linear, Clough–Tocher, natural neighbors, convex-hull projection, and exterior gradients."
+sidebar:
+  order: 345
+references:
+  interp-clough-tocher: "cloughtocher-cubic-patches"
+  interp-convex-hull-extrapolation: "convex-hulls-and-extrapolation"
+  interp-edge-gradients: "gradients-across-edges"
+  interp-natural-neighbor: "natural-neighbor-interpolation"
+  interp-nearest-and-linear: "nearest-and-simplex-linear-methods"
+  interp-tessellation-values: "triangulationvalue-correspondence"
+---
+
+For scattered interpolation, choosing nearby samples determines surface shape.
+One Delaunay triangulation, or simplicial mesh in general dimensions, can serve multiple value sets and methods.
+[Convex hulls, Delaunay triangulations, and Voronoi diagrams](oxref:spatial-delaunay-lifting) covers construction, degeneracy, and duplicate merging.
+Here we examine reproduction, derivatives, and outside-hull behavior on fixed triangulations.
+
+## Triangulation–value correspondence
+
+`ScatteredValues` binds values to one `Delaunay` site's order.
+Exactly equal input coordinates merge into sites, generally changing point counts and order.
+`from_input_values(&mesh, values)` accepts original input order, requiring identical merged-duplicate values, otherwise `InvalidInput`.
+`from_input_view` does the same from real views of shape `[input point, component]`.
+`from_site_values` accepts already site-ordered values.
+Wrong counts give `DimensionMismatch`; nonfinite values `NonFinite`.
+Real, complex, or array values interpolate identically per real component.
+Values record mesh `MeshToken`; constructing with different or rebuilt triangulations gives `InvalidInput`.
+Even rebuilt identical coordinates are a different triangulation.
+
+Interpolants borrow triangulations and values, which must remain alive.
+All four methods have standard `new(&mesh, &values)` and detailed `with_options(&mesh, &values, options)` for settings.
+Nearest, simplex-linear, and natural-neighbor `ScatteredOptions` settings use `ScatteredOptions::with_maximum_workspace_bytes` for query-memory limits, unlimited by default.
+Construction compares exact required workspace with limits, giving `ResourceLimit` on excess.
+Construct `ScatteredWorkspace` from interpolant `workspace()` and reuse for queries.
+Location, projection, and local computation storage are preallocated; reserved `evaluate_into` and similar queries allocate nothing.
+One workspace serves all four if sufficient, checked with `workspace_capacity`.
+Insufficient workspace gives `DimensionMismatch` and remains reusable after failures.
+
+## Nearest and simplex-linear methods
+
+`NearestNeighborInterpolator` returns nearest sample values piecewise constantly.
+Exact Euclidean KD searches over $n$ sites have expected cost $O(\log n)$.
+Rounded-distance ties choose smallest triangulation indices.
+Voronoi-boundary jumps prevent derivative support.
+
+`SimplexLinearInterpolator` combines containing-simplex vertex values using barycentric $\lambda_j$.
+
+$$
+s(x)=\sum_{j=0}^D\lambda_j(x)y_j,\qquad
+\sum_j\lambda_j=1,\qquad x=\sum_j\lambda_jx_j.
+$$
+
+Here $x_j$ and $y_j$ are $D+1$ vertices and values.
+Nondegenerate simplices reproduce affine functions with continuous shared-face values.
+For smooth functions and diameter $h$, value errors are $O(h^2)$ and gradient errors $O(h)$.
+Gradients are constant per simplex and generally jump across faces.
+Points on shared faces use the simplex selected by location.
+Slender simplices make barycentric systems ill-conditioned; exact location predicates guarantee no value accuracy.
+Simplices too flat for affine coordinates evaluate on the nearest face if distance is within $32\varepsilon$ relative to hull/query scales, otherwise give `NumericalInstability`.
+
+For one query set, one-shot `interpolate_scattered(points, values, queries)` constructs default Delaunay geometry and returns simplex-linear values under `Reject`.
+Sites not spanning dimension $D$ give `Singular`.
+Repeated queries should retain `SimplexLinearInterpolator` rather than rebuild each call.
+
+## Clough–Tocher cubic patches
+
+`CloughTocherInterpolator` splits each planar triangle into three at its centroid and places cubic Bézier patches on them.
+Shared vertex values/gradients and cross-edge derivatives give globally $C^1$ surfaces on hulls.
+Affine functions reproduce exactly.
+Without gradient samples, vertex gradients are estimated globally.
+SciOxide uses Nielson's (1983) global method, minimizing approximate total curvature of cubics along all edges.
+Each site's gradients satisfy coupled $2\times2$ systems, solved by Gauss–Seidel sweeps starting at zero.
+This does not guarantee exact quadratic reproduction.
+Singular site $2\times2$ gives `Singular`; iteration overflow `NonFinite`.
+
+`CloughTocherOptions` sets sweep tolerances, default absolute/relative $\sqrt{\varepsilon}$, per-component sweep limits default 400, zero giving `InvalidInput`, preparation memory, and proposal/iteration limits.
+A component converges when maximum vertex-gradient change per sweep meets tolerance relative to $\max(1,|\nabla f|)$.
+Gradients use coordinates scaled by the longer bounding-rectangle side, making tests unit-independent.
+`termination()` of `CloughTocherReport` from `gradient_report()` is the sole termination.
+`CloughTocherTermination` has three cases: all-component `Converged`, earlier sweep-limit `IterationLimit`, or iteration-limit `BudgetExhausted` after at least one sweep; `is_success()` is true only for `Converged`.
+
+Standard `CloughTocherInterpolator::new(&mesh, &values)` uses defaults, returning `ConvergenceFailure` (`IterationLimit`) without an interpolant unless `Converged`.
+Detailed `with_options(&mesh, &values, options)` and scoped `build` return interpolants on `IterationLimit` or `BudgetExhausted` after at least one sweep.
+These remain sample-through $C^1$ surfaces; only estimated vertex-gradient accuracy decreases.
+No permitted sweep gives `ConvergenceFailure` (`IterationLimit`); exhausted proposals `ConvergenceFailure` (`ResourceLimit`), without interpolants.
+`iterations()` is maximum completed component sweeps; `final_change()` last normalized maximum change, not unknown-function gradient error.
+
+For flat triangles, queries within $32\varepsilon$ of an edge or vertex are evaluated using the edge's cubic Hermite curve or the vertex value; otherwise the result is `NumericalInstability`.
+
+## Gradients across edges
+
+The next two cells share $f(x,y)=x^2+xy+y^2$ samples at four unit-square corners and center.
+Their Delaunay mesh has four center-corner edges; center-to-origin diagonal is internal.
+Shared samples, $f$, and construction follow.
+
+```rust
+//| id: interp-scattered-square-model
+//| kind: definitions
+//| title: "Five unit-square points and quadratic samples"
+//| crates: [scioxide-core, scioxide-spatial]
+use scioxide_core::SciOxideError;
+use scioxide_spatial::{Delaunay, PointSet};
+
+/// Four corners and center, each [x, y].
+pub(crate) const SITES: [[f64; 2]; 5] =
+    [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.5, 0.5]];
+
+/// Sample quadratic f(x, y) = x² + xy + y².
+pub(crate) fn quadratic(x: f64, y: f64) -> f64 {
+    x * x + x * y + y * y
+}
+
+/// Construct five-point Delaunay triangulation.
+pub(crate) fn square_mesh() -> Result<Delaunay<f64>, SciOxideError> {
+    Delaunay::new(&PointSet::from_points(&SITES)?)
+}
+```
+
+The first cell measures gradient-difference norms at $(0.25-\delta,0.25+\delta)$ and $(0.25+\delta,0.25-\delta)$ at diagonal distance $\delta$.
+The true $f$ gradient difference is $2\sqrt2\,\delta$, vanishing for $\delta\to0$.
+For $C^1$ surfaces differences tend to zero proportionally to $\delta$; discontinuous gradients retain constants even as $\delta\to0$.
+Also compare maximum value errors on grid $21\times21$ across four methods.
+Another input limits Clough–Tocher sweeps through detailed `with_options`.
+Limit-stopped interpolants return; show termination/sweeps in tables and termination as outcome.
+
+```rust
+//| id: interp-clough-tocher-quadratic
+//| ref: interp-clough-tocher-quadratic
+//| title: "Measure Clough–Tocher value errors and gradients across edges"
+//| run: reactive
+//| uses: [interp-scattered-square-model]
+//| crates: [scioxide-core, scioxide-interp, scioxide-spatial]
+//| inputs:
+//|   offset: {"type":"range","label":"Edge distance δ [-]","min":0.0001,"max":0.01,"step":0.0001,"value":0.001}
+//|   max_sweeps: {"type":"range","label":"Maximum sweeps","description":"Maximum Gauss–Seidel sweeps of Clough–Tocher gradients.","min":1,"max":400,"step":1,"value":400}
+//| cases:
+//|   - {"id":"near-edge","label":"δ = 0.0001","description":"Nearer edges keep Clough–Tocher difference/δ constant; simplex-linear jumps remain.","inputs":{"offset":0.0001}}
+//|   - {"id":"one-sweep","label":"One sweep","description":"IterationLimit stops estimation, but surfaces remain C¹ and pass samples.","inputs":{"max_sweeps":1}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"gradients","path":"/rows/0/2","approx":{"value":10.949919932023723,"rtol":1e-6}}
+//|       - {"artifact":"gradients","path":"/rows/0/3","approx":{"value":0.12148407580323717,"rtol":1e-6}}
+//|       - {"artifact":"gradients","path":"/rows/1/1","approx":{"value":0.7071067811865476,"rtol":1e-12}}
+//|       - {"artifact":"gradients","path":"/rows/2/1","equals":null}
+//|       - {"artifact":"gradients","path":"/rows/4/2","approx":{"value":2.8284271247461903,"rtol":1e-9}}
+//|       - {"artifact":"report","path":"/rows/0/0","equals":"Converged"}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+//|   - case: near-edge
+//|     expect:
+//|       - {"artifact":"gradients","path":"/rows/0/2","approx":{"value":10.968498447696856,"rtol":1e-6}}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+//|   - case: one-sweep
+//|     expect:
+//|       - {"artifact":"report","path":"/rows/0/0","equals":"IterationLimit"}
+//|       - {"artifact":"report","path":"/rows/0/1","equals":1}
+//|       - {"artifact":"gradients","path":"/rows/0/3","approx":{"value":0.25492928581210816,"rtol":1e-6}}
+//|       - {"path":"/outputs/2/state","equals":"partial"}
+use scioxide_core::RealScalar;
+use scioxide_interp::{
+    CloughTocherInterpolator, CloughTocherOptions, Differentiable, ExtrapolationPolicy,
+    Interpolant, NaturalNeighborInterpolator, NearestNeighborInterpolator, ScatteredValues,
+    SimplexLinearInterpolator,
+};
+
+let mesh = square_mesh().map_err(|e| e.to_string())?;
+let data: Vec<f64> = SITES.iter().map(|p| quadratic(p[0], p[1])).collect();
+let values = ScatteredValues::from_input_values(&mesh, data).map_err(|e| e.to_string())?;
+// Detailed forms return after sweep limits and retain termination reports
+let options = CloughTocherOptions::new().with_maximum_iterations(max_sweeps as usize);
+let cubic = CloughTocherInterpolator::with_options(&mesh, &values, options)
+    .map_err(|e| e.to_string())?;
+let linear =
+    SimplexLinearInterpolator::<_, 2>::new(&mesh, &values).map_err(|e| e.to_string())?;
+let natural = NaturalNeighborInterpolator::new(&mesh, &values).map_err(|e| e.to_string())?;
+let nearest =
+    NearestNeighborInterpolator::<_, 2>::new(&mesh, &values).map_err(|e| e.to_string())?;
+let policy = ExtrapolationPolicy::Reject;
+// Two points across internal edge y = x
+let left = [0.25 - offset, 0.25 + offset];
+let right = [0.25 + offset, 0.25 - offset];
+let gap = |a: [f64; 2], b: [f64; 2]| RealScalar::hypot(a[0] - b[0], a[1] - b[1]);
+let cubic_gap = gap(
+    cubic.gradient(left, policy).map_err(|e| e.to_string())?,
+    cubic.gradient(right, policy).map_err(|e| e.to_string())?,
+);
+let linear_gap = gap(
+    linear.gradient(left, policy).map_err(|e| e.to_string())?,
+    linear.gradient(right, policy).map_err(|e| e.to_string())?,
+);
+// Independent check: differences of gradient (2x + y, x + 2y)
+let exact = |p: [f64; 2]| [2.0 * p[0] + p[1], p[0] + 2.0 * p[1]];
+let exact_gap = gap(exact(left), exact(right));
+// Maximum errors on a 21 × 21 grid, ordered [Clough–Tocher, simplex-linear, natural-neighbor, nearest]
+let mut errors = [0.0_f64; 4];
+for i in 0..=20 {
+    for j in 0..=20 {
+        let p = [i as f64 / 20.0, j as f64 / 20.0];
+        let computed = [
+            cubic.evaluate(p, policy).map_err(|e| e.to_string())?,
+            linear.evaluate(p, policy).map_err(|e| e.to_string())?,
+            natural.evaluate(p, policy).map_err(|e| e.to_string())?,
+            nearest.evaluate(p, policy).map_err(|e| e.to_string())?,
+        ];
+        for (error, value) in errors.iter_mut().zip(computed) {
+            *error = error.max((value - quadratic(p[0], p[1])).abs());
+        }
+    }
+}
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed3 = serde_json::json!({ "fractionDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Interpolant" },
+    {
+        "key": "1",
+        "label": "Gradient difference [-]",
+        "type": "number",
+        "format": sci3,
+        "nullText": "Unavailable"
+    },
+    {
+        "key": "2",
+        "label": "Gradient difference / δ [-]",
+        "type": "number",
+        "format": fixed3,
+        "nullText": "Unavailable"
+    },
+    { "key": "3", "label": "Maximum value error [-]", "type": "number", "format": sci3, "nullText": "—" }
+]);
+let rows = vec![
+    (
+        "Clough–Tocher",
+        Some(cubic_gap),
+        Some(cubic_gap / offset),
+        Some(errors[0]),
+    ),
+    (
+        "Simplex-linear",
+        Some(linear_gap),
+        Some(linear_gap / offset),
+        Some(errors[1]),
+    ),
+    ("Natural neighbors", None, None, Some(errors[2])),
+    ("Nearest", None, None, Some(errors[3])),
+    ("f, reference", Some(exact_gap), Some(exact_gap / offset), None),
+];
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "gradients" })
+);
+let report = cubic.gradient_report();
+let termination = report.termination();
+emit_table_with_columns!(
+    [
+        "Gradient-estimation termination",
+        "Sweeps",
+        "Last normalized change [-]"
+    ],
+    vec![(
+        format!("{termination:?}"),
+        report.iterations(),
+        report.final_change()
+    )],
+    metadata = serde_json::json!({ "id": "report" })
+);
+let outcome = if termination.is_success() {
+    Outcome::satisfied("Vertex gradients met tolerance √ε")
+} else {
+    Outcome::partial("Vertex estimation stopped at sweep limit").explanation(
+        "The surface remains C¹ and interpolates data, but estimated gradients and surface accuracy decrease.",
+    )
+};
+emit_outcome!(
+    outcome
+        .status(format!("{termination:?}"))
+        .diagnostic("Sweeps", report.iterations() as f64, None)
+        .diagnostic("Last normalized change", report.final_change(), None)
+);
+```
+
+Defaults reach `Converged` in 15 sweeps, with outcome `satisfied`.
+Clough–Tocher difference/$\delta$ is 10.9, nearly unchanged at 11.0 for $\delta=0.0001$ (`near-edge`); differences vanish proportionally to $\delta$.
+This demonstrates edge-gradient continuity.
+The coefficient differs from $f$'s $2\sqrt2\approx2.83$ because the surface's second derivatives differ from those of $f$.
+Simplex-linear differences remain 0.71 independently of $\delta$, demonstrating jumps.
+Maximum value errors are 0.12 Clough–Tocher, 0.25 simplex-linear and natural neighbors, 1.2 nearest.
+Gradient estimation does not exactly reproduce quadratics; continuity and exact unknown-function reproduction differ.
+One-sweep limits (`one-sweep`) give termination `IterationLimit` and outcome `partial`.
+Gradient difference $/\delta$ becomes 21.2; surfaces remain $C^1$ but maximum error rises to 0.25, reflecting less accurate vertex estimates.
+
+## Natural-neighbor interpolation
+
+`NaturalNeighborInterpolator` performs planar Sibson interpolation.
+Inserting a query forms its Voronoi cell by taking areas from existing sample cells.
+With area $A_i(x)$ taken from sample $i$, interpolation is
+
+$$
+s(x)=\sum_iw_i(x)y_i,\qquad w_i(x)=\frac{A_i(x)}{\sum_jA_j(x)}
+$$
+
+
+Only samples whose Voronoi cells meet the query point's Voronoi cell (natural neighbors) have $A_i>0$.
+Nonnegative weights sum to one and reproduce affine functions.
+After location, traverse only triangles whose circumcircles contain the query, the insertion cavity, rather than all samples.
+Post-location work therefore scales with natural neighbors, independently of sample count.
+Areas use f64; nonpositive area sums give `NumericalInstability`.
+Samples reproduce; hull edges use linear edge interpolation.
+Sibson is $C^1$ away from samples and generally $C^0$ at samples.
+SciOxide provides no natural-neighbor derivatives and implements only `Interpolant`.
+
+## Convex hulls and extrapolation
+
+Domains are sample convex hulls rather than bounding rectangles.
+Outside points project to Euclidean-nearest hull points.
+Projection scans every boundary face, making exterior queries costlier and dependent on mesh size.
+Policies behave as follows.
+
+| Policy | Nearest | Simplex-linear | Clough–Tocher | Natural neighbors |
+|---|---|---|---|---|
+| `Reject` | `DomainError` | `DomainError` | `DomainError` | `DomainError` |
+| `Clamp` | Sample nearest projected point | Evaluate projected point | Evaluate projected point | Evaluate projected point |
+| `BoundedContinue` | Sample nearest original point | Extend nearest boundary-simplex linears | Extend nearest cubic patches | `DomainError` |
+| `MethodDefined` | Sample nearest original point | Extend nearest boundary-simplex linears | Extend nearest cubic patches | `DomainError` |
+
+Under `BoundedContinue { max_distance }`, any original/projected axis difference above `max_distance` gives `DomainError`.
+Sibson coordinates do not extend beyond hulls; natural neighbors accept only `Clamp` outside.
+
+Under `Clamp`, simplex-linear and Clough–Tocher gradients differentiate projection/surface compositions.
+Edge-projection regions retain only edge-tangent components; vertex-projection regions give zero gradients.
+Projection switches with unequal adjacent composite-gradient limits beyond rounding give `DomainError` (`Undefined`).
+Hull boundaries use interior-simplex or patch gradients.
+`ExtrapolationReport` from `Interpolant::report` reports original/effective coordinates and exterior axis distances, not extrapolation errors.
+
+The next cell evaluates outside $q=(1+d,\,0.4)$ on the same five samples with four methods and four policies.
+Input $d$ is distance from right edge $x=1$; `max_distance` of `BoundedContinue` is fixed at 0.1.
+Pairs giving `DomainError` show `DomainError`; propagate other errors as cell errors.
+The final column evaluates reference $f$ at effective coordinates from simplex-linear `report`.
+
+```rust
+//| id: interp-scattered-extrapolation
+//| ref: interp-scattered-extrapolation
+//| title: "Evaluate outside-hull points with four methods and policies"
+//| run: reactive
+//| uses: [interp-scattered-square-model]
+//| crates: [scioxide-core, scioxide-interp, scioxide-spatial]
+//| inputs:
+//|   distance: {"type":"range","label":"Hull distance d [-]","min":0,"max":0.5,"step":0.01,"value":0.05}
+//| cases:
+//|   - {"id":"beyond-bound","label":"d = 0.3","description":"Above max_distance = 0.1, BoundedContinue also gives DomainError.","inputs":{"distance":0.3}}
+//|   - {"id":"on-hull","label":"d = 0","description":"Hull-edge points are inside and all policies agree.","inputs":{"distance":0}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"policies","path":"/rows/0/1","equals":null}
+//|       - {"artifact":"policies","path":"/rows/1/2","approx":{"value":1.8,"atol":1e-12}}
+//|       - {"artifact":"policies","path":"/rows/2/4","equals":null}
+//|       - {"artifact":"policies","path":"/rows/3/2","approx":{"value":1.925,"atol":1e-12}}
+//|   - case: beyond-bound
+//|     expect:
+//|       - {"artifact":"policies","path":"/rows/2/2","equals":null}
+//|       - {"artifact":"policies","path":"/rows/3/4","equals":null}
+//|   - case: on-hull
+//|     expect:
+//|       - {"artifact":"policies","path":"/rows/0/4","approx":{"value":1.8,"atol":1e-12}}
+use scioxide_core::{SciOxideError, SciOxideErrorKind};
+use scioxide_interp::{
+    CloughTocherInterpolator, ExtrapolationPolicy, Interpolant, NaturalNeighborInterpolator,
+    NearestNeighborInterpolator, ScatteredValues, SimplexLinearInterpolator,
+};
+
+let mesh = square_mesh().map_err(|e| e.to_string())?;
+let data: Vec<f64> = SITES.iter().map(|p| quadratic(p[0], p[1])).collect();
+let values = ScatteredValues::from_input_values(&mesh, data).map_err(|e| e.to_string())?;
+let nearest =
+    NearestNeighborInterpolator::<_, 2>::new(&mesh, &values).map_err(|e| e.to_string())?;
+let linear =
+    SimplexLinearInterpolator::<_, 2>::new(&mesh, &values).map_err(|e| e.to_string())?;
+let cubic = CloughTocherInterpolator::new(&mesh, &values).map_err(|e| e.to_string())?;
+let natural = NaturalNeighborInterpolator::new(&mesh, &values).map_err(|e| e.to_string())?;
+let mut workspace = linear.workspace().map_err(|e| e.to_string())?;
+// Point distance d from right hull edge x = 1
+let q = [1.0 + distance, 0.4];
+// Blank only DomainError entries; propagate other errors
+let keep = |result: Result<f64, SciOxideError>| match result {
+    Ok(value) => Ok(Some(value)),
+    Err(e) if e.kind() == SciOxideErrorKind::DomainError => Ok(None),
+    Err(e) => Err(e.to_string()),
+};
+let policies = [
+    ("Reject", ExtrapolationPolicy::Reject),
+    ("Clamp", ExtrapolationPolicy::Clamp),
+    (
+        "BoundedContinue（0.1）",
+        ExtrapolationPolicy::BoundedContinue { max_distance: 0.1 },
+    ),
+    ("MethodDefined", ExtrapolationPolicy::MethodDefined),
+];
+let mut rows = Vec::new();
+for (name, policy) in policies {
+    // Independent check: f at effective coordinates
+    let effective = match linear.report(q, policy, &mut workspace) {
+        Ok(report) => Some(report.effective()),
+        Err(e) if e.kind() == SciOxideErrorKind::DomainError => None,
+        Err(e) => return Err(e.to_string()),
+    };
+    rows.push((
+        name,
+        keep(nearest.evaluate(q, policy))?,
+        keep(linear.evaluate(q, policy))?,
+        keep(cubic.evaluate(q, policy))?,
+        keep(natural.evaluate(q, policy))?,
+        effective.map(|p| quadratic(p[0], p[1])),
+    ));
+}
+// All values use four decimal places; blank DomainError entries
+let value_column = |key: &str, label: &str| {
+    serde_json::json!({
+        "key": key,
+        "label": label,
+        "type": "number",
+        "format": { "fractionDigits": 4 },
+        "nullText": "DomainError"
+    })
+};
+let columns = serde_json::json!([
+    { "key": "0", "label": "Policy" },
+    value_column("1", "Nearest [-]"),
+    value_column("2", "Simplex-linear [-]"),
+    value_column("3", "Clough–Tocher [-]"),
+    value_column("4", "Natural neighbors [-]"),
+    value_column("5", "f at effective coordinates [-]")
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "policies" })
+);
+```
+
+At default $d=0.05$, `Reject` gives `DomainError` for every method.
+`Clamp` evaluates projection $(1,0.4)$; simplex-linear/natural give edge value 1.8, Clough–Tocher 1.664, nearest value 1 at nearest sample $(1,0)$.
+Under `BoundedContinue` and `MethodDefined`, nearest-boundary linear extension gives 1.925, cubic extension 1.749, and natural neighbors `DomainError`.
+At $d=0.3$ (`beyond-bound`), axis distances exceed `max_distance`, so `BoundedContinue` also gives `DomainError` for every method.
+At maximum input $d=0.5$, Clough–Tocher under `MethodDefined` returns $-0.10$, far from reference 3.01.
+Cubic extensions rapidly lose accuracy away from hulls; permitted extrapolation guarantees none.
+At $d=0$ (`on-hull`), hull-edge membership makes every policy give identical interior values.
+
+## Summary
+
+`ScatteredValues` binds values to site order and `MeshToken`; rebuild values after rebuilding meshes.
+Nearest is piecewise constant; simplex-linear continuous in value with gradient jumps; Clough–Tocher first-derivative continuous; natural neighbors affine-reproducing weighted averages.
+Check Clough–Tocher `CloughTocherReport::termination`; even false `is_success()` leaves sample-through $C^1$ surfaces, but vertex gradients are less accurate.
+Outside hulls, `Clamp` returns projected values and composite gradients; `BoundedContinue` and `MethodDefined` differ by method and are both unsupported by natural neighbors.
+
+## Further reading
+
+- [Local models and kriging predictive variance](../local-models-and-kriging/): examine neighborhoods without triangulation and covariance prediction variances.
+- [RBF cross-validation with the Franke function](../../examples/station-cross-validation/): compare Clough–Tocher and RBF leave-one-out and grid errors.
+- [Two-dimensional, scattered, and local-model APIs](../../api/multidimensional/): look up shared-mesh interpolants and reports.

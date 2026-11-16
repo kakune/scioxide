@@ -1,0 +1,280 @@
+---
+title: "FFT plans, workspaces, and caches"
+description: "Explain preparing and reusing plans from FftPlanSpec, plan diagnostics, workspace requirements and ownership, and FftPlanCache keys, LRU eviction, and statistics."
+sidebar:
+  order: 312
+references:
+  fft-plan-preparation: "plan-preparation-and-ownership"
+  fft-plan-diagnostics: "plan-diagnostics"
+  fft-workspace-requirements: "workspace-requirements-and-ownership"
+  fft-plan-cache: "plan-caches"
+---
+
+[FFT algorithms and arbitrary lengths](../planner-and-arbitrary-lengths/) showed how lengths determine algorithms and why preparation requires twiddle tables and convolution kernels.
+This page explains plans holding preparation results, workspaces required for execution, and caches sharing plans.
+The three have different lifetimes.
+A plan remains unchanged after preparation, a workspace is owned and reused by the caller, and a cache operates only where the caller places it.
+[External FFT implementations and CPU instruction sets](../providers-and-cpu-backends/) covers external-implementation injection and CPU instruction-set selection.
+
+## Plan preparation and ownership
+
+`FftPlanSpec::new(length, direction, normalization, layout)` specifies a one-dimensional plan.
+`length` is the logical length: even for packed layouts (`FftLayout::Real`, `Hermitian`), it denotes the real-sequence length rather than the bin count.
+Execution policy defaults to `ExecutionPolicy::Sequential` and CPU instruction-set policy to `FftBackendStrategy::Automatic`; change them with `with_execution_policy` and `with_backend_strategy`.
+The specification only holds values; validation occurs during preparation.
+
+There are two ways to prepare a plan.
+
+- `FftPlan::new(spec)` prepares using the capabilities of `ExecutionContext::sequential_native()`.
+  With feature `std`, it uses host instruction sets detected at runtime.
+- `FftPlan::build(spec, context)` uses only the supplied context's capabilities.
+  `ExecutionContext::sequential()` reports no processor capabilities, so the kernel is scalar.
+
+Preparation returns `InvalidInput` for length 0 or an unavailable requested instruction set.
+Unrepresentable or unallocatable table or workspace sizes give one of `SizeOverflow`, `ResourceLimit`, or `AllocationFailure`.
+`build` returns `ExecutionStopped` if the context is already cancelled or past its deadline.
+
+A plan fixes length, direction, normalization, layout, execution policy, and instruction set and is immutable after preparation.
+Prepare a separate plan for the opposite direction.
+Clones share prepared tables through `Arc` rather than copying them.
+A plan retains no preparation context and can run in any execution context once prepared.
+During execution, a plan uses only the executor, cancellation flag, and deadline from the context.
+
+`execute_into(input, output, scratch, context)` borrows the plan through `&self`, borrows input immutably, and borrows output and workspace mutably.
+Input and output may be references to slices, arrays, `Vec`, `VectorView`, and `HermitianSpectrum`.
+[Storage layouts in plans](oxref:fft-real-plan-layout) lists input/output combinations compatible with each layout and direction.
+Complex layouts also support `execute_in_place(data, scratch, context)`.
+A failure leaves the caller's output unchanged.
+For complex layouts, the first $N$ workspace values assemble the result, which is copied to output after success.
+Functions such as `fft` and `rfft` create and discard a plan and workspace on every call and return results in a new `Vec`.
+
+## Plan diagnostics
+
+`plan.diagnostics()` returns `FftPlanDiagnostics`.
+`algorithm()` is the selected `FftAlgorithmKind` (`Identity`, `MixedRadix`, `Rader`, `Bluestein`, `Provider`); `stage_count()` is the maximum FFT stage count along the execution path.
+Packed-layout plans report the inner complex FFT algorithm.
+[Algorithm-selection rules](oxref:fft-algorithm-selection) covers selection and stage counting.
+
+`FftAlgorithmKind` names the mathematical algorithm, while `FftBackendStrategy` is the CPU instruction-set policy; the two are independent.
+`plan.resolved_backends()` returns the actual implementations as an iterator over `FftBackend`.
+`FftBackend` is either `Cpu(KernelBackend)` or `Provider`.
+For packed odd lengths that are proper multiples of 3, 5, or 7, the plan holds several complex FFTs, so the iterator returns several values and may repeat values.
+`plan.plan_bytes()` is the plan's byte count, including shared tables.
+Each clone sharing the same tables reports the full amount, while `retained_plan_bytes()` in `FftPlanCache` counts shared tables only once.
+
+## Workspace requirements and ownership
+
+`plan.workspace_requirements(())` returns `FftWorkspaceRequirements`.
+`complex_len()` is the required complex-value count, `bytes()` its bytes, `alignment()` the element alignment boundary, and `byte_limit()` the maximum workspace capacity the plan accepts.
+One-dimensional plans impose a limit only with external implementations; otherwise it is `usize::MAX` ([Resource limits](oxref:fft-provider-limits)).
+
+Let $A(m)$ be the internal workspace of a complex FFT of length $m$.
+$A(m)$ is $m$ for product-of-2,3,5,7 lengths $m > 1$, $2(m-1)$ for Rader, $2L$ (twice convolution length $L$) for Bluestein, and the provider-declared value for external implementations.
+A complex-layout plan requires $N + A(N)$ values for $N > 1$ and 0 for $N = 1$.
+The first $N$ values assemble the result so that failures leave output unchanged.
+The packed-layout requirement $R(N)$ is
+
+$$
+R(N)=\begin{cases}
+N/2+1+A(N/2) & N\ \text{ is even},\\
+(N+1)/2+(p-1)m/2+R(m)+A(m) & N=pm\ \text{ is odd},\ m>1,\\
+N+A(N) & \text{other odd}\ N>1,\\
+1 & N=1
+\end{cases}
+$$
+
+as above.
+$p$ is the smallest of 3, 5, and 7 dividing $N$.
+
+`FftWorkspace` is complex storage owned by the caller.
+
+- `FftWorkspace::new()` creates an empty workspace without allocating; `from_vec(values)` takes ownership of an existing `Vec` as storage.
+- `check(&requirements)` returns `Capacity::Sufficient` when length (`len`) is at least `complex_len()` and `Capacity::NeedsGrowth` otherwise.
+  If allocated capacity (`capacity`) in bytes exceeds `byte_limit()`, it gives `ResourceLimit`.
+- `try_reserve(&requirements)` extends length to `complex_len()`.
+  If the resulting capacity would exceed the limit, it returns `ResourceLimit` before allocating; allocation failure returns `AllocationFailure`.
+  Existing capacity is retained and never automatically shrunk.
+- The entire retained capacity counts toward the limit, so reusing a large plan's workspace for a limited plan may give `ResourceLimit`.
+- `Deref` exposes a slice of `[Complex<S>]` that can be passed directly to `scratch` on `execute_into`.
+
+`plan.workspace(())` allocates a new workspace meeting the requirements.
+Passing an insufficiently long workspace gives `DimensionMismatch`.
+A prepared plan makes no heap allocation during execution with sufficient workspace.
+This is the contract stated in the rustdoc for `scioxide-fft`; this book's cells do not measure allocation counts.
+To reuse one workspace for plans of several lengths, call `try_reserve` for each plan to grow it to the maximum requirement.
+[Execution modes, workspaces, and reproducibility](../../../concepts/workspaces-and-reproducibility/) covers general workspace concepts.
+
+## Plan caches
+
+`FftPlanCache` is a bounded, caller-owned LRU cache (evicting the least recently used entries first).
+SciOxide has no implicit process-wide cache.
+`FftPlanCache::new(policy)` preallocates the entry table up to its entry limit and returns `AllocationFailure` if allocation fails.
+`cache.plan(spec, context)` returns the same plan as `FftPlan::build`, sharing tables when an entry's key matches.
+
+- Entry keys contain length, complex versus packed layout, execution policy, and resolved CPU instruction set.
+  Plans differing only in direction and normalization share an entry; `Real` and `Hermitian` also share one entry.
+  Even for `Automatic` requests, the key uses the resolved instruction set, so contexts with different capabilities do not share entries.
+- `FftCachePolicy::new(max_entries, max_plan_bytes)` sets entry-count and retained-byte limits.
+  Either being 0 gives `InvalidInput` (`OutOfRange`); defaults are 16 entries and 64 MiB.
+- A new entry that would exceed either limit evicts entries in least-recently-used order.
+  A plan exceeding `max_plan_bytes` on its own is returned without retention, so it does not evict other entries.
+- Returned plans share tables with the cache and remain valid after entry eviction.
+- Failed preparation leaves entries unchanged.
+- Plans prepared with contexts containing external implementations bypass the cache and its statistics (because provider and limits are absent from the key).
+- `plan` takes `&mut self`, so multiple threads cannot use one cache concurrently.
+
+`cache.stats()` returns `FftCacheStats`.
+`hits()` counts requests served from the cache, `misses()` newly prepared requests, `evictions()` entries evicted by limits, `entries()` current entries, and `retained_plan_bytes()` bytes retained by current entries (shared tables counted once).
+The three counters accumulate over the cache lifetime; `clear()` empties entries without resetting counts.
+These record reuse and storage, not execution times.
+
+The following cell makes two passes requesting complex forward, complex inverse, and real forward plans, in that order, for each length 64, 97, and 100.
+It reuses one `FftWorkspace` for every plan, recording each request's `check` result and length after `try_reserve`.
+Beside cache statistics, it lists independent values from a manually simulated LRU tracking keys (N, packed layout) using only the entry-count limit.
+Vary the entry limit and examine how reuse changes when it is below or above the 6-key count.
+
+```rust
+//| id: fft-plan-cache-reuse
+//| ref: fft-plan-cache-reuse
+//| title: "Check cache entry limits and workspace reuse through statistics"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-fft]
+//| inputs:
+//|   max_entries: {"type":"range","label":"Entry limit","description":"There are 6 keys. A limit below 6 evicts old entries on each pass.","min":1,"max":8,"step":1,"value":4}
+//| cases:
+//|   - {"id":"all-fit","label":"Limit 6","description":"All 6 keys remain, so the entire second pass reuses entries.","inputs":{"max_entries":6}}
+//|   - {"id":"single-entry","label":"Limit 1","description":"Only inverse transforms immediately following the same key reuse entries; all others prepare again.","inputs":{"max_entries":1}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"cache-stats","path":"/rows/0/1","approx":{"value":6,"atol":0.5}}
+//|       - {"artifact":"cache-stats","path":"/rows/1/1","approx":{"value":12,"atol":0.5}}
+//|       - {"artifact":"cache-stats","path":"/rows/2/1","approx":{"value":8,"atol":0.5}}
+//|       - {"artifact":"cache-stats","path":"/rows/2/2","approx":{"value":8,"atol":0.5}}
+//|       - {"artifact":"requests","path":"/rows/0/6","equals":"NeedsGrowth"}
+//|       - {"artifact":"requests","path":"/rows/1/6","equals":"Sufficient"}
+//|   - case: all-fit
+//|     expect:
+//|       - {"artifact":"cache-stats","path":"/rows/0/1","approx":{"value":12,"atol":0.5}}
+//|       - {"artifact":"cache-stats","path":"/rows/2/1","approx":{"value":0,"atol":0.5}}
+//|   - case: single-entry
+//|     expect:
+//|       - {"artifact":"cache-stats","path":"/rows/1/1","approx":{"value":12,"atol":0.5}}
+//|       - {"artifact":"cache-stats","path":"/rows/2/1","approx":{"value":11,"atol":0.5}}
+use scioxide_core::ExecutionContext;
+use scioxide_fft::{
+    FftCachePolicy, FftDirection, FftLayout, FftPlanCache, FftPlanSpec, FftWorkspace,
+    Normalization,
+};
+
+let limit = max_entries.round() as usize;
+let cx = ExecutionContext::sequential();
+let policy = FftCachePolicy::new(limit, 64 << 20).map_err(|e| e.to_string())?;
+let mut cache = FftPlanCache::<f64>::new(policy).map_err(|e| e.to_string())?;
+let mut workspace = FftWorkspace::<f64>::new();
+// One pass: complex forward, complex inverse, and real forward for each length
+let mut requests = Vec::new();
+for n in [64_usize, 97, 100] {
+    requests.push((n, FftDirection::Forward, FftLayout::Complex));
+    requests.push((n, FftDirection::Inverse, FftLayout::Complex));
+    requests.push((n, FftDirection::Forward, FftLayout::Real));
+}
+// Independent simulation: track LRU keys (N, packed layout) using only the entry limit
+let mut lru: Vec<(usize, bool)> = Vec::new();
+let (mut hits, mut misses, mut evictions) = (0_u64, 0_u64, 0_u64);
+let mut rows = Vec::new();
+for round in 1..=2 {
+    for &(n, direction, layout) in &requests {
+        let spec = FftPlanSpec::new(n, direction, Normalization::Inverse, layout);
+        let plan = cache.plan(spec, cx).map_err(|e| e.to_string())?;
+        let requirements = plan.workspace_requirements(()).map_err(|e| e.to_string())?;
+        let before = workspace.check(&requirements).map_err(|e| e.to_string())?;
+        workspace
+            .try_reserve(&requirements)
+            .map_err(|e| e.to_string())?;
+        let key = (n, layout != FftLayout::Complex);
+        if let Some(index) = lru.iter().position(|k| *k == key) {
+            hits += 1;
+            let found = lru.remove(index);
+            lru.push(found);
+        } else {
+            misses += 1;
+            if lru.len() == limit {
+                lru.remove(0);
+                evictions += 1;
+            }
+            lru.push(key);
+        }
+        rows.push((
+            round,
+            n,
+            format!("{layout:?} / {direction:?}"),
+            format!("{:?}", plan.diagnostics().algorithm()),
+            plan.plan_bytes(),
+            requirements.complex_len(),
+            format!("{before:?}"),
+            workspace.len(),
+        ));
+    }
+}
+let stats = cache.stats();
+let stat_rows = vec![
+    ("hits()", stats.hits(), Some(hits)),
+    ("misses()", stats.misses(), Some(misses)),
+    ("evictions()", stats.evictions(), Some(evictions)),
+    ("entries()", stats.entries() as u64, Some(lru.len() as u64)),
+    (
+        "retained_plan_bytes() [B]",
+        stats.retained_plan_bytes() as u64,
+        None,
+    ),
+];
+let request_columns = serde_json::json!([
+    { "key": "0", "label": "Pass", "type": "integer" },
+    { "key": "1", "label": "N", "type": "integer" },
+    { "key": "2", "label": "Layout / direction" },
+    { "key": "3", "label": "Algorithm" },
+    { "key": "4", "label": "plan_bytes() [B]", "type": "integer" },
+    { "key": "5", "label": "complex_len() [count]", "type": "integer" },
+    { "key": "6", "label": "check() before growth" },
+    { "key": "7", "label": "Length after try_reserve [count]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    request_columns,
+    rows,
+    metadata = serde_json::json!({ "id": "requests" })
+);
+let stat_columns = serde_json::json!([
+    { "key": "0", "label": "FftCacheStats" },
+    { "key": "1", "label": "SciOxide", "type": "integer" },
+    { "key": "2", "label": "Manually simulated LRU", "type": "integer", "nullText": "-" }
+]);
+emit_table_with_columns!(
+    stat_columns,
+    stat_rows,
+    metadata = serde_json::json!({ "id": "cache-stats" })
+);
+```
+
+At the default limit 4, the 6-key cycle evicts the least recently used entry on each new-key request in the second pass, so only the 6 inverse transforms immediately following the same key reuse entries (`hits()` 6, `misses()` 12, `evictions()` 8).
+At limit 6, all 9 second-pass requests reuse entries (`hits()` 12, `misses()` 6, `evictions()` 0); at limit 1 there are 11 evictions.
+The manually simulated LRU counts agree with SciOxide statistics at limits 1, 4, 6, and 8.
+
+The workspace grows to 128 values ($64 + 64$) for the first length-64 plan and to 289 ($97 + 2\cdot 96$) for the length-97 Rader plan.
+Every subsequent plan gives `Sufficient`, and the workspace does not shrink.
+The length-64 real layout requires 65 values ($33 + A(32)$), about half the complex layout.
+Length 97 is odd and not divisible by 3, 5, or 7, so its real layout uses a length-97 complex FFT internally and requires the same 289 values as the complex layout.
+
+## Summary
+
+Prepare a plan once from its specification and context, share immutable tables through `Arc`, and reuse it in any execution context.
+The caller owns workspace as `FftWorkspace`, queries size with `workspace_requirements`, and can reuse it across plans.
+`check` tests sufficiency by length but compares limits against allocated capacity, so a workspace grown large may be rejected by a limited plan.
+`FftPlanCache` is a bounded LRU placed by the caller; it combines direction and normalization differences into one entry and counts reuse and evictions through `stats()`.
+
+## Further reading
+
+- [External FFT implementations and CPU instruction sets](../providers-and-cpu-backends/) examines delegating a plan's complex FFTs to external implementations and what SciOxide checks.
+- [FFT algorithms and arbitrary lengths](../planner-and-arbitrary-lengths/) examines the algorithm selection inside plans, its cost, and rounding error.
+- [Multidimensional Fourier transforms](../multidimensional-transforms/) examines multidimensional plans and their workspace requirements.
+- [API guide](../../api/) lists plan, workspace, and cache types and functions.

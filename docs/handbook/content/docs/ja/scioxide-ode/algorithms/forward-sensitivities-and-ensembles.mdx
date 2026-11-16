@@ -1,0 +1,522 @@
+---
+title: 前進感度とアンサンブル
+description: 変分方程式を連立した前進感度、ForwardSensitivitySystem の拡大系と誤差の制御、終端の事象での時刻の感度、パラメータや初期値を変えた多数の問題を solve_ensemble_into で解くときの実行と計算回数の上限の分け方。
+sidebar:
+  order: 360
+references:
+  ode-forward-sensitivity-equations: "変分方程式と拡大系"
+  ode-event-sensitivities: "事象の時刻の感度"
+  ode-ensembles: "アンサンブル"
+  ode-forward-sensitivity-construction: "感度の系の作り方"
+---
+
+パラメータの推定、実験の Plan、不確かさの伝播では、解 $y(t; p)$ がパラメータ $p$ や初期値 $y_0$ でどれだけ変わるかが要る。
+パラメータが少なければ、解と一緒にその微分を積分する前進感度（forward sensitivity）が素直な方法である。
+また、パラメータや初期値を変えた多数の問題を解くこと（アンサンブル）は、感度を有限の変化で見る方法でもあり、Monte Carlo 法による不確かさの伝播でもある。
+このページでは前進感度の方程式、`ForwardSensitivitySystem` の使い方、終端の事象での感度、`solve_ensemble_into` による多数の問題の実行を説明する。
+スカラーの目的関数の勾配だけが要り、パラメータが多い場合は[随伴法](../adjoint-gradients/)の方が計算量が小さい。
+
+## 変分方程式と拡大系
+
+$y' = f(t, y, p)$、$y(t_0) = y_0(p)$ の解をパラメータの方向 $d \in \mathbb R^m$ に微分した $s(t) = \partial y(t)/\partial p \cdot d$ は、方程式を $p$ で微分した変分方程式
+
+$$
+s' = f_y(t, y, p)\, s + f_p(t, y, p)\, d, \qquad s(t_0) = \frac{\partial y_0}{\partial p}\, d
+$$
+
+に従う。
+$f_y$ は状態についての $n \times n$ のヤコビ行列、$f_p$ はパラメータについての $n \times m$ のヤコビ行列である。
+初期値 $y_{0,i}$ についての感度は、$d = 0$、$s(t_0) = e_i$（単位ベクトル）とした同じ方程式で得られる。
+変分方程式は $y$ に依存するので、$k$ 個の方向の感度を $y$ と連立した次元 $N = n(k + 1)$ の拡大系
+
+$$
+\frac{d}{dt}\begin{bmatrix} y \\ s_1 \\ \vdots \\ s_k \end{bmatrix}
+= \begin{bmatrix} f(t, y, p) \\ f_y s_1 + f_p d_1 \\ \vdots \\ f_y s_k + f_p d_k \end{bmatrix}
+$$
+
+として積分する。
+拡大系は通常の ODE なので、どの方式でも解ける。
+感度の成分も誤差の制御に入れるので、刻みは $y$ と感度の両方の精度で決まる（連立型の制御）。
+
+拡大系の右辺の 1 回の評価は、$f$ の 1 回と方向微分 $f_y s_j + f_p d_j$ の $k$ 回である。
+陽的な方式では、計算量はおおよそ方向の数に比例して増える。
+陰的な方式（BDF、Radau IIA、後退 Euler 法など）は拡大系のヤコビ行列を前進差分で作るので、密な線形解法では 1 回あたり拡大系の右辺を約 $N$ 回評価し、$N^2$ 個の要素を保存する。
+Krylov の線形解法は方向差分を使い、行列を作らない（[ヤコビ行列と各ステージの線形方程式の解法](../jacobians-and-linear-stages/)）。
+
+## 感度の系の作り方
+
+`OdeSensitivitySystem` は状態の次元 $n$（`dimension`）、実数のパラメータの数 $m$（`parameter_dimension`）、右辺 $f(t, y, p)$（`rhs`）、方向微分 $f_y\,\delta y + f_p\,\delta p$（`tangent_rhs`）を与える。
+方向微分は密・疎のヤコビ行列、行列を作らない作用、前進モードの自動微分のどれで計算してもよい。
+状態は実数か複素数で、パラメータは実数である。
+方向微分は実の経路に沿った微分なので、正則でない右辺でも実線形な積を返せばよい。
+コールバックが使う作業用のスカラーの数は `workspace_len` で返す。
+
+`ForwardSensitivitySystem::bind(provider, parameters, parameter_directions, workspace)` は、パラメータの値と、行ごとに 1 つの方向を持つ $k \times m$ の行列を受け取り、拡大系の `OdeSystem` を返す。
+方向の値は `ForwardSensitivityWorkspace` に $O(km)$ の手間で写し、作業領域は必要なときだけ大きくなる。
+`ForwardSensitivityRequirements::new(provider, directions)` は、方向の値の数 $mk$（`packed_directions`）と作業用のスカラーの数（`provider_scratch`）を返し、作業領域の `check` と `try_reserve` で前もって確保できる。
+束ねた系は作業領域を借用するので、系を使い終わるまで作業領域は他に使えない。
+
+拡大系の初期値は `initialize_into(state, tangents, output)` で作る。
+`tangents` は列 $j$ が $s_j(t_0)$ の $n \times k$ の行列で、0 の列はパラメータの感度、単位ベクトルの列は初期値の感度になる。
+積分の後は `extract_into(augmented, state, tangents)` で状態と感度に分ける。
+`error_tolerance(primal_absolute, sensitivity_absolute, relative, norm)` は、$y$ と感度に別の絶対許容誤差を持つ拡大系の許容誤差を作り、`OdeOptions::with_error_tolerance` に渡す。
+感度の大きさが状態と大きく違うときは、感度の絶対許容誤差を感度の尺度に合わせる。
+
+## 事象の時刻の感度
+
+事象 $g(t, y, p) = 0$ で積分を止めると、止まる時刻 $t^*$ 自体がパラメータに依存する。
+拡大系が与える $s_j(t^*)$ は時刻を固定した感度で、事象の時刻の変化を含まない。
+$g(t^*(p), y(t^*(p); p), p) = 0$ を方向 $j$ に微分すると、事象の時刻と事象での状態の感度は
+
+$$
+\tau_j = \frac{\partial t^*}{\partial p}\, d_j = -\frac{g_y s_j + g_p d_j}{g_t + g_y f}, \qquad
+\sigma_j = s_j + f\, \tau_j
+$$
+
+になる。
+分母 $g_t + g_y f$ は事象関数の全微分（$dg/dt$）で、0 に近いと（事象の関数が接する）感度は不安定になり、0 では定義されない。
+条件数は $1/|dg/dt|$ のように増える。
+
+`ForwardSensitivitySystem::event_sensitivities_into(input, time_output, state_output)` はこの変換を $O(nk)$ の手間で行う。
+`EventSensitivityInput` には、時刻を固定した感度の行列（`fixed_time`）、事象での状態の傾き $f$（`state_slope`）、方向ごとの分子 $g_y s_j + g_p d_j$（`numerators`）、全微分 $dg/dt$（`event_slope`）、横断性の閾値（`minimum_slope`）、根が孤立しているかの提示内容（`isolation`）を与える。
+これらの値は呼び出し側が事象関数の導関数から計算する。
+`EventIsolation::Ambiguous` か $|dg/dt| \le$ `minimum_slope` なら、何も書かずに `EventSensitivityStatus::Ambiguous` か `NonTransverse` を返し、それ以外は `Available` を返す。
+この状態は感度の変換の可否だけを表し、積分そのものの成否は `OdeTermination` で読む。
+事象で状態を変える（跳びを与える）場合の感度の補正は提供しないので、跳びの写像の微分を呼び出し側で掛ける。
+
+## 前進感度の実験
+
+ロジスティック成長
+
+$$
+y' = r\, y \left(1 - \frac{y}{K}\right), \qquad y(0) = y_0
+$$
+
+の解は $y(t) = K/D$、$D = 1 + A e^{-rt}$、$A = (K - y_0)/y_0$ で、三つの感度も閉形式で書ける。
+
+$$
+\frac{\partial y}{\partial r} = \frac{K A t\, e^{-rt}}{D^2}, \qquad
+\frac{\partial y}{\partial K} = \frac{1}{D} - \frac{K e^{-rt}}{y_0 D^2}, \qquad
+\frac{\partial y}{\partial y_0} = \frac{K^2 e^{-rt}}{y_0^2 D^2}
+$$
+
+方向微分は $f_y = r(1 - 2y/K)$、$f_r = y(1 - y/K)$、$f_K = r y^2/K^2$ から作る。
+
+次のブロックは二つのセルが使うモデルである。
+`logistic_rhs` が右辺 $f$、`Logistic` が `OdeSensitivitySystem` の実装（パラメータ $p = (r, K)$）、`logistic_exact` が解と三つの感度の閉形式に対応する。
+
+```rust
+//| id: ode-logistic-sensitivity-model
+//| kind: definitions
+//| title: ロジスティック成長の右辺、方向微分と閉形式
+//| crates: [scioxide-core, scioxide-ode]
+use scioxide_core::{SciOxideError, SolveContext};
+use scioxide_ode::OdeSensitivitySystem;
+
+/// f(y; r, K) = r y (1 − y/K)。
+pub(crate) fn logistic_rhs(r: f64, k: f64, y: f64) -> f64 {
+    r * y * (1.0 - y / k)
+}
+
+/// パラメータ p = (r, K) のロジスティック成長。
+pub(crate) struct Logistic;
+
+impl OdeSensitivitySystem<f64> for Logistic {
+    fn dimension(&self) -> usize {
+        1
+    }
+
+    fn parameter_dimension(&self) -> usize {
+        2
+    }
+
+    fn rhs(
+        &self,
+        _: f64,
+        y: &[f64],
+        p: &[f64],
+        out: &mut [f64],
+        _: &mut [f64],
+        _: &mut SolveContext<'_, '_>,
+    ) -> Result<(), SciOxideError> {
+        out[0] = logistic_rhs(p[0], p[1], y[0]);
+        Ok(())
+    }
+
+    // f_y δy + f_r δr + f_K δK。f_y = r(1 − 2y/K)、f_r = y(1 − y/K)、f_K = r y²/K²。
+    fn tangent_rhs(
+        &self,
+        _: f64,
+        y: &[f64],
+        p: &[f64],
+        dy: &[f64],
+        dp: &[f64],
+        out: &mut [f64],
+        _: &mut [f64],
+        _: &mut SolveContext<'_, '_>,
+    ) -> Result<(), SciOxideError> {
+        let (r, k, y) = (p[0], p[1], y[0]);
+        let f_y = r * (1.0 - 2.0 * y / k);
+        out[0] = f_y * dy[0] + y * (1.0 - y / k) * dp[0] + r * y * y / (k * k) * dp[1];
+        Ok(())
+    }
+}
+
+/// 閉形式 [y, ∂y/∂r, ∂y/∂K, ∂y/∂y₀]（参照値、f64 の標準関数）。
+pub(crate) fn logistic_exact(r: f64, k: f64, y0: f64, t: f64) -> [f64; 4] {
+    let (a, e) = ((k - y0) / y0, (-r * t).exp());
+    let d = 1.0 + a * e;
+    [
+        k / d,
+        k * a * t * e / (d * d),
+        1.0 / d - k * e / (y0 * d * d),
+        k * k * e / (y0 * y0 * d * d),
+    ]
+}
+```
+
+次のセルは培養中の細菌を想定し、$K = 100$（$10^6$ 個/mL）、$y_0 = 2$、$t \in [0, 20]$ h、増殖率 $r$ を入力とする。
+パラメータの方向 $(1, 0)$、$(0, 1)$ と、初期値の方向（パラメータの方向 0、初期の接ベクトル 1）の 3 方向を `DormandPrince5` で拡大系として解く。
+グラフは三つの感度を弾性値 $(p/y)\,\partial y/\partial p$（パラメータの相対変化に対する解の相対変化）で描き、記号が数値解、破線が閉形式である。
+表は終端での感度と閉形式との差を示す。
+
+```rust
+//| id: ode-forward-sensitivity
+//| ref: ode-forward-sensitivity
+//| title: ロジスティック成長の感度を前進感度と閉形式で比べる
+//| run: reactive
+//| uses: [ode-logistic-sensitivity-model]
+//| crates: [scioxide-core, scioxide-linalg, scioxide-ode]
+//| inputs:
+//|   rate: {"type":"range","label":"増殖率 r [1/h]","min":0.2,"max":2,"step":0.05,"value":0.6}
+//|   tolerance_exponent: {"type":"range","label":"許容誤差の指数 p（ε = 10^p）","description":"状態と感度の絶対・相対許容誤差。","min":-12,"max":-4,"step":1,"value":-9}
+//| cases:
+//|   - {"id":"fast","label":"r = 2 h⁻¹","description":"早く飽和し、終端の r と y₀ の感度はほぼ 0 になる。","inputs":{"rate":2}}
+//|   - {"id":"loose","label":"ε = 10⁻⁴","description":"刻みが減り、感度の誤差が増える。","inputs":{"tolerance_exponent":-4}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"sensitivities","path":"/rows/0/3","range":{"max":1e-5}}
+//|       - {"artifact":"sensitivities","path":"/rows/1/3","range":{"max":1e-7}}
+//|       - {"artifact":"sensitivities","path":"/rows/2/3","range":{"max":1e-7}}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+//|   - case: loose
+//|     expect:
+//|       - {"artifact":"sensitivities","path":"/rows/0/3","range":{"max":1e-1}}
+use scioxide_core::{EvaluationRole, NormSelection};
+use scioxide_linalg::{MatrixView, MatrixViewMut, Vector};
+use scioxide_ode::{
+    DormandPrince5, ForwardSensitivitySystem, ForwardSensitivityWorkspace, OdeMethod,
+    OdeOptions, OdeOutputSchedule, OdeProblem, OdeState,
+};
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let digits10 = serde_json::json!({ "significantDigits": 10 });
+let (capacity, start, horizon) = (100.0_f64, 2.0_f64, 20.0_f64);
+let parameters = [rate, capacity];
+// 方向の行: ∂/∂r、∂/∂K、初期値の方向（パラメータの方向は 0）。
+let directions = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+let directions = MatrixView::from_slice(3, 2, &directions).map_err(|e| e.to_string())?;
+let mut sensitivity_workspace = ForwardSensitivityWorkspace::new();
+let system = ForwardSensitivitySystem::bind(
+    &Logistic,
+    &parameters,
+    directions,
+    &mut sensitivity_workspace,
+)
+.map_err(|e| e.to_string())?;
+// 初期の接ベクトル s(0) = (0, 0, 1)：初期値の方向だけが 1。
+let tangents = MatrixView::from_slice(1, 3, &[0.0, 0.0, 1.0]).map_err(|e| e.to_string())?;
+let mut initial = vec![0.0; system.augmented_dimension()];
+system
+    .initialize_into(&[start], tangents, &mut initial)
+    .map_err(|e| e.to_string())?;
+let epsilon = 10.0_f64.powf(tolerance_exponent);
+let tolerance = system
+    .error_tolerance(epsilon, epsilon, epsilon, NormSelection::RootMeanSquare)
+    .map_err(|e| e.to_string())?;
+let times: Vec<f64> = (0..=80).map(|i| horizon * f64::from(i) / 80.0).collect();
+let options = OdeOptions::new()
+    .with_error_tolerance(tolerance)
+    .with_output_schedule(OdeOutputSchedule::times(times));
+let solution = DormandPrince5::new()
+    .solve(
+        &OdeProblem::new(&system, horizon),
+        &options,
+        OdeState::new(0.0, Vector::from_vec(initial)),
+    )
+    .map_err(|e| e.error().to_string())?;
+let exact = |t: f64| logistic_exact(rate, capacity, start, t);
+let scales = [rate, capacity, start];
+let names = ["r", "K", "y₀"];
+let units = ["[10⁶ h/mL]", "[-]", "[-]"];
+let mut layers = Vec::new();
+for j in 0..3 {
+    let numeric: Vec<[f64; 2]> = solution
+        .trajectory()
+        .times()
+        .iter()
+        .zip(solution.trajectory().states())
+        .map(|(&t, s)| [t, scales[j] * s.as_slice()[j + 1] / s.as_slice()[0]])
+        .collect();
+    let reference: Vec<[f64; 2]> = (0..=200)
+        .map(|i| horizon * f64::from(i) / 200.0)
+        .map(|t| [t, scales[j] * exact(t)[j + 1] / exact(t)[0]])
+        .collect();
+    layers.push(serde_json::json!({
+        "id": format!("n{j}"),
+        "kind": "scatter",
+        "name": format!("{}（前進感度）", names[j]),
+        "points": numeric
+    }));
+    layers.push(serde_json::json!({
+        "id": format!("e{j}"),
+        "kind": "line",
+        "name": format!("{}（閉形式）", names[j]),
+        "points": reference,
+        "style": { "lineType": "dashed", "showSymbol": false }
+    }));
+}
+emit_chart!(serde_json::json!({
+    "kind": "xy",
+    "xLabel": "時刻 t [h]",
+    "yLabel": "弾性値 (p/y) ∂y/∂p [-]",
+    "dataZoom": true,
+    "tooltip": true,
+    "layers": layers
+}));
+// 終端の拡大系を状態と感度に分ける。
+let mut state = [0.0];
+let mut sensitivities = [0.0; 3];
+system
+    .extract_into(
+        solution.state().values(),
+        &mut state,
+        MatrixViewMut::from_slice(1, 3, &mut sensitivities).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+let reference = exact(horizon);
+let rows: Vec<(String, f64, f64, f64)> = (0..3)
+    .map(|j| {
+        (
+            format!("∂y/∂{} {}", names[j], units[j]),
+            sensitivities[j],
+            reference[j + 1],
+            (sensitivities[j] - reference[j + 1]).abs(),
+        )
+    })
+    .collect();
+let columns = serde_json::json!([
+    { "key": "0", "label": "感度" },
+    { "key": "1", "label": "前進感度", "type": "number", "format": digits10 },
+    { "key": "2", "label": "閉形式", "type": "number", "format": digits10 },
+    { "key": "3", "label": "差の絶対値", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "sensitivities" })
+);
+let report = solution.report();
+let counts = report.counts();
+let outcome = if report.is_success() {
+    Outcome::satisfied("終端まで積分した（精度は閉形式との差で読む）")
+} else {
+    Outcome::partial("終端の前で止まった")
+};
+emit_outcome!(
+    outcome
+        .status(format!("{:?}", report.termination()))
+        .diagnostic("受理した刻み", report.accepted_steps() as f64, None)
+        .diagnostic(
+            "右辺の評価",
+            counts.provider(EvaluationRole::RightHandSide) as f64,
+            None
+        )
+        .diagnostic(
+            "方向微分の評価",
+            counts.provider(EvaluationRole::LinearOperator) as f64,
+            None
+        )
+);
+```
+
+既定値（$r = 0.6$ h⁻¹、$\varepsilon = 10^{-9}$）では、153 刻みで `ReachedEnd` に達し、$t = 20$ h での三つの感度は閉形式と $1.5 \times 10^{-9}$（$\partial y/\partial r$）、$3.7 \times 10^{-12}$（$\partial y/\partial K$）、$7.7 \times 10^{-11}$（$\partial y/\partial y_0$）の差で一致する。
+右辺の評価 926 回に対して方向微分の評価は 2778 回で、3 方向の分だけ 3 倍になる。
+弾性値のグラフでは、$y_0$ の弾性値は 1 から減り、$r$ の弾性値は増殖の途中で最大になり、飽和すると $K$ の弾性値が 1 に近づいて他の二つは 0 に近づく。
+飽和した解は $K$ だけで決まり、初期値と増殖率の情報を失うので、$t = 20$ h の観測だけから $r$ を推定するのは難しいことがグラフから分かる。
+$\varepsilon = 10^{-4}$ では 18 刻みになり、$\partial y/\partial r$ の差は $8.6 \times 10^{-5}$ に増える。
+$r = 2$ h⁻¹ では $\partial y/\partial r$ の真の値 $4.2 \times 10^{-13}$ に対して数値は $6.0 \times 10^{-10}$ で、差は感度の絶対許容誤差 $10^{-9}$ の程度にとどまる。
+0 に近い感度の相対誤差は意味を持たないので、絶対許容誤差で読む。
+
+## アンサンブル
+
+`solve_ensemble_into(parameters, run, policy, members, outcomes, workspace, scope)` は、メンバー $i = 0, 1, \dots$ ごとに `run(i, parameters_i, member_i, cx)` を呼び、結果を `outcomes[i]` に入れて `EnsembleReport` を返す。
+`run` が受け取る `cx` はそのメンバーの入れ子の解法のコンテキストで、メンバーの解法の `advance` にそのまま渡す。
+`members` はメンバーごとの可変の状態（作業領域や結果の置き場）で、数値のメモリはメンバーが持つ。
+
+`EnsembleParameters` はパラメータの渡し方である。
+`Shared(values)` は全メンバーに同じ列を写さずに渡し、`Independent(matrix)` は $M \times m$ の行列の行 $i$ をメンバー $i$ に渡す。
+行が連続した行列はそのまま借用し、それ以外の配置の行は実行ごとに作業領域へ写す。
+パラメータが有限でないと、どのメンバーも実行せずに `NonFinite` を返す。
+`EnsembleRequirements::new(members, parameters)` はメンバーの数と写すパラメータの数を返し、`EnsembleWorkspace` の `check` と `try_reserve` で確保できる。
+作業領域が十分に大きければ、関数そのものはメモリを確保しない。
+
+`EnsembleOutcome` はメンバーの結果が成功かを返すトレイトで、ODE、SDE、DDE、DAE、力学系、BVP、随伴の各レポートが実装する。
+レポートと解から取り出した値を組にした独自の型にも実装できる。
+メンバーのエラーはそのメンバーの結果（`Some(Err(e))`）として残り、他のメンバーの実行を止めない。
+`EnsembleReport` は実行したメンバーの数（`completed`）、成功したメンバーの数（`successful`）、全体の作業量（`accounting`）を持ち、`is_success` は全メンバーが実行されて成功したときだけ真である。
+取り消しなどで実行自体が止まった場合は、終わったメンバーの結果を残し、残りは `None` のままで、`EnsembleWorkspace::last_attempt` にレポートが残る。
+
+`ExecutionPolicy::Sequential` ではメンバーを番号の順に呼ぶ。
+他の方針では、実行コンテキストのエグゼキューターのワーカーにメンバーを分け、分割は最大 64 個である。
+並列に実行するには `run` が `Sync`、メンバーと結果が `Send` でなければならない。
+囲む解法の計算回数の上限（評価回数などの共有の上限）は、実行の前にメンバーへ番号の順に分配され、あるメンバーが使わなかった分は他のメンバーに回らない。
+各メンバーの反復と提案の上限は個別に持たず、メンバーの解法の設定で決める。
+Wasm のセルは逐次の実行コンテキストで動くので、どの方針でも 1 つのワーカーで番号の順に実行される。
+
+## 増殖率のアンサンブルと剛性
+
+次のセルは同じロジスティック方程式（$K = 100$、$y_0 = 2$、$T = 20$ h）を増殖率 $r = 0.1, 0.3, 1, 3, \dots, 1000$ h⁻¹ の 9 個のメンバーで解く。
+パラメータは `Independent` の $9 \times 1$ の行列で渡し、各メンバーは `DormandPrince5` の `advance` に `cx` を渡して解く。
+すべてのメンバーに同じ刻みの上限 $N_{\max}$ を設定する。
+$r$ が大きいと、平衡 $y = K$ でのヤコビ行列 $f_y = -r$ により問題は剛性を持ち、陽的な方式の刻み幅は安定性の条件でおよそ $3.3/r$ に制限される（[誤差・次数・安定性](../error-order-and-stability/)）。
+表はメンバーごとの終端値、閉形式との差、受理した刻み、終了状態を示す。
+
+```rust
+//| id: ode-ensemble-growth-rates
+//| ref: ode-ensemble-growth-rates
+//| title: 増殖率を変えたアンサンブルで刻みの上限による停止を見る
+//| run: reactive
+//| uses: [ode-logistic-sensitivity-model]
+//| crates: [scioxide-core, scioxide-linalg, scioxide-ode]
+//| inputs:
+//|   step_limit: {"type":"range","label":"刻みの上限 N_max [回]","description":"各メンバーの試行した刻みの上限。","min":500,"max":20000,"step":500,"value":2000}
+//| cases:
+//|   - {"id":"generous","label":"N_max = 20000","description":"全メンバーが終端に達する。","inputs":{"step_limit":20000}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"members","path":"/rows/0/3","range":{"max":1e-2}}
+//|       - {"artifact":"members","path":"/rows/8/5","equals":"Some(BudgetLimit(Proposal))"}
+//|       - {"path":"/outputs/1/state","equals":"partial"}
+//|   - case: generous
+//|     expect:
+//|       - {"artifact":"members","path":"/rows/8/5","equals":"Some(ReachedEnd)"}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+use scioxide_core::{Budget, ExecutionContext, ExecutionPolicy, SciOxideError, SolveContext};
+use scioxide_linalg::{MatrixView, Vector};
+use scioxide_ode::{
+    DormandPrince5, EnsembleParameters, EnsembleWorkspace, OdeFn, OdeMethod, OdeOptions,
+    OdeProblem, OdeSolveReport, OdeState, solve_ensemble_into,
+};
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let digits3 = serde_json::json!({ "significantDigits": 3 });
+let digits4 = serde_json::json!({ "significantDigits": 4 });
+let digits8 = serde_json::json!({ "significantDigits": 8 });
+let (capacity, start, horizon) = (100.0_f64, 2.0_f64, 20.0_f64);
+let rates = [0.1, 0.3, 1.0, 3.0, 10.0, 30.0, 100.0, 300.0, 1000.0];
+let parameters = MatrixView::from_slice(rates.len(), 1, &rates).map_err(|e| e.to_string())?;
+let budget = Budget::try_from(step_limit.round() as usize).map_err(|e| e.to_string())?;
+let options = OdeOptions::new().with_max_steps(budget);
+// メンバー i は増殖率 p[0] の問題を解き、終端値を member に書く。
+let run = |_: usize, p: &[f64], member: &mut f64, cx: &mut SolveContext<'_, '_>| {
+    let r = p[0];
+    let system = OdeFn::new(1, move |_: f64, y: &[f64], out: &mut [f64]| {
+        out[0] = logistic_rhs(r, capacity, y[0]);
+        Ok(())
+    })?;
+    let problem = OdeProblem::new(&system, horizon);
+    let plan = DormandPrince5::new();
+    let mut workspace = plan.workspace(&problem, &options)?;
+    let mut state = OdeState::new(0.0, Vector::from_vec(vec![start]));
+    let report = plan.advance(&problem, &options, &mut state, &mut (), &mut workspace, cx)?;
+    *member = state.values()[0];
+    Ok(report)
+};
+let mut members = vec![0.0_f64; rates.len()];
+let mut outcomes: Vec<Option<Result<OdeSolveReport<f64>, SciOxideError>>> =
+    (0..rates.len()).map(|_| None).collect();
+let mut workspace = EnsembleWorkspace::new();
+let ensemble = solve_ensemble_into(
+    EnsembleParameters::Independent(parameters),
+    &run,
+    ExecutionPolicy::Sequential,
+    &mut members,
+    &mut outcomes,
+    &mut workspace,
+    ExecutionContext::sequential(),
+)
+.map_err(|e| e.to_string())?;
+// 閉形式の y(T)（参照値）。
+let exact = |r: f64| logistic_exact(r, capacity, start, horizon)[0];
+let mut rows = Vec::new();
+for (i, outcome) in outcomes.iter().enumerate() {
+    let report = match outcome {
+        Some(Ok(report)) => report,
+        Some(Err(error)) => return Err(error.to_string()),
+        None => return Err("実行されなかったメンバーがある".to_string()),
+    };
+    let finished = report.is_success();
+    rows.push((
+        rates[i],
+        report.final_time(),
+        members[i],
+        finished.then(|| (members[i] - exact(rates[i])).abs()),
+        report.accepted_steps(),
+        format!("{:?}", report.termination()),
+    ));
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "増殖率 r [1/h]", "type": "number", "format": digits3 },
+    { "key": "1", "label": "最後の時刻 [h]", "type": "number", "format": digits4 },
+    { "key": "2", "label": "最後の y [10⁶/mL]", "type": "number", "format": digits8 },
+    { "key": "3", "label": "終端の誤差 [10⁶/mL]", "type": "number", "format": sci3, "nullText": "未到達" },
+    { "key": "4", "label": "受理した刻み [回]", "type": "integer" },
+    { "key": "5", "label": "終了状態" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "members" })
+);
+let outcome = if ensemble.is_success() {
+    Outcome::satisfied("全メンバーが終端に達した")
+} else {
+    Outcome::partial("刻みの上限で止まったメンバーがある")
+        .explanation("止まったメンバーの値は最後に受理した点で、終端の値ではない。")
+};
+emit_outcome!(
+    outcome
+        .status(format!(
+            "成功 {} / 実行 {}",
+            ensemble.successful(),
+            ensemble.completed()
+        ))
+        .diagnostic("成功したメンバー", ensemble.successful() as f64, None)
+        .diagnostic("実行したメンバー", ensemble.completed() as f64, None)
+);
+```
+
+既定の $N_{\max} = 2000$ では、$r \le 100$ の 7 個のメンバーが終端に達し、$r = 300$ と $1000$ の 2 個は `BudgetLimit(Proposal)` で止まる。
+アンサンブルのレポートは「成功 7、実行 9」で、止まったメンバーも結果を持ち、他のメンバーの実行を妨げない。
+受理した刻みは $r \ge 10$ でほぼ $r$ に比例し、$r = 1000$ を終端まで解くには 6066 刻み（$h \approx 3.3/r$）が要る。
+平衡に達した後の解はほぼ一定なのに刻みが増えるのは、精度ではなく安定性が刻み幅を決めるためで、剛性のある問題には[陰的な方式](../implicit-runge-kutta-and-mass-matrices/)か、剛性を検出して方式を切り替える[自動切り替え](../rosenbrock-and-stiffness-switching/)を選ぶ。
+止まった 2 個のメンバーは、最後の時刻は 18.0 h と 5.41 h と違うが、最後の y と受理した刻みの数は同じである。
+増殖率 $r$ のロジスティック方程式は時刻 $rt$ で見ると $r = 1$ の方程式になり、絶対許容誤差の下で `DormandPrince5` は同じ刻みを時刻の尺度だけ変えて選ぶので、同じ数の刻みで止まると同じ値になる。
+
+## まとめ
+
+前進感度は変分方程式 $s' = f_y s + f_p d$ を解と連立した次元 $n(k + 1)$ の拡大系で、`ForwardSensitivitySystem::bind` が `OdeSensitivitySystem` から作る通常の `OdeSystem` なので、どの方式でも解ける。
+感度の成分も誤差の制御に入るので、`error_tolerance` で感度の尺度に合った絶対許容誤差を与える。
+計算量は方向の数にほぼ比例し、陰的な方式では拡大系のヤコビ行列の差分の計算コストが加わるので、パラメータが多く勾配だけが要る場合は随伴法を選ぶ。
+終端の事象では `event_sensitivities_into` で時刻を固定した感度を事象の時刻の感度に直し、$|dg/dt|$ が小さい事象では変換しない。
+`solve_ensemble_into` はメンバーごとの結果を残して多数の問題を解き、成否は `EnsembleReport` とメンバーごとの終了状態で読む。
+
+## 次に読むページ
+
+- [随伴法による勾配とチェックポイント](../adjoint-gradients/)：パラメータが多いときの勾配を逆向きの積分で求める。
+- [Lorenz 系の初期値鋭敏性と Lyapunov 指数](../../examples/lorenz-lyapunov/)：初期値の感度を使って Lyapunov 指数を推定する。
+- [確率微分方程式の解釈と解法](../stochastic-equations/)：アンサンブルで確率微分方程式の期待値を推定する。
+- [連続出力と事象](../dense-output-and-events/)：事象の検出と局在化を確かめる。

@@ -1,0 +1,275 @@
+---
+title: 多次元 Fourier 変換
+description: 多次元 DFT を軸ごとの 1 次元変換に分ける理由と計算コスト、行優先の格納と一括の軸、ストライド付きのビューを読む多次元の Plan を説明する。
+sidebar:
+  order: 320
+references:
+  fft-multidimensional: "軸ごとの分離と計算量"
+  fft-row-major-batches: "行優先の格納と一括の軸"
+  fft-nd-plan: "多次元の-plan"
+---
+
+画像、体積データ、時刻とチャネルを持つ記録は、複数の軸を持つ配列である。
+多次元の離散 Fourier 変換（DFT）は、選んだ軸ごとに 1 次元の DFT を順にかければ求まる。
+`scioxide-fft` では、配列の形状と変換する軸の列を別々に指定し、選ばなかった軸は独立な一括の変換として残る。
+このページは軸ごとの分離の導出と計算コスト、配列の格納と軸の対応、ストライド付きのビューを読む Plan を説明する。
+多次元の DCT・DST の Plan と作業領域は[多次元の DCT・DST と作業領域](../multidimensional-dct-dst/)にある。
+実数配列で 1 本の軸だけを詰める方法と、周波数の並べ替えは[多次元の実数 FFT と周波数の並べ替え](../real-multidimensional-transforms/)にある。
+
+## 軸ごとの分離と計算量
+
+形状 $(N_0,\ldots,N_{D-1})$ の複素配列 $x_{\mathbf n}$ の、すべての軸に沿う DFT は
+
+$$
+X_{\mathbf k}=\sum_{n_0=0}^{N_0-1}\cdots\sum_{n_{D-1}=0}^{N_{D-1}-1}
+x_{\mathbf n}\prod_{d=0}^{D-1}e^{-2\pi i k_dn_d/N_d}
+$$
+
+である（$\mathbf n=(n_0,\ldots,n_{D-1})$ は標本の添字、$\mathbf k$ は波数の添字）。
+核が軸ごとの指数の積に分かれるので、和を内側から 1 軸ずつ取ると、各段は 1 本の軸に沿う 1 次元 DFT を他の軸の添字ごとに並べたものになる。
+厳密な演算では軸の順序を変えても値は同じである。
+浮動小数点では途中の丸めが順序で変わるので、結果は丸め誤差の範囲で違いうる。
+
+総要素数を $V=\prod_dN_d$ とすると、軸 $d$ の段は長さ $N_d$ の FFT を $V/N_d$ 回行うので $O(V\log N_d)$ かかる。
+全軸では $O(V\sum_d\log N_d)=O(V\log V)$、選んだ軸の集合 $A$ だけなら $O(V\sum_{d\in A}\log N_d)$ である。
+各軸の長さはどれでもよく、2・3・5・7 だけを素因数に持つ長さが速い（[速い長さの選択](oxref:fft-fast-lengths)）。
+
+## 行優先の格納と一括の軸
+
+一括関数 `fftn` と `ifftn` は配列を行優先（最後の軸が最も速く変わる順）に並べたスライスと、その形状 `shape`、変換する軸の列 `axes` を受け取る。
+実数配列の `rfftn` と `ihfftn` も同じ引数を取る（[多次元の実数 FFT と周波数の並べ替え](../real-multidimensional-transforms/)）。
+要素 $\mathbf n$ の位置は $\sum_dn_ds_d$ で、ストライドは $s_{D-1}=1$、$s_d=s_{d+1}N_{d+1}$ である。
+例えば形状 `[2, 3]` の要素 `(1, 2)` は位置 $1\cdot3+2=5$ にある。
+結果は同じ形状と順序の新しい `Vec` で返る。
+
+`axes` に入れなかった軸はその添字ごとに独立な変換を並べる一括の軸になる。
+形状 `[バッチ, 行, 列]` に `axes = &[1, 2]` を渡すと、バッチごとに 2 次元の変換を行う。
+軸は `axes` の順に変換される。
+
+正規化の基準長は選んだ軸の長さの積で、一括の軸の長さは含めない。
+変換の前に値の範囲を 2 のべきで縮め、最後に戻す処理もバッチごとに行う。
+大きい値を持つバッチに合わせて、別のバッチの小さい値まで縮めて下位桁を失うことを避けるためである。
+
+一括関数のエラーは次のとおりである。
+
+- スライスの長さが形状の要素数と違えば `DimensionMismatch`、形状の積が `usize` に収まらなければ `SizeOverflow` になる。
+- 階数以上の軸は `OutOfBounds`、同じ軸の重複は `InvalidInput`（`Inconsistent`）、長さ 0 の軸を選ぶと `InvalidInput`（`Empty`）になる。
+- 入力の NaN と無限大は `NonFinite`、有限の入力から結果があふれると `NumericalInstability`（`Overflow`）になる。
+
+## 多次元の Plan
+
+同じ形状の変換を繰り返すとき、またはストライド付きの配列を変換するときは Plan を使う。
+`FftNdPlanSpec::new(shape, axes, direction, normalization, layout)` は形状と軸を写して保持し、写しを確保できなければ `AllocationFailure` を返す。
+軸と形状の検査は `FftNdPlan::new(spec)` が準備のときに行い、エラーは一括関数と同じ分類になる。
+`FftLayout::Real` と `FftLayout::Hermitian` では、選んだ軸が 1 本以上必要である。
+
+`execute_into(input, output, scratch, context)` の入力は `FftNdInput`、出力は `FftNdOutput` で、どちらも `NdView` と `NdViewMut` から変換される。
+複素のビューは `Complex`、実数のビューは `Real` の列挙子になる。
+ビューの形状が Plan と違えば `DimensionMismatch`、列挙子が配置と方向に合わなければ `InvalidInput`（`UnsupportedConfiguration`）になる。
+ビューは任意のストライドを持てるので、転置して格納した配列や、パディングを含む配列の一部を写さずに読める。
+入力には零のストライドで同じ要素を共有する配置（`StridedLayout::new_broadcast`）も使える。
+出力の `NdViewMut` は、作るときに要素ごとの位置が互いに異なることを確かめるので、重なる配置は出力にならない。
+実数配列の Plan（`FftLayout::Real` と `Hermitian`）の入出力は[実数配列の詰め方](oxref:fft-real-nd-layout)で扱う。
+
+作業領域は一次元の Plan と同じ `FftWorkspace` で、`plan.workspace(())` で確保し、`workspace_requirements(())` で必要な複素数の個数とバイト数を調べる。
+要件は準備のときに決まり、結果を組み立てる $V$ 個の領域、ストライドのある列を一時的に並べる領域、軸ごとの 1 次元変換の作業領域の最大を足した $O(V+\max_dN_d)$ 個の複素数である。
+十分な作業領域を渡した実行はヒープを確保しない。
+複素の Plan は `execute_in_place` で配列をその場で変換できる。
+エラーのときは出力を書き換えない。
+
+### 2 次元の変換と軸ごとの 1 次元変換の照合
+
+次のセルは複素の平面波 $x_{jk}=e^{2\pi i(2j/M+3k/N)}$ を `fftn` で 2 次元変換し、行と列の 1 次元 `fft` を順にかけた結果と比べる。
+軸 1 だけを選んだ `fftn` が各行の `fft` と一致すること、軸の順序を `[1, 0]` に変えた結果、同じ配列を列優先で格納してストライド $(1,M)$ のビューで `FftNdPlan` に読ませた結果も比べる。
+Plan にはビューから変換した `FftNdInput` と `FftNdOutput`（どちらも `Complex` の列挙子）を渡す。
+無尺度の `ifftn` を `fftn` の結果にかけ、往復が $MN\,x$ になることも確かめる。
+これらは同じ FFT の部品を使うので、互いに独立な精度の検証ではない。
+そこで解析値とも比べる。
+無尺度の DFT では波数 $(2,3)$ のビンが $MN$、それ以外のビンが 0 になる。
+平面波の値は `f64` の `cos` と `sin` で作った参照値である。
+
+```rust
+//| id: fft-2d-separable
+//| ref: fft-2d-separable
+//| title: 2 次元 FFT と軸ごとの 1 次元 FFT の照合
+//| run: reactive
+//| crates: [scioxide-core, scioxide-fft]
+//| inputs:
+//|   rows_count: {"type":"range","label":"行数 M","description":"軸 0 の長さ。","min":8,"max":32,"step":1,"value":16}
+//|   cols_count: {"type":"range","label":"列数 N","description":"軸 1 の長さ。","min":8,"max":32,"step":1,"value":16}
+//| cases:
+//|   - {"id":"odd-sizes","label":"M = 9, N = 15","description":"奇数長の軸。長さ 15 の FFT は 3 と 5 の段で計算される。","inputs":{"rows_count":9,"cols_count":15}}
+//|   - {"id":"prime-sizes","label":"M = 11, N = 13","description":"素数長の軸。2・3・5・7 で割り切れない長さでも一致する。","inputs":{"rows_count":11,"cols_count":13}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"peak","path":"/rows/0/2","approx":{"value":256,"rtol":1e-12}}
+//|       - {"artifact":"peak","path":"/rows/0/3","equals":256}
+//|       - {"artifact":"errors","path":"/rows/0/2","range":{"max":1e-15}}
+//|       - {"artifact":"errors","path":"/rows/1/2","range":{"max":1e-15}}
+//|       - {"artifact":"errors","path":"/rows/2/2","range":{"max":1e-15}}
+//|       - {"artifact":"errors","path":"/rows/3/2","range":{"max":1e-15}}
+//|       - {"artifact":"errors","path":"/rows/4/2","range":{"max":1e-14}}
+//|       - {"artifact":"errors","path":"/rows/5/2","range":{"max":1e-14}}
+//|   - case: odd-sizes
+//|     expect:
+//|       - {"artifact":"peak","path":"/rows/0/3","equals":135}
+//|       - {"artifact":"errors","path":"/rows/1/2","range":{"max":1e-15}}
+//|       - {"artifact":"errors","path":"/rows/4/2","range":{"max":1e-14}}
+//|       - {"artifact":"errors","path":"/rows/5/2","range":{"max":1e-14}}
+//|   - case: prime-sizes
+//|     expect:
+//|       - {"artifact":"peak","path":"/rows/0/2","approx":{"value":143,"rtol":1e-12}}
+//|       - {"artifact":"errors","path":"/rows/1/2","range":{"max":1e-15}}
+//|       - {"artifact":"errors","path":"/rows/4/2","range":{"max":1e-14}}
+//|       - {"artifact":"errors","path":"/rows/5/2","range":{"max":1e-14}}
+use scioxide_core::{Complex, ExecutionContext, NdView, NdViewMut, StridedLayout};
+use scioxide_fft::{FftDirection, FftLayout, FftNdInput, FftNdOutput, FftNdPlan, FftNdPlanSpec};
+use scioxide_fft::{Normalization, fft, fftn, ifftn};
+
+let (m, n) = (rows_count.round() as usize, cols_count.round() as usize);
+let shape = [m, n];
+let norm = Normalization::Unscaled;
+let pi = std::f64::consts::PI;
+// 平面波（参照値として f64 の cos と sin で作る）。行優先なので要素 (j, k) は位置 j·N + k。
+let mut matrix = Vec::with_capacity(m * n);
+for j in 0..m {
+    for k in 0..n {
+        let phase = 2.0 * pi * (2.0 * j as f64 / m as f64 + 3.0 * k as f64 / n as f64);
+        matrix.push(Complex::new(phase.cos(), phase.sin()));
+    }
+}
+let max_gap = |a: &[Complex<f64>], b: &[Complex<f64>]| {
+    a.iter()
+        .zip(b)
+        .map(|(p, q)| (*p - *q).norm())
+        .fold(0.0_f64, f64::max)
+};
+let direct = fftn(&matrix, &shape, &[0, 1], norm).map_err(|e| e.to_string())?;
+// 軸 1 だけを選ぶと、各行が独立な一括の変換になる。
+let rows_only = fftn(&matrix, &shape, &[1], norm).map_err(|e| e.to_string())?;
+// 軸ごとの合成: 各行の 1 次元 fft、続いて各列の 1 次元 fft。
+let mut separable = Vec::with_capacity(m * n);
+for row in matrix.chunks_exact(n) {
+    separable.extend(fft(row, norm).map_err(|e| e.to_string())?);
+}
+let row_gap = max_gap(&rows_only, &separable);
+for k in 0..n {
+    let column: Vec<Complex<f64>> = (0..m).map(|j| separable[j * n + k]).collect();
+    let transformed = fft(&column, norm).map_err(|e| e.to_string())?;
+    for (j, value) in transformed.into_iter().enumerate() {
+        separable[j * n + k] = value;
+    }
+}
+let reversed = fftn(&matrix, &shape, &[1, 0], norm).map_err(|e| e.to_string())?;
+// 同じ配列を列優先で格納し（要素 (j, k) は位置 k·M + j）、ストライド (1, M) のビューで読む。
+let transposed: Vec<Complex<f64>> = (0..m * n).map(|i| matrix[(i % m) * n + i / m]).collect();
+let strides = [1, m];
+let column_major = StridedLayout::new(&shape, &strides).map_err(|e| e.to_string())?;
+let spec = FftNdPlanSpec::new(
+    &shape,
+    &[0, 1],
+    FftDirection::Forward,
+    norm,
+    FftLayout::Complex,
+)
+.map_err(|e| e.to_string())?;
+let plan = FftNdPlan::<f64>::new(spec).map_err(|e| e.to_string())?;
+let mut workspace = plan.workspace(()).map_err(|e| e.to_string())?;
+let mut planned = vec![Complex::new(0.0, 0.0); m * n];
+// 複素のビューは FftNdInput::Complex と FftNdOutput::Complex に変換される。
+let input: FftNdInput<f64> = NdView::new(&transposed, column_major)
+    .map_err(|e| e.to_string())?
+    .into();
+let output: FftNdOutput<f64> = NdViewMut::row_major(&mut planned, &shape)
+    .map_err(|e| e.to_string())?
+    .into();
+plan.execute_into(
+    input,
+    output,
+    &mut workspace,
+    ExecutionContext::sequential(),
+)
+.map_err(|e| e.to_string())?;
+// 無尺度の往復: ifftn(fftn(x)) は MN·x になる。
+let round_trip = ifftn(&direct, &shape, &[0, 1], norm).map_err(|e| e.to_string())?;
+// 独立検算: 波数 (2, 3) のビンが MN、ほかは 0。
+let volume = (m * n) as f64;
+let exact: Vec<Complex<f64>> = (0..m * n)
+    .map(|i| Complex::new(if i == 2 * n + 3 { volume } else { 0.0 }, 0.0))
+    .collect();
+let scaled: Vec<Complex<f64>> = matrix.iter().map(|&z| z * volume).collect();
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let digits12 = serde_json::json!({ "significantDigits": 12 });
+let peak_columns = serde_json::json!([
+    { "key": "0", "label": "行数 M", "type": "integer" },
+    { "key": "1", "label": "列数 N", "type": "integer" },
+    { "key": "2", "label": "|X(2, 3)| [-]", "type": "number", "format": digits12 },
+    { "key": "3", "label": "解析値 MN [-]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    peak_columns,
+    vec![(m, n, direct[2 * n + 3].norm(), m * n)],
+    metadata = serde_json::json!({ "id": "peak" })
+);
+let comparisons = vec![
+    ("fftn の軸 [1] と各行の fft", row_gap),
+    (
+        "fftn の軸 [0, 1] と行・列の fft の合成",
+        max_gap(&direct, &separable),
+    ),
+    (
+        "fftn の軸の順 [0, 1] と [1, 0]",
+        max_gap(&direct, &reversed),
+    ),
+    (
+        "列優先のストライドで読む FftNdPlan と fftn",
+        max_gap(&direct, &planned),
+    ),
+    ("fftn と解析値", max_gap(&direct, &exact)),
+    (
+        "無尺度の ifftn(fftn(x)) と MN·x",
+        max_gap(&round_trip, &scaled),
+    ),
+];
+let rows: Vec<(&str, f64, f64)> = comparisons
+    .into_iter()
+    .map(|(label, gap)| (label, gap, gap / volume))
+    .collect();
+let error_columns = serde_json::json!([
+    { "key": "0", "label": "比較" },
+    { "key": "1", "label": "最大絶対差 [-]", "type": "number", "format": sci3 },
+    { "key": "2", "label": "MN で割った差 [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    error_columns,
+    rows,
+    metadata = serde_json::json!({ "id": "errors" })
+);
+```
+
+既定の 16×16 では $|X_{2,3}|$ が $256=MN$ になり、解析値との最大差は $1.4\times10^{-13}$（$MN$ で割って $5.4\times10^{-16}$）である。
+軸 1 だけを選んだ `fftn` は各行の `fft` と一致し、差は 0 になった。
+行と列の 1 次元変換を合成した結果と `fftn` の差は $1.4\times10^{-14}$（$MN$ で割って $5.4\times10^{-17}$）で、丸め誤差の大きさである。
+軸の順序を `[1, 0]` に入れ替えたときの差も同じ値になった。
+列優先のストライドで読ませた Plan の結果は、この例では `fftn` とすべてのビットで一致した。
+無尺度の `ifftn(fftn(x))` と $MN\,x$ の差は $8.5\times10^{-14}$（$MN$ で割って $3.3\times10^{-16}$）で、往復の係数が選んだ軸の長さの積 $MN$ であることと合う。
+11×13 の素数長でも、合成との差は $1.8\times10^{-14}$、解析値との差は $MN$ で割って $5.7\times10^{-16}$、往復の差は $MN$ で割って $9.9\times10^{-16}$ にとどまる。
+
+
+軸ごとの合成との差だけが小さいときは、正規化や添字の取り違えが両方に共通している可能性を除けない。
+解析値との差が同じ程度に小さいことで、ピークの位置と尺度も確かめられる。
+
+## まとめ
+
+多次元 DFT は核が軸ごとの積に分かれるので、選んだ軸に 1 次元 FFT を順にかければ求まり、計算コストは $O(V\sum_{d\in A}\log N_d)$ である。
+一括関数は行優先の連続なスライスを読み、選ばなかった軸は独立なバッチとして正規化の基準長に含めない。
+ストライド付きの配列や繰り返しの変換には `FftNdPlan` と `FftWorkspace` を使い、ビューの形状と配置の対応は準備のときに決まる。
+軸ごとの合成と解析値の両方と比べると、正規化と添字の取り違えを区別して確かめられる。
+
+## 次に読むページ
+
+- [多次元の実数 FFT と周波数の並べ替え](../real-multidimensional-transforms/) で、実数配列で詰める軸とパックした形状、DC と Nyquist の面での共役の対の検査、`fftshift_nd` を確かめる。
+- [多次元の DCT・DST と作業領域](../multidimensional-dct-dst/) で、軸ごとに型を混ぜる Plan と、実数と複素数の二つの作業領域を確かめる。
+- [FFT の Plan・作業領域・キャッシュ](../plans-workspaces-and-providers/) で、一次元の Plan と作業領域の使い回しの規則を確かめる。

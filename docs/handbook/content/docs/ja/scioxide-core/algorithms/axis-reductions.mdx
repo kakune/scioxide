@@ -1,0 +1,457 @@
+---
+title: 軸に沿った正規化と対数和
+description: 配列の 1 つの軸に沿ったレーンごとのソフトマックス、対数ソフトマックス、対数和、重み付き対数和。所有値を返す API と出力先を指定する API の出力の形、作業領域の長さ、実行方針、エラー分類。
+sidebar:
+  order: 345
+references:
+  core-axis-functions: "軸方向の-4-種類の関数"
+  core-axis-storage: "所有値を返す-api-と出力先を指定する-api-のメモリ領域"
+---
+
+行列や多次元配列では、1 つの軸に沿った 1 次元の並び（レーン）ごとに正規化や対数和を取ることが多い。
+2 次元の配列なら、軸 1 のレーンは各行、軸 0 のレーンは各列である。
+このページは 1 本のベクトルに対する対数和とソフトマックスを、配列のレーンごとに適用する 8 つの関数を扱う。
+
+各レーンの値の定義、マスク（$-\infty$）の扱い、精度は 1 本のベクトルの関数と同じで、[対数和・重み付き和・正規化](../logarithmic-reductions/)で説明している。
+入力と出力のビュー（`NdView`、`NdViewMut`）、配置、レーンの番号は[借用レイアウトとアフィン値](../borrowed-layouts-and-affine-values/)を前提にする。
+実行方針と実行コンテキストは[実行方針・分割・実行コンテキスト](../execution-and-partitions/)を前提にする。
+
+## 軸方向の 4 種類の関数
+
+`scioxide-core` は入力を `NdView` で受け取るので、転置や軸の入れ替えをしたビューにもデータを写さずに適用できる。
+行優先（最後の軸が最も速く進む順）に並んだスライスからは `NdView::row_major(data, shape)` でビューを作れる（階数 8 まで）。
+
+軸方向の関数は 4 種類あり、それぞれに所有値を返す API と出力先を指定する API がある。
+
+| 所有値を返す API | 出力先を指定する API | 各レーンの計算 | 出力の形 |
+|---|---|---|---|
+| `softmax_axis(input, axis)` | `softmax_axis_into(input, axis, policy, output, scratch, cx)` | `softmax` | 入力と同じ |
+| `log_softmax_axis(input, axis)` | `log_softmax_axis_into(input, axis, policy, output, scratch, cx)` | `log_softmax` | 入力と同じ |
+| `logsumexp_axis(input, axis)` | `logsumexp_axis_into(input, axis, policy, output, scratch, cx)` | `logsumexp` | 入力から `axis` を除いた形 |
+| `weighted_logsumexp_axis(input, weights, axis)` | `weighted_logsumexp_axis_into(input, weights, axis, policy, output, scratch, cx)` | `weighted_logsumexp` | 入力から `axis` を除いた形（要素は `LogValue`） |
+
+正規化の 2 種類は実数の対数だけを受け取る。
+`logsumexp_axis` は実数と複素数の対数を受け取り、`weighted_logsumexp_axis` は実数の対数と実数・複素数の重みを受け取る。
+重みの配列は入力と同じ形でなければならないが、ストライドは違ってよく、ブロードキャスト（同じ要素を繰り返し読む配置）でもよい。
+
+空のレーン（`axis` の長さが 0）とすべてがマスクのレーンの結果は、1 本のベクトルの関数と同じである。
+
+- 正規化の 2 種類は、正規化する和が 0 なので `DomainError` にする。
+- `logsumexp_axis` は $-\infty$（複素数では $(-\infty, +0)$）を返す。
+- `weighted_logsumexp_axis` は 0 の `LogValue` を返す。
+  厳密に打ち消し合ったレーンも 0 の `LogValue` になる。
+
+レーンが 1 本もない配列（軸以外の長さに 0 がある配列）は有効で、所有値を返す API は空の `Vec` を返し、出力先を指定する API は何も書き込まない。
+
+## 所有値を返す API と出力先を指定する API のメモリ領域
+
+所有値を返す API は結果を `Vec` で返す。
+要素の順序は正規化では入力の行優先の順、対数和では残りの軸の行優先の順（レーンの番号の順）である。
+所有値を返す API は `ExecutionContext::sequential_native()` のもとで逐次に実行する。
+`logsumexp_axis` と `weighted_logsumexp_axis` は結果だけを確保し、`softmax_axis` と `log_softmax_axis` は結果、同じ長さの一時領域、軸ごとのストライドを確保する。
+
+出力先を指定する API は出力のビュー `NdViewMut` と作業領域 `scratch` を呼び出し側が用意し、数値処理でヒープを確保しない。
+
+| 出力先を指定する API | 出力の形 | `scratch` の長さ |
+|---|---|---|
+| `softmax_axis_into`、`log_softmax_axis_into` | 入力と同じ | 入力の要素数以上 |
+| `logsumexp_axis_into` | 入力から `axis` を除いた形 | レーンの数以上 |
+| `weighted_logsumexp_axis_into` | 入力から `axis` を除いた形 | レーンの数以上（要素は `LogValue`） |
+
+入力はブロードキャストでもよいが、出力は同じアドレスを 2 度指さない配置でなければならない。
+出力先を指定する API は結果を `scratch` に作り、すべてのレーンが成功してから出力に写す。
+エラーや停止で終わったときは出力を変えない。
+
+## 実行方針と停止
+
+実行方針 `policy`（`ExecutionPolicy`）は、レーンを何個の分割に割り振るかを決める。
+分割はどの方針でも最大 64 個である。
+`Auto` はレーンが 32 本未満なら分割せず、32 本以上のときに実行コンテキストのエグゼキューターに応じて分割の数を決める。
+方針が変えるのはレーンの割り振りだけで、各レーンの中の計算は同じなので、結果は方針によらない。
+
+実行コンテキスト `cx`（`ExecutionContext`）はエグゼキューター、取り消し通知、期限を保持する。
+取り消しと期限は各レーンの前に確かめるので、停止の要求のあとに各分割が計算するレーンは多くても 1 本である。
+停止した場合は `ExecutionStopped` を返す。
+
+## エラー分類
+
+| 分類 | 条件 | 対象 |
+|---|---|---|
+| `OutOfBounds` | `axis` が入力の軸でない | すべて |
+| `SizeOverflow` | レーンの数が `usize` に収まらない | すべて |
+| `DimensionMismatch` | 重みの形が入力と違う | 重み付きの対数和 |
+| `DimensionMismatch` | 出力の形が合わない、または `scratch` が短い | 出力先を指定する API |
+| `DomainError` | 空のレーンか、すべてがマスクのレーンがある | 正規化 |
+| `DomainError` | 複素数の対数のレーンで項が厳密に打ち消し合う | `logsumexp_axis`、`logsumexp_axis_into` |
+| `NonFinite` | 対数が NaN か $+\infty$、または複素数の対数の虚部か重みが有限でない | すべて |
+| `NumericalInstability` | 結果がオーバーフローする | すべて |
+| `AllocationFailure` | 結果や一時領域を確保できない | 所有値を返す API |
+| `ExecutionStopped` | 取り消しか期限で停止した | 出力先を指定する API |
+| `ExecutionFailure`、`CapabilityFailure` | エグゼキューターが失敗した、クロックが失敗した | 出力先を指定する API |
+
+NaN や $+\infty$ の対数、有限でない虚部や重みは、マスクの項や重み 0 の項にあっても `NonFinite` になる。
+
+## 行と列に沿った正規化
+
+次のセルは 2 行 3 列の対数 $x_{rc}$ を選んだ軸に沿って正規化する。
+入力は正規化する軸（1 なら行ごと、0 なら列ごと）、$(0, 1)$ 成分をマスクするかどうか、対数確率で出力するかどうかである。
+所有値を返す API（`softmax_axis` か `log_softmax_axis`）と、出力と 6 要素の作業領域を用意した出力先を指定する API（`softmax_axis_into` か `log_softmax_axis_into`）の両方で計算する。
+
+検算として、同じ軸の対数和 $y_\ell$ を `logsumexp_axis` で別に求め、出力を $x_{rc} - y_\ell$（確率ならその指数）と比べる。
+1 つ目の表は成分ごとの出力と参照値、2 つ目の表はレーンごとの確率の和（`checked_sum` による 1 回の丸め）と参照値との差の最大を示す。
+3 つ目の表は、マスクの成分が厳密な $+0$（対数確率なら $-\infty$）になった数と、所有値を返す API と出力先を指定する API でビットが異なった成分の数を示す。
+
+```rust
+//| id: core-masked-normalization-plan
+//| ref: core-masked-normalization-plan
+//| title: 軸に沿った正規化とマスク
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   axis: {"type":"range","label":"正規化する軸","description":"1 は行ごと（3 成分のレーンが 2 本）、0 は列ごと（2 成分のレーンが 3 本）。","min":0,"max":1,"step":1,"value":1}
+//|   mask_entry: {"type":"checkbox","label":"(0, 1) 成分をマスクする","description":"マスクした成分の確率は厳密に +0 になる。","value":true}
+//|   log_output: {"type":"checkbox","label":"対数確率で出力する","description":"log_softmax_axis を使う。マスクは -∞ になる。","value":false}
+//| cases:
+//|   - {"id":"log-output","label":"対数確率","description":"マスクの成分は −∞、残りは x − y になる。","inputs":{"log_output":true}}
+//|   - {"id":"columns","label":"列ごと（軸 0）","description":"列 1 はマスクと 5 だけなので、(1, 1) 成分の確率が 1 になる。","inputs":{"axis":0}}
+//|   - {"id":"no-mask","label":"マスクなし","description":"行 0 は (1, 2, 3) のソフトマックスになる。","inputs":{"mask_entry":false}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"elements","path":"/rows/0/3","approx":{"value":0.11920292202211755,"rtol":1e-13}}
+//|       - {"artifact":"elements","path":"/rows/1/3","equals":0}
+//|       - {"artifact":"lanes","path":"/rows/0/1","approx":{"value":1,"atol":5e-16}}
+//|       - {"artifact":"lanes","path":"/rows/1/1","approx":{"value":1,"atol":5e-16}}
+//|       - {"artifact":"lanes","path":"/rows/1/3","range":{"min":0,"max":1e-15}}
+//|       - {"artifact":"checks","path":"/rows/0/0","equals":1}
+//|       - {"artifact":"checks","path":"/rows/0/1","equals":0}
+//|   - case: log-output
+//|     expect:
+//|       - {"artifact":"elements","path":"/rows/0/3","approx":{"value":-2.1269280110429727,"rtol":1e-13}}
+//|       - {"artifact":"elements","path":"/rows/1/3","equals":null}
+//|       - {"artifact":"lanes","path":"/rows/0/1","approx":{"value":1,"atol":5e-16}}
+//|       - {"artifact":"checks","path":"/rows/0/0","equals":1}
+//|       - {"artifact":"checks","path":"/rows/0/1","equals":0}
+//|   - case: columns
+//|     expect:
+//|       - {"artifact":"elements","path":"/rows/4/3","approx":{"value":1,"atol":5e-16}}
+//|       - {"artifact":"elements","path":"/rows/0/3","approx":{"value":0.04742587317756678,"rtol":1e-13}}
+//|       - {"artifact":"lanes","path":"/rows/2/1","approx":{"value":1,"atol":5e-16}}
+//|       - {"artifact":"checks","path":"/rows/0/1","equals":0}
+//|   - case: no-mask
+//|     expect:
+//|       - {"artifact":"elements","path":"/rows/1/3","approx":{"value":0.24472847105479764,"rtol":1e-13}}
+//|       - {"artifact":"lanes","path":"/rows/0/2","approx":{"value":3.4076059644443806,"rtol":1e-14}}
+//|       - {"artifact":"checks","path":"/rows/0/0","equals":0}
+use scioxide_core::{
+    ExecutionContext, ExecutionPolicy, NdView, NdViewMut, RealScalar, checked_sum,
+    log_softmax_axis, log_softmax_axis_into, logsumexp_axis, softmax_axis, softmax_axis_into,
+};
+
+let axis = axis as usize;
+let shape = [2, 3];
+let mut logits = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+if mask_entry {
+    logits[1] = f64::NEG_INFINITY;
+}
+let input = NdView::row_major(&logits, &shape).map_err(|e| e.to_string())?;
+
+// 所有値を返す API: 結果の Vec を確保し、逐次に実行する。
+let owned = if log_output {
+    log_softmax_axis(input, axis)
+} else {
+    softmax_axis(input, axis)
+}
+.map_err(|e| e.to_string())?;
+
+// 出力先を指定する API: 出力と、要素数と同じ長さの作業領域を呼び出し側が用意する。
+let mut borrowed = [0.0; 6];
+let mut scratch = [0.0; 6];
+let output = NdViewMut::row_major(&mut borrowed, &shape).map_err(|e| e.to_string())?;
+// Auto でも、レーンが 32 本未満なので分割しない。
+let policy = ExecutionPolicy::Auto;
+let cx = ExecutionContext::sequential();
+if log_output {
+    log_softmax_axis_into(input, axis, policy, output, &mut scratch, cx)
+} else {
+    softmax_axis_into(input, axis, policy, output, &mut scratch, cx)
+}
+.map_err(|e| e.to_string())?;
+
+// 検算: レーンごとの対数和 y を別に求め、出力を x − y（確率なら e^(x−y)）と比べる。
+let lane_sums = logsumexp_axis(input, axis).map_err(|e| e.to_string())?;
+let mut lane_probabilities = vec![Vec::new(); lane_sums.len()];
+let mut deviation = vec![0.0_f64; lane_sums.len()];
+let (mut exact_masks, mut form_mismatches) = (0_u32, 0_u32);
+let mut elements = Vec::new();
+for (index, (&x, &value)) in logits.iter().zip(&owned).enumerate() {
+    let (row, column) = (index / 3, index % 3);
+    let lane = if axis == 0 { column } else { row };
+    let probability = if log_output {
+        RealScalar::exp(value)
+    } else {
+        value
+    };
+    lane_probabilities[lane].push(probability);
+    form_mismatches += u32::from(value.to_bits() != borrowed[index].to_bits());
+    let masked = x == f64::NEG_INFINITY;
+    let expected = if masked {
+        // マスクの出力は厳密な値（確率 +0、対数確率 −∞）と照合する。
+        let exact = if log_output { f64::NEG_INFINITY } else { 0.0 };
+        exact_masks += u32::from(value.to_bits() == exact.to_bits());
+        exact
+    } else if log_output {
+        x - lane_sums[lane]
+    } else {
+        RealScalar::exp(x - lane_sums[lane])
+    };
+    if !masked {
+        deviation[lane] = deviation[lane].max((value - expected).abs());
+    }
+    // −∞ は JSON の数値にできないので None で出す。
+    let finite = |v: f64| RealScalar::is_finite(v).then_some(v);
+    elements.push((row, column, finite(x), finite(value), finite(expected)));
+}
+let digits = serde_json::json!({ "significantDigits": 16 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let element_columns = serde_json::json!([
+    { "key": "0", "label": "行 r", "type": "integer" },
+    { "key": "1", "label": "列 c", "type": "integer" },
+    { "key": "2", "label": "対数 x [-]", "type": "number", "nullText": "−∞（マスク）" },
+    { "key": "3", "label": "出力 [-]", "type": "number", "format": digits, "nullText": "−∞" },
+    { "key": "4", "label": "参照値 [-]", "type": "number", "format": digits, "nullText": "−∞" }
+]);
+emit_table_with_columns!(
+    element_columns,
+    elements,
+    metadata = serde_json::json!({ "id": "elements" })
+);
+
+let mut lanes = Vec::new();
+for (lane, probabilities) in lane_probabilities.iter().enumerate() {
+    let total = checked_sum(probabilities).map_err(|e| e.to_string())?;
+    lanes.push((lane, total, lane_sums[lane], deviation[lane]));
+}
+let lane_columns = serde_json::json!([
+    { "key": "0", "label": "レーン ℓ", "type": "integer" },
+    { "key": "1", "label": "確率の和（checked_sum）[-]", "type": "number", "format": digits },
+    { "key": "2", "label": "対数和 y [-]", "type": "number", "format": digits },
+    { "key": "3", "label": "出力と参照値の差の最大 [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    lane_columns,
+    lanes,
+    metadata = serde_json::json!({ "id": "lanes" })
+);
+let check_columns = serde_json::json!([
+    { "key": "0", "label": "厳密な値になったマスクの成分 [個]", "type": "integer" },
+    { "key": "1", "label": "所有値を返す API と出力先を指定する API でビットが異なる成分 [個]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    check_columns,
+    vec![(exact_masks, form_mismatches)],
+    metadata = serde_json::json!({ "id": "checks" })
+);
+```
+
+既定値（行ごと、マスクあり、確率）では、行 0 の残りの 2 成分が $e^{1}$ と $e^{3}$ の比で分けられ、$p_{00} = 0.1192$、$p_{02} = 0.8808$ になる。
+マスクした $(0, 1)$ 成分は厳密な $+0$ で、各行の確率の和と 1 との差は 1 ULP 以内である。
+出力と参照値の差も $10^{-16}$ 程度で、正規化と対数和が同じ $y_\ell$ を与えていることを確かめられる。
+所有値を返す API と出力先を指定する API の出力は全成分でビットまで一致する。
+
+対数確率にすると、マスクの成分は $-\infty$、$\ln p_{00} = -2.1269$ になる。
+列ごと（軸 0）にするとレーンは 3 本になり、列 1 はマスクと 5 だけなので $(1, 1)$ 成分の確率が 1 になる。
+マスクを外すと、行 0 は $(1, 2, 3)$ のソフトマックス $(0.0900, 0.2447, 0.6652)$ になる。
+
+## 軸に沿った対数和と符号付きの重み
+
+次のセルは、行 0 が $(0, 1, 2)$、行 1 が $(s, s, s)$ の 2 行 3 列の対数について、選んだ軸に沿った対数和と重み付きの対数和を求める。
+入力は縮約する軸、行 1 の共通の移動 $s$（無次元）、行 1 の重みを $(1, -1, 0)$ にするかどうかである。
+重みを変えない場合はすべて 1 とする。
+
+所有値を返す API（`logsumexp_axis` と `weighted_logsumexp_axis`）の結果を表に示し、出力先を指定する API（`logsumexp_axis_into` と `weighted_logsumexp_axis_into`）の結果と値が異なったレーンの数を別の表に示す。
+出力先を指定する API の出力は軸を除いた形（長さがレーンの数の 1 次元）で、作業領域もレーンの数だけ用意する。
+参照値は `f64` の固有メソッドで計算した解析値である。
+行ごと（軸 1）では行 0 が $\ln(1 + e + e^2)$、行 1 が $s + \ln 3$ になり、重み $(1, -1, 0)$ の行 1 は $e^{s} - e^{s} + 0$ で厳密に 0 になる。
+列ごと（軸 0）では列 $j$ が $s + \ln(1 + e^{j - s})$ で、重み付きの列 1 は $e^{1} - e^{s} < 0$、列 2 は $e^{2}$ になる。
+
+```rust
+//| id: core-axis-logsumexp
+//| ref: core-axis-logsumexp
+//| title: 軸に沿った対数和と重み付き対数和
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   axis: {"type":"range","label":"縮約する軸","description":"1 は行ごと（レーンが 2 本）、0 は列ごと（レーンが 3 本）。","min":0,"max":1,"step":1,"value":1}
+//|   row_shift: {"type":"range","label":"行 1 の共通の移動 s [-]","description":"行 1 の対数は (s, s, s)。s ≥ 710 では e^s がオーバーフローする。","min":10,"max":1000,"step":10,"value":800}
+//|   signed_weights: {"type":"checkbox","label":"行 1 の重みを (1, −1, 0) にする","description":"外すとすべての重みが 1 になる。","value":true}
+//| cases:
+//|   - {"id":"columns","label":"列ごと（軸 0）","description":"列 1 の重み付きの和は負になり、列 2 は重み 0 の項が除かれて e² になる。","inputs":{"axis":0}}
+//|   - {"id":"unit-weights","label":"重みがすべて 1","description":"重み付きの対数和が通常の対数和と一致する。","inputs":{"signed_weights":false}}
+//|   - {"id":"small-shift","label":"列ごと、s = 10","description":"列 1 の重み付きの和は e − e¹⁰ で、ln|Z| は 10 より少し小さい。","inputs":{"axis":0,"row_shift":10}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"lanes","path":"/rows/0/1","approx":{"value":2.4076059644443806,"rtol":1e-14}}
+//|       - {"artifact":"lanes","path":"/rows/1/1","approx":{"value":801.0986122886682,"rtol":1e-14}}
+//|       - {"artifact":"lanes","path":"/rows/1/3","equals":0}
+//|       - {"artifact":"lanes","path":"/rows/1/4","equals":null}
+//|       - {"artifact":"lanes","path":"/rows/0/4","approx":{"value":2.4076059644443806,"rtol":1e-14}}
+//|       - {"artifact":"checks","path":"/rows/0/0","equals":0}
+//|       - {"artifact":"checks","path":"/rows/0/1","range":{"min":0,"max":1e-14}}
+//|   - case: columns
+//|     expect:
+//|       - {"artifact":"lanes","path":"/rows/1/3","equals":-1}
+//|       - {"artifact":"lanes","path":"/rows/1/4","approx":{"value":800,"rtol":1e-14}}
+//|       - {"artifact":"lanes","path":"/rows/2/4","approx":{"value":2,"rtol":1e-14}}
+//|       - {"artifact":"checks","path":"/rows/0/0","equals":0}
+//|   - case: unit-weights
+//|     expect:
+//|       - {"artifact":"lanes","path":"/rows/1/3","equals":1}
+//|       - {"artifact":"lanes","path":"/rows/1/4","approx":{"value":801.0986122886682,"rtol":1e-14}}
+//|       - {"artifact":"checks","path":"/rows/0/0","equals":0}
+//|   - case: small-shift
+//|     expect:
+//|       - {"artifact":"lanes","path":"/rows/1/1","approx":{"value":10.000123402189724,"rtol":1e-14}}
+//|       - {"artifact":"lanes","path":"/rows/1/3","equals":-1}
+//|       - {"artifact":"lanes","path":"/rows/1/4","approx":{"value":9.999876582580296,"rtol":1e-14}}
+//|       - {"artifact":"checks","path":"/rows/0/1","range":{"min":0,"max":1e-14}}
+use scioxide_core::{
+    ExecutionContext, ExecutionPolicy, LogValue, NdView, NdViewMut, logsumexp_axis,
+    logsumexp_axis_into, weighted_logsumexp_axis, weighted_logsumexp_axis_into,
+};
+
+let axis = axis as usize;
+let s = row_shift;
+let shape = [2, 3];
+let logits = [0.0, 1.0, 2.0, s, s, s];
+let weights = if signed_weights {
+    [1.0, 1.0, 1.0, 1.0, -1.0, 0.0]
+} else {
+    [1.0; 6]
+};
+let input = NdView::row_major(&logits, &shape).map_err(|e| e.to_string())?;
+let weight_view = NdView::row_major(&weights, &shape).map_err(|e| e.to_string())?;
+
+// 所有値を返す API: レーンごとに 1 つの値を Vec で返す。
+let sums = logsumexp_axis(input, axis).map_err(|e| e.to_string())?;
+let weighted = weighted_logsumexp_axis(input, weight_view, axis).map_err(|e| e.to_string())?;
+
+// 出力先を指定する API: 出力は軸を除いた形、作業領域はレーンの数。
+let lanes = sums.len();
+let reduced = [lanes];
+let policy = ExecutionPolicy::Sequential;
+let mut sums_into = vec![0.0; lanes];
+let mut scratch = vec![0.0; lanes];
+let output = NdViewMut::row_major(&mut sums_into, &reduced).map_err(|e| e.to_string())?;
+logsumexp_axis_into(
+    input,
+    axis,
+    policy,
+    output,
+    &mut scratch,
+    ExecutionContext::sequential(),
+)
+.map_err(|e| e.to_string())?;
+let mut weighted_into = vec![LogValue::<f64, f64>::ZERO; lanes];
+let mut log_scratch = vec![LogValue::<f64, f64>::ZERO; lanes];
+let output = NdViewMut::row_major(&mut weighted_into, &reduced).map_err(|e| e.to_string())?;
+weighted_logsumexp_axis_into(
+    input,
+    weight_view,
+    axis,
+    policy,
+    output,
+    &mut log_scratch,
+    ExecutionContext::sequential(),
+)
+.map_err(|e| e.to_string())?;
+
+// 解析値（f64 の固有メソッドによる参照値）。重み付きの和が厳密に 0 なら None。
+let reference = |lane: usize| -> (f64, Option<f64>) {
+    if axis == 1 {
+        let plain = if lane == 0 {
+            (1.0 + 1.0_f64.exp() + 2.0_f64.exp()).ln()
+        } else {
+            s + 3.0_f64.ln()
+        };
+        (plain, (!(signed_weights && lane == 1)).then_some(plain))
+    } else {
+        let plain = s + (lane as f64 - s).exp().ln_1p();
+        let signed = match lane {
+            1 => s + (-(1.0 - s).exp()).ln_1p(),
+            2 => 2.0,
+            _ => plain,
+        };
+        (plain, Some(if signed_weights { signed } else { plain }))
+    }
+};
+let (mut rows, mut form_mismatches, mut worst) = (Vec::new(), 0_u32, 0.0_f64);
+for lane in 0..lanes {
+    let (plain, signed) = reference(lane);
+    let log_magnitude = weighted[lane].log_magnitude();
+    let same = sums[lane] == sums_into[lane]
+        && log_magnitude == weighted_into[lane].log_magnitude()
+        && weighted[lane].sign() == weighted_into[lane].sign();
+    form_mismatches += u32::from(!same);
+    worst = worst.max(((sums[lane] - plain) / plain).abs());
+    if let (Some(value), Some(expected)) = (log_magnitude, signed) {
+        worst = worst.max(((value - expected) / expected).abs());
+    }
+    let sign = weighted[lane].sign() as i32;
+    rows.push((lane, sums[lane], plain, sign, log_magnitude, signed));
+}
+let digits = serde_json::json!({ "significantDigits": 16 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let zero = "厳密に 0";
+let columns = serde_json::json!([
+    { "key": "0", "label": "レーン ℓ", "type": "integer" },
+    { "key": "1", "label": "対数和 ln Σ e^x [-]", "type": "number", "format": digits },
+    { "key": "2", "label": "対数和の参照値 [-]", "type": "number", "format": digits },
+    { "key": "3", "label": "重み付きの和の符号 [-]", "type": "integer" },
+    { "key": "4", "label": "ln |Σ w e^x| [-]", "type": "number", "format": digits, "nullText": zero },
+    { "key": "5", "label": "その参照値 [-]", "type": "number", "format": digits, "nullText": zero }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "lanes" })
+);
+let check_columns = serde_json::json!([
+    { "key": "0", "label": "所有値を返す API と出力先を指定する API で値が異なるレーン [本]", "type": "integer" },
+    { "key": "1", "label": "参照値との相対差の最大 [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    check_columns,
+    vec![(form_mismatches, worst)],
+    metadata = serde_json::json!({ "id": "checks" })
+);
+```
+
+既定値（行ごと、$s = 800$、重み $(1, -1, 0)$）では、行 0 の対数和は $\ln(1 + e + e^2) = 2.4076$、行 1 は $800 + \ln 3 = 801.0986$ である。
+$e^{800}$ は倍精度で表せないが、どちらの関数も指数を作らないので結果は有限である。
+行 1 の重み付きの和は厳密に打ち消し合い、符号 0、$\ln |Z|$ は「厳密に 0」（`log_magnitude()` が `None`）になる。
+
+列ごと（軸 0）にするとレーンは 3 本になる。
+列 1 の重み付きの和は $e - e^{800}$ で符号が $-1$、$\ln |Z|$ は倍精度で 800 に等しい。
+列 2 は重み 0 の項が除かれて $\ln |Z| = 2$ になる。
+$s = 10$ では列 1 の対数和が $10 + \ln(1 + e^{-9}) = 10.000123$、重み付きの $\ln |Z|$ が $10 + \ln(1 - e^{-9}) = 9.999877$ で、参照値との相対差は $10^{-15}$ 以下である。
+どの入力でも、所有値を返す API と出力先を指定する API の値は全レーンで一致する。
+
+## まとめ
+
+配列の軸に沿って 1 回だけ計算するなら、所有値を返す API の `softmax_axis`、`log_softmax_axis`、`logsumexp_axis`、`weighted_logsumexp_axis` を使う。
+同じ形の配列で繰り返すときや並列に実行するときは `_into` の出力先を指定する API を選び、出力と作業領域を呼び出し側で用意して使い回す。
+作業領域の長さは正規化では入力の要素数以上、対数和ではレーンの数以上である。
+正規化の出力は入力と同じ形、対数和の出力は `axis` を除いた形で、レーンの番号の順に並ぶ。
+空のレーンやすべてがマスクのレーンは、正規化では `DomainError`、対数和では $-\infty$、重み付きの対数和では 0 の `LogValue` になる。
+結果は実行方針によらず、出力先を指定する API はエラーや停止のときに出力を変えない。
+
+## 次に読むページ
+
+- [対数和・重み付き和・正規化](../logarithmic-reductions/)：各レーンに適用される対数和の 16 ULP 仕様と、符号付き・複素重みの誤差限界を確かめる。
+- [借用レイアウトとアフィン値](../borrowed-layouts-and-affine-values/)：`NdView` と `NdViewMut` が受け付ける配置と、レーンの順序を確かめる。
+- [実行方針・分割・実行コンテキスト](../execution-and-partitions/)：`Auto` が分割の数を決める規則を確かめる。
+- [取り消し・クロック・期限](../cancellation-clocks-and-deadlines/)：取り消しと期限を確かめる位置と、停止を観測したときの出力の扱いを確かめる。
+- [実行形式・作業領域・再現性](../../../concepts/workspaces-and-reproducibility/)：呼び出し側が用意する作業領域と、実行方針によらない結果の考え方を確かめる。
+- [算術・安定変換・対数和の API](../../api/arithmetic-and-reductions/)：軸方向の関数の全項目を引く。

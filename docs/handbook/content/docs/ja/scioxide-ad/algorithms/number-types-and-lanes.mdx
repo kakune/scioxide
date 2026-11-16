@@ -1,0 +1,715 @@
+---
+title: 数値型・lane・汎用コード
+description: 関数を Real に対して一度だけ書き、f64・Lanes・Dual・MultiDual・Jet・Var のどれで評価するかを選ぶための仕様。Base・Primal・Mask・LEVEL、値のリフト、BaseReal による lane の組み立てと取り出し、LaneMask の比較と select、Lanes の SIMD とスカラーとのビット一致、入れ子の型の成分を確かめる。
+sidebar:
+  order: 305
+references:
+  ad-number-types: "数値型と入れ子"
+  ad-real-contract: "real-の仕様"
+  ad-lifting-values: "値のリフトと取り出し"
+  ad-base-real: "最も内側の型-basereal"
+  ad-comparisons-and-select: "比較マスクselect"
+  ad-generic-code: "汎用コードの書き方"
+  ad-lanes-simd: "laness-w-と-simd"
+  ad-lane-accuracy: "lane-の結果とスカラーの結果"
+  ad-nesting-components: "入れ子の型の成分"
+---
+
+`scioxide-ad` では、微分したい関数を型引数 `R: Real` に対して一度だけ書き、呼び出し側が数値型を選んで実行する。
+`f64` を選べば普通の評価になり、`Dual` を選べば前進モードの微分、テープの上の `Var` を選べば逆モードの微分になる。
+同じ関数を SIMD の `Lanes` で評価すれば、独立な複数の点を 1 回の演算列で計算できる。
+このページはすべての数値型に共通する `Real` トレイトの仕様、汎用コードの書き方、`Lanes` の結果がスカラーの結果とどう対応するか、入れ子の型の意味を説明する。
+各モードの微分の規則は[前進モードと二重数](../forward-mode/)以降のページで扱う。
+
+## 数値型と入れ子
+
+`scioxide-ad` の数値型は次の 7 種類である。
+`S` は IEEE 754 のスカラー型で、`f32` か `f64` である。
+
+| 型 | 1 つの値が持つもの | `Base` | `Primal` | `LANES` | `LEVEL` |
+|---|---|---|---|---|---|
+| `f32`、`f64` | IEEE の値 1 個 | 自身 | 自身 | 1 | 0 |
+| `Lanes<S, W>` | 独立な `S` の値 `W` 個 | 自身 | 自身 | `W` | 0 |
+| `Dual<V>` | 値 $v$ と 1 方向の微分 $\dot v$ | `V::Base` | `V` | `V::LANES` | `V::LEVEL + 1` |
+| `MultiDual<V, N>` | 値と `N` 方向の微分 | `V::Base` | `V` | `V::LANES` | `V::LEVEL + 1` |
+| `Jet<V, N>` | 正規化 Taylor 係数 $c_0, \dots, c_{N-1}$ | `V::Base` | `V` | `V::LANES` | `V::LEVEL + 1` |
+| `Var<'t, V>` | テープ上の値と、それを作った文の位置 | `V::Base` | `V` | `V::LANES` | `V::LEVEL + 1` |
+
+`Base` は最も内側の値の型、`Primal` は一つ下の階層の値の型である。
+`LANES` は独立な値の個数、`LEVEL` は `Base` の上に重ねた微分の階層の数である。
+
+下の 4 つは微分を保持するラッパー型（wrapper）である。
+`Dual`、`MultiDual`、`Jet` は内側の型 `V` に任意の数値型を取る。
+`Var` の内側はテープに記録できる型（`f32`、`f64`、`Lanes` と、それらを内側に持つ `Dual`、`MultiDual`、`Jet`）に限る。
+この型の集まりをトレイト `TapeValue` が表す（[逆モードとテープ](../reverse-mode-and-replay/)）。
+ラッパー型を入れ子にすると、次のような量が 1 回の評価で求まる。
+
+- `Dual<Lanes<f64, 8>>` は 8 つの独立な点のそれぞれで、1 方向の微分を保持する（`LEVEL` 1、`LANES` 8）。
+- `Dual<Dual<f64>>` は 2 階微分を保持する（`LEVEL` 2）。
+  内側と外側の方向を同じにすると $f''$、異なる方向にすると混合偏微分になる。
+- `MultiDual<Lanes<f64, W>, N>` は `W` 個の点のそれぞれで `N` 方向の微分を保持する。
+- `Dual<MultiDual<f64, N>>` は、外側の方向を $\mathbf{v}$、内側の `N` 方向を単位ベクトルにすると、ヘッセ行列・ベクトル積 $\mathbf{H}\mathbf{v}$ の `N` 成分を保持する。
+- `Var<'t, Dual<f64>>` はテープに二重数を記録する前進・逆の組み合わせ（forward-over-reverse）で、ヘッセ行列・ベクトル積を求める（[二階微分とヘッセ行列の作用素](../second-order-derivatives/)）。
+- `Jet<Jet<f64, M>, N>` は 2 つの方向の混合 Taylor 係数を保持する（[Taylor ジェットと高階の係数](../taylor-jets/)）。
+
+内側の型の演算はすべて `V` の算術で行われるので、入れ子の型は「評価した式の微分をもう一度微分する」ことになる。
+
+## `Real` の仕様
+
+`Real<S = f64>` は上の 7 種類の型が実装するトレイトである。
+型引数 `S` を省くと `f64` になる。
+トレイトは外部からの実装を許可していないため（sealed）、利用者の型に実装することはできない。
+独自の関数を数値型に加えるには、`map_scalar`、`try_map_scalar`、`combine`、テープの `ExternalRule` を使う（[スカラー関数の微分規則](../custom-primitives/)、[外部の微分規則 ExternalRule](../external-rules/)）。
+
+`Real` が要求する演算は次のとおりである。
+
+- `Copy`、`Debug`、反復子の `Sum` と `Product`。
+- `Self` どうしの `+`、`-`、`*`、`/`、`%` と単項の `-`、右側がスカラー `S` の `+`、`-`、`*`、`/`、`%`。
+  複合代入は右側が `Self` か `S` の `+=`、`-=`、`*=`、`/=` で、`%=` は要求しない。
+- 単項の初等関数 45 個（`sqrt`、`exp`、`ln`、`sin`、`atan`、`tanh`、`abs`、`floor`、安定変換の `softplus`・`sigmoid`・`logit`・`exprel`・`cosm1`・`sinc`・`sin_pi` など）、二項の関数 10 個（`powf`、`hypot`、`atan2`、`min`、`max`、`log`、`logaddexp`、`xlogy`、`xlog1py`、`powm1`）、`powi`、`clamp`、`sin_cos`、`azmul`。
+- 比較（`lt`、`le`、`gt`、`ge`）、`is_finite`、`select`。
+- 値のリフトと取り出し（`constant`、`passive`、`lift`、`primal`、`base`、`zero`、`one`）。
+- 規則を呼び出し側が与える `map_scalar`、`try_map_scalar`、`combine` と、表から値を選ぶ `gather`。
+
+値の計算は IEEE 754 に従い、演算の順序は固定されている。
+演算は引数を検査せず、エラーを返さない。
+定義域の外の引数（`sqrt` の負の数、`ln` の負の数など）は NaN を返し、NaN と無限大はそのまま伝わる。
+`Real` のメソッドで `Result` を返すのは、長さの不一致を `DimensionMismatch` で返す `combine`、表の外の番号を `OutOfBounds` で返す `gather`、規則のエラーをそのまま返す `try_map_scalar` だけである。
+
+ラッパー型は値の成分を `Primal` の算術で計算する。
+そのため、関数の値は微分の方式によらない。
+`Dual`、`MultiDual`、`Var` で計算した値は、同じ関数を内側の型（`Dual<f64>` なら `f64`）で評価した値とビットで一致する。
+微分は各関数の偏導関数を `Primal` の算術で評価し、連鎖律で合成して求める。
+各関数の偏導関数と、それを接成分にかける積の規則は[前進モードと二重数](../forward-mode/)と[初等関数の微分と精度](../elementary-functions/)で扱う。
+
+`PartialEq` と `PartialOrd` は `Real` の要求に含まれない。
+汎用コードで大小を比べるときは、次の節の比較メソッドを使う。
+
+### 値のリフトと取り出し
+
+数値型の値を作るメソッドは、引数の型と、残す微分の成分が異なる。
+
+| メソッド | 引数の型 | 結果 |
+|---|---|---|
+| `R::constant(c)` | スカラー `S` | すべての lane が `c`、すべての微分成分が 0 |
+| `R::zero()`、`R::one()` | なし | `R::constant(0)`、`R::constant(1)` |
+| `R::passive(b)` | `R::Base`（lane ごとに違う値でよい） | すべての階層で微分成分が 0 |
+| `R::lift(p)` | `R::Primal` | 一つ下の値 `p` を値の成分にし、この階層の微分成分を 0 にする。`p` が持つ内側の微分は残る |
+| `x.primal()` | なし | 一つ下の値。内側の微分を含む |
+| `x.base()` | なし | 最も内側の値（`S` か `Lanes<S, W>`） |
+
+テープの上では、`constant`、`passive`、`lift` で作った値は受動的（passive）で、被演算子がすべて受動的な演算は何も記録しない。
+乱数の標本や計測値のように lane ごとに違う定数は `R::passive` で入れる。
+すべての lane で同じ定数は `R::constant(c)` で作るか、演算子の右にスカラーとして置く。
+
+### 最も内側の型 `BaseReal`
+
+`R::Base` は最も内側の値の型で、トレイト `BaseReal<S>` を実装する。
+`BaseReal` を実装するのは `f32`、`f64`、`Lanes<S, W>` だけで（トレイトは外部からは実装できない）、どれも `Base` と `Primal` が自身である。
+比較の結果の型はラッパー型と同じで、`R::Base` の `Mask` は `R::Mask` に等しい。
+`BaseReal` は、lane ごとの値を組み立てるメソッドと読むメソッドを 1 つずつ持つ。
+
+| メソッド | 動作 |
+|---|---|
+| `B::from_fn(f)` | lane `k` を `f(k)` にした値を作る。スカラーの型では `f(0)` になる |
+| `b.lane(k)` | lane `k` の値を `Some` で返す。`k` が `LANES` 以上なら `None` を返す |
+
+汎用コードでは lane ごとに違う定数を `R::passive(R::Base::from_fn(f))` で入れ、結果の lane を `x.base().lane(k)` で読む。
+`Lanes` は同じ名前の固有メソッド `from_fn` と `lane` も持ち、動作は同じである。
+次の節のセルと[lane の結果とスカラーの結果](#lane-の結果とスカラーの結果)のセルは、この 2 つのメソッドでスカラーと `Lanes` の値を同じ関数で組み立てて読む。
+
+### 比較・マスク・`select`
+
+`lt`、`le`、`gt`、`ge` は最も内側の値（base）を lane ごとに比べ、微分の成分は比べない。
+NaN を含む比較は偽になる。
+結果の型 `R::Mask` はスカラーの型では `bool`、`Lanes<S, W>` を内側に持つ型では `LaneMask<W>` である。
+`is_finite` は値とすべての微分成分が有限である lane を返す。
+
+マスクは `Mask` トレイトを実装し、`splat`（全 lane を同じ値にする）、`any`、`all` と、`&`、`|`、`!` を持つ。
+`LaneMask<W>` は、さらに lane ごとの値との変換 `from_array`、`to_array` を持つ。
+
+`R::select(mask, a, b)` は lane ごとに、`mask` が真なら `a` のすべての成分を、偽なら `b` のすべての成分を選ぶ。
+結果の微分は選んだ側の微分で、選択は折れ点として数えない。
+両側の式は評価済みだが、選ばなかった側の値と微分は、NaN や無限大を含んでいても結果に入らない。
+
+次のセルは 4 つの lane に値 $(a - 1, a, a + 1, \mathrm{NaN})$ を持つ `Lanes<f64, 4>` で、比較と `select` を調べる。
+入力は値のずれ $a \in [-2, 2]$ である。
+比較 $x > 0$ の結果を `LaneMask<4>` として受け、`to_array`、`any`、`all` で読む。
+$\sqrt{x}$ と 0 から選ぶ `select(x > 0, √x, 0)` を `Lanes` と `Dual<Lanes<f64, 4>>` で評価し、`Dual` で評価した $\sqrt{x}$ の `is_finite` も読む。
+さらに、値の等しい 2 つの式 `select(x > 0, x, 0)` と `max(x, 0)` を `Tape<Lanes<f64, 4>>` で微分し、勾配と `TapeReport::kinks`（能動的な引数が折れ点に当たった回数、[逆モードとテープ](../reverse-mode-and-replay/)）を比べる。
+表の lane ごとの値は `BaseReal::lane` で読み、非有限の値は名前で示す。
+確かめるのは、NaN の lane の比較が偽になること、選ばなかった側の NaN と無限大が値と導関数に入らないこと、`select` は折れ点を数えず、`max` は $x = 0$ の lane で 1 回数えることである。
+
+```rust
+//| id: ad-lane-masks
+//| ref: ad-lane-masks
+//| title: Lanes の比較を LaneMask で受け、select と max の微分と折れ点の回数を比べる
+//| run: reactive
+//| crates: [scioxide-ad, scioxide-core]
+//| inputs:
+//|   shift: {"type":"range","label":"lane の値のずれ a","description":"4 つの lane の値は (a − 1, a, a + 1, NaN)。","min":-2,"max":2,"step":0.5,"value":0}
+//| cases:
+//|   - {"id":"kink-first","label":"a = 1","description":"lane 0 の値が 0 になり、max(x, 0) の折れ点に当たる。","inputs":{"shift":1}}
+//|   - {"id":"negative","label":"a = −2","description":"どの lane も x > 0 を満たさない。","inputs":{"shift":-2}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"lanes","path":"/rows/1/2","equals":"false"}
+//|       - {"artifact":"lanes","path":"/rows/2/2","equals":"true"}
+//|       - {"artifact":"lanes","path":"/rows/3/2","equals":"false"}
+//|       - {"artifact":"lanes","path":"/rows/0/3","equals":0}
+//|       - {"artifact":"lanes","path":"/rows/3/3","equals":0}
+//|       - {"artifact":"lanes","path":"/rows/2/4","approx":{"value":0.5,"atol":1e-15}}
+//|       - {"artifact":"lanes","path":"/rows/1/5","equals":0}
+//|       - {"artifact":"lanes","path":"/rows/1/6","approx":{"value":0.5,"atol":1e-15}}
+//|       - {"path":"/outputs/1/content","equals":"x > 0: any() = true、all() = false。√x の Dual の is_finite(): [false, false, true, false]。kinks(): select 0 回、max 1 回"}
+//|   - case: kink-first
+//|     expect:
+//|       - {"artifact":"lanes","path":"/rows/0/6","approx":{"value":0.5,"atol":1e-15}}
+//|       - {"artifact":"lanes","path":"/rows/1/4","approx":{"value":0.5,"atol":1e-15}}
+//|       - {"path":"/outputs/1/content","equals":"x > 0: any() = true、all() = false。√x の Dual の is_finite(): [false, true, true, false]。kinks(): select 0 回、max 1 回"}
+//|   - case: negative
+//|     expect:
+//|       - {"artifact":"lanes","path":"/rows/2/3","equals":0}
+//|       - {"artifact":"lanes","path":"/rows/2/6","equals":0}
+//|       - {"path":"/outputs/1/content","equals":"x > 0: any() = false、all() = false。√x の Dual の is_finite(): [false, false, false, false]。kinks(): select 0 回、max 0 回"}
+use scioxide_ad::{BaseReal, Dual, LaneMask, Lanes, Real, Tape, TapeOptions};
+use scioxide_core::ExecutionContext;
+
+// x > 0 の lane では √x を、それ以外の lane では 0 を選ぶ。
+fn clipped_root<R: Real>(x: R) -> R {
+    R::select(x.gt(R::zero()), x.sqrt(), R::zero())
+}
+// 値の等しい 2 つの式。比較で選ぶ select と、折れ点を持つ max。
+fn ramp_select<R: Real>(x: R) -> R {
+    R::select(x.gt(R::zero()), x, R::zero())
+}
+fn ramp_max<R: Real>(x: R) -> R {
+    x.max(R::zero())
+}
+// 最も内側の値の lane k を BaseReal::lane で読む。非有限の値は None にする。
+fn read<B: BaseReal>(b: B, k: usize) -> Option<f64> {
+    b.lane(k).filter(|v| v.is_finite())
+}
+let flags = |mask: LaneMask<4>| mask.to_array().map(|m| m.to_string()).join(", ");
+
+let x = Lanes::<f64, 4>::from_array([shift - 1.0, shift, shift + 1.0, f64::NAN]);
+// 比較は lane ごとの LaneMask を返す。NaN の lane は偽になる。
+let positive: LaneMask<4> = x.gt(Lanes::splat(0.0));
+let value = clipped_root(x);
+let tangent = clipped_root(Dual::variable(x)).derivative();
+// is_finite は値と導関数の両方が有限な lane で真になる。
+let finite = Dual::variable(x).sqrt().is_finite();
+
+// テープの上で 2 つの式を微分し、勾配と折れ点の回数を読む。
+let cx = ExecutionContext::sequential();
+let mut tape = Tape::<Lanes<f64, 4>>::new(TapeOptions::new());
+let mut by_select = [Lanes::splat(0.0)];
+tape.gradient_into(|v| Ok(ramp_select(v[0])), &[x], &mut by_select, cx)
+    .map_err(|e| e.to_string())?;
+let select_kinks = tape.report().kinks();
+let mut by_max = [Lanes::splat(0.0)];
+tape.gradient_into(|v| Ok(ramp_max(v[0])), &[x], &mut by_max, cx)
+    .map_err(|e| e.to_string())?;
+let max_kinks = tape.report().kinks();
+
+let rows: Vec<_> = (0..4)
+    .map(|k| {
+        (
+            k,
+            read(x, k),
+            positive.to_array()[k].to_string(),
+            read(value, k),
+            read(tangent, k),
+            read(by_select[0], k),
+            read(by_max[0], k),
+        )
+    })
+    .collect();
+let columns = serde_json::json!([
+    { "key": "0", "label": "lane k", "type": "integer" },
+    { "key": "1", "label": "x [-]", "type": "number", "nullText": "NaN" },
+    { "key": "2", "label": "x > 0（to_array）" },
+    { "key": "3", "label": "select(x > 0, √x, 0) [-]", "type": "number", "nullText": "非有限" },
+    { "key": "4", "label": "同じ式の Dual の導関数 [-]", "type": "number", "nullText": "非有限" },
+    { "key": "5", "label": "select(x > 0, x, 0) のテープの勾配 [-]", "type": "number" },
+    { "key": "6", "label": "max(x, 0) のテープの勾配 [-]", "type": "number" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "lanes" })
+);
+emit_text!(format!(
+    "x > 0: any() = {}、all() = {}。√x の Dual の is_finite(): [{}]。kinks(): select {} 回、max {} 回",
+    positive.any(),
+    positive.all(),
+    flags(finite),
+    select_kinks,
+    max_kinks
+));
+```
+
+既定の $a = 0$ では lane の値が $(-1, 0, 1, \mathrm{NaN})$ で、比較 $x > 0$ は lane 2 だけで真になる。
+NaN の lane 3 は比較が偽なので `select` は偽の側の 0 を選び、入力の NaN は値にも導関数にも残らない。
+lane 0 の $\sqrt{-1}$ は NaN、lane 1 の $\sqrt{x}$ の導関数は $+\infty$ だが、どちらも選ばれないので、`select` の値は $(0, 0, 1, 0)$、`Dual` の導関数は $(0, 0, 0.5, 0)$ になる。
+`Dual` で評価した $\sqrt{x}$ の `is_finite` は lane 1 でも偽になる。
+値 0 は有限だが、導関数が $+\infty$ だからである。
+テープでは、$x = 0$ の lane 1 で `select(x > 0, x, 0)` の勾配が偽の側の 0、`max(x, 0)` の勾配が片側導関数の中点 1/2 になり、`kinks()` は `select` で 0 回、`max` で 1 回である。
+$a = 1$ では lane 0 が 0 になり、`max` の勾配はその lane で 1/2、`kinks()` は 1 回になる。
+$a = -2$ ではどの lane も $x > 0$ を満たさないので `any()` も偽になり、`select` の値と 2 つの勾配はすべての lane で 0 になる。
+このように比較による選択では、入力の NaN が偽の側の値に置き換わり、結果に残らないことがある。
+入力の NaN を検出するには、選ぶ前に `is_finite` で調べる。
+
+### 汎用コードの書き方
+
+汎用コードでは次の規則に従う。
+
+- スカラーは演算子の右に置く（`x * 2.0`、`-x + 1.0`）。
+  `Real` は `S: Mul<R>` を要求しないので、`2.0 * x` は具体的な型（`f64`、`Lanes`、`Dual` など）でだけコンパイルできる。
+- 境界 `R: Real` は `R: Real<f64>` の意味である。
+  `f32` で使う関数は `R: Real<f32>` とし、両方で使う関数は `S: RealScalar` と `R: Real<S>` の 2 つの型引数を取る（`RealScalar` は scioxide-core のトレイト）。
+- lane ごとに違う定数（乱数など）は `R::passive(z)` で入れる。
+- 普通の `if` で分岐するには境界を `R: Real<Mask = bool>` にする。
+  この境界は `Lanes` を内側に持つ型を除く。
+  `Lanes` でも動かすコードは両方の式を計算して `R::select` で選ぶ。
+
+分岐を含むコードの微分と、テープに記録される内容の違いは[分岐・マスク・表引き](../control-flow/)で扱う。
+
+## `Lanes<S, W>` と SIMD
+
+`Lanes<S, W>` は `W` 個の独立な `S` の値を固定長の配列に持ち、すべての演算を lane（レーン、SIMD の 1 要素）ごとに同じ演算列で行う型である。
+各演算は配列の上のループで、安全な Rust としてインライン展開されるので、コンパイラがビルドの target feature に合わせて SIMD 命令に変換する。
+target feature はコンパイル時に決まる。
+x86-64 で AVX2 を使うには `-C target-cpu=x86-64-v3`（または `native`）でビルドする必要がある。
+既定の x86-64 のビルドは SSE2 を使い、lane の演算が中心のコードでは約 1.2〜1.7 倍遅くなる。
+
+値の作り方と取り出し方は次のとおりである。
+
+| メソッド | 動作 | 失敗 |
+|---|---|---|
+| `Lanes::splat(v)` | すべての lane を `v` にする | なし |
+| `Lanes::from_array(a)` | 長さ `W` の配列から作る | なし |
+| `Lanes::from_fn(f)` | lane `k` を `f(k)` にする | なし |
+| `Lanes::from_slice(s)` | スライスから作る | `s.len() != W` で `DimensionMismatch` |
+| `x.to_array()` | lane ごとの値を配列で返す | なし |
+| `x.lane(k)` | lane `k` の値を返す | `k ≥ W` で `None` |
+| `x.write_to_slice(out)` | lane ごとの値をスライスに書く | `out.len() != W` で `DimensionMismatch` |
+
+`f32` と `f64` は演算子の左に置いても `Lanes` と組み合わせられる。
+`Dual<Lanes<f64, W>>` や `MultiDual<Lanes<f64, W>, N>` のようにラッパー型の内側に置くと、`W` 個の点の微分を同時に保持する。
+多数の独立な項目を `W` 個ずつ lane に詰めて評価する手順は[多数の項目の一括評価](../batches/)で扱う。
+
+### lane の結果とスカラーの結果
+
+各 lane は同じ演算列で計算され、lane の結果はその lane の引数だけで決まる。
+そのため、結果は lane の幅 `W`、lane の位置、ビルドの target feature（SSE2 か AVX2 か）によらず同じビットになる。
+
+スカラーの関数との関係は演算によって 2 通りある。
+
+- `exp`、`exp_m1`、`ln`、`ln_1p`、`sin`、`cos`、`tanh`、`powf` の 8 つは、scioxide-core の分岐のない lane カーネルで計算する。
+  カーネルの結果は厳密な値から 4 ulp 以内で、スカラーの関数とは最後の数桁が違いうる。
+  カーネルの定義域の外にある lane は、スカラーの関数の結果を受け取る。
+- それ以外の演算はスカラーの関数とビットで一致する。
+
+`f32` の lane のカーネルは値を `f64` に広げて `f64` のカーネルで計算し、`f32` に丸めて返す。
+カーネルは融合積和（FMA）を使わないので、FMA の有無でも結果は変わらない。
+`sin_cos` のようにこれらのカーネルを内部で使う演算や、偏導関数がカーネルを使う微分（`sin` の偏導関数 `cos`、`tanh` の偏導関数に現れる `exp` など）も、`Lanes` を内側に持つ型ではスカラーの型と最後の桁が違いうる。
+
+次のセルは同じ汎用関数を `f64`・`f32` のスカラーと `Lanes<S, 8>`・`Lanes<S, 2>` で評価し、lane ごとの結果を比べる。
+入力は評価点の区間の半幅 $R$ で、区間 $[-R, R]$ を 1024 等分した各小区間の中点を評価点にする。
+比べる演算はカーネルを使う 8 つ、使わない 6 つ（`select` による分岐を含む）、カーネルを使う合成関数 $f(x) = \sin(x^2) + e^x/2$ とその導関数（`Dual` の接成分）である。
+出力は、スカラーの結果と違う点の数、最大の ulp 差、`W = 8` と `W = 2` で結果が違う点の数である。
+スカラーと 2 つの幅の `Lanes` は `BaseReal::from_fn` で点を lane に詰め、`BaseReal::lane` で結果を取り出す同じ汎用関数で評価する。
+ulp 差は浮動小数点数を順序どおりに並べた整数の上の距離として独立に数える。
+確かめるのは、カーネルを使わない行のスカラーとの差が 0 であること、カーネルを使う行の差が数 ulp に収まること、`W` による違いがないことである。
+
+```rust
+//| id: ad-lanes-scalar-agreement
+//| ref: ad-lanes-scalar-agreement
+//| title: 同じ汎用関数を f64・f32 のスカラーと Lanes で評価して lane ごとの差を数える
+//| run: reactive
+//| crates: [scioxide-ad, scioxide-core]
+//| inputs:
+//|   half_width: {"type":"select","label":"評価点の区間の半幅 R","description":"区間 [−R, R] の 1024 点で評価する。R = 100 では exp が 10⁴³ 程度まで大きくなる。","options":["1","10","100"],"value":"10"}
+//| cases:
+//|   - {"id":"narrow","label":"R = 1","description":"0 の近くの評価点だけで比べる。","inputs":{"half_width":"1"}}
+//|   - {"id":"wide","label":"R = 100","description":"大きな引数でも、カーネルを使わない演算はスカラーと一致する。","inputs":{"half_width":"100"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"agreement","path":"/rows/8/2","equals":0}
+//|       - {"artifact":"agreement","path":"/rows/13/2","equals":0}
+//|       - {"artifact":"agreement","path":"/rows/13/4","equals":0}
+//|       - {"artifact":"agreement","path":"/rows/0/3","range":{"min":0,"max":8}}
+//|       - {"artifact":"agreement","path":"/rows/4/3","range":{"min":0,"max":8}}
+//|       - {"artifact":"agreement","path":"/rows/0/5","range":{"min":0,"max":2}}
+//|       - {"artifact":"agreement","path":"/rows/15/6","equals":0}
+//|   - case: narrow
+//|     expect:
+//|       - {"artifact":"agreement","path":"/rows/11/2","equals":0}
+//|       - {"artifact":"agreement","path":"/rows/6/3","range":{"min":0,"max":8}}
+//|       - {"artifact":"agreement","path":"/rows/14/6","equals":0}
+//|   - case: wide
+//|     expect:
+//|       - {"artifact":"agreement","path":"/rows/12/2","equals":0}
+//|       - {"artifact":"agreement","path":"/rows/1/3","range":{"min":0,"max":8}}
+//|       - {"artifact":"agreement","path":"/rows/7/6","equals":0}
+use scioxide_ad::{BaseReal, Dual, Lanes, Real};
+use scioxide_core::RealScalar;
+
+// 比べる演算の名前。0〜7 は lane カーネルを使い、8〜13 は使わない。
+const NAMES: [&str; 16] = [
+    "exp x",
+    "exp_m1 x",
+    "ln |x|",
+    "ln_1p |x|",
+    "sin x",
+    "cos x",
+    "tanh x",
+    "|x|^1.5（powf）",
+    "√|x|",
+    "∛x",
+    "atan x",
+    "sinh x",
+    "sigmoid x",
+    "select(x > 0, x, 0)",
+    "f(x) = sin(x²) + eˣ/2",
+    "f′(x)（Dual の接成分）",
+];
+
+// 汎用コード: スカラーは演算子の右に置き、定数は R::constant、分岐は R::select で書く。
+fn apply<S: RealScalar, R: Real<S>>(k: usize, x: R) -> R {
+    let a = x.abs();
+    match k {
+        0 => x.exp(),
+        1 => x.exp_m1(),
+        2 => a.ln(),
+        3 => a.ln_1p(),
+        4 => x.sin(),
+        5 => x.cos(),
+        6 => x.tanh(),
+        7 => a.powf(R::constant(S::from_f64_ieee(1.5))),
+        8 => a.sqrt(),
+        9 => x.cbrt(),
+        10 => x.atan(),
+        11 => x.sinh(),
+        12 => x.sigmoid(),
+        13 => R::select(x.gt(R::zero()), x, R::zero()),
+        _ => (x * x).sin() + x.exp() * S::HALF,
+    }
+}
+
+// 行 k の量を数値型 V で求める。最後の行は Dual<V> で評価した f の接成分。
+fn row<S: RealScalar, V: Real<S>>(k: usize, x: V) -> V {
+    if k < 15 {
+        apply::<S, V>(k, x)
+    } else {
+        apply::<S, Dual<V>>(14, Dual::variable(x)).derivative()
+    }
+}
+
+// 独立検算の道具: IEEE のビット列と、順序どおりに並べた整数の上の距離（ulp 差）。
+fn bits<S: RealScalar>(v: S) -> u64 {
+    if S::MANTISSA_DIGITS == 24 {
+        u64::from((v.into_f64() as f32).to_bits())
+    } else {
+        v.into_f64().to_bits()
+    }
+}
+fn ulps<S: RealScalar>(a: S, b: S) -> u64 {
+    let sign = if S::MANTISSA_DIGITS == 24 {
+        1 << 31
+    } else {
+        1 << 63
+    };
+    let ordered = |v: S| {
+        let raw = bits(v);
+        if raw & sign != 0 {
+            -i128::from(raw & !sign)
+        } else {
+            i128::from(raw)
+        }
+    };
+    u64::try_from(ordered(a).abs_diff(ordered(b))).unwrap_or(u64::MAX)
+}
+
+// 点の列を B::LANES 個ずつ lane に詰めて行 k を評価し、lane ごとの結果を並べる。
+// B がスカラーなら 1 点ずつ、Lanes<S, W> なら W 点ずつ評価する。
+fn evaluate<S: RealScalar, B: BaseReal<S>>(k: usize, xs: &[S]) -> Vec<S> {
+    xs.chunks(B::LANES)
+        .flat_map(|chunk| {
+            let y = row::<S, B>(k, B::from_fn(|j| chunk[j]));
+            (0..B::LANES).filter_map(move |j| y.lane(j))
+        })
+        .collect()
+}
+
+// 1024 点で行 k を比べ、(スカラーと違う点, 最大の ulp 差, W = 8 と W = 2 で違う点) を返す。
+fn compare<S: RealScalar>(k: usize, half_width: f64) -> (u32, u64, u32) {
+    let xs: Vec<S> = (0..1024)
+        .map(|i| S::from_f64_ieee(half_width * ((2 * i + 1) as f64 / 1024.0 - 1.0)))
+        .collect();
+    let same = |a: S, b: S| bits(a) == bits(b) || (a.is_nan() && b.is_nan());
+    let scalar = evaluate::<S, S>(k, &xs);
+    let wide = evaluate::<S, Lanes<S, 8>>(k, &xs);
+    let narrow = evaluate::<S, Lanes<S, 2>>(k, &xs);
+    let (mut differ, mut worst, mut width) = (0, 0, 0);
+    for j in 0..xs.len() {
+        if !same(wide[j], scalar[j]) {
+            differ += 1;
+            worst = worst.max(ulps(wide[j], scalar[j]));
+        }
+        width += u32::from(!same(wide[j], narrow[j]));
+    }
+    (differ, worst, width)
+}
+
+let r: f64 = half_width.parse().map_err(|_| "半幅を数として読めない")?;
+let rows: Vec<_> = (0..NAMES.len())
+    .map(|k| {
+        let (d64, u64_, w64) = compare::<f64>(k, r);
+        let (d32, u32_, w32) = compare::<f32>(k, r);
+        let kernel = if k < 8 || k >= 14 {
+            "使う"
+        } else {
+            "使わない"
+        };
+        (NAMES[k], kernel, d64, u64_, d32, u32_, w64 + w32)
+    })
+    .collect();
+let columns = serde_json::json!([
+    { "key": "0", "label": "演算" },
+    { "key": "1", "label": "lane カーネル" },
+    { "key": "2", "label": "f64: スカラーと違う点 [点]", "type": "integer" },
+    { "key": "3", "label": "f64: 最大の差 [ulp]", "type": "integer" },
+    { "key": "4", "label": "f32: スカラーと違う点 [点]", "type": "integer" },
+    { "key": "5", "label": "f32: 最大の差 [ulp]", "type": "integer" },
+    { "key": "6", "label": "W = 8 と W = 2 で違う点 [点]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "agreement" })
+);
+```
+
+既定の $R = 10$ のブラウザでの実行では、カーネルを使わない 6 行（`select` を含む）は、`f64` と `f32` の 1024 点すべてでスカラーとビットで一致する。
+カーネルを使う 8 行では、スカラーと違う点が `f64` で 0〜80 点（`exp` で 59 点、`powf` で 80 点）、`f32` で 0〜112 点あり、差はどれも 1 ulp である。
+カーネルを使う合成関数 $f$ の差も、`f64` で 1 ulp、`f32` で 2 ulp にとどまる。
+導関数 $f'(x) = 2x\cos(x^2) + e^x/2$ の差は、`f64` と `f32` のどちらでも最大 16 ulp になる。
+`f64` で最大になる $x \approx 1.59$ では 2 つの項（約 $-2.6$ と $2.5$）が打ち消し合って $f' \approx -0.157$ になり、項の 1 ulp の違いが小さな結果に対して相対的に大きくなる（`f32` で最大になる $x \approx 1.88$ でも $f' \approx -0.164$ である）。
+$R = 1$ では $f'$ の零点の近くの $x \approx -0.206$（$f' \approx -0.0048$）で、どちらの精度でも差が 64 ulp まで上がる。
+最後の列はすべての区間とすべての行で 0 である。
+
+違う点の数はスカラーの関数の実装によって変わる。
+スカラーの `f64` と `f32` の初等関数は標準ライブラリの数学関数で計算されるので、ネイティブのビルドでは数が変わる（上の数はブラウザでの値である）。
+一方、カーネルの定義域の中の lane では、lane のカーネルはネイティブのビルドでもブラウザでも同じビットの結果を返す。
+
+## 入れ子の型の成分
+
+入れ子の二重数で 2 階微分が求まる理由は、二重数の代数から分かる。
+`Dual::variable(Dual::variable(x))` は、内側の無限小を $\varepsilon_1$、外側の無限小を $\varepsilon_2$（$\varepsilon_1^2 = \varepsilon_2^2 = 0$）として $x + \varepsilon_1 + \varepsilon_2$ を表す。
+$f$ を 2 回微分可能とし、Taylor 展開 $f(x + h) = f(x) + f'(x)\,h + \tfrac{1}{2}f''(x)\,h^2 + \cdots$ に $h = \varepsilon_1 + \varepsilon_2$ を入れる。
+$h^2 = 2\varepsilon_1\varepsilon_2$、$h^3 = 0$ なので
+
+$$
+f(x + \varepsilon_1 + \varepsilon_2) = f(x) + f'(x)\,\varepsilon_1 + f'(x)\,\varepsilon_2 + f''(x)\,\varepsilon_1 \varepsilon_2
+$$
+
+となる。
+4 つの係数は値の成分 `value()` と微分の成分 `derivative()` を順に取り出して読む。
+
+| 取り出し方 | 係数 |
+|---|---|
+| `value().value()`（`base()` と同じ） | $f(x)$ |
+| `value().derivative()` | 内側の方向の微分 $f'(x)$ |
+| `derivative().value()` | 外側の方向の微分 $f'(x)$ |
+| `derivative().derivative()` | $f''(x)$ |
+
+内側と外側に異なる方向 $\mathbf{u}$、$\mathbf{v}$ をシードとして入れると、最後の係数は混合偏微分 $\mathbf{u}^\mathsf{T}\mathbf{H}\mathbf{v}$ になる。
+
+`R::lift(p)` は内側の値 `p` の微分を残し、外側の微分成分を 0 にする。
+`Dual<Dual<f64>>` で `R::lift(Dual::variable(x))` を評価すると、内側の方向の $f'(x)$ だけが残り、外側の微分と $f''$ の成分は 0 になる。
+`R::constant(x)` と `R::passive(x)` はどの階層の微分成分も 0 にする。
+
+次のセルは汎用関数 $f(x) = \sin(x^2) + e^x/2$ をいくつかの数値型で評価し、型の定数 `LEVEL` と `LANES`、取り出した成分を閉形式と比べる。
+閉形式は
+
+$$
+f'(x) = 2x\cos(x^2) + \tfrac{1}{2}e^x, \qquad f''(x) = 2\cos(x^2) - 4x^2\sin(x^2) + \tfrac{1}{2}e^x
+$$
+
+で、セルでは参照値として `f64` の固有メソッドで評価する。
+入力は評価点 $x \in [-2, 2]$ で、`Lanes<f64, 4>` の lane $k$ には点 $x + k h$（$h = 0.25$）を入れる。
+確かめるのは、各成分が閉形式と丸めの範囲で一致すること、`lift` で作った値の外側の微分が 0 になることである。
+
+```rust
+//| id: ad-nested-components
+//| ref: ad-nested-components
+//| title: 入れ子の数値型の LEVEL・LANES と成分を閉形式と比べる
+//| run: reactive
+//| crates: [scioxide-ad]
+//| inputs:
+//|   point: {"type":"range","label":"評価点 x","description":"Lanes<f64, 4> の lane k は x + 0.25k。","min":-2,"max":2,"step":0.05,"value":0.3}
+//| cases:
+//|   - {"id":"origin","label":"x = 0","description":"f(0) = 1/2、f′(0) = 1/2、f″(0) = 5/2。","inputs":{"point":0}}
+//|   - {"id":"steep","label":"x = 1.5","description":"sin(x²) の山を越え、f″ が負になる点。","inputs":{"point":1.5}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"components","path":"/rows/0/2","equals":0}
+//|       - {"artifact":"components","path":"/rows/3/3","equals":4}
+//|       - {"artifact":"components","path":"/rows/7/2","equals":2}
+//|       - {"artifact":"components","path":"/rows/7/6","approx":{"value":0,"atol":1e-13}}
+//|       - {"artifact":"components","path":"/rows/3/6","approx":{"value":0,"atol":1e-13}}
+//|       - {"artifact":"components","path":"/rows/9/4","equals":0}
+//|   - case: origin
+//|     expect:
+//|       - {"artifact":"components","path":"/rows/2/4","approx":{"value":0.5,"atol":1e-15}}
+//|       - {"artifact":"components","path":"/rows/7/4","approx":{"value":2.5,"atol":1e-14}}
+//|   - case: steep
+//|     expect:
+//|       - {"artifact":"components","path":"/rows/7/6","approx":{"value":0,"atol":1e-12}}
+//|       - {"artifact":"components","path":"/rows/8/6","approx":{"value":0,"atol":1e-13}}
+use scioxide_ad::{Dual, Lanes, Real};
+
+// 汎用のモデル f(x) = sin(x²) + eˣ/2。数値型を変えるだけで値と導関数が得られる。
+fn model<R: Real>(x: R) -> R {
+    (x * x).sin() + x.exp() * 0.5
+}
+// 型の定数 LEVEL と LANES を読む。
+fn shape<R: Real>(_: R) -> (usize, usize) {
+    (R::LEVEL, R::LANES)
+}
+
+let x = point;
+let h = 0.25;
+let pack = Lanes::<f64, 4>::from_fn(|k| x + h * k as f64);
+let plain = model(x);
+let lanes = model(pack);
+let tangent = model(Dual::variable(x));
+let tangent_lanes = model(Dual::variable(pack));
+// 内側と外側の両方の方向に 1 を入れる: x + ε₁ + ε₂。
+let second = model(Dual::variable(Dual::variable(x)));
+// lift は内側の微分を残し、外側の微分成分を 0 にする。
+let lifted = model(<Dual<Dual<f64>>>::lift(Dual::variable(x)));
+
+// 独立検算: 閉形式（f64 の固有メソッドで評価する参照値）。
+let f = |t: f64| (t * t).sin() + 0.5 * t.exp();
+let d1 = |t: f64| 2.0 * t * (t * t).cos() + 0.5 * t.exp();
+let d2 = |t: f64| 2.0 * (t * t).cos() - 4.0 * t * t * (t * t).sin() + 0.5 * t.exp();
+let last = x + 3.0 * h;
+
+let entries = [
+    ("f64", "値", shape(plain), plain, f(x)),
+    (
+        "Lanes<f64, 4>",
+        "to_array()[3] = f(x + 3h)",
+        shape(lanes),
+        lanes.to_array()[3],
+        f(last),
+    ),
+    (
+        "Dual<f64>",
+        "derivative() = f′(x)",
+        shape(tangent),
+        tangent.derivative(),
+        d1(x),
+    ),
+    (
+        "Dual<Lanes<f64, 4>>",
+        "derivative().to_array()[3] = f′(x + 3h)",
+        shape(tangent_lanes),
+        tangent_lanes.derivative().to_array()[3],
+        d1(last),
+    ),
+    (
+        "Dual<Dual<f64>>",
+        "base() = f(x)",
+        shape(second),
+        second.base(),
+        f(x),
+    ),
+    (
+        "Dual<Dual<f64>>",
+        "value().derivative() = f′(x)",
+        shape(second),
+        second.value().derivative(),
+        d1(x),
+    ),
+    (
+        "Dual<Dual<f64>>",
+        "derivative().value() = f′(x)",
+        shape(second),
+        second.derivative().value(),
+        d1(x),
+    ),
+    (
+        "Dual<Dual<f64>>",
+        "derivative().derivative() = f″(x)",
+        shape(second),
+        second.derivative().derivative(),
+        d2(x),
+    ),
+    (
+        "lift で作った Dual<Dual<f64>>",
+        "value().derivative() = f′(x)",
+        shape(lifted),
+        lifted.value().derivative(),
+        d1(x),
+    ),
+    (
+        "lift で作った Dual<Dual<f64>>",
+        "derivative().value() = 0",
+        shape(lifted),
+        lifted.derivative().value(),
+        0.0,
+    ),
+];
+let rows: Vec<_> = entries
+    .iter()
+    .map(|&(ty, part, (level, width), value, exact)| {
+        (ty, part, level, width, value, exact, value - exact)
+    })
+    .collect();
+let fixed15 = serde_json::json!({ "fractionDigits": 15 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "数値型" },
+    { "key": "1", "label": "取り出した成分" },
+    { "key": "2", "label": "LEVEL", "type": "integer" },
+    { "key": "3", "label": "LANES", "type": "integer" },
+    { "key": "4", "label": "計算値 [-]", "type": "number", "format": fixed15 },
+    { "key": "5", "label": "閉形式（参照値） [-]", "type": "number", "format": fixed15 },
+    { "key": "6", "label": "差 [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "components" })
+);
+```
+
+既定の $x = 0.3$ では、10 行すべてで計算値が閉形式の評価とビットで一致する。
+`LEVEL` は `Dual` を 1 回ラップするごとに 1 増え、`LANES` は内側の `Lanes<f64, 4>` の 4 を引き継ぐ。
+`Dual<Dual<f64>>` の内側と外側の微分はどちらも $f'(0.3) = 1.2725010435951982$ で、`derivative().derivative()` は $f''(0.3) = 2.634478592100706$ である。
+`lift` で作った値は内側の $f'$ だけを持ち、外側の微分成分は 0 である。
+$x = 0$ では $f = f' = 1/2$、$f'' = 5/2$ が厳密に得られ、$x = 1.5$ でも差は 0 になる。
+ビットで一致するのはこの関数とこれらの点での結果で、一般の関数では偏導関数の丸めの順序が閉形式の式と違うので、最後の桁が違いうる。
+
+## まとめ
+
+関数は `fn f<R: Real>(x: R) -> R` の形で一度だけ書き、スカラーを演算子の右に、lane ごとの定数を `R::passive` で、分岐を `R::select` で書けば、`f64`、`Lanes`、`Dual`、`MultiDual`、`Jet`、`Var` のどれでも同じコードが動く。
+値は微分の方式によらず、ラッパー型の値は内側の型で評価した値とビットで一致する。
+`Lanes` の結果は lane の幅によらず同じで、`exp`、`exp_m1`、`ln`、`ln_1p`、`sin`、`cos`、`tanh`、`powf` の 8 つのカーネルとそれを使う演算だけがスカラーの結果と最後の数桁で違いうる。
+比較は lane ごとのマスク（`Lanes` では `LaneMask`）を返し、`select` は折れ点を数えず、NaN の lane では偽の側を選ぶので、入力の NaN は選ぶ前に `is_finite` で調べる。
+スカラーとビットで一致する結果が必要な検算では、`Lanes` の代わりにスカラーの型で評価する。
+2 階微分は `Dual<Dual<f64>>` の `derivative().derivative()` で、多数の点の微分は `Dual<Lanes<f64, W>>` で求まり、成分は `value()`、`derivative()`、`base()` を順に呼んで取り出す。
+
+## 次に読むページ
+
+- [前進モードと二重数](../forward-mode/)：`Dual` と `MultiDual` の規則、IEEE 積と `azmul` の使い分け、導関数の精度を確かめる。
+- [逆モードとテープ](../reverse-mode-and-replay/)：同じ汎用関数を `Var` でテープに記録し、勾配を入力の数によらない計算コストで求める方法を確かめる。
+- [多数の項目の一括評価](../batches/)：多数の独立な項目を `Lanes` に詰めて評価し、和や平均の勾配を求める手順を確かめる。
+- [スカラー関数の微分規則](../custom-primitives/)：外部から実装できない `Real` に関数を加える `map_scalar` と `combine` の精度を確かめる。

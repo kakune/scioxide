@@ -1,0 +1,508 @@
+---
+title: 宇宙機の姿勢補間と角速度
+description: Z-Y-X 内在の Euler 角で与えた宇宙機のキー姿勢を Rotation に変換し、ピッチ 90° 付近での Euler 角の往復とジンバルロックの判定、Slerp の区間ごとに一定の角速度と節点での跳び、回転スプラインの連続な角速度・角加速度を区間ごとの表と連動するグラフで確かめる。
+sidebar:
+  order: 435
+---
+
+宇宙機の姿勢を一連の目標に向けて変えるとき、目標の姿勢（キー姿勢）は時刻とともに与えられ、そのあいだを補間した姿勢の軌道を姿勢制御系が追う。
+軌道の角速度に跳びがあると、跳びを実現するためにトルクの衝撃が要る。
+この例題ではヨー・ピッチ・ロールで与えたキー姿勢を `Rotation` に変換し、`Slerp` と `RotationSpline` で補間して、角速度と角加速度を比べる。
+キー姿勢のピッチを 90° に近づけ、Euler 角との変換で何が起きるかも確かめる。
+
+## 姿勢の運動学と必要なトルク
+
+慣性系に対する機体の姿勢を回転 $R(t)$ で表すと、機体座標系の角速度 $\omega$ [rad/s] は
+
+$$
+\dot R = R\,\hat\omega
+$$
+
+で定まる（$\hat\omega$ は $\omega$ の外積行列）。
+慣性テンソル $I$ が一定の剛体では、姿勢の軌道に沿って運動させるのに要るトルクは Euler の運動方程式
+
+$$
+\tau = I\,\dot\omega + \omega \times (I\,\omega)
+$$
+
+から決まる。
+$\tau$ は角加速度 $\alpha = \dot\omega$ について線形だが、$\omega$ については 2 次である。
+$\omega$ に跳びがあれば $\tau$ にデルタ関数の衝撃が現れ、$\alpha$ に跳びがあれば $\tau$ に跳びが現れる。
+$\omega$ と $\alpha$ がどちらも連続な軌道なら、$\tau$ も連続になる。
+
+## キー姿勢の与え方
+
+キー姿勢は、航空宇宙で使う Z-Y-X 内在の Euler 角、ヨー $\psi$・ピッチ $\theta$・ロール $\phi$ で与え、
+
+$$
+R = R_z(\psi)\,R_y(\theta)\,R_x(\phi)
+$$
+
+とする。
+`EulerSequence::new([Z, Y, X], EulerFrame::Intrinsic)` がこの系列で、`Rotation::from_euler` が角 [rad] から回転を作る。
+$K$ 個のキー姿勢を時刻 $t_k = 10k$ s（$k = 0, \ldots, K - 1$）に置き、ヨーの旋回角 $A$ とピッチ $P$ から
+
+$$
+\psi_k = A\,\frac{k}{K - 1}, \qquad
+\theta_k = P \sin\frac{\pi k}{K - 1}, \qquad
+\phi_k = (-1)^k\,\frac{A}{4}
+$$
+
+と決める。
+ヨーは $0$ から $A$ まで一定の割合で旋回し、ピッチは両端で 0、中央で最大の $P$ になり、ロールは向きを交互に変える。
+$K$ が奇数なら中央のキー姿勢のピッチがちょうど $P$ になり、$P = 90°$ ではジンバルロックの姿勢になる。
+
+`Rotation::as_euler` は、ピッチの $\lvert\cos\theta\rvert$ が許容誤差の閾値（`Tolerance::from_sqrt_epsilon()` で $2\sqrt\varepsilon \approx 2.98 \times 10^{-8}$）以下のとき `gimbal_lock` を真にし、ロールを 0 にして、決まる組み合わせ（ピッチが +90° ならヨーとロールの差 $\psi - \phi$、−90° なら和 $\psi + \phi$）をヨーに入れる。
+ロックの手前でもヨーとロールの誤差は $\varepsilon/\lvert\cos\theta\rvert$ に拡大される。
+詳しくは[角の範囲とジンバルロック](oxref:spatial-gimbal-lock)で導く。
+
+次のブロックは 2 つのセルが共有する定義である。
+`yaw_pitch_roll` が Z-Y-X 内在の系列、`key_angles` が上の式のキーの角 [deg]、`key_rotations` がキーの時刻と回転を返す。
+`distance` は回転の距離 $d(R_a, R_b) = \angle(R_a^{-1}R_b)$ [rad]、`norm3` は 3 成分のベクトルの Euclid ノルムである。
+
+```rust
+//| id: spatial-attitude-keys
+//| kind: definitions
+//| title: Z-Y-X 内在の Euler 角によるキー姿勢
+//| crates: [scioxide-core, scioxide-spatial]
+use scioxide_core::{SciOxideError, RealScalar};
+use scioxide_spatial::{EulerFrame, EulerSequence, Rotation, RotationAxis};
+
+/// キーの間隔 Δt [s]。
+pub(crate) const KEY_SPACING: f64 = 10.0;
+
+/// ヨー・ピッチ・ロールの Z-Y-X 内在の系列。
+pub(crate) fn yaw_pitch_roll() -> Result<EulerSequence, SciOxideError> {
+    let axes = [RotationAxis::Z, RotationAxis::Y, RotationAxis::X];
+    EulerSequence::new(axes, EulerFrame::Intrinsic)
+}
+
+/// キー k の (ψ, θ, φ) [deg]: ψ = A k/(K−1)、θ = P sin(πk/(K−1))、φ = (−1)^k A/4。
+pub(crate) fn key_angles(count: usize, slew: f64, pitch: f64) -> Vec<[f64; 3]> {
+    let last = (count - 1) as f64;
+    (0..count)
+        .map(|k| {
+            let s = k as f64 / last;
+            let sign = if k % 2 == 0 { 1.0 } else { -1.0 };
+            let theta = pitch * RealScalar::sin(<f64 as RealScalar>::PI * s);
+            [slew * s, theta, sign * slew / 4.0]
+        })
+        .collect()
+}
+
+/// キーの時刻 t_k = k Δt [s] と回転。
+pub(crate) fn key_rotations(
+    count: usize,
+    slew: f64,
+    pitch: f64,
+) -> Result<(Vec<f64>, Vec<Rotation<f64>>), SciOxideError> {
+    let sequence = yaw_pitch_roll()?;
+    let times = (0..count).map(|k| KEY_SPACING * k as f64).collect();
+    let rotations = key_angles(count, slew, pitch)
+        .into_iter()
+        .map(|a| Rotation::from_euler(sequence, a.map(RealScalar::to_radians)))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((times, rotations))
+}
+
+/// 回転の距離 d(a, b) = ∠(a⁻¹ b) [rad]。
+pub(crate) fn distance(a: Rotation<f64>, b: Rotation<f64>) -> Result<f64, SciOxideError> {
+    Ok(a.inverse().compose(b)?.as_axis_angle().1)
+}
+
+/// 3 成分のベクトルの Euclid ノルム。
+pub(crate) fn norm3(v: [f64; 3]) -> f64 {
+    RealScalar::hypot(RealScalar::hypot(v[0], v[1]), v[2])
+}
+```
+
+次のセルはキーの数 $K$、旋回角 $A$、ピッチ $P$ を選び、キー姿勢を作って Euler 角に戻す。
+表 `keys` は各キー姿勢の時刻、与えた角、`as_euler` で戻した角、ロックの判定、与えた回転と戻した角から作り直した回転の距離 $d$ [rad] を示す。
+$d$ は相対回転の角で、Euler 角の表し方によらない回転の差である。
+このセルはキーの数、旋回角、ピッチを次のセルに渡す。
+
+```rust
+//| id: spatial-attitude-euler-keys
+//| ref: spatial-attitude-euler-keys
+//| title: Euler 角で与えたキー姿勢を回転に変換して往復を確かめる
+//| run: reactive
+//| uses: [spatial-attitude-keys]
+//| crates: [scioxide-core, scioxide-spatial]
+//| exports: [key_count, slew, pitch]
+//| inputs:
+//|   key_count: {"type":"range","label":"キーの数 K","description":"時刻 0, 10, 20, … s に置くキー姿勢の数。","min":3,"max":8,"step":1,"value":5}
+//|   slew: {"type":"range","label":"ヨーの旋回角 A [deg]","description":"ヨーを 0 から A まで旋回し、ロールを ±A/4 で交互に振る。","min":30,"max":180,"step":10,"value":120}
+//|   pitch: {"type":"range","label":"最大のピッチ P [deg]","description":"中央のキー姿勢のピッチ。90° でジンバルロックになる。","min":0,"max":90,"step":0.5,"value":60}
+//| cases:
+//|   - {"id":"gimbal-lock","label":"P = 90°","description":"中央のキー姿勢がジンバルロックになり、ロールが 0 に、ヨーが ψ − φ になる。","inputs":{"pitch":90}}
+//|   - {"id":"near-lock","label":"P = 89.5°, K = 7","description":"ロックの手前では角が戻るが、中央の誤差がほかより大きい。","inputs":{"pitch":89.5,"key_count":7}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"keys","path":"/rows/2/2","approx":{"value":60,"atol":1e-12}}
+//|       - {"artifact":"keys","path":"/rows/2/5","approx":{"value":60,"atol":1e-9}}
+//|       - {"artifact":"keys","path":"/rows/2/7","equals":false}
+//|       - {"artifact":"keys","path":"/rows/2/8","range":{"max":1e-14}}
+//|   - case: gimbal-lock
+//|     expect:
+//|       - {"artifact":"keys","path":"/rows/2/7","equals":true}
+//|       - {"artifact":"keys","path":"/rows/2/6","equals":0}
+//|       - {"artifact":"keys","path":"/rows/2/4","approx":{"value":30,"atol":1e-6}}
+//|       - {"artifact":"keys","path":"/rows/2/8","range":{"max":1e-14}}
+//|   - case: near-lock
+//|     expect:
+//|       - {"artifact":"keys","path":"/rows/3/7","equals":false}
+//|       - {"artifact":"keys","path":"/rows/3/8","range":{"max":1e-12}}
+use scioxide_core::{RealScalar, Tolerance};
+use scioxide_spatial::Rotation;
+
+let count = key_count as usize;
+let sequence = yaw_pitch_roll().map_err(|e| e.to_string())?;
+let (times, rotations) = key_rotations(count, slew, pitch).map_err(|e| e.to_string())?;
+let mut rows = Vec::new();
+for ((t, angles), rotation) in times
+    .iter()
+    .zip(key_angles(count, slew, pitch))
+    .zip(&rotations)
+{
+    let euler = rotation
+        .as_euler(sequence, Tolerance::from_sqrt_epsilon())
+        .map_err(|e| e.to_string())?;
+    let back = euler.angles.map(RealScalar::to_degrees);
+    let rebuilt = Rotation::from_euler(sequence, euler.angles).map_err(|e| e.to_string())?;
+    rows.push((
+        *t,
+        angles[0],
+        angles[1],
+        angles[2],
+        back[0],
+        back[1],
+        back[2],
+        euler.gimbal_lock,
+        distance(*rotation, rebuilt).map_err(|e| e.to_string())?,
+    ));
+}
+let fixed = serde_json::json!({ "notation": "standard", "significantDigits": 8 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "時刻 t_k [s]", "type": "number", "format": { "fractionDigits": 0 } },
+    { "key": "1", "label": "ψ [deg]", "type": "number", "format": fixed },
+    { "key": "2", "label": "θ [deg]", "type": "number", "format": fixed },
+    { "key": "3", "label": "φ [deg]", "type": "number", "format": fixed },
+    { "key": "4", "label": "戻した ψ [deg]", "type": "number", "format": fixed },
+    { "key": "5", "label": "戻した θ [deg]", "type": "number", "format": fixed },
+    { "key": "6", "label": "戻した φ [deg]", "type": "number", "format": fixed },
+    { "key": "7", "label": "ジンバルロック", "type": "boolean" },
+    { "key": "8", "label": "回転の距離 d [rad]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "keys" })
+);
+export!(key_count, key_count);
+export!(slew, slew);
+export!(pitch, pitch);
+```
+
+既定値（$K = 5$、$A = 120°$、$P = 60°$）では、すべてのキー姿勢でロックと判定されず、戻した角は与えた角と $10^{-13}$ 度以内で一致し、回転の距離は最大 $3.5 \times 10^{-16}$ rad である。
+$P = 90°$ では中央のキー姿勢（$t = 20$ s、$\psi = 60°$、$\phi = 30°$）が `gimbal_lock` になり、戻した角は $(30°, 90°, 0°)$ である。
+ヨーの 30° は $\psi - \phi$ で、ヨーとロールはそれぞれ 30° ずれるが、回転の距離は $1.7 \times 10^{-16}$ rad で、同じ姿勢を表している。
+$P = 89.5°$、$K = 7$ ではロックと判定されないが、中央のキー姿勢のヨーとロールの誤差は $1.6 \times 10^{-12}$ 度、$5.7 \times 10^{-13}$ 度で、ほかのキー姿勢の $10^{-14}$ 度程度より大きく、回転の距離も $1.7 \times 10^{-14}$ rad に増える。
+$\cos 89.5° = 8.7 \times 10^{-3}$ による拡大 $1/\lvert\cos\theta\rvert \approx 115$ 倍と同じ程度である。
+
+## Slerp と回転スプラインの比較
+
+`Slerp` は各区間で一定の角速度 $v_i/\Delta t$ で回り、$v_i$ は相対回転 $R_i^{-1}R_{i+1}$ の回転ベクトルである。
+したがって区間の角速度の大きさは、相対回転の角を $\Delta t$ で割った値に等しい。
+`RotationSpline` は区間ごとの 3 次の回転ベクトルで補間し、角速度を構成で連続にし、角加速度の連続性を不動点反復で許容誤差まで満たす。
+導出は[球面線形補間（Slerp）](oxref:spatial-slerp)と[回転スプライン](../../algorithms/rotation-spline/)にある。
+
+次のセルは前のセルのキーの数、旋回角、ピッチを受け取り、同じキー姿勢で `Slerp` を作る。
+表 `slerp` は区間ごとに次の値を示す。
+
+- 相対回転の角 $\angle(R_i^{-1}R_{i+1})$ [deg] と、それを $\Delta t$ で割った Slerp の角速度の大きさ。
+- `Slerp::evaluate` で区間の $1/4$ と $3/4$ の時刻の回転を求め、その距離を時間差で割った角速度の大きさ。
+  一定の角速度なら上の値と一致する。
+- 各区間の始点にあたる節点での角速度ベクトルの跳び $\lvert\Delta\omega\rvert = \lvert v_i - v_{i-1}\rvert/\Delta t$ [deg/s]。
+
+Slerp の角加速度は区間の中で 0 で、節点で衝撃になる。
+このセルは区間ごとに一定な角速度の大きさを、階段状の折れ線の点として次のセルに渡す。
+
+```rust
+//| id: spatial-attitude-slerp
+//| ref: spatial-attitude-slerp
+//| title: Slerp の区間ごとの角速度と節点での跳び
+//| run: reactive
+//| uses: [spatial-attitude-keys]
+//| crates: [scioxide-core, scioxide-spatial]
+//| dependsOn:
+//|   keys: spatial-attitude-euler-keys
+//| exports: [slerp_curve]
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"slerp","path":"/rows/0/3","approx":{"value":8.5721531170,"atol":1e-8}}
+//|       - {"artifact":"slerp","path":"/rows/0/4","approx":{"value":8.5721531170,"atol":1e-8}}
+//|       - {"artifact":"slerp","path":"/rows/0/5","equals":null}
+//|       - {"artifact":"slerp","path":"/rows/1/5","range":{"min":1}}
+use scioxide_core::RealScalar;
+use scioxide_spatial::Slerp;
+
+let count = keys["key_count"].as_f64().ok_or("キーの数がない")? as usize;
+let slew = keys["slew"].as_f64().ok_or("旋回角がない")?;
+let pitch = keys["pitch"].as_f64().ok_or("ピッチがない")?;
+let (times, rotations) = key_rotations(count, slew, pitch).map_err(|e| e.to_string())?;
+let slerp = Slerp::new(&times, &rotations).map_err(|e| e.to_string())?;
+let degrees = |x: f64| RealScalar::to_degrees(x);
+let dt = KEY_SPACING;
+
+// 区間 i の角速度ベクトル v_i/Δt（v_i は相対回転 R_i⁻¹ R_{i+1} の回転ベクトル）。
+let mut rates = Vec::new();
+let mut slerp_curve = Vec::new();
+for i in 0..count - 1 {
+    let relative = rotations[i]
+        .inverse()
+        .compose(rotations[i + 1])
+        .map_err(|e| e.to_string())?;
+    rates.push(relative.as_rotation_vector().map(|x| x / dt));
+    let speed = degrees(norm3(rates[i]));
+    slerp_curve.push([times[i], speed]);
+    slerp_curve.push([times[i + 1], speed]);
+}
+
+let mut rows = Vec::new();
+for i in 0..count - 1 {
+    let angle = degrees(norm3(rates[i]) * dt);
+    // 区間の 1/4 と 3/4 の時刻の Slerp の回転の距離を時間差で割る。
+    let (ta, tb) = (times[i] + 0.25 * dt, times[i] + 0.75 * dt);
+    let ra = slerp.evaluate(ta).map_err(|e| e.to_string())?;
+    let rb = slerp.evaluate(tb).map_err(|e| e.to_string())?;
+    let measured = degrees(distance(ra, rb).map_err(|e| e.to_string())?) / (tb - ta);
+    let change = |a: [f64; 3], b: [f64; 3]| norm3([a[0] - b[0], a[1] - b[1], a[2] - b[2]]);
+    let jump = (i > 0).then(|| degrees(change(rates[i], rates[i - 1])));
+    rows.push((times[i], times[i + 1], angle, angle / dt, measured, jump));
+}
+
+let seconds = serde_json::json!({ "fractionDigits": 0 });
+let fixed4 = serde_json::json!({ "significantDigits": 4 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "始点 t_i [s]", "type": "number", "format": seconds },
+    { "key": "1", "label": "終点 t_{i+1} [s]", "type": "number", "format": seconds },
+    { "key": "2", "label": "相対回転の角 [deg]", "type": "number", "format": fixed4 },
+    { "key": "3", "label": "|ω| = 角/Δt [deg/s]", "type": "number", "format": fixed4 },
+    { "key": "4", "label": "|ω|（evaluate）[deg/s]", "type": "number", "format": fixed4 },
+    { "key": "5", "label": "始点の |Δω| [deg/s]", "type": "number", "format": fixed4, "nullText": "—" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "slerp" })
+);
+export!(slerp_curve, &slerp_curve);
+```
+
+既定値（$K = 5$、$A = 120°$、$P = 60°$）では、4 つの区間の相対回転の角は 85.7°、43.9°、86.9°、68.5° で、Slerp の角速度の大きさはそれを 10 s で割った 8.57、4.39、8.69、6.85 deg/s である。
+`evaluate` から求めた値との差は $10^{-14}$ deg/s 以下で、Slerp が区間の中で一定の角速度で回ることを確かめられる。
+節点では Slerp の角速度ベクトルが 10.7〜13.0 deg/s 跳ぶ。
+剛体をこの軌道に追従させると、各節点でトルクの衝撃が要る。
+
+次のセルは同じキー姿勢で `RotationSpline` を作る。
+不動点反復の上限はこのセルの入力で、既定は 32 回である。
+連続性の許容誤差は既定の相対 $\sqrt\varepsilon$ で、絶対の部分を持たないので、判定は時間の単位によらない。
+上のグラフは角速度の大きさ $\lvert\omega\rvert$ [deg/s] で、前のセルの Slerp の階段と重ねる。
+下のグラフはスプラインの角加速度の大きさ $\lvert\alpha\rvert$ [deg/s²] で、2 つのグラフは横軸の時刻が連動し、縦線が節点である。
+表 `intervals` は区間ごとに、スプラインの区間内の $\lvert\omega\rvert$ と $\lvert\alpha\rvert$ の最大値（0.1 s ごとの標本）と、各区間の始点にあたる節点での角加速度の跳び $\lvert\Delta\alpha\rvert$ を示す。
+跳びは節点の左側の 3 点（間隔 $h = 10^{-2}$ s）からの 2 次の外挿による左極限と、節点での値の差で求める（打ち切り誤差 $O(h^3)$）。
+最後に、スプラインの終了状態を outcome で示す。
+
+```rust
+//| id: spatial-attitude-interpolation
+//| ref: spatial-attitude-interpolation
+//| title: 回転スプラインの角速度・角加速度を Slerp と比べる
+//| run: reactive
+//| uses: [spatial-attitude-keys]
+//| crates: [scioxide-core, scioxide-spatial]
+//| dependsOn:
+//|   keys: spatial-attitude-euler-keys
+//|   slerp: spatial-attitude-slerp
+//| inputs:
+//|   iteration_limit: {"type":"range","label":"不動点反復の上限 [回]","description":"既定は 32 回。","min":0,"max":32,"step":1,"value":32}
+//| cases:
+//|   - {"id":"too-few-iterations","label":"反復の上限 2 回","description":"連続性の許容誤差に届かず、スプラインは返されない。","inputs":{"iteration_limit":2}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"intervals","path":"/rows/1/4","range":{"max":1e-5}}
+//|       - {"artifact":"intervals","path":"/rows/2/2","range":{"min":10}}
+//|       - {"path":"/outputs/3/state","equals":"satisfied"}
+//|   - case: too-few-iterations
+//|     expect:
+//|       - {"artifact":"intervals","path":"/rows/1/4","equals":null}
+//|       - {"path":"/outputs/2/state","equals":"failed"}
+use scioxide_core::RealScalar;
+use scioxide_spatial::{
+    RotationSpline, RotationSplineOptions, RotationSplineSample, RotationSplineTermination,
+};
+
+let count = keys["key_count"].as_f64().ok_or("キーの数がない")? as usize;
+let slew = keys["slew"].as_f64().ok_or("旋回角がない")?;
+let pitch = keys["pitch"].as_f64().ok_or("ピッチがない")?;
+let slerp_curve = slerp["slerp_curve"].clone();
+let (times, rotations) = key_rotations(count, slew, pitch).map_err(|e| e.to_string())?;
+let options = RotationSplineOptions::new().with_max_iterations(iteration_limit as usize);
+let result =
+    RotationSpline::with_options(&times, &rotations, options).map_err(|e| e.to_string())?;
+let degrees = |x: f64| RealScalar::to_degrees(x);
+
+// 0.1 s ごとの標本と、区間ごとの最大値。
+let (mut speed, mut acceleration) = (Vec::new(), Vec::new());
+let mut peaks = vec![(0.0_f64, 0.0_f64); count - 1];
+if let Some(spline) = &result.spline {
+    let samples = 100 * (count - 1);
+    for j in 0..=samples {
+        let t = 0.1 * j as f64;
+        let s = spline.evaluate(t).map_err(|e| e.to_string())?;
+        let (w, a) = (
+            degrees(norm3(s.angular_velocity)),
+            degrees(norm3(s.angular_acceleration)),
+        );
+        speed.push([t, w]);
+        acceleration.push([t, a]);
+        let i = (j / 100).min(count - 2);
+        peaks[i] = (peaks[i].0.max(w), peaks[i].1.max(a));
+    }
+}
+// 節点 t の左極限: 左側 3 点からの 2 次の外挿 3a(t − h) − 3a(t − 2h) + a(t − 3h)。
+let h = 1e-2;
+let left_acceleration = |spline: &RotationSpline<f64>, t: f64| -> Result<[f64; 3], String> {
+    let at = |j: f64| -> Result<RotationSplineSample<f64>, String> {
+        spline.evaluate(t - j * h).map_err(|e| e.to_string())
+    };
+    let (s1, s2, s3) = (at(1.0)?, at(2.0)?, at(3.0)?);
+    Ok([0, 1, 2].map(|m| {
+        3.0 * s1.angular_acceleration[m] - 3.0 * s2.angular_acceleration[m]
+            + s3.angular_acceleration[m]
+    }))
+};
+
+let mut rows = Vec::new();
+for i in 0..count - 1 {
+    let mut jump = None;
+    if let (Some(spline), true) = (&result.spline, i > 0) {
+        let left = left_acceleration(spline, times[i])?;
+        let right = spline.evaluate(times[i]).map_err(|e| e.to_string())?;
+        let a = right.angular_acceleration;
+        let difference = [0, 1, 2].map(|m| a[m] - left[m]);
+        jump = Some(degrees(norm3(difference)));
+    }
+    let peak = result.spline.as_ref().map(|_| peaks[i]);
+    rows.push((
+        times[i],
+        times[i + 1],
+        peak.map(|p| p.0),
+        peak.map(|p| p.1),
+        jump,
+    ));
+}
+
+let knot_lines: Vec<serde_json::Value> = (1..count - 1)
+    .map(|k| serde_json::json!({ "kind": "line", "axis": "x", "value": times[k] }))
+    .collect();
+let end = times[count - 1];
+// スプラインが返されなかったときは Slerp の系列だけを描く。
+let mut speed_layers = vec![serde_json::json!({
+    "id": "slerp",
+    "kind": "line",
+    "name": "Slerp",
+    "points": slerp_curve
+})];
+if result.spline.is_some() {
+    speed_layers.push(serde_json::json!({
+        "id": "spline",
+        "kind": "line",
+        "name": "回転スプライン",
+        "points": speed
+    }));
+}
+emit_chart!(serde_json::json!({
+    "kind": "xy",
+    "link": { "group": "attitude-time" },
+    "dataZoom": true,
+    "tooltip": true,
+    "xLabel": "時刻 t [s]",
+    "yLabel": "角速度の大きさ |ω| [deg/s]",
+    "xMin": 0.0,
+    "xMax": end,
+    "layers": speed_layers,
+    "annotations": knot_lines
+}));
+if result.spline.is_some() {
+    emit_chart!(serde_json::json!({
+        "kind": "xy",
+        "link": { "group": "attitude-time" },
+        "dataZoom": true,
+        "tooltip": true,
+        "xLabel": "時刻 t [s]",
+        "yLabel": "角加速度の大きさ |α| [deg/s²]",
+        "xMin": 0.0,
+        "xMax": end,
+        "layers": [
+            { "id": "spline", "kind": "line", "name": "回転スプライン", "points": acceleration }
+        ],
+        "annotations": knot_lines
+    }));
+}
+let seconds = serde_json::json!({ "fractionDigits": 0 });
+let fixed4 = serde_json::json!({ "significantDigits": 4 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "始点 t_i [s]", "type": "number", "format": seconds },
+    { "key": "1", "label": "終点 t_{i+1} [s]", "type": "number", "format": seconds },
+    { "key": "2", "label": "最大 |ω| [deg/s]", "type": "number", "format": fixed4, "nullText": "—" },
+    { "key": "3", "label": "最大 |α| [deg/s²]", "type": "number", "format": fixed4, "nullText": "—" },
+    { "key": "4", "label": "始点の |Δα| [deg/s²]", "type": "number", "format": sci2, "nullText": "—" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "intervals" })
+);
+
+let outcome = match result.termination {
+    RotationSplineTermination::Converged => {
+        Outcome::satisfied("すべての内部節点で角加速度の跳びが連続性の許容誤差を満たした")
+    }
+    RotationSplineTermination::IterationLimit => Outcome::failed(
+        "反復の上限までに角加速度の跳びが許容誤差に届かず、スプラインは返されない",
+    )
+    .explanation("反復の上限を上げるか、キー姿勢の間隔を細かくする。"),
+};
+emit_outcome!(
+    outcome
+        .status(format!("{:?}", result.termination))
+        .diagnostic("不動点反復の回数", result.iterations as f64, None)
+        .diagnostic("連続性の残差", result.continuity_residual, Some("rad/s²"))
+);
+```
+
+既定値では、`RotationSpline::with_options` は 5 回の不動点反復で `Converged` になり、連続性の残差（内部節点での角加速度の跳びの最大値）は $1.1 \times 10^{-9}$ rad/s² である。
+スプラインの $\lvert\omega\rvert$ は 1.8〜11.2 deg/s の範囲で連続に変わり、$t = 25$ s 付近で Slerp の最大値 8.69 deg/s を上回る 11.2 deg/s になる。
+角速度を連続にする代わりに、区間の中で速さが変わる。
+$\lvert\alpha\rvert$ の最大値は区間ごとに 2.6〜3.2 deg/s² で、節点での跳びは外挿の打ち切り誤差と同じ程度（最大 $1.0 \times 10^{-7}$ deg/s²）である。
+反復の上限を 2 回にすると、残差 $4.7 \times 10^{-5}$ rad/s² で `IterationLimit` になり、outcome は `failed` で、表のスプラインの列は空欄になる。
+
+## まとめ
+
+Euler 角で与えた姿勢は `Rotation::from_euler` で回転に変換し、補間と比較は回転のまま行う。
+`as_euler` で角に戻すと、ピッチ 90° の近くではヨーとロールの誤差が $1/\lvert\cos\theta\rvert$ 倍に増え、`gimbal_lock` が真ならヨーとロールの差（ピッチ −90° では和）だけが意味を持つ。
+`Slerp` の角速度は区間ごとに相対回転の角を $\Delta t$ で割った一定値で、節点で跳ぶので、剛体を追従させると節点でトルクの衝撃が要る。
+`RotationSpline` は角速度と角加速度を連続にするので、慣性テンソルが一定の剛体に要るトルク $\tau = I\alpha + \omega \times I\omega$ も連続になり、その代わりに区間の中で角速度の大きさが変化する。
+スプラインは `Converged` のときだけ返されるので、outcome が `failed` なら反復の上限を上げるかキー姿勢を見直す。
+
+## 次に読むページ
+
+- [回転スプライン](../../algorithms/rotation-spline/)：回転スプラインの Hermite 条件、ブロック三重対角系、不動点反復の収束を確かめる。
+- [3 次元回転と姿勢補間](../../algorithms/rotations-and-transforms/)：Euler 角の内在・外在の合成順とジンバルロックの判定を確かめる。
+- [平面 3 リンクのロボットアームの順運動学](../robot-arm-kinematics/)：回転と並進を組み合わせた剛体変換の合成の順序を確かめる。
+- [分子構造の重ね合わせと RMSD](../molecular-superposition/)：対応する点の組から最適な回転を推定し、その誤差を RMSD で確かめる。

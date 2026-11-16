@@ -1,0 +1,792 @@
+---
+title: "ARMA(1,1) identification, estimation, forecasting, and residual whiteness"
+description: "Use simulated ARMA(1,1) series to examine identification through sample autocorrelation, maximum likelihood with exact Kalman-filter likelihood and injected L-BFGS-B, observed-information standard errors, Ljung–Box statistics, and forecast intervals, comparing theoretical autocorrelation, asymptotic variance, and forecast-interval coverage."
+sidebar:
+  order: 455
+references:
+  stats-arma-forecast-estimation-kalman-likelihood: "estimation-exact-kalman-filter-likelihood"
+  stats-arma-forecast-identification-acf: "identification-sample-autocorrelation"
+  stats-arma-forecast-prediction-interval: "forecasts-and-forecast-intervals"
+---
+
+Series retaining effects of previous values and shocks, such as monthly demand, temperature anomalies, or inventory fluctuations, often admit autoregressive moving-average (ARMA) models.
+This page follows the Box–Jenkins procedure in scioxide-stats using simulated ARMA(1,1) series whose properties are known in closed form.
+The steps are order identification by sample autocorrelation, exact Kalman-filter likelihood maximization, observed-information standard errors, residual-whiteness checks, and forecasts with forecast intervals.
+Compare each stage with theoretical autocorrelation, asymptotic estimator variance, and forecast-error variance, then assess forecast-interval coverage through repeated experiments.
+
+## ARMA(1,1) process
+
+Define a zero-mean ARMA(1,1) process by:
+
+$$
+x_t=\phi\,x_{t-1}+\varepsilon_t+\theta\,\varepsilon_{t-1},\qquad \varepsilon_t\sim N(0,\sigma^2)\ \text{independent}
+$$
+
+
+$\phi$ is the autoregressive (AR) coefficient, $\theta$ the moving-average (MA) coefficient, and $\varepsilon_t$ white noise called innovations.
+Using the backshift operator $Bx_t=x_{t-1}$ gives $(1-\phi B)x_t=(1+\theta B)\varepsilon_t$.
+Under $|\phi|<1$ the process is stationary and causal (current values depend only on past innovations); under $|\theta|<1$ it is invertible (innovations can be recovered from past observations).
+A stationary causal process has the MA(∞) representation:
+
+$$
+x_t=\sum_{j=0}^\infty\psi_j\varepsilon_{t-j},\qquad \psi_0=1,\quad \psi_j=(\phi+\theta)\,\phi^{\,j-1}\ (j\ge1)
+$$
+
+
+The autocorrelation function (ACF) $\rho(k)=\mathrm{Cov}(x_t,x_{t+k})/\mathrm{Var}(x_t)$ is given by (Brockwell–Davis 1991, §3.3):
+
+$$
+\rho(1)=\frac{(1+\phi\theta)(\phi+\theta)}{1+2\phi\theta+\theta^2},\qquad \rho(k)=\phi^{\,k-1}\rho(1)\quad(k\ge1)
+$$
+
+
+Lag 1 depends on both $\phi$ and $\theta$; from lag 2 onward it decays geometrically with ratio $\phi$.
+The MA term shifts lag 1 away from the AR(1) value $\phi$.
+The partial autocorrelation function (PACF) $\phi_{kk}$ is the correlation of $x_t$ and $x_{t+k}$ after removing effects of the $k-1$ intermediate values; it is zero from lag 2 onward for AR(1), but keeps decaying for MA(1).
+For ARMA(1,1), both ACF and PACF decay rather than cutting off at lag 1; their joint decay suggests ARMA structure.
+
+When $\phi+\theta=0$, $\psi_j=0$ for $j\ge1$, and the process is white noise itself.
+The AR and MA roots cancel, preventing separate identification of $\phi$ and $\theta$.
+Nearby, likelihood becomes nearly flat and estimates vary widely.
+
+## Identification: sample autocorrelation
+
+`time_series_summary(values, statistic, max_lag)` returns sample autocovariance (`TimeSeriesStatistic::Covariance`), autocorrelation (`Acf`), or partial autocorrelation (`Pacf`) at lags 0 through `max_lag` as an array of `TimeSeriesLag { value, pairs }`.
+The one-shot call centers by the sample mean and uses observation count $n$ as the divisor for every lag (`LagNormalization::ObservationCount`).
+Divisor $n$ preserves positive semidefiniteness of the autocovariance matrix, allowing Levinson–Durbin recursion for PACF.
+Specify missing-value masks or pair-count divisors with `time_series_summary_with_options`; process many series together with `time_series_summaries_into`.
+Complexity is $O(nK)$ ($K$ is maximum lag).
+
+For white noise, sample autocorrelations $\hat\rho(k)$ ($k\ge1$) are approximately independent $N(0,1/n)$ variables (a special case of Bartlett's formula).
+Lags far beyond the band $\pm1.96/\sqrt n$ provide evidence against white noise.
+This band assumes white noise; for positively correlated processes, the variance of $\hat\rho(k)$ is generally larger, as Bartlett's formula shows.
+
+The following definitions block contains the model and helpers used by every cell on this page.
+`simulate` generates `length` ARMA(1,1) points with $\sigma=1$ after a 500-point burn-in.
+`arma_acf` is the ACF closed form above; `psi_variance` is the forecast-error variance closed form used later.
+`fit_arma` combines fitting and observed information, as explained below.
+
+```rust
+//| id: stats-arma-forecast-model
+//| kind: definitions
+//| title: "Simulated ARMA(1,1) series, theoretical values, and maximum-likelihood procedure"
+//| crates: [scioxide-core, scioxide-differentiate, scioxide-linalg, scioxide-optimize, scioxide-random, scioxide-stats]
+use scioxide_core::{Bounds, ExecutionContext, SciOxideError, RankThreshold, RealScalar};
+use scioxide_differentiate::DerivativeStrategy;
+use scioxide_linalg::HermitianEigenOptions;
+use scioxide_optimize::{LbfgsB, LbfgsBFitSolver, LbfgsBOptions};
+use scioxide_random::{Distribution, Normal, SeedableRng, SplitMix64};
+use scioxide_stats::{
+    ArimaInnovation, ArimaModel, ArimaOrder, ArimaTrend, FitInformation, FitObjective, FitReport,
+    PreparedArimaFit, StatisticsOptions, TimeSeriesStatistic, fit_information,
+    time_series_summary,
+};
+
+/// x_t = φ x_{t−1} + ε_t + θ ε_{t−1}, ε_t ~ N(0, 1). length points after a 500-point burn-in.
+pub(crate) fn simulate(
+    phi: f64,
+    theta: f64,
+    length: usize,
+    seed: u64,
+) -> Result<Vec<f64>, SciOxideError> {
+    let normal = Normal::new(0.0_f64, 1.0)?;
+    let mut rng = SplitMix64::from_seed(seed);
+    let (mut x, mut previous) = (0.0, 0.0);
+    let mut series = Vec::with_capacity(length);
+    for t in 0..length + 500 {
+        let shock = normal.sample(&mut rng)?;
+        x = phi * x + shock + theta * previous;
+        previous = shock;
+        if t >= 500 {
+            series.push(x);
+        }
+    }
+    Ok(series)
+}
+
+/// Theoretical autocorrelation ρ(k). ρ(1) = (1 + φθ)(φ + θ)/(1 + 2φθ + θ²), ρ(k) = φ^(k−1) ρ(1).
+pub(crate) fn arma_acf(phi: f64, theta: f64, lag: usize) -> f64 {
+    if lag == 0 {
+        return 1.0;
+    }
+    let first = (1.0 + phi * theta) * (phi + theta) / (1.0 + 2.0 * phi * theta + theta * theta);
+    first * RealScalar::powi(phi, lag as i32 - 1)
+}
+
+/// Forecast-error variance h steps ahead: σ² Σ_{j<h} ψ_j², ψ_0 = 1, ψ_j = (φ + θ) φ^(j−1).
+pub(crate) fn psi_variance(phi: f64, theta: f64, sigma2: f64, horizon: usize) -> f64 {
+    let tail: f64 = (1..horizon)
+        .map(|j| RealScalar::powi((phi + theta) * RealScalar::powi(phi, j as i32 - 1), 2))
+        .sum();
+    sigma2 * (1.0 + tail)
+}
+
+/// Fit result: solver report, model, observed information, and standardized innovations v_t/√f_t.
+pub(crate) struct ArmaFit {
+    pub(crate) report: FitReport<f64>,
+    pub(crate) model: ArimaModel<f64>,
+    pub(crate) information: FitInformation<f64>,
+    pub(crate) standardized: Vec<f64>,
+}
+
+/// Fit ARMA(1,1) without trend by maximum likelihood. Initial values: φ₀ = ρ̂(2)/ρ̂(1), θ₀ = 0.
+pub(crate) fn fit_arma(series: &[f64]) -> Result<ArmaFit, SciOxideError> {
+    let order = ArimaOrder { p: 1, d: 0, q: 1 };
+    let options = StatisticsOptions::new();
+    let problem = PreparedArimaFit::new(series, None, order, ArimaTrend::None, options)?;
+    let acf = time_series_summary(series, TimeSeriesStatistic::Acf, 2)?;
+    let phi0 = (acf[2].value / acf[1].value).clamp(-0.9, 0.9);
+    let variance = time_series_summary(series, TimeSeriesStatistic::Covariance, 0)?[0].value;
+    let initial = [phi0, 0.0, variance * (1.0 - phi0 * phi0)];
+    let bounds = Bounds::new(vec![(None, None); 3])?;
+    // Approximate derivatives by central differences. Line search rejects nonstationary or noninvertible points.
+    let lbfgsb = LbfgsBOptions::default().with_derivative_strategy(DerivativeStrategy::Central);
+    let mut solver = LbfgsBFitSolver::new(LbfgsB::new(lbfgsb), 3)?;
+    let fitted = problem.fit(&initial, &bounds, &mut solver)?;
+    let report = *fitted.report();
+    let model = fitted
+        .into_model()
+        .ok_or_else(|| SciOxideError::external("Missing model"))?;
+    let parameters = model.parameters().to_vec();
+    // Construct observed information from the negative-log-likelihood Hessian (central differences).
+    let nll = |p: &[f64]| {
+        let mut work = problem.workspace()?;
+        FitObjective::value(&problem, p, &mut work)
+    };
+    let hessian = scioxide_differentiate::hessian(nll, &parameters)?;
+    let information = fit_information(
+        &parameters,
+        &bounds,
+        &[false; 3],
+        &hessian,
+        RankThreshold::new(0.0, 1e-10)?,
+        &HermitianEigenOptions::default(),
+    )?;
+    let mut work = problem.workspace()?;
+    let mut innovations = vec![ArimaInnovation::default(); series.len()];
+    let context = ExecutionContext::sequential();
+    problem.evaluate_into(&parameters, &mut innovations, &mut work, context)?;
+    let standardized = innovations
+        .iter()
+        .filter_map(|i| Some(i.residual? / RealScalar::sqrt(i.variance?)))
+        .collect();
+    Ok(ArmaFit {
+        report,
+        model,
+        information,
+        standardized,
+    })
+}
+```
+
+The next cell generates a series from input $\phi$, $\theta$, series length $n$, and random seed, plotting sample ACF and PACF through lag 20.
+The ACF plot overlays theoretical $\rho(k)$ as a dashed line and shows the white-noise band $\pm1.96/\sqrt n$ as a range.
+The two plots share lag on the horizontal axis, with linked zooming and panning.
+The series and inputs are passed to the next two cells.
+
+```rust
+//| id: stats-arma-forecast-api-1
+//| ref: stats-arma-forecast-api-1
+//| title: "Identify orders by comparing sample and theoretical autocorrelations"
+//| run: reactive
+//| uses: [stats-arma-forecast-model]
+//| crates: [scioxide-core, scioxide-stats]
+//| exports: [phi, theta, points, seed, series]
+//| inputs:
+//|   phi: {"type":"range","label":"AR coefficient φ [-]","min":-0.9,"max":0.9,"step":0.1,"value":0.6}
+//|   theta: {"type":"range","label":"MA coefficient θ [-]","min":-0.9,"max":0.9,"step":0.1,"value":0.3}
+//|   length: {"type":"range","label":"Series length n","description":"Points used for fitting. Twelve additional points are generated for checking forecasts.","min":100,"max":800,"step":100,"value":200}
+//|   seed: {"type":"range","label":"Random seed","min":1,"max":100,"step":1,"value":4}
+//| cases:
+//|   - {"id":"near-cancel","label":"φ = 0.5, θ = −0.4","description":"The AR and MA roots nearly cancel; most ACF values lie within the band.","inputs":{"phi":0.5,"theta":-0.4}}
+//|   - {"id":"persistent","label":"φ = 0.9","description":"The ACF decays slowly and sample ACF fluctuations are also larger.","inputs":{"phi":0.9}}
+//|   - {"id":"negative-ar","label":"φ = −0.7","description":"The ACF alternates in sign.","inputs":{"phi":-0.7}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"acf","path":"/spec/layers/1/points/0/1","approx":{"value":0.732414,"atol":1e-6}}
+//|       - {"artifact":"acf","path":"/spec/layers/1/points/1/1","approx":{"value":0.439448,"atol":1e-6}}
+//|       - {"artifact":"acf","path":"/spec/layers/0/points/0/1","approx":{"value":0.7216,"atol":0.01}}
+//|   - case: near-cancel
+//|     expect:
+//|       - {"artifact":"acf","path":"/spec/layers/1/points/0/1","approx":{"value":0.105263,"atol":1e-6}}
+use scioxide_core::RealScalar;
+use scioxide_stats::{TimeSeriesLag, TimeSeriesStatistic, time_series_summary};
+
+let n = length as usize;
+let series = simulate(phi, theta, n + 12, seed as u64).map_err(|e| e.to_string())?;
+let sample = &series[..n];
+let lags = 20;
+let acf =
+    time_series_summary(sample, TimeSeriesStatistic::Acf, lags).map_err(|e| e.to_string())?;
+let pacf =
+    time_series_summary(sample, TimeSeriesStatistic::Pacf, lags).map_err(|e| e.to_string())?;
+let band = 1.96 / RealScalar::sqrt(n as f64);
+let points = |values: &[TimeSeriesLag<f64>]| -> Vec<[f64; 2]> {
+    (1..=lags).map(|k| [k as f64, values[k].value]).collect()
+};
+let theory: Vec<[f64; 2]> = (1..=lags)
+    .map(|k| [k as f64, arma_acf(phi, theta, k)])
+    .collect();
+let white = serde_json::json!({
+    "kind": "range",
+    "axis": "y",
+    "from": -band,
+    "to": band,
+    "label": "±1.96/√n"
+});
+let link = serde_json::json!({ "group": "arma-lag" });
+emit_chart!(
+    serde_json::json!({
+        "kind": "xy",
+        "xLabel": "Lag k [steps]",
+        "yLabel": "Autocorrelation ρ(k) [-]",
+        "xMin": 0.5,
+        "xMax": 20.5,
+        "yMin": -1.0,
+        "yMax": 1.0,
+        "dataZoom": true,
+        "tooltip": true,
+        "link": link,
+        "layers": [
+            { "id": "sample", "kind": "scatter", "name": "Sample ACF", "points": points(&acf) },
+            {
+                "id": "theory",
+                "kind": "line",
+                "name": "Theoretical ρ(k)",
+                "points": theory,
+                "style": { "lineType": "dashed", "showSymbol": false }
+            }
+        ],
+        "annotations": [white]
+    }),
+    metadata = serde_json::json!({ "id": "acf" })
+);
+emit_chart!(serde_json::json!({
+    "kind": "xy",
+    "xLabel": "Lag k [steps]",
+    "yLabel": "Partial autocorrelation φ_kk [-]",
+    "xMin": 0.5,
+    "xMax": 20.5,
+    "yMin": -1.0,
+    "yMax": 1.0,
+    "dataZoom": true,
+    "tooltip": true,
+    "link": link,
+    "layers": [{ "id": "sample", "kind": "scatter", "name": "Sample PACF", "points": points(&pacf) }],
+    "annotations": [white]
+}));
+export!(phi, phi);
+export!(theta, theta);
+export!(points, n);
+export!(seed, seed);
+export!(series, series);
+```
+
+For default inputs ($\phi=0.6$, $\theta=0.3$, $n=200$, seed 4), theoretical $\rho(1)=1.18\times0.9/1.45\approx0.732$ and the ACF decays with ratio $0.6$.
+Sample ACF values 0.722, 0.407, 0.236, and 0.123 at lags 1–4 follow the dashed theory (0.732, 0.439, 0.264, 0.158), then fluctuate within the band.
+The PACF is 0.722 at lag 1 and $-0.237$ at lag 2, outside the band (half-width 0.139), then decreases with changing signs inside it.
+AR(1) PACF should lie within the band from lag 2 onward, so the lag-2 departure and continued decay indicate an MA term.
+Adjacent sample-ACF lags are correlated, so consecutive departures are not necessarily independent evidence.
+
+At $\phi=0.5$ and $\theta=-0.4$, $\phi+\theta=0.1$ is near cancellation and theoretical $\rho(1)$ is only $0.8\times0.1/0.76\approx0.105$.
+This is below the $n=200$ band half-width 0.139, so sample ACF alone (0.120 at lag 1) cannot distinguish it from white noise.
+At $\phi=0.9$, ACF decays slowly; for this seed, sample ACF remains 0.571 at lag 6, near the theoretical 0.552.
+However, sample-mean-centered autocorrelations have downward bias for persistent processes, so other seeds may appear to decay faster than theory.
+At $\phi=-0.7$, ACF changes sign at every lag.
+
+## Estimation: exact Kalman-filter likelihood
+
+`PreparedArimaFit::new(values, validity, order, trend, options)` prepares a Gaussian likelihood problem for ARIMA$(p,d,q)$.
+Parameter order is $[\phi_1,\dots,\phi_p,\theta_1,\dots,\theta_q,\text{trend coefficients},\sigma^2]$, or $[\phi,\theta,\sigma^2]$ for ARMA(1,1) without a trend.
+Likelihood is computed by applying a Kalman filter to a state-space representation.
+From one-step prediction $\hat x_{t|t-1}$ and error variance $f_t$ (including $\sigma^2$), it forms innovation $v_t=x_t-\hat x_{t|t-1}$ and returns the negative log-likelihood:
+
+$$
+\ell(\phi,\theta,\sigma^2)=\frac12\sum_t\left(\frac{v_t^2}{f_t}+\ln f_t+\ln2\pi\right)
+$$
+
+
+The initial state follows the stationary distribution, giving an exact likelihood for the ARMA part rather than conditional least squares.
+With state dimension $m=p+d+q$, each evaluation costs $O(nm^3)$; missing observations are skipped while retaining their time-grid positions.
+AR-polynomial reflection coefficients (partial autocorrelations) with magnitude at least $1-64\varepsilon$, the same condition for the MA polynomial, or $\sigma^2\le0$ are rejected with `InvalidInput`.
+`evaluate_into` writes likelihood `ArimaLikelihood` and per-time `ArimaInnovation { prediction, variance, residual }` at supplied parameters.
+
+scioxide-stats has no optimizer for minimizing likelihood; pass a solver implementing `FitSolver` to `PreparedArimaFit::fit(initial, bounds, solver)`.
+The definitions block above supplies scioxide-optimize's `LbfgsBFitSolver` (L-BFGS-B).
+Because ARIMA likelihood supplies no analytic derivatives, gradients use central differences (`DerivativeStrategy::Central`) selected through `LbfgsBOptions::with_derivative_strategy`.
+A projected gradient meeting default tolerance gives `Converged`; reaching the iteration limit (default 1000) or evaluation limit gives `BudgetExhausted`.
+Objective validation rejects nonstationary/noninvertible points with `InvalidInput`, and L-BFGS-B line search treats them as outside the domain and shortens the step, so parameters are not given bound constraints.
+`fit` checks solver results for bounds and finiteness, reevaluates likelihood, then returns `ArimaFitReport`.
+`report()` returns termination, final objective, and iteration/evaluation counts; `model()` returns an `ArimaModel` for forecasting.
+If the solver stops before final evaluation, the model is `None`.
+
+Standard errors come from the inverse of the negative-log-likelihood Hessian (observed information) $I(\hat\vartheta)$.
+`fit_information` examines eigenvalues of $I$ for free parameters; positive definiteness gives `FitIdentifiability::Identifiable` and covariance $I^{-1}$.
+Rank deficiency gives `RankDeficient`, a negative eigenvalue gives `Indefinite` (not a minimum), and a parameter at a bound gives `Nonregular`; covariance is then `None`.
+The Hessian uses scioxide-differentiate's central differences `hessian`, costing $1+2\cdot3^2=19$ likelihood evaluations.
+For large $n$, theoretical asymptotic covariance is (Brockwell–Davis 1991, Example 8.8.3):
+
+$$
+n\,\mathrm{Cov}(\hat\phi,\hat\theta)\to\frac{1+\phi\theta}{(\phi+\theta)^2}
+\begin{pmatrix}(1-\phi^2)(1+\phi\theta)&-(1-\phi^2)(1-\theta^2)\\-(1-\phi^2)(1-\theta^2)&(1-\theta^2)(1+\phi\theta)\end{pmatrix},
+\qquad n\,\mathrm{Var}(\hat\sigma^2)\to2\sigma^4
+$$
+
+
+The denominator contains $(\phi+\theta)^2$, making standard errors large near cancellation.
+
+## Residual whiteness
+
+Under a correct model, standardized innovations $e_t=v_t/\sqrt{f_t}$ are independent $N(0,1)$ variables.
+The Ljung–Box statistic jointly checks residual autocorrelation through lag $K$:
+
+$$
+Q=n(n+2)\sum_{k=1}^K\frac{\hat r_k^2}{n-k}
+$$
+
+Here $\hat r_k$ is sample residual autocorrelation.
+Under a correct model, $Q$ approximately follows $\chi^2$ with $K-p-q$ degrees of freedom (Ljung–Box 1978).
+scioxide-stats provides neither Ljung–Box nor Box–Pierce tests; the cell below obtains $\hat r_k$ through `time_series_summary` and computes a p-value from the upper tail of scioxide-random's `ChiSquared`.
+The $\chi^2$ approximation is coarse for small $n$, and results depend on the choice of $K$.
+
+## Forecasts and forecast intervals
+
+`ArimaModel::forecast(h)` returns conditional means and forecast-error variances `ArimaForecast { mean, variance }` for $h$ steps after the series' final time.
+`forecast_into` takes workspace `ArimaModel::workspace(h)` and performs the same calculation without allocation.
+For stationary ARMA, forecast-error variance $h$ steps ahead is $\sigma^2\sum_{j<h}\psi_j^2$, approaching process variance as $h\to\infty$.
+For models with differencing $d\ge1$, variance grows without bound with $h$.
+`variance` treats parameters as known and excludes estimation error.
+Consequently, intervals $\hat x_{n+h|n}\pm1.96\sqrt{\text{variance}}$ constructed from estimated parameters have coverage slightly below nominal.
+
+The next cell fits ARMA(1,1) to the first $n$ points of the previous cell's series, showing termination, estimates, standard errors, residual tests, and forecasts.
+The parameter table shows true values, estimates, observed-information standard errors and 95% intervals, and asymptotic standard errors at the truth.
+The forecast table compares model forecast variances with $\sigma^2\sum\psi_j^2$ computed at estimated parameters (an independent check).
+The plot shows the final 60 series points, forecast means with 95% interval bands, and 12 actual values withheld from fitting.
+
+```rust
+//| id: stats-arma-forecast-calc
+//| ref: stats-arma-forecast-calc
+//| title: "Fit ARMA(1,1) by maximum likelihood, inspect residuals, and forecast"
+//| run: reactive
+//| uses: [stats-arma-forecast-model]
+//| crates: [scioxide-core, scioxide-random, scioxide-stats]
+//| dependsOn:
+//|   data: stats-arma-forecast-api-1
+//| inputs:
+//|   max_lag: {"type":"range","label":"Ljung–Box lag count K","description":"Degrees of freedom are K − 2.","min":5,"max":30,"step":5,"value":10}
+//| cases:
+//|   - {"id":"long-lag","label":"K = 30","description":"Adding many lags reduces sensitivity to correlation at individual lags.","inputs":{"max_lag":30}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"parameters","path":"/rows/0/2","approx":{"value":0.6,"atol":0.15}}
+//|       - {"artifact":"forecast","path":"/rows/0/3","range":{"max":1e-6}}
+//|       - {"artifact":"forecast","path":"/rows/3/3","range":{"max":1e-6}}
+//|       - {"path":"/outputs/4/state","equals":"satisfied"}
+use scioxide_core::RealScalar;
+use scioxide_random::{ChiSquared, Survival};
+use scioxide_stats::{FitIdentifiability, TimeSeriesStatistic, time_series_summary};
+
+let phi = data["phi"].as_f64().ok_or("Missing φ")?;
+let theta = data["theta"].as_f64().ok_or("Missing θ")?;
+let n = data["points"].as_u64().ok_or("Missing length")? as usize;
+let series: Vec<f64> =
+    serde_json::from_value(data["series"].clone()).map_err(|e| e.to_string())?;
+let fit = fit_arma(&series[..n]).map_err(|e| e.to_string())?;
+let p = fit.model.parameters().to_vec();
+let covariance = fit.information.covariance();
+let se = |i: usize| covariance.map(|c| RealScalar::sqrt(c[i * 3 + i]));
+// Asymptotic standard errors at the truth (Brockwell–Davis, Example 8.8.3)
+let scale = (1.0 + phi * theta) / ((phi + theta) * (phi + theta) * n as f64);
+let theory = [
+    RealScalar::sqrt(scale * (1.0 - phi * phi) * (1.0 + phi * theta)),
+    RealScalar::sqrt(scale * (1.0 - theta * theta) * (1.0 + phi * theta)),
+    RealScalar::sqrt(2.0 / n as f64),
+];
+let names = ["AR coefficient φ", "MA coefficient θ", "Innovation variance σ²"];
+let rows: Vec<_> = (0..3)
+    .map(|i| {
+        let interval = se(i).map(|s| (p[i] - 1.96 * s, p[i] + 1.96 * s));
+        let truth = [phi, theta, 1.0][i];
+        (
+            names[i],
+            truth,
+            p[i],
+            se(i),
+            interval.map(|v| v.0),
+            interval.map(|v| v.1),
+            theory[i],
+        )
+    })
+    .collect();
+let fixed4 = serde_json::json!({ "fractionDigits": 4 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Parameter" },
+    { "key": "1", "label": "True value [-]", "type": "number", "format": fixed4 },
+    { "key": "2", "label": "Estimate [-]", "type": "number", "format": fixed4 },
+    {
+        "key": "3",
+        "label": "Standard error (observed information) [-]",
+        "type": "number",
+        "format": fixed4,
+        "nullText": "Undefined"
+    },
+    { "key": "4", "label": "Lower 95% interval endpoint [-]", "type": "number", "format": fixed4, "nullText": "—" },
+    { "key": "5", "label": "Upper 95% interval endpoint [-]", "type": "number", "format": fixed4, "nullText": "—" },
+    { "key": "6", "label": "Asymptotic standard error (truth) [-]", "type": "number", "format": fixed4 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "parameters" })
+);
+
+// Ljung–Box (not provided by scioxide-stats): compute Q and a p-value from standardized-innovation autocorrelations.
+let k = max_lag as usize;
+let residuals = &fit.standardized;
+let r =
+    time_series_summary(residuals, TimeSeriesStatistic::Acf, k).map_err(|e| e.to_string())?;
+let m = residuals.len() as f64;
+let q: f64 = (1..=k)
+    .map(|j| r[j].value * r[j].value / (m - j as f64))
+    .sum::<f64>()
+    * m
+    * (m + 2.0);
+let chi = ChiSquared::new((k - 2) as f64).map_err(|e| e.to_string())?;
+let pvalue = chi.sf(q).map_err(|e| e.to_string())?;
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let diagnostics = vec![(
+    format!("{:?}", fit.information.identifiability()),
+    fit.information.condition(),
+    q,
+    k - 2,
+    pvalue,
+)];
+let diagnostic_columns = serde_json::json!([
+    { "key": "0", "label": "Information classification" },
+    { "key": "1", "label": "Information condition number [-]", "type": "number", "format": sci3, "nullText": "—" },
+    { "key": "2", "label": "Ljung–Box Q [-]", "type": "number", "format": fixed4 },
+    { "key": "3", "label": "Degrees of freedom K − 2", "type": "integer" },
+    { "key": "4", "label": "p value [-]", "type": "number", "format": fixed4 }
+]);
+emit_table_with_columns!(
+    diagnostic_columns,
+    diagnostics,
+    metadata = serde_json::json!({ "id": "residuals" })
+);
+
+// Forecasts: model variance and σ² Σ ψ_j² at estimates (independent check)
+let horizon = 12;
+let forecasts = fit.model.forecast(horizon).map_err(|e| e.to_string())?;
+let forecast_rows: Vec<_> = [1_usize, 2, 5, 12]
+    .iter()
+    .map(|&h| {
+        let check = psi_variance(p[0], p[1], p[2], h);
+        let f = forecasts[h - 1];
+        (
+            h,
+            f.mean,
+            f.variance,
+            ((f.variance - check) / check).abs(),
+            series[n + h - 1],
+        )
+    })
+    .collect();
+let forecast_columns = serde_json::json!([
+    { "key": "0", "label": "Steps ahead h", "type": "integer" },
+    { "key": "1", "label": "Forecast mean [-]", "type": "number", "format": fixed4 },
+    { "key": "2", "label": "Forecast-error variance [-]", "type": "number", "format": fixed4 },
+    { "key": "3", "label": "Relative difference from σ²Σψ² [-]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "Actual value [-]", "type": "number", "format": fixed4 }
+]);
+emit_table_with_columns!(
+    forecast_columns,
+    forecast_rows,
+    metadata = serde_json::json!({ "id": "forecast" })
+);
+
+let history: Vec<[f64; 2]> = (n - 60..n).map(|t| [t as f64, series[t]]).collect();
+let mean: Vec<[f64; 2]> = (0..horizon)
+    .map(|h| [(n + h) as f64, forecasts[h].mean])
+    .collect();
+let band: Vec<[f64; 4]> = (0..horizon)
+    .map(|h| {
+        let half = 1.96 * RealScalar::sqrt(forecasts[h].variance);
+        [
+            (n + h) as f64,
+            forecasts[h].mean,
+            forecasts[h].mean - half,
+            forecasts[h].mean + half,
+        ]
+    })
+    .collect();
+let actual: Vec<[f64; 2]> = (n..n + horizon).map(|t| [t as f64, series[t]]).collect();
+emit_chart!(serde_json::json!({
+    "kind": "xy",
+    "xLabel": "Time t [steps]",
+    "yLabel": "x_t [-]",
+    "dataZoom": true,
+    "tooltip": true,
+    "layers": [
+        { "id": "history", "kind": "line", "name": "Series used for fitting", "points": history },
+        { "id": "band", "kind": "band", "name": "95% forecast interval", "points": band },
+        { "id": "mean", "kind": "line", "name": "Forecast mean", "points": mean },
+        { "id": "actual", "kind": "scatter", "name": "Actual values (withheld)", "points": actual }
+    ],
+    "annotations": [{ "kind": "line", "axis": "x", "value": n as f64 - 0.5, "label": "Forecast origin" }]
+}));
+
+let termination = fit.report.termination();
+let identifiable = fit.information.identifiability() == FitIdentifiability::Identifiable;
+let outcome = if termination.is_success() && identifiable {
+    Outcome::satisfied("Likelihood minimization converged with positive-definite observed information")
+} else if termination.is_success() {
+    Outcome::partial("Converged, but observed information does not determine standard errors")
+        .explanation("Parameters may be unidentified, for example through cancellation of AR and MA roots.")
+} else {
+    Outcome::partial("The solver stopped before satisfying convergence criteria")
+        .explanation("Read estimates as values at the last point.")
+};
+// Solver iterations count toward nested solves; read overall counts
+let iterations = fit
+    .report
+    .counts()
+    .total()
+    .map_err(|e| e.to_string())?
+    .iterations();
+emit_outcome!(
+    outcome
+        .status(format!("{termination:?}"))
+        .diagnostic("Negative log-likelihood", fit.report.objective().unwrap_or(0.0), None)
+        .diagnostic("Iteration count", iterations as f64, None)
+);
+```
+
+For default inputs, the solver reaches `Converged` in 12 iterations, and observed information is positive definite (`Identifiable`, condition number 5.9).
+$\hat\phi=0.583$ and $\hat\theta=0.359$ lie 0.2 and 0.7 standard errors from their true values; observed-information standard errors (0.075, 0.089) agree well with asymptotic standard errors at the truth (0.074, 0.088).
+$\hat\sigma^2=1.164$ is 1.4 standard errors from true value 1, but its 95% interval $[0.936,1.392]$ contains the truth.
+The Ljung–Box statistic is $Q=8.36$ (8 degrees of freedom), with p-value 0.40, giving no evidence of remaining residual autocorrelation.
+Forecast-error variances agree with $\sigma^2\sum\psi_j^2$ at rounding scale (relative difference at most $2\times10^{-16}$).
+The Kalman state-error variance has converged to its stationary value within the 200-point series, so forecasts from a finite series and an infinite past show no visible difference.
+Forecast means approach zero with ratio $\hat\phi^{\,h-1}$ as $h$ grows, and variances approach estimated process variance 2.73.
+
+At $\phi=0.5$ and $\theta=-0.4$, asymptotic standard errors at the truth increase to 0.49 and 0.52.
+With seed 4, estimates $\hat\phi=-0.057$ and $\hat\theta=0.187$ lie far from the truth and observed-information standard errors reach about 1.1, but sum $\hat\phi+\hat\theta=0.13$ is near the true 0.1.
+Likelihood is nearly flat along directions keeping $\phi+\theta$ constant, so only the sum is well determined.
+The information condition number increases to about 1000.
+Classification remains `Identifiable` with a satisfied outcome, but large standard errors and condition number suggest reducing model order and comparing white noise or AR(1).
+If observed information loses rank or has negative eigenvalues, standard-error entries show “undetermined” and the outcome becomes partial.
+At $K=30$, $Q=22.8$ (28 degrees of freedom) gives p-value 0.74; more degrees of freedom reduce sensitivity to correlation concentrated at a few lags.
+
+## Forecast-interval coverage
+
+For one series, whether the 12 actual values lie inside intervals depends on chance.
+The next cell receives $\phi$, $\theta$, and $n$ from the first cell and repeats fitting/forecasting for $R$ series generated with different seeds.
+It counts actual values inside 95% forecast intervals at each step $h=1,\dots,12$, and 95% observed-information intervals for $\phi$/$\theta$ containing true parameters.
+It also records mean and sample standard deviation of estimates, comparing them with asymptotic standard errors.
+Computing gradients and observed information by differences requires many likelihood evaluations per series; at $R=30$ this takes about 8 seconds in wasm, so execution uses a button and reuses results for identical inputs.
+
+```rust
+//| id: stats-arma-forecast-coverage
+//| ref: stats-arma-forecast-coverage
+//| title: "Regenerate series and repeat fitting and forecasting to count interval coverage"
+//| run: button
+//| cache: inputs
+//| uses: [stats-arma-forecast-model]
+//| crates: [scioxide-core, scioxide-stats]
+//| dependsOn:
+//|   data: stats-arma-forecast-api-1
+//| exports: [phi, theta, points, replicates, covered, parameters]
+//| inputs:
+//|   replicates: {"type":"range","label":"Series count R","description":"Changes the Monte Carlo error in coverage.","min":10,"max":30,"step":10,"value":30}
+//|   seed: {"type":"range","label":"Random seed","min":1,"max":100,"step":1,"value":1}
+//| cases:
+//|   - {"id":"few-series","label":"R = 10","description":"Wilson intervals widen.","inputs":{"replicates":10}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"path":"/exports/replicates","equals":30}
+use scioxide_core::RealScalar;
+use scioxide_stats::FitIdentifiability;
+
+let phi = data["phi"].as_f64().ok_or("Missing φ")?;
+let theta = data["theta"].as_f64().ok_or("Missing θ")?;
+let n = data["points"].as_u64().ok_or("Missing length")? as usize;
+let horizon = 12;
+let r = replicates as usize;
+// covered[h] = coverage count h + 1 steps ahead. parameters[i] = [count of intervals covering truth,
+// count with determined standard errors, sum of estimates, sum of squared estimates] (i = 0 for φ, 1 for θ)
+let mut covered = vec![0_usize; horizon];
+let mut parameters = [[0.0_f64; 4]; 2];
+for j in 0..r {
+    let series = simulate(phi, theta, n + horizon, 100_000 * seed as u64 + j as u64)
+        .map_err(|e| e.to_string())?;
+    let fit = fit_arma(&series[..n]).map_err(|e| e.to_string())?;
+    let p = fit.model.parameters().to_vec();
+    let forecasts = fit.model.forecast(horizon).map_err(|e| e.to_string())?;
+    for (h, f) in forecasts.iter().enumerate() {
+        let half = 1.96 * RealScalar::sqrt(f.variance);
+        covered[h] += usize::from((series[n + h] - f.mean).abs() <= half);
+    }
+    let covariance = fit.information.covariance();
+    let identifiable = fit.information.identifiability() == FitIdentifiability::Identifiable;
+    for (i, truth) in [phi, theta].into_iter().enumerate() {
+        let cell = &mut parameters[i];
+        cell[2] += p[i];
+        cell[3] += p[i] * p[i];
+        if let (true, Some(c)) = (identifiable, covariance) {
+            let s = RealScalar::sqrt(c[i * 3 + i]);
+            cell[0] += f64::from(u8::from((p[i] - truth).abs() <= 1.96 * s));
+            cell[1] += 1.0;
+        }
+    }
+}
+export!(phi, phi);
+export!(theta, theta);
+export!(points, n);
+export!(replicates, r);
+export!(covered, covered);
+export!(parameters, parameters);
+```
+
+The display cell plots per-step coverage with Wilson 95% intervals against nominal 0.95.
+For $\phi$ and $\theta$, the table shows mean estimates, standard deviations across repetitions, asymptotic standard errors, interval coverage, and Wilson intervals.
+The coverage denominator is the number of series whose observed information determines standard errors.
+
+```rust
+//| id: stats-arma-forecast-coverage-display
+//| ref: stats-arma-forecast-coverage-display
+//| title: "Compare forecast and parameter interval coverage with nominal levels"
+//| run: reactive
+//| crates: []
+//| dependsOn:
+//|   run: stats-arma-forecast-coverage
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"parameters","path":"/rows/0/0","equals":"AR coefficient φ"}
+//|       - {"artifact":"pooled","path":"/rows/0/0","equals":360}
+let phi = run["phi"].as_f64().ok_or("Missing φ")?;
+let theta = run["theta"].as_f64().ok_or("Missing θ")?;
+let n = run["points"].as_f64().ok_or("Missing length")?;
+let r = run["replicates"].as_f64().ok_or("Missing count")?;
+let covered: Vec<f64> =
+    serde_json::from_value(run["covered"].clone()).map_err(|e| e.to_string())?;
+let parameters: [[f64; 4]; 2] =
+    serde_json::from_value(run["parameters"].clone()).map_err(|e| e.to_string())?;
+// Wilson score interval (95%)
+let wilson = |p: f64, total: f64| {
+    let z = 1.96_f64;
+    let center = (p + z * z / (2.0 * total)) / (1.0 + z * z / total);
+    let radius = z * (p * (1.0 - p) / total + z * z / (4.0 * total * total)).sqrt()
+        / (1.0 + z * z / total);
+    (center - radius, center + radius)
+};
+let points: Vec<[f64; 4]> = covered
+    .iter()
+    .enumerate()
+    .map(|(h, &c)| {
+        let rate = c / r;
+        let (low, high) = wilson(rate, r);
+        [(h + 1) as f64, rate, low, high]
+    })
+    .collect();
+emit_chart!(serde_json::json!({
+    "kind": "errorbar",
+    "xLabel": "Steps ahead h [steps]",
+    "yLabel": "95% forecast-interval coverage [-]",
+    "xMin": 0.5,
+    "xMax": 12.5,
+    "yMin": 0.8,
+    "yMax": 1.0,
+    "tooltip": true,
+    "series": [{ "name": "Coverage and Wilson interval", "points": points }],
+    "annotations": [{ "kind": "line", "axis": "y", "value": 0.95, "label": "Nominal 0.95" }]
+}));
+// Coverage pooled across 12 steps (steps in the same series are dependent, so the interval is indicative)
+let total = covered.len() as f64 * r;
+let pooled = covered.iter().sum::<f64>() / total;
+let (pooled_low, pooled_high) = wilson(pooled, total);
+let fixed3 = serde_json::json!({ "fractionDigits": 3 });
+emit_table_with_columns!(
+    serde_json::json!([
+        { "key": "0", "label": "Forecast-interval checks", "type": "integer" },
+        { "key": "1", "label": "Pooled coverage [-]", "type": "number", "format": fixed3 },
+        { "key": "2", "label": "Wilson interval lower endpoint [-]", "type": "number", "format": fixed3 },
+        { "key": "3", "label": "Wilson interval upper endpoint [-]", "type": "number", "format": fixed3 }
+    ]),
+    vec![(total as usize, pooled, pooled_low, pooled_high)],
+    metadata = serde_json::json!({ "id": "pooled" })
+);
+// Asymptotic standard errors at the truth (reference)
+let scale = (1.0 + phi * theta) / ((phi + theta) * (phi + theta) * n);
+let theory = [
+    (scale * (1.0 - phi * phi) * (1.0 + phi * theta)).sqrt(),
+    (scale * (1.0 - theta * theta) * (1.0 + phi * theta)).sqrt(),
+];
+let rows: Vec<_> = (0..2)
+    .map(|i| {
+        let [hits, defined, sum, square] = parameters[i];
+        let average = sum / r;
+        let spread = ((square - r * average * average) / (r - 1.0)).sqrt();
+        let rate = (defined > 0.0).then(|| hits / defined);
+        let interval = rate.map(|c| wilson(c, defined));
+        let name = ["AR coefficient φ", "MA coefficient θ"][i];
+        (
+            name,
+            [phi, theta][i],
+            average,
+            spread,
+            theory[i],
+            rate,
+            interval.map(|v| v.0),
+            interval.map(|v| v.1),
+        )
+    })
+    .collect();
+let columns = serde_json::json!([
+    { "key": "0", "label": "Parameter" },
+    { "key": "1", "label": "True value [-]", "type": "number", "format": fixed3 },
+    { "key": "2", "label": "Mean estimate [-]", "type": "number", "format": fixed3 },
+    { "key": "3", "label": "Standard deviation of estimates [-]", "type": "number", "format": fixed3 },
+    { "key": "4", "label": "Asymptotic standard error [-]", "type": "number", "format": fixed3 },
+    { "key": "5", "label": "Interval coverage [-]", "type": "number", "format": fixed3, "nullText": "—" },
+    {
+        "key": "6",
+        "label": "Wilson interval lower endpoint [-]",
+        "type": "number",
+        "format": fixed3,
+        "nullText": "—"
+    },
+    { "key": "7", "label": "Wilson interval upper endpoint [-]", "type": "number", "format": fixed3, "nullText": "—" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "parameters" })
+);
+```
+
+For default inputs ($R=30$, seed 1), per-step coverage ranges from 0.87 to 1.0, and every Wilson interval includes 0.95.
+With 30 series per step, Wilson intervals are wider than 0.2, preventing interpretation of differences between steps.
+Pooling 360 checks across 12 steps gives coverage 0.933 (Wilson interval 0.903–0.955), containing nominal 0.95.
+Checks at different steps of the same series are dependent, so the pooled interval is indicative.
+Ignoring parameter-estimation error tends to put coverage slightly below nominal, but at $n=200$ the difference is smaller than Monte Carlo error at this replicate count.
+Standard deviations across repeated estimates (0.068 for $\phi$, 0.073 for $\theta$) are comparable to asymptotic standard errors (0.074, 0.088); observed-information interval coverage is 0.90 and 0.97, with both Wilson intervals containing 0.95.
+Near-cancellation combinations such as $\phi=0.5$ and $\theta=-0.4$ give estimates far from asymptotic normality; change the first cell's inputs and repeat to check whether coverage deteriorates.
+
+## Summary
+
+ARMA(1,1) ACF lag 1 depends on $\phi$/$\theta$ and then decays with ratio $\phi$, so decay without cutoff in both ACF and PACF guides identification.
+`PreparedArimaFit` evaluates exact Gaussian likelihood with a Kalman filter, while a solver implementing `FitSolver` minimizes it; check termination through `ArimaFitReport::report()`.
+Obtain standard errors by passing observed information to `fit_information`; if classification is not `Identifiable`, defer interpreting estimates and reconsider the order.
+scioxide-stats provides no Ljung–Box test, but the same statistic can be built from residual autocorrelations in `time_series_summary` and the $\chi^2$ distribution.
+Variances in `ArimaModel::forecast` exclude estimation error, so assess forecast-interval coverage for short series through repeated experiments.
+
+## Further reading
+
+- [Time-series analysis and frequency spectra](../../algorithms/time-series/): check derivations of autocorrelation, periodograms, and ARIMA state-space representations.
+- [Distribution fitting and transformations](../../api/distribution-fitting/): check the contracts of `FitSolver`, `FitReport`, and `fit_information`.
+- [Example: checking confidence-interval coverage through repeated experiments](../confidence-coverage/): examine how mean intervals lose coverage when autocorrelation is ignored.
+- [Example: bootstrap-interval coverage for the mean of a skewed distribution](../bootstrap-coverage/): check bootstrap-interval coverage using the same binomial intervals.

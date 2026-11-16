@@ -1,0 +1,329 @@
+---
+title: 外部 BLAS プロバイダーの仕様
+description: blas 機能で外部の BLAS ライブラリを差し込む方法。プロバイダーの機能の提示内容、呼び出しの振り分けと自前実装への退避、ULP の精度の保証、受け渡しの型と作業領域の大きさ、Wasm で観察できない部分のネイティブでの確かめ方。
+sidebar:
+  order: 395
+references:
+  linalg-blas-feature: "blas-機能の役割"
+  linalg-blas-capabilities: "機能の提示内容"
+  linalg-blas-dispatch: "振り分けの規則"
+  linalg-blas-operands: "受け渡しの型と作業領域"
+---
+
+`scioxide-linalg` の密行列の積と分解は、依存のない Rust の自前実装で動く。
+機種に合わせて調整した BLAS ライブラリを使いたい場合は、`blas` 機能を有効にし、そのライブラリをラップするプロバイダー（provider）を呼び出し側が実装して実行コンテキストに渡す。
+このページは、プロバイダーが提示する機能、SciOxide が呼び出しをプロバイダーへ回すか自前実装へ退避させるかを決める規則、プロバイダーの結果の精度の保証、受け渡しの型を説明する。
+BLAS 水準 1〜3 の演算と精度階層 `Standard`・`Exact` は[メモリレイアウト・ビュー・密行列カーネルと精度階層](../storage-views-and-kernels/)で、出力先を指定する API やスコープ付き API などの呼び出しの形は[作業領域・実行コンテキスト・試行記録](oxref:linalg-execution-forms)で説明している。
+
+---
+
+## blas 機能の役割
+
+`blas` 機能は既定で無効で、有効にしても型と振り分けの処理が加わるだけである。
+BLAS ライブラリをリンクせず、依存クレートやビルドスクリプト、プロセス全体で共有する設定も加えない。
+`no_std + alloc` の構成でも同じ API が使える。
+呼び出し側は CBLAS 互換のライブラリを包んで `BlasProvider` トレイトを実装し、`BlasDispatch::new(&provider, fallback)` を `LinalgExecutionContext::with_blas` でコンテキストに付ける。
+コンテキストに付けたプロバイダーは `LinalgExecutionContext::blas()` で読み出せる。
+
+プロバイダーを使えるのは、コンテキストを受け取る出力先を指定する API（`*_into`、`*_in_place`）とスコープ付き API（`*_scoped`）だけである。
+所有値を返す API（標準形式とオプション付き形式）とワンショット関数は `ExecutionContext::sequential_native()` の上で動き、プロバイダーを持たない。
+コンテキストを受け取る密行列の積、三角行列の積と求解、ベクトル演算と平面回転の生成と、LU・Cholesky・LDL・QR とその変種・SVD などの分解の内側の積が、このコンテキストを通じてプロバイダーを使える。
+三角系の Plan `TriangularPlan` も、右辺が一本の求解を TRSV・TBSV・TPSV としてプロバイダーに渡す。
+
+プロバイダーに回せる操作は `BlasOperation` の 45 種類で、CBLAS の名前に対応する。
+水準 1 には `Copy`、`Scale`、`Axpy`、内積 `Dotu`・`Dotc`、`Norm2`、`Asum`、`Iamax`、`Swap`、平面回転の `Rotg`・`Rotmg`・`Rot`・`Rotm`、binary32 の内積を binary64 で累積して返す `WideDot`（DSDOT）と、binary32 の定数に binary64 で累積した内積を足して binary32 で返す `OffsetDot`（SDSDOT）がある。
+水準 2 は行列とベクトルの積（`Gemv`、帯の `Gbmv`、対称・Hermite の `Symv`・`Hemv`・`Sbmv`・`Hbmv`・`Spmv`・`Hpmv`）、三角の求解（`Trsv`・`Tbsv`・`Tpsv`）、階数 1・2 の更新（`Geru`・`Gerc`・`Syr`・`Syr2`・`Her`・`Her2`・`Spr`・`Spr2`・`Hpr`・`Hpr2`）を扱い、水準 3 は `Gemm`、`Symm`、`Hemm`、`Syrk`、`Herk`、`Syr2k`、`Her2k`、`Trmm`、`Trsm` である。
+`BlasOperation::supports_scalar` は、CBLAS がその操作をスカラー型に定義しているかを返す。
+水準 2 の対称の操作（`Symv`・`Sbmv`・`Spmv`・`Syr`・`Syr2`・`Spr`・`Spr2`）と平面回転は実数だけ、Hermite の操作と `Gerc` は複素数だけ、`WideDot` と `OffsetDot` は `f32` だけに定義され、ほかの操作はどのスカラー型にも定義される。
+水準 3 の対称の操作 `Symm`・`Syrk`・`Syr2k` は複素数にも定義される（CBLAS の複素対称の積）。
+
+## 機能の提示内容
+
+プロバイダーは `capabilities()` で、次の項目を `BlasCapabilities` として提示する。
+`BlasCapabilities::empty(width)` は何も扱えない提示内容で、`with_*` で項目を積み上げる。
+
+| 項目 | 設定 | 意味 |
+|---|---|---|
+| 整数の幅 | `empty(BlasIntegerWidth::Lp64)` か `Ilp64` | 大きさ・ストライド・主次元を符号付き 32 ビットか 64 ビットで渡す。上限を超える値を含む呼び出しは退避の方針に従う |
+| 格納の順 | `with_layout(BlasLayout::RowMajor)`、`ColumnMajor` | 一つの呼び出しの行列はすべて同じ順にする。帯とパック形式の被演算子は列優先だけを使う |
+| 変換 | `with_transform(BlasTransform::None)` など | 行列の `None`・`Transpose`・`Adjoint` と、ベクトルの共役 `Conjugate`。普通のベクトルにも `None` の提示内容が要る |
+| 操作と精度 | `with_operation(ScalarKind::F64, BlasOperation::Gemm, BlasUlp::new(4))` | スカラー型と操作の組ごとに、成分ごとの誤差の上限を ULP で提示する。CBLAS が定義しない組は `InvalidInput`（`UnsupportedConfiguration`） |
+| 整列 | `with_minimum_alignment(bytes)`（既定 1） | 被演算子の先頭アドレスの整列。0 や 2 の冪でない値は実行時に `InvalidInput` |
+| スレッド | `with_threading(BlasThreading::SingleThreaded)`（既定）か `Budgeted` | `Budgeted` のプロバイダーは呼び出しごとのワーカー数に従う |
+
+`ScalarKind` は `scioxide_core::backend` の型で、`F32`、`F64`、`Complex32`、`Complex64` を区別する。
+ULP（unit in the last place）は、浮動小数点数で隣り合う二つの値の間隔である。
+`BlasUlp::new(m)` は、プロバイダーの結果の各成分が自前実装の `Exact` の階層の結果から $m$ ULP 以内（$m$ を含む）にあることを約束する。
+`Exact` の積は正しく丸めた値なので、積では $m = 0$ が正しく丸めた結果との一致を意味し、正規化数の範囲の相対誤差はおよそ $(m + \tfrac12) \cdot 2^{1-p}$ 以下になる（$p$ は仮数の桁数で、`f64` では $2^{1-p} \approx 2.2 \times 10^{-16}$）。
+読み出しは `supports_layout`、`supports_transform`、`operation_ulp`、`integer_width`、`minimum_alignment`、`threading` で行う。
+
+## 振り分けの規則
+
+一つの演算をプロバイダーへ回すかどうかは、次の順に決まる。
+退避の方針 `BlasFallbackPolicy` は、プロバイダーが扱えない演算を自前実装で行う `Reference` と、`CapabilityUnavailable` のエラーを返す `Error` の二つである。
+
+| 順 | 条件 | 結果 |
+|---|---|---|
+| 1 | 空の作業（ベクトルの長さ 0、行列積の行数・列数・内側の次元のどれかが 0） | 方針によらず自前実装。出力の $\beta$ 倍だけを行い、プロバイダーを呼ばない |
+| 2 | 提示内容の整列が 0 か 2 の冪でない | 機能を読み出した時点で、方針によらず `InvalidInput` |
+| 3 | 操作とスカラー型の組を提示していない、格納の順・変換・整数の幅・整列・詰め直しの領域の長さのどれかが合わない、または途中の値に拡張した指数の範囲が要る修正 Givens 回転の呼び出しである | `Reference` なら自前実装、`Error` なら `CapabilityUnavailable` |
+| 4 | 精度階層が `Exact` で、提示内容の ULP が 0 でない | 3 と同じ |
+| 5 | 1〜4 に当たらない | プロバイダーを呼ぶ |
+
+3 の判定の前に、SciOxide は行列のビューを詰め直さずに渡せるかを調べる。
+使う格納の順は、行優先を提示していれば行優先、そうでなければ列優先である。
+ストライドがその順に合えば変換 `None` で、行と列を入れ替えれば合うなら `Transpose`（共役のビューなら `Adjoint`）で、ビューをそのまま渡す。
+どちらも提示内容に合わなければ、作業領域にその順の連続な行列として詰め直して `None` で渡す。
+CBLAS には共役だけを取る行列の引数がないので、共役のビューを `Conjugate` として渡すことはない。
+`Symm`・`Hemm` は変換を取らず、`Syrk` は `None`・`Transpose`、`Herk` は `None`・`Adjoint` だけを取るなど、操作ごとの制限は提示内容より優先する。
+行列とベクトルの積 `Gemv` は詰め直さず、行優先と列優先のどちらの提示内容でもそのまま渡せなければ退避の方針に従う。
+
+プロバイダーを呼んだ後は、結果を呼び出し側の出力に写す前に検証する。
+プロバイダーが `Err` を返した場合は `CapabilityFailure`、結果に NaN や無限大があれば `NonFinite`（非有限値の出どころの分類は `Callback`）になる。
+有限でも不正な結果（負のノルムや和、範囲外の `Iamax` の添字、Hermite 行列の対角の虚部、修正回転の不正な旗）は `CapabilityFailure` になる。
+プロバイダーの書き込み先は呼び出し側の出力とは別の場所に用意してあるので、どの失敗でも出力は変わらず、自前実装でやり直すこともない。
+三角だけを出力に反映する積はその三角だけを検証して出力に反映する。
+
+`SingleThreaded` のプロバイダーに渡すワーカー数は常に 1 である。
+`Budgeted` のプロバイダーには、実行方針が `Sequential` なら 1、`Parallel(k)` なら $k$ とエグゼキューターの計算回数の上限の小さい方、`Auto` ならエグゼキューターの計算回数の上限を上限とし、行列の積ではさらに積の Plan で絞った数を渡す。
+積の Plan は行列の大きさでワーカーを減らすので、小さな積や分解の内側の小さな積には 1 を渡すことがある。
+
+分解のように多くの操作を組み合わせる計算では、方針の選び方で結果が変わる。
+`Error` では、内側の呼び出しが一つでもプロバイダーへ回せなければ、計算全体が `CapabilityUnavailable` で止まる。
+`Reference` では回せる呼び出しだけがプロバイダーへ回り、残りは自前実装で行う。
+
+## 精度の保証と自前実装との差
+
+ULP の提示内容はプロバイダーの約束で、SciOxide は実行時に厳密な値を計算し直して確かめることはしない。
+実行時に確かめるのは、上の有限性と値の範囲だけである。
+提示内容の ULP は振り分けにだけ使い、`Standard` では大きさを問わず、積を厳密に累積して一度だけ丸める `Exact` では 0 の操作だけをプロバイダーへ回す（振り分けの表の 4）。
+
+自前実装の `Standard` は内側の次元が $k$ の積の各成分で $\lvert \hat c_{ij} - c_{ij} \rvert \le \gamma_k (\lvert A \rvert \lvert B \rvert)_{ij} + k u_{\mathrm{sub}}$（$\gamma_k = k\varepsilon/(1-k\varepsilon)$、$k\varepsilon < 1$ のとき）を満たす。
+この上限は $\lvert A \rvert \lvert B \rvert$ に比例するので、打ち消しのある成分では相対誤差が大きくなりうる。
+同じ成分で数 ULP を約束するには、打ち消しの後の値に対して誤差を抑える累積が要る。
+通常の和で計算するライブラリに小さな ULP を提示内容させると、約束が実際の誤差より強くなるので、提示内容の値はプロバイダーの作者が自分の実装の誤差解析と試験に基づいて決める。
+
+再現性の約束も経路で異なる。
+自前実装の `Standard` は同じオプションと同じ命令セットならワーカー数によらずビット単位で同じ結果を返す（[共通の再現性の説明](../../../concepts/workspaces-and-reproducibility/)）。
+プロバイダーの結果はそのライブラリのブロック分けやスレッド数に依存しうる。
+SciOxide はプロバイダーと自前実装の結果がビット単位で一致することを約束せず、両者は提示内容の ULP と `Standard` の上限の範囲で異なりうる。
+提示内容を確かめるには、同じ入力を `Exact` の自前実装でも計算し、成分ごとの ULP の距離を数える。
+
+## 受け渡しの型と作業領域
+
+プロバイダーが受け取る `BlasCall` は、操作ごとの列挙子（`BlasOperation` と同じ名前）を持つ一つの列挙型で、`operation()` で操作の種類を返す。
+各列挙子は被演算子と、操作に応じてスカラーの $\alpha$・$\beta$、行列の変換 `BlasTransform`、格納した三角の指定を持つ。
+プロバイダーは `Norm2` と `Asum` の結果を、複素数の呼び出しでも実数の型 `S::Real` で書く。
+被演算子は初期化済みで範囲を検査したスライスを借用する次の型で、生ポインタは公開しない。
+
+| 型 | 内容 |
+|---|---|
+| `BlasVector` | 読み取り専用のベクトル。要素 $i$ は `values()[i * stride()]`。`len`、`stride`、`is_conjugated`、`is_empty` |
+| `BlasVectorMut` | 書き込むベクトル。`values`・`values_mut`、`len`、`stride`、`is_empty`。SciOxide の作業領域を指す |
+| `BlasMatrix` | 読み取り専用の密行列。変換を掛ける前の格納の `rows`・`cols`、主次元 `leading_dimension`、格納の順 `layout`。成分 $(i, j)$ は行優先なら `i * ld + j`、列優先なら `j * ld + i` |
+| `BlasMatrixMut` | 書き込む密行列。`values_mut` のほかは `BlasMatrix` と同じで、SciOxide の作業領域を指す |
+| `BlasBandMatrix` | 列優先の帯の格納。`rows`、`cols`、下帯幅 `lower`、上帯幅 `upper`、主次元。成分 $(i, j)$ は `j * ld + upper + i − j` |
+| `BlasPackedMatrix` | 列ごとにパックした三角。次数 `order`、格納した三角 `triangle`（scioxide-core の `Triangle`）。上三角の $(i, j)$（$i \le j$）は `i + j(j + 1)/2` |
+| `BlasPackedMatrixMut` | 書き込むパック三角。SciOxide の作業領域を指す |
+
+`BlasProvider` は `Sync` を要求し、`name`、`capabilities`、スカラー型ごとの `execute_f32`、`execute_f64`、`execute_complex32`、`execute_complex64` を実装する。
+`execute_*` は呼び出し一つとワーカー数 `workers`（`NonZeroUsize`）を受け取り、ライブラリが失敗を返したら scioxide-core の `CapabilityError` を返す。
+SciOxide は生ポインタを渡さないので、外部のコードを呼ぶ実装でも、境界を検査済みのスライスからライブラリの引数を作れる。
+`BlasDispatch` はプロバイダーと方針の組で、`provider()` と `fallback()` で読み出す。
+次の骨組みは `f64` の `Gemm` だけを提示するプロバイダーの形を示す（`--features blas` のネイティブのビルド用で、ブラウザのセルでは動かない）。
+
+```text
+impl BlasProvider for MyBlas {
+    fn name(&self) -> &'static str { "my-blas" }
+    fn capabilities(&self) -> BlasCapabilities {
+        BlasCapabilities::empty(BlasIntegerWidth::Lp64)
+            .with_layout(BlasLayout::RowMajor)
+            .with_transform(BlasTransform::None).with_transform(BlasTransform::Transpose)
+            .with_operation(ScalarKind::F64, BlasOperation::Gemm, BlasUlp::new(4))
+            .unwrap() // Gemm は f64 に定義されるので失敗しない
+    }
+    fn execute_f64(&self, call: BlasCall<'_, f64>, workers: NonZeroUsize) -> Result<(), CapabilityError> {
+        match call {
+            BlasCall::Gemm { alpha, a, b, left_transform, right_transform, beta, c } => { /* cblas_dgemm */ Ok(()) }
+            _ => Err(CapabilityError::new("unsupported routine")),
+        }
+    }
+    // execute_f32・execute_complex32・execute_complex64 も同じ形で書く。
+}
+let cx = LinalgExecutionContext::sequential().with_blas(BlasDispatch::new(&my_blas, BlasFallbackPolicy::Reference));
+a.view().mul_mat_into(&b, &options, c.view_mut(), &mut workspace, cx)?;
+```
+
+詰め直しの領域は呼び出し側の作業領域から取る。
+密行列の要求型と各分解の要求型（`DenseWorkspaceRequest`、`LuWorkspaceRequest`、`CholeskyWorkspaceRequest`、`HouseholderWorkspaceRequest` など）は、`with_provider_packing()` で被演算子をまるごと詰め直す区画を加える。
+`for_context(&cx)` はワーカー数をコンテキストから決め、コンテキストにプロバイダーがあるときだけ同じ区画を加える。
+この区画は `blas` 機能がなくても計算できる。
+所有する作業領域は出力先を指定する API の準備段階でこの区画まで大きくなるが、`LinalgWorkspace::from_scalar_slice` で参照を渡した固定の作業領域が自前実装の分しかないと、プロバイダーを付けたコンテキストではプロバイダーを呼ぶ前に `DimensionMismatch` になる（[作業領域・実行コンテキスト・試行記録](oxref:linalg-workspace-reservation)）。
+
+## 実例
+
+次のセルは $n \times n$ の行列の積・三角行列との積と、LU・Cholesky・QR 分解について、`with_provider_packing()` の有無で作業領域の要件を比べる。
+入力は行列の次数 $n$（1〜512）で、要件は `LinalgRequirements::scalar_len()` のスカラーの要素数と、`required_bytes::<f64>()` のバイト数で読む。
+ワーカー数で区画が変わらないように、実行方針は `with_execution_policy(ExecutionPolicy::Sequential)` で逐次にそろえる。
+表の増分を $n^2$ で割った値は、被演算子をまるごと詰め直す区画が自前実装の区画をどれだけ超えるかを示す。
+このセルは `blas` 機能を使わずに動き、プロバイダーへの振り分けそのものは観察しない。
+
+```rust
+//| id: linalg-blas-provider-packing
+//| ref: linalg-blas-provider-packing
+//| title: プロバイダーへの受け渡しに備える作業領域の大きさ
+//| run: reactive
+//| crates: [scioxide-core, scioxide-linalg]
+//| inputs:
+//|   order: {"type":"range","label":"行列の次数 n","description":"n × n の行列の積と分解で比べる。","min":1,"max":512,"step":1,"value":64}
+//| cases:
+//|   - {"id":"small","label":"n = 8","description":"小さな積は自前実装がブロックに分けないので、被演算子 2 個分の 2n² 要素が増える。","inputs":{"order":8}}
+//|   - {"id":"large","label":"n = 512","description":"自前実装のブロックの区画が n² より小さくなり、積の増分は 1.62 n² になる。","inputs":{"order":512}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"packing","path":"/rows/0/3","equals":0}
+//|       - {"artifact":"packing","path":"/rows/1/3","equals":4096}
+//|   - case: small
+//|     expect:
+//|       - {"artifact":"packing","path":"/rows/0/1","equals":64}
+//|       - {"artifact":"packing","path":"/rows/0/3","equals":128}
+//|   - case: large
+//|     expect:
+//|       - {"artifact":"packing","path":"/rows/0/2","equals":786432}
+//|       - {"artifact":"packing","path":"/rows/0/4","approx":{"value":1.62,"atol":0.005}}
+use scioxide_core::{ExecutionPolicy, SciOxideError};
+use scioxide_linalg::{CholeskyDecomposition, CholeskyWorkspaceRequest, DenseWorkspaceRequest};
+use scioxide_linalg::{
+    HouseholderDecomposition, HouseholderOrientation, HouseholderWorkspaceRequest,
+};
+use scioxide_linalg::{LinalgExecutionOptions, LinalgRequirements, LinalgWorkspace};
+use scioxide_linalg::{LuDecomposition, LuWorkspaceRequest};
+
+let n = order.round() as usize;
+// ワーカーの数で区画の大きさが変わらないように、逐次実行の方針で要求を作る。
+let options = LinalgExecutionOptions::new().with_execution_policy(ExecutionPolicy::Sequential);
+let dense = |r: DenseWorkspaceRequest| LinalgWorkspace::<f64>::workspace_requirements(&r);
+type Pair = (
+    Result<LinalgRequirements, SciOxideError>,
+    Result<LinalgRequirements, SciOxideError>,
+);
+let product = DenseWorkspaceRequest::product(n, n, n, &options);
+let triangular = DenseWorkspaceRequest::triangular_product(n, n, n, &options);
+let lu = LuWorkspaceRequest::factor(n, &options);
+let cholesky = CholeskyWorkspaceRequest::factor(n, &options);
+let qr = HouseholderWorkspaceRequest::factor(n, n, HouseholderOrientation::Qr, &options);
+// 各行は（自前実装だけの要求、with_provider_packing() を付けた要求）。
+let cases: [(&str, Pair); 5] = [
+    (
+        "行列の積 C = AB",
+        (dense(product), dense(product.with_provider_packing())),
+    ),
+    (
+        "三角行列との積",
+        (dense(triangular), dense(triangular.with_provider_packing())),
+    ),
+    (
+        "LU 分解",
+        (
+            LuDecomposition::<f64>::workspace_requirements(&lu),
+            LuDecomposition::<f64>::workspace_requirements(&lu.with_provider_packing()),
+        ),
+    ),
+    (
+        "Cholesky 分解",
+        (
+            CholeskyDecomposition::<f64>::workspace_requirements(&cholesky),
+            CholeskyDecomposition::<f64>::workspace_requirements(
+                &cholesky.with_provider_packing(),
+            ),
+        ),
+    ),
+    (
+        "QR 分解（Householder）",
+        (
+            HouseholderDecomposition::<f64>::workspace_requirements(&qr),
+            HouseholderDecomposition::<f64>::workspace_requirements(
+                &qr.with_provider_packing(),
+            ),
+        ),
+    ),
+];
+let mut rows = Vec::new();
+for (name, (native, provider)) in cases {
+    let native = native.map_err(|e| e.to_string())?;
+    let provider = provider.map_err(|e| e.to_string())?;
+    let a = native.scalar_len().map_err(|e| e.to_string())?;
+    let b = provider.scalar_len().map_err(|e| e.to_string())?;
+    let bytes = provider
+        .required_bytes::<f64>()
+        .map_err(|e| e.to_string())?;
+    // 増分を n² で割り、被演算子をまるごと詰め直す区画が何個分かを見る。
+    rows.push((name, a, b, b - a, (b - a) as f64 / (n * n) as f64, bytes));
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "操作" },
+    { "key": "1", "label": "自前実装だけ [要素]", "type": "integer" },
+    { "key": "2", "label": "プロバイダーの詰め直しを含む [要素]", "type": "integer" },
+    { "key": "3", "label": "増分 [要素]", "type": "integer" },
+    { "key": "4", "label": "増分 / n² [-]", "type": "number", "format": { "fractionDigits": 2 } },
+    { "key": "5", "label": "プロバイダー用の総量 [B]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "packing" })
+);
+```
+
+自前実装の積はキャッシュに合わせた大きさのブロックだけを詰め直す。
+小さな行列はブロックに分けずに直接計算するので、$n = 8$ では自前実装の区画が出力の $n^2 = 64$ 要素だけで、プロバイダーの分として $A$ と $B$ の $2n^2 = 128$ 要素が増える。
+既定の $n = 64$ では、自前実装が $A$ と $B$ のブロックに使う区画がどちらもすでに $n^2$ 以上あるので、行列の積と三つの分解の増分は 0 になる。
+$n = 512$ ではどちらの区画も $n^2$ より小さく、行列の積の総量は出力と二つの被演算子の $3n^2 = 786\,432$ 要素（6.3 MB）になって、増分は $1.62 n^2$ である。
+三角行列との積は自前実装が三角を詰め直さないので、どの $n$ でも三角の $n^2$ 要素だけが増える。
+LU と Cholesky の増分は内側の積と同じ値で、QR は $n = 512$ で $0.78 n^2$ である。
+
+## Wasm で観察できない部分とネイティブでの確かめ方
+
+このハンドブックのセルは `blas` 機能を有効にしていないので、`BlasProvider` などの型も `with_blas` もセルの中では使えない。
+`blas` 機能を有効にしたネイティブのビルドでは、呼び出しを記録する模擬のプロバイダーを実装すると、振り分けの規則、プロバイダーに渡すワーカー数、結果を検証する動作を確かめられる。
+`Cargo.toml` で `scioxide-linalg = { version = "…", features = ["blas"] }` を指定し、`execute_f64` が受け取った `BlasCall` の種類、変換、格納の順、主次元、ワーカー数を記録して、自前の素朴な三重ループで結果を書くプロバイダーを作ればよい。
+
+次の表は `f64` の `Gemm` だけを ULP 4 で提示し、行優先・`None`・`Transpose` を扱う模擬のプロバイダーで、$3 \times 4$ の $A$（$a_{ij} = 0.1(4i + j) + 1/3$）と $4 \times 2$ の $B$（$b_{ij} = 0.7 - 0.3(2i + j)$）の積 `mul_mat_into` を逐次のコンテキストで行った結果である（特記のない行は同じプロバイダー）。
+
+| 条件 | プロバイダーの呼び出し | 結果 |
+|---|---|---|
+| `Standard`、`Error` | 1 回 | 成功。自前実装の `Standard` の結果と一致 |
+| `Exact`、`Reference` | 0 回 | 成功。自前実装の `Exact` の結果 |
+| `Exact`、`Error` | 0 回 | `CapabilityUnavailable`。出力は変わらない |
+| ULP 0 を提示内容、`Exact`、`Error` | 1 回 | 成功 |
+| 内側の次元 0、`Error` | 0 回 | 成功。出力は 0 |
+| 整列 3 を提示内容、`Reference` | 0 回 | `InvalidInput`（内側の次元 0 なら成功） |
+| プロバイダーが NaN を書く、`Reference` | 1 回 | `NonFinite`。出力は変わらない |
+| プロバイダーが `Err` を返す、`Reference` | 1 回 | `CapabilityFailure`。出力は変わらない |
+| 列優先と `None`・`Transpose` を提示内容 | 1 回 | 行優先の $A$ と $B$ を列優先の転置と見て、どちらも `Transpose` で渡す。詰め直しなし |
+| 列優先と `None` だけを提示内容 | 1 回 | 列優先に詰め直して `None` で渡す |
+| `Gemv` を使う `mul_vec_into`、`Error` と `Reference` | 0 回 | `CapabilityUnavailable` と、自前実装での成功 |
+| 自前実装の分だけ（6 要素）への参照を渡した固定の作業領域 | 0 回 | `DimensionMismatch`（26 要素が必要） |
+| $80 \times 80$ の Cholesky 分解、`Reference` と `Error` | 2 回と 0 回 | 成功と `CapabilityUnavailable` |
+| 4 ワーカーのエグゼキューターで $200 \times 200$ の積、`Budgeted` のプロバイダー | 1 回 | ワーカー数は `Sequential` で 1、`Parallel(2)` で 2、`Auto` で 1（積の Plan が絞った数） |
+
+ULP 0 の行の模擬のプロバイダーは実際には普通の和で計算しており、結果は `Exact` の自前実装と $2.2 \times 10^{-16}$ 違ったが、そのまま出力に書かれた。
+提示内容の正しさを SciOxide が実行時に確かめないことを、この行が示している。
+
+---
+
+## まとめ
+
+外部の BLAS を使うには、ライブラリをラップする `BlasProvider` を実装し、`BlasDispatch` と `LinalgExecutionContext::with_blas` で出力先を指定する API とスコープ付き API の呼び出しに渡す。
+`BlasCapabilities` には格納の順・変換・整数の幅・整列・スレッドの扱いと、スカラー型と操作の組ごとの ULP を提示し、SciOxide が確かめない ULP の値は自分の実装の誤差解析と試験から決める。
+提示内容に合わない呼び出しと `Exact` で ULP が 0 でない呼び出しを自前実装で続けるか `CapabilityUnavailable` で止めるかは、`BlasFallbackPolicy` で選ぶ。
+プロバイダーの失敗と非有限の結果は出力を変えずにエラーになるので、自前実装へのやり直しが要るなら呼び出し側で行う。
+プロバイダーを付けたコンテキストに固定の作業領域を渡すときは、`with_provider_packing()` か `for_context(&cx)` で要件を求める（大きな行列ほど、被演算子をまるごと詰め直す分が増える）。
+振り分けの動作は `blas` 機能を有効にしたネイティブのビルドで模擬のプロバイダーを使って確かめる。
+
+## 次に読むページ
+
+- [メモリレイアウト・ビュー・密行列カーネルと精度階層](../storage-views-and-kernels/)：自前実装の `Standard` と `Exact` の誤差限界と再現性を確かめる。
+- [作業領域・実行コンテキスト・試行記録](../workspaces-and-execution/)：要求型から作業領域を事前確保して再利用する手順と、コンテキストを受け取る呼び出しの形を確かめる。
+- [外部 BLAS のプロバイダーの API](../../api/blas-provider/)：18 項目の型とメソッドの一覧を引く。

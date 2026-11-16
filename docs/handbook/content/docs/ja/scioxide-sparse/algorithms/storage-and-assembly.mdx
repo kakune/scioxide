@@ -1,0 +1,588 @@
+---
+title: 疎行列の格納形式と組立て
+description: COO・CSR・CSC・BSR・DIA の配列とメモリ使用量、SparseBuilder による重複寄与の厳密な合算と明示的に格納されたゼロ成分の方針、構造を保った値の更新、小さい要素の除去、ブロック・対角からの構成と、自由度の番号付けによるブロック形式のメモリ使用量の違い。
+sidebar:
+  order: 305
+references:
+  sparse-block-assembly-experiment: "連成ブロックの組立て"
+  sparse-block-construction: "ブロックと対角からの構成"
+  sparse-bsr: "bsrブロック行形式"
+  sparse-coo: "coo座標形式"
+  sparse-csr-csc: "csr圧縮行形式と-csc圧縮列形式"
+  sparse-duplicate-policy: "重複の方針"
+  sparse-explicit-zero-policy: "明示的に格納されたゼロ成分の方針"
+  sparse-format-costs: "メモリ使用量と得意な操作"
+  sparse-pruning: "小さい要素の除去"
+  sparse-triplet-assembly: "三つ組からの組立て"
+  sparse-value-updates: "構造を保った値の更新"
+---
+
+$m \times n$ 行列 $\mathbf{A}$ のうち 0 でない可能性のある位置が $\mathrm{nnz} \ll mn$ 個しかないとき、位置と値だけを持てばメモリ使用量は $O(m + n + \mathrm{nnz})$ に下がる。
+ただし、位置の持ち方によって速く済む操作が違う。
+有限要素法の組立てでは同じ位置への加算を順不同に受け付ける必要があり、反復解法では同じ構造に対する積を何度も計算し、直接法では行や列を順にたどる。
+このページでは 5 つの格納形式の配列とメモリ使用量、三つ組から正準な行列を作る組立ての規則、確定した構造を保ったまま値だけを更新する方法、ブロックと対角からの構成を説明する。
+
+構造と値を分ける考え方と、格納されていないゼロ成分と明示的に格納されたゼロ成分の区別は [疎行列アルゴリズムの共通仕様と構成](../) にまとめてある。
+
+## 正準形と 5 つの格納形式
+
+行列の**非零パターン**（構造）を、値を保存する位置の集合 $\mathcal{S}(\mathbf{A}) \subseteq \{0, \dots, m-1\} \times \{0, \dots, n-1\}$ と定める。
+`scioxide-sparse` の格納形式はどれも**正準**である。
+すなわち、各位置は一度だけ現れ、決まった順に整列しており、保存された値はすべて有限である。
+正準形では、構造と値が同じ行列はいつも同じ配列で表されるので、二つの行列の構造が等しいかどうかを配列の比較で判定できる。
+この性質が後で述べる記号解析の再利用や値だけの更新の前提になる。
+
+### COO（座標形式）
+
+COO は保存した位置ごとに三つ組 $(i_k, j_k, a_k)$ を持つ。
+`CooMatrix` の座標は行優先の辞書式順に整列し、重複を含まない。
+組立て途中の整列していない三つ組は `CooMatrix` ではなく後で述べる `SparseBuilder` が持つ。
+`row_indices()`、`col_indices()`、`values()` が三つの配列を返し、`iter()` は $(i, j, a_{ij})$ を格納の順に返す。
+`CooMatrix` は `SparseBuilder::finish_coo` で作り、`to_csr`、`to_csc` で $O(m + n + \mathrm{nnz})$ の手間で変換できる。
+
+### CSR（圧縮行形式）と CSC（圧縮列形式）
+
+CSR は COO の行添字を、行の始まりの位置を表す長さ $m + 1$ の配列 `row_ptr` に圧縮する。
+第 $i$ 行の成分は位置 $k = \mathrm{row\_ptr}[i], \dots, \mathrm{row\_ptr}[i+1] - 1$ にあり、列は `col_indices()[k]`、値は `values()[k]` で、各行の中で列は狭義に増加する。
+たとえば
+
+$$
+\mathbf{A} = \begin{pmatrix} 4 & 0 & 1 \\ 0 & 3 & 0 \\ 2 & 0 & 5 \end{pmatrix}
+$$
+
+は $\mathrm{row\_ptr} = [0, 2, 3, 5]$、$\mathrm{col\_indices} = [0, 2, 1, 0, 2]$、$\mathrm{values} = [4, 1, 3, 2, 5]$ と表される。
+この三つの配列だけなら、第 $i$ 行の取り出しは $O(1 + \text{その行の成分数})$ で済むが、第 $j$ 列の取り出しには全成分の走査が要る。
+CSC は行と列の役割を入れ替えた形式で、`col_ptr()`、`row_indices()`、`values()` を持ち、列の取り出しが速い。
+
+`CsrMatrix` と `CscMatrix` は確定のときに反対方向の走査の索引も作って保持する。
+CSR なら、列ごとの行添字と、それぞれが `values()` のどの位置にあたるかの対応である。
+`opposite_traversal()` はこの索引を確保なしに `SparseTraversalView` への参照を渡し、その `pattern()` が列ごとの構造、`positions()` が値の位置を返す。
+このため、CSR のままでも列方向の走査、転置積、随伴積を確保なしに計算できる。
+値を持たない構造だけの転置は、`transpose_pattern` が同じ位置の対応を含む `SparseTraversal` として返す（計数ソートで $O(m + n + \mathrm{nnz})$）。
+
+### BSR（ブロック行形式）
+
+BSR は行列を $r \times c$ の小ブロックに分け、保存成分を一つでも含むブロックを密な $r \times c$ の配列として持つ。
+ブロック単位の CSR であり、`row_ptr()` と `col_indices()` はブロック行とブロック列の添字、`values()` はブロックごとに行優先で並べた $r c$ 個の値である。
+ブロックの中の 0 も値として保存される。
+保存したブロックの数を $b$ とすると、値は $b r c$ 個で、**ブロック充填率** $\mathrm{nnz} / (b r c)$ が 1 に近いほど無駄が少ない。
+節点ごとに $r$ 個の自由度を持つ弾性体や多成分の流体では、節点ごとに番号を付ければ $r \times r$ のブロックがほぼ密になり、添字の数が成分ごとの $\mathrm{nnz}$ 個からブロックごとの $b \approx \mathrm{nnz}/(rc)$ 個に減り、ブロックごとの密な積で計算できる。
+`BsrMatrix::from_sparse(view, r, c)` は、$r$ か $c$ が 0 であるか、行数と列数を割り切らなければ `InvalidInput` を返す。
+
+### DIA（対角形式）
+
+DIA は対角のずれ $d = j - i$ ごとに値の列を持つ。
+`offsets()` は昇順のずれ、`values()` はずれ 1 本あたり $n$ 個の、列にそろえた枠を並べたもので、$k$ 番目のずれの対角にある成分 $a_{ij}$ は `values()[k · n + j]` に置かれる。
+行列の外にはみ出す枠はパディングで、値は 0 でなければならない。
+対角が $q$ 本なら値は $q n$ 個で、添字は $q$ 個しか要らない。
+係数が一定の差分ステンシルのように、少数の対角がほぼ全部埋まる行列に向き、対角の中が疎だと 0 の枠が増える。
+
+### メモリ使用量と得意な操作
+
+$m \times n$、成分数 $\mathrm{nnz}$ の行列について、保持する配列の大きさを比べる（BSR はブロック数 $b$、DIA は対角の本数 $q$）。
+
+| 形式 | 型 | 整数の配列 | 値の配列 | 得意な操作 |
+|---|---|---|---|---|
+| COO | `CooMatrix` | $2\,\mathrm{nnz}$、走査用の索引 $m + n + 2 + \mathrm{nnz}$ | $\mathrm{nnz}$ | 他の形式への変換、成分の列挙 |
+| CSR | `CsrMatrix` | $m + 1 + \mathrm{nnz}$、反対方向の索引 $n + 1 + 2\,\mathrm{nnz}$ | $\mathrm{nnz}$ | 行の走査、行列ベクトル積、分解と前処理の入力 |
+| CSC | `CscMatrix` | $n + 1 + \mathrm{nnz}$、反対方向の索引 $m + 1 + 2\,\mathrm{nnz}$ | $\mathrm{nnz}$ | 列の走査、列ごとの消去 |
+| BSR | `BsrMatrix` | $m/r + 1 + b$、反対方向の索引 $n/c + 1 + 2b$ | $b r c$ | 密なブロックを持つ多自由度の系 |
+| DIA | `DiaMatrix` | $q$ | $q n$ | 係数一定の差分ステンシル |
+
+BSR と DIA は自分の配列から `from_raw` で作るか、他の形式から `from_sparse` で変換して作る。
+変換後の配列の大きさは `BsrMatrix::conversion_requirements` と `DiaMatrix::conversion_requirements` が `SparseStorageRequirements`（ポインタ・添字・値・走査用の索引の要素数）として変換の前に返す。
+問い合わせは占めるブロックや対角を数えるための一時的な一覧を作るが、値の配列は確保しないので、大きすぎる変換を値の確保の前に断れる。
+どの形式も `view()` で確保なしの共通の借用ビュー `SparseView` を返し、積やグラフのアルゴリズムはこのビューを受け取る。
+`SparseView::iter()` は保存した成分を格納の順に `SparseEntries` として返し、明示的に格納されたゼロ成分と BSR のブロックの中の 0 を含み、DIA のパディングを含まない。
+
+## 三つ組からの組立て
+
+有限要素法では、要素 $e$ の局所行列 $\mathbf{A}^{(e)}$ を全体の自由度番号に足し込んで
+
+$$
+\mathbf{A} = \sum_{e} \mathbf{P}_e^{\mathsf{T}} \mathbf{A}^{(e)} \mathbf{P}_e
+$$
+
+を作る。
+ここで $\mathbf{P}_e$ は、要素の局所番号を全体の番号に対応させる 0 と 1 の行列である。
+隣り合う要素は節点を共有するので、同じ位置 $(i, j)$ に複数の寄与が届く。
+`SparseBuilder::new(m, n)` はこうした三つ組を `push(i, j, v)` や `extend(rows, cols, values)` で順不同に受け取り、範囲外の添字（`OutOfBounds`）と非有限な値（`NonFinite`）はその場で拒む。
+確定の `finish_coo(duplicate, zeros)`、`finish_csr`、`finish_csc` は、三つ組を $(i, j)$ の順に整列し（三つ組が $T$ 個なら $O(T \log T)$）、重複と 0 を引数の方針で処理して、正準な行列を一度で作る。
+`finish_csr` と `finish_csc` は途中で COO を作らない。
+三つ組の配列がそろっているなら、`CsrMatrix::from_triplets(rows, cols, row_indices, col_indices, values)` が `(DuplicatePolicy::Sum, ExplicitZeroPolicy::Preserve)` の方針で一度に CSR を作る。
+
+### 重複の方針
+
+`DuplicatePolicy::Sum` は、同じ位置の寄与を厳密に累積して足し合わせ、最後に一度だけ丸める。
+合算値は寄与の真の和を一度だけ丸めた値なので、寄与を足す順番にビット単位で依存しない。
+倍精度で順に足すと、和が途中の丸めに左右される。
+たとえば $10^{16} + 1 - 10^{16}$ を左から足すと、$10^{16} + 1$ が $10^{16}$ に丸められて結果は 0 になる。
+`Sum` なら、要素を処理する順番が並列化や網目の生成の仕方で変わっても組立ての結果は同じなので、計算を再現できる。
+真の和が倍精度で表せないほど大きいときは `NumericalInstability` を返す。
+
+`DuplicatePolicy::Reject` は、整列した順で最初に重複した位置を見つけた時点で `InvalidInput` を返す。
+一つの位置に一度しか値を与えないはずの入力で、誤って重複が生じていないかを確かめるのに使う。
+
+### 明示的に格納されたゼロ成分の方針
+
+`ExplicitZeroPolicy` は、重複を処理したあとで値が厳密に 0 になった位置の扱いを決める。
+`Preserve` はその位置を構造に残し、`Drop` は構造から取り除く。
+寄与が打ち消し合って 0 になった位置も対象になる。
+`Drop` はメモリ使用量と演算量を減らすが、構造が値に依存するようになる。
+係数を変えて何度も分解する問題で、ある回だけ打ち消しで成分が消えると構造が変わり、記号解析を再利用できなくなる。
+構造を固定したい場合や、重み 0 の辺をグラフに残したい場合は `Preserve` を選ぶ。
+
+### 重複と零の方針、合算の順序
+
+次のセルは位置 $(0, 0)$ に 2 と $v$ の二つの寄与、$(0, 1)$ に厳密な 0、$(1, 1)$ に 4 を与えた $2 \times 2$ の三つ組を、重複と零の方針の 4 通りの組で確定する。
+入力 $v$ は $-4$ から $4$ までの整数で、$v = -2$ にすると $(0, 0)$ の寄与が打ち消し合う。
+1 つ目の表は方針の組ごとの結果、保存数、各位置に保存された値を示す。
+「—」は、その位置が保存されていないこと、または行列が拒まれたことを表す。
+2 つ目の表は $10^{16}$、$1$、$-10^{16}$ の三つの寄与を 3 通りの順で同じ位置に与え、`Sum` の合算値と、与えた順に倍精度で足した参照値を並べる。
+真の和は 1 である。
+
+```rust
+//| id: sparse-duplicate-zero-policies
+//| ref: sparse-duplicate-zero-policies
+//| title: 重複寄与と明示的に格納されたゼロ成分の方針、合算の順序
+//| run: reactive
+//| crates: [scioxide-sparse]
+//| inputs:
+//|   second_value: {"type":"range","label":"(0, 0) への二つ目の寄与 v","description":"2 + v が (0, 0) の合算値になる。","min":-4,"max":4,"step":1,"value":3}
+//| cases:
+//|   - {"id":"cancellation","label":"v = −2","description":"(0, 0) の寄与が打ち消し合い、Sum / Drop では保存数が 1 に減る。","inputs":{"second_value":-2}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"policies","path":"/rows/0/3","equals":3}
+//|       - {"artifact":"policies","path":"/rows/0/4","approx":{"value":5.0,"atol":1e-15}}
+//|       - {"artifact":"policies","path":"/rows/0/5","approx":{"value":0.0,"atol":1e-15}}
+//|       - {"artifact":"policies","path":"/rows/1/3","equals":2}
+//|       - {"artifact":"policies","path":"/rows/1/5","equals":null}
+//|       - {"artifact":"policies","path":"/rows/2/2","equals":"InvalidInput"}
+//|       - {"artifact":"policies","path":"/rows/3/2","equals":"InvalidInput"}
+//|       - {"artifact":"orders","path":"/rows/0/1","approx":{"value":1.0,"atol":1e-15}}
+//|       - {"artifact":"orders","path":"/rows/0/2","approx":{"value":0.0,"atol":1e-15}}
+//|       - {"artifact":"orders","path":"/rows/1/2","approx":{"value":0.0,"atol":1e-15}}
+//|       - {"artifact":"orders","path":"/rows/2/1","approx":{"value":1.0,"atol":1e-15}}
+//|       - {"artifact":"orders","path":"/rows/2/2","approx":{"value":1.0,"atol":1e-15}}
+//|   - case: cancellation
+//|     expect:
+//|       - {"artifact":"policies","path":"/rows/0/3","equals":3}
+//|       - {"artifact":"policies","path":"/rows/0/4","approx":{"value":0.0,"atol":1e-15}}
+//|       - {"artifact":"policies","path":"/rows/1/3","equals":1}
+//|       - {"artifact":"policies","path":"/rows/1/4","equals":null}
+use scioxide_sparse::{DuplicatePolicy, ExplicitZeroPolicy, SparseBuilder};
+
+// (0, 0) に 2 と v、(0, 1) に厳密な 0、(1, 1) に 4 を順不同に与える。
+let triplets = [
+    (0, 0, 2.0_f64),
+    (1, 1, 4.0),
+    (0, 1, 0.0),
+    (0, 0, second_value),
+];
+let mut rows = Vec::new();
+for (duplicate_name, duplicate) in [
+    ("Sum", DuplicatePolicy::Sum),
+    ("Reject", DuplicatePolicy::Reject),
+] {
+    for (zero_name, zeros) in [
+        ("Preserve", ExplicitZeroPolicy::Preserve),
+        ("Drop", ExplicitZeroPolicy::Drop),
+    ] {
+        let mut builder = SparseBuilder::new(2, 2);
+        for &(i, j, v) in &triplets {
+            builder.push(i, j, v).map_err(|e| e.to_string())?;
+        }
+        let row = match builder.finish_csr(duplicate, zeros) {
+            // 保存されていない位置は None にする（get は格納されていないゼロ成分に 0 を返すので使わない）。
+            Ok(a) => {
+                let stored = |r: usize, c: usize| {
+                    a.iter()
+                        .find(|&(i, j, _)| (i, j) == (r, c))
+                        .map(|(_, _, v)| v)
+                };
+                let (a00, a01, a11) = (stored(0, 0), stored(0, 1), stored(1, 1));
+                ("受理".to_string(), Some(a.nnz()), a00, a01, a11)
+            }
+            // 拒否は分類 e.kind() で表示する。
+            Err(e) => (format!("{:?}", e.kind()), None, None, None, None),
+        };
+        rows.push((duplicate_name, zero_name, row.0, row.1, row.2, row.3, row.4));
+    }
+}
+let plain = serde_json::json!({ "significantDigits": 6 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "重複の方針" },
+    { "key": "1", "label": "零の方針" },
+    { "key": "2", "label": "結果" },
+    { "key": "3", "label": "保存数 nnz [個]", "type": "integer", "nullText": "—" },
+    { "key": "4", "label": "(0, 0) の値 [-]", "type": "number", "format": plain, "nullText": "—" },
+    { "key": "5", "label": "(0, 1) の値 [-]", "type": "number", "format": plain, "nullText": "—" },
+    { "key": "6", "label": "(1, 1) の値 [-]", "type": "number", "format": plain, "nullText": "—" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "policies" })
+);
+
+// 同じ三つの寄与を 3 通りの順で同じ位置に与える。真の和は 1。
+let parts = [1.0e16_f64, 1.0, -1.0e16];
+let labels = ["1e16", "1", "-1e16"];
+let mut order_rows = Vec::new();
+for order in [[0, 1, 2], [1, 0, 2], [0, 2, 1]] {
+    let mut builder = SparseBuilder::new(1, 1);
+    for &k in &order {
+        builder.push(0, 0, parts[k]).map_err(|e| e.to_string())?;
+    }
+    let a = builder
+        .finish_csr(DuplicatePolicy::Sum, ExplicitZeroPolicy::Preserve)
+        .map_err(|e| e.to_string())?;
+    // 参照値: 与えた順に倍精度で足す（途中で丸めが入る）。
+    let sequential = order.iter().fold(0.0_f64, |sum, &k| sum + parts[k]);
+    let names: Vec<&str> = order.iter().map(|&k| labels[k]).collect();
+    let summed = a.get(0, 0).map_err(|e| e.to_string())?;
+    order_rows.push((names.join(", "), summed, sequential));
+}
+let order_columns = serde_json::json!([
+    { "key": "0", "label": "寄与の順" },
+    { "key": "1", "label": "Sum の合算値 [-]", "type": "number", "format": plain },
+    { "key": "2", "label": "順に倍精度で足した値（参照）[-]", "type": "number", "format": plain }
+]);
+emit_table_with_columns!(
+    order_columns,
+    order_rows,
+    metadata = serde_json::json!({ "id": "orders" })
+);
+```
+
+既定の $v = 3$ では、`Sum` の 2 行は $(0, 0) = 5$ を受理し、`Preserve` は明示的に格納されたゼロ成分 $(0, 1) = 0$ を残して保存数 3、`Drop` は取り除いて保存数 2 になる。
+`Reject` の 2 行は零の方針によらず `InvalidInput` で拒まれる。
+$v = -2$ にすると、`Sum / Drop` では打ち消しで生じた $(0, 0)$ の 0 も取り除かれ、保存数は 1 になる。
+`Sum / Preserve` では $(0, 0) = 0$ が明示的に格納されたゼロ成分として残り、保存数は 3 のままである。
+2 つ目の表では、`Sum` はどの順でも 1 を返し、順に足した参照値は 0、0、1 と順序で変わる。
+
+## 構造を保った値の更新
+
+確定した行列に成分を挿入したり、成分を削除したりする方法はない。
+時間発展や Newton 法のように構造が同じで係数だけが変わる問題では、構造を作り直さずに値だけを入れ替える。
+`CooMatrix`、`CsrMatrix`、`CscMatrix` が次の三つの方法を持つ（`BsrMatrix` と `DiaMatrix` は持たないので、正準な形式で更新してから変換し直す）。
+
+- `set_value(position, value)` は、`values()` の格納順の位置 `position` にある値を一つ置き換える。
+  位置が範囲外なら `OutOfBounds`、値が有限でなければ `NonFinite` を返し、行列は変わらない。
+- `copy_values_from(values)` は、計算済みの全成分を長さと有限性を検査してから写す。
+  作業領域は要らない。
+- `update_values(fill, workspace)` は、古い値 `old` と候補の配列 `next` を受け取るクロージャ `fill(old, next)` に候補を作業領域の中で書かせ、全成分が有限なときだけ行列に写す。
+  `next` は NaN で埋めた状態で渡されるので、書き忘れた位置は `NonFinite` として見つかる。
+  クロージャがエラーを返すか非有限な値を書くと、行列は変わらない。
+  作業領域 `SparseValueWorkspace` は `workspace(())` で作るか、`workspace_requirements(())` が返す `SparseValueRequirements`（保存した値と同じ個数）に対して `try_reserve` で事前確保する。
+  事前確保したあとの更新は確保しない。
+
+構造を丸ごと別の構造に替えたいときは、`CsrMatrix::try_assign_pattern(pattern, scratch)` が既存のメモリ領域を使い回して形と構造を置き換え、値をすべて 0 にする。
+`scratch` は反対方向の索引を作るための添字の配列で、長さは新しい構造のちょうど $n + 1 + 2\,\mathrm{nnz}$ でなければならず、違えば `DimensionMismatch` になる。
+メモリ領域が足りないときだけ確保し、確保に失敗すると行列は変わらない。
+置き換えたあとの行列には前の構造から作った解析や因子を使えない。
+
+## 小さい要素の除去
+
+反復の途中で生じた小さな成分を捨てて構造を細くしたいときは、`SparsePruning::new(tolerance, reference_scale)` で捨てる基準を作る。
+`tolerance` は scioxide-core の `Tolerance`（絶対項 $\tau_{\mathrm{abs}}$ と相対項 $\tau_{\mathrm{rel}}$）、`reference_scale` は相対項に掛ける尺度 $s \ge 0$ で、
+
+$$
+|a_{ij}| \le \tau_{\mathrm{abs}} + \tau_{\mathrm{rel}}\, s
+$$
+
+を満たす保存成分を取り除く。
+$s$ が負、NaN、無限大のいずれかなら、`SparsePruning::new` は `InvalidInput` を返す。
+`ExplicitZeroPolicy` が厳密な 0 だけを扱うのに対し、小さい要素の除去は 0 でない小さな値も取り除く。
+判定は対角を含むすべての保存成分に当てはまり、複素数の絶対値と閾値は尺度を調整して比べる。
+`SparseView::pruned` は新しい `CsrMatrix` を返し、元の行列は変わらない。
+`BsrMatrix::pruned` と `DiaMatrix::pruned` はそれぞれ同じ形式で返し、ブロックや対角はすべての値が捨てられたときだけ取り除き、残るブロックや対角では捨てた値を 0 にする。
+
+## ブロックと対角からの構成
+
+連成問題や領域分割では、小さな行列を並べて大きな系を作る。
+次の三つの関数は密な中間配列を作らずに正準な `CsrMatrix` を返す。
+
+- `sparse_block_grid(row_sizes, col_sizes, blocks)` は、行優先に並べたブロックの格子から行列を組み立てる。
+  `blocks` の `None` はその位置の寸法の零ブロックを表す。
+  ブロックの数やブロックの寸法が `row_sizes` と `col_sizes` に合わなければ `DimensionMismatch` を返す。
+- `sparse_block_diagonal(blocks)` は、長方形や空のものを含むブロックを対角に並べる。
+- `sparse_diagonals(rows, cols, offsets, diagonals)` は、ずれ $d$ の対角の値の列から帯行列を作る。
+  ずれ $d$ の列の長さは、$d \ge 0$ なら $\min(m, n - d)$、$d < 0$ なら $\min(m + d, n)$ でなければならず、違えば `DimensionMismatch`、対角が行列の外にあれば `InvalidInput` を返す。
+
+三つの関数は与えた成分を明示的に格納されたゼロ成分も含めてすべて保存し、`sparse_diagonals` は同じずれの値を厳密に足す（`Sum` と `Preserve` の方針）。
+値 0 の成分を取り除くには、結果を `view().to_csr(ExplicitZeroPolicy::Drop)` で変換し直す。
+
+### 連成した節点の鎖
+
+2 つの場が節点ごとに結合した系として、$m$ 節点の 1 次元の剛性 $\mathbf{A} = \mathrm{tridiag}(-1, 2, -1)$ を二つ並べ、同じ節点の自由度どうしを係数 $-c$ で結んだ
+
+$$
+\mathbf{K} = \begin{pmatrix} \mathbf{A} & -c\,\mathbf{I} \\ -c\,\mathbf{I} & \mathbf{A} \end{pmatrix} \in \mathbb{R}^{2m \times 2m}
+$$
+
+を考える。
+場ごとの番号では、自由度 $i$ は場 $\lfloor i/m \rfloor$ の節点 $i \bmod m$ で、成分は
+
+$$
+K_{ij} = \begin{cases} 2 & \lfloor i/m \rfloor = \lfloor j/m \rfloor,\ i = j \\ -1 & \lfloor i/m \rfloor = \lfloor j/m \rfloor,\ \lvert (i \bmod m) - (j \bmod m) \rvert = 1 \\ -c & \lfloor i/m \rfloor \ne \lfloor j/m \rfloor,\ i \bmod m = j \bmod m \\ 0 & \text{それ以外} \end{cases}
+$$
+
+である。
+節点ごとの番号では節点 $p$ の二つの自由度を $2p$ と $2p + 1$ とし、自由度 $i$ は場ごとの番号の $(i \bmod 2)\,m + \lfloor i/2 \rfloor$ にあたる。
+保存数は、$\mathbf{A}$ の 2 個が $2(3m - 2)$、結合の 2 本の対角が $2m$ で、$c \ne 0$ なら $\mathrm{nnz}(\mathbf{K}) = 2(3m - 2) + 2m$ である。
+
+次のブロックは、下の二つのセルが共有する定義である。
+`coupled_entry` が場ごとの番号の成分 $K_{ij}$、`node_to_field` が節点ごとの番号から場ごとの番号への対応である。
+
+```rust
+//| id: sparse-coupled-chain-model
+//| kind: definitions
+//| title: 連成した節点の鎖の成分と番号の対応
+//| crates: []
+/// 場ごとの番号での K の成分 K_ij（m は 1 つの場の節点の数、c は結合の強さ）。
+pub(crate) fn coupled_entry(m: usize, c: f64, i: usize, j: usize) -> f64 {
+    match (i / m == j / m, (i % m).abs_diff(j % m)) {
+        (true, 0) => 2.0,
+        (true, 1) => -1.0,
+        (false, 0) => -c,
+        _ => 0.0,
+    }
+}
+
+/// 節点ごとの番号の自由度 i（節点 i / 2 の場 i % 2）を、場ごとの番号に移す。
+pub(crate) fn node_to_field(m: usize, i: usize) -> usize {
+    (i % 2) * m + i / 2
+}
+```
+
+### 連成ブロックの組立て
+
+次のセルは $\mathbf{A}$ と $-c\,\mathbf{I}$ を `sparse_diagonals` で作り、`sparse_block_grid` で $\mathbf{K}$ を組み立てて、`to_csr(ExplicitZeroPolicy::Drop)` で値 0 の成分を取り除く。
+入力は節点の数 $m$（2〜16）と結合の強さ $c$（0〜2）である。
+検算として、`to_dense_into` で密にした全成分を定義式 $K_{ij}$ と比べ、$\mathbf{x} = (1, 2, \dots, 2m)$ に対する `apply_into` の積を、定義式の成分で順に足した参照値と比べる。
+表の「保存数の式」は上の式から求めた $\mathrm{nnz}(\mathbf{K})$ である。
+
+```rust
+//| id: sparse-block-assembly
+//| ref: sparse-block-assembly
+//| title: 連成ブロックの組立てと定義式との照合
+//| run: reactive
+//| uses: [sparse-coupled-chain-model]
+//| crates: [scioxide-core, scioxide-sparse]
+//| inputs:
+//|   nodes: {"type":"range","label":"節点の数 m","description":"1 つの場の節点の数。K は 2m 次。","min":2,"max":16,"step":1,"value":6}
+//|   coupling: {"type":"range","label":"結合の強さ c","description":"同じ節点の二つの自由度を結ぶ係数 −c の大きさ。","min":0.0,"max":2.0,"step":0.2,"value":0.6}
+//| cases:
+//|   - {"id":"uncoupled","label":"c = 0","description":"結合の成分が厳密な 0 になり、Drop の方針で取り除かれて保存数が 2(3m − 2) に減る。","inputs":{"coupling":0.0}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"assembly","path":"/rows/0/0","equals":12}
+//|       - {"artifact":"assembly","path":"/rows/0/1","equals":44}
+//|       - {"artifact":"assembly","path":"/rows/0/2","equals":44}
+//|       - {"artifact":"assembly","path":"/rows/0/3","range":{"max":0}}
+//|       - {"artifact":"assembly","path":"/rows/0/4","range":{"max":1e-14}}
+//|   - case: uncoupled
+//|     expect:
+//|       - {"artifact":"assembly","path":"/rows/0/1","equals":32}
+//|       - {"artifact":"assembly","path":"/rows/0/2","equals":32}
+//|       - {"artifact":"assembly","path":"/rows/0/3","range":{"max":0}}
+use scioxide_core::LinearOperator;
+use scioxide_sparse::{ExplicitZeroPolicy, sparse_block_grid, sparse_diagonals};
+
+let m = nodes as usize;
+let n = 2 * m;
+let (main, off, link) = (vec![2.0_f64; m], vec![-1.0_f64; m - 1], vec![-coupling; m]);
+// A = tridiag(-1, 2, -1) はずれ -1, 0, 1 の対角、-cI はずれ 0 の対角から作る。
+let a = sparse_diagonals(m, m, &[-1, 0, 1], &[&off[..], &main[..], &off[..]])
+    .map_err(|e| e.to_string())?;
+let c_block = sparse_diagonals(m, m, &[0], &[&link[..]]).map_err(|e| e.to_string())?;
+let blocks = [
+    Some(a.view()),
+    Some(c_block.view()),
+    Some(c_block.view()),
+    Some(a.view()),
+];
+// 格子は与えた成分をすべて保存するので、c = 0 の値 0 の成分は to_csr で取り除く。
+let k = sparse_block_grid(&[m, m], &[m, m], &blocks)
+    .and_then(|grid| grid.view().to_csr(ExplicitZeroPolicy::Drop))
+    .map_err(|e| e.to_string())?;
+
+// 独立検算: 密にした全成分を定義式 K_ij と比べ、積を定義式の成分で順に足した値と比べる。
+let mut dense = vec![0.0_f64; n * n];
+k.to_dense_into(&mut dense).map_err(|e| e.to_string())?;
+let x: Vec<f64> = (1..=n).map(|i| i as f64).collect();
+let mut y = vec![0.0_f64; n];
+let mut scratch = vec![0.0_f64; k.apply_workspace_len().map_err(|e| e.to_string())?];
+k.apply_into(&x, &mut y, &mut scratch)
+    .map_err(|e| e.to_string())?;
+let (mut entry_diff, mut product_diff) = (0.0_f64, 0.0_f64);
+for i in 0..n {
+    let reference: f64 = (0..n)
+        .map(|j| coupled_entry(m, coupling, i, j) * x[j])
+        .sum();
+    product_diff = product_diff.max((y[i] - reference).abs());
+    for j in 0..n {
+        entry_diff =
+            entry_diff.max((dense[i * n + j] - coupled_entry(m, coupling, i, j)).abs());
+    }
+}
+let formula = 2 * (3 * m - 2) + if coupling != 0.0 { 2 * m } else { 0 };
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "次数 2m", "type": "integer" },
+    { "key": "1", "label": "保存数 nnz(K) [個]", "type": "integer" },
+    { "key": "2", "label": "保存数の式 [個]", "type": "integer" },
+    { "key": "3", "label": "定義式との成分の差の最大 [-]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "参照値との積の差の最大 [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    vec![(k.rows(), k.nnz(), formula, entry_diff, product_diff)],
+    metadata = serde_json::json!({ "id": "assembly" })
+);
+```
+
+既定の $m = 6$、$c = 0.6$ では、$\mathbf{K}$ は $12 \times 12$ で、保存数は式どおり $2(3m - 2) + 2m = 44$ である。
+成分の差は 0 で、積の差は $8.9 \times 10^{-16}$ と、足す順序の違いによる丸めの程度に収まる。
+$c = 0$ にすると $-c$ の成分が厳密な 0 になり、`Drop` の方針で取り除かれて保存数は $2(3m - 2) = 32$ に減る。
+このとき成分と $\mathbf{x}$ がすべて整数なので、積の差も 0 になる。
+
+### 番号付けとブロック形式のメモリ使用量
+
+同じ作用素でも、自由度の番号の付け方で BSR と DIA の効率が変わる。
+次のセルは上の $\mathbf{K}$ を場ごとの番号と節点ごとの番号で `SparseBuilder` から組み立て、CSR、BSR（$2 \times 2$）、DIA に変換して値の配列の大きさを比べる。
+入力は上のセルと同じである。
+BSR と DIA の値の数から CSR の値の数を引いた分が、ブロックや対角の中に保存された 0 である。
+二つの図は、それぞれの番号付けで BSR が保存する位置を示す。
+色の濃い位置が $\mathbf{K}$ の保存成分、淡い位置がブロックを埋めるために保存した 0、空白は保存しない位置である。
+行の番号は上から下に増える。
+
+```rust
+//| id: sparse-block-storage
+//| ref: sparse-block-storage
+//| title: 番号付けによる BSR と DIA のメモリ使用量の違い
+//| run: reactive
+//| uses: [sparse-coupled-chain-model]
+//| crates: [scioxide-sparse]
+//| inputs:
+//|   nodes: {"type":"range","label":"節点の数 m","description":"1 つの場の節点の数。K は 2m 次。","min":2,"max":16,"step":1,"value":6}
+//|   coupling: {"type":"range","label":"結合の強さ c","description":"同じ節点の二つの自由度を結ぶ係数 −c の大きさ。","min":0.0,"max":2.0,"step":0.2,"value":0.6}
+//| cases:
+//|   - {"id":"odd-nodes","label":"m = 7","description":"場の境目が 2×2 のブロックの境目とずれ、場ごとの番号で BSR のブロック数がさらに増える。","inputs":{"nodes":7}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"storage","path":"/rows/0/1","equals":44}
+//|       - {"artifact":"storage","path":"/rows/0/2","equals":20}
+//|       - {"artifact":"storage","path":"/rows/0/3","equals":80}
+//|       - {"artifact":"storage","path":"/rows/0/5","equals":60}
+//|       - {"artifact":"storage","path":"/rows/1/1","equals":44}
+//|       - {"artifact":"storage","path":"/rows/1/2","equals":16}
+//|       - {"artifact":"storage","path":"/rows/1/3","equals":64}
+//|       - {"artifact":"storage","path":"/rows/1/5","equals":60}
+//|   - case: odd-nodes
+//|     expect:
+//|       - {"artifact":"storage","path":"/rows/0/2","equals":33}
+//|       - {"artifact":"storage","path":"/rows/1/2","equals":19}
+//|       - {"artifact":"storage","path":"/rows/1/3","equals":76}
+use scioxide_sparse::{BsrMatrix, DiaMatrix, DuplicatePolicy, ExplicitZeroPolicy, SparseBuilder};
+
+let m = nodes as usize;
+let n = 2 * m;
+// 行 0 が上に来るように、y 軸の項目を逆順に並べる。
+let x_names: Vec<String> = (0..n).map(|i| i.to_string()).collect();
+let y_names: Vec<String> = (0..n).rev().map(|i| i.to_string()).collect();
+let mut rows = Vec::new();
+for node_major in [false, true] {
+    let mut builder = SparseBuilder::new(n, n);
+    for (i, j) in (0..n).flat_map(|i| (0..n).map(move |j| (i, j))) {
+        let v = if node_major {
+            coupled_entry(m, coupling, node_to_field(m, i), node_to_field(m, j))
+        } else {
+            coupled_entry(m, coupling, i, j)
+        };
+        if v != 0.0 {
+            builder.push(i, j, v).map_err(|e| e.to_string())?;
+        }
+    }
+    let matrix = builder
+        .finish_csr(DuplicatePolicy::Reject, ExplicitZeroPolicy::Drop)
+        .map_err(|e| e.to_string())?;
+    let bsr = BsrMatrix::from_sparse(matrix.view(), 2, 2).map_err(|e| e.to_string())?;
+    let dia = DiaMatrix::from_sparse(matrix.view()).map_err(|e| e.to_string())?;
+    let name = if node_major {
+        "節点ごと"
+    } else {
+        "場ごと"
+    };
+    rows.push((
+        name,
+        matrix.values().len(),
+        bsr.block_count(),
+        bsr.values().len(),
+        dia.offsets().len(),
+        dia.values().len(),
+    ));
+    // BSR が保存する位置: 1 は K の保存成分、0 はブロックを埋める 0。
+    let cells: Vec<_> = bsr
+        .view()
+        .iter()
+        .map(|(i, j, v)| serde_json::json!([j.to_string(), i.to_string(), f64::from(v != 0.0)]))
+        .collect();
+    emit_chart!(
+        serde_json::json!({
+            "kind": "heatmap",
+            "data": cells,
+            "xCategories": x_names,
+            "yCategories": y_names,
+            "xLabel": "列 j [-]",
+            "yLabel": "行 i [-]",
+            "colorMin": 0.0,
+            "colorMax": 1.0,
+            "tooltip": true
+        }),
+        metadata =
+            serde_json::json!({ "title": format!("{name}の番号での BSR 2×2 の保存位置") })
+    );
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "番号付け" },
+    { "key": "1", "label": "CSR の値の数 [個]", "type": "integer" },
+    { "key": "2", "label": "BSR のブロック数 [個]", "type": "integer" },
+    { "key": "3", "label": "BSR 2×2 の値の数 [個]", "type": "integer" },
+    { "key": "4", "label": "DIA の対角の本数 [本]", "type": "integer" },
+    { "key": "5", "label": "DIA の値の数 [個]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "storage" })
+);
+```
+
+既定の $m = 6$、$c = 0.6$ では、CSR の値の数はどちらの番号付けでも 44 である。
+節点ごとの番号では節点の $2 \times 2$ ブロック $\begin{pmatrix} 2 & -c \\ -c & 2 \end{pmatrix}$ が密になり、BSR は対角のブロック $m$ 個と隣り合う節点を結ぶブロック $2(m - 1)$ 個の $3m - 2 = 16$ ブロック、値 64 個に収まる。
+図では、ブロックを埋める 0 は、隣り合う節点を結ぶブロックの非対角の 2 か所だけに現れる。
+場ごとの番号では、$\mathbf{A}$ の帯の非対角のブロックには成分が 1 個しかなく、$-c\,\mathbf{I}$ のブロックも 4 個の位置のうち 2 個しか埋まらない。
+$m$ が偶数なら、各場の $\mathbf{A}$ が対角のブロック $m/2$ 個と非対角のブロック $m - 2$ 個、二つの $-c\,\mathbf{I}$ がブロック $m$ 個を占めるので、BSR は $4m - 4 = 20$ ブロック、値 80 個になる。
+DIA は場ごとの番号ではずれ $0, \pm 1, \pm m$ の 5 本、節点ごとの番号ではずれ $0, \pm 1, \pm 2$ の 5 本で、どちらも値は $5 \cdot 2m = 60$ 個である。
+$m = 7$ にすると、場の境目が $2 \times 2$ のブロックの境目とずれ、節点ごとの番号の $3m - 2 = 19$ ブロックに対して、場ごとの番号では 33 ブロック（値 132 個）に増える。
+
+## まとめ
+
+正準な形式では各位置が一度だけ整列して現れるので、構造の比較と再利用が配列の比較で済む。
+行の走査と積には CSR、列の走査には CSC、節点ごとに密なブロックを持つ系には BSR、少数の対角が埋まる差分ステンシルには DIA を選び、BSR と DIA は CSR などから `from_sparse` で変換する。
+有限要素の組立てでは `SparseBuilder` と `DuplicatePolicy::Sum` を使うと、寄与の順序によらず真の和を一度だけ丸めた値が得られる。
+係数だけを変えて分解を繰り返す問題では、`ExplicitZeroPolicy::Preserve` で構造を固定し、値は `set_value`、`copy_values_from`、`update_values` で更新する。
+BSR を使う場合は、節点ごとに自由度をまとめて番号を付けると、ブロックが密になってメモリ使用量が減る。
+
+## 次に読むページ
+
+- [行列ベクトル積と疎行列の積](../kernels-and-products/)：確定した行列に対する積のアルゴリズム、丸めの規約、疎行列どうしの積の二段階の計算を確かめる。
+- [疎行列アルゴリズムの共通仕様と構成](../)：構造と値の分離、失敗したときの出力の扱い、上限と作業領域の規約を確かめる。
+- [格納・組立て・積](../../api/storage-and-products/)：ビルダー、各形式、ビュー、ブロック構成の全項目の仕様を引く。

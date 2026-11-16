@@ -1,0 +1,473 @@
+---
+title: "Biorthogonal methods, least-squares Krylov methods, and stationary iterations"
+description: "Biorthogonal recurrences and breakdown in BiCG, CGS, QMR, and TFQMR; least-squares problems and normal-residual tests with LSQR and LSMR; flexible GMRES preconditioning; LGMRES, GCROT, and refreshing recycled spaces; block Krylov methods; Richardson, Jacobi, Gauss–Seidel, SOR, and optimal relaxation parameters."
+sidebar:
+  order: 360
+references:
+  linalg-flexible-recycled-block: "flexible-preconditioning-recycling-and-blocks"
+  linalg-biorthogonal-recurrences: "short-biorthogonal-recurrences"
+  linalg-least-squares-krylov: "krylov-methods-for-least-squares-problems"
+  linalg-stationary-iterations: "stationary-iterations-and-relaxation-parameters"
+---
+
+Besides CG, MINRES, GMRES, and BiCGSTAB from the [previous page](../krylov-and-preconditioning/), `scioxide-linalg` provides memory-efficient solvers for nonsymmetric systems, Krylov methods for rectangular least-squares problems, methods for preconditioners that vary between iterations or repeated solves of similar systems, and classical stationary iterations.
+This page describes their principles and uses.
+The three calling forms—standard, with options, and with caller-provided output—along with `IterativeWorkspace`, the termination reason `LinearSolveTermination`, and the conventions for iterates returned on stopping follow [Iteration state and results on stopping](oxref:linalg-iterative-status) on the previous page.
+
+---
+
+## Short biorthogonal recurrences
+
+For a general non-Hermitian $A$, short recurrences cannot coexist with minimization of the error or residual in a norm induced by an inner product (the Faber–Manteuffel theorem; exceptions are a narrow class of matrices for which $A^{\mathsf H}$ is a low-degree polynomial in $A$).
+GMRES chooses minimization and uses memory that grows with iteration count, while biorthogonal methods choose short recurrences and give up minimization.
+
+| Solver | Principle | Cost per iteration and workspace (vectors of length $n$) | Caveats |
+|---|---|---|---|
+| `BicgSolver` | Two-sided Lanczos process that makes the Krylov spaces of $A$ and $A^{\mathsf H}$ biorthogonal (BiCG) | One product each with $A$ and $A^{\mathsf H}$, 13 vectors | Supply $A$ through `AdjointOperator` and the preconditioner through `Preconditioning::InverseAdjoint`. The residual need not decrease monotonically |
+| `CgsSolver` | Squares the BiCG residual polynomial to eliminate $A^{\mathsf H}$ (CGS) | Two products with $A$, 14 vectors | Squared oscillations can amplify rounding error |
+| `QmrSolver` | Quasi-minimal residual on the same basis as BiCG, without look-ahead (QMR) | One product each with $A$ and $A^{\mathsf H}$, 18 vectors | Requires the adjoint, like BiCG. Convergence is smooth, but does not minimize the residual |
+| `TfqmrSolver` | Uses the quasi-minimal residual idea in the CGS recurrence to obtain QMR without $A^{\mathsf H}$ (TFQMR) | One half-step counts as one iteration, with one product with $A$, 14 vectors | Residual history records the upper bound $\tau\sqrt{k+1}$ between checkpoints |
+
+All four methods apply right preconditioning and assume the same linear $M^{-1}$ throughout the solve.
+The true residual is recomputed every 50 iterations, when the recurrence-based residual estimate satisfies the tolerance, and at termination.
+To limit drift from cancellation, CGS recomputes the true residual $b - Ax$ in its second product every iteration while retaining its directions and shadow residual.
+
+Any of these methods can break down when a recurrence denominator, such as the inner product $\hat r^{\mathsf H} v$ with the shadow residual, approaches 0.
+`scioxide-linalg` treats this as breakdown only when $\lvert \hat r^{\mathsf H} v \rvert \le \varepsilon_{\mathrm{mach}}^2 \lVert \hat r \rVert_2 \lVert v \rVert_2$; larger inner products are used even if cancellation has reduced their accuracy.
+Because the squared polynomial in CGS amplifies inner-product cancellation, the shadow inner product is computed with the Dot2 algorithm, at roughly twice the working precision.
+If the Dot2 error bound cannot determine which side of the threshold the value lies on, exact accumulation decides the comparison, so the breakdown decision matches that for the exact inner product.
+Breakdown returns `Ok` with termination reason `Breakdown(RecurrenceDenominator)`, and the returned solution follows the conventions on the previous page.
+When restarts are allowed with `with_breakdown_restarts`, the recurrence restarts from the last verified iterate, using its true residual as the new shadow residual (the same applies to `BicgstabSolver`; the default allows no restarts).
+A second breakdown before an accepted step stops the solver even if restarts remain.
+
+## Krylov methods for least-squares problems
+
+The least-squares problem $\min \lVert Ax - b \rVert_2$ for a rectangular matrix $A \in \mathbb{K}^{m \times n}$ can be solved by Golub–Kahan bidiagonalization without forming the normal equations $A^{\mathsf H}A x = A^{\mathsf H} b$.
+LSQR (Paige–Saunders) stably performs iterations mathematically equivalent to CG on the normal equations, while LSMR (Fong–Saunders) corresponds to MINRES and monotonically reduces the normal-equation residual $\lVert A^{\mathsf H} r_k \rVert$ in exact arithmetic.
+`LsqrSolver` and `LsmrSolver` accept $m < n$, $m = n$, and $m > n$; each iteration uses one product each with $A$ and $A^{\mathsf H}$.
+Supply $A$ as an `AdjointOperator` (such as a scioxide-sparse matrix or a finite dense-matrix view); there is no preconditioner argument, so the standard form is `solve(&a, &b)` and the form with options is `solve_with_options(&a, &b, x0)`.
+
+If $b$ lies outside the range of $A$, the residual $\lVert r \rVert$ cannot reach 0, so convergence is tested using the normal-equation residual.
+The normal-equation residual test is $\lVert A^{\mathsf H} r \rVert_2 \le \tau_{\mathrm{abs}} + \tau_{\mathrm{rel}} \lVert A \rVert \lVert r \rVert_2$ ($\lVert A \rVert$ is an estimate updated during iteration); unless set with `with_normal_tolerance`, $\tau_{\mathrm{abs}} = 0$ and $\tau_{\mathrm{rel}}$ equals the relative residual tolerance.
+Satisfying this test gives termination reason `LeastSquaresConverged`, while satisfying the original residual $\lVert r \rVert$ tolerance gives `Converged`; both residuals are recomputed every 50 iterations and before accepting convergence.
+`with_condition_limit` stops with `ConditionLimit` when the estimated reciprocal condition number of the small projected problem falls below the threshold (`ReciprocalConditionThreshold`, disabled at 0), limiting noise amplification in ill-conditioned problems (the estimate does not certify the rank of the full matrix).
+In `KrylovDiagnostics` diagnostics, `normal_residual()` is the normal residual $\lVert A^{\mathsf H} r \rVert_2$ recomputed from the returned solution, and `condition_estimate()` is the estimated reciprocal condition number of the projected problem.
+
+The following block defines helper functions shared by the two cells on this page.
+`termination_name` returns the name of the termination-reason variant, `severity` returns the outcome rank (success 0, limit/stagnation/stop 1, breakdown 2), and `relative_difference` returns the relative difference from the reference solution, $\lVert x - y \rVert_\infty / \lVert y \rVert_\infty$.
+
+```rust
+//| id: linalg-advanced-krylov-helpers
+//| kind: definitions
+//| title: "Termination names, outcome ranks, and relative differences"
+//| crates: [scioxide-linalg]
+use scioxide_linalg::{LinearSolveBreakdown, LinearSolveTermination};
+
+/// Termination-reason variant name (used in table columns and outcome status).
+pub(crate) fn termination_name(termination: LinearSolveTermination) -> &'static str {
+    match termination {
+        LinearSolveTermination::Converged => "Converged",
+        LinearSolveTermination::LeastSquaresConverged => "LeastSquaresConverged",
+        LinearSolveTermination::ConditionLimit => "ConditionLimit",
+        LinearSolveTermination::IterationLimit => "IterationLimit",
+        LinearSolveTermination::EvaluationLimit => "EvaluationLimit",
+        LinearSolveTermination::Stagnation => "Stagnation",
+        LinearSolveTermination::Breakdown(cause) => match cause {
+            LinearSolveBreakdown::RecurrenceDenominator => "Breakdown(RecurrenceDenominator)",
+            LinearSolveBreakdown::NonPositiveCurvature => "Breakdown(NonPositiveCurvature)",
+            LinearSolveBreakdown::ArnoldiInvariant => "Breakdown(ArnoldiInvariant)",
+            LinearSolveBreakdown::Preconditioner => "Breakdown(Preconditioner)",
+        },
+        LinearSolveTermination::ExecutionStopped(_) => "ExecutionStopped",
+    }
+}
+
+/// Outcome rank: success 0, limit/stagnation/stop 1 (the returned iterate is an estimate), breakdown 2.
+pub(crate) fn severity(termination: LinearSolveTermination) -> u8 {
+    match termination {
+        t if t.is_success() => 0,
+        LinearSolveTermination::Breakdown(_) => 2,
+        _ => 1,
+    }
+}
+
+/// Relative maximum-norm difference from reference solution y: ‖x − y‖∞ / ‖y‖∞.
+pub(crate) fn relative_difference(x: &[f64], reference: &[f64]) -> f64 {
+    let scale = reference.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+    let gap = x
+        .iter()
+        .zip(reference)
+        .fold(0.0_f64, |acc, (p, q)| acc.max((p - q).abs()));
+    gap / scale
+}
+```
+
+The following cell uses the forms with options of LSQR and LSMR to solve the least-squares problem with $b = Ax^{\star} + s\, w$ ($w = H_u e_{41}$ is a unit vector orthogonal to the range) for the $120 \times 40$ matrix $A = H_u \begin{bmatrix} \Sigma \\ 0 \end{bmatrix} H_v$ ($H_u$ and $H_v$ are Householder reflections), whose singular values form a geometric progression from 1 to $10^{-t}$.
+The relative residual tolerance is $10^{-12}$, the relative normal-residual tolerance is $10^{q}$, and the iteration limit is 5000.
+The least-squares solution is $x^{\star} = (1, 1.1, \dots, 4.9)$ independently of $s$, and the table also compares the solution from the one-shot function `least_squares` (Householder QR with column pivoting).
+Raising the reciprocal-condition lower limit $10^{c}$ causes termination with `ConditionLimit` when the projected problem's estimated reciprocal condition number falls below it.
+The outcome uses the worse termination reason of the two iterative methods.
+
+```rust
+//| id: linalg-lsqr-rectangular
+//| ref: linalg-lsqr-rectangular
+//| title: "Rectangular least-squares solutions with LSQR and LSMR"
+//| run: button
+//| uses: [linalg-advanced-krylov-helpers]
+//| crates: [scioxide-core, scioxide-linalg]
+//| inputs:
+//|   condition_exponent: {"type":"range","label":"t in condition number κ₂ = 10^t","description":"Arrange singular values in a geometric progression from 1 to 10^−t.","min":0,"max":4,"step":0.5,"value":2}
+//|   residual_size: {"type":"range","label":"Component s outside the range","description":"s in b = A x* + s w. At 0, b lies in the range.","min":0,"max":10,"step":0.5,"value":1}
+//|   normal_exponent: {"type":"range","label":"q in normal-residual tolerance 10^q","description":"Stop when ‖Aᴴr‖ ≤ 10^q ‖A‖ ‖r‖ (‖A‖ is estimated during iteration).","min":-14,"max":-6,"step":1,"value":-12}
+//|   limit_exponent: {"type":"range","label":"c in reciprocal-condition lower limit 10^c","description":"Stop when the projected problem's estimated reciprocal condition number falls below 10^c.","min":-8,"max":-1,"step":1,"value":-8}
+//| cases:
+//|   - {"id":"consistent","label":"s = 0","description":"When b lies in the range, the original-residual test gives Converged.","inputs":{"residual_size":0}}
+//|   - {"id":"loose-normal","label":"q = −6","description":"Relaxing the normal-residual test stops earlier and increases the difference from x* to the scale of the upper bound.","inputs":{"normal_exponent":-6}}
+//|   - {"id":"condition-limit","label":"t = 4, c = −2","description":"The estimated reciprocal condition number falls below the lower limit, stopping with ConditionLimit.","inputs":{"condition_exponent":4,"limit_exponent":-2}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"solutions","path":"/rows/0/5","range":{"max":1e-12}}
+//|       - {"artifact":"solutions","path":"/rows/1/1","equals":"LeastSquaresConverged"}
+//|       - {"artifact":"solutions","path":"/rows/1/5","range":{"max":1e-8}}
+//|       - {"artifact":"solutions","path":"/rows/2/5","range":{"max":1e-8}}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+//|   - case: consistent
+//|     expect:
+//|       - {"artifact":"solutions","path":"/rows/1/1","equals":"Converged"}
+//|       - {"artifact":"solutions","path":"/rows/2/5","range":{"max":1e-8}}
+//|   - case: loose-normal
+//|     expect:
+//|       - {"artifact":"solutions","path":"/rows/1/5","range":{"min":1e-4,"max":1e-1}}
+//|   - case: condition-limit
+//|     expect:
+//|       - {"artifact":"solutions","path":"/rows/1/1","equals":"ConditionLimit"}
+//|       - {"artifact":"solutions","path":"/rows/0/5","range":{"max":1e-9}}
+//|       - {"artifact":"solutions","path":"/rows/2/5","range":{"min":0.1,"max":1.5}}
+//|       - {"path":"/outputs/1/state","equals":"partial"}
+use scioxide_core::{Budget, GradientTolerance, ResidualTolerance};
+use scioxide_linalg::{
+    LinearSolveTermination, LsmrSolver, LsqrSolver, Matrix, ReciprocalConditionThreshold,
+    least_squares,
+};
+
+let (m, n) = (120_usize, 40_usize);
+// Entry (i, k) of the Householder reflection H_w = I − 2 w wᵀ / (wᵀ w).
+let reflect = |w: &[f64], i: usize, k: usize| {
+    let identity = if i == k { 1.0 } else { 0.0 };
+    identity - 2.0 * w[i] * w[k] / w.iter().map(|x| x * x).sum::<f64>()
+};
+let u: Vec<f64> = (0..m).map(|i| 1.0 + ((i * 7) % 11) as f64).collect();
+let v: Vec<f64> = (0..n).map(|i| ((i + 1) as f64).sqrt()).collect();
+let sigma: Vec<f64> = (0..n)
+    .map(|k| 10.0_f64.powf(-condition_exponent * k as f64 / (n - 1) as f64))
+    .collect();
+// Construct A = H_u [Σ; 0] H_v entry by entry (row-major).
+let entries = (0..m * n).map(|index| {
+    let (i, j) = (index / n, index % n);
+    (0..n)
+        .map(|k| reflect(&u, i, k) * sigma[k] * reflect(&v, k, j))
+        .sum()
+});
+let a = Matrix::from_vec(m, n, entries.collect()).map_err(|e| e.to_string())?;
+let x_star: Vec<f64> = (0..n).map(|j| 1.0 + 0.1 * j as f64).collect();
+let ax = a.view().mul_vec(&x_star[..]).map_err(|e| e.to_string())?;
+// w = H_u e₄₁ is a unit vector orthogonal to the range.
+let b: Vec<f64> = (0..m)
+    .map(|i| ax.as_slice()[i] + residual_size * reflect(&u, i, n))
+    .collect();
+// Reference: one-shot least-squares solution (Householder QR with column pivoting).
+let qr = least_squares(&a, &b[..]).map_err(|e| e.to_string())?;
+let operator = a.view().try_finite().map_err(|e| e.to_string())?;
+let tolerance = ResidualTolerance::new(0.0, 1e-12).map_err(|e| e.to_string())?;
+let budget = Budget::try_from(5000).map_err(|e| e.to_string())?;
+// Normal-residual test: ‖Aᴴr‖ ≤ 10^q ‖A‖ ‖r‖ (‖A‖ is estimated during iteration).
+let normal =
+    GradientTolerance::new(0.0, 10.0_f64.powf(normal_exponent)).map_err(|e| e.to_string())?;
+let limit = ReciprocalConditionThreshold::new(10.0_f64.powf(limit_exponent))
+    .map_err(|e| e.to_string())?;
+let lsqr = LsqrSolver::new(tolerance, budget)
+    .with_normal_tolerance(normal)
+    .with_condition_limit(limit)
+    .solve_with_options(&operator, &b[..], None)
+    .map_err(|e| e.to_string())?;
+let lsmr = LsmrSolver::new(tolerance, budget)
+    .with_normal_tolerance(normal)
+    .with_condition_limit(limit)
+    .solve_with_options(&operator, &b[..], None)
+    .map_err(|e| e.to_string())?;
+let qr_error = relative_difference(qr.as_slice(), &x_star);
+let mut rows = vec![("least_squares（QR）", None, None, None, None, qr_error)];
+let mut worst = LinearSolveTermination::Converged;
+for (name, result) in [("LSQR", &lsqr), ("LSMR", &lsmr)] {
+    let report = result.report();
+    let krylov = report.krylov();
+    let normal_residual = krylov
+        .and_then(|k| k.normal_residual())
+        .map(|r| r.raw_norm());
+    let rcond = krylov
+        .and_then(|k| k.condition_estimate())
+        .map(|c| c.reciprocal().value());
+    let termination = report.termination();
+    if severity(termination) > severity(worst) {
+        worst = termination;
+    }
+    let error = relative_difference(result.solution().as_slice(), &x_star);
+    let iterations = Some(report.iterations());
+    let name_of = Some(termination_name(termination));
+    rows.push((name, name_of, iterations, normal_residual, rcond, error));
+}
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Solver" },
+    { "key": "1", "label": "Termination reason", "nullText": "-" },
+    { "key": "2", "label": "Iterations [count]", "type": "integer", "nullText": "-" },
+    {
+        "key": "3",
+        "label": "Normal residual ‖Aᴴr‖₂ [-]",
+        "type": "number",
+        "format": sci2,
+        "nullText": "-"
+    },
+    {
+        "key": "4",
+        "label": "Estimated reciprocal condition number [-]",
+        "type": "number",
+        "format": sci2,
+        "nullText": "-"
+    },
+    { "key": "5", "label": "Relative difference from x* [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "solutions" })
+);
+let outcome = match severity(worst) {
+    0 => Outcome::satisfied("Both LSQR and LSMR satisfy a convergence test"),
+    1 => Outcome::partial("An iterative method stopped before satisfying a convergence test")
+        .explanation("A stopped method returns the verified iterate with the smallest true residual."),
+    _ => Outcome::failed("An iterative method's recurrence broke down"),
+};
+emit_outcome!(
+    outcome
+        .status(termination_name(worst))
+        .diagnostic("LSQR iterations", lsqr.report().iterations() as f64, None)
+        .diagnostic("LSMR iterations", lsmr.report().iterations() as f64, None)
+        .diagnostic("QR relative difference from x*", qr_error, None)
+);
+```
+
+With the defaults $\kappa_2 = 100$, $s = 1$, and $q = -12$, both LSQR and LSMR reach `LeastSquaresConverged` in 110 iterations (rounding differences can change the count by a few across environments); their relative difference from $x^{\star}$ is $2.1 \times 10^{-11}$, compared with $7.1 \times 10^{-15}$ for QR.
+At the least-squares solution, $A^{\mathsf H}(b - Ax^{\star}) = 0$, so the residual $r = b - Ax$ of iterate $x$ satisfies $x^{\star} - x = (A^{\mathsf H}A)^{-1} A^{\mathsf H} r$, and the error is bounded by $\lVert A^{\mathsf H} r \rVert_2 / \sigma_{\min}^2$.
+The table's normal residual $1.2 \times 10^{-12}$ and $\sigma_{\min} = 10^{-2}$ give the error 2-norm upper bound $1.2 \times 10^{-8}$; the actual difference ($1.0 \times 10^{-10}$ in the maximum norm) lies below it.
+Because $\lVert A \rVert$ in the test's right-hand side $10^{q} \lVert A \rVert \lVert r \rVert_2$ is an estimate updated during iteration, the normal residual at termination differs from and slightly exceeds $10^{q} \lVert r \rVert_2$ (here $\lVert r \rVert_2 = s = 1$, giving $10^{-12}$).
+Relaxing to $q = -6$ stops in 77 iterations, with normal residuals $4.4 \times 10^{-6}$ (LSQR) and $4.0 \times 10^{-6}$ (LSMR), and relative differences increasing to $3.1 \times 10^{-3}$ and $3.5 \times 10^{-3}$; with $q = -14$, 117 iterations give a relative difference of $1.8 \times 10^{-12}$.
+With $s = 0$ ($b$ lies in the range), the original residual tolerance is met first, giving termination reason `Converged`.
+
+With 40 columns, the Golub–Kahan process would finish in at most 40 iterations in exact arithmetic.
+More iterations are needed because rounding error destroys basis orthogonality, causing the same singular values to be captured again.
+For $s = 1$, the counts for $t = 0, 1, 2, 3, 4$ are 1, 57, 110, 198, and 326, increasing with $\kappa$ (at $t = 0$, the columns are orthonormal, so one iteration suffices).
+At $t = 4$, the relative difference increases to $5.1 \times 10^{-7}$, widening the gap from QR's $1.2 \times 10^{-11}$.
+The CG-like estimate in which the iteration-count bound is proportional to the normal equations' $\sqrt{\kappa(A^{\mathsf H}A)} = \kappa(A)$ is a guide for large problems with far more distinct singular values than iterations.
+
+The reciprocal-condition estimate concerns the projected problem: at the default inputs, LSQR gives $8.1 \times 10^{-4}$, below the true value $1/\kappa_2 = 10^{-2}$, while LSMR gives $3.0 \times 10^{-2}$, above it, so neither is an upper or lower bound for the true reciprocal condition number.
+At $t = 4$, setting the lower limit to $10^{-2}$ makes LSQR stop in 17 iterations and LSMR in 44 with `ConditionLimit`, giving a partial outcome.
+Stopping before resolving components associated with small singular values gives relative differences from $x^{\star}$ of 0.92 and 0.74; this acts as regularization for a noisy right-hand side but does not recover the exact least-squares solution in this example.
+QR suits dense matrices with few columns like this one; LSQR and LSMR suit large sparse matrices and operators whose actions are inexpensive.
+Because there is no preconditioner argument, callers implement right preconditioning by constructing and solving with the operator $AM^{-1}$, then transforming back with $x = M^{-1}y$.
+
+## Flexible preconditioning, recycling, and blocks
+
+`GmresSolver` directly supports preconditioning that varies between iterations, such as a nested solver that uses another iterative method as its preconditioner.
+`GmresSolver` retains the applied directions, so it accepts varying right preconditioners (using QR of their images, as described on the [previous page](oxref:linalg-minres-gmres-bicgstab)).
+The same holds for `LgmresSolver`, `GcrotSolver`, and the block variants; pass preconditioning as `Preconditioning` on each call.
+
+- `LgmresSolver` (LGMRES) adds normalized corrections $x_i - x_{i-1}$ from several recent cycles and their images to the search space at the end of each cycle, then minimizes the residual in the expanded space to limit stagnation from restarting.
+- `GcrotSolver` (flexible GCROT($m$, $k$)) keeps at most $k$ pairs of orthonormalized images $c_i = A u_i$ and directions $u_i$ in an outer space.
+  Each cycle first minimizes the residual over $\operatorname{span}\{u_i\}$, performs $m$ GMRES iterations with an Arnoldi basis orthogonal to $c_i$, then orthogonalizes the cycle correction against $c_i$ and adds it to the space.
+
+Both store the pairs in a caller-owned `KrylovRecycleSpace`, discarding the oldest pair when full.
+Only the caller-provided-output API `solve_recycled_into(&a, &b, p, epoch, &mut space, x, &mut ws, cx)` stores and reuses pairs (`BlockLgmresSolver` and `BlockGcrotSolver` have forms with the same name); the standard `solve`, with-options `solve_with_options`, and `solve_into` forms keep no pairs and perform the same iterations as restarted flexible GMRES.
+A capacity-$k$ space constructed by `KrylovRecycleSpace::new(n, k, epoch)` holds $2k$ vectors of length $n$, and adds approximately $4k + 2$ workspace vectors (include these in preallocation with `IterativeWorkspaceRequest::with_recycle_space(&space)`).
+The epoch `epoch` is a caller-chosen `ProblemToken` identifying operator $A$, independently of the right-hand side.
+Stored images are valid only for the operator that produced them, so `solve_recycled_into` rejects a mismatched epoch or a space populated by the other method with `InvalidInput` (`Inconsistent`), before applying $A$.
+A call returning `Ok` updates the space even when its termination reason does not satisfy convergence; an error leaves it unchanged.
+
+When the operator changes, empty the space with `clear(epoch)` or recompute the images $c_i = A u_i$ with `refresh(&a, epoch, rank, &options, &mut ws, cx)`.
+`refresh` reorthonormalizes GCROT images; for LGMRES, it discards directions whose new images are numerically dependent (using the `rank` threshold for dependence).
+Each direction requires one product with $A$, counted as one iteration against the limit in `options`; stopping at a limit, cancellation, or deadline returns `Ok(false)` and preserves the old space.
+Construct the refresh workspace `KrylovRecycleWorkspace` by passing `KrylovRecycleWorkspaceRequest::new(&a, &options)?` (which can fail because it reads the operator shape and auxiliary length) to `space.workspace(&request)`, or preallocate it from the `KrylovRecycleRequirements` returned by `space.workspace_requirements(&request)`.
+The workspace's `last_attempt()` records `Succeeded` when the space is replaced and `Stopped` when stopping preserves it.
+
+The block variants (`BlockGmresSolver`, `BlockLgmresSolver`, and `BlockGcrotSolver`) solve multiple right-hand sides together in one block Krylov space.
+They build the space from unconverged columns' residuals, minimize each column's residual over it, and discard residuals numerically contained in the span of other columns' residuals (deflation), so dependent right-hand sides add no products.
+Column $j$ converges when $\lVert b_j - A x_j \rVert_2 \le \tau_{\mathrm{abs}} + \tau_{\mathrm{rel}} \lVert b_j \rVert_2$, and success requires every column to converge.
+The block variants do not separate standard and with-options forms; the owning-result API `solve(&a, b, p, x0)` accepts a preconditioner and initial guess (`BlockVectorView`), and returns `BlockKrylovResult`.
+The solution is arranged column by column; read each column's true residual, reference, and convergence through `residuals()`, `references()`, and `converged()`, while the history records the largest column residual.
+The `BlockKrylovReport` report from the caller-provided-output API `solve_into` includes the overall termination reason, block iteration count, largest residual `max_residual()`, restart count, and discarded-direction count `deflated()`; read column-specific values in the `KrylovColumns` of `last_accepted()`.
+Preallocate workspace from a request specifying the column count with `with_right_hand_sides(k)`.
+
+`IterativeLinearSolver` is a common API for switching among CG, GMRES, BiCGSTAB, MINRES, Richardson, CGS, TFQMR, LGMRES, and GCROT through `dyn`; it provides standard, with-options, and caller-provided-output forms, plus `solve_block_into` for solving independent right-hand sides one column at a time with preallocated workspace.
+`solve_block_into` solves columns independently; it is not a block Krylov method.
+It writes output only when all columns converge, returning `ConvergenceFailure` at the first column that fails to converge.
+Call the respective types' methods for BiCG and QMR, which require an adjoint; stationary iterations, which use matrix entries; rectangular LSQR and LSMR; and the block variants.
+
+## Stationary iterations and relaxation parameters
+
+With the splitting $A = D - L - U$ (diagonal, strictly lower triangular, and strictly upper triangular parts), the stationary iteration $x_{k+1} = x_k + M^{-1}(b - Ax_k)$ takes different names according to the choice of $M$.
+
+| Solver | $M$ | Weight | Input |
+|---|---|---|---|
+| `RichardsonSolver` | $\omega^{-1} I$ ($\omega^{-1} P$ when $P^{-1}$ is applied from the left through `Preconditioning`) | `RelaxationWeight` (positive) | `LinearOperator` and preconditioner |
+| `JacobiSolver` | $\omega^{-1} D$ | `RelaxationWeight` (`with_weight`, default 1) | `StationaryMatrix` |
+| `GaussSeidelSolver` | $D - L$ | None (SOR with $\omega = 1$) | `StationaryMatrix` |
+| `SorSolver` | $\omega^{-1} D - L$ | `SorWeight`（$0 < \omega < 2$） | `StationaryMatrix` |
+
+The error $e_k = x - x_k$ evolves as $e_{k+1} = G e_k$ under the iteration matrix $G = I - M^{-1}A$, so convergence from every initial guess holds exactly when the spectral radius satisfies $\rho(G) < 1$; after sufficiently many iterations, each iteration multiplies the error by approximately $\rho(G)$.
+The SOR iteration matrix $G_\omega$ satisfies $\rho(G_\omega) \ge \lvert \omega - 1 \rvert$, so it can converge only for $0 < \omega < 2$ (Kahan's theorem); `SorWeight` cannot construct values outside this range.
+For Hermitian positive-definite $A$, every $\omega$ in this range converges (the Ostrowski–Reich theorem).
+Jacobi with weight $0 < \omega \le 1$ converges for strictly diagonally dominant $A$, while Gauss–Seidel converges for strictly diagonally dominant or Hermitian positive-definite $A$ (both are sufficient conditions).
+For consistently ordered matrices (such as the tridiagonal matrix of the one-dimensional Poisson equation), if $\rho_J$ is the spectral radius of the Jacobi iteration matrix, the Gauss–Seidel spectral radius is $\rho_J^2$; the relaxation parameter minimizing $\rho(G_\omega)$ and its spectral radius are as follows (Young's theory).
+
+$$
+\omega_{\mathrm{opt}} = \frac{2}{1 + \sqrt{1 - \rho_J^2}}, \qquad \rho(G_{\omega_{\mathrm{opt}}}) = \omega_{\mathrm{opt}} - 1
+$$
+
+For the one-dimensional Poisson equation, $\rho_J = \cos \pi h$ gives $\omega_{\mathrm{opt}} = 2/(1 + \sin \pi h)$ and $\rho(G_{\omega_{\mathrm{opt}}}) \approx 1 - 2\pi h$.
+Compared with Gauss–Seidel's $\cos^2 \pi h \approx 1 - \pi^2 h^2$, the number of iterations to reduce the error by a fixed factor decreases from $O(h^{-2})$ to $O(h^{-1})$.
+Jacobi, Gauss–Seidel, and SOR use diagonal and strictly lower-triangular entries, so they accept `StationaryMatrix` (finite `Dense` views, `Csr`, or `Csc`), have no preconditioner argument, and return a `Singular` error for an exactly zero diagonal entry.
+Each iteration performs an $O(n)$ correction for Jacobi or one forward substitution with $D - L$ ($\omega^{-1}D - L$) for Gauss–Seidel and SOR; all then compute the true residual with one product with $A$ to test convergence.
+The correction and forward substitution are internal work; only this residual product and products used to check the rounding floor at 50-iteration checkpoints ([Iteration state and results on stopping](oxref:linalg-iterative-status)) count against the evaluation limit.
+As standalone solvers they are inferior to Krylov methods, but they are used as multigrid smoothers and preconditioners.
+
+The following cell solves the one-dimensional Poisson equation $-u'' = 1$ with $n$ interior points ($2u_i - u_{i-1} - u_{i+1} = h^2$, $h = 1/(n+1)$, $u(0) = u(1) = 0$) using SOR's with-options form.
+The relative tolerance is $10^{-8}$, and the iteration limit is 100 000.
+For Gauss–Seidel ($\omega = 1$) and $\omega_{\mathrm{opt}}$, the table shows iteration counts, termination reasons, spectral radii, the estimate $\ln 10^{-8} / \ln \rho$ of iterations to reduce the error by a factor of $10^{-8}$, and relative differences from the exact discrete solution $u_i = x_i(1 - x_i)/2$ (the second difference is exact for quadratics).
+The plot shows iteration counts at $\omega = 1.0, 1.1, \dots, 1.9$, with $\omega_{\mathrm{opt}}$ marked by a vertical line.
+
+```rust
+//| id: linalg-sor-omega
+//| ref: linalg-sor-omega
+//| title: "SOR relaxation parameter and iteration count"
+//| run: reactive
+//| uses: [linalg-advanced-krylov-helpers]
+//| crates: [scioxide-core, scioxide-linalg, scioxide-sparse]
+//| inputs:
+//|   points: {"type":"range","label":"Number of interior points n","description":"The grid spacing is h = 1/(n + 1).","min":10,"max":40,"step":5,"value":30}
+//| cases:
+//|   - {"id":"coarse","label":"n = 10","description":"On a coarse grid, the difference between Gauss–Seidel and optimal SOR is small.","inputs":{"points":10}}
+//|   - {"id":"fine","label":"n = 40","description":"On a fine grid, Gauss–Seidel counts grow proportionally to h⁻² and optimal SOR counts to h⁻¹.","inputs":{"points":40}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"sor","path":"/rows/0/2","range":{"min":1700,"max":1850}}
+//|       - {"artifact":"sor","path":"/rows/0/3","equals":"Converged"}
+//|       - {"artifact":"sor","path":"/rows/0/4","approx":{"value":0.98976,"atol":1e-4}}
+//|       - {"artifact":"sor","path":"/rows/1/2","range":{"min":90,"max":140}}
+//|       - {"artifact":"sor","path":"/rows/1/6","range":{"max":1e-5}}
+//|   - case: coarse
+//|     expect:
+//|       - {"artifact":"sor","path":"/rows/0/4","approx":{"value":0.92063,"atol":1e-4}}
+//|       - {"artifact":"sor","path":"/rows/1/6","range":{"max":1e-5}}
+//|   - case: fine
+//|     expect:
+//|       - {"artifact":"sor","path":"/rows/0/2","range":{"min":2900,"max":3300}}
+//|       - {"artifact":"sor","path":"/rows/0/6","range":{"max":1e-6}}
+//|       - {"artifact":"sor","path":"/rows/1/2","range":{"min":120,"max":200}}
+use scioxide_core::{Budget, ResidualTolerance};
+use scioxide_linalg::{IterativeSolveResult, SorSolver, SorWeight, StationaryMatrix, Vector};
+use scioxide_sparse::sparse_diagonals;
+
+let n = points.round() as usize;
+let h = 1.0 / (n + 1) as f64;
+let (main, off) = (vec![2.0; n], vec![-1.0; n - 1]);
+let a =
+    sparse_diagonals(n, n, &[0, 1, -1], &[&main[..], &off, &off]).map_err(|e| e.to_string())?;
+let b = Vector::from_vec(vec![h * h; n]);
+// Exact discrete solution u_i = x_i(1 − x_i)/2 (x_i = ih).
+let exact: Vec<f64> = (1..=n)
+    .map(|i| i as f64 * h * (1.0 - i as f64 * h) / 2.0)
+    .collect();
+let tolerance = ResidualTolerance::new(0.0, 1e-8).map_err(|e| e.to_string())?;
+let budget = Budget::try_from(100_000).map_err(|e| e.to_string())?;
+let sor = |omega: f64| -> Result<IterativeSolveResult<f64>, String> {
+    let weight = SorWeight::new(omega).map_err(|e| e.to_string())?;
+    SorSolver::new(tolerance, budget, weight)
+        .solve_with_options(StationaryMatrix::Csr(&a), &b, None)
+        .map_err(|e| e.to_string())
+};
+let pi_h = std::f64::consts::PI * h;
+let omega_opt = 2.0 / (1.0 + pi_h.sin());
+// Estimated iterations to reduce the error by a factor of 1e-8: ln(1e-8)/ln ρ.
+let predict = |rho: f64| (1e-8_f64).ln() / rho.ln();
+let mut rows = Vec::new();
+for (name, omega, rho) in [
+    ("Gauss–Seidel", 1.0, pi_h.cos().powi(2)),
+    ("SOR（ω_opt）", omega_opt, omega_opt - 1.0),
+] {
+    let result = sor(omega)?;
+    let report = result.report();
+    let termination = termination_name(report.termination());
+    let error = relative_difference(result.solution().as_slice(), &exact);
+    rows.push((
+        name,
+        omega,
+        report.iterations(),
+        termination,
+        rho,
+        predict(rho),
+        error,
+    ));
+}
+let fixed0 = serde_json::json!({ "fractionDigits": 0 });
+let fixed4 = serde_json::json!({ "fractionDigits": 4 });
+let fixed5 = serde_json::json!({ "fractionDigits": 5 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Method" },
+    { "key": "1", "label": "ω [-]", "type": "number", "format": fixed4 },
+    { "key": "2", "label": "Iterations [count]", "type": "integer" },
+    { "key": "3", "label": "Termination reason" },
+    { "key": "4", "label": "ρ(G) [-]", "type": "number", "format": fixed5 },
+    { "key": "5", "label": "Estimate ln 10⁻⁸ / ln ρ [iterations]", "type": "number", "format": fixed0 },
+    { "key": "6", "label": "Relative difference from exact solution [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(columns, rows, metadata = serde_json::json!({ "id": "sor" }));
+let mut curve = Vec::new();
+for k in 0..10 {
+    let omega = 1.0 + 0.1 * k as f64;
+    curve.push([omega, sor(omega)?.report().iterations() as f64]);
+}
+emit_line_chart!(
+    &vec![serde_json::json!({ "name": "SOR iterations", "points": curve })],
+    options = &serde_json::json!({
+        "xLabel": "Relaxation parameter ω [-]",
+        "yLabel": "Iterations [count]",
+        "yType": "log",
+        "annotations": [{ "kind": "line", "axis": "x", "value": omega_opt, "label": "ω_opt" }]
+    })
+);
+```
+
+With the default $n = 30$, Gauss–Seidel takes 1783 iterations, close to the spectral-radius estimate of 1791.
+At $\omega_{\mathrm{opt}} \approx 1.816$, it takes 115 iterations, exceeding the estimate of 91.
+This occurs because at $\omega_{\mathrm{opt}}$ the SOR iteration matrix is not diagonalizable (it has a size-2 Jordan block at eigenvalue $\omega_{\mathrm{opt}} - 1$), so the error decreases on the scale of $k\rho^k$ rather than $\rho^k$; the smallest $k$ satisfying $k\rho^k \le 10^{-8}$ is 115, matching observation.
+The relative differences from the exact solution are $1.1 \times 10^{-8}$ for Gauss–Seidel and $3.3 \times 10^{-9}$ for optimal SOR, both on the scale of the residual tolerance $10^{-8}$.
+In the plot, raising $\omega$ from 1 gradually reduces the iteration count, reaching its minimum of 152 at $\omega = 1.8$ near $\omega_{\mathrm{opt}}$, then increasing to 186 at $\omega = 1.9$.
+Increasing $n$ from 10 to 40 raises Gauss–Seidel's count from 223 to 3120, approximately following the $h^{-2}$ ratio $(41/11)^2 \approx 13.9$, while optimal SOR rises from 40 to 152, approximately following the $h^{-1}$ ratio of 3.7.
+
+---
+
+## Summary
+
+For nonsymmetric systems, biorthogonal methods with short recurrences (BiCG, CGS, QMR, TFQMR) save memory at the expense of residual minimization and a risk of breakdown; GMRES methods minimize the residual with greater memory use and orthogonalization work.
+LSQR and LSMR solve rectangular least-squares problems without forming the normal equations and test convergence through the normal-equation residual when a component lies outside the range; however, the solution-error bound divides the normal residual by $\sigma_{\min}^2$, so ill-conditioning can leave an error far above the tolerance.
+`GmresSolver` directly accepts preconditioners that vary between iterations; when solving again with the same operator and a different right-hand side, pass an LGMRES or GCROT recycled space to `solve_recycled_into`, and use `refresh` or `clear` to adapt the space when the operator changes.
+Use block variants to solve multiple right-hand sides together in the same space, or `solve_block_into` to solve them independently.
+SOR convergence speed strongly depends on the relaxation parameter; near the optimum $2/(1 + \sin\pi h)$, it needs over an order of magnitude fewer iterations than Gauss–Seidel.
+
+## Further reading
+
+- [Matrix functions, Fréchet derivatives, and sparse matrix functions](../matrix-functions-and-equations/): move beyond linear systems to methods for matrix exponentials and logarithms.
+- [Cancellation, stopping at limits, and reading accepted iterates](../../examples/accepted-state-and-cancellation/): use examples to check how to read results returned when iterative solvers stop.

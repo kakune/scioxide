@@ -1,0 +1,450 @@
+---
+title: "Online sensor aggregation with a large baseline"
+description: "Aggregate temperature measurements with a large baseline, periodic component, and linear drift using OnlineMoments; examine online-mean tracking, analytical variance components, cancellation in the one-pass formula, measurement quantization from floating-point spacing, and online skewness and kurtosis."
+sidebar:
+  order: 405
+references:
+  stats-online-sensor-skew-kurtosis: "online-skewness-and-kurtosis"
+---
+
+Use online aggregation without retaining the sample when observations must be summarized in arrival order without storing measurements.
+Actual measurement series combine large baselines, periodic fluctuations, and instrument drift.
+This page aggregates temperature measurements with `OnlineMoments`, checking what the online mean follows, which components make up sample variance, and what is lost at large baselines against analytical values and two-pass calculations.
+The second half aggregates skewness and kurtosis of the same series and compares them with formulas based on raw power sums.
+
+## Measurement-series model
+
+Define the measurement at time $i = 0, 1, \dots, N-1$ by
+
+$$
+x_i = B + A \sin\!\left(\frac{2\pi i}{P}\right) + D\,\frac{i}{N-1}
+$$
+
+
+$B = 20 + 10^p$ °C is the baseline, $A = 0.2$ °C the amplitude of fluctuations with period $P = 16$ observations, and $D$ °C the drift over the full observation period.
+The baseline exponent $p$ determines how many orders of magnitude smaller the fluctuations are than the mean.
+An actual thermometer does not measure $10^6$ °C, but the same relative scales commonly arise with large absolute timestamps, cumulative energy consumption, and latitude/longitude coordinates.
+
+If $N$ is a multiple of $P$, the sine sums to 0; since $\sum_i i = N(N-1)/2$, the mean is
+
+$$
+\bar x = B + \frac{D}{2}
+$$
+
+
+The online mean $\bar x_n$ averages the first $n$ observations, so its drift contribution rises gradually as $D(n-1)/(2(N-1))$, reaching $D/2$ at $n = N$.
+An online mean weights every past observation equally, tracking the midpoint of the drift so far rather than the current value.
+Tracking the current value requires another estimator, such as an exponential moving average or state-space model.
+
+Sample variance does not describe measurement noise alone.
+Splitting the sum of squared deviations $\sum_i (x_i - \bar x)^2$ into sine, drift, and cross terms gives the following when $N$ is a multiple of $P$:
+
+$$
+(N-1)\,s^2 = \frac{N A^2}{2} - \frac{A D N}{N-1}\cot\frac{\pi}{P} + \frac{D^2 N (N+1)}{12 (N-1)}
+$$
+
+
+The first term comes from the sine sum of squares over complete periods, $\sum_i \sin^2(2\pi i/P) = N/2$; the third comes from the equally spaced grid's sum of squared deviations, $\sum_i (i - (N-1)/2)^2 = N(N^2-1)/12$.
+The second is a cross term using $\sum_i i \sin(2\pi i/P) = -(N/2)\cot(\pi/P)$.
+The sine peaks lie in the first half of each period, so its covariance with the drift is negative.
+Variance computed without detrending includes this deterministic change.
+
+The following definitions block constructs the measurement series used by both cells on this page.
+`sensor_series` returns deviations $A\sin(2\pi i/P) + D\,i/(N-1)$ and measurements $x_i$ obtained by adding $B$ and rounding to `f64`.
+
+```rust
+//| id: stats-online-sensor-model
+//| kind: definitions
+//| title: "Measurement series combining baseline, periodic variation, and drift"
+//| crates: [scioxide-core]
+use scioxide_core::RealScalar;
+
+/// Periodic amplitude A [°C] and period P [observations].
+pub(crate) const AMPLITUDE: f64 = 0.2;
+pub(crate) const PERIOD: f64 = 16.0;
+
+/// Baseline B [°C], deviations before adding the baseline [°C], and stored measurements xᵢ = B + deviation [°C].
+pub(crate) struct SensorSeries {
+    pub(crate) baseline: f64,
+    pub(crate) deviations: Vec<f64>,
+    pub(crate) values: Vec<f64>,
+}
+
+/// xᵢ = B + A sin(2πi/P) + D i/(N − 1), B = 20 + 10ᵖ.
+pub(crate) fn sensor_series(drift: f64, baseline_exponent: f64, count: usize) -> SensorSeries {
+    let baseline = 20.0 + RealScalar::powf(10.0_f64, baseline_exponent);
+    let last = (count - 1) as f64;
+    let deviations: Vec<f64> = (0..count)
+        .map(|i| {
+            let phase = 2.0 * std::f64::consts::PI * i as f64 / PERIOD;
+            AMPLITUDE * RealScalar::sin(phase) + drift * i as f64 / last
+        })
+        .collect();
+    let values = deviations.iter().map(|d| baseline + d).collect();
+    SensorSeries {
+        baseline,
+        deviations,
+        values,
+    }
+}
+```
+
+## Online aggregation experiment
+
+The next cell varies drift $D$, baseline exponent $p$, and sample size $N$, generating measurements and aggregating them individually with `OnlineMoments::observe`.
+At each step, read `snapshot().mean()` and plot the online mean's path as a deviation from the baseline.
+The dashed line is the drift-only online mean $D\,i/(2(N-1))$; the horizontal line is the final theoretical mean $D/2$.
+
+Compute variance by four paths and compare them with the analytical value above.
+These are `sample_variance` from `OnlineMoments`, a two-pass calculation computing the mean of stored measurements by ordinary summation before summing deviations, the one-pass formula (difference of sums of squares), and a two-pass calculation on deviations before adding the baseline.
+The last computes the model variance without baseline rounding, providing an independent check of the analytical value.
+The two-pass and one-pass calculations are comparison paths written with `f64` arithmetic in the cell, bypassing SciOxide functions.
+The lower table shows the final mean minus the theoretical mean, floating-point spacing near the baseline (1 ulp), and the standard error $s/\sqrt N$ of the mean assuming independence.
+
+```rust
+//| id: stats-online-sensor
+//| ref: stats-online-sensor
+//| title: "Aggregate a drifting measurement series with a large baseline online"
+//| run: reactive
+//| uses: [stats-online-sensor-model]
+//| crates: [scioxide-core, scioxide-stats]
+//| exports: [drift, baseline_exponent, sensor_sample_count]
+//| inputs:
+//|   drift: {"type":"range","label":"Full-period drift D [°C]","description":"Linear change added to the measurement series.","min":0,"max":4,"step":0.25,"value":0.5}
+//|   baseline_exponent: {"type":"range","label":"Baseline exponent p (B = 20 + 10ᵖ °C)","description":"Change the orders of magnitude separating fluctuations from the mean.","min":0,"max":15,"step":1,"value":6}
+//|   sensor_sample_count: {"type":"range","label":"Sample size N [observations]","description":"Observation period spanning an integer number of 16-observation cycles.","min":64,"max":256,"step":16,"value":128}
+//| cases:
+//|   - {"id":"strong-drift","label":"D = 4 °C","description":"Drift accounts for most variance, and the online mean rises linearly.","inputs":{"drift":4}}
+//|   - {"id":"small-baseline","label":"p = 0","description":"With a small baseline, the one-pass formula also approaches the analytical value.","inputs":{"baseline_exponent":0}}
+//|   - {"id":"quantized","label":"p = 15","description":"Floating-point spacing approaches the amplitude, quantizing stored measurements themselves.","inputs":{"baseline_exponent":15}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"variance","path":"/rows/0/1","approx":{"value":0.0374958183729549,"rtol":1e-09}}
+//|       - {"artifact":"variance","path":"/rows/2/2","approx":{"value":0.000767,"rtol":0.01}}
+//|       - {"artifact":"variance","path":"/rows/3/2","approx":{"value":2.269e-12,"rtol":0.01}}
+//|       - {"artifact":"variance","path":"/rows/4/2","range":{"min":-1e-15,"max":1e-15}}
+//|       - {"artifact":"summary","path":"/rows/0/1","approx":{"value":0.0374958183706857,"rtol":1e-12}}
+//|       - {"artifact":"summary","path":"/rows/1/1","range":{"min":-1e-12,"max":1e-12}}
+//|       - {"artifact":"summary","path":"/rows/2/1","approx":{"value":1.1641532182693481e-10,"rtol":1e-12}}
+//|   - case: strong-drift
+//|     expect:
+//|       - {"artifact":"variance","path":"/rows/0/1","approx":{"value":1.35323457351,"rtol":1e-09}}
+//|       - {"artifact":"summary","path":"/rows/0/1","approx":{"value":1.35323457350154,"rtol":1e-12}}
+//|   - case: small-baseline
+//|     expect:
+//|       - {"artifact":"variance","path":"/rows/2/2","range":{"min":-1e-12,"max":1e-12}}
+//|       - {"artifact":"summary","path":"/rows/2/1","approx":{"value":3.552713678800501e-15,"rtol":1e-12}}
+//|   - case: quantized
+//|     expect:
+//|       - {"artifact":"variance","path":"/rows/0/1","approx":{"value":0.0393700787401575,"rtol":1e-09}}
+//|       - {"artifact":"variance","path":"/rows/3/1","approx":{"value":0.0393700787401575,"rtol":1e-09}}
+//|       - {"artifact":"variance","path":"/rows/1/1","approx":{"value":1.94488,"rtol":0.001}}
+//|       - {"artifact":"summary","path":"/rows/2/1","equals":0.125}
+use scioxide_core::RealScalar;
+use scioxide_stats::{MomentOrder, OnlineMoments};
+
+let n = sensor_sample_count as usize;
+let count = n as f64;
+let SensorSeries {
+    baseline,
+    deviations,
+    values,
+} = sensor_series(drift, baseline_exponent, n);
+// Main calculation: aggregate in arrival order and record the online mean at every step.
+let mut moments = OnlineMoments::new(MomentOrder::Second);
+let (mut signal, mut running, mut drift_mean) = (Vec::new(), Vec::new(), Vec::new());
+for (i, &value) in values.iter().enumerate() {
+    moments.observe(value).map_err(|e| e.to_string())?;
+    let mean = moments.snapshot().mean().map_err(|e| e.to_string())?;
+    let mean = mean.ok_or("Undefined mean")?;
+    signal.push([i as f64, value - baseline]);
+    running.push([i as f64, mean - baseline]);
+    drift_mean.push([i as f64, drift * i as f64 / (2.0 * (count - 1.0))]);
+}
+let snapshot = moments.snapshot();
+let online = snapshot.sample_variance().map_err(|e| e.to_string())?;
+let online = online.ok_or("Sample variance is undefined")?;
+// Comparison: two-pass and one-pass formulas using f64 arithmetic (bypassing SciOxide).
+let two_pass = |xs: &[f64]| {
+    let m = xs.iter().sum::<f64>() / count;
+    xs.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / (count - 1.0)
+};
+let sum: f64 = values.iter().sum();
+let squares: f64 = values.iter().map(|v| v * v).sum();
+let one_pass = (squares - sum * sum / count) / (count - 1.0);
+// Check: analytical value for N a multiple of P (formula in the text).
+let cot = 1.0 / RealScalar::tan(std::f64::consts::PI / PERIOD);
+let analytic = (count * AMPLITUDE * AMPLITUDE / 2.0
+    - AMPLITUDE * drift * count * cot / (count - 1.0)
+    + drift * drift * count * (count + 1.0) / (12.0 * (count - 1.0)))
+    / (count - 1.0);
+emit_chart!(
+    serde_json::json!({
+        "kind": "line",
+        "dataZoom": true,
+        "tooltip": true,
+        "series": [
+            { "name": "Measurement xᵢ − B", "points": signal, "style": { "symbol": "circle" } },
+            { "name": "Online mean x̄ₙ − B", "points": running },
+            {
+                "name": "Drift-only online mean",
+                "points": drift_mean,
+                "style": { "lineType": "dashed" }
+            }
+        ],
+        "xLabel": "Observation index i [-]",
+        "yLabel": "Deviation from baseline B [°C]",
+        "annotations": [
+            { "kind": "line", "axis": "y", "value": drift / 2.0, "label": "Theoretical mean D/2" }
+        ]
+    }),
+    metadata = serde_json::json!({ "id": "running" })
+);
+let full = serde_json::json!({ "significantDigits": 10 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Variance calculation" },
+    { "key": "1", "label": "Sample variance [°C²]", "type": "number", "format": full },
+    { "key": "2", "label": "Difference from analytical value [°C²]", "type": "number", "format": sci2 }
+]);
+// Stored measurements minus B (this subtraction does not round). Reference variance of the rounded measurements themselves.
+let stored: Vec<f64> = values.iter().map(|v| v - baseline).collect();
+let paths = [
+    ("OnlineMoments", online),
+    ("Two-pass on measurements", two_pass(&values)),
+    ("One-pass formula", one_pass),
+    ("Two-pass on stored measurements − B", two_pass(&stored)),
+    ("Two-pass on deviations (model before rounding)", two_pass(&deviations)),
+];
+let rows: Vec<(&str, f64, f64)> = paths
+    .iter()
+    .map(|&(name, v)| (name, v, v - analytic))
+    .collect();
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "variance" })
+);
+let final_mean = snapshot.mean().map_err(|e| e.to_string())?;
+let final_mean = final_mean.ok_or("Undefined mean")?;
+let standard_error = snapshot
+    .standard_error_of_sample_mean()
+    .map_err(|e| e.to_string())?
+    .ok_or("Undefined standard error")?;
+let ulp = RealScalar::next_after(baseline, f64::INFINITY) - baseline;
+let summary = vec![
+    ("Analytical sample variance [°C²]", analytic),
+    (
+        "Final mean − theoretical mean B + D/2 [°C]",
+        final_mean - (baseline + drift / 2.0),
+    ),
+    ("Floating-point spacing near baseline [°C]", ulp),
+    ("Mean standard error s/√N assuming independence [°C]", standard_error),
+];
+let value_format = serde_json::json!({ "significantDigits": 5 });
+let summary_columns = serde_json::json!([
+    { "key": "0", "label": "Quantity" },
+    { "key": "1", "label": "Value", "type": "number", "format": value_format }
+]);
+emit_table_with_columns!(
+    summary_columns,
+    summary,
+    metadata = serde_json::json!({ "id": "summary" })
+);
+export!(drift, drift);
+export!(baseline_exponent, baseline_exponent);
+export!(sensor_sample_count, sensor_sample_count);
+```
+
+For defaults $D = 0.5$ °C, $p = 6$, and $N = 128$, the analytical sample variance is $3.7496 \times 10^{-2}$ °C².
+Its components are the sine term $NA^2/(2(N-1)) = 0.02016$ °C², drift term 0.02133 °C², and negative cross term $-0.00399$ °C².
+The two-pass calculation on deviations before adding the baseline agrees with the analytical value to about $10^{-17}$ °C², confirming consistency between the analytical formula and series construction.
+
+`OnlineMoments` and the two-pass calculation on measurements differ from the analytical value by $2.3 \times 10^{-12}$ °C²; a two-pass calculation after subtracting $B$ from stored measurements differs by the same amount.
+Floating-point spacing near baseline $10^6$ is $1.16 \times 10^{-10}$ °C, and stored measurements are rounded to this grid.
+The difference is between the variance of rounded measurements and the unrounded model, not an aggregation-algorithm error.
+The one-pass formula deviates by $7.7 \times 10^{-4}$ °C² (2% relative error).
+It extracts a sum of squared deviations of 4.76 °C² from the difference of two sums of squares of size $\sum_i x_i^2 \approx 1.28 \times 10^{14}$ °C²; their rounding, with 1 ulp = 0.016 °C², remains as an error of 0.097 °C² in the sum of squared deviations.
+
+The online mean rises while oscillating around the drift-only mean (dashed) by the periodic component, finally reaching theoretical mean $D/2$.
+The final mean minus theoretical mean $B + D/2$ (computed in `f64`) is 0 for every tested input.
+`OnlineMoments` stores the mean as a compensated sum with high and low parts, returning the stored-measurement mean with error roughly equal to one final rounding to `f64`, so it matches $B + D/2$ rounded to `f64`.
+The table's final-row value $s/\sqrt N = 0.0171$ °C would be the mean's standard error for independent observations.
+This series consists of a deterministic sine and drift, so this value does not describe uncertainty in its mean.
+
+Setting drift to $D = 4$ °C increases variance to 1.3532 °C², including a drift contribution of 1.3650 °C².
+At $p = 0$, even the one-pass formula stays within $3.3 \times 10^{-13}$ °C² of the analytical value.
+
+At $p = 15$, spacing near the baseline is 0.125 °C, the same order as amplitude 0.2 °C.
+Stored measurements are quantized to a 0.125 °C grid; the `OnlineMoments` variance 0.03937 °C² agrees with the two-pass calculation after subtracting $B$ from stored measurements.
+The difference $1.9 \times 10^{-3}$ °C² from the model variance is due to quantization; no aggregation algorithm can recover information lost during representation.
+Meanwhile, the two-pass calculation using an ordinary sum for the mean gives 1.94 °C² and the one-pass formula $1.6 \times 10^{15}$ °C², failing even to recover the variance of the rounded measurements.
+
+## Online skewness and kurtosis
+
+Define the shape summaries skewness and kurtosis from central moments $m_k = \frac1N \sum_i (x_i - \bar x)^k$ by
+
+$$
+g_1 = \frac{m_3}{m_2^{3/2}}, \qquad g_2 = \frac{m_4}{m_2^2} - 3
+$$
+
+
+$g_1$ is Fisher–Pearson skewness, and $g_2$ is excess kurtosis, equal to 0 for a normal distribution.
+For a sine over complete periods alone, $m_2 = A^2/2$, $m_3 = 0$, and $m_4 = 3A^4/8$ give $g_1 = 0$ and $g_2 = -1.5$.
+Drift adds approximately uniformly distributed values, moving $g_2$ toward the uniform-distribution value $-1.2$; cross terms with the sine move $g_1$ slightly away from 0.
+
+`OnlineMoments::new(MomentOrder::Fourth)` also updates third and fourth central moments online.
+Updates and merges use Pébay's formulas, accumulating only powers of deviations from the mean and never forming raw power sums $\sum_i x_i^k$.
+`MomentsSnapshot::skewness` and `kurtosis` return $g_1$ and $g_2$ under `BiasCorrection::None`, and independent-sample bias corrections $G_1$ and $G_2$ under `BiasCorrection::Corrected`.
+`KurtosisConvention::Fisher` returns excess kurtosis; `Pearson` returns $m_4/m_2^2$.
+`central_moment(k)` returns $m_k$; requesting an order the accumulator does not retain gives `NotImplemented`.
+For constant samples, skewness and kurtosis are `None`; with `Corrected`, fewer than three observations for skewness or four for kurtosis also gives `None`.
+
+The comparison formula based on raw power sums constructs central moments from $S_k = \sum_i x_i^k$ and $\bar x = S_1/N$, for example:
+
+$$
+m_4 = \frac{S_4}{N} - 4\bar x \frac{S_3}{N} + 6\bar x^2 \frac{S_2}{N} - 3\bar x^4
+$$
+
+
+At $p = 6$, each term is of size $B^4 \approx 10^{24}$ °C⁴, subtracting terms 27 orders of magnitude larger than $m_4 \approx 3 \times 10^{-3}$ °C⁴.
+
+The next cell receives $D$, $p$, and $N$ from the preceding cell, generates the same series, and compares $g_1$, $g_2$, and $m_4$ computed by online accumulation through order four against two-pass deviation calculations (reference) and raw-power-sum formulas.
+Changing the preceding cell's inputs recomputes this cell with the same series.
+If the raw-power-sum formula gives $m_2$ at most 0, skewness and kurtosis are displayed as undefined.
+
+```rust
+//| id: stats-online-sensor-api-2
+//| ref: stats-online-sensor-api-2
+//| title: "Aggregate skewness and kurtosis online and compare with raw-power-sum formulas"
+//| run: reactive
+//| uses: [stats-online-sensor-model]
+//| crates: [scioxide-core, scioxide-stats]
+//| dependsOn:
+//|   sensor: stats-online-sensor
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"shape","path":"/rows/0/1","approx":{"value":0.0132019073,"rtol":1e-06}}
+//|       - {"artifact":"shape","path":"/rows/0/2","approx":{"value":-0.66765323,"rtol":1e-07}}
+//|       - {"artifact":"shape","path":"/rows/2/2","approx":{"value":-0.66765323,"rtol":1e-07}}
+//|       - {"artifact":"shape","path":"/rows/3/1","approx":{"value":0.0132019076,"rtol":1e-06}}
+//|       - {"artifact":"shape","path":"/rows/3/2","approx":{"value":-0.6676532303,"rtol":1e-09}}
+//|       - {"artifact":"shape","path":"/rows/1/3","equals":null}
+use scioxide_core::RealScalar;
+use scioxide_stats::{BiasCorrection, KurtosisConvention, MomentOrder, OnlineMoments};
+
+// Receive the preceding cell's inputs and generate the same measurement series.
+let drift = sensor["drift"].as_f64().ok_or("Missing drift")?;
+let exponent = sensor["baseline_exponent"]
+    .as_f64()
+    .ok_or("Missing baseline exponent")?;
+let n = sensor["sensor_sample_count"]
+    .as_f64()
+    .ok_or("Missing sample count")? as usize;
+let SensorSeries {
+    deviations, values, ..
+} = sensor_series(drift, exponent, n);
+let count = n as f64;
+// Main calculation: aggregate central moments through fourth order in arrival order.
+let mut moments = OnlineMoments::new(MomentOrder::Fourth);
+for &value in &values {
+    moments.observe(value).map_err(|e| e.to_string())?;
+}
+let s = moments.snapshot();
+let shape = |correction| -> Result<(Option<f64>, Option<f64>), String> {
+    let skew = s.skewness(correction).map_err(|e| e.to_string())?;
+    let kurt = s.kurtosis(correction, KurtosisConvention::Fisher);
+    Ok((skew, kurt.map_err(|e| e.to_string())?))
+};
+let (g1, g2) = shape(BiasCorrection::None)?;
+let (big_g1, big_g2) = shape(BiasCorrection::Corrected)?;
+let m4 = s.central_moment(4).map_err(|e| e.to_string())?;
+// Construct (g₁, g₂) from central moments (m₂, m₃, m₄). Undefined if m₂ ≤ 0.
+let coefficients = |m2: f64, m3: f64, m4: f64| {
+    (m2 > 0.0).then(|| (m3 / RealScalar::powf(m2, 1.5), m4 / (m2 * m2) - 3.0))
+};
+// Reference: two-pass central moments (f64 arithmetic). Subtract x₀ from stored measurements first.
+let central = |xs: &[f64]| {
+    let center = xs.iter().sum::<f64>() / count;
+    let moment = |k: i32| {
+        xs.iter()
+            .map(|x| RealScalar::powi(x - center, k))
+            .sum::<f64>()
+            / count
+    };
+    (moment(2), moment(3), moment(4))
+};
+let shifted: Vec<f64> = values.iter().map(|v| v - values[0]).collect();
+let (s2, s3, s4) = central(&shifted);
+let (r2, r3, r4) = central(&deviations);
+let stored = coefficients(s2, s3, s4);
+let reference = coefficients(r2, r3, r4);
+// Comparison: construct central moments from raw power sums S_k (f64 arithmetic).
+let raw = |k: i32| values.iter().map(|v| RealScalar::powi(*v, k)).sum::<f64>() / count;
+let (a1, a2, a3, a4) = (raw(1), raw(2), raw(3), raw(4));
+let n2 = a2 - a1 * a1;
+let n3 = a3 - 3.0 * a1 * a2 + 2.0 * a1 * a1 * a1;
+let n4 = a4 - 4.0 * a1 * a3 + 6.0 * a1 * a1 * a2 - 3.0 * a1 * a1 * a1 * a1;
+let naive = coefficients(n2, n3, n4);
+let fixed4 = serde_json::json!({ "fractionDigits": 4 });
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Path" },
+    { "key": "1", "label": "Skewness [-]", "type": "number", "format": fixed4, "nullText": "—" },
+    { "key": "2", "label": "Excess kurtosis [-]", "type": "number", "format": fixed4, "nullText": "—" },
+    { "key": "3", "label": "m₄ [°C⁴]", "type": "number", "format": sci3, "nullText": "—" }
+]);
+let rows = vec![
+    ("OnlineMoments (g₁, g₂)", g1, g2, m4),
+    ("OnlineMoments (corrected G₁, G₂)", big_g1, big_g2, None),
+    (
+        "Two-pass on stored measurements − x₀",
+        stored.map(|r| r.0),
+        stored.map(|r| r.1),
+        Some(s4),
+    ),
+    (
+        "Two-pass on deviations (model before rounding)",
+        reference.map(|r| r.0),
+        reference.map(|r| r.1),
+        Some(r4),
+    ),
+    (
+        "Raw-power-sum formula",
+        naive.map(|r| r.0),
+        naive.map(|r| r.1),
+        Some(n4),
+    ),
+];
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "shape" })
+);
+```
+
+For default inputs, $g_1 = 0.0132$, $g_2 = -0.6677$, and $m_4 = 3.228 \times 10^{-3}$ °C⁴ from `OnlineMoments` agree with the two-pass stored-measurement calculation to the displayed digits.
+Differences from the unrounded model are about $10^{-10}$ for $g_2$ and $m_4$, and relative $2 \times 10^{-8}$ even for $g_1$ with strong cancellation.
+The raw-power-sum formula gives $g_1$ equal to $-1.7 \times 10^5$ and $g_2$ equal to $1.9 \times 10^{12}$, retaining no shape information.
+The corrections $G_1 = 0.0134$ and $G_2 = -0.6461$ address independent-sample bias; for this deterministic series, their interpretation is the same as $g_1$ and $g_2$.
+
+Setting the preceding cell to $D = 0$ gives $g_1$ of order $10^{-16}$ and $g_2$ agreeing with $-1.5$ within $3 \times 10^{-10}$, reproducing the analytical sine values.
+At $D = 4$ °C, drift dominates, and $g_2 = -1.2208$ approaches the uniform-distribution value $-1.2$.
+At $p = 15$, stored measurements have $g_1$ near 0 and $g_2$ equal to $-0.680$, differing from model values $0.0132$ and $-0.6677$.
+This is `OnlineMoments` correctly aggregating the shape of quantized measurements; again the information was lost at the representation stage.
+
+## Summary
+
+The online mean weights all past observations equally, so in a drifting series it approaches the drift's midpoint rather than the current value.
+Sample variance includes deterministic periodic and drift changes and their negative cross term, as well as noise; detrend before interpreting it as measurement uncertainty.
+For the same reason, $s/\sqrt N$ returned by `standard_error_of_sample_mean` assumes independent observations and does not describe uncertainty in this series' mean.
+`OnlineMoments` keeps stored-measurement variances and higher central moments near analytical values even with large baselines; at $p = 15$, where ordinary-sum two-pass and raw-power-sum formulas fail, it still returns statistics of the rounded measurements themselves.
+However, as floating-point spacing near the baseline approaches the fluctuations, stored measurements become quantized and lose information that no aggregation algorithm can recover.
+
+## Further reading
+
+- [Mathematics of online means, variances, higher moments, and covariances](../../algorithms/online-moments-and-covariance/): examine why one-pass formula errors scale with the squared condition number, and how higher moments merge.
+- [Checking partitioned aggregation against a single pass](../merge-covariance/): verify in the bivariate case that merging partition aggregates gives the same statistics.
+- [Checking confidence-interval coverage through repeated experiments](../confidence-coverage/): examine how much independence-based $s/\sqrt N$ underestimates mean uncertainty for autocorrelated series.

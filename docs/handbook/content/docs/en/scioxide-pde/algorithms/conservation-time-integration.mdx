@@ -1,0 +1,314 @@
+---
+title: "CFL conditions and time integration for conservation laws"
+description: "Explicit finite-volume step limits (CFL conditions) for conservation laws, SSP time integration and admissibility-based trial rejection, and APIs for spatial plans, workspaces, and reports."
+sidebar:
+  order: 354
+references:
+  pde-conservation-cfl: "cfl-condition-and-maximum-step"
+  pde-conservation-ssp: "ssp-time-integration"
+  pde-conservation-plans: "spatial-plans-and-workspaces"
+---
+
+The residual $L(u)$ constructed in [Conservation laws and numerical fluxes](../conservation-laws/) and [Conservation-law reconstruction and boundaries](../conservation-reconstruction/) is the right-hand side of the cell-average ordinary differential equation $du/dt = L(u)$.
+This page explains step limits for explicit methods, admissibility checks when advancing with `scioxide-ode` methods, and the spatial-plan APIs bringing them together.
+
+## CFL condition and maximum step
+
+Consider one forward Euler stage with the Rusanov flux for a one-dimensional scalar problem.
+
+$$
+\bar u_i^{n+1} = \bar u_i^n - \frac{\Delta t}{h}\Bigl(\hat F(\bar u_i, \bar u_{i+1}) - \hat F(\bar u_{i-1}, \bar u_i)\Bigr)
+$$
+
+If the face value $a$ bounds $|f'|$ on both sides, the partial derivatives $\partial_1 \hat F = \tfrac12(f'(u^-) + a)$ and $\partial_2 \hat F = \tfrac12(f'(u^+) - a)$ of $\hat F$ satisfy $0 \le \partial_1 \hat F \le a$ and $-a \le \partial_2 \hat F \le 0$, so the derivative of $\bar u_i^{n+1}$ with respect to $\bar u_i$ is at least $1 - \frac{\Delta t}{h}(a_{i+1/2} + a_{i-1/2})$.
+Therefore, under the condition
+
+$$
+\frac{\Delta t}{h}\,\bigl(a_{i-1/2} + a_{i+1/2}\bigr) \le 1
+$$
+
+the update is a monotone function of the three values, and a maximum principle holds.
+For a multidimensional cell $K$, this condition becomes $\Delta t \sum_{f\subset\partial K} |f|\,s_f \le |K|$.
+$s_f$ is the maximum signal speed returned by the numerical flux at face $f$.
+
+For second-order reconstruction, split the cell average into an average of face values and write the update as a convex combination of first-order face updates.
+In one-dimensional linear reconstruction, the decomposition is $\bar u_i = \tfrac12(u_{i-1/2}^+ + u_{i+1/2}^-)$; each update has twice the step size, so the condition is halved to $\Delta t \sum_f |f|\,s_f \le \tfrac12 |K|$ (Zhang–Shu, 2010).
+
+Using the Courant number $\nu$, `scioxide-pde` sets the maximum step at the state where the residual is evaluated to
+
+$$
+\Delta t_{\max} = \min_K \frac{\nu\,|K|}{\sum_{f\subset\partial K} |f|\,s_f}
+$$
+
+
+Select $\nu$ through `ConservationOptions::with_cfl` in the range greater than 0 and at most 1/2; the default is 0.45.
+On a uniform one-dimensional grid with constant wave speed $s$, $\Delta t_{\max} = \nu h/(2s)$, and the usual Courant number $s\Delta t/h$ is $\nu/2 \le 1/4$.
+`ConservationReport::maximum_step()` returns this value, `limiting_cell()` the cell giving the minimum, and `maximum_speed()` the maximum signal speed over all faces; when all wave speeds are 0, `maximum_step()` returns `None`.
+
+This limit is local, computed from wave speeds at the evaluated state; it does not guarantee stability if wave speeds increase during the step.
+The next section's checks handle system admissibility (positive density and pressure).
+
+## SSP time integration
+
+A spatial plan's `bind(equation, flux, workspace)` returns a `ConservationSystem` borrowing the equation, numerical flux, and workspace.
+`ConservationSystem` implements `scioxide_ode::OdeSystem`.
+The state contains cell averages with $N$ components per cell; the right-hand side is the residual normalized by mass (cell measure $|K|$).
+No Jacobian is provided, so advance with an explicit method.
+
+The intended methods are the SSP methods `scioxide_ode::ForwardEuler` and `scioxide_ode::Heun`.
+`Heun` is the two-stage SSPRK2 method
+
+$$
+u^{(1)} = u^n + \Delta t\,L(u^n),\qquad
+u^{n+1} = \tfrac12 u^n + \tfrac12\bigl(u^{(1)} + \Delta t\,L(u^{(1)})\bigr)
+$$
+
+where $L$ is the spatial residual.
+Each stage consists of a forward Euler stage and convex combinations, so it preserves the properties maintained by forward Euler below the limit $\Delta t_{\mathrm{FE}}$ (maximum principle, TVD, and the admissible set) under the same step limit (SSP coefficient 1; Gottlieb–Shu, 1998).
+
+Admissibility is checked through `OdeSystem::admits`.
+If any cell average in a stage input ($u^{(1)}$ in `Heun`) or candidate $u^{n+1}$ is inadmissible, the trial is rejected without changing the accepted state and retried with half the step size.
+Values are never clipped.
+If a retry step falls below the minimum from `OdeOptions::with_minimum_step` or floating-point time cannot advance, integration stops with `StepSizeLimit` and returns the last accepted state (a partial result).
+Calling `rhs` directly with an inadmissible state produces an `InvalidInput` error (argument `y`).
+
+Explicit Runge–Kutta methods receive the first residual at the accepted state and the CFL limit together through `OdeSystem::rhs_with_step_limit`, avoiding an extra residual evaluation for the limit.
+Each step is the minimum of the method's proposed step, $\Delta t_{\max}$, the maximum step in `OdeOptions`, and the remaining interval.
+Because `ForwardEuler` and `Heun` are fixed-step methods, passing a large value to `with_initial_step` makes every step equal to $\Delta t_{\max}$.
+Other methods receive the same limit through `step_limit`, which evaluates the residual once more.
+`ConservationSystem::report(time, state, execution)` returns a `ConservationReport` for one residual evaluation without retaining a cache.
+
+## Spatial plans and workspaces
+
+A spatial plan prepares and stores mesh geometry, face pairs, reconstruction stencils, and boundary conditions.
+
+- `StructuredConservationPlan::new(mesh, conditions)` and `with_options(mesh, conditions, options)`: structured grids of segments, quadrilaterals, or hexahedra (`CellMesh`).
+  `conditions` is a sequence of `(BoundarySet, ConservationBoundary)` pairs that must cover each bounded exterior face exactly once.
+  Do not place conditions at periodic seams.
+- `SimplexConservationPlan::new(mesh, tags, conditions)` and `with_options(mesh, tags, conditions, options)`: triangles and tetrahedra (`SimplexMesh`, $D = 2, 3$).
+  `SimplexBoundaryTags` supplies a tag per exterior face, and `conditions` contains one `(u32, ConservationBoundary)` per tag.
+  Untagged exterior faces, tags without conditions, duplicate conditions, and unused conditions are rejected.
+
+`ConservationOptions::new()` selects constant reconstruction, $\nu = 0.45$, sequential execution, and no resource limits.
+Change these through `with_reconstruction`, `with_cfl`, `with_execution_policy`, and `with_limits`, and read them with the corresponding accessors.
+The execution policy deterministically divides independent cell and face operations among at most 32 workers.
+`ConservationLimits::new(max_unknowns, max_faces, max_storage_bytes)` limits cell unknowns across all components, face counts including duplicated periodic seams, and bytes for preparation and one workspace; exceeding a limit makes preparation fail with `InvalidInput`.
+The byte estimate excludes the mesh, boundary callbacks, ODE storage, and output fields; read it through the plan's `storage_bound()`.
+
+The main plan methods are as follows.
+
+- `mesh()`, `centers()`, `volumes()`, `unknowns()`: the mesh, cell centroids, cell measures, and ODE component count (cell count × $N$).
+- `workspace()`: allocates a `ConservationWorkspace`.
+  It can be reused with plans of the same dimensions, and successful evaluations allocate no library storage, including on the first evaluation.
+- `residual_into(equation, flux, time, state, output, workspace, execution)`: writes the mass-normalized residual to `output` and returns `ConservationReport`.
+  Its cost is $O((\text{cells} + \text{faces})\,N D)$, and failure leaves `output` unchanged.
+- `face_fluxes_into(...)`: writes oriented fluxes multiplied by face measure in canonical face order.
+  Duplicated faces at periodic seams receive the same flux.
+- `bind`, `initial_state(equation, field)`, `field(equation, state)`: construct an ODE system and convert between typed fields and ODE state vectors.
+  Both conversions reject inadmissible states.
+
+## When the CFL limit is not exposed
+
+The next cell advances Toro's double-rarefaction problem ($\rho = 1$, $p = 0.4$, $u = -2$ for $x < 0.5$, $u = 2$ for $x > 0.5$, $\gamma = 1.4$) to time 0.15 on 200 cells over $[0, 1]$, using `Hllc`, MC reconstruction, and transmissive boundaries.
+A region with density and pressure near 0 forms in the center, making admissibility checks likely to act.
+With the same initial step $\Delta t_0$, it compares passing `ConservationSystem` directly with passing a system forwarding only `rhs` and `admits`, hiding the CFL limit.
+The latter tries steps of size $\Delta t_0$; inadmissible stage inputs or candidates are rejected and the step is halved.
+The table shows termination reasons, accepted and rejected counts, minimum density and pressure over accepted states, and `ConservationReport` values for the final state.
+
+```rust
+//| id: pde-conservation-admissibility-retry
+//| ref: pde-conservation-admissibility-retry
+//| title: "Compare double-rarefaction steps and rejections with and without a CFL limit"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-ode, scioxide-pde, scioxide-spatial]
+//| inputs:
+//|   method: {"type":"select","label":"Time integration method","options":["Heun","ForwardEuler"],"value":"Heun"}
+//|   cfl: {"type":"range","label":"Courant number ν [-]","description":"Coefficient in the CFL limit Δt_max = ν|K|/Σ|f|s_f.","min":0.05,"max":0.5,"step":0.05,"value":0.45}
+//|   initial_step: {"type":"range","label":"Initial-step exponent p (Δt₀ = 10^p)","min":-4,"max":-1,"step":0.5,"value":-2}
+//| cases:
+//|   - {"id":"forward-euler","label":"ForwardEuler","description":"Forward Euler also proceeds at a constant step after three rejections when CFL is hidden.","inputs":{"method":"ForwardEuler"}}
+//|   - {"id":"large-step","label":"Δt₀ = 0.1","description":"A larger initial step increases rejections to six, then advances to the end at the admissible step 0.1/64.","inputs":{"initial_step":-1}}
+//|   - {"id":"half-cfl","label":"ν = 0.25","description":"Reducing the Courant number decreases steps and increases the accepted count for the run exposing CFL.","inputs":{"cfl":0.25}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"runs","path":"/rows/0/1","equals":"ReachedEnd"}
+//|       - {"artifact":"runs","path":"/rows/0/2","equals":367}
+//|       - {"artifact":"runs","path":"/rows/0/3","equals":0}
+//|       - {"artifact":"runs","path":"/rows/1/2","equals":120}
+//|       - {"artifact":"runs","path":"/rows/1/3","equals":3}
+//|       - {"artifact":"runs","path":"/rows/0/5","approx":{"value":0.0067097975,"rtol":1e-5}}
+//|       - {"artifact":"runs","path":"/rows/0/8","approx":{"value":0.00040933879,"rtol":1e-5}}
+//|   - case: forward-euler
+//|     expect:
+//|       - {"artifact":"runs","path":"/rows/1/3","equals":3}
+//|       - {"artifact":"runs","path":"/rows/0/1","equals":"ReachedEnd"}
+//|   - case: large-step
+//|     expect:
+//|       - {"artifact":"runs","path":"/rows/1/3","equals":6}
+//|       - {"artifact":"runs","path":"/rows/1/2","equals":96}
+//|   - case: half-cfl
+//|     expect:
+//|       - {"artifact":"runs","path":"/rows/0/3","equals":0}
+use scioxide_core::{ExecutionContext, SciOxideError, RealScalar, SolveContext};
+use scioxide_ode::{ForwardEuler, Heun, OdeMethod, OdeOptions, OdeOutputSchedule, OdeProblem};
+use scioxide_ode::{OdeState, OdeSystem};
+use scioxide_pde::{ConservationBoundary, ConservationOptions, Hllc, IdealGasEuler};
+use scioxide_pde::{ConservationReconstruction, StructuredConservationPlan};
+use scioxide_spatial::SegmentMesh;
+use scioxide_spatial::{AxisSide, AxisTopology, BoundarySet, CellField, CoordinateAxis, Grid1d};
+
+// A system forwarding only rhs and admits, without exposing a CFL limit (step_limit, etc.).
+struct WithoutCfl<'a, S>(&'a S);
+impl<S: OdeSystem<f64>> OdeSystem<f64> for WithoutCfl<'_, S> {
+    fn dimension(&self) -> usize {
+        self.0.dimension()
+    }
+    fn rhs(
+        &self,
+        t: f64,
+        y: &[f64],
+        out: &mut [f64],
+        cx: &mut SolveContext<'_, '_>,
+    ) -> Result<(), SciOxideError> {
+        self.0.rhs(t, y, out, cx)
+    }
+    fn admits(
+        &self,
+        t: f64,
+        y: &[f64],
+        cx: &mut SolveContext<'_, '_>,
+    ) -> Result<bool, SciOxideError> {
+        self.0.admits(t, y, cx)
+    }
+}
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let gas = IdealGasEuler::new(1.4).map_err(|e| e.to_string())?;
+let execution = ExecutionContext::sequential();
+let mut rows = Vec::new();
+for advertised in [true, false] {
+    let axis = CoordinateAxis::uniform(0.0, 1.0, 201).map_err(|e| e.to_string())?;
+    let grid = Grid1d::new([axis], [AxisTopology::Bounded]).map_err(|e| e.to_string())?;
+    let mesh = SegmentMesh::new(grid).map_err(|e| e.to_string())?;
+    let start = BoundarySet::axis_side(&mesh, 0, AxisSide::Start).map_err(|e| e.to_string())?;
+    let finish = BoundarySet::axis_side(&mesh, 0, AxisSide::End).map_err(|e| e.to_string())?;
+    let conditions = vec![
+        (start, ConservationBoundary::Transmissive),
+        (finish, ConservationBoundary::Transmissive),
+    ];
+    let options = ConservationOptions::new()
+        .with_reconstruction(ConservationReconstruction::MonotonizedCentral)
+        .with_cfl(cfl);
+    let plan = StructuredConservationPlan::with_options(mesh, conditions, options)
+        .map_err(|e| e.to_string())?;
+    let values = plan
+        .centers()
+        .iter()
+        .map(|x| gas.conserved(1.0, [if x[0] < 0.5 { -2.0 } else { 2.0 }], 0.4))
+        .collect::<Result<Vec<[f64; 3]>, _>>()
+        .map_err(|e| e.to_string())?;
+    let field = CellField::new(plan.mesh(), values).map_err(|e| e.to_string())?;
+    let mut workspace = plan.workspace().map_err(|e| e.to_string())?;
+    let bound = plan
+        .bind(&gas, &Hllc, &mut workspace)
+        .map_err(|e| e.to_string())?;
+    let hidden = WithoutCfl(&bound);
+    let system: &dyn OdeSystem<f64> = if advertised { &bound } else { &hidden };
+    let problem = OdeProblem::new(system, 0.15);
+    let options = OdeOptions::new()
+        .with_initial_step(RealScalar::powf(10.0, initial_step))
+        .with_output_schedule(OdeOutputSchedule::AcceptedSteps);
+    let vector = plan
+        .initial_state(&gas, field.view())
+        .map_err(|e| e.to_string())?;
+    let mut state = OdeState::new(0.0, vector);
+    // Minimum density and pressure over accepted states. Every accepted state is admissible.
+    let (mut density, mut pressure) = (f64::INFINITY, f64::INFINITY);
+    let mut sink = |_: f64, y: &[f64]| {
+        for u in y.as_chunks::<3>().0 {
+            density = RealScalar::min(density, u[0]);
+            pressure = RealScalar::min(pressure, gas.pressure::<1, 3>(u)?);
+        }
+        Ok(())
+    };
+    let solve = if method == "Heun" {
+        let ode = Heun::new();
+        let mut work = ode
+            .workspace(&problem, &options)
+            .map_err(|e| e.to_string())?;
+        ode.advance(
+            &problem, &options, &mut state, &mut sink, &mut work, execution,
+        )
+    } else {
+        let ode = ForwardEuler::new();
+        let mut work = ode
+            .workspace(&problem, &options)
+            .map_err(|e| e.to_string())?;
+        ode.advance(
+            &problem, &options, &mut state, &mut sink, &mut work, execution,
+        )
+    }
+    .map_err(|e| e.to_string())?;
+    let report = bound
+        .report(state.time(), state.values(), execution)
+        .map_err(|e| e.to_string())?;
+    rows.push((
+        if advertised {
+            "CFL exposed"
+        } else {
+            "CFL hidden"
+        },
+        solve.termination().map_or("None".into(), |t| t.to_string()),
+        solve.accepted_steps(),
+        solve.rejected_steps(),
+        solve.final_time(),
+        density,
+        pressure,
+        report.hlle_fallback_faces(),
+        report.maximum_step(),
+    ));
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "System" },
+    { "key": "1", "label": "Termination reason" },
+    { "key": "2", "label": "Accepted [count]", "type": "integer" },
+    { "key": "3", "label": "Rejected [count]", "type": "integer" },
+    { "key": "4", "label": "Final time [-]", "type": "number", "format": { "significantDigits": 6 } },
+    { "key": "5", "label": "Minimum density [-]", "type": "number", "format": sci3 },
+    { "key": "6", "label": "Minimum pressure [-]", "type": "number", "format": sci3 },
+    { "key": "7", "label": "Faces using HLLE fallback [count]", "type": "integer" },
+    { "key": "8", "label": "Last Δt_max [-]", "type": "number", "format": sci3, "nullText": "None" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "runs" })
+);
+```
+
+At the defaults (`Heun`, $\nu = 0.45$, $\Delta t_0 = 10^{-2}$), the run exposing the CFL limit accepted 367 steps with no rejections.
+The final state's $\Delta t_{\max}$ is $4.09 \times 10^{-4}$, and the maximum signal speed is about 2.75, so the usual Courant number $s\Delta t/h$ is 0.225.
+With the limit hidden, trials at $\Delta t_0 = 10^{-2}$ were rejected three times, reducing the step to $1.25 \times 10^{-3}$; 120 steps of that size reached the end.
+For fixed-step methods, the step halved by rejection becomes the step for subsequent advances.
+This step corresponds to a Courant number of about 0.69, exceeding the theoretical range in the preceding section, but every accepted state was admissible and the run ended with `ReachedEnd`.
+
+In both runs, the minimum density over accepted states ($6.7 \times 10^{-3}$ and $7.5 \times 10^{-3}$) is below the exact central density $\rho^* = 0.0219$.
+This difference is spatial discretization error; in the double-rarefaction computation in [Sod's shock tube](../../examples/sod-shock-tube/), density error decreases with more cells.
+Admissibility checks catch violations of positivity and retry trials, but do not guarantee step stability or solution accuracy.
+Let steps follow the CFL limit and use admissibility checks as protection against its being a local estimate.
+
+## Summary
+
+Choose explicit steps so that each cell satisfies $\Delta t \sum_f |f| s_f \le \nu |K|$.
+`ConservationReport::maximum_step` returns this limit at every residual evaluation, and `ConservationSystem` passes it to explicit Runge–Kutta methods together with the first residual, so step control needs no additional evaluation.
+The SSP methods `ForwardEuler` and `Heun` preserve forward Euler's maximum principle and TVD properties under this limit.
+Positive density and pressure are checked stage by stage through `admits`; inadmissible trials are rejected and the step halved, and reaching the minimum step stops with a `StepSizeLimit` partial result.
+Because admissibility checks do not replace stability, pass the system exposing its limit directly to `OdeMethod`.
+
+## Further reading
+
+- [Conservation-law reconstruction and boundaries](../conservation-reconstruction/) explains why face bounds preserve a maximum principle even with second-order reconstruction.
+- [The wave equation and CFL conditions](../hyperbolic-waves-and-cfl/) examines CFL conditions and numerical dispersion for the linear wave equation.
+- [Sod's shock tube](../../examples/sod-shock-tube/) solves an Euler shock tube with this time integration and checks conserved-quantity balances.
+- [Explicit Runge–Kutta methods in scioxide-ode](../../../scioxide-ode/algorithms/explicit-runge-kutta-and-control/) examines the stability regions and step control of `Heun` and `ForwardEuler`.

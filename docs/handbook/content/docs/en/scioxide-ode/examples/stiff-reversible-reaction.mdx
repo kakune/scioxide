@@ -1,0 +1,428 @@
+---
+title: "Stiff reversible reactions and damping in implicit methods"
+description: "Solve reversible first-order A ⇄ B relaxation with fixed-step backward Euler and implicit trapezoidal, comparing analytical solutions, invariants, and one-step amplification, then compare minimum concentrations under step changes with Alexander SDIRK."
+sidebar:
+  order: 415
+references:
+  ode-reversible-reaction-amplification: "step-size-and-minimum-concentration"
+---
+
+Chemical and combustion models combine short-lived intermediates (timescales around 10⁻⁸ s) with main-reactant changes (around 10² s), producing strong stiffness.
+Explicit steps are limited by the fastest-decaying component's stability, requiring many steps even to follow slow changes.
+This page uses reversible first-order reactions as a minimal stiff system with adjustable relaxation rate.
+Compare fixed-step backward Euler (`BackwardEuler`) and implicit trapezoidal (`ImplicitTrapezoid`) against analytical solutions, using amplification to examine negative concentrations.
+
+## Reversible first-order reactions and eigenvalues
+
+For the reversible first-order reaction between species A and B,
+
+$$
+\mathrm{A} \underset{k_r}{\overset{k_f}{\rightleftharpoons}} \mathrm{B}
+$$
+
+concentrations $A(t)$ and $B(t)$ [mol/L] satisfy, with forward and reverse constants $k_f$ and $k_r$ [1/s],
+
+$$
+\frac{dA}{dt} = -k_f A + k_r B, \qquad \frac{dB}{dt} = k_f A - k_r B
+$$
+
+
+Adding equations gives $(A + B)' = 0$, conserving total concentration $M = A + B$.
+Substituting $B = M - A$ gives the equation for $A$ alone,
+
+$$
+\frac{dA}{dt} = -(k_f + k_r) A + k_r M = -\lambda (A - A_{\mathrm{eq}})
+$$
+
+
+Relaxation rate $\lambda$ [1/s] and equilibrium concentration $A_{\mathrm{eq}}$ are
+
+$$
+\lambda = k_f + k_r, \qquad A_{\mathrm{eq}} = \frac{k_r}{k_f + k_r} M
+$$
+
+with analytical solution
+
+$$
+A(t) = A_{\mathrm{eq}} + (A(0) - A_{\mathrm{eq}}) e^{-\lambda t}
+$$
+
+
+Jacobian eigenvalues are $0$ (total conservation) and $-\lambda$ (relaxation).
+Large $\lambda$ makes relaxation rapid, but explicit Euler remains restricted to $h < 2/\lambda$ for stability even after equilibrium.
+
+## Amplification factors
+
+For linear systems, each step multiplies $A - A_{\mathrm{eq}}$ by amplification factor $R(-z)$.
+Here $z = h\lambda$ is dimensionless step size and $R$ the method's stability function.
+
+$$
+R_{\mathrm{BE}}(-z) = \frac{1}{1 + z}, \qquad
+R_{\mathrm{TR}}(-z) = \frac{1 - z/2}{1 + z/2}
+$$
+
+Backward Euler's $R_{\mathrm{BE}}$ stays between 0 and 1 for $z > 0$, approaching zero as $z \to \infty$ (L-stable).
+Implicit trapezoidal's $R_{\mathrm{TR}}$ satisfies $\lvert R \rvert \le 1$ (A-stable), but becomes negative for $z > 2$ and approaches $-1$ as $z \to \infty$.
+Negative $R$ makes the otherwise monotonically decaying $A - A_{\mathrm{eq}}$ alternate sign each step.
+For $A_0 > A_{\mathrm{eq}}$, the first step gives negative $A_1 = A_{\mathrm{eq}} + R(-z)(A_0 - A_{\mathrm{eq}})$ when
+
+$$
+R(-z) < -\frac{A_{\mathrm{eq}}}{A_0 - A_{\mathrm{eq}}}
+$$
+
+
+[Error, order, and stability](../../algorithms/error-order-and-stability/) defines stability functions and L-stability.
+
+The following block supplies shared definitions for this page's cells.
+The type `Reaction` supplies the right-hand side and constant Jacobian, declaring constancy through `jacobian_is_constant`.
+The function `march` advances a supplied fixed-step method for `steps` steps of size $h$, returning every accepted state.
+
+```rust
+//| id: ode-stiff-reaction-model
+//| kind: definitions
+//| title: "Reversible-reaction right-hand side, constant Jacobian, and fixed-step integration"
+//| crates: [scioxide-core, scioxide-linalg, scioxide-ode]
+use scioxide_core::{SciOxideError, SolveContext};
+use scioxide_linalg::{MatrixViewMut, Vector};
+use scioxide_ode::{
+    OdeMethod, OdeOptions, OdeOutputSchedule, OdeProblem, OdeState, OdeSystem, OdeTrajectory,
+};
+
+/// A′ = −k_f A + k_r B, B′ = k_f A − k_r B. Component order (A, B).
+pub(crate) struct Reaction {
+    pub(crate) kf: f64,
+    pub(crate) kr: f64,
+}
+
+impl OdeSystem<f64> for Reaction {
+    fn dimension(&self) -> usize {
+        2
+    }
+
+    fn rhs(
+        &self,
+        _: f64,
+        y: &[f64],
+        out: &mut [f64],
+        _: &mut SolveContext<'_, '_>,
+    ) -> Result<(), SciOxideError> {
+        let rate = self.kf * y[0] - self.kr * y[1];
+        out[0] = -rate;
+        out[1] = rate;
+        Ok(())
+    }
+
+    fn jacobian(
+        &self,
+        _: f64,
+        _: &[f64],
+        j: &mut MatrixViewMut<'_, f64>,
+        _: &mut SolveContext<'_, '_>,
+    ) -> Result<Option<()>, SciOxideError> {
+        j.set(0, 0, -self.kf)?;
+        j.set(0, 1, self.kr)?;
+        j.set(1, 0, self.kf)?;
+        j.set(1, 1, -self.kr)?;
+        Ok(Some(()))
+    }
+
+    fn jacobian_is_constant(&self) -> bool {
+        true
+    }
+}
+
+/// Advance a fixed-step method from (A₀, M − A₀) for `steps` steps of size h.
+/// Without a step limit, failed stage solves return errors.
+pub(crate) fn march<M: OdeMethod<f64> + Clone>(
+    method: &M,
+    reaction: &Reaction,
+    initial_a: f64,
+    total: f64,
+    step: f64,
+    steps: usize,
+) -> Result<OdeTrajectory<f64>, SciOxideError> {
+    let options = OdeOptions::new()
+        .with_initial_step(step)
+        .with_output_schedule(OdeOutputSchedule::AcceptedSteps);
+    let problem = OdeProblem::new(reaction, step * steps as f64);
+    let initial = OdeState::new(0.0, Vector::from_vec(vec![initial_a, total - initial_a]));
+    let solution = method
+        .solve(&problem, &options, initial)
+        .map_err(SciOxideError::from)?;
+    let (_, _, path) = solution.into_parts();
+    Ok(path)
+}
+```
+
+## Fixed-step implicit integration
+
+The next cell advances `BackwardEuler` (first-order, L-stable) and `ImplicitTrapezoid` (second-order, A-stable) for 40 common fixed steps $h$, comparing with the analytical solution.
+Fixed-step methods keep the `OdeOptions::with_initial_step` size without error estimation or step adjustment.
+The plot shows both methods' $A(t)$ and the dashed analytical solution, with horizontal equilibrium concentration.
+The upper table gives first-step ratio $(A_1 - A_{\mathrm{eq}})/(A_0 - A_{\mathrm{eq}})$ (measured amplification), maximum analytical difference, minimum $A$, and maximum total-$A + B$ error.
+The lower table gives $z$ and amplification-formula values.
+
+```rust
+//| id: ode-stiff-reaction-solve
+//| ref: ode-stiff-reaction-solve
+//| title: "Solve stiff reversible reactions with backward Euler and implicit trapezoidal"
+//| run: reactive
+//| uses: [ode-stiff-reaction-model]
+//| crates: [scioxide-core, scioxide-linalg, scioxide-ode]
+//| inputs:
+//|   forward_rate: {"type":"range","label":"Forward rate constant k_f [1/s]","min":10,"max":200,"step":10,"value":100}
+//|   reverse_rate: {"type":"range","label":"Reverse rate constant k_r [1/s]","min":2,"max":40,"step":2,"value":20}
+//|   stiff_step_size: {"type":"range","label":"Step size h [s]","description":"Vary dimensionless z = h(k_f + k_r).","min":0.005,"max":0.1,"step":0.005,"value":0.04}
+//|   initial_a: {"type":"range","label":"Initial concentration A₀ [mol/L]","min":0,"max":2,"step":0.1,"value":1.5}
+//|   total_mass: {"type":"range","label":"Total concentration M = A + B [mol/L]","min":1,"max":3,"step":0.1,"value":2}
+//| cases:
+//|   - {"id":"small-step","label":"h = 0.005 s（z = 0.6）","description":"At z < 2, implicit trapezoidal also has a positive ratio and less error than backward Euler.","inputs":{"stiff_step_size":0.005}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/0/1","approx":{"value":0.1724137931,"rtol":1e-9}}
+//|       - {"artifact":"methods","path":"/rows/1/1","approx":{"value":-0.4117647059,"rtol":1e-9}}
+//|       - {"artifact":"methods","path":"/rows/1/3","range":{"max":0}}
+//|       - {"artifact":"methods","path":"/rows/0/4","range":{"max":1e-14}}
+//|   - case: small-step
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/1/1","approx":{"value":0.5384615385,"rtol":1e-9}}
+use scioxide_ode::{BackwardEuler, ImplicitTrapezoid};
+
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let fixed4 = serde_json::json!({ "fractionDigits": 4 });
+let reaction = Reaction {
+    kf: forward_rate,
+    kr: reverse_rate,
+};
+let (h, m, steps) = (stiff_step_size, total_mass, 40);
+let lambda = reaction.kf + reaction.kr;
+let a_eq = reaction.kr * m / lambda;
+// Independent check: analytical A(t) = A_eq + (A₀ − A_eq) e^{−λt} (f64 standard function).
+let exact = |t: f64| a_eq + (initial_a - a_eq) * (-lambda * t).exp();
+let backward = march(&BackwardEuler::new(), &reaction, initial_a, m, h, steps)
+    .map_err(|e| e.to_string())?;
+let trapezoid = march(&ImplicitTrapezoid::new(), &reaction, initial_a, m, h, steps)
+    .map_err(|e| e.to_string())?;
+let exact_curve: Vec<[f64; 2]> = (0..=4 * steps)
+    .map(|i| {
+        let t = h * i as f64 / 4.0;
+        [t, exact(t)]
+    })
+    .collect();
+let mut series = vec![serde_json::json!({
+    "name": "Analytical",
+    "points": exact_curve,
+    "style": { "lineType": "dashed", "showSymbol": false }
+})];
+let mut rows = Vec::new();
+for (name, path) in [("Backward Euler", &backward), ("Implicit trapezoidal", &trapezoid)] {
+    let points: Vec<[f64; 2]> = path
+        .times()
+        .iter()
+        .zip(path.states())
+        .map(|(&t, y)| [t, y.as_slice()[0]])
+        .collect();
+    let error = points
+        .iter()
+        .map(|p| (p[1] - exact(p[0])).abs())
+        .fold(0.0_f64, f64::max);
+    let minimum = points.iter().map(|p| p[1]).fold(f64::INFINITY, f64::min);
+    let mass = path
+        .states()
+        .iter()
+        .map(|y| (y.as_slice()[0] + y.as_slice()[1] - m).abs())
+        .fold(0.0_f64, f64::max);
+    // First-step ratio (A₁ − A_eq)/(A₀ − A_eq) measures amplification R(−z). Undefined if A₀ = A_eq.
+    let ratio = (initial_a != a_eq).then(|| (points[1][1] - a_eq) / (initial_a - a_eq));
+    rows.push((
+        name.to_string(),
+        ratio,
+        error,
+        minimum,
+        mass,
+        path.times().len() - 1,
+    ));
+    series.push(serde_json::json!({ "name": name, "points": points }));
+}
+emit_line_chart!(
+    &series,
+    options = &serde_json::json!({
+        "xLabel": "Time t [s]",
+        "yLabel": "A concentration [mol/L]",
+        "annotations": [{ "kind": "line", "axis": "y", "value": a_eq, "label": "A_eq" }]
+    })
+);
+let columns = serde_json::json!([
+    { "key": "0", "label": "Method" },
+    { "key": "1", "label": "First-step ratio [-]", "type": "number", "format": fixed4, "nullText": "Undefined" },
+    { "key": "2", "label": "Maximum analytical difference [mol/L]", "type": "number", "format": sci2 },
+    { "key": "3", "label": "Minimum A [mol/L]", "type": "number", "format": fixed4 },
+    { "key": "4", "label": "max |A + B − M| [mol/L]", "type": "number", "format": sci2 },
+    { "key": "5", "label": "Step count", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "methods" })
+);
+let z = h * lambda;
+let factor_columns = serde_json::json!([
+    { "key": "0", "label": "z = hλ [-]", "type": "number", "format": { "fractionDigits": 2 } },
+    { "key": "1", "label": "A_eq [mol/L]", "type": "number", "format": fixed4 },
+    { "key": "2", "label": "1/(1 + z) [-]", "type": "number", "format": fixed4 },
+    { "key": "3", "label": "(1 − z/2)/(1 + z/2) [-]", "type": "number", "format": fixed4 }
+]);
+emit_table_with_columns!(
+    factor_columns,
+    vec![(z, a_eq, 1.0 / (1.0 + z), (1.0 - z / 2.0) / (1.0 + z / 2.0))],
+    metadata = serde_json::json!({ "id": "factors" })
+);
+```
+
+With defaults ($k_f = 100$, $k_r = 20$ s⁻¹, $h = 0.04$ s, $A_0 = 1.5$, $M = 2$ mol/L), $z = h\lambda = 4.8$.
+First-step ratios are 0.1724 for backward Euler and $-0.4118$ for implicit trapezoidal, matching formulas $1/(1 + z)$ and $(1 - z/2)/(1 + z/2)$.
+Implicit trapezoidal's $A$ oscillates around equilibrium 0.3333, reaching negative $-0.1471$ mol/L.
+Backward Euler's $A$ approaches equilibrium monotonically.
+Maximum analytical differences occur at the rapid-relaxation first step for both: 0.19 mol/L for backward Euler and 0.49 mol/L for implicit trapezoidal.
+Total $A + B$ errors stay at most $2 \times 10^{-15}$ mol/L for both; Runge–Kutta preserves linear invariants provided stage equations are solved.
+At $h = 0.005$ s ($z = 0.6$), implicit trapezoidal's ratio is also positive (0.5385), with maximum analytical difference 0.013 mol/L versus backward Euler's 0.10 mol/L.
+For $z < 2$, second-order implicit trapezoidal has smaller error; at large $z$, backward Euler's fast-component damping gives smaller error.
+
+## Step size and minimum concentration
+
+The next cell fixes $k_f = 100$, $k_r = 20$ s⁻¹ ($\lambda = 120$ s⁻¹), $A_0 = 1.5$, and $M = 2$ mol/L ($A_{\mathrm{eq}} = 1/3$), taking 40 steps for 40 choices of $z = h\lambda$ from 0.25 to the upper limit.
+Compare backward Euler and implicit trapezoidal with three-stage third-order L-stable SDIRK (`Sdirk`, Alexander coefficients).
+The upper plot shows first-step ratios and the lower minimum $A$ over 40 steps, sharing horizontal axis $z$.
+The table shows every eighth $z$ choice.
+
+```rust
+//| id: ode-stiff-amplification-comparison
+//| ref: ode-stiff-amplification-comparison
+//| title: "Vary steps to measure minimum concentrations and one-step amplification"
+//| run: reactive
+//| uses: [ode-stiff-reaction-model]
+//| crates: [scioxide-core, scioxide-linalg, scioxide-ode]
+//| inputs:
+//|   amplification_maximum_z: {"type":"range","label":"Upper limit of z = hλ [-]","description":"Vary z over 40 choices from 0.25 to this value.","min":2.5,"max":20,"step":0.5,"value":10}
+//| cases:
+//|   - {"id":"large-z","label":"z ≤ 20","description":"Larger z makes implicit trapezoidal's ratio approach −1.","inputs":{"amplification_maximum_z":20}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"sweep","path":"/rows/5/1","approx":{"value":0.0909090909,"rtol":1e-9}}
+//|       - {"artifact":"sweep","path":"/rows/5/3","approx":{"value":-0.6666666667,"rtol":1e-9}}
+//|       - {"artifact":"sweep","path":"/rows/5/2","approx":{"value":0.3333333333,"rtol":1e-9}}
+use scioxide_ode::{BackwardEuler, ImplicitTrapezoid, OdeTrajectory, Sdirk};
+
+let fixed4 = serde_json::json!({ "fractionDigits": 4 });
+let reaction = Reaction {
+    kf: 100.0,
+    kr: 20.0,
+};
+let (initial_a, total, a_eq) = (1.5, 2.0, 1.0 / 3.0);
+let names = ["Backward Euler", "Implicit trapezoidal", "SDIRK"];
+let (mut ratio, mut minimum) = (vec![Vec::new(); 3], vec![Vec::new(); 3]);
+let mut rows = Vec::new();
+for i in 0..40 {
+    let z = 0.25 + (amplification_maximum_z - 0.25) * f64::from(i) / 39.0;
+    let h = z / 120.0;
+    let paths: [OdeTrajectory<f64>; 3] = [
+        march(&BackwardEuler::new(), &reaction, initial_a, total, h, 40)
+            .map_err(|e| e.to_string())?,
+        march(
+            &ImplicitTrapezoid::new(),
+            &reaction,
+            initial_a,
+            total,
+            h,
+            40,
+        )
+        .map_err(|e| e.to_string())?,
+        march(&Sdirk::new(), &reaction, initial_a, total, h, 40).map_err(|e| e.to_string())?,
+    ];
+    let mut row = vec![z];
+    for (k, path) in paths.iter().enumerate() {
+        // First-step (A₁ − A_eq)/(A₀ − A_eq) measures amplification R(−z).
+        let r = (path.states()[1].as_slice()[0] - a_eq) / (initial_a - a_eq);
+        let low = path
+            .states()
+            .iter()
+            .map(|y| y.as_slice()[0])
+            .fold(f64::INFINITY, f64::min);
+        ratio[k].push([z, r]);
+        minimum[k].push([z, low]);
+        row.extend([r, low]);
+    }
+    if i % 8 == 0 || i == 39 {
+        rows.push((row[0], row[1], row[2], row[3], row[4], row[5], row[6]));
+    }
+}
+let series = |data: &[Vec<[f64; 2]>]| -> Vec<serde_json::Value> {
+    names
+        .iter()
+        .zip(data)
+        .map(|(name, points)| serde_json::json!({ "name": name, "points": points }))
+        .collect()
+};
+// Below R = 0, A − A_eq alternates sign each step.
+emit_line_chart!(
+    &series(&ratio),
+    options = &serde_json::json!({
+        "link": { "group": "reaction-z" },
+        "xLabel": "z = hλ [-]",
+        "yLabel": "First-step ratio [-]",
+        "annotations": [
+            { "kind": "line", "axis": "y", "value": 0.0 },
+            { "kind": "line", "axis": "y", "value": -1.0, "label": "R = −1" }
+        ]
+    })
+);
+emit_line_chart!(
+    &series(&minimum),
+    options = &serde_json::json!({
+        "link": { "group": "reaction-z" },
+        "xLabel": "z = hλ [-]",
+        "yLabel": "Minimum A over 40 steps [mol/L]",
+        "annotations": [{ "kind": "line", "axis": "y", "value": 0.0, "label": "A = 0" }]
+    })
+);
+let columns = serde_json::json!([
+    { "key": "0", "label": "z [-]", "type": "number", "format": { "fractionDigits": 2 } },
+    { "key": "1", "label": "Backward Euler ratio [-]", "type": "number", "format": fixed4 },
+    { "key": "2", "label": "Backward Euler minimum A [mol/L]", "type": "number", "format": fixed4 },
+    { "key": "3", "label": "Implicit trapezoidal ratio [-]", "type": "number", "format": fixed4 },
+    { "key": "4", "label": "Implicit trapezoidal minimum A [mol/L]", "type": "number", "format": fixed4 },
+    { "key": "5", "label": "SDIRK ratio [-]", "type": "number", "format": fixed4 },
+    { "key": "6", "label": "SDIRK minimum A [mol/L]", "type": "number", "format": fixed4 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "sweep" })
+);
+```
+
+Implicit trapezoidal's ratio becomes negative at $z > 2$, equals $-0.6667$ at $z = 10$, and near $z = 20$ falls below $-0.8$ toward $-1$.
+Negative-$A$ condition $R(-z) < -A_{\mathrm{eq}}/(A_0 - A_{\mathrm{eq}}) = -2/7 \approx -0.286$ corresponds to $z > 3.6$ for implicit trapezoidal.
+The table gives minimum $A$ of $-0.0867$ mol/L at $z = 4.25$ and $-0.4444$ mol/L at $z = 10$.
+Backward Euler ratio $1/(1 + z)$ remains between 0 and 1 for every $z$, keeping minimum $A$ at equilibrium 0.3333.
+
+The method `Sdirk` is also L-stable but has negative ratios $-0.0855$ at $z = 4.25$ and $-0.1302$ at $z = 8.25$.
+L-stability requires only A-stability and $R \to 0$ as $z \to \infty$, not nonnegative $R$ at intermediate $z$.
+Here `Sdirk` ratios never fall below $-0.286$, keeping minimum $A$ at least 0.18 mol/L; concentrations can become negative in problems with $A_{\mathrm{eq}}/(A_0 - A_{\mathrm{eq}})$ below 0.13 (equilibrium much smaller than initial concentration).
+When nonnegativity matters, check the stability function's sign for each method.
+
+## Summary
+
+For stiff systems, stability rather than accuracy determines explicit step size.
+Fixed-step implicit methods avoid divergence at large steps, but A-stable implicit trapezoidal leaves fast components as sign-alternating oscillations at $z > 2$ and can produce negative concentrations.
+Backward Euler amplification $0 < R < 1$ gives monotone concentration convergence to equilibrium, but only first-order accuracy.
+Even L-stable `Sdirk` can have negative amplification; check nonnegativity through each stability function.
+For stiff problems requiring both accuracy and stability, use adaptive `RadauIia` or `Bdf` ([Choosing a method](../../choosing/)).
+
+## Further reading
+
+- [Implicit Runge–Kutta methods and mass matrices](../../algorithms/implicit-runge-kutta-and-mass-matrices/): examine stage equations and stability of `BackwardEuler`, `ImplicitTrapezoid`, `Sdirk`, and `RadauIia`.
+- [Error, order, and stability](../../algorithms/error-order-and-stability/): examine A-stability versus L-stability and stability functions.
+- [Robertson kinetics and componentwise tolerances](../robertson-kinetics/): solve nonlinear reactions with widely separated timescales using adaptive methods.

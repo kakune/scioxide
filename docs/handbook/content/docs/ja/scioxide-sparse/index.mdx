@@ -1,0 +1,182 @@
+---
+title: 疎行列の格納・分解・前処理・グラフ
+description: 疎行列の正準な格納と組立て、積、疎な直接分解、反復法の前処理、並べ替えと彩色、グラフのアルゴリズムを提供する scioxide-sparse の役割、機能一覧、最初の計算と章の構成。
+sidebar:
+  order: 10
+---
+
+有限要素法や差分法の剛性行列、回路網の節点方程式、ネットワークの隣接行列は、ほとんどの成分が 0 の**疎行列**になる。
+未知数が $n = 10^6$ 個でも、各行の非零が十数個なら保存する成分は $O(n)$ 個で済むが、同じ行列を倍精度の密行列で持つと $8n^2$ バイト、すなわち 8 TB が必要になる。
+疎行列の計算では 0 でない位置と値だけを保存し、計算もその位置だけで済ませる。
+
+`scioxide-sparse` は、疎行列の格納と組立て、積、疎な直接分解、反復法の前処理、並べ替えと彩色、グラフのアルゴリズムを提供するクレートである。
+格納の形式は COO・CSR・CSC・BSR・DIA で、`SparseBuilder` による組立てでは、同じ位置の重複と値 0 の扱いを呼び出し側が明示する。
+直接分解は疎 LU・Cholesky・LDL・QR で、構造だけを見る記号解析と値を使う数値分解を分け、構造が同じなら記号解析を使い回せる。
+前処理は Jacobi、不完全分解、代数的多重格子（AMG）、重なりのある Schwarz 法で、scioxide-core の `Preconditioner` を実装する。
+三角格納の向き `Triangle`、対角の表し方 `DiagonalKind`、置換 `Permutation`、構造 `StructuralPattern`、作用素のトレイトは scioxide-core から使う。
+共役勾配法や GMRES などの反復解法は scioxide-linalg が提供し、この章の行列と前処理をそのまま渡せる。
+実数と複素数の `f32`、`f64` を扱える。
+
+## 最初の計算：三重対角行列の組立てと積
+
+次のセルは 3 つの未知数の三重対角行列 $\mathbf{A} = \mathrm{tridiag}(-1, \alpha, -1)$ を `SparseBuilder` で組み立てて CSR に確定する。
+$\alpha = 2$ なら 1 次元の Poisson 方程式の差分行列で、$\alpha > 2$ は対角を強めた行列である。
+続いて、$\mathbf{x} = (1, 2, 1)^{\mathsf{T}}$ に対する積 $\mathbf{y} = \mathbf{A}\mathbf{x}$ を `apply_into` で別の配列に求め、ワンショット関数（[呼び出しの形](oxref:sparse-execution-forms)）`solve` で $\mathbf{A}\hat{\mathbf{x}} = \mathbf{y}$ を解いて $\mathbf{x}$ に戻るかを確かめる。
+入力は対角の値 $\alpha$（2〜6）である。
+1 つ目の表は CSR が保存した成分を格納の順に並べ、2 つ目の表は積を手で求めた値 $(\alpha - 2,\ 2\alpha - 2,\ \alpha - 2)$ と、解き戻した $\hat{\mathbf{x}}$ の誤差を並べる。
+
+```rust
+//| id: sparse-intro-first-computation
+//| ref: sparse-intro-first-computation
+//| title: 三重対角行列の組立て、行列ベクトル積、解き戻し
+//| run: reactive
+//| crates: [scioxide-core, scioxide-sparse]
+//| inputs:
+//|   diff_scale: {"type":"range","label":"対角の値 α","description":"三重対角行列の主対角の値。2 なら 1 次元の差分ラプラシアン。","min":2.0,"max":6.0,"step":0.5,"value":2.0}
+//| cases:
+//|   - {"id":"stronger-diagonal","label":"α = 3","description":"対角を強めると積の各成分が増え、y = (1, 4, 1) になる。","inputs":{"diff_scale":3.0}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"csr","path":"/rows/6/1","equals":2}
+//|       - {"artifact":"csr","path":"/rows/6/2","equals":2}
+//|       - {"artifact":"csr","path":"/rows/1/3","approx":{"value":-1.0,"atol":1e-15}}
+//|       - {"artifact":"product","path":"/rows/0/2","approx":{"value":0.0,"atol":1e-15}}
+//|       - {"artifact":"product","path":"/rows/1/2","approx":{"value":2.0,"atol":1e-15}}
+//|       - {"artifact":"product","path":"/rows/1/5","range":{"max":1e-14}}
+//|   - case: stronger-diagonal
+//|     expect:
+//|       - {"artifact":"product","path":"/rows/0/2","approx":{"value":1.0,"atol":1e-15}}
+//|       - {"artifact":"product","path":"/rows/1/2","approx":{"value":4.0,"atol":1e-15}}
+//|       - {"artifact":"product","path":"/rows/2/5","range":{"max":1e-14}}
+use scioxide_core::LinearOperator;
+use scioxide_sparse::{DuplicatePolicy, ExplicitZeroPolicy, SparseBuilder};
+
+let n = 3;
+let mut builder = SparseBuilder::new(n, n);
+for i in 0..n {
+    builder.push(i, i, diff_scale).map_err(|e| e.to_string())?;
+    if i > 0 {
+        builder.push(i, i - 1, -1.0).map_err(|e| e.to_string())?;
+        builder.push(i - 1, i, -1.0).map_err(|e| e.to_string())?;
+    }
+}
+// 重複は起きないはずなので Reject で確かめ、値 0 の成分は取り除く。
+let a = builder
+    .finish_csr(DuplicatePolicy::Reject, ExplicitZeroPolicy::Drop)
+    .map_err(|e| e.to_string())?;
+// 格納位置 k の (行, 列, 値)。CSR は行ごとに列の昇順で並ぶ。
+let stored: Vec<(usize, usize, usize, f64)> = a
+    .iter()
+    .enumerate()
+    .map(|(k, (i, j, v))| (k, i, j, v))
+    .collect();
+
+let x = [1.0_f64, 2.0, 1.0];
+let mut y = [0.0; 3];
+// 作業領域の長さは apply_workspace_len() が返す。
+let mut work = vec![0.0; a.apply_workspace_len().map_err(|e| e.to_string())?];
+a.apply_into(&x, &mut y, &mut work)
+    .map_err(|e| e.to_string())?;
+// ワンショット関数 solve で A x̂ = y を解き、x に戻るかを見る。
+let x_hat = scioxide_sparse::solve(&a, &y).map_err(|e| e.to_string())?;
+// 独立検算: 手で求めた積。
+let expected = [diff_scale - 2.0, 2.0 * diff_scale - 2.0, diff_scale - 2.0];
+let rows: Vec<_> = (0..n)
+    .map(|i| {
+        (
+            i,
+            x[i],
+            y[i],
+            expected[i],
+            x_hat[i],
+            (x_hat[i] - x[i]).abs(),
+        )
+    })
+    .collect();
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let plain = serde_json::json!({ "significantDigits": 6 });
+let csr_columns = serde_json::json!([
+    { "key": "0", "label": "格納位置 k", "type": "integer" },
+    { "key": "1", "label": "行 i", "type": "integer" },
+    { "key": "2", "label": "列 j", "type": "integer" },
+    { "key": "3", "label": "値 a_ij [-]", "type": "number", "format": plain }
+]);
+emit_table_with_columns!(
+    csr_columns,
+    stored,
+    metadata = serde_json::json!({ "id": "csr" })
+);
+let product_columns = serde_json::json!([
+    { "key": "0", "label": "成分 i", "type": "integer" },
+    { "key": "1", "label": "x_i [-]", "type": "number", "format": plain },
+    { "key": "2", "label": "y_i（apply_into）[-]", "type": "number", "format": plain },
+    { "key": "3", "label": "y_i（手計算）[-]", "type": "number", "format": plain },
+    { "key": "4", "label": "x̂_i（solve）[-]", "type": "number", "format": plain },
+    { "key": "5", "label": "|x̂_i − x_i| [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    product_columns,
+    rows,
+    metadata = serde_json::json!({ "id": "product" })
+);
+```
+
+## 結果の読み方
+
+1 つ目の表には、対角 3 個と上下の隣 4 個の 7 個の成分が並び、$3 \times 3 = 9$ 個のうち 0 の 2 個は保存されない。
+成分は行の順に、同じ行の中では列の昇順に並ぶ。
+これが CSR の格納の順で、行ごとの区切りの位置を別の配列 `row_ptr()` が持つ（[疎行列の格納形式と組立て](algorithms/storage-and-assembly/)）。
+
+既定の $\alpha = 2$ では $\mathbf{y} = (0, 2, 0)$ で、手計算と一致する。
+$\alpha$ を増やすと、対角の寄与が増えた分だけ $\mathbf{y}$ の各成分が大きくなり、$\alpha = 3$ では $\mathbf{y} = (1, 4, 1)$ になる。
+`solve` で解き戻した $\hat{\mathbf{x}}$ は、入力の範囲のどの $\alpha$ でも $\mathbf{x}$ とビット単位で一致し、表の差は 0 になる。
+一般の行列では、解き戻した値の誤差は丸めと $\mathbf{A}$ の条件数で決まり、0 になるとは限らない。
+`solve` は呼ぶたびに行列を分解するので、同じ行列で何度も解くときは `SparseLu::new` で作った因子を残し、そのメソッド `lu.solve` を繰り返す。
+
+`apply_into` は長さを検査してから計算し、結果を作業領域にすべて求めてから $\mathbf{y}$ に写すので、失敗したときは $\mathbf{y}$ が変わらない。
+積の誤差限界と、一度だけ丸める `Exact` の算術は [行列ベクトル積と疎行列の積](algorithms/kernels-and-products/) で扱う。
+
+## 機能一覧
+
+次の表は機能ごとの主な型・関数と、それを扱うアルゴリズムのページを示す。
+「主な型・関数」の列はワンショット関数やコンストラクターを先に、設定や再利用のための型を後に並べる。
+
+| 機能 | 主な型・関数 | 扱うページ |
+|---|---|---|
+| 格納と組立て | `CsrMatrix::from_triplets`、`SparseBuilder`、`CooMatrix`、`CsrMatrix`、`CscMatrix`、`BsrMatrix`、`DiaMatrix`、`SparseView` | [疎行列の格納形式と組立て](algorithms/storage-and-assembly/) |
+| 積 | `LinearOperator` の実装、`CsrMatrix::multiply`、`SparseProductPlan`、`sparse_dense_into` | [行列ベクトル積と疎行列の積](algorithms/kernels-and-products/) |
+| 三角系と LU | `solve`、`SparseLu::new`、`SparseTriangular`、`SparseLuSymbolic`、`SparseLu` | [疎三角代入と疎 LU 分解](algorithms/triangular-and-sparse-lu/) |
+| 対称な分解と慣性 | `SparseCholesky::new`、`SparseLdl::new`、`SparseSymmetricSymbolic`、`LdlInertia` | [疎 Cholesky 分解とブロック LDL 分解](algorithms/symmetric-factorizations/) |
+| 最小二乗 | `least_squares`、`SparseQrMinimumNormPlan::new`、`SparseQrSymbolic`、`SparseQr` | [疎 QR 分解と最小二乗法](algorithms/sparse-qr-and-least-squares/) |
+| 並べ替えと彩色 | `approximate_minimum_degree`、`reverse_cuthill_mckee`、`derivative_coloring`、`SparseOrdering` | [並べ替えと彩色](algorithms/orderings-and-coloring/) |
+| 不完全分解 | `IncompleteFactor::ilu0`・`ic0`、`JacobiPreconditioner::new`、`IncompleteSymbolic`、`IncompleteFactor` | [不完全分解と反復法の前処理](algorithms/incomplete-factorizations/) |
+| 代数的多重格子 | `AmgPreconditioner::new`、`AmgHierarchy`、`AmgCycle` | [代数的多重格子による前処理](algorithms/algebraic-multigrid/) |
+| 領域分割 | `SchwarzPlan`、`SchwarzKind` | [重なりのある Schwarz 法](algorithms/overlapping-schwarz/) |
+| グラフ | `connected_components`、`laplacian`、`GraphPlan`、`LaplacianPlan` | [グラフの探索・連結成分・全域森・ラプラシアン](algorithms/graph-algorithms/) |
+| 最短路 | `shortest_paths`、`GraphPlan::shortest_paths`、`GraphPathMethod` | [最短路と負の閉路](algorithms/shortest-paths/) |
+| 流れとマッチング | `maximum_flow`、`maximum_bipartite_matching`、`MaxFlowPlan` | [最大流と二部マッチング](algorithms/flows-and-matchings/) |
+| 割当て | `minimum_cost_assignment`、`AssignmentPlan` | [線形割当て問題](algorithms/linear-assignment/) |
+
+## この章の構成
+
+1. [疎行列の形式・前処理・グラフ解法の選び方](choosing/)：問題の性質から使う格納形式、直接分解、前処理、グラフのアルゴリズム、呼び出しの形を選ぶ判断の流れ。
+2. [疎行列アルゴリズムの共通仕様と構成](algorithms/)：記号、構造と値の分離、呼び出しの形、上限と作業領域、失敗したときの出力の扱い、アルゴリズムのページ一覧。
+3. アルゴリズムのページ：格納と組立て、積、LU、Cholesky と LDL、QR、並べ替えと彩色、不完全分解、代数的多重格子、重なりのある Schwarz 法、グラフの探索とラプラシアン、最短路、最大流と二部マッチング、線形割当ての 13 ページ（機能一覧の表から入る）。
+4. [疎行列の例題](examples/)：ばね系、2 次元 Poisson 方程式、抵抗回路網、PageRank、多重格子、水準測量網、グラフ分割の 7 題。
+5. [疎行列の API ガイド](api/)：公開されているすべての項目の仕様を用途別の表で引く。
+
+## まとめ
+
+`scioxide-sparse` は、疎行列を正準な形式で持ち、確定した構造を変えずに値だけを更新する前提で、積、直接分解、前処理、グラフのアルゴリズムを提供する。
+組立てでは `SparseBuilder` に重複と値 0 の方針を明示し、一度だけ CSR か CSC に確定する。
+一回の求解なら `solve` や `least_squares` のようなワンショット関数で足り、同じ行列で何度も解くなら `SparseLu::new` などで因子を作って使い回す。
+構造が同じ行列の列では、記号解析と作業領域を残して `refactor` で数値分解だけを繰り返し、記号解析に上限を与えた形は使うメモリが上限を超えると `ResourceLimit` で止まる。
+出力を書き込む演算は失敗したときに出力も以前の因子も変えないので、エラーの分類 `e.kind()` を読んで直前の状態から計算を続けられる。
+
+## 次に読むページ
+
+- [疎行列の形式・前処理・グラフ解法の選び方](choosing/)：解く問題の性質から、使う型、アルゴリズム、呼び出しの形を選ぶ。
+- [疎行列アルゴリズムの共通仕様と構成](algorithms/)：構造と値の分離、呼び出しの形、上限など、アルゴリズムに共通の約束を確かめる。
+- [ばね系の局所寄与からの剛性行列の組立て](examples/spring-assembly/)：最初の例題で、局所の寄与から疎行列を組み立てる手順を確かめる。

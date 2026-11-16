@@ -1,0 +1,415 @@
+---
+title: 疎な多変数多項式
+description: 多重指数と単項式順序による正準形、ヒープによる積の併合、二進のべきの表による評価の Plan とその丸め誤差、代入で途中に増える項数とその上限、厳密な係数の疎な多項式。
+sidebar:
+  order: 360
+references:
+  poly-sparse-evaluation-plan: "疎評価の-plan"
+  poly-sparse-multi-indices: "疎な多重指数"
+  poly-sparse-scratch-lifetime: "一時領域とライフタイム"
+  poly-sparse-substitution-limits: "代入と展開の上限"
+  poly-sparse-sum-product-merge: "和と積の併合"
+---
+
+多変数の多項式では、次数から数えられる単項式の個数より、実際に零でない項がずっと少ないことがある。
+そのような多項式は零でない項の指数と係数だけを持つ疎な表現で扱う。
+係数の配列だけでは意味が決まらないので、変数の個数と指数の並べ方（単項式順序）を指定する必要がある。
+このページは疎な多項式の正準形と演算、繰り返し評価の Plan とその丸め誤差、代入で途中に増える項数の上限を説明する。
+
+## 疎な多重指数
+
+$d$ 変数の単項式を $x^\alpha=\prod_{j=0}^{d-1}x_j^{\alpha_j}$ と書く。
+$\alpha$ は非負整数の指数ベクトル（多重指数）で、全次数は $|\alpha|=\sum_j\alpha_j$ である。
+全次数 $n$ 以下の単項式は $\binom{n+d}{d}$ 個あるので、密な係数の配列は $d$ とともに急速に大きくなる。
+たとえば $d=6$、$n=10$ では 8008 個になる。
+疎な表現は零でない $s$ 個の項だけを、$s$ 行 $d$ 列の指数と $s$ 個の係数で持つ。
+
+`Monomial` は指数ベクトルを借用し、全次数を一度だけ計算して保持する。
+`Monomial::new` は全次数が `usize` で表せなければ `SizeOverflow` を返し、空の指数ベクトルは変数のない定数を表す。
+
+`MonomialOrder` は単項式の並べ方（単項式順序）を指定する。
+長さの等しい指数ベクトル $\alpha,\beta$ について、各順序は $x^\alpha>x^\beta$ を次のように決める。
+
+- `Lexicographic`（辞書式）は、$\alpha-\beta$ の最初の零でない成分が正なら $x^\alpha>x^\beta$ とする。
+  変数 0 が最も重い。
+- `GradedLexicographic`（次数付き辞書式）は全次数を比べ、等しければ辞書式で比べる。
+- `GradedReverseLexicographic`（次数付き逆辞書式）は全次数を比べ、等しければ $\alpha-\beta$ の最後の零でない成分が負のとき $x^\alpha>x^\beta$ とする。
+
+たとえば $x_0^2x_2$ と $x_0x_1^2$ は全次数がともに 3 である。
+次数付き辞書式では $x_0$ の指数が大きい $x_0^2x_2$ が大きい。
+次数付き逆辞書式では差 $(1,-2,1)$ の最後の成分が正なので、$x_0x_1^2$ が大きい。
+項は選んだ順序の昇順に保存し、最後の項が先頭項（leading term）である。
+同じ多項式でも、先頭項は順序によって変わる。
+`MonomialOrder::compare_monomials` は二つの単項式を比べ、変数の個数が違えば `DimensionMismatch` を返す。
+
+`ApproxSparsePolynomial::new(dimension, order, exponents, coefficients)` は、一項につき `dimension` 個の指数を並べた平坦な配列と係数を受け取り、正準形にする。
+正準形では項を昇順に並べ替え、同じ指数の係数を入力の順に足し、厳密な零の係数だけを除く。
+許容誤差で小さい係数を捨てることはしない。
+同じ順序の正準形どうしは等しい多項式なら同じ項の列になる。
+指数の配列の長さが `dimension` と項数の積でなければ `DimensionMismatch`、非有限の係数は `NonFinite`、同じ指数の係数の和が桁あふれすれば `NumericalInstability` になる。
+`from_terms` は `(指数, 係数)` の反復子から同じ正準形を作り、指数の長さが `dimension` と違う項を `DimensionMismatch` として拒否する。
+
+`ExactSparsePolynomial` は、利用者が `ExactCoefficient` を実装した係数型（整数、有理数、有限体など）で同じ正準化を行う厳密な係数の疎多項式である。
+SciOxide はどの型にも `ExactCoefficient` を実装していない。
+利用者のクレートからは孤児規則により `f32`・`f64` に実装できないので、浮動小数点の係数では使えない。
+係数の演算は厳密なので、非有限や桁あふれの検査はない。
+
+`terms()` が返す `SparseTerms` は保存した項を借用し、`len`、`is_empty`、`iter` を持つ。
+`SparseTermIter` は `(Monomial, &係数)` を正準な順に返す反復子で、両端から進められ、確保しない。
+`exponents()` と `coefficients()` は平坦な配列をそのまま借用し、`degree()` は項の全次数の最大値（零多項式では 0）を返す。
+
+## 和と積の併合
+
+加減算 `try_add`・`try_sub` は二つの昇順の列を一度の走査で併合し、厳密に打ち消し合った項を除く。
+項数 $s,t$ に対して $O(s+t)$ 回の比較で済む。
+
+乗算 `try_mul` は $st$ 個の項の積を、昇順に併合する。
+短い側の各項について「その項と長い側の項の積」の昇順の列を考えると、これは $\min(s,t)$ 本の整列済みの列の併合になる。
+各列の先頭を $\min(s,t)$ 個の要素の二分ヒープに入れ、最小の積を取り出しては同じ列の次の積を入れる（S. C. Johnson, "Sparse polynomial arithmetic", *ACM SIGSAM Bulletin* 8(3), 1974）。
+同じ単項式の積はヒープから続けて出てくるので、その場で係数を足す。
+比較は $O(st\log\min(s,t))$ 回、係数の積は $st$ 回で、作業用のメモリはヒープと指数一つ分だけである。
+結果の領域は積の対の個数と指数の箱の大きさ $\prod_j(\max\alpha_j+\max\beta_j+1)$ の小さい方を上限として先に確保する。
+
+二項演算は変数の個数と単項式順序がそろっていることを要求し、変数の個数の違いを `DimensionMismatch`、順序の違いを `InvalidInput` として拒否する。
+浮動小数点の係数の和や積が桁あふれすれば `NumericalInstability` になり、複素数の係数の積は成分が範囲の端に近いとき拡張した指数の範囲で作る。
+`try_mul` の項数に上限はない。
+
+`derivative(axis)` は偏導関数を返し、変数の範囲外の軸を `OutOfBounds` として拒否する。
+`permute_variables` は変数の番号を付け替え、置換でない配列を `InvalidInput` とする。
+`with_order` は同じ多項式を別の順序の正準形に作り直す。
+`ApproxSparsePolynomial` の `from_tensor` と `to_tensor_into` は、密な単項式係数のテンソルと相互に変換する。
+`to_tensor_into` は、書き込む前にすべての指数がテンソルの大きさに収まるかを確かめ、収まらなければ `DimensionMismatch` を返す。
+
+## 疎評価の Plan
+
+$p(x)=\sum_\alpha c_\alpha x^\alpha$ を評価するとき、項ごとにべきを計算し直すと、同じ $x_j^k$ を何度も作ることになる。
+`SparseEvaluationPlan` は、軸 $j$ の最大の指数のビット数を $b_j$ として、評価点ごとに $x_j,x_j^2,x_j^4,\ldots,x_j^{2^{b_j-1}}$ の表を一度だけ作る。
+各項は係数から始め、$\alpha_j$ の 2 進表示で 1 のビットに当たる表の値を順に掛けて求め、項を正準な順に足す。
+一点の評価には表の作成に $\sum_j(b_j-1)$ 回の二乗、各項に $\sum_j\mathrm{popcount}(\alpha_j)$ 回の乗算、項の和に $s$ 回の加算を要する。
+計算量は項数だけでなく、指数の大きさにも依存する。
+
+### 丸め誤差と条件数
+
+実数の係数と点について、標準の丸めのモデル $\mathrm{fl}(a\circ b)=(a\circ b)(1+\eta)$、$|\eta|\le u$ を使う（`f64` では $u=2^{-53}$）。
+表の値 $x_j^{2^k}$ は $k$ 回の二乗で作られ、$x_j^{2^k}$ に $2^k-1$ 個の $(1+\eta)$ を掛けた値になる。
+項 $c_\alpha x^\alpha$ は係数に表の値を順に掛けて作るので、表の作成の分と合わせて、丸めの因子はちょうど $|\alpha|$ 個になる。
+項を先頭から足すと、各項はさらに最大 $s-1$ 個の因子を受ける。
+したがって、最大の全次数を $N$、$\gamma_k=ku/(1-ku)$ として、計算値 $\hat p(x)$ は
+
+$$
+|\hat p(x)-p(x)|\le\gamma_{N+s-1}\sum_\alpha|c_\alpha|\,|x^\alpha|
+$$
+
+を満たす（N. J. Higham, *Accuracy and Stability of Numerical Algorithms*, 2nd ed., SIAM, 2002, §3.1、§5.1）。
+右辺の和を $|p(x)|$ で割った値が評価の条件数で、相対誤差はこの条件数の $\gamma_{N+s-1}$ 倍で抑えられる。
+項が打ち消し合う点では条件数が大きくなり、同じ多項式でも展開した形の評価は因数分解した形の評価より不正確になりうる。
+Plan は条件数を返しないので、必要なら係数を絶対値にした多項式を $|x|$ で評価して右辺の和を求める。
+
+### 範囲の外れと拡張した指数
+
+評価はまず通常の浮動小数点演算で行い、べき・積・部分和のどれかが安全な範囲（各成分が 0 か、`f64` では絶対値がおよそ $2^{-511}$ 以上 $2^{510}$ 未満）を外れたら、その点を拡張した指数の範囲で最初から計算し直し、最後に一度だけ丸める。
+係数のどれかがこの範囲の外にあれば、Plan を作る時点でそれが分かり、最初から拡張した範囲で計算する。
+拡張した範囲でも仮数の丸めは同じなので、上の評価はそのまま成り立つ。
+最後の値が桁あふれすれば `NumericalInstability` になり、アンダーフローする値は非正規化数か零へ丸める。
+点の次元が違うときと一時領域が短いときは `DimensionMismatch`、非有限の座標は `NonFinite` になる。
+
+### 一時領域とライフタイム
+
+呼び出し側が渡す一時領域の長さは、一点の評価で $1+\sum_jb_j$ であり、`workspace_requirements(1).scratch_len()` で問い合わせる。
+指数がすべて 0 の軸は表を作らないので、一時領域を使わない。
+$m$ 点の一括評価 `evaluate_batch_into` は、点ごとの値 $m$ 個と、使うワーカーごとの表 $\sum_jb_j$ 個を合わせた長さを `workspace_requirements(m)` で求める。
+既定の逐次の実行設定ではワーカーは 1 つである。
+`evaluate_batch_into` は `[点, 変数]` の形の点の列を評価し、形が違えば `InvalidInput` を返し、失敗すれば出力を変えない。
+
+`ApproxSparsePolynomial::evaluation_plan(options)` は多項式の項と表の配置を借用し、係数を複製しないので、作成に必要な計算量は少ない。
+`SparseEvaluationPlan::new(dimension, order, exponents, coefficients, options)` は呼び出し側の平坦な配列を借用し、表の配置を一度だけ確保して作る。
+所有する多項式の構築と違い、零の係数、重複した指数、順序の乱れを正準化せずに `InvalidInput` として拒否する。
+どちらの Plan も借用した配列が存続する間だけ使え、評価は確保しない。
+`ApproxSparsePolynomial::evaluate(point)` は同じ方法で一点を評価し、べきの表の一時領域を呼び出しごとに確保する。
+
+`ExactSparseView` は厳密な係数の項を借用して評価するビューで、`ExactSparsePolynomial::as_view()` か、正準形を検査する `ExactSparseView::new(dimension, order, exponents, coefficients)` で作る。
+項ごとに二乗の繰り返しでべきを作り、軸ごとの表は共有しない。
+一点の評価に一時領域は要らず、`evaluate_batch_into` は点の個数だけの係数を一時領域として使い、失敗すれば出力を変えない。
+係数型の複製や演算が確保するメモリは、係数型の規約に従う。
+厳密な係数の評価の Plan（`SparseEvaluationPlan` に当たるもの）は提供しないので、多くの点では `ExactSparseView` を使う。
+
+## 代入と展開の上限
+
+`substitute(replacements, target_dimension)` は、各変数 $x_i$ を `target_dimension` 変数の多項式 $r_i$ で置き換えた多項式 $p(r_0,\ldots,r_{d-1})$ を作る。
+各項 $c_\alpha x^\alpha$ は $c_\alpha\prod_ir_i^{\alpha_i}$ に展開される。
+$r_i$ のべきは二乗の繰り返しで $r_i^2,r_i^4,\ldots$ を必要な分だけ作り、後の項でも使い回す。
+項の展開は定数 $c_\alpha$ から始め、$\alpha_i$ の 1 のビットごとに $r_i^{2^k}$ を掛けていく。
+最後にすべての項の展開を併せて正準形にする。
+置換の個数が変数の個数と違うとき、置換の変数の個数が `target_dimension` と違うとき、置換の順序が違うときは `InvalidInput` になる。
+
+最後の結果が少ない項しか持たなくても、途中の展開は多くの項を持ちうる。
+たとえば $x^my^m$ に $x\to x+y$、$y\to x-y$ を代入すると、結果 $(x^2-y^2)^m$ は $m+1$ 項である。
+しかし途中の $(x+y)^m(x-y)^j$（$j$ は $m$ の 2 進表示の下位のビットから作った部分和）は、全次数 $m+j$ の単項式を最大で $m+j+1$ 個持つ。
+
+`substitute` は途中の項数を制限しない。
+`substitute_with_options(replacements, target_dimension, limits)` に渡す `SparseExpansionLimits::new(max_terms)` は、代入の途中に現れる次のすべての多項式の項数に上限を与える。
+
+- 指数が正の軸の置換 $r_i$ そのものと、その二乗の繰り返し $r_i^{2^k}$。
+- 各項の展開の途中の積。
+- 項の展開を順に足した部分和。
+
+ここでの項数は重複した指数をまとめ、厳密に打ち消し合った項を除いた正準な項数である。
+積では新しい項を加える前に検査し、積の対やヒープのメモリは項数に数えない。
+上限を超えると `ResourceLimit` を返し、部分的な結果は返さない。
+`SparseExpansionLimits::default()` は上限 `usize::MAX`、つまり制限なしである。
+`max_terms` を 0 にすると、零多項式の代入だけが成功する。
+この上限は項数だけを制限し、計算時間や係数型自身の確保量を制限しない。
+`substitute_into(replacements, target_dimension, limits, output, context)` は `substitute_with_options` と同じ代入を `ExecutionContext` の取り消しと期限を確かめながら行い、成功したときだけ出力を置き換える。
+
+次のセルは $x^my^m$ に上の代入を行い、上限 $L=m+1,\ldots,2m+1$ ごとの結果を表にする。
+一つ目の表は上限ごとの終了と結果の項数で、上限を超えた行の項数は「—」になる。
+二つ目の表は独立検算である。
+成功した結果の係数を二項係数 $(-1)^j\binom mj$ と照合し、評価の Plan で点 $(3,2)$ の値を求めて $(3^2-2^2)^m=5^m$ と比べる。
+$m\le12$ では途中の値がどれも $2^{53}$ 未満の整数なので、評価は丸めなしで $5^m$ に一致するはずである。
+セルは指数 $m$ と結果の指数・係数を、次の節のセルへ渡す。
+
+```rust
+//| id: poly-sparse-substitution
+//| ref: poly-sparse-substitution
+//| title: 代入の中間項数と疎評価の一時領域
+//| run: reactive
+//| crates: [scioxide-poly]
+//| exports: [power, exponents, coefficients]
+//| inputs:
+//|   power: {"type":"range","label":"指数 m [-]","description":"p = xᵐyᵐ の指数。途中の展開の形は m の 2 進表示で変わる。","min":2,"max":12,"step":1,"value":6}
+//| cases:
+//|   - {"id":"power-of-two","label":"m = 8","description":"m が 2 のべきなら、途中の最大の項数は結果と同じ m + 1 になる。","inputs":{"power":8}}
+//|   - {"id":"largest","label":"m = 12","description":"途中の (x + y)¹²(x − y)⁴ の 17 項が最大になり、L = 17 で初めて成功する。","inputs":{"power":12}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"limits","path":"/rows/1/1","equals":"ResourceLimit"}
+//|       - {"artifact":"limits","path":"/rows/2/1","equals":"成功"}
+//|       - {"artifact":"limits","path":"/rows/2/2","equals":7}
+//|       - {"artifact":"check","path":"/rows/0/1","range":{"max":0}}
+//|       - {"artifact":"check","path":"/rows/0/2","equals":9}
+//|       - {"artifact":"check","path":"/rows/0/3","equals":15625}
+//|   - case: power-of-two
+//|     expect:
+//|       - {"artifact":"limits","path":"/rows/0/1","equals":"成功"}
+//|       - {"artifact":"limits","path":"/rows/0/2","equals":9}
+//|       - {"artifact":"check","path":"/rows/0/3","equals":390625}
+//|   - case: largest
+//|     expect:
+//|       - {"artifact":"limits","path":"/rows/3/1","equals":"ResourceLimit"}
+//|       - {"artifact":"limits","path":"/rows/4/2","equals":13}
+//|       - {"artifact":"check","path":"/rows/0/2","equals":11}
+//|       - {"artifact":"check","path":"/rows/0/3","equals":244140625}
+use scioxide_poly::{
+    ApproxSparsePolynomial, MonomialOrder, SparseEvaluationPlan, SparseExpansionLimits,
+};
+
+let m = power as usize;
+let order = MonomialOrder::GradedLexicographic;
+// p(x, y) = xᵐyᵐ と、代入する x → x + y、y → x − y（指数は一項に二つずつ）。
+let p = ApproxSparsePolynomial::new(2, order, vec![m, m], vec![1.0_f64])
+    .map_err(|e| e.to_string())?;
+let sum = ApproxSparsePolynomial::new(2, order, vec![1, 0, 0, 1], vec![1.0, 1.0])
+    .map_err(|e| e.to_string())?;
+let difference = ApproxSparsePolynomial::new(2, order, vec![1, 0, 0, 1], vec![1.0, -1.0])
+    .map_err(|e| e.to_string())?;
+let replacements = [sum, difference];
+let mut rows = Vec::new();
+let mut result = None;
+for limit in m + 1..=2 * m + 1 {
+    let limits = SparseExpansionLimits::new(limit);
+    match p.substitute_with_options(&replacements, 2, limits) {
+        Ok(q) => {
+            rows.push((limit, "成功".to_string(), Some(q.terms().len())));
+            result.get_or_insert(q);
+        }
+        Err(e) => rows.push((limit, format!("{:?}", e.kind()), None)),
+    }
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "中間の項数の上限 L [項]", "type": "integer" },
+    { "key": "1", "label": "終了" },
+    { "key": "2", "label": "結果の項数 [項]", "type": "integer", "nullText": "—" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "limits" })
+);
+
+let q = result.ok_or("どの上限でも代入が成功しなかった")?;
+// 独立検算: (x² − y²)ᵐ の x^(2m−2j) y^(2j) の係数は (−1)ʲ C(m, j)。
+let mut coefficient_error = 0.0_f64;
+for (monomial, &c) in q.terms() {
+    let j = monomial.exponents()[1] / 2;
+    let binomial = (0..j).fold(1.0, |b, i| b * (m - i) as f64 / (i + 1) as f64);
+    let expected = if j % 2 == 0 { binomial } else { -binomial };
+    coefficient_error = coefficient_error.max((c - expected).abs());
+}
+// 結果の平坦な指数と係数を借用し、正準形であることを検査して Plan を作る。
+let plan = SparseEvaluationPlan::new(
+    q.dimension(),
+    q.order(),
+    q.exponents(),
+    q.coefficients(),
+    Default::default(),
+)
+.map_err(|e| e.to_string())?;
+let scratch_len = plan
+    .workspace_requirements(1)
+    .map_err(|e| e.to_string())?
+    .scratch_len();
+let mut scratch = vec![0.0; scratch_len];
+let value = plan
+    .evaluate(&[3.0, 2.0], &mut scratch)
+    .map_err(|e| e.to_string())?;
+let leading = q.terms().iter().next_back().ok_or("零多項式になった")?.0;
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let check_columns = serde_json::json!([
+    { "key": "0", "label": "先頭項の x の指数", "type": "integer" },
+    { "key": "1", "label": "二項係数との最大差 [-]", "type": "number", "format": sci2 },
+    { "key": "2", "label": "一時領域 [個]", "type": "integer" },
+    { "key": "3", "label": "Plan による p(3, 2) [-]", "type": "number" },
+    { "key": "4", "label": "5ᵐ [-]", "type": "integer" }
+]);
+let check = vec![(
+    leading.exponents()[0],
+    coefficient_error,
+    scratch_len,
+    value,
+    5_u64.pow(m as u32),
+)];
+emit_table_with_columns!(
+    check_columns,
+    check,
+    metadata = serde_json::json!({ "id": "check" })
+);
+export!(power, m);
+export!(exponents, q.exponents());
+export!(coefficients, q.coefficients());
+```
+
+既定の $m=6$ では、$L=7,8$ で `ResourceLimit` になり、$L=9$ から成功して結果は 7 項になる。
+$6=110_2$ なので、途中で $(x+y)^6$ に $(x-y)^2$ を掛けた全次数 8 の多項式が 9 項を持つためである。
+最初に成功する上限は$m=8=1000_2$ では途中の最大の項数が結果と同じなので $m+1=9$、$m=12=1100_2$ では $(x+y)^{12}(x-y)^4$ の 17 項で決まる。
+係数は二項係数と一致し、先頭項は次数付き辞書式で最大の $x^{2m}$ である。
+一時領域は $1+2b$ 個（$b$ は $2m$ のビット数）で、$m=6$ では 9 個、$m=12$ では 11 個になる。
+$p(3,2)$ は $m=12$ でも $5^{12}=244140625$ に一致する。
+
+## 展開した形の評価と打ち消し
+
+上の誤差の評価によれば、展開した形の評価の精度は条件数 $\sum_\alpha|c_\alpha||x^\alpha|/|p(x)|$ で決まる。
+$(x^2-y^2)^m$ を展開した形では、正の点で $\sum_\alpha|c_\alpha||x^\alpha|=(x^2+y^2)^m$ なので、条件数は
+
+$$
+\kappa(x,y)=\left(\frac{x^2+y^2}{|x^2-y^2|}\right)^m
+$$
+
+になる。
+対角線 $x=y$ に近づくと、値は $(2\delta)^m$ 程度（$\delta=x-y$）まで小さくなるのに、項の大きさは $2^m$ 程度のまま残るので、$\kappa$ は $\delta^{-m}$ の速さで増える。
+
+次のセルは前のセルが渡す $m$ と結果の指数・係数を借用して `SparseEvaluationPlan::new` で Plan を作り、$x=1+\delta$、$y=1$ で評価する。
+同じ指数と係数の絶対値で作った多項式を同じ点で評価し、右辺の和 $\sum_\alpha|c_\alpha||x^\alpha|$ を求める。
+参照値は因数分解した形 $((x-y)(x+y))^m$ で、$x-y$ は Sterbenz の補題により丸めなしに求まり、残りの丸めは相対 $3mu$ 程度である。
+参照値は `f64` の固有メソッド `powi` で求め、SciOxide の関数を使わない。
+表の最後の列は実際の相対誤差を上界 $\gamma_{N+s-1}\kappa$（$N=2m$、$s=m+1$）で割った比で、1 以下なら上界が成り立っている。
+
+```rust
+//| id: poly-sparse-cancellation
+//| ref: poly-sparse-cancellation
+//| title: 展開した形の評価と条件数
+//| run: reactive
+//| crates: [scioxide-poly]
+//| dependsOn:
+//|   solve: poly-sparse-substitution
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"cancellation","path":"/rows/0/3","approx":{"value":1358431.9067819,"rtol":1e-9}}
+//|       - {"artifact":"cancellation","path":"/rows/0/4","range":{"max":1}}
+//|       - {"artifact":"cancellation","path":"/rows/2/4","range":{"max":1}}
+//|       - {"artifact":"cancellation","path":"/rows/5/2","range":{"min":1}}
+use scioxide_poly::{ApproxSparsePolynomial, MonomialOrder, SparseEvaluationPlan};
+
+let m = solve["power"].as_u64().ok_or("指数がない")? as usize;
+let exponents: Vec<usize> =
+    serde_json::from_value(solve["exponents"].clone()).map_err(|e| e.to_string())?;
+let coefficients: Vec<f64> =
+    serde_json::from_value(solve["coefficients"].clone()).map_err(|e| e.to_string())?;
+let order = MonomialOrder::GradedLexicographic;
+// 受け取った正準形の項を借用し、並べ替えずに検査して Plan を作る。
+let plan = SparseEvaluationPlan::new(2, order, &exponents, &coefficients, Default::default())
+    .map_err(|e| e.to_string())?;
+// 係数を絶対値にした多項式。正の点での値が誤差の上界の和 Σ|c_α| x^α になる。
+let magnitudes: Vec<f64> = coefficients.iter().map(|c| c.abs()).collect();
+let envelope = ApproxSparsePolynomial::new(2, order, exponents.clone(), magnitudes)
+    .map_err(|e| e.to_string())?;
+let envelope_plan = envelope
+    .evaluation_plan(Default::default())
+    .map_err(|e| e.to_string())?;
+let scratch_len = plan
+    .workspace_requirements(1)
+    .map_err(|e| e.to_string())?
+    .scratch_len();
+let mut scratch = vec![0.0; scratch_len];
+// γ_k = k u / (1 − k u)、k = N + s − 1（N = 2m は最大の全次数、s は項数）。
+let unit = f64::EPSILON / 2.0;
+let k = (2 * m + coefficients.len() - 1) as f64;
+let gamma = k * unit / (1.0 - k * unit);
+let mut rows = Vec::new();
+for e in 1..=6 {
+    let (x, y) = (1.0 + 10.0_f64.powi(-e), 1.0);
+    let value = plan
+        .evaluate(&[x, y], &mut scratch)
+        .map_err(|e| e.to_string())?;
+    let absolute = envelope_plan
+        .evaluate(&[x, y], &mut scratch)
+        .map_err(|e| e.to_string())?;
+    // 参照値: 因数分解した形 ((x − y)(x + y))ᵐ。f64 の powi による参照計算。
+    let reference = ((x - y) * (x + y)).powi(m as i32);
+    let relative = (value - reference).abs() / reference.abs();
+    let condition = absolute / reference.abs();
+    rows.push((
+        x - y,
+        reference,
+        relative,
+        condition,
+        relative / (gamma * condition),
+    ));
+}
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "δ = x − y [-]", "type": "number", "format": sci3 },
+    { "key": "1", "label": "参照値 (x² − y²)ᵐ [-]", "type": "number", "format": sci3 },
+    { "key": "2", "label": "展開した形の相対誤差 [-]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "条件数 κ [-]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "相対誤差 / (γ κ) [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "cancellation" })
+);
+```
+
+既定の $m=6$ では、$\delta=10^{-1}$ で条件数は $\kappa\approx1.36\times10^6$、相対誤差は $3.8\times10^{-11}$ である。
+$\delta=10^{-2}$ では $\kappa\approx1.0\times10^{12}$ になり、相対誤差は $3.0\times10^{-6}$ まで増える。
+$\delta=10^{-3}$ では 7 項がちょうど打ち消し合って計算値が 0 になり、相対誤差は 1 である。
+それより小さい $\delta$ では、計算値は参照値と無関係な丸め誤差の大きさ（絶対値で $10^{-15}$ 程度）になり、相対誤差は 1 を大きく超える。
+どの行でも比は 0.05 未満で、上界は成り立ち、実際の誤差の 20〜2000 倍である。
+条件数の列は $((x^2+y^2)/(x^2-y^2))^m$ と一致し、$\delta$ が 1 桁減るごとにおよそ $10^m$ 倍になる。
+因数分解した形 $((x-y)(x+y))^m$ は同じ点でも相対 $3mu$ 程度の精度を保つので、打ち消しは多項式そのものではなく展開した表現の性質である。
+
+## まとめ
+
+疎な多項式は変数の個数と単項式順序をそろえて構築し、最後の項が先頭項であることを前提に結果を読む。
+積は $\min(s,t)$ 個の要素のヒープで併合され、比較の回数は $O(st\log\min(s,t))$ なので、項数の積が計算量の目安になる。
+繰り返し評価するときは `SparseEvaluationPlan` を借用で作り、一時領域 $1+\sum_jb_j$ 個を一度だけ用意すれば、評価でメモリを確保しない。
+評価の相対誤差は条件数 $\sum_\alpha|c_\alpha||x^\alpha|/|p(x)|$ の $\gamma_{N+s-1}$ 倍で抑えられるので、項が打ち消し合う点では因数分解した形や別の基底での評価を検討する。
+代入では最終結果より途中の展開が大きくなりうるので、`SparseExpansionLimits` に途中の項数の上限を与え、`ResourceLimit` を受け取ったら上限か式の形を見直す。
+
+## 次に読むページ
+
+- [Bernstein 表現と de Casteljau 法](../multivariate-and-bernstein/)、[テンソル積 Bernstein と値域の推定](../tensor-bernstein-bounds/)：曲線・曲面を制御点で表し、凸包性と分割で値域を推定する方法を確かめる。
+- [Horner 法の丸め誤差](../horner-rounding-error/)：一変数の評価の条件数と誤差の上界を、同じ丸めのモデルで確かめる。
+- [厳密な演算・高速演算・多変数の API](../../api/exact-and-fast/)：疎な多項式の全項目と仕様を引く。

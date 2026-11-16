@@ -1,0 +1,581 @@
+---
+title: "Mathematics of online means, variances, higher moments, and covariance"
+description: "Cancellation and conditioning in naive variance formulas, Welford recurrences, Chan–Golub–LeVeque and Pébay merge formulas, higher central moments and skewness/kurtosis corrections, bivariate covariance and correlation, and accumulator and batched matrix-view reduction APIs."
+sidebar:
+  order: 305
+references:
+  stats-online-accumulator-state-api: "accumulator-state-and-api"
+  stats-online-bivariate-covariance-correlation: "bivariate-covariance-and-correlation"
+  stats-online-higher-moments-skew-kurtosis: "higher-central-moments-skewness-and-kurtosis"
+  stats-online-matrix-view-reduction: "batched-matrix-view-reductions"
+  stats-online-merging-partials: "merging-partial-aggregates"
+  stats-online-variance-large-offset: "variance-with-an-increasing-offset"
+---
+
+Updating means and variances as observations arrive one by one is called **online aggregation**.
+It retains no samples, so memory remains constant regardless of sample count.
+Separately computed aggregates can also be merged later.
+This page explains why textbook variance formulas fail in floating-point arithmetic and derives Welford recurrences, their merge generalization, third and fourth central moments, and bivariate covariance.
+It then explains the `OnlineMoments` and `OnlineCovariance` accumulators and `reduce_*` functions aggregating matrix views in batches.
+
+## Cancellation in the naive variance formula
+
+For sample $x_1, \dots, x_n$, mean $\bar x$, and sum of squared deviations $S = \sum_i (x_i - \bar x)^2$, the sample variance is $s^2 = S/(n-1)$.
+Expanding $S$ gives the following formula computable in one pass over the data.
+
+$$
+S = \sum_{i=1}^n x_i^2 - \frac{1}{n}\Bigl(\sum_{i=1}^n x_i\Bigr)^2
+$$
+
+This formula subtracts two large numbers.
+When mean $\mu$ is orders of magnitude greater than standard deviation $\sigma$, the terms are nearly equal and their leading digits cancel on subtraction.
+This is called **cancellation**.
+
+Chan, Golub, and LeVeque (1983) express the condition number of $S$ under data perturbations as
+
+$$
+\kappa = \frac{\lVert x \rVert_2}{\sqrt S} = \sqrt{1 + \frac{\mu^2}{\sigma^2}}, \qquad \sigma^2 = \frac{S}{n}
+$$
+
+
+Here, $\mu$ is the sample mean and $\lVert x \rVert_2$ is the 2-norm of the data vector.
+For unit roundoff $u = 2^{-53} \approx 1.1 \times 10^{-16}$, approximate relative-error bounds for each algorithm are as follows.
+
+| Algorithm | Approximate relative-error bound |
+|---|---|
+| One-pass formula (difference of sums of squares) | $n \kappa^2 u$ |
+| Two passes (compute the mean, then sum deviations) | $n u + n^2 \kappa^2 u^2$ |
+| Online updates (Welford) | $n \kappa u$ |
+| Pairwise merging of partial aggregates | $\kappa u \log_2 n$ |
+
+The one-pass bound is proportional to $\kappa^2$; at $\mu/\sigma \approx 10^8$ it exceeds 1, so every significant digit may be lost.
+The computed variance can even be negative.
+These are worst-case bounds; actual errors may be much smaller for particular data.
+Two-pass algorithms remain accurate for large $\kappa$ but read data twice, making them unsuitable for streams.
+
+## Welford recurrence
+
+Let $\bar x_{n-1}$ be the mean through observation $n-1$ and $M_{2,n-1}$ the sum of squared deviations; write the difference from the new observation $x_n$ as $\delta_n = x_n - \bar x_{n-1}$.
+The mean updates as follows.
+
+$$
+\bar x_n = \bar x_{n-1} + \frac{\delta_n}{n}
+$$
+
+Square the deviation $x_i - \bar x_n = (x_i - \bar x_{n-1}) - \delta_n/n$ and sum over $i < n$.
+Since $\sum_{i<n} (x_i - \bar x_{n-1}) = 0$, the cross term vanishes, giving $\sum_{i<n}(x_i - \bar x_n)^2 = M_{2,n-1} + (n-1)\delta_n^2/n^2$.
+Adding the contribution $((n-1)\delta_n/n)^2$ of $x_n$ gives the recurrence (Welford, 1962).
+
+$$
+M_{2,n} = M_{2,n-1} + \frac{n-1}{n}\delta_n^2 = M_{2,n-1} + (x_n - \bar x_{n-1})(x_n - \bar x_n)
+$$
+
+Only products of deviations are accumulated, avoiding differences between large sums of squares.
+Substituting $n_B = 1$ and $M_{2,B} = 0$ into the next section's merge formula gives this recurrence.
+
+## Merging partial aggregates
+
+For subsets $A$ and $B$, let sizes be $n_A$ and $n_B$, means $\bar x_A$ and $\bar x_B$, squared-deviation sums $M_{2,A}$ and $M_{2,B}$, and set $n = n_A + n_B$ and $\Delta = \bar x_B - \bar x_A$.
+Reexpressing each group's deviations relative to the overall mean and using zero within-group deviation sums gives the following (Chan, Golub, LeVeque, 1979).
+
+$$
+\bar x_{AB} = \bar x_A + \frac{n_B}{n}\Delta, \qquad
+M_{2,AB} = M_{2,A} + M_{2,B} + \frac{n_A n_B}{n}\Delta^2
+$$
+
+The last term is variation between group means.
+Simply averaging group variances omits this term and underestimates overall variance.
+Parallel and streaming computations pairwise merge partition aggregates $(n_k, \bar x_k, M_{2,k})$ into final statistics.
+Binary-tree merging makes the error estimate proportional to $\log_2 n$ instead of $n$, as in the last row of the preceding table.
+
+Merging is mathematically associative, but floating-point rounding depends on merge order.
+Different partitions and merge orders can therefore change trailing result digits even for identical data.
+The [Merge order and rounding](#merge-order-and-rounding) cell measures these differences.
+
+## Accumulator state and API
+
+`OnlineMoments::new(order)` creates an empty accumulator; `observe(x)` treats an observation as a size-one aggregate and merges it into the current state with the formula above.
+`merge(&other)` merges accumulators from disjoint partitions.
+Both cost $O(1)$ operations per call and allocate nothing.
+`from_slice(values, order)` constructs an accumulator from a whole slice.
+If every value is within the ordinary f64 range, it uses a compensated first pass for a shifted-origin mean and a second pass summing centered powers.
+Trailing digits may therefore differ from adding the same values individually with `observe`.
+
+Internal state contains count, mean, minimum and maximum, and central moments divided by count $M_k/n$.
+The mean is retained as a compensated sum of high and low parts; updates and merges preserve the low part.
+Mean differences $\Delta$ for merging subtract high and low parts separately before recombining, cancelling large common offsets first.
+Values outside the ordinary f64 range switch state to an extended-range representation with a separate binary exponent (`scioxide_core::Scaled`), continuing aggregation without overflow.
+
+`observe` rejects nonfinite values with `NonFinite` and count overflow with `SizeOverflow`.
+`merge` rejects differing retained moment orders with `InvalidInput`; merging an empty accumulator changes nothing.
+If merging produces negative even-order $M_2$ or $M_4$, it returns `NumericalInstability` for cancellation.
+Any failure leaves accumulator state unchanged.
+
+`snapshot()` only returns a state copy `MomentsSnapshot` and cannot fail.
+Each estimate is rounded to `S` on every query and returned as `Result<Option<S>, SciOxideError>`.
+Undefined estimates (empty-sample means or one-point sample variances) become `Ok(None)`; a value unrepresentable in `S` causes only its own query to return `Err`.
+For example, for the two points $\pm 10^{154}$, sample variance $2 \times 10^{308}$ overflows f64 and returns `Err`, while mean 0 and standard error $10^{154}$ remain available.
+Primary queries are `mean`, `population_variance` (divisor $n$), `sample_variance` (divisor $n-1$), `variance(ddof)`, `variance_of_sample_mean` ($s^2/n$), `standard_error_of_sample_mean` ($s/\sqrt n$), `minimum`, and `maximum`.
+`scaled_variance_of_sample_mean` reads the variance of the mean without rounding to `S`; its use in intervals appears in [Mathematics of weighted estimation, standard errors, and confidence intervals](oxref:stats-weighted-mean-confidence-interval).
+
+## Higher central moments, skewness, and kurtosis
+
+Third and fourth central-moment sums $M_3 = \sum (x_i - \bar x)^3$ and $M_4 = \sum (x_i - \bar x)^4$ merge similarly by binomial expansion (Pébay, 2008; Pébay et al., 2016).
+
+$$
+M_{3,AB} = M_{3,A} + M_{3,B} + \Delta^3 \frac{n_A n_B (n_A - n_B)}{n^2} + 3\Delta \frac{n_A M_{2,B} - n_B M_{2,A}}{n}
+$$
+
+$$
+\begin{aligned}
+M_{4,AB} ={}& M_{4,A} + M_{4,B} + \Delta^4 \frac{n_A n_B (n_A^2 - n_A n_B + n_B^2)}{n^3} \\
+&+ 6\Delta^2 \frac{n_A^2 M_{2,B} + n_B^2 M_{2,A}}{n^2} + 4\Delta \frac{n_A M_{3,B} - n_B M_{3,A}}{n}
+\end{aligned}
+$$
+
+Higher orders require more operations per update; choose the accumulator's maximum retained order (`Second`, `Third`, or `Fourth`) with `MomentOrder` in advance.
+Querying an unretained order returns `NotImplemented`.
+`central_moment(k)` returns population central moments $m_k = M_k / n$ ($m_0 = 1$, $m_1 = 0$).
+
+From $m_k$, compute sample skewness $g_1 = m_3 / m_2^{3/2}$ and excess kurtosis $g_2 = m_4/m_2^2 - 3$.
+`skewness(BiasCorrection::None)` and `kurtosis(BiasCorrection::None, …)` return these $g_1$ and $g_2$.
+`BiasCorrection::Corrected` applies independent-sample corrections ($G_1$ and $G_2$ in Joanes and Gill, 1998).
+
+$$
+G_1 = \frac{\sqrt{n(n-1)}}{n-2}\, g_1 \quad (n \ge 3), \qquad
+G_2 = \frac{n-1}{(n-2)(n-3)}\bigl((n+1) g_2 + 6\bigr) \quad (n \ge 4)
+$$
+
+$G_1$ and $G_2$ are ratios of k-statistics.
+The k-statistic $k_r$ is an unbiased estimator of the order-$r$ cumulant $\kappa_r$, but ratios are generally biased.
+`k_statistic(r)` ($r = 1, \dots, 4$) returns $k_r$ itself; `k_statistic_variance(r)` ($r = 1, 2$) returns an unbiased estimator of its variance.
+The variance estimate for $r = 2$ can be negative in some samples.
+`KurtosisConvention::Fisher` returns excess kurtosis (0 for a normal distribution); `Pearson` adds 3.
+Empty or constant samples, or counts insufficient for the correction, return `None`.
+
+## Bivariate covariance and correlation
+
+The cross-deviation sum $C = \sum (x_i - \bar x)(y_i - \bar y)$ of pairs $(x_i, y_i)$ also updates and merges using $\delta_{x,n} = x_n - \bar x_{n-1}$, $\Delta_x = \bar x_B - \bar x_A$, and $\Delta_y = \bar y_B - \bar y_A$ as follows.
+
+$$
+C_n = C_{n-1} + \delta_{x,n}\,(y_n - \bar y_n), \qquad
+C_{AB} = C_A + C_B + \frac{n_A n_B}{n}\Delta_x \Delta_y
+$$
+
+Sample covariance is $C/(n-1)$; Pearson correlation is $r = C/\sqrt{M_{2,x} M_{2,y}}$.
+
+`OnlineCovariance` treats each pair as an independent estimation unit, updating both marginal moments and cross-deviation sums from the same pairs.
+`from_slices(x, y, order)` rejects mismatched input lengths with `DimensionMismatch` and recomputes with exact products if the cross-deviation sum suffers severe cancellation.
+`CovarianceSnapshot` returns `population_covariance`, `sample_covariance`, covariance between means `covariance_of_sample_means` ($C/(n(n-1))$), and marginal `marginal_x` and `marginal_y`.
+`correlation` computes correlation from marginal variances before rounding and clips to $[-1, 1]$.
+If unclipped $|r|$ exceeds $1 + 128\varepsilon$, the cross-deviation sum is considered to have lost accuracy to cancellation, returning `NumericalInstability`.
+
+Covariance and correlation definedness are reported separately.
+`CovarianceValidity` returned by `validity()` distinguishes no pairs (`Empty`), only population covariance defined (`PopulationOnly`), and sample covariance also defined (`SampleDefined`).
+`CorrelationValidity` returned by `correlation_validity()` distinguishes defined (`Defined`), insufficient pairs (`InsufficientPairs`), and which coordinates are constant (`ConstantX`, `ConstantY`, `ConstantBoth`).
+When correlation is undefined, `correlation` returns `Ok(None)`.
+
+For covariance matrices with more than two variables, use matrix-based `sample_covariance` and related APIs ([Multivariate statistics](../multivariate-statistics/)).
+For frequency tables whose rows have integer counts, passing counts as `Weights::<_, Frequency>` to `frequency_covariance` computes means and covariance without expanding rows.
+
+## Batched matrix-view reductions
+
+To aggregate multidimensional-array rows or columns as separate samples, wrap the array in `BatchView` and pass it to `reduce_*` functions.
+The `axis` of `BatchView::new(&values, layout, axis)` is the sample axis; each position on the remaining axes is a **batch** (an independent sample, called a unit of batch processing in the API guide).
+Output contains one snapshot per batch, each holding the same quantities as feeding that batch's observations into an accumulator individually.
+
+| Default form | Settings form | Workspace form | Output per batch | Purpose |
+|---|---|---|---|---|
+| `reduce_moments` | `reduce_moments_with_options` | `reduce_moments_into` | `MomentsSnapshot` | Means, variances, higher moments |
+| `reduce_trimmed_moments` | `reduce_trimmed_moments_with_options` | `reduce_trimmed_moments_into` | `MomentsSnapshot` | Moments of observations within the value range `TrimLimits` |
+| `reduce_weighted_moments` | `reduce_weighted_moments_with_options` | `reduce_weighted_moments_into` | `WeightedMomentsSnapshot` | Moments using view weights (frequency, reliability, analytical) |
+| `reduce_covariance` | `reduce_covariance_with_options` | `reduce_covariance_into` | `CovarianceSnapshot` | Pairwise covariance of two identically shaped views |
+| `reduce_weighted_covariance` | `reduce_weighted_covariance_with_options` | `reduce_weighted_covariance_into` | `WeightedCovarianceSnapshot` | Weighted pairwise covariance |
+| `reduce_moment` | `reduce_moment_with_options` | `reduce_moment_into` | `Option<S>` | Moments of arbitrary order $k$ around a specified center |
+
+As shown, each function has three forms.
+Unsuffixed forms (such as `reduce_moments(view)`) use defaults; `_with_options` forms accept `StatisticsOptions`.
+Both allocate workspace and output per call and execute sequentially on the current thread.
+`_into` forms (such as `reduce_moments_into(view, options, output, workspace, context)`) write caller-provided output slices and workspace and accept execution context `ExecutionContext`.
+Query workspace sizes with `ReductionWorkspace::workspace_requirements(view, options, context)`.
+The returned `ReductionRequirements` contains batch count `batches()`, partitions per batch `workers()`, and workspace bytes `required_bytes::<S>()`.
+Construct with `ReductionWorkspace::workspace(&req)` or enlarge existing workspace with `try_reserve(&req)`; check sufficiency with `check(&req)`.
+For repeated reductions of identically shaped views, reuse `_into` forms and workspace to avoid allocation after the first call.
+
+`StatisticsOptions` controls missing and nonfinite values, merge order, and retained moment order.
+By default, observations marked missing in a validity array (`BatchView::with_validity`) (`MissingPolicy::Reject`), and NaN or infinity (`NonFinitePolicy::Reject`), cause errors; `Skip` omits them from estimation.
+`with_moment_order` selects the retained order for `reduce_moments` and related results (default `MomentOrder::Second`); `with_max_bytes` selects the workspace limit.
+`MergePolicy::InputOrder` (the default) traverses each batch once in input order.
+`MergePolicy::StablePartitions` divides each batch into execution-plan partitions, processes them in parallel, and merges them in fixed partition order.
+Both are independent of thread completion order, but their results may differ by rounding.
+scioxide-stats tests compare partition merging with one-pass accumulation within $128\,\varepsilon\,(\text{tree depth}+1)$ times a scale (value magnitude for means, squared range for variances, and the product of coordinate ranges for covariance).
+Against exact rational reference values, differences normalized by the corresponding power of spread are checked within $512\,\varepsilon$ (plus one output subnormal unit).
+These are tested ranges, not forward-error guarantees for every ill-conditioned dataset.
+
+`reduce_moment(view, k, center)` returns the following quantity per batch.
+
+$$
+\mu_k = \frac{1}{n}\sum_{i=1}^n (x_i - c)^k
+$$
+
+When `center` is `Some(c)`, moments are about $c$; with `None`, they are about the batch mean.
+Moments about the origin (raw moments) use `Some(0.0)`.
+Moments about the mean use two passes: one for the mean and one for powers.
+Empty batches return `None`; $k = 0$ is exactly 1 and mean-centered $k = 1$ exactly 0.
+`reduce_trimmed_moments(view, limits)` first validates observations under missing-data and nonfinite-value policies, then removes observations outside `TrimLimits` before computing moments.
+`TrimLimits` is a value range, distinct from trimmed means removing endpoint fractions ([Order statistics, extrema, and robust location estimators](oxref:stats-robust-breakdown-trimmed-mean)).
+
+## Variance with an increasing offset
+
+Five values formed by adding offset $10^p$ to deviations $[-2, -1, 0, 1, 2]$ have sample variance exactly 2.5 regardless of offset.
+Since $10^{15.5} < 2^{52}$, values $10^p + d$ are exactly representable in f64; all differences between computed variance and 2.5 come from algorithmic rounding.
+The next cell varies the offset from $10^0$ to $10^{15.5}$ and plots differences from 2.5 for `OnlineMoments` sample variance and a comparison one-pass formula on logarithmic axes.
+A vertical line marks the offset for the selected exponent $p$, and the values at that point appear in the table.
+Exactly zero differences cannot be plotted on log axes, so the table counts them.
+
+```rust
+//| id: stats-offset-variance
+//| ref: stats-offset-variance
+//| title: "Compare naive variance and online updates as the offset increases"
+//| run: reactive
+//| crates: [scioxide-stats, scioxide-core]
+//| inputs:
+//|   offset_exponent: {"type":"range","label":"Offset exponent p (offset 10^p)","description":"Changes the offset added to the same deviations −2…2.","min":0,"max":15,"step":1,"value":10}
+//| cases:
+//|   - {"id":"small-offset","label":"p = 3","description":"κ² u remains small and the one-pass formula is still close to 2.5.","inputs":{"offset_exponent":3}}
+//|   - {"id":"huge-offset","label":"p = 15","description":"The one-pass formula gives meaningless values while online updates retain 2.5.","inputs":{"offset_exponent":15}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"variance","path":"/rows/1/1","approx":{"value":2.5,"atol":1e-14}}
+//|       - {"artifact":"variance","path":"/rows/0/2","approx":{"value":-2.5,"atol":1e-12}}
+//|       - {"artifact":"variance","path":"/rows/1/3","equals":61}
+//|       - {"artifact":"variance","path":"/rows/0/3","equals":17}
+//|   - case: small-offset
+//|     expect:
+//|       - {"artifact":"variance","path":"/rows/0/2","range":{"min":-1e-9,"max":1e-9}}
+//|       - {"artifact":"variance","path":"/rows/1/1","approx":{"value":2.5,"atol":1e-14}}
+//|   - case: huge-offset
+//|     expect:
+//|       - {"artifact":"variance","path":"/rows/0/2","range":{"max":-1e10}}
+//|       - {"artifact":"variance","path":"/rows/1/1","approx":{"value":2.5,"atol":1e-14}}
+use scioxide_core::RealScalar;
+use scioxide_stats::{MomentOrder, OnlineMoments};
+
+// Deviations [-2, -1, 0, 1, 2] have sample variance exactly 2.5 regardless of offset.
+let deviations = [-2.0_f64, -1.0, 0.0, 1.0, 2.0];
+let exact = 2.5_f64;
+let evaluate = |offset: f64| -> Result<(f64, f64), String> {
+    let values: Vec<f64> = deviations.iter().map(|&d| offset + d).collect();
+    // Main computation: scioxide-stats online updates.
+    let mut moments = OnlineMoments::new(MomentOrder::Second);
+    for &v in &values {
+        moments.observe(v).map_err(|e| e.to_string())?;
+    }
+    let stable = moments
+        .snapshot()
+        .sample_variance()
+        .map_err(|e| e.to_string())?
+        .ok_or("Sample variance is undefined")?;
+    // Comparison: one-pass difference-of-squares formula (not a scioxide-stats computation).
+    let n = values.len() as f64;
+    let sum: f64 = values.iter().sum();
+    let squares: f64 = values.iter().map(|v| v * v).sum();
+    Ok(((squares - sum * sum / n) / (n - 1.0), stable))
+};
+
+// Plot differences on a horizontal range fixed from 10^0 to 10^15.5. Count zero differences omitted from log axes.
+let (mut naive_curve, mut stable_curve) = (Vec::new(), Vec::new());
+let (mut naive_zero, mut stable_zero) = (0_u32, 0_u32);
+for i in 0..=62 {
+    let offset = RealScalar::powf(10.0_f64, 15.5 * f64::from(i) / 62.0);
+    let (naive, stable) = evaluate(offset)?;
+    let (dn, ds) = ((naive - exact).abs(), (stable - exact).abs());
+    if dn > 0.0 {
+        naive_curve.push([offset, dn]);
+    } else {
+        naive_zero += 1;
+    }
+    if ds > 0.0 {
+        stable_curve.push([offset, ds]);
+    } else {
+        stable_zero += 1;
+    }
+}
+let offset = RealScalar::powf(10.0_f64, offset_exponent);
+let (naive, stable) = evaluate(offset)?;
+
+emit_line_chart!(
+    &vec![
+        serde_json::json!({
+            "name": "One-pass formula (difference of sums of squares)",
+            "points": naive_curve,
+            "style": {"showSymbol": true}
+        }),
+        serde_json::json!({
+            "name": "OnlineMoments (online updates)",
+            "points": stable_curve,
+            "style": {"showSymbol": true, "symbol": "diamond"}
+        }),
+    ],
+    options = &serde_json::json!({
+        "xLabel": "Reference value [-]",
+        "yLabel": "Difference from exact sample variance 2.5 [-]",
+        "xType": "log",
+        "yType": "log",
+        "xMin": 1.0,
+        "xMax": 4.0e15,
+        "link": {"group": "stats-offset"},
+        "annotations": [{"kind": "line", "axis": "x", "value": offset, "label": "Selected offset"}]
+    })
+);
+let sci4 = serde_json::json!({ "notation": "scientific", "significantDigits": 4 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Algorithm", "type": "string" },
+    { "key": "1", "label": "Sample variance [-]", "type": "number", "format": sci4 },
+    { "key": "2", "label": "Difference from exact 2.5 [-]", "type": "number", "format": sci2 },
+    { "key": "3", "label": "Points with zero difference [count/63]", "type": "integer" }
+]);
+let rows = vec![
+    ("One-pass formula", naive, naive - exact, naive_zero),
+    ("OnlineMoments", stable, stable - exact, stable_zero),
+];
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "variance" })
+);
+```
+
+The one-pass difference grows proportionally to squared offset: $7.1 \times 10^{-15}$ at offset 5.6 and $6.2 \times 10^{-2}$ at $1.8 \times 10^7$.
+The sample's population variance is $\sigma^2 = 2$, giving $\kappa \approx 10^p/\sqrt 2$; difference growth matches proportionality to $\kappa^2$ in the approximate bound $n\kappa^2 u$ above.
+At offset $10^8$, the difference reaches 2.5 (variance becomes 0); larger offsets return 0 or meaningless values such as difference $-1.4 \times 10^{14}$ at $10^{15}$.
+The table shows the one-pass formula returning 0 at the default $p = 10$.
+
+`OnlineMoments` differs from 2.5 at only two of 63 points, offsets 3.2 and 32, by at most $5.3 \times 10^{-15}$.
+The other 61 points return 2.5 exactly.
+Small integer deviations also make update products exactly representable; this does not imply zero error for general data.
+The next section measures errors for fractional deviations.
+
+## Merge order and rounding
+
+Measure how partial-aggregate merge order affects rounding using data with an exact reference.
+The next cell uses the random seed to generate $n = 4096$ deviations $d_i \in [-8, 8]$ in integer multiples of $1/64$, then adds offset $10^p$.
+Since $10^{13} \cdot 64 < 2^{53}$, values $10^p + d_i$ ($p \le 13$) are exactly representable in f64.
+Deviation sum $\sum d_i$ and squared sum $\sum d_i^2$ are exact in f64; the exact sample variance is
+
+$$
+s^2 = \frac{n\sum d_i^2 - \bigl(\sum d_i\bigr)^2}{n(n-1)}
+$$
+
+Its numerator can be computed exactly, with a single rounding in division (independent check).
+Compare sample-variance relative errors for four computation orders on these data.
+The orders are individual updates with `observe`, two passes with `from_slice`, left-to-right `merge` of partition accumulators, and binary-tree pairwise `merge` of partition accumulators.
+Partition count $k$ is adjustable.
+The one-pass formula's relative error is also plotted for comparison.
+The horizontal axis uses the same offset as the preceding cell, linking both charts' zooming and panning.
+
+```rust
+//| id: stats-merge-order
+//| ref: stats-merge-order
+//| title: "Vary partition count and merge order to measure relative sample-variance error"
+//| run: reactive
+//| crates: [scioxide-stats, scioxide-core]
+//| inputs:
+//|   sampling_seed: {"type":"integer","label":"Random seed","min":0,"max":100000,"value":2024}
+//|   partition_exponent: {"type":"range","label":"Exponent j in partition count k = 2^j","description":"Divide 4096 observations into k equal-size partitions.","min":0,"max":8,"step":1,"value":4}
+//|   offset_exponent: {"type":"range","label":"Offset exponent p shown in the table","description":"Select offset 10^p for table rows.","min":0,"max":13,"step":1,"value":10}
+//| cases:
+//|   - {"id":"one-partition","label":"k = 1","description":"One partition gives left-to-right and tree merges the same order as observe.","inputs":{"partition_exponent":0}}
+//|   - {"id":"many-partitions","label":"k = 256","description":"Merge partitions of 16 observations each.","inputs":{"partition_exponent":8}}
+//|   - {"id":"small-offset","label":"p = 0","description":"Even with condition number near 1, accumulator error matches the offset-10^10 case.","inputs":{"offset_exponent":0}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"orders","path":"/rows/0/2","approx":{"value":24.2515,"rtol":1e-4}}
+//|       - {"artifact":"orders","path":"/rows/1/1","range":{"max":4e-16}}
+//|       - {"artifact":"orders","path":"/rows/2/2","approx":{"value":6.0629,"rtol":1e-4}}
+//|       - {"artifact":"orders","path":"/rows/3/2","approx":{"value":3.0314,"rtol":1e-4}}
+//|       - {"artifact":"orders","path":"/rows/4/1","range":{"min":100}}
+//|   - case: one-partition
+//|     expect:
+//|       - {"artifact":"orders","path":"/rows/2/2","approx":{"value":24.2515,"rtol":1e-4}}
+//|       - {"artifact":"orders","path":"/rows/3/2","approx":{"value":24.2515,"rtol":1e-4}}
+//|   - case: many-partitions
+//|     expect:
+//|       - {"artifact":"orders","path":"/rows/3/1","range":{"max":4e-16}}
+//|   - case: small-offset
+//|     expect:
+//|       - {"artifact":"orders","path":"/rows/0/2","approx":{"value":24.2515,"rtol":1e-4}}
+//|       - {"artifact":"orders","path":"/rows/4/1","range":{"max":1e-13}}
+use scioxide_core::RealScalar;
+use scioxide_stats::{MomentOrder, OnlineMoments};
+
+const N: usize = 4096;
+// Generate deviations d ∈ [-8, 8] on a 1/64 grid with a linear congruential method (input generation).
+let mut state = sampling_seed as u64;
+let deviations: Vec<f64> = (0..N)
+    .map(|_| {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((state >> 40) % 1025) as f64 / 64.0 - 8.0
+    })
+    .collect();
+// Independent check: deviation sums and squared sums are exact in f64, so the numerator is exact and only division rounds.
+let n = N as f64;
+let sum: f64 = deviations.iter().sum();
+let squares: f64 = deviations.iter().map(|d| d * d).sum();
+let exact = (n * squares - sum * sum) / (n * (n - 1.0));
+let parts = 1_usize << (partition_exponent as u32);
+
+let variance = |m: &OnlineMoments<f64>| -> Result<f64, String> {
+    let s2 = m.snapshot().sample_variance().map_err(|e| e.to_string())?;
+    Ok(s2.ok_or("Sample variance is undefined")?)
+};
+let evaluate = |offset: f64| -> Result<[f64; 5], String> {
+    let values: Vec<f64> = deviations.iter().map(|&d| offset + d).collect();
+    let mut sequential = OnlineMoments::new(MomentOrder::Second);
+    for &v in &values {
+        sequential.observe(v).map_err(|e| e.to_string())?;
+    }
+    let slice =
+        OnlineMoments::from_slice(&values, MomentOrder::Second).map_err(|e| e.to_string())?;
+    // Construct an accumulator for each partition using observe.
+    let mut chunks = Vec::with_capacity(parts);
+    for chunk in values.chunks(N / parts) {
+        let mut m = OnlineMoments::new(MomentOrder::Second);
+        for &v in chunk {
+            m.observe(v).map_err(|e| e.to_string())?;
+        }
+        chunks.push(m);
+    }
+    let mut left = OnlineMoments::new(MomentOrder::Second);
+    for m in &chunks {
+        left.merge(m).map_err(|e| e.to_string())?;
+    }
+    // Binary tree: repeatedly merge adjacent pairs to halve the count.
+    while chunks.len() > 1 {
+        let mut next = Vec::with_capacity(chunks.len() / 2);
+        for pair in chunks.chunks(2) {
+            let mut m = pair[0];
+            m.merge(&pair[1]).map_err(|e| e.to_string())?;
+            next.push(m);
+        }
+        chunks = next;
+    }
+    // Comparison: one-pass formula (not a scioxide-stats computation).
+    let (s, q) = values
+        .iter()
+        .fold((0.0, 0.0), |(s, q), v| (s + v, q + v * v));
+    let naive = (q - s * s / n) / (n - 1.0);
+    let out = [
+        variance(&sequential)?,
+        variance(&slice)?,
+        variance(&left)?,
+        variance(&chunks[0])?,
+        naive,
+    ];
+    Ok(out.map(|v| (v - exact).abs() / exact))
+};
+
+let names = [
+    "observe (one at a time)",
+    "from_slice (two passes)",
+    "Left-to-right merge",
+    "Binary-tree merge",
+    "One-pass formula",
+];
+let mut curves: Vec<Vec<[f64; 2]>> = vec![Vec::new(); 5];
+let mut zeros = [0_u32; 5];
+for p in 0..=26 {
+    let offset = RealScalar::powf(10.0_f64, 0.5 * f64::from(p));
+    for (j, e) in evaluate(offset)?.into_iter().enumerate() {
+        if e > 0.0 {
+            curves[j].push([offset, e]);
+        } else {
+            zeros[j] += 1;
+        }
+    }
+}
+let series: Vec<_> = names
+    .iter()
+    .zip(curves)
+    .map(|(name, points)| {
+        serde_json::json!({
+            "name": name,
+            "points": points,
+            "style": {"showSymbol": true}
+        })
+    })
+    .collect();
+let chosen = RealScalar::powf(10.0_f64, offset_exponent);
+emit_line_chart!(
+    &series,
+    options = &serde_json::json!({
+        "xLabel": "Reference value [-]",
+        "yLabel": "Relative sample-variance error [-]",
+        "xType": "log",
+        "yType": "log",
+        "xMin": 1.0,
+        "xMax": 4.0e15,
+        "link": {"group": "stats-offset"},
+        "annotations": [
+            {"kind": "line", "axis": "x", "value": chosen, "label": "Offset shown in table"},
+            {"kind": "line", "axis": "y", "value": f64::EPSILON / 2.0, "label": "Unit roundoff u"}
+        ]
+    })
+);
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let fixed1 = serde_json::json!({ "fractionDigits": 1 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Computation order", "type": "string" },
+    { "key": "1", "label": "Relative error [-]", "type": "number", "format": sci2 },
+    { "key": "2", "label": "Relative error / u [-]", "type": "number", "format": fixed1 },
+    { "key": "3", "label": "Offsets with zero error [count/27]", "type": "integer" }
+]);
+let errors = evaluate(chosen)?;
+let rows: Vec<_> = (0..5)
+    .map(|j| {
+        (
+            names[j],
+            errors[j],
+            errors[j] / (f64::EPSILON / 2.0),
+            zeros[j],
+        )
+    })
+    .collect();
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "orders" })
+);
+```
+
+At the default seed 2024 and $k = 16$, relative errors are $2.7 \times 10^{-15}$ (about $24u$) for `observe`, $6.7 \times 10^{-16}$ (about $6u$) for left-to-right `merge`, and $3.4 \times 10^{-16}$ (about $3u$) for binary-tree `merge`; `from_slice` gives 0.
+All four orders give the same relative errors across offsets from $10^0$ to $10^{13}$.
+Compensated high and low mean parts are subtracted separately, cancelling the offset first and rounding only the deviation part.
+Over the same range, one-pass relative error grows from 0 at $p = 0$ to $1.6 \times 10^3$ at $p = 10$ and $6.5 \times 10^9$ at $p = 13$.
+
+At $k = 1$ there is one partition, so left-to-right and binary-tree merges use the same order as `observe` and give the same error $24u$.
+At $k = 256$, binary-tree error is 0 and left-to-right error is about $3u$.
+With seed 1, `observe` gives about $33u$, left-to-right merging about $4.5u$, and binary-tree merging about $6.0u$.
+One dataset cannot establish the best order, but every error is within tens of $u$, far below the approximate bound $n\kappa u$ above (of order $10^{10}$ times at $p = 10$).
+Trailing-digit changes from merge order provide a basis for choosing tolerances when comparing parallel aggregates.
+
+## Summary
+
+One-pass variance error grows proportionally to squared condition number $\kappa^2 \approx (\mu/\sigma)^2$; when the mean exceeds standard deviation by about eight orders of magnitude, no meaningful digits remain.
+Welford recurrences and their merge generalization accumulate only deviations, giving an error estimate proportional to $\kappa$.
+`OnlineMoments` and `OnlineCovariance` use the same merge formula for updates and partial aggregates, retaining compensated means to preserve variance digits even with large offsets.
+Merge order changes trailing digits; fix the order with `MergePolicy` when reproducibility is required.
+Choose retained order with `MomentOrder` in advance and specify skewness/kurtosis corrections and conventions through `BiasCorrection` and `KurtosisConvention`.
+Undefined statistics return `Ok(None)`; unrepresentable values and detected cancellation return `Err`.
+Handle these separately.
+
+## Further reading
+
+- [Mathematics of weighted estimation, standard errors, and confidence intervals](../weighted-estimation-and-confidence/): examine how weight meaning changes variance divisors and degrees of freedom, and how mean intervals are constructed.
+- [Online sensor aggregation with large offsets](../../examples/online-sensor/): examine online means and variances for measurements with drift and periodic components.
+- [Compare merged partial aggregates with a full aggregate](../../examples/merge-covariance/): compare partition and merge-order effects on covariance against batched matrix-view reductions.

@@ -1,0 +1,522 @@
+---
+title: 確率的勾配降下法と確率的信頼領域法
+description: 標本化した目的と勾配の仕様、SGD の刻みとノイズの下限、確率的信頼領域法の適応的な反復観測と受理判定を説明する。
+sidebar:
+  order: 392
+references:
+  optimize-sampled-objective: "標本化した目的と勾配"
+  optimize-sgd: "確率的勾配降下法"
+  optimize-stochastic-trust-region: "確率的信頼領域法"
+---
+
+目的の値や勾配を、データの一部（ミニバッチ）やシミュレーションの乱数を通してしか評価できないことがある。
+このとき最小化するのは期待値 $f(x)=\mathrm E[F(x,\xi)]$ で、解法が受け取るのは標本ごとの観測 $F(x,\xi)$ と $\nabla_xF(x,\xi)$ だけである（$\xi$ は標本を表す確率変数）。
+個々の観測はノイズを含むので、結果には推定のばらつきが付き、決定論的な最適化と同じ意味の収束判定はできない。
+このページでは標本化した目的と勾配の受け取り方、確率的勾配降下法（SGD）、確率的信頼領域法を説明する。
+同じ受け取り方は多目的の [NSGA-II](../multiobjective-and-stochastic/) も使う。
+
+## 標本化した目的と勾配
+
+`SampledObjective` は点 $x$ とソルバーが内容を解釈しない 64 ビットの番号（トークン）を受け取り、目的の各成分の観測を書く。
+`SampledGradient` は、成分が一つの目的に勾配の観測を加える。
+SGD と確率的信頼領域法は、目的の成分がちょうど一つであることを要求する。
+トークンは解法が標本器から受け取って渡す値で、利用者はデータの添字、ミニバッチのシード、ノイズのシードとして解釈する。
+同じトークンに同じ観測を返せば、実行全体をシードから再現できる。
+観測が非有限なら、解法は `NonFinite` のエラーで止まる。
+
+`NoiseModel` は同じ点での繰り返し観測の関係を宣言する。
+`NoiseModel::Deterministic` は同じ点で同じ値を返すという宣言で、標準誤差を 0 として返す。
+`NoiseModel::Independent`（既定）は、異なるトークンの観測が共通の平均と有限の分散を持つ独立な標本だという宣言である。
+解法は観測と勾配が不偏であることを仮定するが、検査はしない。
+`DeterministicGradient(&smooth)` は `SmoothGradient` の実装を、トークンを無視する決定論的な `SampledGradient` に変える。
+
+`StochasticProblem::new(&objective)` は目的を借用し、既定の標本器 `PhiloxSampler` でトークンを作る。
+標本器は `OptimizationSampleKey` の三つ組（派生元のシード、用途、通し番号）からトークンを決める。
+用途は 0 が乱数による変異、1 が目的、2 が勾配、3 が信頼領域の基点、4 が試行点である。
+通し番号は標本ごとに 1 ずつ増えてチェックポイントに保存されるので、再開しても標本を使い回さない。
+`PhiloxSampler` は、派生元のシードを鍵とする Philox4x64-10 の生成器から通し番号の部分流を取り、用途で分岐させた流れの最初の出力をトークンにする。
+鍵はエグゼキューターの数によらないので、並列に評価しても結果は変わらない。
+標本器の一回の呼び出しは失敗しても標本 1 個と評価 1 回に数える。
+別の標本器は `OptimizationSampler` トレイトを実装して `with_sampler` で差し替える。
+`sample(key)` は等しい鍵に等しいトークンを返さなければならず、`configuration_token()` は標本器の設定を識別する値を返す。
+チェックポイントは、この値が同じ標本器でしか再開できない。
+
+`ReplicationOptions` は一つの推定に使う反復観測の数を決める。
+`fixed(count)` は数を固定し、`adaptive(minimum, maximum)` は判断がつかないときに数を倍にする（上限 `maximum`、`maximum < minimum` は `InvalidInput`）。
+推定は観測の標本平均 $\bar g$ と標準誤差 $\mathrm{SE}=s/\sqrt n$（$s$ は標本標準偏差、$n$ は観測数）で、判断には $\kappa\,\mathrm{SE}$ の余裕を使う。
+$\kappa$ は既定 2 で、`with_error_multiplier` で変える。
+$\kappa=2$ は信頼区間の被覆率を約束しない。
+`Independent` の観測が一つだけなら標準誤差は求まらず、結果の `standard_error()` は `None` になる。
+
+## ノイズのある一次元のモデル
+
+このページの二つのセルは、$f(x)=\tfrac12(x-x^\star)^2$ の目的と勾配に独立な正規ノイズが乗るモデルを使う。
+目的の観測は $\tfrac12(x-x^\star)^2+\sigma\xi$、勾配の観測は $x-x^\star+\sigma\xi'$ で、$\xi,\xi'$ はトークンをシードにした scioxide-random の標準正規乱数である。
+用途ごとにトークンが違うので、目的と勾配のノイズは互いに独立な標本として扱える。
+セルでは $x^\star=1.7$、$x_0=0$ とする。
+次の定義のブロックはこのモデルを二つのセルで共有する。
+
+```rust
+//| id: optimize-noisy-quadratic-model
+//| kind: definitions
+//| title: 目的と勾配の観測に正規ノイズが乗る一次元の二次関数
+//| crates: [scioxide-core, scioxide-optimize, scioxide-random]
+use scioxide_core::SciOxideError;
+use scioxide_optimize::{NoiseModel, SampledGradient, SampledObjective};
+use scioxide_random::{Distribution, Normal, SeedableRng, SplitMix64};
+
+/// f(x) = ½(x − x*)² の目的の観測 ½(x − x*)² + σξ と勾配の観測 x − x* + σξ。
+/// ξ はトークンをシードにした標準正規乱数で、トークンが違えば独立になる。
+pub(crate) struct NoisyQuadratic {
+    pub(crate) target: f64,
+    pub(crate) noise: f64,
+    normal: Normal<f64>,
+}
+
+impl NoisyQuadratic {
+    /// 最小点 x* とノイズの標準偏差 σ からモデルを作る。
+    pub(crate) fn new(target: f64, noise: f64) -> Result<Self, SciOxideError> {
+        Ok(Self {
+            target,
+            noise,
+            normal: Normal::new(0.0, 1.0)?,
+        })
+    }
+
+    /// トークンをシードにした標準正規乱数 ξ。
+    fn draw(&self, token: u64) -> Result<f64, SciOxideError> {
+        self.normal.sample(&mut SplitMix64::from_seed(token))
+    }
+}
+
+impl SampledObjective<f64> for NoisyQuadratic {
+    fn dimension(&self) -> usize {
+        1
+    }
+    fn objectives(&self) -> usize {
+        1
+    }
+    fn noise_model(&self) -> NoiseModel {
+        NoiseModel::Independent
+    }
+    fn sample_into(&self, x: &[f64], token: u64, out: &mut [f64]) -> Result<(), SciOxideError> {
+        let residual = x[0] - self.target;
+        out[0] = 0.5 * residual * residual + self.noise * self.draw(token)?;
+        Ok(())
+    }
+}
+
+impl SampledGradient<f64> for NoisyQuadratic {
+    fn gradient_sample_into(
+        &self,
+        x: &[f64],
+        token: u64,
+        out: &mut [f64],
+    ) -> Result<(), SciOxideError> {
+        out[0] = x[0] - self.target + self.noise * self.draw(token)?;
+        Ok(())
+    }
+}
+```
+
+## 確率的勾配降下法
+
+`StochasticGradientDescent` は
+
+$$
+x_{k+1}=x_k-\alpha_k\bar g_k
+$$
+
+と更新する。
+$\bar g_k$ はミニバッチの平均で、`SgdOptions::new(step, iterations, batch)` の `batch` 個の勾配の観測から作る。
+すべての更新を受理し、新しい点ではレポートのためだけに目的を別の `batch` 個の標本で観測する。
+一回の反復は勾配のバッチと目的のバッチを一回ずつ使う。
+
+刻み $\alpha_k$ は `SgdStep` で決め、$k$ は終えた更新の数である。
+`SgdStep::Constant(α)` は固定刻み、`SgdStep::Diminishing { initial, decay, power }` は $\alpha_k=\alpha_0/(1+dk)^p$ で、`SgdStep::Diminishing` の $p$ が $1/2<p\le1$ になければ `new` が `InvalidInput` を返す。
+不偏性、有界な分散、滑らかさなどの仮定に加え、古典的な収束条件には $\sum\alpha_k=\infty$、$\sum\alpha_k^2<\infty$ が現れる（Robbins と Monro, 1951）。
+$1/2<p\le1$ の減少刻みはこの条件を満たすが、固定刻みは満たさず、反復は最小点の周りで揺れ続ける。
+
+一次元のモデルで、この違いを式で確かめる。
+誤差 $e_k=x_k-x^\star$ は、固定刻みでは $e_{k+1}=(1-\alpha)e_k-\alpha\sigma\xi_k$ に従う。
+$\xi_k$ が独立な標準正規なら、二乗の期待値は
+
+$$
+\mathrm E[e_k^2]=(1-\alpha)^{2k}e_0^2+\frac{\alpha\sigma^2}{2-\alpha}\bigl(1-(1-\alpha)^{2k}\bigr)
+$$
+
+となる。
+第 1 項は初期誤差が比 $(1-\alpha)^2$ で減る過渡項で、第 2 項は $k\to\infty$ でノイズの下限 $\alpha\sigma^2/(2-\alpha)$ に近づく。
+$\alpha_k=1/(k+1)$ の減少刻みでは、$x_K$ が $K$ 個の勾配の観測から作る $x^\star-\sigma\cdot(\xi_0+\dots+\xi_{K-1})/K$ になり、$\mathrm E[e_K^2]=\sigma^2/K$ で 0 へ近づく。
+
+停止は、勾配の推定が $\|\bar g\|+\kappa\|\mathrm{SE}\|$ で `GradientTolerance` の閾値（既定は絶対・相対とも $\sqrt{\varepsilon}$、尺度 1）以下になったときである。
+決定論的なら `GradientSmall`（成功）、ノイズがあれば `EstimatedStationarity`（成功ではない推定の状態）になる。
+`Independent` で観測が一つなら標準誤差が求まらないので、この停止は起きず、反復の上限で `IterationLimit` になる。
+上限に達した場合も、最後の点で勾配を観測してから止まる。
+刻みが丸めで点を動かさなければ `StepSmall` で止まる。
+
+`StochasticResult` は最後に受理した点 `x()`、その点での目的の推定 `value()`、`standard_error()`、`sample_variance()`、`value_replicates()` を返す。
+勾配の推定は `gradient()`、`gradient_standard_errors()`、`gradient_replicates()` で、その点で勾配を観測していなければ `None` になる。
+`iterations()`、`termination()`、`counts()`、`sample_cursor()`（次の標本の通し番号）も返し、`is_success()` は `GradientSmall` のときだけ真である。
+`x0` が空か次元が合わないか、目的の成分が一つでなければ `InvalidInput` になり、最初の目的の推定より前に止まるとエラーになる。
+`StochasticWorkspace` を `minimize_into` に渡すと、止まった実行を `checkpoint()` で保存し、`resume_into` で標本を使い回さずに続けられる。
+`workspace_requirements(n)` が返す `StochasticWorkspaceRequirements` は次元、一つの推定に使う標本の最大数 `replicates()`、概算のバイト数 `bytes()` を持つ。
+`StochasticWorkspace` は直前の呼び出しを記録し、`last_attempt()` の `progress()` が返す `StochasticProgress` から受理した点までの反復回数 `iterations()` とその点での目的の標本平均 `value()` を読める。
+
+## 固定刻みと減少刻みのノイズの下限
+
+次のセルは一次元のモデルを `StochasticGradientDescent` で解き、ミニバッチ 1 で反復の上限 $K$ を 1 から 512 まで倍にする。
+各 $K$ でシードだけを変えた $R=40$ 回の実行から平均二乗誤差 $\overline{e_K^2}$ とその標準誤差を求め、上の理論式と比べる。
+各 $K$ の実行は同じ 40 個のシードを使うので、ある $K$ の実行はそれより大きい $K$ の実行の途中までと同じ反復になる。
+そのため、異なる $K$ の点は独立ではない。
+入力はノイズの標準偏差 $\sigma$、固定刻み $\alpha$、シードの基点である。
+一つ目のグラフは平均二乗誤差（記号）と理論値（破線）を両対数で描き、二つ目のグラフは測定値と理論値の比を $\pm2\,\mathrm{SE}$ のエラーバーとともに描く。
+比が 1 の線をエラーバーが覆っていれば、測定は理論と整合する。
+表は $K=512$ の測定値、標準誤差、理論値、標準化した差 $(\overline{e_K^2}-\mathrm E[e_K^2])/\mathrm{SE}$、終了理由である。
+
+```rust
+//| id: optimize-sgd-noise-floor
+//| ref: optimize-sgd-noise-floor
+//| title: 固定刻みと減少刻みの SGD の平均二乗誤差を理論と比べる
+//| run: button
+//| timeoutMs: 120000
+//| uses: [optimize-noisy-quadratic-model]
+//| crates: [scioxide-core, scioxide-optimize, scioxide-random]
+//| inputs:
+//|   noise: {"type":"range","label":"勾配のノイズ σ [-]","min":0.1,"max":2,"step":0.1,"value":1}
+//|   step: {"type":"range","label":"固定刻み α [-]","min":0.02,"max":0.5,"step":0.02,"value":0.1}
+//|   seed: {"type":"range","label":"シードの基点 [-]","min":1,"max":100,"step":1,"value":1}
+//| cases:
+//|   - {"id":"small-step","label":"α = 0.02","description":"ノイズの下限は 0.0101 に下がるが、過渡項が下限を下回るまでに約 140 回かかる。","inputs":{"step":0.02}}
+//|   - {"id":"large-step","label":"α = 0.5","description":"ノイズの下限は 1/3 に上がり、減少刻みより 2 桁大きい誤差で止まる。","inputs":{"step":0.5}}
+//|   - {"id":"seed-100","label":"シードの基点 100","description":"別の乱数列でも、測定値は理論値の周りに標準誤差の程度で散らばる。","inputs":{"seed":100}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"final","path":"/rows/0/1","equals":512}
+//|       - {"artifact":"final","path":"/rows/0/4","approx":{"value":0.0526316,"atol":1e-6}}
+//|       - {"artifact":"final","path":"/rows/0/5","range":{"min":-3,"max":3}}
+//|       - {"artifact":"final","path":"/rows/1/4","approx":{"value":0.001953125,"atol":1e-9}}
+//|       - {"artifact":"final","path":"/rows/1/5","range":{"min":-3,"max":3}}
+//|       - {"artifact":"final","path":"/rows/0/6","equals":"IterationLimit"}
+//|   - case: small-step
+//|     expect:
+//|       - {"artifact":"final","path":"/rows/0/4","approx":{"value":0.010101,"atol":1e-5}}
+//|       - {"artifact":"final","path":"/rows/0/5","range":{"min":-3,"max":3}}
+//|   - case: large-step
+//|     expect:
+//|       - {"artifact":"final","path":"/rows/0/4","approx":{"value":0.333333,"atol":1e-5}}
+//|       - {"artifact":"final","path":"/rows/0/5","range":{"min":-3,"max":3}}
+//|   - case: seed-100
+//|     expect:
+//|       - {"artifact":"final","path":"/rows/0/5","range":{"min":-3,"max":3}}
+//|       - {"artifact":"final","path":"/rows/1/5","range":{"min":-3,"max":3}}
+use scioxide_core::{Budget, RealScalar};
+use scioxide_optimize::{SgdOptions, SgdStep, StochasticGradientDescent, StochasticProblem};
+let model = NoisyQuadratic::new(1.7, noise).map_err(|e| e.to_string())?;
+let problem = StochasticProblem::new(&model);
+let schedules = [
+    ("固定刻み", SgdStep::Constant(step)),
+    (
+        "減少刻み 1/(k+1)",
+        SgdStep::Diminishing {
+            initial: 1.0,
+            decay: 1.0,
+            power: 1.0,
+        },
+    ),
+];
+let replicates = 40;
+let (mut series, mut ratios, mut rows) = (Vec::new(), Vec::new(), Vec::new());
+for (name, schedule) in schedules {
+    let (mut measured, mut theory, mut bars) = (Vec::new(), Vec::new(), Vec::new());
+    for level in 0..10 {
+        let iterations = 1_usize << level;
+        let budget = Budget::try_from(iterations).map_err(|e| e.to_string())?;
+        let mut squares = Vec::with_capacity(replicates);
+        let mut termination = String::new();
+        for r in 0..replicates {
+            // シードだけを変えた独立な実行。ミニバッチは 1 標本。
+            let options = SgdOptions::new(schedule, budget, Budget::ONE)
+                .with_seed(seed as u64 * 1000 + r as u64);
+            let result = StochasticGradientDescent::new(options)
+                .map_err(|e| e.to_string())?
+                .minimize(&problem, &[0.0])
+                .map_err(|e| e.to_string())?;
+            squares.push((result.x()[0] - model.target).powi(2));
+            termination = result.termination().to_string();
+        }
+        let count = replicates as f64;
+        let mean = squares.iter().sum::<f64>() / count;
+        let spread = squares.iter().map(|s| (s - mean).powi(2)).sum::<f64>() / (count - 1.0);
+        let standard_error = RealScalar::sqrt(spread / count);
+        // 理論値（独立な式）: 固定刻みは過渡項とノイズの下限、減少刻みは σ²/K。
+        let k = iterations as f64;
+        let expected = match schedule {
+            SgdStep::Constant(a) => {
+                let decay = RealScalar::powf(1.0 - a, 2.0 * k);
+                decay * model.target.powi(2) + a * noise * noise / (2.0 - a) * (1.0 - decay)
+            }
+            SgdStep::Diminishing { .. } => noise * noise / k,
+        };
+        measured.push([k, mean]);
+        theory.push([k, expected]);
+        let (low, high) = (mean - 2.0 * standard_error, mean + 2.0 * standard_error);
+        bars.push([k, mean / expected, low / expected, high / expected]);
+        if level == 9 {
+            let z = (mean - expected) / standard_error;
+            rows.push((
+                name,
+                iterations,
+                mean,
+                standard_error,
+                expected,
+                z,
+                termination,
+            ));
+        }
+    }
+    series.push(serde_json::json!({
+        "name": format!("{name}（測定）"),
+        "points": measured,
+        "style": { "showSymbol": true }
+    }));
+    series.push(serde_json::json!({
+        "name": format!("{name}（理論）"),
+        "points": theory,
+        "style": { "lineType": "dashed" }
+    }));
+    ratios.push(serde_json::json!({ "name": name, "points": bars }));
+}
+emit_line_chart!(
+    &series,
+    options = &serde_json::json!({
+        "link": { "group": "sgd-iterations" },
+        "xLabel": "反復の上限 K [回]",
+        "yLabel": "平均二乗誤差 E[(x_K − x*)²] [-]",
+        "xType": "log",
+        "yType": "log"
+    })
+);
+emit_chart!(
+    serde_json::json!({
+        "kind": "errorbar",
+        "link": { "group": "sgd-iterations" },
+        "dataZoom": true,
+        "tooltip": true,
+        "xLabel": "反復の上限 K [回]",
+        "yLabel": "測定値 / 理論値（± 2 SE）[-]",
+        "xType": "log",
+        "series": ratios,
+        "annotations": [{ "kind": "line", "axis": "y", "value": 1.0, "label": "理論値" }]
+    }),
+    metadata = serde_json::json!({ "id": "ratio" })
+);
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "刻み" },
+    { "key": "1", "label": "K [回]", "type": "integer" },
+    { "key": "2", "label": "平均二乗誤差 [-]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "その標準誤差 [-]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "理論値 [-]", "type": "number", "format": sci3 },
+    { "key": "5", "label": "(測定 − 理論) / SE [-]", "type": "number", "format": fixed2 },
+    { "key": "6", "label": "終了理由" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "final" })
+);
+```
+
+固定刻み $\alpha=0.1$、$\sigma=1$ では、平均二乗誤差は $K\approx19$ までは過渡項 $(1-\alpha)^{2K}e_0^2$ で減り、その後はノイズの下限 $\alpha\sigma^2/(2-\alpha)=0.0526$ の近くで止まる。
+$K=512$ の測定値は $0.0409\pm0.0093$（平均 ± 標準誤差）で、理論値との差は標準誤差の $-1.26$ 倍である。
+減少刻み $1/(k+1)$ は両対数グラフで傾き $-1$ の直線 $\sigma^2/K$ に沿って下がり、$K=512$ で $0.00241\pm0.00042$（理論値 0.00195、差は標準誤差の 1.09 倍）になる。
+同じ反復数でも、ノイズの下限を持つ固定刻みより減少刻みの誤差が 1 桁以上小さい。
+比のグラフでは 20 本のエラーバーのうち 19 本が 1 を覆い、減少刻みの $K=32$ だけが $[1.03,2.14]$ で 1 をわずかに外れる。
+$\pm2\,\mathrm{SE}$ のエラーバーが 1 を外れる割合は 5% 程度が目安で、$e_K^2$ の分布は右に歪み、異なる $K$ の点は独立でもないので、この一本だけで理論との不一致とは言えない。
+$\alpha=0.02$ では下限が 0.0101 に下がる代わりに、過渡項が下限を下回るまでに約 140 回かかる。
+$\alpha=0.5$ では下限が $1/3$ に上がり、$K=512$ の測定値 $0.256\pm0.061$ は減少刻みの 0.0024 より 2 桁大きい。
+ミニバッチが 1 なので勾配の標準誤差は求まらず、どの実行も `IterationLimit` で止まる。
+
+## 確率的信頼領域法
+
+`StochasticTrustRegion` は、一次のモデル $m(s)=f(x)+\bar g^Ts$ を半径 $\Delta$ の球の中で使い、推定の誤差に応じて観測の数を増やしながら試行を受理するか決める（Chen、Menickelly と Scheinberg, 2018）。
+一回の反復は次の手順である。
+
+1. 勾配を最小の数だけ観測し、余裕 $\kappa\|\mathrm{SE}(\bar g)\|$ が $\theta\Delta$ 以下になるまで観測を倍にする。
+   上限まで増やしても満たさなければ `NoiseLimit` で止まる。
+2. モデルを球の中で最小にする刻み $s=-\Delta\,\bar g/\|\bar g\|$ をとり、予測減少を $\Delta\|\bar g\|$ とする。
+   $\|\bar g\|<\beta\Delta$ なら、目的を観測せずに棄却する。
+3. 基点と試行点の目的を同じ数だけ観測し、推定した減少 $\hat r$ と、二つの標準誤差を合成した $\mathrm{SE}=\sqrt{\mathrm{SE}_x^2+\mathrm{SE}_{x+s}^2}$ を求める。
+4. $\hat r-\kappa\,\mathrm{SE}\ge\eta\,\Delta\|\bar g\|$ なら受理して半径を $\gamma$ 倍（上限 $\Delta_{\max}$）にする。
+   $\hat r+\kappa\,\mathrm{SE}<\eta\,\Delta\|\bar g\|$ なら棄却して半径を $1/\gamma$ 倍にする。
+   どちらとも言えなければ観測を倍にして 3 に戻り、上限に達すると `NoiseLimit` で止まる。
+5. 半径が下限 $\Delta_{\min}$ を下回ると `StepSmall` で止まる。
+
+手順 1 の観測でも SGD と同じ停止判定を行い、`GradientSmall` か `EstimatedStationarity` で止まることがある。
+勾配の余裕を $\theta\Delta$ で抑えるのは、モデルの誤差を刻みの大きさに比例させるためで、半径が小さくなるほど勾配に多くの観測が要る。
+観測 $n$ 個の標準誤差はおよそ $\sigma/\sqrt n$ なので、上限 $M$ で手順 1 を満たせる半径は $\Delta\ge\kappa\sigma/(\theta\sqrt M)$ に限られる。
+
+`StochasticTrustOptions::new(iterations, replication)` の既定は、初期半径 $\Delta_0=1$、$\Delta_{\max}=10$、$\Delta_{\min}$ は機械イプシロン、$\eta=0.1$、$\beta=0.001$、$\gamma=2$、$\theta=1/4$ である。
+`with_radii(minimum, initial, maximum)` は正の有限値で小さい順の半径を、`with_model_policy(η, β, γ, θ)` は $0<\eta<1$、$\beta>0$、$\gamma>1$、$\theta>0$ の値をとる。
+rustdoc は勾配の精度 $\theta$ を $\kappa$ と書くが、このページでは $\kappa$ を標準誤差の倍率に使う。
+`Independent` の目的では、`replication` の最小の数が 2 未満なら `InvalidInput` になる。
+結果の `iterations()` は棄却した反復も数え、`trust_radius()` は最後の半径を返す。
+`SgdOptions` と `StochasticTrustOptions` はシード（`with_seed`、既定 42）、勾配の許容誤差、実行方針、時間の上限を同じ方法で設定する。
+
+## 反復観測の上限と最終誤差
+
+次のセルは一次元のモデルを `StochasticTrustRegion` で解き、反復観測の上限 $M$ を $8$ から $2048$ まで倍にして、止まり方と最終点の誤差を比べる。
+反復観測の最小の数は 4、反復の上限は 300 回で、ほかは既定値を使う。
+一次元では刻みが $\pm\Delta$ で、半径は上限 10 に達しない限り $\Delta_0=1$ の 2 の冪倍なので、反復点は 2 進の格子に乗る。
+$x^\star=2$ のように格子上の値を選ぶと誤差が厳密に 0 になるので、モデルでは $x^\star=1.7$ を使う。
+入力は観測のノイズ $\sigma$ とシードである。
+グラフは最終点の誤差 $|x-x^\star|$ と最後の半径 $\Delta$（記号）と、勾配の精度から決まる半径の下限 $\kappa\sigma/(\theta\sqrt M)$（破線）を両対数で描く。
+表は各 $M$ の終了理由、反復数、使った標本の数、最終点と誤差、最後の半径、半径の下限、最後の勾配の標準誤差を並べる。
+
+```rust
+//| id: optimize-stochastic-trust-replicates
+//| ref: optimize-stochastic-trust-replicates
+//| title: 確率的信頼領域法の止まり方と誤差を反復観測の上限ごとに比べる
+//| run: button
+//| timeoutMs: 120000
+//| uses: [optimize-noisy-quadratic-model]
+//| crates: [scioxide-core, scioxide-optimize, scioxide-random]
+//| inputs:
+//|   noise: {"type":"range","label":"観測のノイズ σ [-]","min":0,"max":2,"step":0.25,"value":1}
+//|   seed: {"type":"range","label":"シード [-]","min":1,"max":100,"step":1,"value":1}
+//| cases:
+//|   - {"id":"noise-free","label":"σ = 0","description":"観測は決定論的だがモデルは Independent と宣言しているので、最小点の近くで EstimatedStationarity になる。","inputs":{"noise":0}}
+//|   - {"id":"noisy","label":"σ = 2","description":"勾配の精度の下限が 2 倍になり、最初の一歩に 256 個の観測が要る。","inputs":{"noise":2}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"replicates","path":"/rows/0/1","equals":"NoiseLimit"}
+//|       - {"artifact":"replicates","path":"/rows/0/2","equals":0}
+//|       - {"artifact":"replicates","path":"/rows/3/2","range":{"min":1,"max":300}}
+//|       - {"artifact":"replicates","path":"/rows/8/1","equals":"NoiseLimit"}
+//|       - {"artifact":"replicates","path":"/rows/8/5","range":{"min":0,"max":0.75}}
+//|   - case: noise-free
+//|     expect:
+//|       - {"artifact":"replicates","path":"/rows/0/1","equals":"EstimatedStationarity"}
+//|       - {"artifact":"replicates","path":"/rows/0/5","range":{"min":0,"max":1e-6}}
+//|   - case: noisy
+//|     expect:
+//|       - {"artifact":"replicates","path":"/rows/4/2","equals":0}
+//|       - {"artifact":"replicates","path":"/rows/5/2","range":{"min":1,"max":300}}
+use scioxide_core::{Budget, EvaluationRole, RealScalar};
+use scioxide_optimize::{
+    ReplicationOptions, StochasticProblem, StochasticTrustOptions, StochasticTrustRegion,
+};
+let model = NoisyQuadratic::new(1.7, noise).map_err(|e| e.to_string())?;
+let problem = StochasticProblem::new(&model);
+let minimum = Budget::try_from(4_usize).map_err(|e| e.to_string())?;
+let iterations = Budget::try_from(300_usize).map_err(|e| e.to_string())?;
+let (mut rows, mut errors, mut radii, mut reference) =
+    (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+for level in 3..=11 {
+    let maximum = 1_usize << level;
+    let replication = ReplicationOptions::adaptive(
+        minimum,
+        Budget::try_from(maximum).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    let options = StochasticTrustOptions::new(iterations, replication).with_seed(seed as u64);
+    let result = StochasticTrustRegion::new(options)
+        .map_err(|e| e.to_string())?
+        .minimize(&problem, &[0.0])
+        .map_err(|e| e.to_string())?;
+    let m = maximum as f64;
+    let error = (result.x()[0] - model.target).abs();
+    // 観測 M 個で勾配の精度 κ·σ/√M ≤ θΔ を満たせる最小の半径（κ = 2、θ = 1/4）。
+    let floor = 2.0 * noise / (0.25 * RealScalar::sqrt(m));
+    errors.push([m, error]);
+    radii.push([m, result.trust_radius()]);
+    if floor > 0.0 {
+        reference.push([m, floor]);
+    }
+    rows.push((
+        maximum,
+        result.termination().to_string(),
+        result.iterations(),
+        result.counts().own().provider(EvaluationRole::Sample),
+        result.x()[0],
+        error,
+        result.trust_radius(),
+        floor,
+        result.gradient_standard_errors().map(|e| e[0]),
+    ));
+}
+emit_line_chart!(
+    &vec![
+        serde_json::json!({ "name": "|x − x*|", "points": errors, "style": { "showSymbol": true } }),
+        serde_json::json!({ "name": "最後の半径 Δ", "points": radii, "style": { "showSymbol": true } }),
+        serde_json::json!({
+            "name": "κσ/(θ√M)",
+            "points": reference,
+            "style": { "lineType": "dashed" }
+        })
+    ],
+    options = &serde_json::json!({
+        "xLabel": "反復観測の上限 M [個]",
+        "yLabel": "誤差と半径 [-]",
+        "xType": "log",
+        "yType": "log"
+    })
+);
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let general4 = serde_json::json!({ "significantDigits": 4 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "上限 M [個]", "type": "integer" },
+    { "key": "1", "label": "終了理由" },
+    { "key": "2", "label": "反復 [回]", "type": "integer" },
+    { "key": "3", "label": "標本 [個]", "type": "integer" },
+    { "key": "4", "label": "最終点 x [-]", "type": "number", "format": general4 },
+    { "key": "5", "label": "|x − x*| [-]", "type": "number", "format": sci3 },
+    { "key": "6", "label": "最後の半径 Δ [-]", "type": "number", "format": sci3 },
+    { "key": "7", "label": "κσ/(θ√M) [-]", "type": "number", "format": sci3 },
+    { "key": "8", "label": "勾配の SE [-]", "type": "number", "format": sci3, "nullText": "なし" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "replicates" })
+);
+```
+
+既定の $\sigma=1$、シード 1 では、$M\le32$ のどの実行も反復 0 回で `NoiseLimit` になり、$x_0=0$ のまま誤差は 1.7 である。
+最初の勾配で $\kappa\sigma/\sqrt n\le\theta\Delta_0=0.25$ を満たすには $n\ge64$ 個の観測が要り、表の半径の下限 $\kappa\sigma/(\theta\sqrt M)$ が $\Delta_0=1$ を超えている。
+$M=64$ と $128$ では $x=1$ に進み、$M\ge256$ ではさらに $x=2$（誤差 0.3）に進んで、どれも `NoiseLimit` で止まる。
+$x^\star=1.7$ を越えた $x=2$ から戻るには、半径を縮めた短い一歩を受理する必要がある。
+$M=512$ 以上では最後の半径が 0.5 に下がるが、誤差は 0.3 から縮まない。
+
+$M\ge256$ の停止は勾配の精度ではなく受理判定のノイズで決まる。
+$x=2$、$\Delta=0.5$ では $\|\bar g\|\approx0.3$ なので予測減少は約 $0.15$、受理の基準 $\eta\Delta\|\bar g\|$ は約 $0.015$ である。
+試行点 $1.5$ での真の減少は $f(2)-f(1.5)=0.045-0.02=0.025$ で、基準との差は約 $0.01$ しかない。
+受理か棄却かを決めるには $\kappa\sigma\sqrt{2/n}<0.01$、つまり $n>2(\kappa\sigma/0.01)^2=80000$ 個の観測が要り、上限 2048 では判断がつかない。
+勾配の精度の下限（破線）は $M$ とともに $1/\sqrt M$ で下がるが、受理判定には目的の値の差を見分ける観測が要るので、誤差は破線ほど速く縮まない。
+$\sigma=0$ では観測は決定論的だが、モデルは `Independent` と宣言しているので、53 回の反復で誤差 $1.2\times10^{-8}$ に達しても `EstimatedStationarity` になり、成功とは判定されない。
+シード 100 では $M=2048$ で 10 回進んで誤差 0.05 になり、シードによって止まる位置が変わる。
+
+## 参考文献
+
+- 確率近似と刻みの条件: H. Robbins and S. Monro, [A Stochastic Approximation Method](https://doi.org/10.1214/aoms/1177729586), Ann. Math. Statist. 22(3), 1951.
+- SGD の収束とノイズの扱い: L. Bottou, F. E. Curtis and J. Nocedal, [Optimization Methods for Large-Scale Machine Learning](https://doi.org/10.1137/16M1080173), SIAM Rev. 60(2), 2018.
+- 確率的なモデルによる信頼領域法: R. Chen, M. Menickelly and K. Scheinberg, [Stochastic Optimization Using a Trust-Region Method and Random Models](https://doi.org/10.1007/s10107-017-1141-8), Math. Program. 169(2), 2018.
+- 標本器の生成器: J. K. Salmon, M. A. Moraes, R. O. Dror and D. E. Shaw, [Parallel Random Numbers: As Easy as 1, 2, 3](https://doi.org/10.1145/2063384.2063405), Proc. SC11, 2011.
+
+## まとめ
+
+ノイズのある目的では `NoiseModel` で観測の関係を宣言し、結果を標本数、標準誤差、終了理由と併せて読む。
+固定刻みの SGD はノイズの下限 $\alpha\sigma^2/(2-\alpha)$ の程度で止まると見積もり、誤差を 0 へ近づけたいなら $1/2<p\le1$ の減少刻みを使う。
+確率的信頼領域法は判断がつくまで観測を増やすので、反復観測の上限 $M$ が到達できる半径と受理の判断の精度を決める。
+`NoiseLimit` で止まったら、$M$ を増やすか、目的の差がノイズに埋もれていないかを確かめる。
+ノイズのある目的の最良の終了状態は `EstimatedStationarity` で、成功ではないので、独立な検証と併せて使う。
+
+## 次に読むページ
+
+- [多目的最適化と NSGA-II](../multiobjective-and-stochastic/)：同じ `SampledObjective` で複数の目的を受け取り、Pareto 前線を集団で近似する。
+- [合成目的・確率的・多目的の API](../../api/composite-stochastic-multiobjective/)：`SgdOptions`、`StochasticTrustOptions`、`ReplicationOptions`、`StochasticResult` の各項目とエラー条件を確かめる。
+- [差分進化法](../differential-evolution/)：乱数のシードによる結果のばらつきと、成功でない終了の読み方を大域探索で確かめる。

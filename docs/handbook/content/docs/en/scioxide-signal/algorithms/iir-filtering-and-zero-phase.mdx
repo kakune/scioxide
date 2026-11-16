@@ -1,0 +1,582 @@
+---
+title: "IIR filtering and zero phase"
+description: "Execution with cascaded second-order sections (SOS) and ill-conditioning of high-order transfer functions, transposed direct-form II state and workspace, streaming in chunks, and forward–backward zero-phase filtering with endpoint extension and initial states."
+sidebar:
+  order: 325
+references:
+  signal-iir-sos: "filtering-with-second-order-sections-sos"
+  signal-iir-state: "method-objects-and-state"
+  signal-iir-zero-phase: "forwardbackward-zero-phase-filtering"
+---
+
+This page addresses applying the zeros, poles, and gain from [IIR filter design](../iir-design/) to a record.
+Even with the same transfer function, coefficient representation and computation order change how roundoff propagates.
+Since IIR output depends on past outputs, processing a record in pieces requires carrying delay state forward.
+Finally, the page derives forward–backward filtering that cancels phase shifts and its endpoint treatment.
+
+## Filtering with second-order sections (SOS)
+
+Using an order-$N$ transfer function $H(z) = B(z)/A(z)$ directly as a difference equation lets roundoff in denominator coefficients $a_1, \dots, a_N$ move pole positions.
+Polynomial roots can be ill-conditioned with respect to coefficients.
+In particular, low-pass filters with low cutoffs cluster poles near $z = 1$; for $m$ nearby poles, relative coefficient error $\varepsilon$ moves roots by about $\varepsilon^{1/m}$.
+If poles leave the unit circle, a filter designed to be stable diverges.
+
+A cascade of second-order sections (SOS) separates $H$ by conjugate pole pairs as
+
+$$
+H(z) = \prod_{\ell=1}^{L} \frac{b_{0\ell} + b_{1\ell} z^{-1} + b_{2\ell} z^{-2}}{1 + a_{1\ell} z^{-1} + a_{2\ell} z^{-2}}
+$$
+
+
+Each section's coefficients depend on just two roots, so roundoff does not spread to other poles.
+`IirDesign::to_sos()` performs this decomposition, placing sections with poles near the stability boundary last.
+
+`SecondOrderSections::new(domain, rows)` divides each row $[b_0, b_1, b_2, a_0, a_1, a_2]$ by its leading nonzero denominator coefficient, finds section poles with the quadratic formula in a cancellation-avoiding form, and checks strict stability.
+Digital rows use ascending powers of $z^{-1}$, and analog rows use descending powers of $s$.
+Nonfinite coefficients produce `NonFinite`; a zero denominator or unstable poles produce `InvalidInput`.
+
+- `response(f)` is the product of section responses, and `group_delay(f)` is the sum of section group delays, evaluated without expansion into high-order polynomials.
+- `to_zpk()` finds roots section by section to recover zeros, poles, and gain; `to_zpk_scoped` counts that rootfinding against the outer scope's limit.
+- `to_real(tolerance)` converts complex sections to real sections when imaginary parts are within tolerance.
+- `to_transfer()` multiplies section polynomials into a single transfer function.
+  High-order coefficients are ill-conditioned, so this conversion is for comparison and display.
+
+Each section uses the **transposed direct-form II** recurrence
+
+$$
+y[k] = b_0 x[k] + s_1[k-1], \qquad
+s_j[k] = s_{j+1}[k-1] + b_j x[k] - a_j y[k] \quad (j = 1, 2), \quad s_3 = 0
+$$
+
+where $s_j$ denotes section delays.
+Operations per sample per channel are proportional to delay count $d$; for a second-order-section cascade, $d = 2L$.
+`SecondOrderSections::filter(input)` is a one-shot form that causally processes the entire record from zero initial delays; `TransferFunction::filter` uses the same recurrence with the transfer function as one section of order $\max(\mathrm{len}(a), \mathrm{len}(b)) - 1$.
+
+### Errors from transfer-function expansion
+
+The next cell designs a Butterworth low-pass filter (order $N$, cutoff $f_c$) with `design_iir` and compares second-order sections `sos` with their expanded transfer function `sos.to_transfer()`.
+It finds roots of the expanded denominator with `to_zpk()`, showing the maximum distance to designed poles and stability.
+Both forms process a 400-sample unit step, and the maximum output difference is measured.
+Since DC gain should be 1, it also shows $|H(0)| - 1$ for each form.
+Fields are left empty if transfer-function root checks or filtering fail.
+
+```rust
+//| id: signal-iir-sos-vs-transfer
+//| ref: signal-iir-sos-vs-transfer
+//| title: "Compare step responses of second-order sections and an expanded transfer function"
+//| run: reactive
+//| crates: [scioxide-signal]
+//| inputs:
+//|   order: {"type":"range","label":"Order N","description":"Butterworth pole count.","min":2,"max":20,"step":1,"value":12}
+//|   cutoff: {"type":"range","label":"Cutoff f_c [Nyquist ratio]","description":"Lower cutoffs cluster poles nearer z = 1.","min":0.01,"max":0.3,"step":0.01,"value":0.05}
+//| cases:
+//|   - {"id":"low-order","label":"N = 4","description":"The two forms nearly agree at low order.","inputs":{"order":4}}
+//|   - {"id":"high-order","label":"N = 20, f_c = 0.02","description":"Expanded transfer-function poles shift substantially.","inputs":{"order":20,"cutoff":0.02}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"forms","path":"/rows/0/0","equals":6}
+//|       - {"artifact":"forms","path":"/rows/0/1","approx":{"value":497.54,"rtol":1e-4}}
+//|       - {"artifact":"forms","path":"/rows/0/2","approx":{"value":7.58e-3,"rtol":5e-2}}
+//|       - {"artifact":"forms","path":"/rows/0/3","equals":1}
+//|       - {"artifact":"forms","path":"/rows/0/4","range":{"min":-1e-13,"max":1e-13}}
+//|       - {"artifact":"forms","path":"/rows/0/5","approx":{"value":2.97e-4,"rtol":0.1}}
+//|       - {"artifact":"forms","path":"/rows/0/6","approx":{"value":7.1e-4,"rtol":0.1}}
+//|   - case: low-order
+//|     expect:
+//|       - {"artifact":"forms","path":"/rows/0/2","range":{"min":0,"max":1e-11}}
+//|       - {"artifact":"forms","path":"/rows/0/6","range":{"min":0,"max":1e-11}}
+//|   - case: high-order
+//|     expect:
+//|       - {"artifact":"forms","path":"/rows/0/3","equals":0}
+//|       - {"artifact":"forms","path":"/rows/0/2","range":{"min":0.05,"max":1}}
+//|       - {"artifact":"forms","path":"/rows/0/6","range":{"min":1e10}}
+use scioxide_signal::{IirBand, IirDomain, IirFamily, design_iir};
+
+let n = order.round() as usize;
+let design = design_iir(
+    n,
+    IirFamily::Butterworth,
+    IirBand::Lowpass(cutoff),
+    IirDomain::Digital,
+)
+.map_err(|e| e.to_string())?;
+let sos = design.to_sos().map_err(|e| e.to_string())?;
+let transfer = sos.to_transfer().map_err(|e| e.to_string())?;
+let largest_coefficient = transfer
+    .denominator()
+    .iter()
+    .fold(0.0_f64, |m, a| m.max(a.abs()));
+
+// Distance from expanded denominator roots to designed poles (from each designed pole to the nearest root)
+let roots = transfer.to_zpk().ok();
+let pole_error = roots.as_ref().map(|zpk| {
+    design
+        .zpk()
+        .poles()
+        .iter()
+        .map(|p| {
+            zpk.poles()
+                .iter()
+                .map(|q| (*p - *q).norm())
+                .fold(f64::INFINITY, f64::min)
+        })
+        .fold(0.0_f64, f64::max)
+});
+let stable = roots
+    .as_ref()
+    .map(|zpk| if zpk.is_stable() { 1 } else { 0 });
+
+let step = vec![1.0_f64; 400];
+let by_sections = sos.filter(&step).map_err(|e| e.to_string())?;
+let by_transfer = transfer.filter(&step).ok();
+let step_gap = by_transfer.as_ref().map(|y| {
+    y.iter()
+        .zip(&by_sections)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f64, f64::max)
+});
+let dc_sections = sos.response(0.0).map_err(|e| e.to_string())?.norm() - 1.0;
+let dc_transfer = transfer.response(0.0).ok().map(|h| h.norm() - 1.0);
+
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+// Display for fields whose root check or execution failed
+let failed = "Failed";
+let columns = serde_json::json!([
+    { "key": "0", "label": "Second-order section count", "type": "integer" },
+    { "key": "1", "label": "Maximum denominator coefficient magnitude [-]", "type": "number", "format": sci2 },
+    { "key": "2", "label": "Maximum pole distance [-]", "type": "number", "format": sci2, "nullText": failed },
+    { "key": "3", "label": "Expanded-form stability (1 = stable)", "type": "integer", "nullText": failed },
+    { "key": "4", "label": "SOS |H(0)| − 1 [-]", "type": "number", "format": sci2 },
+    { "key": "5", "label": "Expanded-form |H(0)| − 1 [-]", "type": "number", "format": sci2, "nullText": failed },
+    { "key": "6", "label": "Maximum step-response difference [-]", "type": "number", "format": sci2, "nullText": failed }
+]);
+let row = (
+    sos.sections().len(),
+    largest_coefficient,
+    pole_error,
+    stable,
+    dc_sections,
+    dc_transfer,
+    step_gap,
+);
+emit_table_with_columns!(
+    columns,
+    vec![row],
+    metadata = serde_json::json!({ "id": "forms" })
+);
+let points = |y: &[f64]| -> Vec<[f64; 2]> {
+    y.iter().enumerate().map(|(k, &v)| [k as f64, v]).collect()
+};
+let mut series = vec![serde_json::json!({ "name": "Second-order sections", "points": points(&by_sections) })];
+if let Some(y) = &by_transfer {
+    series.push(serde_json::json!({
+        "name": "Expanded transfer function",
+        "points": points(y),
+        "style": { "lineType": "dashed" }
+    }));
+}
+emit_line_chart!(
+    &series,
+    options = &serde_json::json!({
+        "xLabel": "Sample k [-]",
+        "yLabel": "Step response y[k] [-]",
+        "yMin": -0.5,
+        "yMax": 2.0
+    })
+);
+```
+
+With the default $N = 12$ and $f_c = 0.05$, there are 6 second-order sections, and expanded transfer-function denominator coefficients reach magnitude 498.
+Roots of the expanded denominator shift by up to $7.6 \times 10^{-3}$ from the designed poles but remain inside the unit circle.
+Even so, DC gain error is $3.0 \times 10^{-4}$, ten orders of magnitude above the sections' $6.4 \times 10^{-15}$, and the maximum step-response difference reaches $7.1 \times 10^{-4}$.
+With $N = 4$, root displacement is $3.3 \times 10^{-13}$ and step-response difference is $5.0 \times 10^{-13}$, so the forms nearly agree.
+
+With $N = 20$ and $f_c = 0.02$, denominator coefficients reach magnitude $1.2 \times 10^{5}$; roots shift by 0.13 and leave the unit circle.
+The expanded-form step response diverges, with maximum difference $1.6 \times 10^{30}$ (the plot's vertical axis is fixed from $-0.5$ to $2$).
+Second-order-section DC gain error remains $1.6 \times 10^{-15}$.
+Even coefficient roundoff of order $10^{-16}$ is strongly amplified by clustered roots.
+
+## Method objects and state
+
+`SecondOrderSections::filter` suffices for processing an entire record at once.
+Use method object `IirFilter` to process many records or channels with the same filter or to stream a record in chunks.
+
+- `IirFilter::from_sos(&sos, options)` constructs from a stable second-order-section cascade; `IirFilter::from_transfer(&transfer, options)` constructs from a transfer function.
+  Both produce `InvalidInput` unless the domain is digital.
+  `from_transfer` also accepts unstable finite transfer functions; check `transfer.to_zpk()?.is_stable()` when stability is required.
+- Construction only validates and retains coefficients, without computation.
+  The `SignalExecutionOptions` of `options` limits threads when processing lanes in parallel along an axis.
+- `delays()` is the delay count per channel: two per section in an SOS cascade (including first-order sections).
+
+The caller owns delay values in `IirState`.
+`IirState::new(&filter, channels)` initializes all channel delays to zero; values are arranged by channel, `delays()` per channel, in section order.
+Read with `values()`, modify with `values_mut()` (finiteness is checked on the next execution), reset to zero with `reset()`, and obtain the channel count with `channels()`.
+
+`filter_into(input, output, state, workspace, cx)` processes part of a one-channel record, writes `input.len()` elements at the beginning of `output`, and replaces `state` with delays after the final sample.
+Passing the same `state` consecutively gives the same result as processing the whole record once.
+Create workspace with `filter.workspace(IirRequest::Filter(SignalLayout::Contiguous(n)))`; it serves any call of length at most $n$.
+The required value count is $n + d$.
+Failed execution leaves both `output` and `state` unchanged.
+`filter(input)` is an owned-result API starting from zero initial delays.
+
+`filter_axis_into(input, axis, output, state, workspace, cx)` processes each lane along one array axis as an independent channel.
+`state` has one channel per lane; lanes follow row-major order of the shape excluding `axis`.
+Query workspace with `IirRequest::Filter(SignalLayout::Axis { shape, axis })`.
+Each lane uses the same recurrence even in parallel, so results are independent of thread count.
+
+### Chunked and whole-record processing
+
+The next cell processes a 600-sample record with band-pass $[0.1, 0.3]$ (8 poles, 4 second-order sections) built from a fourth-order Chebyshev type-I (0.5 dB) prototype.
+The input sums two sine waves and a unit impulse at sample 300.
+It compares whole-record `IirFilter::filter` with `filter_into` called on length-$n_c$ chunks.
+Checking the box resets delays with `IirState::reset` for every chunk, demonstrating the error from discarding state.
+
+```rust
+//| id: signal-iir-chunked-state
+//| ref: signal-iir-chunked-state
+//| title: "Process chunks while carrying delay state forward"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-signal]
+//| inputs:
+//|   chunk_len: {"type":"range","label":"Chunk length n_c [samples]","description":"Samples passed to filter_into at once.","min":1,"max":200,"step":1,"value":37}
+//|   restart: {"type":"checkbox","label":"Reset state to zero for each chunk","description":"Incorrect processing that does not carry IirState forward.","value":false}
+//| cases:
+//|   - {"id":"restart","label":"Discard state","description":"Transients appear at every chunk boundary, causing large differences from whole-record processing.","inputs":{"restart":true}}
+//|   - {"id":"single-sample","label":"n_c = 1","description":"Even one-sample chunks give identical output when state is retained.","inputs":{"chunk_len":1}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"chunks","path":"/rows/0/0","equals":17}
+//|       - {"artifact":"chunks","path":"/rows/0/1","equals":8}
+//|       - {"artifact":"chunks","path":"/rows/0/2","equals":45}
+//|       - {"artifact":"chunks","path":"/rows/0/3","equals":0}
+//|   - case: restart
+//|     expect:
+//|       - {"artifact":"chunks","path":"/rows/0/3","approx":{"value":0.9675,"rtol":1e-3}}
+//|   - case: single-sample
+//|     expect:
+//|       - {"artifact":"chunks","path":"/rows/0/0","equals":600}
+//|       - {"artifact":"chunks","path":"/rows/0/2","equals":9}
+//|       - {"artifact":"chunks","path":"/rows/0/3","equals":0}
+use scioxide_core::ExecutionContext;
+use scioxide_signal::{
+    IirBand, IirDomain, IirFamily, IirFilter, IirRequest, IirState, SignalExecutionOptions,
+    SignalLayout, design_iir,
+};
+
+let band = IirBand::Bandpass(0.1, 0.3);
+let family = IirFamily::ChebyshevI { ripple: 0.5 };
+let sos = design_iir(4, family, band, IirDomain::Digital)
+    .and_then(|design| design.to_sos())
+    .map_err(|e| e.to_string())?;
+let filter =
+    IirFilter::from_sos(&sos, SignalExecutionOptions::new()).map_err(|e| e.to_string())?;
+// Add a unit impulse at sample 300 to passband (0.2) and stopband (0.6) sine waves
+let pi = std::f64::consts::PI;
+let input: Vec<f64> = (0..600)
+    .map(|k| {
+        let t = k as f64;
+        (pi * 0.2 * t).sin() + 0.5 * (pi * 0.6 * t).sin() + if k == 300 { 1.0 } else { 0.0 }
+    })
+    .collect();
+let whole = filter.filter(&input).map_err(|e| e.to_string())?;
+
+let chunk = chunk_len.round() as usize;
+let request = IirRequest::Filter(SignalLayout::Contiguous(chunk));
+let mut workspace = filter.workspace(request).map_err(|e| e.to_string())?;
+let mut state = IirState::new(&filter, 1).map_err(|e| e.to_string())?;
+let mut chunked = vec![0.0; input.len()];
+for (piece, out) in input.chunks(chunk).zip(chunked.chunks_mut(chunk)) {
+    if restart {
+        state.reset();
+    }
+    filter
+        .filter_into(
+            piece,
+            out,
+            &mut state,
+            &mut workspace,
+            ExecutionContext::sequential(),
+        )
+        .map_err(|e| e.to_string())?;
+}
+let gap = whole
+    .iter()
+    .zip(&chunked)
+    .map(|(a, b)| (a - b).abs())
+    .fold(0.0_f64, f64::max);
+
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Chunk count", "type": "integer" },
+    { "key": "1", "label": "Delay count d", "type": "integer" },
+    { "key": "2", "label": "Workspace value count", "type": "integer" },
+    { "key": "3", "label": "Maximum difference from whole-record processing [-]", "type": "number", "format": sci2 }
+]);
+let values = filter
+    .workspace_requirements(request)
+    .map_err(|e| e.to_string())?
+    .values_len();
+let row = (input.len().div_ceil(chunk), filter.delays(), values, gap);
+emit_table_with_columns!(
+    columns,
+    vec![row],
+    metadata = serde_json::json!({ "id": "chunks" })
+);
+let points = |y: &[f64]| -> Vec<[f64; 2]> {
+    y.iter().enumerate().map(|(k, &v)| [k as f64, v]).collect()
+};
+emit_line_chart!(
+    &vec![
+        serde_json::json!({ "name": "Whole-record processing", "points": points(&whole) }),
+        serde_json::json!({
+            "name": "Chunked processing",
+            "points": points(&chunked),
+            "style": { "lineType": "dashed" }
+        }),
+    ],
+    options = &serde_json::json!({ "xLabel": "Sample k [-]", "yLabel": "Output y[k] [-]" })
+);
+```
+
+With the default $n_c = 37$, processing takes 17 calls and differs from whole-record processing by exactly zero.
+Carrying delays forward makes each sample's recurrence identical to whole-record processing, so results agree down to roundoff.
+With $n_c = 1$, the difference remains zero and workspace value count becomes $n_c + d = 9$.
+Resetting state on every call starts a transient at each chunk's beginning and produces a maximum difference of 0.97.
+For streaming, save `IirState` as part of the record and pass it to the next call.
+
+## Forward–backward zero-phase filtering
+
+A causal IIR filter has frequency-dependent delay (group delay), changing waveform shape.
+When the whole record is available, process it forward, reverse the output in time, process again, and reverse once more to cancel phase.
+For real coefficients, time reversal conjugates frequency response, so the overall frequency response is
+
+$$
+H_{\mathrm{fb}}(f) = H(f)\, \overline{H(f)} = |H(f)|^2
+$$
+
+
+Phase is zero, magnitude is squared, and effective order doubles.
+It uses future samples, so it is noncausal and cannot be used for streaming.
+
+The $|H|^2$ formula describes steady-state response for an infinite record; finite records retain endpoint transients.
+The forward pass starts at the record's beginning from zero delays; the backward pass does the same at its end.
+Extend both endpoints, initialize delays in each direction to steady state, process, then remove the extension.
+
+`IirPadding` selects the number $L$ of samples added at each endpoint and how to construct them.
+For record $x_0, \dots, x_{n-1}$, samples prepended for $k = 1, \dots, L$ are as follows; the end is constructed similarly around $x_{n-1}$.
+
+| `IirPadding` | Prepended samples |
+|---|---|
+| `None` | None |
+| `Odd(L)` | $x_{-k} = 2x_0 - x_k$ (odd reflection around the endpoint) |
+| `Even(L)` | $x_{-k} = x_k$ (even reflection without repeating the endpoint) |
+| `Constant(L)` | $x_{-k} = x_0$ |
+
+Positive $L$ must be less than $n$; otherwise `InvalidInput` results.
+Odd reflection preserves continuous value and slope at the endpoint, reducing transients for records with a slope.
+
+`IirInitialization` selects initial delays for one direction.
+`Zero` uses zero; `SteadyState` uses steady state for repetition of that direction's first sample $x_0$, making output $H(1)\,x_0$ from the start ($H(1)$ is DC gain).
+A filter with a section whose denominator vanishes at DC has no steady state and produces `DomainError`.
+`State(&values)` uses caller-provided delays (in the same order as `IirState`).
+
+`ForwardBackwardOptions` combines extension and initialization for both directions.
+`ForwardBackwardOptions::new()` (equivalent to `default()`) uses no extension and zero initial delays in both directions and accepts records of any length.
+Change these with `with_padding`, `with_forward`, and `with_backward` and pass them to `IirFilter::forward_backward_with_options(input, options)`.
+Query workspace for the output-destination API `forward_backward_into(input, options, output, workspace, cx)` with `IirRequest::ForwardBackward(SignalLayout::Contiguous(n), padding)`; it holds as many values as the extended record's length.
+The computational cost is $O(d(n + 2p))$ for $d$ delays, $n$ samples, and extension $p$.
+The axis-based form is `forward_backward_axis_into`.
+
+One-shot `SecondOrderSections::forward_backward(input)` fixes endpoint treatment as follows.
+For $L$ second-order sections ($d = 2L$ delays) and record length $n$, extend each end by $\min(3(d+1), n-1)$ samples using odd reflection and start both directions with `SteadyState`.
+`TransferFunction::forward_backward` uses the same rule, extending by $\min(3\max(\mathrm{len}(a), \mathrm{len}(b)), n-1)$ samples for $d = \max(\mathrm{len}(a), \mathrm{len}(b)) - 1$ delays.
+Extension length depends on the filter and record; use `IirFilter::forward_backward_with_options` for other treatments.
+
+### Endpoint treatment and errors
+
+The next cell uses a fourth-order Butterworth low-pass filter (cutoff $f_c$, two second-order sections, $d = 4$) to process a 400-sample record containing a slope and a sine wave:
+
+$$
+x[k] = 1 + \frac{k}{2n} + \sin(\pi f_x k)
+$$
+
+
+A zero-phase filter with symmetric impulse response and unit DC gain passes a linear function unchanged, so the ideal infinite-record output is $1 + k/(2n) + |H(f_x)|^2 \sin(\pi f_x k)$.
+The ideal causal output delays the linear function by DC group delay $\tau(0)$, multiplies the sinusoid's amplitude by $|H(f_x)|$, and shifts its phase by $\arg H(f_x)$.
+For four treatments (`forward_backward` with fixed handling, no extension with zero initialization, odd-reflection extension with zero initialization, and causal `filter`), compare maximum differences from ideal output in the first and last 40 samples and the middle ($100 \le k < 300$).
+The plot shows absolute differences from ideal output on a logarithmic axis (omitting exact-zero differences).
+
+```rust
+//| id: signal-iir-forward-backward
+//| ref: signal-iir-forward-backward
+//| title: "Compare forward–backward endpoint treatments with ideal output"
+//| run: reactive
+//| crates: [scioxide-signal]
+//| inputs:
+//|   cutoff: {"type":"range","label":"Cutoff f_c [Nyquist ratio]","description":"Lower cutoffs lengthen transients.","min":0.02,"max":0.3,"step":0.01,"value":0.1}
+//|   tone: {"type":"range","label":"Sine-wave frequency f_x [Nyquist ratio]","description":"|H|² ≈ 1 in the passband; attenuation occurs in the transition band.","min":0.01,"max":0.3,"step":0.01,"value":0.05}
+//| cases:
+//|   - {"id":"low-cutoff","label":"f_c = 0.03","description":"Transients persist into the record's middle, where even fixed handling leaves errors of order 10⁻².","inputs":{"cutoff":0.03,"tone":0.02}}
+//|   - {"id":"transition","label":"f_x = f_c = 0.1","description":"At the cutoff frequency, |H|² = 1/2.","inputs":{"tone":0.1}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"ends","path":"/rows/0/1","equals":15}
+//|       - {"artifact":"ends","path":"/rows/0/2","approx":{"value":1.82e-2,"rtol":1e-2}}
+//|       - {"artifact":"ends","path":"/rows/0/3","approx":{"value":4.41e-2,"rtol":1e-2}}
+//|       - {"artifact":"ends","path":"/rows/0/4","range":{"min":0,"max":1e-6}}
+//|       - {"artifact":"ends","path":"/rows/1/3","approx":{"value":1.343,"rtol":1e-2}}
+//|       - {"artifact":"ends","path":"/rows/3/2","approx":{"value":0.339,"rtol":1e-2}}
+//|       - {"artifact":"ends","path":"/rows/3/3","range":{"min":0,"max":1e-12}}
+//|       - {"artifact":"response","path":"/rows/0/1","approx":{"value":8.2493,"rtol":1e-4}}
+//|       - {"artifact":"response","path":"/rows/0/2","equals":0}
+//|   - case: low-cutoff
+//|     expect:
+//|       - {"artifact":"ends","path":"/rows/0/4","approx":{"value":1.17e-2,"rtol":2e-2}}
+//|       - {"artifact":"response","path":"/rows/0/1","approx":{"value":27.706,"rtol":1e-4}}
+//|   - case: transition
+//|     expect:
+//|       - {"artifact":"response","path":"/rows/0/0","approx":{"value":0.5,"atol":1e-12}}
+//|       - {"artifact":"ends","path":"/rows/0/4","range":{"min":0,"max":5e-6}}
+use scioxide_signal::{
+    ForwardBackwardOptions, IirBand, IirDomain, IirFamily, IirFilter, IirInitialization,
+    IirPadding, SignalExecutionOptions, design_iir,
+};
+
+let n = 400;
+let sos = design_iir(
+    4,
+    IirFamily::Butterworth,
+    IirBand::Lowpass(cutoff),
+    IirDomain::Digital,
+)
+.and_then(|design| design.to_sos())
+.map_err(|e| e.to_string())?;
+let filter =
+    IirFilter::from_sos(&sos, SignalExecutionOptions::new()).map_err(|e| e.to_string())?;
+let pi = std::f64::consts::PI;
+let trend = |k: f64| 1.0 + k / (2.0 * n as f64);
+let x: Vec<f64> = (0..n)
+    .map(|k| trend(k as f64) + (pi * tone * k as f64).sin())
+    .collect();
+
+// Ideal output (steady-state response for an infinite record). Evaluate H and τ(0) with SciOxide
+let h = sos.response(tone).map_err(|e| e.to_string())?;
+let delay = sos.group_delay(0.0).map_err(|e| e.to_string())?;
+let zero_phase = |k: f64| trend(k) + h.norm_sqr() * (pi * tone * k).sin();
+let causal = |k: f64| trend(k - delay) + h.norm() * (pi * tone * k + h.arg()).sin();
+
+let padding = (3 * (filter.delays() + 1)).min(n - 1);
+let steady = IirInitialization::SteadyState;
+let odd_only = ForwardBackwardOptions::new().with_padding(IirPadding::Odd(padding));
+let fixed = sos.forward_backward(&x).map_err(|e| e.to_string())?;
+let rest = filter
+    .forward_backward_with_options(&x, ForwardBackwardOptions::new())
+    .map_err(|e| e.to_string())?;
+let padded = filter
+    .forward_backward_with_options(&x, odd_only)
+    .map_err(|e| e.to_string())?;
+let forward = sos.filter(&x).map_err(|e| e.to_string())?;
+// Also check that fixed handling equals odd reflection combined with steady state
+let explicit = filter
+    .forward_backward_with_options(&x, odd_only.with_forward(steady).with_backward(steady))
+    .map_err(|e| e.to_string())?;
+let same = fixed
+    .iter()
+    .zip(&explicit)
+    .map(|(a, b)| (a - b).abs())
+    .fold(0.0_f64, f64::max);
+
+let edge = 40;
+let mut rows = Vec::new();
+let mut series = Vec::new();
+let runs: [(&str, &Vec<f64>, bool, usize); 4] = [
+    ("forward_backward (fixed)", &fixed, true, padding),
+    ("No extension, zero initialization", &rest, true, 0),
+    ("Odd reflection, zero initialization", &padded, true, padding),
+    ("Causal filter", &forward, false, 0),
+];
+for (name, y, symmetric, extension) in runs {
+    let errors: Vec<f64> = y
+        .iter()
+        .enumerate()
+        .map(|(k, &v)| {
+            let ideal = if symmetric {
+                zero_phase(k as f64)
+            } else {
+                causal(k as f64)
+            };
+            (v - ideal).abs()
+        })
+        .collect();
+    // Take maximum errors over the first and last 40 samples and the middle 100 ≤ k < 300
+    let largest = |part: &[f64]| part.iter().fold(0.0_f64, |m, &e| m.max(e));
+    let (head, tail) = (largest(&errors[..edge]), largest(&errors[n - edge..]));
+    rows.push((name, extension, head, tail, largest(&errors[100..300])));
+    let points: Vec<[f64; 2]> = errors
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| **e > 0.0)
+        .map(|(k, &e)| [k as f64, e])
+        .collect();
+    series.push(serde_json::json!({ "name": name, "points": points }));
+}
+
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Treatment" },
+    { "key": "1", "label": "Extension [samples]", "type": "integer" },
+    { "key": "2", "label": "Maximum error in first 40 samples [-]", "type": "number", "format": sci2 },
+    { "key": "3", "label": "Maximum error in last 40 samples [-]", "type": "number", "format": sci2 },
+    { "key": "4", "label": "Maximum error in middle [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "ends" })
+);
+let summary = serde_json::json!([
+    { "key": "0", "label": "|H(f_x)|² [-]", "type": "number", "format": sci2 },
+    { "key": "1", "label": "τ(0) [samples]", "type": "number", "format": sci2 },
+    { "key": "2", "label": "Difference between fixed and explicit settings [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    summary,
+    vec![(h.norm_sqr(), delay, same)],
+    metadata = serde_json::json!({ "id": "response" })
+);
+emit_line_chart!(
+    &series,
+    options = &serde_json::json!({
+        "xLabel": "Sample k [-]",
+        "yLabel": "Difference from ideal output [-]",
+        "yType": "log",
+        "yMin": 1e-17,
+        "yMax": 10.0
+    })
+);
+```
+
+With the default $f_c = 0.1$ and $f_x = 0.05$, $|H(f_x)|^2 = 0.9963$, DC group delay is $\tau(0) = 8.25$ samples, and fixed extension is $\min(3 \cdot 5, 399) = 15$ samples.
+Fixed `forward_backward` has maximum errors $1.8 \times 10^{-2}$ in the first 40 samples, $4.4 \times 10^{-2}$ in the last 40, and $4.8 \times 10^{-7}$ in the middle, the smallest of the four treatments.
+It differs by exactly zero from passing explicit odd-reflection and steady-state settings to `forward_backward_with_options`.
+
+Starting from zero without extension gives an endpoint error of 1.34.
+The backward pass starts from zero delays at the record's final value (about 1.3).
+Adding only odd-reflection extension lowers the initial error to $2.0 \times 10^{-2}$ but leaves 0.27 at the end; both extension and steady state are needed.
+Causal `filter` reaches steady state at the end, with error $7 \times 10^{-15}$, but has a transient of 0.34 in the first 40 samples.
+Every treatment's middle error is at most $3 \times 10^{-6}$, showing that zero-phase filtering preserves phase inside the record and multiplies amplitude by $|H|^2$.
+
+With $f_x = f_c = 0.1$, $|H(f_x)|^2 = 0.5$ and the sine-wave amplitude halves (the Butterworth cutoff is the half-power point).
+With $f_c = 0.03$, $\tau(0)$ increases to 27.7 samples, and even fixed handling leaves middle error $1.2 \times 10^{-2}$.
+Filter poles determine transient length, so low-cutoff filters require records sufficiently longer than their transients.
+
+## Summary
+
+Apply IIR filters after converting to second-order sections with `IirDesign::to_sos()`; avoid computation with coefficients expanded into a high-order transfer function.
+Use `SecondOrderSections::filter` for whole-record processing, or `IirFilter::filter_into` and `IirState` for chunks, carrying state between calls.
+For offline processing that preserves phase, use `SecondOrderSections::forward_backward` and account during design for magnitude $|H|^2$.
+To change endpoint treatment, select extension and initial state with `ForwardBackwardOptions` and check that the record is long enough relative to the transients.
+See the [group-delay example](../../examples/iir-group-delay-zero-phase/) for differences in group delay and pulse distortion between families, and the [ECG example](../../examples/ecg-baseline-and-mains/) for application to biological signals.

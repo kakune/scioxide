@@ -1,0 +1,457 @@
+---
+title: "Axiswise normalization and logarithmic sums"
+description: "Lanewise softmax, log-softmax, logarithmic sums, and weighted logarithmic sums along one array axis; output shapes, workspace lengths, execution policies, and error categories for owned and borrowed forms."
+sidebar:
+  order: 345
+references:
+  core-axis-functions: "four-axiswise-function-families"
+  core-axis-storage: "storage-for-owned-and-borrowed-forms"
+---
+
+Matrices and multidimensional arrays often require normalization or logarithmic sums for each one-dimensional sequence (lane) along an axis.
+In two dimensions, axis 1 lanes are rows and axis 0 lanes are columns.
+This page covers eight functions applying vector logarithmic sums and softmax independently to array lanes.
+
+Value definitions, masks ($-\infty$), and accuracy match the vector functions, described in [Logarithmic sums, weighted sums, and normalization](../logarithmic-reductions/).
+Input and output views (`NdView`, `NdViewMut`), layouts, and lane indices assume [Borrowed layouts and affine values](../borrowed-layouts-and-affine-values/).
+Policies and contexts assume [Execution policies, partitioning, and execution contexts](../execution-and-partitions/).
+
+## Four axiswise function families
+
+`scioxide-core` accepts input through `NdView`, supporting transposed or axis-permuted views without copying data.
+Use `NdView::row_major(data, shape)` to construct views from row-major slices (last axis varying fastest), through rank 8.
+
+There are four families, each with owned and borrowed forms.
+
+| Owned form | Borrowed form | Per-lane computation | Output shape |
+|---|---|---|---|
+| `softmax_axis(input, axis)` | `softmax_axis_into(input, axis, policy, output, scratch, cx)` | `softmax` | Same as input |
+| `log_softmax_axis(input, axis)` | `log_softmax_axis_into(input, axis, policy, output, scratch, cx)` | `log_softmax` | Same as input |
+| `logsumexp_axis(input, axis)` | `logsumexp_axis_into(input, axis, policy, output, scratch, cx)` | `logsumexp` | Input shape with `axis` removed |
+| `weighted_logsumexp_axis(input, weights, axis)` | `weighted_logsumexp_axis_into(input, weights, axis, policy, output, scratch, cx)` | `weighted_logsumexp` | Input shape with `axis` removed (elements are `LogValue`) |
+
+Both normalization families accept only real logarithms.
+`logsumexp_axis` accepts real or complex logarithms; `weighted_logsumexp_axis` accepts real logarithms with real or complex weights.
+Weights must have the same shape as the input, but may have different strides, including broadcasting (layouts that read the same element repeatedly).
+
+Empty lanes (length of `axis` is zero) and entirely masked lanes behave like the vector functions.
+
+- Both normalization families produce `DomainError` because the normalization sum is zero.
+- `logsumexp_axis` returns $-\infty$ ($(-\infty, +0)$ for complex values).
+- `weighted_logsumexp_axis` returns a zero `LogValue`.
+  Exactly cancelling lanes also produce a zero `LogValue`.
+
+Arrays with no lanes (a zero length on another axis) are valid: owned forms return empty `Vec`, and borrowed forms write nothing.
+
+## Storage for owned and borrowed forms
+
+Owned forms return results in `Vec`.
+Normalization output uses input row-major order; logarithmic sums use row-major order of the remaining axes (lane-index order).
+Owned forms run sequentially under `ExecutionContext::sequential_native()`.
+`logsumexp_axis` and `weighted_logsumexp_axis` allocate only the result; `softmax_axis` and `log_softmax_axis` allocate the result, temporary storage of the same length, and per-axis strides.
+
+For borrowed forms, the caller supplies output view `NdViewMut` and workspace `scratch`; numerical processing does not allocate on the heap.
+
+| Borrowed form | Output shape | Length of `scratch` |
+|---|---|---|
+| `softmax_axis_into`, `log_softmax_axis_into` | Same as input | At least the input element count |
+| `logsumexp_axis_into` | Input shape with `axis` removed | At least the lane count |
+| `weighted_logsumexp_axis_into` | Input shape with `axis` removed | At least the lane count (elements are `LogValue`) |
+
+Input may broadcast, but output must not map two coordinates to the same address.
+Borrowed forms compute into `scratch` and copy to output only after every lane succeeds.
+Errors or stopping leave output unchanged.
+
+## Execution policies and stopping
+
+Execution policy `policy` (`ExecutionPolicy`) determines how many partitions receive the lanes.
+All policies permit at most 64 partitions.
+`Auto` does not partition fewer than 32 lanes; from 32 lanes onward, the context's executor determines the partition count.
+Policies change only lane assignment; per-lane calculations are identical, making results policy-independent.
+
+Execution context `cx` (`ExecutionContext`) carries the executor, cancellation, and deadline.
+Cancellation and deadlines are checked before every lane, so each partition computes at most one lane after a stop request.
+Stopping returns `ExecutionStopped`.
+
+## Error categories
+
+| Category | Condition | Applies to |
+|---|---|---|
+| `OutOfBounds` | `axis` is not an input axis | All |
+| `SizeOverflow` | Lane count exceeds `usize` | All |
+| `DimensionMismatch` | Weight shape differs from input | Weighted logarithmic sums |
+| `DimensionMismatch` | Wrong output shape or short `scratch` | Borrowed form |
+| `DomainError` | An empty or entirely masked lane | Normalization |
+| `DomainError` | Exact cancellation in a lane of complex logarithms | `logsumexp_axis`, `logsumexp_axis_into` |
+| `NonFinite` | A logarithm is NaN or $+\infty$, or a complex logarithm's imaginary part or a weight is non-finite | All |
+| `NumericalInstability` | Result overflow | All |
+| `AllocationFailure` | Failure to allocate result or temporary storage | Owned form |
+| `ExecutionStopped` | Cancellation or deadline stop | Borrowed form |
+| `ExecutionFailure`, `CapabilityFailure` | Executor or clock failure | Borrowed form |
+
+NaN or $+\infty$ logarithms and non-finite imaginary parts or weights produce `NonFinite` even in masked or zero-weight terms.
+
+## Normalizing along rows and columns
+
+The following cell normalizes a 2-row, 3-column array of logarithms $x_{rc}$ along the selected axis.
+Inputs are the normalization axis (1 for rows, 0 for columns), whether to mask component $(0, 1)$, and whether output should be logarithmic probabilities.
+Compute with both an owned form (`softmax_axis` or `log_softmax_axis`) and a borrowed form (`softmax_axis_into` or `log_softmax_axis_into`) with prepared output and six-element workspace.
+
+As an independent check, separately obtain logarithmic sums $y_\ell$ along the same axis through `logsumexp_axis`, and compare output with $x_{rc} - y_\ell$ (or its exponential for probabilities).
+The first table shows componentwise outputs and references; the second shows lane probability sums (one rounding through `checked_sum`) and maximum reference differences.
+The third shows counts of masks becoming exact $+0$ ($-\infty$ for log probabilities) and components differing in bits between owned and borrowed forms.
+
+```rust
+//| id: core-masked-normalization-plan
+//| ref: core-masked-normalization-plan
+//| title: "Axiswise normalization and masking"
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   axis: {"type":"range","label":"Normalization axis","description":"1 selects rows (two lanes of three components); 0 selects columns (three lanes of two components).","min":0,"max":1,"step":1,"value":1}
+//|   mask_entry: {"type":"checkbox","label":"Mask component (0, 1)","description":"The masked component's probability is exactly +0.","value":true}
+//|   log_output: {"type":"checkbox","label":"Output log probabilities","description":"Use log_softmax_axis. Masks become -∞.","value":false}
+//| cases:
+//|   - {"id":"log-output","label":"Log probabilities","description":"Masked components become −∞; others are x − y.","inputs":{"log_output":true}}
+//|   - {"id":"columns","label":"Columnwise (axis 0)","description":"Column 1 has only a mask and 5, so component (1, 1) has probability 1.","inputs":{"axis":0}}
+//|   - {"id":"no-mask","label":"No mask","description":"Row 0 becomes softmax of (1, 2, 3).","inputs":{"mask_entry":false}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"elements","path":"/rows/0/3","approx":{"value":0.11920292202211755,"rtol":1e-13}}
+//|       - {"artifact":"elements","path":"/rows/1/3","equals":0}
+//|       - {"artifact":"lanes","path":"/rows/0/1","approx":{"value":1,"atol":5e-16}}
+//|       - {"artifact":"lanes","path":"/rows/1/1","approx":{"value":1,"atol":5e-16}}
+//|       - {"artifact":"lanes","path":"/rows/1/3","range":{"min":0,"max":1e-15}}
+//|       - {"artifact":"checks","path":"/rows/0/0","equals":1}
+//|       - {"artifact":"checks","path":"/rows/0/1","equals":0}
+//|   - case: log-output
+//|     expect:
+//|       - {"artifact":"elements","path":"/rows/0/3","approx":{"value":-2.1269280110429727,"rtol":1e-13}}
+//|       - {"artifact":"elements","path":"/rows/1/3","equals":null}
+//|       - {"artifact":"lanes","path":"/rows/0/1","approx":{"value":1,"atol":5e-16}}
+//|       - {"artifact":"checks","path":"/rows/0/0","equals":1}
+//|       - {"artifact":"checks","path":"/rows/0/1","equals":0}
+//|   - case: columns
+//|     expect:
+//|       - {"artifact":"elements","path":"/rows/4/3","approx":{"value":1,"atol":5e-16}}
+//|       - {"artifact":"elements","path":"/rows/0/3","approx":{"value":0.04742587317756678,"rtol":1e-13}}
+//|       - {"artifact":"lanes","path":"/rows/2/1","approx":{"value":1,"atol":5e-16}}
+//|       - {"artifact":"checks","path":"/rows/0/1","equals":0}
+//|   - case: no-mask
+//|     expect:
+//|       - {"artifact":"elements","path":"/rows/1/3","approx":{"value":0.24472847105479764,"rtol":1e-13}}
+//|       - {"artifact":"lanes","path":"/rows/0/2","approx":{"value":3.4076059644443806,"rtol":1e-14}}
+//|       - {"artifact":"checks","path":"/rows/0/0","equals":0}
+use scioxide_core::{
+    ExecutionContext, ExecutionPolicy, NdView, NdViewMut, RealScalar, checked_sum,
+    log_softmax_axis, log_softmax_axis_into, logsumexp_axis, softmax_axis, softmax_axis_into,
+};
+
+let axis = axis as usize;
+let shape = [2, 3];
+let mut logits = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+if mask_entry {
+    logits[1] = f64::NEG_INFINITY;
+}
+let input = NdView::row_major(&logits, &shape).map_err(|e| e.to_string())?;
+
+// Owned form: allocate the result Vec and execute sequentially.
+let owned = if log_output {
+    log_softmax_axis(input, axis)
+} else {
+    softmax_axis(input, axis)
+}
+.map_err(|e| e.to_string())?;
+
+// Borrowed form: the caller supplies output and workspace equal to the input element count.
+let mut borrowed = [0.0; 6];
+let mut scratch = [0.0; 6];
+let output = NdViewMut::row_major(&mut borrowed, &shape).map_err(|e| e.to_string())?;
+// Even Auto does not partition fewer than 32 lanes.
+let policy = ExecutionPolicy::Auto;
+let cx = ExecutionContext::sequential();
+if log_output {
+    log_softmax_axis_into(input, axis, policy, output, &mut scratch, cx)
+} else {
+    softmax_axis_into(input, axis, policy, output, &mut scratch, cx)
+}
+.map_err(|e| e.to_string())?;
+
+// Check: obtain lanewise log-sums y separately and compare output with x − y (or e^(x−y) for probabilities).
+let lane_sums = logsumexp_axis(input, axis).map_err(|e| e.to_string())?;
+let mut lane_probabilities = vec![Vec::new(); lane_sums.len()];
+let mut deviation = vec![0.0_f64; lane_sums.len()];
+let (mut exact_masks, mut form_mismatches) = (0_u32, 0_u32);
+let mut elements = Vec::new();
+for (index, (&x, &value)) in logits.iter().zip(&owned).enumerate() {
+    let (row, column) = (index / 3, index % 3);
+    let lane = if axis == 0 { column } else { row };
+    let probability = if log_output {
+        RealScalar::exp(value)
+    } else {
+        value
+    };
+    lane_probabilities[lane].push(probability);
+    form_mismatches += u32::from(value.to_bits() != borrowed[index].to_bits());
+    let masked = x == f64::NEG_INFINITY;
+    let expected = if masked {
+        // Compare masked outputs with exact values (probability +0, log probability −∞).
+        let exact = if log_output { f64::NEG_INFINITY } else { 0.0 };
+        exact_masks += u32::from(value.to_bits() == exact.to_bits());
+        exact
+    } else if log_output {
+        x - lane_sums[lane]
+    } else {
+        RealScalar::exp(x - lane_sums[lane])
+    };
+    if !masked {
+        deviation[lane] = deviation[lane].max((value - expected).abs());
+    }
+    // −∞ cannot be a JSON number, so emit it as None.
+    let finite = |v: f64| RealScalar::is_finite(v).then_some(v);
+    elements.push((row, column, finite(x), finite(value), finite(expected)));
+}
+let digits = serde_json::json!({ "significantDigits": 16 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let element_columns = serde_json::json!([
+    { "key": "0", "label": "Row r", "type": "integer" },
+    { "key": "1", "label": "Column c", "type": "integer" },
+    { "key": "2", "label": "Logarithm x [-]", "type": "number", "nullText": "−∞ (mask)" },
+    { "key": "3", "label": "Output [-]", "type": "number", "format": digits, "nullText": "−∞" },
+    { "key": "4", "label": "Reference [-]", "type": "number", "format": digits, "nullText": "−∞" }
+]);
+emit_table_with_columns!(
+    element_columns,
+    elements,
+    metadata = serde_json::json!({ "id": "elements" })
+);
+
+let mut lanes = Vec::new();
+for (lane, probabilities) in lane_probabilities.iter().enumerate() {
+    let total = checked_sum(probabilities).map_err(|e| e.to_string())?;
+    lanes.push((lane, total, lane_sums[lane], deviation[lane]));
+}
+let lane_columns = serde_json::json!([
+    { "key": "0", "label": "Lane ℓ", "type": "integer" },
+    { "key": "1", "label": "Probability sum (checked_sum) [-]", "type": "number", "format": digits },
+    { "key": "2", "label": "Logarithmic sum y [-]", "type": "number", "format": digits },
+    { "key": "3", "label": "Maximum output/reference difference [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    lane_columns,
+    lanes,
+    metadata = serde_json::json!({ "id": "lanes" })
+);
+let check_columns = serde_json::json!([
+    { "key": "0", "label": "Masks with exact output values [components]", "type": "integer" },
+    { "key": "1", "label": "Owned/borrowed bit mismatches [components]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    check_columns,
+    vec![(exact_masks, form_mismatches)],
+    metadata = serde_json::json!({ "id": "checks" })
+);
+```
+
+At the defaults (rowwise, masked, probabilities), row 0's remaining components divide in ratio $e^{1}$ to $e^{3}$, becoming $p_{00} = 0.1192$ and $p_{02} = 0.8808$.
+The masked component $(0, 1)$ is exactly $+0$; each row's probability sum differs from 1 by at most 1 ULP.
+Output/reference differences are also of order $10^{-16}$, confirming normalization and log-sums give the same $y_\ell$.
+Owned and borrowed outputs match bit for bit in every component.
+
+For log probabilities, the masked component is $-\infty$, and $\ln p_{00} = -2.1269$.
+Columnwise (axis 0) gives three lanes; column 1 contains only a mask and 5, so component $(1, 1)$ has probability 1.
+Removing the mask makes row 0 the softmax $(0.0900, 0.2447, 0.6652)$ of $(1, 2, 3)$.
+
+## Axiswise logarithmic sums and signed weights
+
+The following cell computes log-sums and weighted log-sums along the selected axis of a 2-row, 3-column logarithm array, with row 0 equal to $(0, 1, 2)$ and row 1 to $(s, s, s)$.
+Inputs are the reduction axis, the dimensionless shared shift $s$ of row 1, and whether its weights should be $(1, -1, 0)$.
+Otherwise, all weights are 1.
+
+The table shows owned results (`logsumexp_axis` and `weighted_logsumexp_axis`); another table counts lanes differing from borrowed results (`logsumexp_axis_into` and `weighted_logsumexp_axis_into`).
+Borrowed output removes the reduced axis (one-dimensional, of lane-count length); workspace also has one entry per lane.
+References are analytical values computed with intrinsic `f64` methods.
+Rowwise (axis 1), row 0 is $\ln(1 + e + e^2)$ and row 1 is $s + \ln 3$; weighted row 1 with $(1, -1, 0)$ is exactly zero by $e^{s} - e^{s} + 0$.
+Columnwise (axis 0), column $j$ is $s + \ln(1 + e^{j - s})$; weighted column 1 is $e^{1} - e^{s} < 0$ and column 2 is $e^{2}$.
+
+```rust
+//| id: core-axis-logsumexp
+//| ref: core-axis-logsumexp
+//| title: "Axiswise logarithmic and weighted logarithmic sums"
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   axis: {"type":"range","label":"Reduction axis","description":"1 selects rows (two lanes); 0 selects columns (three lanes).","min":0,"max":1,"step":1,"value":1}
+//|   row_shift: {"type":"range","label":"Shared shift s of row 1 [-]","description":"Row 1 logarithms are (s, s, s). e^s overflows for s ≥ 710.","min":10,"max":1000,"step":10,"value":800}
+//|   signed_weights: {"type":"checkbox","label":"Set row 1 weights to (1, −1, 0)","description":"Disabling this makes every weight 1.","value":true}
+//| cases:
+//|   - {"id":"columns","label":"Columnwise (axis 0)","description":"Column 1's weighted sum is negative; column 2 omits the zero-weight term and becomes e².","inputs":{"axis":0}}
+//|   - {"id":"unit-weights","label":"All weights equal 1","description":"Weighted log-sums equal ordinary log-sums.","inputs":{"signed_weights":false}}
+//|   - {"id":"small-shift","label":"Columnwise, s = 10","description":"Column 1's weighted sum is e − e¹⁰, with ln|Z| slightly below 10.","inputs":{"axis":0,"row_shift":10}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"lanes","path":"/rows/0/1","approx":{"value":2.4076059644443806,"rtol":1e-14}}
+//|       - {"artifact":"lanes","path":"/rows/1/1","approx":{"value":801.0986122886682,"rtol":1e-14}}
+//|       - {"artifact":"lanes","path":"/rows/1/3","equals":0}
+//|       - {"artifact":"lanes","path":"/rows/1/4","equals":null}
+//|       - {"artifact":"lanes","path":"/rows/0/4","approx":{"value":2.4076059644443806,"rtol":1e-14}}
+//|       - {"artifact":"checks","path":"/rows/0/0","equals":0}
+//|       - {"artifact":"checks","path":"/rows/0/1","range":{"min":0,"max":1e-14}}
+//|   - case: columns
+//|     expect:
+//|       - {"artifact":"lanes","path":"/rows/1/3","equals":-1}
+//|       - {"artifact":"lanes","path":"/rows/1/4","approx":{"value":800,"rtol":1e-14}}
+//|       - {"artifact":"lanes","path":"/rows/2/4","approx":{"value":2,"rtol":1e-14}}
+//|       - {"artifact":"checks","path":"/rows/0/0","equals":0}
+//|   - case: unit-weights
+//|     expect:
+//|       - {"artifact":"lanes","path":"/rows/1/3","equals":1}
+//|       - {"artifact":"lanes","path":"/rows/1/4","approx":{"value":801.0986122886682,"rtol":1e-14}}
+//|       - {"artifact":"checks","path":"/rows/0/0","equals":0}
+//|   - case: small-shift
+//|     expect:
+//|       - {"artifact":"lanes","path":"/rows/1/1","approx":{"value":10.000123402189724,"rtol":1e-14}}
+//|       - {"artifact":"lanes","path":"/rows/1/3","equals":-1}
+//|       - {"artifact":"lanes","path":"/rows/1/4","approx":{"value":9.999876582580296,"rtol":1e-14}}
+//|       - {"artifact":"checks","path":"/rows/0/1","range":{"min":0,"max":1e-14}}
+use scioxide_core::{
+    ExecutionContext, ExecutionPolicy, LogValue, NdView, NdViewMut, logsumexp_axis,
+    logsumexp_axis_into, weighted_logsumexp_axis, weighted_logsumexp_axis_into,
+};
+
+let axis = axis as usize;
+let s = row_shift;
+let shape = [2, 3];
+let logits = [0.0, 1.0, 2.0, s, s, s];
+let weights = if signed_weights {
+    [1.0, 1.0, 1.0, 1.0, -1.0, 0.0]
+} else {
+    [1.0; 6]
+};
+let input = NdView::row_major(&logits, &shape).map_err(|e| e.to_string())?;
+let weight_view = NdView::row_major(&weights, &shape).map_err(|e| e.to_string())?;
+
+// Owned form: return one value per lane in a Vec.
+let sums = logsumexp_axis(input, axis).map_err(|e| e.to_string())?;
+let weighted = weighted_logsumexp_axis(input, weight_view, axis).map_err(|e| e.to_string())?;
+
+// Borrowed form: output removes the axis; workspace has one entry per lane.
+let lanes = sums.len();
+let reduced = [lanes];
+let policy = ExecutionPolicy::Sequential;
+let mut sums_into = vec![0.0; lanes];
+let mut scratch = vec![0.0; lanes];
+let output = NdViewMut::row_major(&mut sums_into, &reduced).map_err(|e| e.to_string())?;
+logsumexp_axis_into(
+    input,
+    axis,
+    policy,
+    output,
+    &mut scratch,
+    ExecutionContext::sequential(),
+)
+.map_err(|e| e.to_string())?;
+let mut weighted_into = vec![LogValue::<f64, f64>::ZERO; lanes];
+let mut log_scratch = vec![LogValue::<f64, f64>::ZERO; lanes];
+let output = NdViewMut::row_major(&mut weighted_into, &reduced).map_err(|e| e.to_string())?;
+weighted_logsumexp_axis_into(
+    input,
+    weight_view,
+    axis,
+    policy,
+    output,
+    &mut log_scratch,
+    ExecutionContext::sequential(),
+)
+.map_err(|e| e.to_string())?;
+
+// Analytical reference from intrinsic f64 methods. An exactly zero weighted sum becomes None.
+let reference = |lane: usize| -> (f64, Option<f64>) {
+    if axis == 1 {
+        let plain = if lane == 0 {
+            (1.0 + 1.0_f64.exp() + 2.0_f64.exp()).ln()
+        } else {
+            s + 3.0_f64.ln()
+        };
+        (plain, (!(signed_weights && lane == 1)).then_some(plain))
+    } else {
+        let plain = s + (lane as f64 - s).exp().ln_1p();
+        let signed = match lane {
+            1 => s + (-(1.0 - s).exp()).ln_1p(),
+            2 => 2.0,
+            _ => plain,
+        };
+        (plain, Some(if signed_weights { signed } else { plain }))
+    }
+};
+let (mut rows, mut form_mismatches, mut worst) = (Vec::new(), 0_u32, 0.0_f64);
+for lane in 0..lanes {
+    let (plain, signed) = reference(lane);
+    let log_magnitude = weighted[lane].log_magnitude();
+    let same = sums[lane] == sums_into[lane]
+        && log_magnitude == weighted_into[lane].log_magnitude()
+        && weighted[lane].sign() == weighted_into[lane].sign();
+    form_mismatches += u32::from(!same);
+    worst = worst.max(((sums[lane] - plain) / plain).abs());
+    if let (Some(value), Some(expected)) = (log_magnitude, signed) {
+        worst = worst.max(((value - expected) / expected).abs());
+    }
+    let sign = weighted[lane].sign() as i32;
+    rows.push((lane, sums[lane], plain, sign, log_magnitude, signed));
+}
+let digits = serde_json::json!({ "significantDigits": 16 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let zero = "Exactly zero";
+let columns = serde_json::json!([
+    { "key": "0", "label": "Lane ℓ", "type": "integer" },
+    { "key": "1", "label": "Logarithmic sum ln Σ e^x [-]", "type": "number", "format": digits },
+    { "key": "2", "label": "Log-sum reference [-]", "type": "number", "format": digits },
+    { "key": "3", "label": "Sign of weighted sum [-]", "type": "integer" },
+    { "key": "4", "label": "ln |Σ w e^x| [-]", "type": "number", "format": digits, "nullText": zero },
+    { "key": "5", "label": "Its reference [-]", "type": "number", "format": digits, "nullText": zero }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "lanes" })
+);
+let check_columns = serde_json::json!([
+    { "key": "0", "label": "Owned/borrowed value mismatches [lanes]", "type": "integer" },
+    { "key": "1", "label": "Maximum relative reference difference [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    check_columns,
+    vec![(form_mismatches, worst)],
+    metadata = serde_json::json!({ "id": "checks" })
+);
+```
+
+At the defaults (rowwise, $s = 800$, weights $(1, -1, 0)$), row 0's log-sum is $\ln(1 + e + e^2) = 2.4076$ and row 1's is $800 + \ln 3 = 801.0986$.
+Although $e^{800}$ is unrepresentable in double precision, both functions avoid forming exponentials and return finite results.
+Row 1's weighted sum cancels exactly: sign is 0 and $\ln |Z|$ shows “Exactly zero” (`log_magnitude()` is `None`).
+
+Columnwise (axis 0) gives three lanes.
+Column 1's weighted sum is $e - e^{800}$ with sign $-1$; $\ln |Z|$ equals 800 in double precision.
+Column 2 omits the zero-weight term, becoming $\ln |Z| = 2$.
+At $s = 10$, column 1's log-sum is $10 + \ln(1 + e^{-9}) = 10.000123$ and weighted $\ln |Z|$ is $10 + \ln(1 - e^{-9}) = 9.999877$, with relative reference difference at most $10^{-15}$.
+Owned and borrowed values agree in every lane for all inputs.
+
+## Summary
+
+For a single axiswise array computation, use owned `softmax_axis`, `log_softmax_axis`, `logsumexp_axis`, or `weighted_logsumexp_axis`.
+For repeated same-shape or parallel computations, choose borrowed `_into` forms and reuse caller-provided output and workspace.
+Workspace length is at least the input element count for normalization, or lane count for log-sums.
+Normalization output has the input shape; log-sum output removes `axis` and follows lane-index order.
+Empty or entirely masked lanes produce `DomainError` for normalization, $-\infty$ for log-sums, and a zero `LogValue` for weighted log-sums.
+Results do not depend on policy, and borrowed forms leave output unchanged on error or stopping.
+
+## Further reading
+
+- [Logarithmic sums, weighted sums, and normalization](../logarithmic-reductions/): Check the per-lane 16 ULP log-sum contract and error bounds for signed and complex weights.
+- [Borrowed layouts and affine values](../borrowed-layouts-and-affine-values/): Check layouts accepted by `NdView` and `NdViewMut` and lane ordering.
+- [Execution policies, partitioning, and execution contexts](../execution-and-partitions/): Check how `Auto` chooses partition counts.
+- [Cancellation, clocks, and deadlines](../cancellation-clocks-and-deadlines/): Check where stop requests are observed and how output is handled.
+- [Execution forms, workspaces, and reproducibility](../../../concepts/workspaces-and-reproducibility/): Check caller workspaces and policy-independent results.
+- [Arithmetic, stable transformation, and logarithmic sum APIs](../../api/arithmetic-and-reductions/): Look up every axiswise function.

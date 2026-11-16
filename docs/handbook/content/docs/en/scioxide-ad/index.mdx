@@ -1,0 +1,260 @@
+---
+title: "Automatic differentiation"
+description: "The role of scioxide-ad, a first computation differentiating the same generic function with dual numbers, a tape, Taylor jets and central differences, how to read results and errors, and a chapter map organized by readers' questions."
+sidebar:
+  order: 10
+references:
+  ad-first-computation: "first-computation"
+  ad-generic-functions: "writing-generic-functions"
+  ad-errors-and-outputs: "errors-and-output"
+  ad-chapter-map: "chapter-map"
+---
+
+`scioxide-ad` computes derivatives of calculations written with `f32` and `f64` by applying the chain rule to the local derivatives of each operation.
+This method is called automatic differentiation.
+It computes derivative values at an evaluation point, whereas symbolic differentiation constructs derivative expressions.
+It requires no step-size selection and has no finite-difference truncation error.
+Like the primal value (the value of the function itself), however, it is subject to rounding error in each operation.
+
+With `scioxide-ad`, write a function once for a number type `R: Real` and choose the number type when running it.
+Passing `f64` gives ordinary evaluation; `Dual` gives a directional derivative in forward mode; `Jet` gives Taylor coefficients; and a `Var` recorded on a `Tape` gives a gradient in reverse mode.
+Passing `Lanes` evaluates independent values together with SIMD.
+Wrapper types can be nested: `Dual<Dual<f64>>` gives a second derivative and `Var<Dual<f64>>` gives a Hessian-vector product.
+For sums of many independent items (Monte Carlo paths or per-sample losses), `BatchPlan` packs items into lanes for evaluation.
+
+When a function cannot be written with `Real` operations (an external program or measured values), use finite-difference numerical differentiation ([scioxide-differentiate](../scioxide-differentiate/)).
+[Choosing numerical differentiation](../scioxide-differentiate/choosing/) covers when to use the two methods and finite-difference error.
+
+## First computation
+
+Compute the following function and its derivatives
+
+$$
+f(x) = \frac{e^x}{1 + x^2}, \qquad f'(x) = \frac{e^x (x - 1)^2}{(1 + x^2)^2}, \qquad
+f''(x) = \frac{e^x (x - 1)\bigl(x^3 - 3x^2 + 5x + 1\bigr)}{(1 + x^2)^3}
+$$
+
+at evaluation point $x$ using four methods.
+The methods are forward mode with `Dual::variable(x)`, tape-based reverse mode with `value_and_grad`, Taylor coefficients with `Jet::<_, 3>::variable(x)` ($f' = c_1$, $f'' = 2c_2$), and central differences with scioxide-differentiate's `FiniteDifference::derivative`.
+The first three run the same generic function `model` with different number types, while central differences evaluate `model` with `f64` or `f32` unchanged.
+
+The inputs are the evaluation point $x$ (a dimensionless number from 0.5 to 3.5) and the floating-point type used for the calculation (`f64` or `f32`).
+For each method, the table shows $f'(x)$, its absolute error relative to the closed form, that error divided by the type's unit roundoff $u$ ($2^{-53}$ for `f64` and $2^{-24}$ for `f32`), and the number of evaluations or sweeps required.
+The last row compares `Jet`'s $2c_2$ with the closed-form $f''(x)$.
+The closed form is an independent reference value computed with f64's inherent methods; when `f32` is selected, it uses the evaluation point rounded to f32.
+
+```rust
+//| id: ad-diff-vs-ad-comparison
+//| ref: ad-diff-vs-ad-comparison
+//| title: "Compare derivatives from dual numbers, a tape, jets and central differences"
+//| run: reactive
+//| crates: [scioxide-ad, scioxide-core, scioxide-differentiate]
+//| inputs:
+//|   eval_x: {"type":"range","label":"Evaluation point x","description":"Position at which to compare derivatives (dimensionless). At x = 1, f′(1) = 0.","min":0.5,"max":3.5,"step":0.1,"value":1.5}
+//|   precision: {"type":"select","label":"Floating-point type","description":"Type used for the four methods.","options":["f64","f32"],"value":"f64"}
+//| cases:
+//|   - {"id":"single-precision","label":"f32","description":"Unit roundoff increases to 2^−24. Automatic differentiation error remains a few multiples of u, while central-difference error grows to about 10^−6.","inputs":{"precision":"f32"}}
+//|   - {"id":"stationary-point","label":"x = 1","description":"A point where f′(1) = f″(1) = 0. All three automatic differentiation methods return 0.","inputs":{"eval_x":1.0}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"derivatives","path":"/rows/0/1","approx":{"value":0.10607548095474706,"rtol":1e-14}}
+//|       - {"artifact":"derivatives","path":"/rows/0/3","range":{"max":8}}
+//|       - {"artifact":"derivatives","path":"/rows/1/3","range":{"max":8}}
+//|       - {"artifact":"derivatives","path":"/rows/2/3","range":{"max":8}}
+//|       - {"artifact":"derivatives","path":"/rows/3/2","range":{"min":1e-12,"max":1e-9}}
+//|       - {"artifact":"derivatives","path":"/rows/4/1","approx":{"value":0.33454574762651,"rtol":1e-13}}
+//|       - {"artifact":"derivatives","path":"/rows/4/3","range":{"max":32}}
+//|   - case: single-precision
+//|     expect:
+//|       - {"artifact":"derivatives","path":"/rows/0/3","range":{"max":8}}
+//|       - {"artifact":"derivatives","path":"/rows/3/2","range":{"min":1e-7,"max":1e-4}}
+//|   - case: stationary-point
+//|     expect:
+//|       - {"artifact":"derivatives","path":"/rows/0/2","range":{"max":1e-15}}
+//|       - {"artifact":"derivatives","path":"/rows/1/2","range":{"max":1e-15}}
+//|       - {"artifact":"derivatives","path":"/rows/4/2","range":{"max":1e-15}}
+use scioxide_ad::{Dual, Jet, Real, value_and_grad};
+use scioxide_core::RealScalar;
+use scioxide_differentiate::FiniteDifference;
+
+// Write f(x) = eˣ/(1 + x²) once for the number type R.
+fn model<S: RealScalar, R: Real<S>>(x: R) -> R {
+    x.exp() / (x * x + S::ONE)
+}
+
+// Run the four methods with type S and return (four f′ values, 2c₂, finite-difference evaluation count).
+fn derivatives<S: RealScalar>(x: S) -> Result<([f64; 4], f64, usize), String> {
+    // Forward mode: pass a dual number with tangent 1.
+    let forward = model::<S, Dual<S>>(Dual::variable(x)).derivative();
+    // Reverse mode: record on a new tape and obtain the gradient in one reverse sweep.
+    let (_, gradient) =
+        value_and_grad(|v| Ok(model::<S, _>(v[0])), &[x]).map_err(|e| e.to_string())?;
+    // Taylor coefficients: c₁ = f′, 2c₂ = f″.
+    let c = model::<S, Jet<S, 3>>(Jet::variable(x)).coefficients();
+    // Central differences: evaluate model with f64 or f32 using a step determined by the type's precision.
+    let difference = FiniteDifference::default()
+        .derivative(|t| Ok(model::<S, S>(t)), x)
+        .map_err(|e| e.to_string())?;
+    let central = difference
+        .values()
+        .ok_or("Central-difference value is absent from the output")?[0];
+    let values = [
+        forward.into_f64(),
+        gradient.as_slice()[0].into_f64(),
+        c[1].into_f64(),
+        central.into_f64(),
+    ];
+    let curvature = (c[2] + c[2]).into_f64();
+    Ok((values, curvature, difference.report().evaluations()))
+}
+
+let (x, (values, curvature, evaluations), unit) = if precision == "f32" {
+    let x = eval_x as f32;
+    (f64::from(x), derivatives(x)?, f64::from(f32::EPSILON) / 2.0)
+} else {
+    (eval_x, derivatives(eval_x)?, f64::EPSILON / 2.0)
+};
+// Independent reference: compute the closed-form f′(x) and f″(x) with f64's inherent methods.
+let q = 1.0 + x * x;
+let first = x.exp() * (x - 1.0).powi(2) / (q * q);
+let second = x.exp() * (x - 1.0) * (x.powi(3) - 3.0 * x * x + 5.0 * x + 1.0) / q.powi(3);
+let names = [
+    "Forward mode Dual",
+    "Reverse mode value_and_grad",
+    "Taylor coefficient c₁ from Jet",
+    "Central differences FiniteDifference::derivative",
+];
+let work = [
+    "1 evaluation (together with the primal value)".to_string(),
+    "2 function runs (count and grow, then record), 1 reverse sweep".to_string(),
+    "1 evaluation (3 coefficients)".to_string(),
+    format!("{evaluations} evaluations of f"),
+];
+let mut rows: Vec<(String, f64, f64, f64, String)> = names
+    .iter()
+    .zip(values)
+    .zip(work)
+    .map(|((name, value), work)| {
+        let error = (value - first).abs();
+        (name.to_string(), value, error, error / unit, work)
+    })
+    .collect();
+let error = (curvature - second).abs();
+rows.push((
+    "Taylor coefficient 2c₂ (f″) from Jet".to_string(),
+    curvature,
+    error,
+    error / unit,
+    "Same evaluation as above".to_string(),
+));
+let value = serde_json::json!({ "significantDigits": 15 });
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Method" },
+    { "key": "1", "label": "Derivative value [-]", "type": "number", "format": value },
+    { "key": "2", "label": "Difference from closed form [-]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "Difference / u [-]", "type": "number", "format": fixed2 },
+    { "key": "4", "label": "Required computation" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "derivatives" })
+);
+```
+
+## Reading the results
+
+With the defaults $x = 1.5$ and `f64`, forward mode, reverse mode and the jet's $c_1$ return the same value, differing from the closed form by $2.8 \times 10^{-17}$ ($0.25u$).
+The jet's $2c_2$ also agrees with $f''$ to within $0.5u$.
+Central-difference error is $1.3 \times 10^{-11}$, about 110,000 times $u$.
+Automatic differentiation error comes from rounding when evaluating each operation's local derivative (the derivatives of $e^x$ and $1/(1 + x^2)$) in floating-point arithmetic.
+Central-difference error is the sum of truncation error proportional to the step size $h$ and rounding error proportional to $u/h$; even a step that balances the two leaves an error of about $u^{2/3}$.
+Selecting `f32` increases $u$ to $2^{-24}$: automatic differentiation error remains 1–2 times $u$, while central-difference error becomes about $7 \times 10^{-6}$.
+
+At $x = 1$, both $f'(1) = 0$ and $f''(1) = 0$ hold.
+The three automatic differentiation methods return exactly 0, while central differences return $1.8 \times 10^{-11}$.
+Relative error is meaningless when the true value is 0, so the table reports absolute error.
+
+The required computation column gives the number of evaluations or sweeps needed for one derivative.
+Forward mode computes the primal value and derivative together in one evaluation.
+Reverse mode records the function on a tape once and traverses the recording once in reverse order.
+Since `value_and_grad` starts from an empty tape, it runs the function once to count statements, grows the tape, then runs it again to record.
+Reusing the same tape requires only one recording from the second call onward.
+For $n$ inputs, obtaining a gradient in forward mode requires $n$ evaluations; reverse mode needs one recording and one reverse sweep regardless of the number of inputs.
+This difference is central to selecting forward or reverse mode in [Choosing automatic differentiation](choosing/).
+
+## Writing generic functions
+
+The cell's `model` is written once for the number type `R: Real<S>`.
+It executes the same operation sequence with `f64`, `Dual<f64>` or `Var`, and values agree bit for bit regardless of the number type.
+Follow these rules when writing generic functions.
+
+- Put scalar constants on the right of operators (`x * 2.0`, `-x + 1.0`, `x * x + S::ONE`).
+  With concrete types (such as `Dual<f64>`), they may also appear on the left.
+- Insert undifferentiated base values, such as random numbers or measurements, into the number type with `R::passive(z)`.
+- To branch on a value with `if`, use the bound `R: Real<Mask = bool>`.
+  To also accept types with lanes, select per lane with `R::select(mask, a, b)`.
+- Write closures passed to reverse-mode functions (such as `value_and_grad` and `Tape::gradient_into`) directly in the call's argument position.
+  The closure must be generic over each recording's lifetime; binding it with `let` causes type inference to fail.
+
+[Number types, lanes and generic code](algorithms/number-types-and-lanes/) explains number-type contracts and lanes; [Forward mode and dual numbers](algorithms/forward-mode/) and [Reverse mode and tapes](algorithms/reverse-mode-and-replay/) explain the respective algorithms.
+
+## Errors and output
+
+Number-type operations do not return errors.
+They evaluate according to IEEE 754 without checking arguments, and propagate NaN and infinity unchanged.
+Transforms that accept points and write results (such as `grad`, `Tape::gradient_into` and `BatchPlan::evaluate_into`) and structured operations (such as `solve_into`) return errors through `Result<_, SciOxideError>`.
+The main kinds are as follows.
+
+| Kind | When it occurs |
+|---|---|
+| `DimensionMismatch` | Point, direction or output lengths do not match |
+| `NonFinite` | A point or result contains NaN or infinity under `NonFinitePolicy::Error` |
+| `DomainError` | An active argument reaches a kink under `KinkPolicy::Error`, or a factorization pivot is not positive |
+| `Singular` | A matrix is singular in a linear solve or implicit differentiation |
+| `InvalidInput` | Two recordings are mixed, the second recording exceeds the first (the function is nondeterministic), or an implicit solution does not satisfy the tolerance |
+| `ResourceLimit`, `AllocationFailure` | The tape or workspace cannot grow |
+
+Errors returned by the function propagate unchanged, retaining their kind.
+When a transform fails, it leaves the caller's output storage unchanged.
+Read the error classification with `e.kind()` and `e.view()`.
+[Handling kinks and nonfinite values](algorithms/nonsmooth-and-nonfinite-policies/) covers policy details; [Tape lifecycle and reuse](algorithms/tape-lifecycle/) covers tape capacity and reuse errors.
+
+## Chapter map
+
+| Topic | Page |
+|---|---|
+| Which number type and transform to use | [Choosing automatic differentiation](choosing/) |
+| Computational graphs, notation and computational cost model | [Automatic differentiation algorithms](algorithms/) |
+| The `Real` contract, `Lanes` and writing generic code | [Number types, lanes and generic code](algorithms/number-types-and-lanes/) |
+| Dual numbers, `Dual`, `MultiDual` and `jvp` | [Forward mode and dual numbers](algorithms/forward-mode/) |
+| Adjoints, tape recording and sweeps, and Jacobian products | [Reverse mode and tapes](algorithms/reverse-mode-and-replay/) |
+| Tape capacity, rerecording and allocation-free reuse | [Tape lifecycle and reuse](algorithms/tape-lifecycle/) |
+| Elementary-function derivative rules and accuracy | [Elementary-function derivatives and accuracy](algorithms/elementary-functions/) |
+| Derivatives of softmax, dot products and matrix products | [Differentiating normalization and matrix products](algorithms/normalization-and-matrix-products/) |
+| Hessian-vector products and matrix-free operators | [Second derivatives and Hessian operators](algorithms/second-order-derivatives/) |
+| Sparse Jacobians and Hessians, and coloring | [Structural patterns and sparse derivative recovery](algorithms/sparse-derivatives/) |
+| Higher-order Taylor coefficients | [Taylor jets and higher-order coefficients](algorithms/taylor-jets/) |
+| Value-dependent branches, masks and table lookup | [Branches, masks and table lookup](algorithms/control-flow/) |
+| Long loops and checkpoints | [Loops and checkpointing](algorithms/checkpointing/) |
+| Kinks and nonfinite values | [Handling kinks and nonfinite values](algorithms/nonsmooth-and-nonfinite-policies/) |
+| Differentiating linear solves and matrix factorizations | [Differentiating linear solves and factorizations](algorithms/linear-solutions/) |
+| Sensitivity of equation solutions (implicit function theorem) | [Implicit differentiation](algorithms/implicit-functions/) |
+| Derivatives of complex functions | [Real coordinates and complex derivatives](algorithms/complex-derivatives/) |
+| Rules providing derivatives for scalar functions | [Scalar-function derivative rules](algorithms/custom-primitives/) |
+| Rules providing derivative products for external computations | [External derivative rules with ExternalRule](algorithms/external-rules/) |
+| Sums and means of many items, and Monte Carlo differentiation | [Batch evaluation of many items](algorithms/batches/) |
+| Physics, finance and machine learning examples | [Example index](examples/) |
+| Public item index and contracts | [Automatic differentiation API guide](api/) |
+
+## Summary
+
+With `scioxide-ad`, write a function once for `R: Real` and select number types such as `Dual`, `Jet`, `Var` and `Lanes` to switch between forward mode, Taylor coefficients, reverse mode and SIMD evaluation.
+Automatic differentiation error comes from rounding in each operation, so it remains a few multiples of unit roundoff and requires no step-size selection.
+Forward mode has lower computational cost for few inputs; reverse mode has lower cost for many inputs and few outputs, as in scalar-function gradients.
+Transforms return `Result` and leave outputs unchanged on failure, allowing errors to be classified with `kind()` and handled.
+Continue to [Choosing automatic differentiation](choosing/) for the procedure for selecting number types and transforms from the problem's shape.
+To begin with algorithm mechanisms and error, proceed to [Automatic differentiation algorithms](algorithms/).

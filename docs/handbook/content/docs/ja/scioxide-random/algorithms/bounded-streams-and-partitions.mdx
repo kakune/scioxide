@@ -1,0 +1,210 @@
+---
+title: 範囲付きの系列と実行 Plan の分割
+description: BoundedSubstream で系列の読める範囲を限る方法と、StreamPartitioner が実行 Plan の分割ごとに選ぶセレクター、その再現性と重なりの条件。
+sidebar:
+  order: 309
+references:
+  random-prng-bounded-partitions: "範囲付きの系列"
+  random-prng-plan-partitions: "実行-plan-の分割への割り当て"
+---
+
+並列のワーカーに系列を配るときは、どの系列を渡すかに加えて、各ワーカーが何語まで読んでよいかを決めておく必要がある。
+このページは読める範囲を限った系列 `BoundedSubstream` と、`scioxide_core::ExecutionPlan` の分割ごとに系列を選ぶ `StreamPartitioner` を説明する。
+系列の選び方と間隔の数学は[系列のスキップ・ジャンプ・分割](oxref:random-prng-advance-jump-split)にある。
+
+## 範囲付きの系列
+
+`BoundedSubstream` は、生成器の決まった範囲の遷移だけを読ませる系列である。
+`BoundedSubstream::for_chunk(&base, i, len)` は、`base` の現在の位置から数えて遷移 $[i \cdot len, (i+1) \cdot len)$ だけを読ませる。
+位置は区画の先頭を 0 として数え、`remaining()` は残りの遷移数を返す。
+範囲を越える読み出しや前進は `OutOfBounds` で失敗し、系列を進めない。
+`len` が 0、区画の端が `u128` を越える、`base` が位置を追跡していない場合は `InvalidInput` である。
+
+## 実行 Plan の分割への割り当て
+
+`StreamPartitioner` は `scioxide_core::ExecutionPlan` の分割ごとに範囲付きの系列を割り当てる。
+`StreamPartitioner::from_plan(plan, domain)` は Plan と呼び出し側の領域番号 `domain` を受け取り、`for_partition(&base, &partition, len)` は長さ `len` の `BoundedSubstream` を返す。
+系列のセレクターは分割の識別子（`PartitionId`）と `domain` を混ぜた 128 ビットの鍵で、その下位 64 ビットが `substream` の系列番号、上位 64 ビットが部分系列番号になる。
+セレクターは分割の識別子と `domain` だけで決まり、系列はルート生成器とセレクターで決まるので、実行の順序やスレッドの完了順には依存しない。
+無関係な計算が同じ根と Plan を共有するときは、`domain` を変えて別の系列にする。
+Plan に属さない分割や長さ 0 は `InvalidInput` である。
+
+セレクターは 0, 1, 2, … のような小さな連番ではなく、鍵を混ぜた 64 ビットの値である。
+そのため重なりの判断は[系列の間隔と重なり](oxref:random-prng-stream-spacing)の表を生成器ごとに当てはめて行う。
+カウンター型ではセレクターが異なればカウンターの入力が重ならず、各系列は $2^{66}$ ワードまで読めるので、長さが $2^{66}$ 以下なら重ならない。
+`Mrg32k3a` では部分系列番号がふつう $2^{51}$ 以上になり（下のセルではビット長 61〜64）、L'Ecuyer ほかが部分系列の非重複を保証する範囲 $j < 2^{51}$ を外れる。
+このとき二つの分割の系列が重なるのは、周期の上の二つの開始点の距離が `len` より小さい場合に限られる。
+どの生成器でも、セレクターが異なることだけでは統計的な独立は保証されない。
+
+次のセルは作業項目 1,000 個を $P$ 個の分割に分ける Plan を作り、`StreamPartitioner` で各分割に長さ $L$ の系列を割り当てる。
+セルは wasm で逐次に動くので、ワーカーの上限を 8 と提示し、分割は呼び出し側のスレッドで順に実行するエグゼキューターを使う。
+入力は生成器、分割数 $P$（2〜8）、領域番号、長さ $L$（1〜64）である。
+表は分割ごとに作業項目の範囲、セレクターのビット長、最初の `next_u32`、同じ分割の系列をもう一度作って $L$ ワードを読み直したときの異なるビット数、$L + 1$ 語目を読んだ結果を示す。
+
+```rust
+//| id: random-stream-partitions
+//| ref: random-stream-partitions
+//| title: StreamPartitioner が分割ごとに選ぶセレクターと系列の再現性を確かめる
+//| run: reactive
+//| crates: [scioxide-core, scioxide-random]
+//| inputs:
+//|   engine: {"type":"select","label":"生成器","description":"SplittableRng と SkipAhead を持つ生成器から選ぶ。","options":["Mrg32k3a","Pcg64","Philox4x64"],"value":"Mrg32k3a"}
+//|   partitions: {"type":"range","label":"分割数 P [個]","min":2,"max":8,"step":1,"value":4}
+//|   domain: {"type":"range","label":"領域番号 [-]","description":"同じ Plan でも領域番号が違えば別のセレクターになる。","min":0,"max":100,"step":1,"value":17}
+//|   length: {"type":"range","label":"系列の長さ L [遷移]","min":1,"max":64,"step":1,"value":16}
+//| cases:
+//|   - {"id":"philox-eight","label":"Philox4x64、P = 8","description":"セレクターはカウンターのワードになり、分割ごとに入力の重ならない系列を読む。","inputs":{"engine":"Philox4x64","partitions":8}}
+//|   - {"id":"other-domain","label":"領域番号 0、L = 1","description":"領域番号を変えるとセレクターと最初のワードが変わり、2 語目は範囲外になる。","inputs":{"domain":0,"length":1}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"partitions","path":"/rows/0/1","equals":0}
+//|       - {"artifact":"partitions","path":"/rows/3/2","equals":1000}
+//|       - {"artifact":"partitions","path":"/rows/0/4","range":{"min":52,"max":64}}
+//|       - {"artifact":"partitions","path":"/rows/3/4","range":{"min":52,"max":64}}
+//|       - {"artifact":"partitions","path":"/rows/0/6","equals":0}
+//|       - {"artifact":"partitions","path":"/rows/3/6","equals":0}
+//|       - {"artifact":"partitions","path":"/rows/3/7","equals":"OutOfBounds"}
+//|   - case: philox-eight
+//|     expect:
+//|       - {"artifact":"partitions","path":"/rows/7/2","equals":1000}
+//|       - {"artifact":"partitions","path":"/rows/7/6","equals":0}
+//|   - case: other-domain
+//|     expect:
+//|       - {"artifact":"partitions","path":"/rows/1/6","equals":0}
+//|       - {"artifact":"partitions","path":"/rows/1/7","equals":"OutOfBounds"}
+use core::num::NonZeroUsize;
+use scioxide_core::{
+    ExecutionContext, ExecutionPlan, ExecutionPolicy, Executor, SciOxideError, PartitionFn,
+    PlanLimits, SequentialExecutor,
+};
+use scioxide_random::{
+    BitGenerator, Mrg32k3a, Pcg64, Philox4x64, SeedableRng, SkipAhead, SplittableRng,
+    StreamPartitioner,
+};
+
+// ワーカーの上限を 8 と提示し、分割は呼び出し側のスレッドで順に実行するエグゼキューター。
+struct InOrder;
+
+impl Executor for InOrder {
+    fn worker_budget(&self) -> NonZeroUsize {
+        NonZeroUsize::new(8).unwrap_or(NonZeroUsize::MIN)
+    }
+
+    fn execute(
+        &self,
+        context: ExecutionContext<'_>,
+        plan: ExecutionPlan,
+        operation: &PartitionFn<'_>,
+    ) -> Result<(), SciOxideError> {
+        SequentialExecutor.execute(context, plan, operation)
+    }
+}
+
+// (分割, 範囲の先頭, 範囲の末尾, 系列番号のビット長, 部分系列番号のビット長,
+//  最初の next_u32, 読み直しとの異なるビット数, L + 1 語目の結果)
+type Row = (u64, u64, u64, u32, u32, u32, u32, String);
+
+fn assign<R>(
+    base: &R,
+    plan: ExecutionPlan,
+    domain: u64,
+    length: u64,
+) -> Result<Vec<Row>, String>
+where
+    R: SplittableRng + SkipAhead + Clone,
+{
+    let partitioner = StreamPartitioner::from_plan(plan, domain);
+    let bits = |value: u64| u64::BITS - value.leading_zeros();
+    let mut rows = Vec::new();
+    for partition in plan.partitions() {
+        let open = || {
+            partitioner
+                .for_partition(base, &partition, u128::from(length))
+                .map_err(|e| e.to_string())
+        };
+        let (mut stream, mut replay) = (open()?, open()?);
+        let selectors = stream.stream_identity().and_then(|id| id.selectors());
+        let (stream_id, subsequence) = selectors.ok_or("セレクターがない")?;
+        let (mut first, mut differing) = (0, 0);
+        for index in 0..length {
+            let a = stream.next_u32().map_err(|e| e.to_string())?;
+            let b = replay.next_u32().map_err(|e| e.to_string())?;
+            differing += (a ^ b).count_ones();
+            if index == 0 {
+                first = a;
+            }
+        }
+        let beyond = match stream.next_u32() {
+            Ok(_) => "読めた".to_string(),
+            Err(e) => format!("{:?}", e.kind()),
+        };
+        let range = partition.range();
+        let (start, end) = (range.start as u64, range.end as u64);
+        let index = partition.worker_index() as u64;
+        let selector_bits = (bits(stream_id), bits(subsequence));
+        rows.push((
+            index,
+            start,
+            end,
+            selector_bits.0,
+            selector_bits.1,
+            first,
+            differing,
+            beyond,
+        ));
+    }
+    Ok(rows)
+}
+
+let workers = NonZeroUsize::new(partitions.round() as usize).ok_or("分割数が 0")?;
+let limits = PlanLimits {
+    work_per_item: NonZeroUsize::MIN,
+    auto_threshold: NonZeroUsize::MIN,
+    worker_limit: workers,
+};
+let plan =
+    ExecutionContext::new(&InOrder).plan(ExecutionPolicy::Parallel(workers), 1000, limits);
+let (domain, length) = (domain.round() as u64, length.round() as u64);
+let rows = match engine.as_str() {
+    "Mrg32k3a" => assign(&Mrg32k3a::from_seed(42), plan, domain, length)?,
+    "Pcg64" => assign(&Pcg64::from_seed(42), plan, domain, length)?,
+    _ => assign(&Philox4x64::from_seed(42), plan, domain, length)?,
+};
+let columns = serde_json::json!([
+    { "key": "0", "label": "分割", "type": "integer" },
+    { "key": "1", "label": "作業項目の先頭", "type": "integer" },
+    { "key": "2", "label": "作業項目の末尾（含まない）", "type": "integer" },
+    { "key": "3", "label": "系列番号のビット長 [ビット]", "type": "integer" },
+    { "key": "4", "label": "部分系列番号のビット長 [ビット]", "type": "integer" },
+    { "key": "5", "label": "最初の next_u32", "type": "integer" },
+    { "key": "6", "label": "読み直しとの異なるビット数 [ビット]", "type": "integer" },
+    { "key": "7", "label": "L + 1 語目" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "partitions" })
+);
+```
+
+既定の入力（`Mrg32k3a`、$P = 4$、領域番号 17、$L = 16$）では、作業項目 1,000 個が 250 個ずつ四つの分割に分かれる。
+部分系列番号のビット長は 61〜64 で、どの分割でも部分系列番号は $2^{51}$ を大きく超える。
+読み直しとの異なるビット数はどの分割でも 0 で、同じ分割には同じ系列が割り当てられる。
+$L + 1$ 語目の読み出しは `OutOfBounds` で拒否される。
+領域番号を 0 にするとビット長は変わらないが、セレクターの値が変わり、最初のワードがすべて変わる。
+セレクターは分割と領域番号だけで決まるので、`Pcg64` や `Philox4x64` を選んでも同じセレクターが使われ、`Philox4x64` ではそれがカウンターの系列語と部分系列語になる。
+
+## まとめ
+
+`BoundedSubstream` を使えば、ワーカーが割り当てた遷移数を越えて読んだときに `OutOfBounds` で止められ、系列は進まない。
+`StreamPartitioner` はルート生成器、分割の識別子、領域番号だけから系列を選ぶので、スレッドの完了順が変わっても同じ Plan からは同じ数が出る。
+そのセレクターは混ぜた 64 ビットの値なので、構成による非重複が要るときはカウンター型の生成器（`Philox4x64`、`Threefry4x64`）と組み合わせる。
+`Mrg32k3a` と組み合わせるときは、重ならないことを部分系列の保証ではなく、周期の上の開始点どうしの距離と長さ $L$ から判断する。
+無関係な計算が同じ根と Plan を共有するときは、領域番号を変えて系列を分ける。
+
+## 次に読むページ
+
+- [シード・状態の保存・失敗時の状態](../seeding-and-state/)：範囲付きの系列を使って失敗した一括生成の状態を確かめる。
+- [乱数のシードの衝突と系列の分割](../../examples/seed-collisions-and-streams/)：無作為に配ったシードが衝突する確率を見積もり、`seed_sequence`、`split`、ジャンプ、`StreamPartitioner` が系列の重なりについて何を保証するかを確かめる。
+- [生成器と系列の API](../../api/engines-and-streams/)：`BoundedSubstream` と `StreamPartitioner` の仕様とエラーを引く。

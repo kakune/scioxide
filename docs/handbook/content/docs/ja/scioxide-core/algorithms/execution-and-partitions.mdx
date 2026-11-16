@@ -1,0 +1,445 @@
+---
+title: 実行方針・分割・実行コンテキスト
+description: ExecutionPolicy と PlanLimits から作業分割を決める規則、分割の識別子と乱数の鍵、分割番号順の集約による再現性、エグゼキューターの仕様、実行コンテキストの 4 つの作り方と処理装置の方針、wasm で使えない並列実行と命令の組。
+sidebar:
+  order: 320
+references:
+  core-execution-context: "実行コンテキストの作り方"
+  core-wasm-execution-limits: "wasm-環境での制約"
+  core-executor-contract: "エグゼキューターの仕様"
+  core-execution-policy: "実行方針と分割の決め方"
+  core-ordered-reduction: "分割番号順の集約と再現性"
+  core-partition-ids: "分割の識別子と乱数の鍵"
+---
+
+浮動小数点の加算は結合則を満たさないので、部分和を足し合わせる順序が変わると結果の末尾の桁が変わりうる。
+完了した順に部分和を足す並列集約では、同じ入力でも実行ごとに結果が揺れる。
+`scioxide-core` は作業の分割を入力の大きさと上限だけから決め、部分結果を分割番号の順に集約する。
+並列化してよいかどうかの意図は `ExecutionPolicy`、実際に使うエグゼキューターやクロックは `ExecutionContext` として別々に渡す。
+SciOxide はこれらを大域的な状態から読まないので、計算が使うリソースは引数で渡したコンテキストだけで決まる。
+計算を外から止めるための取り消しと期限は[取り消し・クロック・期限](../cancellation-clocks-and-deadlines/)で扱う。
+
+## 実行方針と分割の決め方
+
+`ExecutionPolicy` は並列化の意図を表し、既定値は `Auto` である。
+
+| 方針 | 意味 |
+|---|---|
+| `Sequential` | 一つの分割で、項目の順に実行する |
+| `Auto` | 演算ごとの規模のしきい値と作業量の見積りに従い、エグゼキューターが要求する最小作業量を満たす場合だけ分割を増やす |
+| `Parallel(n)` | 最大 `n` 個（`NonZeroUsize`）の分割を要求する |
+
+`ExecutionContext::plan(policy, work_items, limits)` は、演算が `PlanLimits` で示す 3 つの値と、コンテキストがその入れ子の深さで使えるワーカー数 $A$（`worker_budget()`）から分割数 $W$ を決めて `ExecutionPlan` を返す。
+
+- `auto_threshold`：`Auto` が分割を検討する最小の作業項目数。
+- `work_per_item`：作業項目一つあたりの推定作業量。
+  1 単位はおよそスカラー演算 1 回で、見積りがなければ 1 を使う。
+  この値は `Auto` の分割数にだけ影響する。
+- `worker_limit`：その演算が許す分割数の上限。
+
+作業項目数を $n$、エグゼキューターが `Auto` に要求する分割あたりの最小作業量を $m$（`Executor::auto_min_work_per_worker`）とすると、$n > 0$ のとき
+
+$$
+W =
+\begin{cases}
+1 & \texttt{Sequential}, \text{ または } \texttt{Auto} \text{ かつ } n < \texttt{auto\_threshold}, \\
+\min\left(A,\ \texttt{worker\_limit},\ \max\left(1, \left\lfloor n / \lceil m / \texttt{work\_per\_item} \rceil \right\rfloor\right)\right) & \texttt{Auto} \text{ かつ } n \ge \texttt{auto\_threshold}, \\
+\min\left(r,\ A,\ \texttt{worker\_limit},\ n\right) & \texttt{Parallel}(r)
+\end{cases}
+$$
+
+であり、$n = 0$ なら分割はない。
+`Auto` の第 3 項は、各分割が $\lceil m / \texttt{work\_per\_item} \rceil$ 個以上の項目を持つための条件である。
+分割の大きさは $\lfloor n / W \rfloor$ 以上なので、$W$ がこの商以下なら、最も小さい分割でも推定作業量が $m$ 以上になる。
+商が 0 のとき、つまり全体の推定作業量 $n \times \texttt{work\_per\_item}$ が $m$ に満たないときは 1 分割になる。
+総作業量 $n \times \texttt{work\_per\_item}$ を掛け算で作らずに $m / \texttt{work\_per\_item}$ の切り上げで割るので、桁あふれが起きない。
+$A = 1$ のときはエグゼキューターに $m$ を問い合わせず、分割数は 1 になる。
+`Parallel(r)` は最小作業量 $m$ を無視する。
+分割の実行の内側で作った Plan では $A = 1$ になるので、入れ子の作業は呼び出し元のワーカーでそのまま実行される。
+
+分割 $i$（$0 \le i < W$）は連続した半開区間で、$b = \lfloor n / W \rfloor$、$r = n \bmod W$ として
+
+$$
+[\, b\,i + \min(i, r),\ \ b\,i + \min(i, r) + b + [i < r] \,)
+$$
+
+となる。
+角括弧 $[i < r]$ は、条件が成り立つとき 1、成り立たないとき 0 を表す。
+前の $r$ 個の分割が一つずつ多くの項目を持ち、空の分割はできない。
+分割の番号と範囲はエグゼキューターのスケジュールに依存しない。
+
+`ThreadExecutor` は $m = 32768$ を要求するので、作業量の小さい演算では `Auto` が 1 分割になる。
+既定の `Executor::auto_min_work_per_worker` は 1 で、その場合は `auto_threshold` だけが効く。
+
+次のセルはワーカー数 8 の `ThreadExecutor`、`auto_threshold` $= 500$、`worker_limit` $= 8$ のもとで 5 つの方針の Plan を作る。
+入力は作業項目数 $n$（100〜20000）と一項目あたりの作業量 `work_per_item`（1〜200）である。
+Plan を作るだけで実行はしないので、ブラウザの wasm 環境でもスレッドは作られない。
+1 つ目の表は方針ごとの分割数、最大と最小の分割の項目数、項目数の合計を示す。
+2 つ目の表は `Auto` の式を `plan` を使わずに計算した値である。
+検証するのは、合計が $n$ に等しいこと、最大と最小の差が 1 以下であること、`Auto` の分割数が式の値と一致することである。
+
+```rust
+//| id: core-execution-plan-resolution
+//| ref: core-execution-plan-resolution
+//| title: 方針と上限から分割数を決める
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   items_count: {"type":"range","label":"作業項目数 n [個]","description":"分割の対象となる項目の数。","min":100,"max":20000,"step":100,"value":1000}
+//|   work_per_item: {"type":"range","label":"一項目あたりの作業量 work_per_item [単位]","description":"PlanLimits に渡す一項目あたりの推定作業量。","min":1,"max":200,"step":1,"value":10}
+//| cases:
+//|   - {"id":"auto-splits","label":"n = 20000、作業量 10","description":"一分割の最小は 3277 項目で、Auto は 6 分割になる。","inputs":{"items_count":20000}}
+//|   - {"id":"heavy-items","label":"n = 20000、作業量 200","description":"一分割の最小が 164 項目に下がり、Auto はワーカー数の 8 分割になる。","inputs":{"items_count":20000,"work_per_item":200}}
+//|   - {"id":"below-threshold","label":"n = 400、作業量 200","description":"作業量は 2 分割に足りるが、auto_threshold の 500 項目に届かないので Auto は 1 分割になる。","inputs":{"items_count":400,"work_per_item":200}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"plans","path":"/rows/0/1","equals":1}
+//|       - {"artifact":"plans","path":"/rows/1/1","equals":1}
+//|       - {"artifact":"plans","path":"/rows/2/1","equals":2}
+//|       - {"artifact":"plans","path":"/rows/3/2","equals":125}
+//|       - {"artifact":"plans","path":"/rows/4/1","equals":8}
+//|       - {"artifact":"plans","path":"/rows/4/4","equals":1000}
+//|       - {"artifact":"auto","path":"/rows/0/1","equals":3277}
+//|       - {"artifact":"auto","path":"/rows/0/3","equals":1}
+//|   - case: auto-splits
+//|     expect:
+//|       - {"artifact":"plans","path":"/rows/1/1","equals":6}
+//|       - {"artifact":"plans","path":"/rows/1/2","equals":3334}
+//|       - {"artifact":"plans","path":"/rows/1/3","equals":3333}
+//|       - {"artifact":"plans","path":"/rows/1/4","equals":20000}
+//|       - {"artifact":"auto","path":"/rows/0/3","equals":6}
+//|   - case: heavy-items
+//|     expect:
+//|       - {"artifact":"plans","path":"/rows/1/1","equals":8}
+//|       - {"artifact":"auto","path":"/rows/0/1","equals":164}
+//|       - {"artifact":"auto","path":"/rows/0/2","equals":121}
+//|       - {"artifact":"auto","path":"/rows/0/3","equals":8}
+//|   - case: below-threshold
+//|     expect:
+//|       - {"artifact":"plans","path":"/rows/1/1","equals":1}
+//|       - {"artifact":"plans","path":"/rows/3/1","equals":8}
+//|       - {"artifact":"plans","path":"/rows/3/2","equals":50}
+//|       - {"artifact":"auto","path":"/rows/0/2","equals":2}
+//|       - {"artifact":"auto","path":"/rows/0/3","equals":1}
+use core::num::NonZeroUsize;
+use scioxide_core::{ExecutionContext, ExecutionPolicy, Executor, PlanLimits, ThreadExecutor};
+
+let nonzero = |value: usize| NonZeroUsize::new(value).ok_or("0 は指定できない");
+let (workers, threshold) = (nonzero(8)?, nonzero(500)?);
+// Plan を作るだけで実行はしないので、スレッドは作られない。
+let executor = ThreadExecutor::new(workers);
+let cx = ExecutionContext::new(&executor);
+let limits = PlanLimits {
+    work_per_item: nonzero(work_per_item as usize)?,
+    auto_threshold: threshold,
+    worker_limit: workers,
+};
+let n = items_count as usize;
+
+let mut rows = Vec::new();
+for (label, policy) in [
+    ("Sequential", ExecutionPolicy::Sequential),
+    ("Auto", ExecutionPolicy::Auto),
+    ("Parallel(2)", ExecutionPolicy::Parallel(nonzero(2)?)),
+    ("Parallel(8)", ExecutionPolicy::Parallel(nonzero(8)?)),
+    ("Parallel(16)", ExecutionPolicy::Parallel(nonzero(16)?)),
+] {
+    let plan = cx.plan(policy, n, limits);
+    let sizes: Vec<usize> = plan.partitions().map(|p| p.range().len()).collect();
+    rows.push((
+        label,
+        plan.worker_count(),
+        sizes.iter().copied().max(),
+        sizes.iter().copied().min(),
+        sizes.iter().sum::<usize>(),
+    ));
+}
+let plan_columns = serde_json::json!([
+    { "key": "0", "label": "方針" },
+    { "key": "1", "label": "分割数 W [個]", "type": "integer" },
+    { "key": "2", "label": "最大の分割 [項目]", "type": "integer", "nullText": "分割なし" },
+    { "key": "3", "label": "最小の分割 [項目]", "type": "integer", "nullText": "分割なし" },
+    { "key": "4", "label": "項目数の合計 [項目]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    plan_columns,
+    rows,
+    metadata = serde_json::json!({ "id": "plans", "title": "方針ごとの Plan" })
+);
+
+// 独立な検算: Auto の式を plan を使わずに評価する（A = worker_limit = 8）。
+let m = executor.auto_min_work_per_worker().get();
+let minimum_items = m.div_ceil(work_per_item as usize);
+let quotient = n / minimum_items;
+let auto_by_formula = if n < threshold.get() {
+    1
+} else {
+    workers.get().min(quotient.max(1))
+};
+let auto_columns = serde_json::json!([
+    { "key": "0", "label": "エグゼキューターの最小作業量 m [単位]", "type": "integer" },
+    { "key": "1", "label": "一分割の最小項目数 ⌈m / work_per_item⌉ [項目]", "type": "integer" },
+    { "key": "2", "label": "商 ⌊n / ⌈m / work_per_item⌉⌋", "type": "integer" },
+    { "key": "3", "label": "式による Auto の分割数 [個]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    auto_columns,
+    vec![(m, minimum_items, quotient, auto_by_formula)],
+    metadata = serde_json::json!({ "id": "auto", "title": "Auto の式の検算" })
+);
+```
+
+既定の $n = 1000$、`work_per_item` $= 10$ では $\lceil 32768 / 10 \rceil = 3277$ 項目が一分割の最小で、$\lfloor 1000 / 3277 \rfloor = 0$ なので `Auto` は 1 分割になる。
+`Parallel(8)` は 125 項目ずつの 8 分割になり、`Parallel(16)` は `worker_limit` とエグゼキューターのワーカー数 8 で制限されて同じ 8 分割になる。
+$n = 20000$ にすると商は 6 で、`Auto` は 3334 項目の分割 2 個と 3333 項目の分割 4 個に分ける。
+`work_per_item` を 200 にすると一分割の最小が 164 項目に下がり、商 121 がワーカー数を超えるので `Auto` は 8 分割になる。
+$n = 400$、`work_per_item` $= 200$ では商は 2 だが、$n$ が `auto_threshold` の 500 に届かないので `Auto` は 1 分割のままで、`Parallel(8)` だけが 50 項目ずつの 8 分割になる。
+
+### 分割の識別子と乱数の鍵
+
+Plan の分割は `WorkPartition` で、番号 `worker_index()`、半開区間 `range()`、階層的な識別子 `id()`（`PartitionId`）を持つ。
+`ExecutionPlan::partitions()` は分割を番号順に返す反復子 `WorkPartitions` で、`partition(i)` は番号 `i` の分割だけを返す。
+根のコンテキストの識別子は `PartitionId::ROOT` で、分割 $i$ の識別子は `child(i)` で親の識別子から計算する。
+入れ子の分割も同じ規則で木をたどるので、識別子は分割の木の中の位置だけで決まり、どのワーカーがいつ実行したかに依存しない。
+
+`stream_key(domain)` はこの識別子と用途の番号 `domain`（`u64`）から 128 ビットの鍵を作る。
+鍵は乱数源に問い合わせずに決まるので、分割ごとの乱数列をこの鍵から作れば、エグゼキューターのスケジュールによらず同じ列が得られる。
+
+## 分割番号順の集約と再現性
+
+`ExecutionPlan::reduce(results, initial, reduce)` は、分割ごとの結果がどの順で届いても、すべての分割から結果がちょうど一つずつ届いたことを確かめてから、分割番号の順に `reduce` を呼ぶ。
+未知・重複・欠落した分割の結果は `ExecutionFailure`（`UnknownPartition`、`DuplicatePartition`、`MissingPartition`）になる。
+`reduce` は分割数ぶんの結果の置き場を確保し、確保できなければ `AllocationFailure` を返す。
+引数のクロージャ `reduce` が返したエラーはそのまま返る。
+これで、同じ分割数なら集約の順序が実行のたびに変わることはない。
+
+ただし、分割数 $W$ が変われば部分和の区切りが変わるので、浮動小数点の加算で作った和は $W$ に依存する。
+分割数によらず同じ結果がほしい場合は、部分和を `RangeAccumulator` で丸めずに保持して `merge` でマージし、最後に `finish` で一度だけ丸める。
+`merge` は丸めを伴わないので、マージの順序にも分割数にも依存しない。
+
+次のセルは大きな項 $\pm L$ と 1 を混ぜた 8 項 $(L, 1, 1, 1, -L, 1, 1, 1)$ の和を $W = 1, 2, 3, 4$ の Plan で分割し、浮動小数点の部分和と `RangeAccumulator` の部分状態をそれぞれ `reduce` でマージしる。
+入力は $L = 10^p$ の指数 $p$（12〜17）で、数学的な和は $L$ によらず 6 である。
+1 つ目の表は各分割の範囲と浮動小数点の部分和、2 つ目の表はマージした和と、分割 0 の `stream_key(1)` の下位 16 ビットを示す。
+倍精度では $2^{53} \approx 9.0 \times 10^{15}$ を超えると隣り合う数の間隔が 2 以上になるので、$L = 10^{16}$ では $L + 1$ の 1 が丸めで失われる。
+
+```rust
+//| id: core-partition-reduction-determinism
+//| ref: core-partition-reduction-determinism
+//| title: 分割数を変えて部分和をマージしる
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   large_exponent: {"type":"range","label":"大きな項の指数 p（L = 10^p）","description":"p が 16 以上になると L に加えた 1 が丸めで失われる。","min":12,"max":17,"step":1,"value":16}
+//| cases:
+//|   - {"id":"exact-range","label":"L = 10¹⁵","description":"L + 1 が倍精度で表せるので、浮動小数点の和も分割数によらず 6 になる。","inputs":{"large_exponent":15}}
+//|   - {"id":"larger-gap","label":"L = 10¹⁷","description":"隣り合う数の間隔が 16 になり、L に足した 2 も失われる。","inputs":{"large_exponent":17}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"sums","path":"/rows/0/1","approx":{"value":3,"atol":1e-12}}
+//|       - {"artifact":"sums","path":"/rows/1/1","approx":{"value":0,"atol":1e-12}}
+//|       - {"artifact":"sums","path":"/rows/2/1","approx":{"value":2,"atol":1e-12}}
+//|       - {"artifact":"sums","path":"/rows/3/1","approx":{"value":4,"atol":1e-12}}
+//|       - {"artifact":"sums","path":"/rows/0/2","approx":{"value":6,"atol":1e-12}}
+//|       - {"artifact":"sums","path":"/rows/3/2","approx":{"value":6,"atol":1e-12}}
+//|       - {"artifact":"sums","path":"/rows/0/3","equals":21708}
+//|       - {"artifact":"sums","path":"/rows/3/3","equals":21708}
+//|       - {"artifact":"parts","path":"/rows/9/3","equals":8}
+//|   - case: exact-range
+//|     expect:
+//|       - {"artifact":"sums","path":"/rows/0/1","approx":{"value":6,"atol":1e-12}}
+//|       - {"artifact":"sums","path":"/rows/1/1","approx":{"value":6,"atol":1e-12}}
+//|       - {"artifact":"sums","path":"/rows/3/1","approx":{"value":6,"atol":1e-12}}
+//|       - {"artifact":"sums","path":"/rows/2/2","approx":{"value":6,"atol":1e-12}}
+//|   - case: larger-gap
+//|     expect:
+//|       - {"artifact":"sums","path":"/rows/3/1","approx":{"value":2,"atol":1e-12}}
+//|       - {"artifact":"sums","path":"/rows/1/2","approx":{"value":6,"atol":1e-12}}
+use core::num::NonZeroUsize;
+use scioxide_core::{
+    ExecutionContext, ExecutionPolicy, PlanLimits, RangeAccumulator, ThreadExecutor,
+};
+
+// 10 の整数乗は 10²² まで倍精度で誤差なく表せる。
+let large = 10.0_f64.powi(large_exponent as i32);
+// 数学的な和は 6。
+let terms = [large, 1.0, 1.0, 1.0, -large, 1.0, 1.0, 1.0];
+let nonzero = |value: usize| NonZeroUsize::new(value).ok_or("0 は指定できない");
+// Plan を作るだけで実行はしないので、スレッドは作られない。
+let executor = ThreadExecutor::new(nonzero(4)?);
+let cx = ExecutionContext::new(&executor);
+let limits = PlanLimits {
+    work_per_item: NonZeroUsize::MIN,
+    auto_threshold: NonZeroUsize::MIN,
+    worker_limit: nonzero(4)?,
+};
+
+let mut parts = Vec::new();
+let mut sums = Vec::new();
+for workers in 1..=4_usize {
+    let policy = ExecutionPolicy::Parallel(nonzero(workers)?);
+    let plan = cx.plan(policy, terms.len(), limits);
+    let mut naive_parts = Vec::new();
+    let mut exact_parts = Vec::new();
+    for partition in plan.partitions() {
+        let range = partition.range();
+        let chunk = &terms[range.clone()];
+        let naive = chunk.iter().fold(0.0, |sum, &x| sum + x);
+        let mut state = RangeAccumulator::new();
+        for &x in chunk {
+            state.add(x).map_err(|e| e.to_string())?;
+        }
+        parts.push((
+            workers,
+            partition.worker_index(),
+            range.start,
+            range.end,
+            naive,
+        ));
+        naive_parts.push((partition.clone(), naive));
+        exact_parts.push((partition, state));
+    }
+    // 部分結果を逆順に渡しても、reduce は分割番号の順にマージしる。
+    let naive = plan
+        .reduce(naive_parts.into_iter().rev(), 0.0, |sum, part| {
+            Ok(sum + part)
+        })
+        .map_err(|e| e.to_string())?;
+    let merge = |mut sum: RangeAccumulator<f64>, part| {
+        sum.merge(&part)?;
+        Ok(sum)
+    };
+    let exact = plan
+        .reduce(
+            exact_parts.into_iter().rev(),
+            RangeAccumulator::new(),
+            merge,
+        )
+        .and_then(|sum| sum.finish())
+        .map_err(|e| e.to_string())?;
+    // 分割 0 の乱数の鍵は、分割の範囲が W で変わっても同じになる。
+    let first = plan.partition(0).ok_or("分割がない")?;
+    sums.push((workers, naive, exact, first.id().stream_key(1) as u16));
+}
+
+let general = serde_json::json!({ "notation": "auto", "significantDigits": 3 });
+let part_columns = serde_json::json!([
+    { "key": "0", "label": "分割数 W [個]", "type": "integer" },
+    { "key": "1", "label": "分割の番号 i", "type": "integer" },
+    { "key": "2", "label": "範囲の始め", "type": "integer" },
+    { "key": "3", "label": "範囲の終わり（含まない）", "type": "integer" },
+    { "key": "4", "label": "浮動小数点の部分和 [-]", "type": "number", "format": general }
+]);
+emit_table_with_columns!(
+    part_columns,
+    parts,
+    metadata = serde_json::json!({ "id": "parts", "title": "分割ごとの部分和" })
+);
+let fixed1 = serde_json::json!({ "fractionDigits": 1 });
+let sum_columns = serde_json::json!([
+    { "key": "0", "label": "分割数 W [個]", "type": "integer" },
+    { "key": "1", "label": "浮動小数点の部分和をマージ [-]", "type": "number", "format": fixed1 },
+    { "key": "2", "label": "RangeAccumulator を merge [-]", "type": "number", "format": fixed1 },
+    { "key": "3", "label": "分割 0 の stream_key(1) の下位 16 ビット", "type": "integer" }
+]);
+emit_table_with_columns!(
+    sum_columns,
+    sums,
+    metadata = serde_json::json!({ "id": "sums", "title": "マージした和" })
+);
+```
+
+既定の $L = 10^{16}$ では、浮動小数点の和は $W = 1, 2, 3, 4$ の順に 3、0、2、4 になり、どれも 6 と一致しない。
+たとえば $W = 2$ では、分割 0 の部分和が $L$、分割 1 の部分和が $-L$ に丸められ、6 個の 1 がすべて失われる。
+`RangeAccumulator` の列はどの $W$ でも 6 である。
+部分結果は逆順に渡しているが、`reduce` は分割番号の順にマージしるので、同じ $W$ なら何度実行しても同じ値になる。
+
+$L = 10^{15}$ 以下では $L + 1$ が倍精度で表せるので、浮動小数点の和も分割数によらず 6 になる。
+$L = 10^{17}$ では隣り合う数の間隔が 16 になり、$W = 4$ の和は 4 から 2 に変わる。
+最後の列は分割 0 の乱数の鍵で、分割の範囲が $W$ で変わっても番号が同じなら鍵は変わらない。
+
+## エグゼキューターの仕様
+
+`Executor` トレイトの実装は Plan のすべての分割をちょうど一回ずつ実行し、借用を解放してから戻らなければならない。
+分割をどの順で実行してもよいが、分割の番号と範囲は変えられない。
+時間切れを理由に、実行中のコールバックを置き去りにして戻ることもできない。
+複数の分割が失敗した場合は、始めた分割がすべて終わってから、番号が最も小さい分割の失敗を返す。
+
+- `SequentialExecutor`：呼び出し元のスレッドで番号順に実行する。
+  コールバックのパニックはそのまま伝わる。
+- `ThreadExecutor::new(workers)`（`std` 機能）：スコープ付きスレッドで実行する。
+  スレッドは並列の作業の間だけ作られ、分割 0 は呼び出し元が実行し、すべてのワーカーの終了を待ってから戻る。
+  コールバックのパニックは `ExecutionFailure`（`CallbackPanicked`）に、スレッドを作れなかった場合は `ExecutionFailure`（`WorkerCreation`）になる。
+  コールバックの内側から始めた作業は、そのコールバックのスレッドで実行される。
+
+`ExecutionContext::execute(plan, operation)` はエグゼキューターに Plan を渡し、各分割の前に取り消しと期限を確かめてから `operation` を呼ぶ（確認の規則は[取り消し・クロック・期限](oxref:core-stop-reasons)）。
+分割ごとに所有データを渡すときは `ExecutionContext::execute_partitioned(plan, slots, f)` と `backend::PartitionSlot` を使う。
+`f` の型 `PartitionFn` は `Fn(WorkPartition, I, ExecutionContext) -> Result<(), SciOxideError>` で、分割と取り出した入力と子のコンテキストを受け取り、子のコンテキストは呼び出しの外へ持ち出せない。
+スロットの数が分割数と違えば `DimensionMismatch` になる。
+各スロットは一度だけ取り出され、重複・欠落した分割は `ExecutionFailure` として検出される。
+
+### 実行コンテキストの作り方
+
+`ExecutionContext` はエグゼキューター、取り消し、クロック、乱数源、処理装置の方針への借用をまとめた値で、コピーできる。
+作り方は 4 通りあり、違いはエグゼキューターと処理装置の方針である。
+どれも取り消し、クロック、乱数源を持たない状態から始まる。
+
+| 作り方 | エグゼキューター | 処理装置の方針 |
+|---|---|---|
+| `ExecutionContext::sequential()` | `SequentialExecutor`（ワーカー 1） | `PortableProcessor` |
+| `ExecutionContext::sequential_native()` | `SequentialExecutor`（ワーカー 1） | `std` 機能があれば `StdProcessor`、なければ `PortableProcessor` |
+| `ExecutionContext::new(&executor)` | 渡したエグゼキューター | `PortableProcessor` |
+| `ExecutionContext::native(&executor)` | 渡したエグゼキューター | `std` 機能があれば `StdProcessor`、なければ `PortableProcessor` |
+
+`PortableProcessor` はどの命令の組も許さないので、カーネルは可搬なスカラーの実装を使う。
+`StdProcessor` は実行中の処理装置で使えると検出できた命令の組をすべて許す。
+`native(&executor)` と `new(&executor)` の関係は、`sequential_native()` と `sequential()` の関係と同じで、`native(&SequentialExecutor)` は `sequential_native()` に等しい。
+
+実行コンテキストを引数に取らない関数は、`ExecutionContext::sequential_native()` で動く。
+`softmax` や `softmax_axis` のように結果を所有して返す `scioxide-core` の関数も、他のクレートのコンテキストを取らない形も同じである。
+コンテキストを取る形（`softmax_axis_into` など）は呼び出し側が渡したコンテキストと方針をそのまま使う。
+`sequential()` を渡せば可搬な実装、`sequential_native()` か `native(&executor)` を渡せば処理装置の命令を使う実装が選ばれる。
+二つの実装の結果は、各カーネルが文書化した誤差の範囲内で異なりうる。
+並列実行でもコンテキストを取らない形と同じカーネルを使いたい場合は、`ExecutionContext::native(&executor)` を使う。
+
+取り消しは `with_cancellation`、クロックと期限は `with_clock`、`with_deadline`、`with_time_limit` で注入する（[取り消し・クロック・期限](../cancellation-clocks-and-deadlines/)）。
+乱数源は `with_entropy(&source)` で注入する。
+トレイト `EntropySource` の `fill_bytes` がバイト列を埋め、`scioxide-core` 自身は実装を持たない。
+再現性が必要な計算は乱数源ではなく[分割の識別子と乱数の鍵](#分割の識別子と乱数の鍵)の `stream_key` を使う。
+
+処理装置の方針はトレイト `ProcessorCapabilities` で、`ExecutionContext::with_processor` で注入する。
+`supports(feature)` は命令の組 `ProcessorFeature`（`X86Sse2`、`X86Avx2`、`X86Fma`、`X86Avx512F`、`X86Avx512Dq`、`X86Avx512Vl`、`Aarch64Neon`）の使用を許すかだけを答え、命令が実行できることの証明にはならない。
+カーネルは実行中の処理装置で命令が使えるかを別に確かめるので、方針は使える命令を制限することしかできない（`false` を返すと、対応する処理装置でもその命令を使わない）。
+この確認は、`std` 機能があれば実行時の検出、なければコンパイル時のターゲット機能による。
+そのため `no_std` で SIMD を使うには、ターゲット機能をコンパイル時に有効にする必要がある。
+
+## wasm 環境での制約
+
+このハンドブックのセルは `wasm32-unknown-unknown` で逐次に実行される。
+この環境では、並列実行と処理装置の命令について次の制約がある。
+
+| 機能 | wasm での扱い | 代わり |
+|---|---|---|
+| `ThreadExecutor` による並列実行 | スレッドを作れないので、2 分割以上の Plan を実行できない | `ExecutionContext::sequential()` か `sequential_native()` で逐次に実行する |
+| `StdProcessor` が許す命令の組 | 検出できる命令がないので、すべて許されない | カーネルは可搬なスカラーの実装を使う |
+
+`ThreadExecutor` を構築して Plan を作ることはできるので、分割を見せるセルではそうしている。
+コンテキストを取らない関数は wasm でも `sequential_native()` で動くが、`ProcessorFeature` の命令を使う実装は選ばれない。
+`usize` は 32 ビットなので、作業項目数や計数の上限もネイティブ環境より小さい。
+標準のクロック `StdClock` と時間上限の制約は[取り消し・クロック・期限](oxref:core-wasm-clocks)で扱う。
+
+## まとめ
+
+分割数は方針、作業項目数、`PlanLimits`、エグゼキューターのワーカー数と最小作業量から一意に決まり、分割は空のない連続区間になる。
+`ExecutionPlan::reduce` は分割番号の順にマージしるので、同じ分割数なら結果は実行ごとに変わらない。
+分割数が変わっても同じ結果がほしい和は、部分状態を `RangeAccumulator` で持って `merge` する。
+コンテキストを取らない関数は `sequential_native()` で動くので、並列実行で同じカーネルを使うには `ExecutionContext::native(&executor)` を、可搬な実装に固定するには `sequential()` か `new(&executor)` を渡す。
+分割ごとの乱数は乱数源ではなく `PartitionId::stream_key` から作り、処理装置の方針は使う命令を制限する目的にだけ使う。
+
+## 次に読むページ
+
+- [取り消し・クロック・期限](../cancellation-clocks-and-deadlines/)：長い計算を取り消しや期限で止め、停止理由を作業の境界で確かめる方法を確かめる。
+- [厳密累積と範囲安全な算術](../range-safe-arithmetic/)：`RangeAccumulator` が丸めずに足し合わせる仕組みを確かめる。
+- [求解のライフサイクルと計算回数の管理](../solve-lifecycle-and-accounting/)：実行コンテキストを受け取る `SolveContext` の回数の集計と、取り消しを反復の境界で確かめる方法を確かめる。
+- [求解の回数の集計と実行の API](../../api/solve-and-execution/)：実行方針・コンテキスト・エグゼキューターの全項目を引く。

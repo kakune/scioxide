@@ -1,0 +1,529 @@
+---
+title: 三重対角・帯・Toeplitz 行列と構造行列の直接解法
+description: 隣接ピボット付き三重対角 LU、巡回三重対角行列の並べ替えと帯 LU、帯行列とパック行列の格納と分解、三角系の代入と数値ランクの推定、保護付き Levinson–Durbin とピボット付き GKO による Toeplitz 系、構造行列の生成子と作用素の積、下位層の分解。
+sidebar:
+  order: 320
+references:
+  linalg-tridiagonal-lu: "三重対角行列の-lu-分解"
+  linalg-periodic-sherman-morrison: "周期境界の巡回三重対角行列"
+  linalg-band-and-packed: "帯行列とパック行列"
+  linalg-triangular-systems: "三角系の代入と数値ランク"
+  linalg-toeplitz-systems: "toeplitzhankel巡回行列"
+  linalg-structured-generators: "構造行列の生成と作用素の組み立て"
+  linalg-structured-backend: "下位層の分解"
+---
+
+差分法の一次元問題、スプライン補間、時系列の自己相関では、係数行列の成分の多くが 0 であったり、少数の値の繰り返しで決まったりする。
+そのような構造を使うと、密行列の $O(n^3)$ の分解と $O(n^2)$ のメモリを、三重対角では $O(n)$、帯行列では $n$ と帯幅の積に比例する量に、Toeplitz 行列では係数の $O(n)$ のメモリと右辺あたり $O(n^2)$ の演算に下げられる。
+このページは `scioxide-linalg` の構造付き行列の型と、それぞれの直接解法の仮定・計算コスト・失敗の扱いをまとめる。
+受理の判定は密行列の分解と同じ `DirectSolveOptions` で行い、その仕様は[分解と解の受理を分ける](oxref:linalg-factorization-acceptance)で説明している。
+標準形式・オプション付き形式・出力先を指定する API・ワンショット関数という呼び出しの形の名前は、[呼び出しの形](oxref:linalg-execution-forms)で定義している。
+
+---
+
+## 三重対角行列の LU 分解
+
+三重対角行列 $T$ は下対角 $l_i$、対角 $d_i$、上対角 $u_i$ の三本で決まる。
+`TridiagonalMatrix::new(lower, main, upper)` は長さ $n - 1, n, n - 1$ のベクトルを所有し、`TridiagonalMatrixView::new(&lower, &main, &upper)` は同じ三本を借用する。
+所有する `TridiagonalMatrix` は作用素ではなく、`view()` で得るビューが core の `LinearOperator` と `AdjointOperator` を実装するので、ビューは反復法の作用素にもなる。
+
+`TridiagonalLuDecomposition::factor(&matrix)` は、各段で現在の行と次の行のうち絶対値の大きい方をピボットに選ぶ隣接ピボット付きの LU 分解で、すべての乗数の絶対値は 1 以下になる。
+行を交換すると次の行の上対角がピボット行に入るので、$U$ にもう一本の上対角が生じる。
+因子は $U$ の対角・上対角・第 2 上対角 `second_superdiagonal()`（長さ $n - 2$）、消去の順の乗数、各段で交換した行 `pivots()`（`pivots()[k]` は $k$ か $k+1$）を持つ。
+ピボット選択をしない Thomas 法は行を交換しない特別な場合で、対角優位でない行列では 0 や小さなピボットで破綻しうる。
+第 $k$ 列で 0 でない成分は行 $k$ と $k+1$ にしかないので、隣接ピボットは通常の部分ピボット選択と同じで、厳密な算術では正則な $T$ のピボットが 0 になることはない。
+入力の検査を除くと、分解が失敗するのは厳密に 0 のピボットの `Singular` と、$U$ の成分のあふれの `NumericalInstability` だけである。
+乗数は絶対値が 1 以下なのであふれず、正規数の範囲より小さい乗数は xGTTRF と同じく非正規化数か 0 に丸め、エラーにはしない。
+分解も求解も $O(n)$ の演算で、因子は残差を測るための元の三本の写し（約 $3n$ 個）も持つので、メモリ使用量は約 $7n$ 個のスカラーと $n$ 個の添字である。
+
+求解 `factor.solve(op, &b)` の最初の引数 `StructuredOperation` は、$T x = b$（`Normal`）、$T^{\mathsf T} x = b$（`Transpose`）、$T^{\mathsf H} x = b$（`Adjoint`）を選ぶ。
+三重対角・帯・三角の構造付き因子の求解はすべてこの引数を右辺より前に取り、標準形式の `solve(op, &b)` は既定の選択肢（`RankPolicy::Exact`）で受理を判定して解を返す。
+オプション付き形式の `solve_with_options(op, &b, &options)` は密行列の分解と同じ `DirectSolveOptions`（ランクの方針、任意の逆条件数の下限、任意の後退誤差の診断）で受理を判定し、拒否された場合も `Ok` の `DirectSolveResult` を返す。
+代入ではあふれを避けるために 2 の冪で尺度を変える。
+出力先を指定する API の作業領域は、分解なら `StructuredWorkspaceRequest::factor(n, 1, 1, &options)`、求解なら `StructuredWorkspaceRequest::solve(n, &options)` を `workspace_requirements` に渡して求める。
+
+## 周期境界の巡回三重対角行列
+
+周期境界の一次元問題では、三重対角行列の右上 $(0, n-1)$ と左下 $(n-1, 0)$ に角の成分 $\beta, \alpha$ が加わる。
+この巡回三重対角行列 $A$ は帯行列ではないが、行と列を同じ順序 $0, n-1, 1, n-2, \dots$ に並べ替えると、下帯幅 2・上帯幅 2 の帯行列になる。
+並べ替えた順序では、元の添字で隣り合う $i$ と $i+1$ の位置の差は 2 以下で、角の成分が結ぶ $0$ と $n-1$ は隣り合うからである。
+
+`CyclicTridiagonalPlan::new(view, corner_upper, corner_lower, &options)` は準備のときにこの帯行列を作り、部分ピボット付きの帯 LU（`BandedLuDecomposition`）で分解する。
+帯幅が 2 なので部分ピボット付きの消去の成長因子は $n$ によらない定数で抑えられ、消去は正則なすべての $A$ について後退安定である（Golub と Van Loan の 4.3 節）。
+求解は右辺を並べ替え、帯の因子で代入し、解を元の順序に戻すので、右辺あたり $O(n)$ の演算である。
+ランク、条件数の推定、後退誤差も同じ帯 LU の因子から求める。
+分解が失敗するのは、帯の消去で厳密に 0 のピボットが現れる場合の `Singular` と、因子の成分があふれる場合の `NumericalInstability` である。
+次数は 3 以上が必要である（$n = 2$ では角の成分が通常の非対角と重なる）。
+準備も求解も $O(n)$ の演算で、メモリ使用量も $O(n)$ である。
+Plan は準備時のバイト上限だけを保持し、求解の受理条件は `DirectSolveOptions` で毎回与える。
+
+$A$ を最初と最後の対角成分だけを変えた三重対角行列 $T'$ と階数 1 の補正の和 $T' + uv^{\mathsf T}$ に分け、Sherman–Morrison の公式で解く方法もよく知られている。
+この分け方では $A$ が良条件でも $T'$ や $1 + v^{\mathsf T}T'^{-1}u$ が悪条件になりうるので、`scioxide-linalg` の Plan と下位層の分解はこの公式を使わない。
+
+次のセルは周期境界の $-u'' + c\,u = f$ を、$[0, 2\pi)$ の $N$ 点の二階差分で離散化して解く。
+入力は格子点の数 $N$、右辺 $f(x) = \sin(kx)$ の波数 $k$、反応係数 $c > 0$ である。
+$\sin(kx)$ は離散ラプラシアンの固有ベクトルなので、離散方程式の厳密解は $u_i = \sin(k x_i) / \lambda_k$、$\lambda_k = \tfrac{4}{h^2}\sin^2(kh/2) + c$ である。
+数値解とこの厳密解との差は丸め誤差だけを表し、連続問題の解 $\sin(kx)/(k^2 + c)$ との差は離散化誤差 $O(h^2)$ を表す。
+解はオプション付き形式 `solve_with_options` で求めて後退誤差をレポートに記録させ、下位層の `CyclicTridiagonalFactor`（後述）で解いた値とも比べる。
+グラフは数値解と連続問題の解で、横軸は位置 $x$、縦軸は解 $u$ である。
+
+```rust
+//| id: linalg-cyclic-tridiagonal
+//| ref: linalg-cyclic-tridiagonal
+//| title: 周期境界の二階差分を並べ替えた帯 LU で解く
+//| run: reactive
+//| crates: [scioxide-linalg]
+//| inputs:
+//|   points: {"type":"range","label":"格子点の数 N","description":"区間 [0, 2π) の等間隔の点の数。","min":8,"max":400,"step":4,"value":64}
+//|   mode: {"type":"range","label":"波数 k","description":"右辺 f(x) = sin(kx) の波数。N/2 未満で使う。","min":1,"max":10,"step":1,"value":3}
+//|   reaction: {"type":"range","label":"反応係数 c","description":"c > 0 のとき周期問題は一意に解ける。","min":0.05,"max":10,"step":0.05,"value":1}
+//| cases:
+//|   - {"id":"fine-grid","label":"N = 128","description":"格子を倍にすると、相対離散化誤差は約 1/4 になる。","inputs":{"points":128}}
+//|   - {"id":"high-mode","label":"N = 8, k = 3","description":"粗い格子では離散化誤差が大きい。","inputs":{"points":8}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"cyclic","path":"/rows/1/1","range":{"max":1e-14}}
+//|       - {"artifact":"cyclic","path":"/rows/3/1","approx":{"value":6.5e-3,"rtol":0.05}}
+//|       - {"artifact":"cyclic","path":"/rows/4/1","range":{"max":1e-15}}
+//|       - {"artifact":"cyclic","path":"/rows/5/1","range":{"max":1e-14}}
+//|   - case: fine-grid
+//|     expect:
+//|       - {"artifact":"cyclic","path":"/rows/3/1","approx":{"value":1.6e-3,"rtol":0.05}}
+//|   - case: high-mode
+//|     expect:
+//|       - {"artifact":"cyclic","path":"/rows/1/1","range":{"max":1e-14}}
+//|       - {"artifact":"cyclic","path":"/rows/3/1","range":{"min":0.1}}
+use scioxide_linalg::backend::tridiagonal::CyclicTridiagonalFactor;
+use scioxide_linalg::{
+    CyclicTridiagonalPlan, DirectSolveOptions, Estimation, LinalgExecutionOptions, RankPolicy,
+    StructuredOperation, TridiagonalMatrixView,
+};
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let n = points.round() as usize;
+let k = mode.round();
+let h = 2.0 * std::f64::consts::PI / n as f64;
+let off = -1.0 / (h * h);
+let (lower, main, upper) = (
+    vec![off; n - 1],
+    vec![2.0 / (h * h) + reaction; n],
+    vec![off; n - 1],
+);
+// 角の成分 (0, N−1) と (N−1, 0) も −1/h²。
+let view = TridiagonalMatrixView::new(&lower, &main, &upper).map_err(|e| e.to_string())?;
+let plan = CyclicTridiagonalPlan::new(view, off, off, &LinalgExecutionOptions::new())
+    .map_err(|e| e.to_string())?;
+// 格子点と右辺 f(x_i) = sin(k x_i)。参照値なので f64 の標準関数で作る。
+let x: Vec<f64> = (0..n).map(|i| i as f64 * h).collect();
+let f: Vec<f64> = x.iter().map(|&t| (k * t).sin()).collect();
+// オプション付き形式で解き、元の巡回行列についての後退誤差をレポートに記録させる。
+let options = DirectSolveOptions::new(RankPolicy::Exact).with_residual(Estimation::Estimate);
+let result = plan
+    .solve_with_options(StructuredOperation::Normal, &f[..], &options)
+    .map_err(|e| e.to_string())?;
+let backward = result.report().residual().map(|r| r.scaled_norm());
+let u = result.into_accepted().map_err(|e| e.to_string())?;
+// 下位層の分解でも同じ系を解く（受理の判定と診断を持たない）。
+let factor =
+    CyclicTridiagonalFactor::factor(lower.clone(), main.clone(), upper.clone(), off, off)
+        .map_err(|e| e.to_string())?;
+let mut raw = f.clone();
+factor.solve_in_place(&mut raw).map_err(|e| e.to_string())?;
+let lambda = 4.0 / (h * h) * (0.5 * k * h).sin().powi(2) + reaction;
+let mut rounding = 0.0_f64;
+let mut discretization = 0.0_f64;
+let mut backend = 0.0_f64;
+let mut numeric = Vec::new();
+let mut continuum = Vec::new();
+for (i, &t) in x.iter().enumerate() {
+    let ui = u.as_slice()[i];
+    rounding = rounding.max((ui - f[i] / lambda).abs());
+    let exact = (k * t).sin() / (k * k + reaction);
+    discretization = discretization.max((ui - exact).abs());
+    backend = backend.max((ui - raw[i]).abs());
+    numeric.push([t, ui]);
+    continuum.push([t, exact]);
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "量" },
+    { "key": "1", "label": "値 [-]", "type": "number", "format": sci3, "nullText": "なし" }
+]);
+emit_table_with_columns!(
+    columns,
+    vec![
+        ("振幅 1/λ_k", Some(1.0 / lambda)),
+        ("離散方程式の厳密解との差の最大", Some(rounding)),
+        ("連続問題の解との差の最大", Some(discretization)),
+        ("相対離散化誤差", Some(discretization * (k * k + reaction))),
+        ("後退誤差（レポート）", backward),
+        ("CyclicTridiagonalFactor の解との差", Some(backend)),
+    ],
+    metadata = serde_json::json!({ "id": "cyclic" })
+);
+emit_line_chart!(
+    &vec![
+        serde_json::json!({ "name": "数値解", "points": numeric, "style": { "showSymbol": true } }),
+        serde_json::json!({
+            "name": "連続問題の解 sin(kx)/(k²+c)",
+            "points": continuum,
+            "style": { "lineType": "dashed" }
+        }),
+    ],
+    options = &serde_json::json!({
+        "xLabel": "位置 x [rad]",
+        "yLabel": "解 u(x) [-]",
+        "xMin": 0.0,
+        "xMax": 2.0 * std::f64::consts::PI
+    })
+);
+```
+
+既定の $N = 64$、$k = 3$、$c = 1$ では、離散方程式の厳密解との差は $1.9 \times 10^{-16}$ の丸め誤差で、示された後退誤差は $9.1 \times 10^{-17}$ である。
+連続問題の解との相対差は $6.5 \times 10^{-3}$ で、$N = 128$ にすると $1.6 \times 10^{-3}$ とほぼ 1/4 になり、二階差分の $O(h^2)$ の精度と一致する。
+$N = 8$ では相対離散化誤差が 0.53 まで増え、グラフでも数値解の振幅が連続問題の解より大きい。
+$k$ を $N/2$ に近づけると $hk$ が大きくなって相対離散化誤差が増え（$N = 64$、$k = 10$ で $8.3 \times 10^{-2}$）、$c$ を 0 に近づけると定数のモードの固有値 $c$ が小さくなって $A$ が特異に近づく（$c = 0.05$ では離散方程式の厳密解との差が $1.0 \times 10^{-15}$ に増える）。
+Plan と下位層の `CyclicTridiagonalFactor` は同じ並べ替えと帯 LU で解くので、両者の解の差は既定と二つのケースで 0 である。
+
+## 帯行列とパック行列
+
+下帯幅 $p_l$、上帯幅 $p_u$ の帯行列 $A$（$i > j + p_l$ または $j > i + p_u$ の成分が 0）を、`BandedMatrix::new(rows, cols, lower, upper, leading_dimension, data)` は列優先の帯格納で持つ。
+成分 $(i, j)$ は `data[j * leading_dimension + upper + i - j]` に置かれ、各列の `leading_dimension − lower − upper − 1` 個の末尾と行列の外にはみ出す位置はパディングとして読まれない。
+`BandedLuDecomposition::factor(&a)` は部分ピボット付きの帯 LU 分解で、第 $k$ 段では $k$ 列目の行 $k, \dots, k + p_l$ から絶対値が最大の成分をピボットに選ぶ。
+行の交換によって $U$ の上帯幅が $p_l + p_u$ まで広がるので、因子は列ごとに $2p_l + p_u + 1$ 個のスカラーを持つ詰めた帯格納（`factors()`）に置かれ、入力の `BandedMatrix` に余白は要らない。
+分解の演算数は $O(n\,p_l (p_l + p_u))$、右辺あたりの求解は $O(n(2p_l + p_u))$ で、帯幅を固定すれば $n$ に比例する。
+下帯幅が 16 以上の帯は、パネルに分けて行列積で更新する。
+分解が失敗するのは厳密に 0 のピボットと $U$ の成分のあふれだけで、正規数の範囲より小さい乗数は xGBTRF と同じく非正規化数か 0 に丸めるので、因子はノルムの意味で後退安定なままである。
+作業領域の要件は `StructuredWorkspaceRequest::factor(n, p_l, p_u, &options)` で求める。
+
+Hermitian 正定値の帯行列は、片側の三角だけを列ごとに $k + 1$ 個ずつ格納する `HermitianBandMatrix::new(n, k, triangle, data)` に置き、`BandedCholeskyDecomposition::factor(&a)` で $A = L L^{\mathsf H}$ と分解する。
+演算数は $O(n k^2)$ で、因子 $L$ は `lower()` で帯行列のビューとして読める。
+正定値でない場合は `DomainError` で失敗する。
+
+`PackedMatrix::new(n, triangle, kind, data)` は正方行列の片側の三角を $n(n+1)/2$ 個の成分で隙間なく列ごとに持ち、`PackedKind` で格納しない側を 0（`Triangular`）とみなすか、共役の鏡像（`Hermitian`）とみなすかを選ぶ。
+帯・Hermitian 帯・パックの所有型はどれも作用素ではなく、`view()` で得るビュー `BandedMatrixView`、`HermitianBandMatrixView`、`PackedMatrixView` が積 `mul_vec` と core の作用素の規約を実装する。
+ビューは呼び出し側のスライスを `new` で直接借用して作ることもでき、構築時に形・帯幅・主次元・長さを検査する。
+成分の値については、Hermitian の帯と `Hermitian` のパックが対角の虚部を構築時に検査するだけで、有限性は数値計算の段階で検査する。
+`PackedMatrixViewMut` は書き換えのためのパック格納の可変ビューで、`set(i, j, value)` は格納しない側への書き込みと、`Hermitian` の対角への虚部のある値を拒否する。
+
+## 三角系の代入と数値ランク
+
+三角行列 $T$ の系 $Tx = b$ は、下三角なら前進代入、上三角なら後退代入で $n^2$ 回の演算で解ける。
+代入は成分ごとに後退安定で、計算した解は $(T + \Delta T)\hat x = b$、$\lvert \Delta T \rvert \le \gamma_n \lvert T \rvert$ の厳密解である（Higham の 8 章）。
+ワンショット関数 `solve_triangular(&a, triangle, &b)` は、密行列 `a` の `triangle`（scioxide-core の `Triangle::Lower` か `Upper`）だけを読んで解き、厳密に 0 の対角を `Singular` のエラーにする。
+
+単位対角、帯やパックの三角行列、転置系、同じ $T$ での繰り返しの求解には `TriangularPlan` を使う。
+`TriangularPlan::from_dense(a, triangle, diagonal)` は密行列のビューに変換できる値（`&Matrix` や `MatrixView`）を受け取り、`from_band(view, triangle, diagonal)` と `from_packed(view, diagonal)` は帯とパックのビューを受け取る（パックの `Hermitian` 解釈は拒否する）。
+どれも行列を写さずに借用し、`diagonal`（`DiagonalKind::Explicit` か `Unit`）で対角を読むかどうかを決める。
+準備は使う成分を一度ずつ読んで有限性と対角の非零を確かめ（`Explicit` で厳密に 0 の対角は `Singular`）、成分の最大値を記録する。
+求解は密とパックで $O(n^2)$、帯幅 $k$ の帯で $O(nk)$ の演算で、代入があふれる場合や、小さなピボットで割る前のアンダーフローで精度を失う場合は、2 の冪で尺度を変えてやり直す。
+求解の形は三重対角の因子と同じで、標準形式 `solve(op, &b)` とオプション付き形式 `solve_with_options(op, &b, &options)` がある。
+三角行列との積は特異な場合も含めて各格納のビューの `mul_vec` か `MatrixView::triangular_mul_mat` で計算する。
+
+`TriangularRankWorkspace` は、呼び出し側が保持する上台形の因子 $R$（QR 分解の $R$ など）の数値ランクを推定する作業領域である。
+`TriangularRankWorkspace::new(rows, cols)` で一度だけ確保し、`estimate(&r, policy)` が $O(mn)$ の演算で `Option<RankReport>` を返す。
+推定は [QR の更新](oxref:linalg-qr-update)と同じ増分的な条件数推定で、しきい値から 16 倍以上離れていればその推定でランクを決め、近い場合は判定できないとして `None` を返す。
+`None` の場合は特異値分解などのランクを明らかにする分解で判定する。
+対角より下に 0 でない成分がある $R$ は `InvalidInput` で拒否する。
+
+## Toeplitz・Hankel・巡回行列
+
+Toeplitz 行列は $t_{ij} = c_{i-j}$ のように対角に沿って成分が一定で、$2n - 1$ 個の値で決まる。
+実対称（複素数では Hermitian）の Toeplitz 系 $T_n x = b$ は、Levinson–Durbin の漸化式で $O(n^2)$ 回の演算で解ける。
+先頭の $k \times k$ の主小行列 $T_k$ についての Yule–Walker 方程式 $T_k y^{(k)} = -(c_1, \dots, c_k)^{\mathsf T}$ の解から、次数 $k+1$ の解を反射係数
+
+$$
+\kappa_{k} = -\frac{c_{k+1} + \sum_{i=1}^{k} c_{k+1-i}\, y^{(k)}_i}{c_0 + \sum_{i=1}^{k} c_i\, y^{(k)}_i}
+$$
+
+を使って更新し、同じ漸化式で一般の右辺も解く。
+分母は予測誤差の分散にあたる。
+この漸化式は先頭の主小行列がすべて正則であることを仮定し、分母が 0 に近づくと不安定になる。
+
+Toeplitz 行列 $T$ は、右上の角が $+1$、$-1$ の巡回シフト $Z_{+}$、$Z_{-}$ について $Z_{+} T - T Z_{-}$ の階数が 2 以下になる変位構造を持つ。
+GKO（Gohberg–Kailath–Olshevsky）のアルゴリズムは、離散フーリエ変換でこの変位を対角のシフトに移し、成分が $g_i^{\mathsf T} h_j / (t_i - s_j)$（$g_i, h_j \in \mathbb{C}^2$ は生成子の行）の Cauchy 型の行列に変える。
+行の交換はこの構造を保つので、生成子の上で部分ピボット付きの Gauss 消去を行え、主小行列が特異でも解ける。
+計算コストは右辺あたり $O(n^2)$ で、離散フーリエ変換は FFT ではなく直接の和で評価する。
+
+`StructuredSolvePlan::new(view, &StructuredSolveOptions::new())` は、`StructuredMatrixView::toeplitz`、`hankel`、`circulant` で作った正方のビューを受け取り、2 の冪で尺度を変えた係数、回転因子、巡回行列の固有値の $O(n)$ 個の値を保持する。
+演算 `StructuredOperation` は求解ごとの引数である。
+実対称（Hermitian）の Toeplitz 系ではまず Levinson–Durbin を試し、予測誤差が係数の最大値に対して $\sqrt{\varepsilon}$ 以下になった場合、漸化式が有限でなくなった場合、解が後退誤差の検査で拒否された場合は、その列をピボット付きの GKO で解き直す。
+対称でない Toeplitz と Hankel の系は最初から GKO で解き、Hankel 行列 $A$ は列を反転した Toeplitz 行列 $AJ$ に帰着させる。
+巡回行列は離散フーリエ変換で対角化できるので、第 1 列の離散フーリエ変換である固有値 $\lambda_k$ による除算で解き、これも直接の和なので右辺あたり $O(n^2)$ である。
+これらの $O(n^2)$ のアルゴリズムの解も拒否された場合は、作業領域の要求に `with_dense_fallback()` で密 LU のメモリを含めたときだけ、$O(n^3)$ の密行列のピボット付き LU で解き直す。
+LU は一回の呼び出しで高々一度分解し、拒否された列にだけ使う。
+巡回行列の固有値、GKO の消去のピボット、密 LU のピボットが厳密に 0 になると `Singular` で失敗し、GKO のピボットが 0 の場合は密 LU を事前確保していても解き直さない。
+
+`solve_into(op, &b, x, &mut ws, cx)` は、各列の行ごとの後退誤差
+
+$$
+\eta = \max_i \frac{\lvert b - \operatorname{op}(A) x \rvert_i}{\lvert b_i \rvert + \lVert x \rVert_\infty \sum_j \lvert \operatorname{op}(A)_{ij} \rvert}
+$$
+
+を測ってから解を出力に反映する。
+受理の条件は `StructuredSolveOptions::with_tolerance` で与える許容誤差 $(\tau_{\mathrm{abs}}, \tau_{\mathrm{rel}})$ について $\eta \le \tau_{\mathrm{abs}} + \tau_{\mathrm{rel}}$ で、既定の `Tolerance::from_sqrt_epsilon()` は $\tau_{\mathrm{abs}} = \tau_{\mathrm{rel}} = \sqrt{\varepsilon}$、つまり $\eta \le 2\sqrt{\varepsilon} \approx 3.0 \times 10^{-8}$ を求める。
+ランクの方針は使わない。
+有限な解の後退誤差が許容誤差を超え、代わりのアルゴリズムもない場合は、`Ok` のレポートの `termination()` が `DirectSolveTermination::ResidualRejected` になり、出力は書き換えない。
+検証できる有限な候補がない場合は `NumericalInstability` で失敗する。
+
+$\eta$ は $\hat x$ を厳密解にする摂動のうち、各行で $\lVert \Delta A_{i,:} \rVert_1 \le \eta \lVert A_{i,:} \rVert_1$、$\lvert \Delta b_i \rvert \le \eta \lvert b_i \rvert$ を満たすものの最小の $\eta$ である（$\operatorname{op}(A)$ を $A$ と書いた）。
+この $\Delta A$ は一般に Toeplitz の構造を保たないので、構造を保つ摂動に限った後退誤差は $\eta$ より大きくなりうる。
+Levinson–Durbin は正定値の行列では Cholesky 分解と同程度の残差を与えることが知られている（Cybenko 1980）。
+一方、不定値の行列では予測誤差が小さくなって漸化式が不安定になることがあり、GKO では生成子の成長によって残差が大きくなりうるので、Plan はアルゴリズムによらず列ごとに $\eta$ を測る。
+受理は後退誤差についての判定で、前進誤差の限界ではない。
+前進誤差は $A$ の条件数にも依存し、Plan の `condition_estimate()` は単位ベクトルについての $n$ 回の構造付き求解から $\lVert A^{-1} \rVert_1$ を列ごとに計算して $1/(\lVert A \rVert_1 \lVert A^{-1} \rVert_1)$ を返す（合計 $O(n^3)$）。
+
+作業領域は `plan.workspace(&StructuredWorkspaceRequest::solve(n, &options))` で作り、Toeplitz と Hankel では GKO のための詰めた複素数の上三角因子と作業ベクトルを含む。
+レポート `StructuredSolveReport` は終了理由 `termination()`（`Accepted` か `ResidualRejected`）、列ごとの後退誤差の最大値 `backward_error()`、受理した列を解いたアルゴリズムごとの回数 `levinson_solves()`、`gko_solves()`、`dense_lu_solves()`、`circulant_solves()` を返す。
+
+ワンショット関数 `solve_structured(matrix, &b)` は、既定の `StructuredSolveOptions` で Plan を作り、密 LU の事前確保のない作業領域で解いて、受理された解を返す。
+拒否は `DirectSolveTermination::require_accepted` によって `NumericalInstability`（`LossOfSignificance`）のエラーになり、Toeplitz・Hankel・巡回以外のビューは `InvalidInput`（`UnsupportedConfiguration`）で拒否する。
+複数の右辺、別の許容誤差、密 LU による解き直しが必要な場合は `StructuredSolvePlan` を使う。
+
+次のセルは Kac–Murdock–Szegő 行列 $t_{ij} = \rho^{\lvert i - j \rvert}$ を解く。
+この行列の逆は三重対角の閉じた形 $\tfrac{1}{1-\rho^2}\operatorname{tridiag}(-\rho,\ 1+\rho^2,\ -\rho)$（両端の対角は 1）を持つので、解 $x = T^{-1} b$ を独立に計算できる。
+入力は相関 $\rho$、次数 $n$、先頭の成分 $t_0$ を 0 にするかどうか、密 LU による解き直しを事前確保するかどうかである。
+先頭の成分を 0 にすると最初の主小行列が特異になって Levinson–Durbin は使えず、参照解は具体化した密行列をワンショット呼び出しの `solve` で解いて作る。
+出力はアルゴリズムごとの回数と作業領域のバイト数の表、精度の表、受理の判定の outcome である。
+
+```rust
+//| id: linalg-toeplitz-levinson
+//| ref: linalg-toeplitz-levinson
+//| title: Toeplitz 系の Levinson–Durbin とピボット付き GKO への切り替え
+//| run: reactive
+//| crates: [scioxide-core, scioxide-linalg]
+//| inputs:
+//|   correlation: {"type":"range","label":"相関 ρ","description":"KMS 行列 ρ^|i−j| のパラメータ。|ρ| → 1 で悪条件になる。","min":-0.99,"max":0.99,"step":0.01,"value":0.9}
+//|   order: {"type":"range","label":"次数 n","description":"Toeplitz 行列の次数。","min":3,"max":200,"step":1,"value":50}
+//|   zero_leading: {"type":"checkbox","label":"先頭の成分 t₀ を 0 にする","description":"最初の主小行列が特異になる。比較は LU で行う。","value":false}
+//|   dense_fallback: {"type":"checkbox","label":"密 LU による解き直しを事前確保する","description":"GKO の解が拒否されたときに使う密 LU のメモリを作業領域に含める。","value":false}
+//| cases:
+//|   - {"id":"zero-leading","label":"t₀ = 0","description":"Levinson–Durbin の最初の分母が 0 になり、GKO が使われる。","inputs":{"zero_leading":true}}
+//|   - {"id":"near-unit-correlation","label":"ρ = 0.99","description":"条件数が大きくなっても Levinson–Durbin のまま解ける。","inputs":{"correlation":0.99}}
+//|   - {"id":"reserved-fallback","label":"密 LU を事前確保","description":"解き直しは使われず、作業領域だけが増える。","inputs":{"dense_fallback":true}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/0/0","equals":1}
+//|       - {"artifact":"methods","path":"/rows/0/1","equals":0}
+//|       - {"artifact":"accuracy","path":"/rows/0/0","range":{"max":1e-14}}
+//|       - {"artifact":"accuracy","path":"/rows/0/1","range":{"max":1e-13}}
+//|       - {"artifact":"accuracy","path":"/rows/0/3","range":{"max":0}}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+//|   - case: zero-leading
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/0/0","equals":0}
+//|       - {"artifact":"methods","path":"/rows/0/1","equals":1}
+//|       - {"artifact":"accuracy","path":"/rows/0/1","range":{"max":1e-12}}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+//|   - case: near-unit-correlation
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/0/0","equals":1}
+//|       - {"artifact":"accuracy","path":"/rows/0/1","range":{"max":1e-11}}
+//|   - case: reserved-fallback
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/0/2","equals":0}
+//|       - {"artifact":"methods","path":"/rows/0/3","range":{"min":100000}}
+use scioxide_core::ExecutionContext;
+use scioxide_linalg::{
+    LinalgExecutionOptions, StructuredMatrixView, StructuredOperation, StructuredSolveOptions,
+    StructuredSolvePlan, StructuredWorkspaceRequest, VectorViewMut, solve, solve_structured,
+};
+
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let n = order.round() as usize;
+let rho = correlation;
+let options = LinalgExecutionOptions::new();
+let mut column: Vec<f64> = (0..n).map(|k| rho.powi(k as i32)).collect();
+if zero_leading {
+    column[0] = 0.0;
+}
+let matrix = StructuredMatrixView::toeplitz(&column, &column).map_err(|e| e.to_string())?;
+// 演算 op(A) は Plan ではなく求解ごとの引数。
+let plan = StructuredSolvePlan::new(matrix, &StructuredSolveOptions::new())
+    .map_err(|e| e.to_string())?;
+let b: Vec<f64> = (0..n).map(|i| 1.0 + (i % 3) as f64).collect();
+// 密 LU による解き直しを使う場合は、そのメモリも要求に含めて事前確保しておく。
+let mut request = StructuredWorkspaceRequest::solve(n, &options);
+if dense_fallback {
+    request = request.with_dense_fallback();
+}
+let bytes = plan
+    .workspace_requirements(&request)
+    .and_then(|r| r.required_bytes::<f64>())
+    .map_err(|e| e.to_string())?;
+let mut ws = plan.workspace(&request).map_err(|e| e.to_string())?;
+let mut x = vec![0.0_f64; n];
+let report = plan
+    .solve_into(
+        StructuredOperation::Normal,
+        &b[..],
+        VectorViewMut::from_slice(&mut x),
+        &mut ws,
+        ExecutionContext::sequential_native(),
+    )
+    .map_err(|e| e.to_string())?;
+let accepted = report.termination().is_success();
+// 独立な参照解: KMS は三重対角の逆の閉じた形、t₀ = 0 は具体化した行列の LU。
+let reference: Vec<f64> = if zero_leading {
+    let dense = matrix.materialize().map_err(|e| e.to_string())?;
+    solve(&dense, &b[..])
+        .map_err(|e| e.to_string())?
+        .as_slice()
+        .to_vec()
+} else {
+    let s = 1.0 / (1.0 - rho * rho);
+    (0..n)
+        .map(|i| {
+            let diagonal = if i == 0 || i == n - 1 {
+                1.0
+            } else {
+                1.0 + rho * rho
+            };
+            let left = if i > 0 { b[i - 1] } else { 0.0 };
+            let right = if i + 1 < n { b[i + 1] } else { 0.0 };
+            s * (diagonal * b[i] - rho * (left + right))
+        })
+        .collect()
+};
+let max_diff = |p: &[f64], q: &[f64]| {
+    p.iter()
+        .zip(q)
+        .fold(0.0_f64, |m, (u, v)| m.max((u - v).abs()))
+};
+let scale = reference.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+let error = accepted.then(|| max_diff(&x, &reference) / scale);
+// ワンショット関数は拒否をエラーにする。
+let one_shot = solve_structured(matrix, &b[..])
+    .ok()
+    .map(|y| max_diff(y.as_slice(), &x));
+let bound = (!zero_leading).then(|| ((1.0 + rho.abs()) / (1.0 - rho.abs())).powi(2));
+let method_columns = serde_json::json!([
+    { "key": "0", "label": "Levinson–Durbin [回]", "type": "integer" },
+    { "key": "1", "label": "GKO [回]", "type": "integer" },
+    { "key": "2", "label": "密 LU [回]", "type": "integer" },
+    { "key": "3", "label": "作業領域 [B]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    method_columns,
+    vec![(
+        report.levinson_solves(),
+        report.gko_solves(),
+        report.dense_lu_solves(),
+        bytes
+    )],
+    metadata = serde_json::json!({ "id": "methods" })
+);
+let accuracy_columns = serde_json::json!([
+    { "key": "0", "label": "後退誤差 η（レポート） [-]", "type": "number", "format": sci2 },
+    { "key": "1", "label": "参照解との相対差 [-]", "type": "number", "format": sci2, "nullText": "出力に反映しない" },
+    { "key": "2", "label": "κ₂ の上界 [-]", "type": "number", "format": sci2, "nullText": "—" },
+    {
+        "key": "3",
+        "label": "solve_structured との差 [-]",
+        "type": "number",
+        "format": sci2,
+        "nullText": "エラー"
+    }
+]);
+emit_table_with_columns!(
+    accuracy_columns,
+    vec![(report.backward_error(), error, bound, one_shot)],
+    metadata = serde_json::json!({ "id": "accuracy" })
+);
+let outcome = if accepted {
+    Outcome::satisfied("後退誤差が許容誤差 2√ε を下回り、解を受理した")
+} else {
+    Outcome::failed("後退誤差が許容誤差を超え、解は出力に反映されなかった")
+        .explanation("密 LU による解き直しを事前確保するか、許容誤差を見直す。")
+};
+let status = match report.termination() {
+    scioxide_linalg::DirectSolveTermination::Accepted => "Accepted",
+    _ => "ResidualRejected",
+};
+emit_outcome!(
+    outcome
+        .status(status)
+        .diagnostic("後退誤差", report.backward_error(), None)
+        .diagnostic("Levinson–Durbin", report.levinson_solves() as f64, None)
+        .diagnostic("GKO", report.gko_solves() as f64, None)
+);
+```
+
+既定の $\rho = 0.9$、$n = 50$ では Levinson–Durbin が 1 回使われ、レポートの後退誤差は $1.0 \times 10^{-16}$、閉じた形の解との相対差は $5.2 \times 10^{-15}$ で、outcome は `Accepted` の satisfied である。
+ワンショット呼び出しの `solve_structured` は同じ計算をするので、その解との差は 0 である。
+$\rho = 0.99$ でも Levinson–Durbin のまま解け、相対差は条件数の上界 $((1+\lvert\rho\rvert)/(1-\lvert\rho\rvert))^2 \approx 4.0 \times 10^{4}$ とともに $1.0 \times 10^{-13}$ に増える。
+先頭の成分を 0 にすると Levinson–Durbin の最初の分母が 0 になるので、ピボット付きの GKO が 1 回使われ、密行列の LU の解との相対差は $1.6 \times 10^{-14}$ になる。
+どの場合も、解は後退誤差が許容誤差 $2\sqrt{\varepsilon} \approx 3.0 \times 10^{-8}$ を下回ってから出力に反映されている。
+
+この行列では GKO の解が拒否されないので、密 LU による解き直しを事前確保しても使われず、$n = 50$ の作業領域が 27,216 バイトから 158,344 バイトに増えるだけである。
+既定の 27,216 バイトは GKO のための詰めた上三角因子と作業ベクトルの $n(n+1)/2 + 7n = 1625$ 個の複素数（1 個につき `f64` 2 個分）と、右辺の段階的なメモリ $3n + 2$ 個分の合計である。
+解き直しのメモリは $O(n^2)$ の密行列と LU 因子を含むので、拒否されたときに解き直せることが必要な場合に限って事前確保する。
+バイト数は `usize` の幅に依存し、64 ビットのネイティブ環境では事前確保した場合の値がこの Wasm の値より大きくなる。
+
+## 構造行列の生成と作用素の組み立て
+
+`StructuredMatrixView` は係数を借用するか次数だけを持ち、成分を格納しない構造行列で、`get(i, j)` で成分を読み、`materialize()` で密行列にし（`materialize_with_options(&options)` は結果の大きさを `LinalgExecutionOptions` のバイト上限で確保前に検査する）、core の `LinearOperator` と `AdjointOperator` として積に使える。
+積は各成分を一度ずつ評価するので、$m \times n$ の行列で $O(mn)$ の演算になる。
+ただし Pascal 行列と Hilbert 行列の逆は各成分を二項係数から $O(n)$ の演算で作るので、次数 $n$ の積は $O(n^3)$ になる。
+`StructuredMatrix::from_view(view)` は Toeplitz・Hankel・巡回の係数だけをコピーして所有する型で、作用素として使うときは `view()` で借りる。
+
+| 生成子 | 行列 | 補足 |
+|---|---|---|
+| `toeplitz(column, row)`、`hankel(column, last_row)`、`circulant(column)` | 対角・反対角に沿って一定、巡回 | `StructuredSolvePlan` と `solve_structured` で解ける |
+| `hilbert(n, form)` | $h_{ij} = 1/(i + j + 1)$ とその逆（`MatrixForm::Direct`、`Inverse`） | 逆は整数行列 |
+| `pascal(n, kind, form)` | 二項係数（`PascalKind::Lower`、`Upper`、`Symmetric`）とその逆 | |
+| `hadamard(n)`、`helmert(n, kind)` | 直交行列の定数倍、直交行列（`HelmertKind::Full`、定数の行を除く `Reduced`） | |
+| `leslie(fertility, survival)`、`fiedler(values)`、`companion(coefficients, kind)` | 個体群行列、$\lvert v_i - v_j \rvert$、多項式の同伴行列（`CompanionKind::Frobenius`、五重対角の `Fiedler`、係数は昇べき） | |
+| `convolution(kernel, input_len, mode)` | 畳み込みの行列（`ConvolutionMode::Full`、`Same`、`Valid`） | |
+| `dft(n, direction, normalization)` | 複素フーリエ行列（`DftDirection::Forward`、`Inverse`、`DftNormalization::None`、`ByOrder`、`Unitary`） | 複素スカラーのみ |
+
+作用素を組み合わせる型もある。
+`KroneckerOperator` は $A \otimes B$ を $(A \otimes B)\operatorname{vec}(X) = \operatorname{vec}(B X A^{\mathsf T})$ で、`BlockDiagonalOperator` はブロック対角の組を、成分を作らずに作用させる。
+どちらも `solve_into` で構成要素の逆作用素を使って解き、元の系の残差が $\lVert b - Ax \rVert_\infty \le \tau_{\mathrm{abs}} s + \tau_{\mathrm{rel}} (\lVert b \rVert_\infty + \lVert Ax \rVert_\infty)$（$s = \max(\lVert b \rVert_\infty, \lVert Ax \rVert_\infty)$、許容誤差は `CompositeSolveOptions`、既定は両方 $\sqrt{\varepsilon}$）を満たすかを `CompositeSolveReport` の `termination()` で示す。
+`khatri_rao(&a, &b)` は列ごとの Kronecker 積を具体化し、`khatri_rao_with_options` と出力先を指定する API の `khatri_rao_into` もある。
+`operator_norm(op, norm)` は作用素の 1 ノルム・$\infty$ ノルム・Frobenius ノルム（`MatrixNorm`）を基底ベクトルへの $n$ 回の作用から丸め誤差を除いて正確に計算する（作業領域とコンテキストを渡すスコープ付き API `operator_norm_scoped` は列ごとに反復の上限を 1 回分使う）。
+正方行列の 1 ノルムを少数の積から推定するには、[1 ノルムの推定と作用素の厳密なノルム](../norm-estimation/)の `OneNormEstimator` を使う。
+`materialize_operator_into` は作用素を密行列にし、`apply_operator_matrix_into` は行列の各列に作用させる。
+これらの作業領域は `OperatorWorkspaceRequest` の要求を `LinalgWorkspace::workspace_requirements` に渡して求める。
+
+## 下位層の分解
+
+`scioxide_linalg::backend` は、他の SciOxide クレートが直接呼ぶ低水準の分解を出力に反映する。
+これらは失敗したときに右辺や作業用のメモリを途中まで書き換えることがあり、ランクの方針・残差と条件数の診断・反復回数の計上を行わず、受理の判定も呼び出し側に任せる。
+アプリケーションでは通常、上で説明した `TridiagonalLuDecomposition` や `CyclicTridiagonalPlan` を使う。
+
+`backend::tridiagonal::TridiagonalFactor` は実数の三重対角行列の隣接ピボット付き LU で、`factor(lower, main, upper, execution)` は三本のベクトルを受け取ってそのまま因子のメモリに使う。
+対称で非対角が非負、各行の対角が非対角の和の 2 倍以上で、成分が浮動小数点の範囲の十分内側にある場合は、ピボット選択をせずにピボットの逆数を保持し、求解を乗算だけで行う。
+`refactor(&lower, &main, &upper, execution)` はメモリを再利用して分解し直し、`solve_in_place(values, execution)` は右辺を解で上書きする。
+`execution`（`ExecutionContext`）は取り消しと期限の確認にだけ使い、反復は数えない。
+失敗は形の不一致、非有限な成分、厳密に 0 のピボットの `Singular`、乗数やピボットのあふれの `NumericalInstability` で、失敗した `refactor` の後の求解は `InvalidInput` になる。
+因子は行列の写しも診断も持たず、分解と求解はどちらも $O(n)$ の演算である。
+
+`backend::tridiagonal::CyclicTridiagonalFactor` は実数の巡回三重対角行列の LU 分解で、`CyclicTridiagonalPlan` と同じ並べ替えで帯幅 2 の帯行列にし、部分ピボット付きで消去する。
+`factor(lower, main, upper, corner_upper, corner_lower)` はコンテキストを取らずに分解し、`solve_in_place(values)` が $O(n)$ で解く。
+失敗は次数 3 未満の `InvalidInput`、形の不一致、非有限な成分、帯の消去で厳密に 0 のピボットが現れる場合の `Singular`、因子や解の成分があふれる場合の `NumericalInstability` で、診断は計算しない。
+
+`backend::bordered_bidiagonal::BorderedBidiagonalFactor` は、境界値問題の多重射撃法や選点法の Newton 反復に現れる縁付きブロック二重対角系の部分ピボット付き LU である。
+未知数は $N$ 個の節点の状態（各 $n$ 個）を節点の順に並べ、最後に $k$ 個のパラメータを置いた $Nn + k$ 個である。
+最初の $(N-1)n$ 行は隣り合う節点とパラメータを結び、最後の $n + k$ 行は両端の節点とパラメータを結ぶ境界条件で、各行は $2n + k$ 個の値（0 も明示する）を持つ。
+`new(n, k, nodes)` がメモリを一度に確保し、`factor(&values, execution)` は現在の区間と残っている縁の行の全体からピボットを選ぶので、個々の区間のブロックが正則である必要はない。
+最後の縁のブロックは密な部分ピボット付き LU で解き、`solve_in_place(&mut rhs, execution)` が右辺を解で上書きする。
+メモリ使用量は節点の数に比例し（`required_bytes(n, k, nodes)` で事前に求められる）、`resize(nodes)` は容量を縮めずに節点の数を変えて因子を無効にする。
+失敗した分解の後の求解は `InvalidInput` で拒否し、分解に失敗したときに作業用のメモリに何が残るかは定めない。
+
+---
+
+## まとめ
+
+三重対角の系は `TridiagonalLuDecomposition` で $O(n)$ で解け、隣接ピボット選択があるので対角優位でない正則な行列でも 0 ピボットで止まらない。
+周期境界の系は `CyclicTridiagonalPlan` に渡せば、並べ替えた帯幅 2 の帯 LU で、$O(n)$ の演算とメモリで後退安定に解ける。
+帯行列は `BandedLuDecomposition` で $O(n\,p_l(p_l + p_u))$ の演算で分解でき、三角系は一度なら `solve_triangular`、帯・パックの格納や繰り返しの求解なら `TriangularPlan` を選ぶ。
+Toeplitz・Hankel・巡回の系は、一度なら `solve_structured`、右辺が多いときや許容誤差・密 LU の解き直しを選ぶときは `StructuredSolvePlan` を使い、レポートの回数でどのアルゴリズムが解いたかを確かめる。
+受理の根拠の $\eta$ は構造を保たない後退誤差なので、前進誤差の見積もりが要るときは `condition_estimate()` の条件数と組み合わせる。
+
+## 次に読むページ
+
+- [混合精度の反復改良](../iterative-refinement/)：構造を使った低精度の解を、高精度の残差で改良する方法を確かめる。
+- [AR 過程の Yule–Walker 方程式と Levinson–Durbin 再帰](../../examples/yule-walker-levinson/)：Toeplitz 系を時系列の推定に使う例題を確かめる。
+- [一次元連成ばね・質点鎖の釣合い変位](../../examples/spring-chain/)：三重対角の求解を力学の問題で確かめる。

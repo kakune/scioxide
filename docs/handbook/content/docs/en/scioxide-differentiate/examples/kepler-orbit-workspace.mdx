@@ -1,0 +1,569 @@
+---
+title: "Reusing workspaces in orbital computation and checking conserved quantities"
+description: "Integrate the planar Kepler problem with velocity Verlet, computing forces through FiniteDifference gradient_into and reused workspace with known-energy base values. Check invariants, analytic forces, and Kepler solutions; compute dE/dM with workspace-free derivative_into and compare implicit differentiation."
+sidebar:
+  order: 440
+---
+
+Time evolution computes same-shaped derivatives thousands of times across stages.
+Preparing `scioxide-differentiate` methods and workspace once and repeating borrowed `gradient_into` avoids reallocating workspace per stage.
+This example integrates the planar Kepler problem with velocity Verlet and computes forces as difference gradients of potential energy.
+Check energy and angular momentum, analytic forces, and exact Kepler-equation trajectories to identify effects of difference formulas.
+Later, differentiate eccentric anomaly $E$ with respect to mean anomaly $M$, comparing with implicitly derived $\mathrm{d}E/\mathrm{d}M$.
+
+Orbital elements match the [root-finding example](../../../scioxide-rootfind/examples/kepler-equation/) using six Kepler solvers.
+Semimajor axis is $a = 1$, focus at the origin, periapsis along $x$, and default eccentricity $e = 0.6$.
+
+## Model and integration
+
+In dimensionless units with gravitational parameter $\mu = 1$, a unit mass at planar position $\mathbf{x}$ has potential $U(\mathbf{x}) = -\mu / \lvert \mathbf{x} \rvert$ and force $\mathbf{F} = -\nabla U = -\mu \mathbf{x} / \lvert \mathbf{x} \rvert^3$.
+Energy $E_{\mathrm{tot}} = \lvert \mathbf{v} \rvert^2 / 2 + U$ and angular momentum $L = x_1 v_2 - x_2 v_1$ are conserved.
+An ellipse with semimajor axis $a = 1$ and eccentricity $e$ starting at periapsis $\mathbf{x}_0 = (1 - e, 0)$ with velocity $\mathbf{v}_0 = (0, \sqrt{(1 + e)/(1 - e)})$ has period $2\pi$, energy $E_{\mathrm{tot}} = -1/2$, and angular momentum $L = \sqrt{1 - e^2}$.
+
+Kepler's equation gives the exact trajectory.
+Mean motion $n = \sqrt{\mu / a^3} = 1$ makes mean anomaly $M = t$ at time $t$ after periapsis.
+Solve for eccentric anomaly $E$ from
+
+$$
+M = E - e \sin E
+$$
+
+as the root.
+The position is then
+
+$$
+x_1 = \cos E - e, \qquad x_2 = \sqrt{1 - e^2} \sin E
+$$
+
+(Derivation and root uniqueness appear in the root-finding example.)
+Use this exact trajectory to measure integration errors.
+
+Velocity Verlet advances positions and velocities at step $\Delta t$ as follows.
+
+$$
+\mathbf{x}_{n+1} = \mathbf{x}_n + \Delta t \, \mathbf{v}_n + \frac{\Delta t^2}{2} \mathbf{F}_n,
+\qquad
+\mathbf{v}_{n+1} = \mathbf{v}_n + \frac{\Delta t}{2} (\mathbf{F}_n + \mathbf{F}_{n+1}).
+$$
+
+Here $\mathbf{F}_n = \mathbf{F}(\mathbf{x}_n)$, requiring one force evaluation per stage.
+The method is symplectic: for conservative forces, energy errors oscillate within width $O(\Delta t^2)$ even over long times instead of growing continually.
+Central forces conserve angular momentum except for rounding.
+Orbital phase error, however, grows linearly with time, increasing distance from the exact trajectory each orbit.
+
+The following model definitions serve three cells.
+`potential` represents $U(\mathbf{x})$; `exact_force` analytic force $\mathbf{F} = -\mathbf{x} / \lvert \mathbf{x} \rvert^3$; `verlet` velocity Verlet from periapsis; `eccentric_anomaly` Kepler root $E(M)$; `kepler_position` exact position at $t$.
+`verlet` accepts a force function, passing position $\mathbf{x}_{n+1}$ and $U(\mathbf{x}_{n+1})$ already computed for energy monitoring.
+To compute $E(M)$, map $M$ to $[-\pi, \pi]$, then use $\lvert M \rvert$ as the mean anomaly in Newton's method starting from $E_0 = \pi$.
+$f(E) = E - e \sin E - \lvert M \rvert$ is convex on $[0, \pi]$ because $f'' = e \sin E \ge 0$, and $f(\pi) \ge 0$, so iterates from this initial value decrease monotonically to the root without crossing it (the root-finding example's initial-value rule).
+
+```rust
+//| id: differentiate-kepler-model
+//| kind: definitions
+//| title: "Potential, velocity Verlet, and Kepler solutions"
+//| crates: [scioxide-core]
+use scioxide_core::RealScalar;
+
+/// Potential U(x) = −1/|x|, μ = 1.
+pub(crate) fn potential(p: &[f64]) -> f64 {
+    -1.0 / RealScalar::sqrt(p[0] * p[0] + p[1] * p[1])
+}
+
+/// Analytic force F = −x/|x|³.
+pub(crate) fn exact_force(p: &[f64; 2]) -> [f64; 2] {
+    let r = RealScalar::sqrt(p[0] * p[0] + p[1] * p[1]);
+    [-p[0] / (r * r * r), -p[1] / (r * r * r)]
+}
+
+/// Advance total velocity-Verlet stages from periapsis (1 − e, 0), returning max |ΔE/E|, max |ΔL/L|, and stage positions.
+/// force accepts x and U(x) and returns force.
+pub(crate) fn verlet(
+    e: f64,
+    dt: f64,
+    total: usize,
+    mut force: impl FnMut(&[f64; 2], f64) -> Result<[f64; 2], String>,
+) -> Result<(f64, f64, Vec<[f64; 2]>), String> {
+    let (mut x, mut v) = (
+        [1.0 - e, 0.0],
+        [0.0, RealScalar::sqrt((1.0 + e) / (1.0 - e))],
+    );
+    let mut u = potential(&x);
+    let mut f = force(&x, u)?;
+    let (e0, l0) = (
+        0.5 * (v[0] * v[0] + v[1] * v[1]) + u,
+        x[0] * v[1] - x[1] * v[0],
+    );
+    let (mut energy, mut momentum) = (0.0_f64, 0.0_f64);
+    let mut path = Vec::with_capacity(total);
+    for _ in 0..total {
+        x = [
+            x[0] + dt * (v[0] + 0.5 * dt * f[0]),
+            x[1] + dt * (v[1] + 0.5 * dt * f[1]),
+        ];
+        u = potential(&x);
+        let next = force(&x, u)?;
+        v = [
+            v[0] + 0.5 * dt * (f[0] + next[0]),
+            v[1] + 0.5 * dt * (f[1] + next[1]),
+        ];
+        f = next;
+        energy = energy.max(((0.5 * (v[0] * v[0] + v[1] * v[1]) + u - e0) / e0).abs());
+        momentum = momentum.max(((x[0] * v[1] - x[1] * v[0] - l0) / l0).abs());
+        path.push(x);
+    }
+    Ok((energy, momentum, path))
+}
+
+/// Kepler root E(M) for M = E − e sin E; map to |M| ≤ π and solve by Newton from E₀ = π.
+pub(crate) fn eccentric_anomaly(e: f64, mean: f64) -> f64 {
+    let tau = 2.0 * std::f64::consts::PI;
+    let turns = (mean / tau).round();
+    let reduced = mean - turns * tau;
+    let target = reduced.abs();
+    let mut anomaly = std::f64::consts::PI;
+    for _ in 0..64 {
+        let residual = anomaly - e * RealScalar::sin(anomaly) - target;
+        let step = residual / (1.0 - e * RealScalar::cos(anomaly));
+        anomaly -= step;
+        if step.abs() <= 4.0 * f64::EPSILON {
+            break;
+        }
+    }
+    turns * tau + anomaly.copysign(reduced)
+}
+
+/// Exact position (cos E − e, √(1 − e²) sin E) at time t = mean anomaly M.
+pub(crate) fn kepler_position(e: f64, time: f64) -> [f64; 2] {
+    let anomaly = eccentric_anomaly(e, time);
+    [
+        RealScalar::cos(anomaly) - e,
+        RealScalar::sqrt(1.0 - e * e) * RealScalar::sin(anomaly),
+    ]
+}
+```
+
+## Bias in difference forces
+
+Difference forces depart from true forces through truncation.
+At default steps $h = c \max(1, \lvert x_i \rvert)$, central $c = \varepsilon^{1/3}$ relative bias is about $\varepsilon^{2/3} \approx 4 \times 10^{-11}$ and forward $c = \varepsilon^{1/2}$ about $\varepsilon^{1/2} \approx 1.5 \times 10^{-8}$ ([Taylor expansion and step-size selection](../../algorithms/taylor-and-step-size/)).
+At periapsis, small $\lvert \mathbf{x} \rvert = 1 - e$ and rapid stepwise $U$ variation increase bias above this guideline.
+
+Bias is far below time-step error ($\Delta t^2$, about $4 \times 10^{-5}$ for 1000 stages per orbit), barely affecting energy errors.
+It gradually displaces the orbit, appearing in differences from analytic-force integration at the same step and growing with time.
+Numerical gradients are generally neither exactly conservative nor central, so angular momentum conservation also breaks at the bias scale.
+
+## Reusing workspace and known potential
+
+Each stage computes $U(\mathbf{x}_{n+1})$ for energy monitoring; pass it to `base` of `gradient_into` ([Taylor expansion and step-size selection](oxref:differentiate-base-argument)).
+For a two-variable gradient, function evaluations fall from $2 \cdot 2 + 1 = 5$ to 4 with central differences and from $2 + 1 = 3$ to 2 with forward differences.
+Construct `FiniteDifference` once per formula and allocate workspace once with `FiniteDifferenceWorkspace::workspace(DerivativeRequest::new(&method, DerivativeShape::gradient(2)))`, reusing it for every stage ([Reusing Plans, requirements, and workspaces](oxref:differentiate-capacity-checks)).
+Stop computation if an evaluation report does not publish output.
+
+The next cell integrates identical initial data using analytic, central-difference, and forward-difference forces.
+Inputs are eccentricity $e$, stages per orbit, and orbit count.
+The table shows maximum relative energy and angular-momentum errors, maximum relative force error across stages, endpoint distances from two references (analytic-force integration and exact Kepler solution), and evaluations per stage.
+Downsample all three trajectories to 50 points per orbit and pass to the next cell.
+
+```rust
+//| id: differentiate-kepler-orbit
+//| ref: differentiate-kepler-orbit
+//| title: "Conserved quantities and trajectory differences for Kepler orbits with finite-difference forces"
+//| run: reactive
+//| uses: [differentiate-kepler-model]
+//| crates: [scioxide-core, scioxide-differentiate]
+//| exports: [eccentricity, paths]
+//| inputs:
+//|   eccentricity: {"type":"range","label":"Eccentricity e [-]","min":0.0,"max":0.8,"step":0.1,"value":0.6}
+//|   steps: {"type":"select","label":"Stages per orbit [-]","options":["250","1000","4000"],"value":"1000"}
+//|   orbits: {"type":"range","label":"Orbits [-]","min":1,"max":10,"step":1,"value":5}
+//| cases:
+//|   - {"id":"fine-steps","label":"4000 stages per orbit","description":"Energy errors and exact-trajectory distance fall about sixteenfold, while difference-force distance from analytic-force integration barely changes.","inputs":{"steps":"4000"}}
+//|   - {"id":"circular","label":"Circular orbit e = 0","description":"Smaller Verlet energy error reveals forward-force bias in energy.","inputs":{"eccentricity":0.0}}
+//|   - {"id":"eccentric-long","label":"e = 0.8, 10 orbits","description":"Periapsis radius 0.2 increases force bias, making forward trajectory errors reach order 10⁻⁴.","inputs":{"eccentricity":0.8,"orbits":10}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"orbits","path":"/rows/0/1","approx":{"value":2.93e-4,"rtol":0.02}}
+//|       - {"artifact":"orbits","path":"/rows/1/1","approx":{"value":2.93e-4,"rtol":0.02}}
+//|       - {"artifact":"orbits","path":"/rows/0/2","range":{"max":1e-13}}
+//|       - {"artifact":"orbits","path":"/rows/1/3","range":{"min":1e-12,"max":1e-8}}
+//|       - {"artifact":"orbits","path":"/rows/2/3","range":{"min":1e-9,"max":1e-6}}
+//|       - {"artifact":"orbits","path":"/rows/1/4","range":{"min":1e-10,"max":1e-7}}
+//|       - {"artifact":"orbits","path":"/rows/2/4","range":{"min":1e-7,"max":1e-4}}
+//|       - {"artifact":"orbits","path":"/rows/1/6","equals":4}
+//|       - {"artifact":"orbits","path":"/rows/2/6","equals":2}
+//|   - case: fine-steps
+//|     expect:
+//|       - {"artifact":"orbits","path":"/rows/0/1","approx":{"value":1.83e-5,"rtol":0.05}}
+//|       - {"artifact":"orbits","path":"/rows/0/5","approx":{"value":1.69e-3,"rtol":0.05}}
+//|       - {"artifact":"orbits","path":"/rows/2/4","range":{"min":1e-7,"max":1e-4}}
+//|   - case: circular
+//|     expect:
+//|       - {"artifact":"orbits","path":"/rows/0/1","range":{"max":1e-9}}
+//|       - {"artifact":"orbits","path":"/rows/2/1","range":{"min":5e-9,"max":1e-7}}
+//|       - {"artifact":"orbits","path":"/rows/1/6","equals":4}
+//|   - case: eccentric-long
+//|     expect:
+//|       - {"artifact":"orbits","path":"/rows/2/4","range":{"min":1e-5,"max":1e-3}}
+use scioxide_core::{ExecutionContext, SciOxideError};
+use scioxide_differentiate::{
+    DerivativeRequest, DerivativeShape, DifferenceScheme, FiniteDifference,
+    FiniteDifferenceWorkspace,
+};
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed1 = serde_json::json!({ "fractionDigits": 1 });
+let steps: usize = steps.parse().map_err(|_| "Cannot read stage count")?;
+let (e, total) = (eccentricity, steps * orbits as usize);
+let dt = 2.0 * std::f64::consts::PI / steps as f64;
+let distance = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).hypot(a[1] - b[1]);
+// Pass (t, x₁, x₂) at 50 points per orbit including the endpoint.
+let stride = steps / 50;
+let sample = |path: &[[f64; 2]]| -> Vec<[f64; 3]> {
+    (stride..=total)
+        .step_by(stride)
+        .map(|k| [k as f64 * dt, path[k - 1][0], path[k - 1][1]])
+        .collect()
+};
+// Reference 1: exact Kepler solution; its difference from analytic-force integration is Verlet integration error.
+let exact_end = kepler_position(e, total as f64 * dt);
+let (energy, momentum, analytic) = verlet(e, dt, total, |p, _| Ok(exact_force(p)))?;
+let analytic_end = analytic[total - 1];
+let mut rows = vec![(
+    "Analytic force",
+    energy,
+    momentum,
+    None,
+    None,
+    distance(analytic_end, exact_end),
+    None,
+)];
+let mut paths = vec![("Analytic force".to_string(), sample(&analytic))];
+for (name, scheme) in [
+    ("Central force differences", DifferenceScheme::Central),
+    ("Forward force differences", DifferenceScheme::Forward),
+] {
+    let method = FiniteDifference::default().with_scheme(scheme);
+    let request = DerivativeRequest::new(&method, DerivativeShape::gradient(2));
+    let mut workspace =
+        FiniteDifferenceWorkspace::workspace(request).map_err(|e| e.to_string())?;
+    let (mut evaluations, mut force_error) = (0, 0.0_f64);
+    // F = −∇U; compute ∇U with gradient_into and base U(x), checking analytic force.
+    let force = |p: &[f64; 2], u: f64| -> Result<[f64; 2], String> {
+        let mut g = [0.0; 2];
+        let f = |q: &[f64], y: &mut [f64]| {
+            y[0] = potential(q);
+            Ok::<(), SciOxideError>(())
+        };
+        let scope = ExecutionContext::sequential();
+        let report = method
+            .gradient_into(f, p, None, Some(u), &mut g, &mut workspace, scope)
+            .map_err(|e| e.to_string())?;
+        if !report.output_available() {
+            return Err(format!("Gradient not published: {}", report.termination()));
+        }
+        evaluations += report.evaluations();
+        let exact = exact_force(p);
+        let relative = (g[0] + exact[0]).hypot(g[1] + exact[1]) / exact[0].hypot(exact[1]);
+        force_error = force_error.max(relative);
+        Ok([-g[0], -g[1]])
+    };
+    let (energy, momentum, path) = verlet(e, dt, total, force)?;
+    // Reference 2: analytic-force trajectory at the same time step; differences arise only from force bias.
+    let end = path[total - 1];
+    rows.push((
+        name,
+        energy,
+        momentum,
+        Some(force_error),
+        Some(distance(end, analytic_end)),
+        distance(end, exact_end),
+        Some(evaluations as f64 / (total + 1) as f64),
+    ));
+    paths.push((name.to_string(), sample(&path)));
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "Force method" },
+    { "key": "1", "label": "max |ΔE/E| [-]", "type": "number", "format": sci3 },
+    { "key": "2", "label": "max |ΔL/L| [-]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "Maximum relative force error [-]", "type": "number", "format": sci3, "nullText": "Reference" },
+    { "key": "4", "label": "Distance from analytic-force orbit [a]", "type": "number", "format": sci3, "nullText": "Reference" },
+    { "key": "5", "label": "Distance from exact solution [a]", "type": "number", "format": sci3 },
+    { "key": "6", "label": "Evaluations per stage [count]", "type": "number", "format": fixed1, "nullText": "—" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "orbits" })
+);
+export!(eccentricity, e);
+export!(paths, paths);
+```
+
+At default $e = 0.6$, 1000 stages per orbit and 5 orbits, all maximum relative energy errors are $2.93 \times 10^{-4}$, indistinguishable at three displayed digits.
+This is Verlet time-step error, hiding difference-force bias.
+Relative angular momentum errors are rounding-scale $2.5 \times 10^{-15}$ analytically, but rise with bias to $4.7 \times 10^{-11}$ centrally and $1.1 \times 10^{-8}$ forward.
+Maximum relative force errors are $2.4 \times 10^{-10}$ centrally and $4.7 \times 10^{-8}$ forward, several times guidelines $\varepsilon^{2/3}$ and $\varepsilon^{1/2}$.
+Endpoint distances from analytic-force integration are $7.3 \times 10^{-9}$ centrally and $1.2 \times 10^{-5}$ forward, about three orders apart.
+Analytic-force integration ends $2.7 \times 10^{-2}$ from the exact solution.
+This Verlet phase error greatly exceeds difference-force bias.
+Supplying `base` gives 4 central or 2 forward evaluations per stage.
+
+At 4000 stages per orbit, energy error $1.83 \times 10^{-5}$ and distance from the exact solution $1.7 \times 10^{-3}$ both fall about sixteenfold.
+Distances between analytic- and numerical-force trajectories barely change, showing their dependence on force bias rather than time step.
+For circular $e = 0$, Verlet energy error falls to $3.9 \times 10^{-10}$, revealing forward-force energy error $1.3 \times 10^{-8}$.
+Energy conservation hides difference bias only when integration errors are larger.
+At eccentricity 0.8 over 10 orbits, periapsis radius 0.2 increases bias and forward displacement reaches $1.3 \times 10^{-4}$.
+At 1000 stages per orbit, even analytic-force integration then differs from exact by $0.91$, requiring more stages for trajectory accuracy.
+
+The next cell plots distances from selected references using passed trajectories.
+The analytic-force reference isolates difference-force bias.
+The exact Kepler reference makes all three distances dominated by Verlet phase error.
+Exclude exactly zero distances from logarithmic axes and show their count in the chart description.
+
+```rust
+//| id: differentiate-kepler-orbit-gaps
+//| ref: differentiate-kepler-orbit-gaps
+//| title: "Trajectory distances over time from two references"
+//| run: reactive
+//| uses: [differentiate-kepler-model]
+//| crates: [scioxide-core]
+//| dependsOn:
+//|   orbits: differentiate-kepler-orbit
+//| inputs:
+//|   reference: {"type":"select","label":"Reference","options":["Analytic-force orbit","Exact Kepler solution"],"value":"Analytic-force orbit"}
+//| cases:
+//|   - {"id":"exact-reference","label":"Exact-solution reference","description":"All distances overlap and grow with time; Verlet phase error hides force bias.","inputs":{"reference":"Exact Kepler solution"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"gaps","path":"/spec/series/0/points/249/1","approx":{"value":7.28e-9,"rtol":0.05}}
+//|       - {"artifact":"gaps","path":"/spec/series/1/points/249/1","approx":{"value":1.19e-5,"rtol":0.02}}
+//|   - case: exact-reference
+//|     expect:
+//|       - {"artifact":"gaps","path":"/spec/series/0/points/249/1","approx":{"value":2.697e-2,"rtol":1e-3}}
+//|       - {"artifact":"gaps","path":"/spec/series/2/points/249/1","approx":{"value":2.698e-2,"rtol":1e-3}}
+// (Force method, (t, x₁, x₂) at 50 points per orbit)
+type Path = (String, Vec<[f64; 3]>);
+
+let e = orbits["eccentricity"].as_f64().ok_or("No eccentricity")?;
+let paths: Vec<Path> =
+    serde_json::from_value(orbits["paths"].clone()).map_err(|e| e.to_string())?;
+let to_analytic = reference == "Analytic-force orbit";
+let distance = |p: &[f64; 3], q: [f64; 2]| (p[1] - q[0]).hypot(p[2] - q[1]);
+let (mut series, mut dropped) = (Vec::new(), 0);
+// paths[0] is the analytic-force trajectory; do not plot it against itself.
+for (name, path) in paths.iter().skip(usize::from(to_analytic)) {
+    let gaps = path.iter().zip(&paths[0].1).map(|(p, a)| {
+        let base = if to_analytic {
+            [a[1], a[2]]
+        } else {
+            kepler_position(e, p[0])
+        };
+        [p[0], distance(p, base)]
+    });
+    let (points, zeros): (Vec<[f64; 2]>, Vec<[f64; 2]>) = gaps.partition(|g| g[1] > 0.0);
+    dropped += zeros.len();
+    series.push(serde_json::json!({ "name": format!("{name} trajectory"), "points": points }));
+}
+let caption = format!("Zero-distance points omitted from logarithmic axes: {dropped}");
+emit_chart!(
+    serde_json::json!({
+        "kind": "line",
+        "dataZoom": true,
+        "tooltip": true,
+        "xLabel": "Time t [-], one orbit = 2π",
+        "yLabel": format!("Distance from {reference} [a]"),
+        "yType": "log",
+        "series": series
+    }),
+    metadata = serde_json::json!({ "id": "gaps", "caption": caption })
+);
+```
+
+With default analytic-force reference, both numerical-force orbits depart with time, reaching $7.3 \times 10^{-9}$ centrally and $1.2 \times 10^{-5}$ forward.
+Against the exact solution, all distances overlap and end at $2.7 \times 10^{-2}$.
+Force-bias displacements are over three orders below Verlet phase errors and invisible against this reference.
+
+## Eccentric-anomaly derivatives
+
+Many orbital quantities involve derivatives with respect to mean anomaly $M$.
+For example, $\dot E = n \, \mathrm{d}E/\mathrm{d}M$ determines velocities through time derivatives $\dot x_1 = -\sin E \, \dot E$ and $\dot x_2 = \sqrt{1 - e^2} \cos E \, \dot E$.
+$E(M)$ is implicit as a Kepler root; differentiating both sides of $M = E - e \sin E$ with respect to $M$ gives $1 = (1 - e \cos E) \, \mathrm{d}E/\mathrm{d}M$ and hence
+
+$$
+\frac{\mathrm{d}E}{\mathrm{d}M} = \frac{1}{1 - e \cos E}
+$$
+
+this exact identity.
+The denominator is Kepler derivative $f'(E)$ in $f(E) = E - e \sin E - M$; $\mathrm{d}E/\mathrm{d}M = 1/f'(E)$ is root sensitivity (absolute condition number) to changes in $M$.
+Its maximum is $1/(1 - e)$ at periapsis $E = 0$ and minimum $1/(1 + e)$ at apoapsis $E = \pi$.
+
+Since $E(M)$ comes from root-finding, pass $E(M)$ as known base `base`.
+Use workspace-free `FiniteDifference::derivative_into` for this scalar first derivative, relying only on stack storage.
+Calls per point are 2 central or 1 forward.
+
+The next cell takes eccentricity $e$ and computes $\mathrm{d}E/\mathrm{d}M$ centrally and forward at 361 points over orbit $0 \le M \le 2\pi$, comparing the exact identity.
+The upper chart compares exact $\mathrm{d}E/\mathrm{d}M$ (dashed) with central values; the lower shows both relative errors, linked on $M$.
+Count and exclude zero relative errors, displaying counts in the table.
+
+```rust
+//| id: differentiate-kepler-anomaly
+//| ref: differentiate-kepler-anomaly
+//| title: "Eccentric-anomaly derivative dE/dM and implicit differentiation"
+//| run: reactive
+//| uses: [differentiate-kepler-model]
+//| crates: [scioxide-core, scioxide-differentiate]
+//| inputs:
+//|   eccentricity: {"type":"range","label":"Eccentricity e [-]","min":0,"max":0.99,"step":0.01,"value":0.6}
+//|   step: {"type":"select","label":"Step","options":["Relative, default","Absolute"],"value":"Relative, default"}
+//| cases:
+//|   - {"id":"absolute-step","label":"Absolute step","description":"Steps become independent of M; central errors at M = 2π periapsis fall to about 6×10⁻¹¹, matching M = 0.","inputs":{"step":"Absolute"}}
+//|   - {"id":"near-parabolic","label":"e = 0.99","description":"Periapsis dE/dM = 100 changes rapidly over M width about 10⁻³, increasing relative-step central errors to order 10⁻⁴.","inputs":{"eccentricity":0.99}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"anomaly","path":"/rows/0/1","equals":2}
+//|       - {"artifact":"anomaly","path":"/rows/1/1","equals":1}
+//|       - {"artifact":"anomaly","path":"/rows/0/2","range":{"min":1e-10,"max":1e-8}}
+//|       - {"artifact":"anomaly","path":"/rows/0/3","approx":{"value":6.283185307179586,"atol":0.05}}
+//|       - {"artifact":"anomaly","path":"/rows/1/2","range":{"min":1e-9,"max":1e-6}}
+//|       - {"artifact":"anomaly","path":"/rows/0/4","approx":{"value":2.5,"rtol":1e-12}}
+//|   - case: absolute-step
+//|     expect:
+//|       - {"artifact":"anomaly","path":"/rows/0/2","range":{"min":1e-12,"max":1e-9}}
+//|       - {"artifact":"anomaly","path":"/rows/0/4","approx":{"value":2.5,"rtol":1e-12}}
+//|   - case: near-parabolic
+//|     expect:
+//|       - {"artifact":"anomaly","path":"/rows/0/4","approx":{"value":100,"rtol":1e-10}}
+//|       - {"artifact":"anomaly","path":"/rows/0/2","range":{"min":1e-5,"max":1e-3}}
+use scioxide_core::{ExecutionContext, ExtendedInterval, SciOxideError, RealScalar};
+use scioxide_differentiate::{DifferenceScheme, DifferenceStep, FiniteDifference};
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed3 = serde_json::json!({ "fractionDigits": 3 });
+let e = eccentricity;
+let grid: Vec<f64> = (0..=360)
+    .map(|k| 2.0 * std::f64::consts::PI * k as f64 / 360.0)
+    .collect();
+// Exact implicit derivative dE/dM = 1/(1 − e cos E).
+let exact: Vec<f64> = grid
+    .iter()
+    .map(|&m| 1.0 / (1.0 - e * RealScalar::cos(eccentric_anomaly(e, m))))
+    .collect();
+// Match absolute steps to default factors ε^(1/3) and ε^(1/2) for |M| ≤ 1.
+let methods = [
+    ("Central difference", DifferenceScheme::Central, f64::EPSILON.cbrt()),
+    ("Forward difference", DifferenceScheme::Forward, f64::EPSILON.sqrt()),
+];
+let (mut rows, mut errors, mut curve) = (Vec::new(), Vec::new(), Vec::new());
+for (name, scheme, c) in methods {
+    let mut method = FiniteDifference::default().with_scheme(scheme);
+    if step == "Absolute" {
+        method = method.with_step(DifferenceStep::absolute(c).map_err(|e| e.to_string())?);
+    }
+    let (mut evaluations, mut worst, mut at, mut zeros) = (0, 0.0_f64, None, 0);
+    let mut points = Vec::new();
+    for (&m, &d) in grid.iter().zip(&exact) {
+        let mut slope = 0.0;
+        let f = |mean: f64| Ok::<f64, SciOxideError>(eccentric_anomaly(e, mean));
+        // Pass solved E(M) as base, omitting the M evaluation.
+        let base = Some(eccentric_anomaly(e, m));
+        let scope = ExecutionContext::sequential();
+        let report = method
+            .derivative_into(f, m, ExtendedInterval::entire(), base, &mut slope, scope)
+            .map_err(|e| e.to_string())?;
+        if !report.output_available() {
+            return Err(format!(
+                "Derivative not published: {}",
+                report.termination()
+            ));
+        }
+        evaluations = evaluations.max(report.evaluations());
+        let relative = (slope - d).abs() / d;
+        if relative > worst {
+            (worst, at) = (relative, Some(m));
+        }
+        if relative > 0.0 {
+            points.push([m, relative]);
+        } else {
+            zeros += 1;
+        }
+        if scheme == DifferenceScheme::Central {
+            curve.push([m, slope]);
+        }
+    }
+    rows.push((name, evaluations, worst, at, exact[0], zeros));
+    errors.push(serde_json::json!({ "name": name, "points": points }));
+}
+let exact_curve: Vec<[f64; 2]> = grid.iter().zip(&exact).map(|(&m, &d)| [m, d]).collect();
+emit_chart!(serde_json::json!({
+    "kind": "line",
+    "dataZoom": true,
+    "tooltip": true,
+    "link": { "group": "kepler-mean-anomaly" },
+    "xLabel": "Mean anomaly M [rad]",
+    "yLabel": "dE/dM [-]",
+    "series": [
+        {
+            "name": "Exact 1/(1 − e cos E)",
+            "points": exact_curve,
+            "style": { "lineType": "dashed" }
+        },
+        {
+            "name": "Central difference",
+            "points": curve,
+            "style": { "lineType": "dotted", "showSymbol": true }
+        }
+    ]
+}));
+emit_line_chart!(
+    &errors,
+    options = &serde_json::json!({
+        "link": { "group": "kepler-mean-anomaly" },
+        "xLabel": "Mean anomaly M [rad]",
+        "yLabel": "dE/dM relative error [-]",
+        "yType": "log"
+    })
+);
+let columns = serde_json::json!([
+    { "key": "0", "label": "Difference formula" },
+    { "key": "1", "label": "Calls per point [count]", "type": "integer" },
+    { "key": "2", "label": "Maximum relative error [-]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "Maximizing M [rad]", "type": "number", "format": fixed3, "nullText": "None" },
+    { "key": "4", "label": "Periapsis dE/dM = 1/(1 − e) [-]", "type": "number", "format": fixed3 },
+    { "key": "5", "label": "Zero-error points [count]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "anomaly" })
+);
+```
+
+At default $e = 0.6$, $\mathrm{d}E/\mathrm{d}M$ varies fourfold from periapsis $2.5$ to apoapsis $0.625$; central points overlap the dashed exact curve.
+Maximum relative errors are $2.3 \times 10^{-9}$ centrally and $6.1 \times 10^{-8}$ forward.
+Central relative error is $5.7 \times 10^{-11}$ at periapsis $M = 0$ but about 40 times larger, $2.3 \times 10^{-9}$, at equivalent periapsis $M = 2\pi$.
+Default steps $h = \varepsilon^{1/3} \max(1, \lvert M \rvert)$ grow by $2\pi$ at $M = 2\pi$; truncation proportional to $h^2$ grows by $(2\pi)^2 \approx 39$.
+Forward relative errors at periapsis and apoapsis ($M = 0$, $\pi$, $2\pi$) are over an order below the maximum.
+Around $M_0 = 0, \pi, 2\pi$, odd relation $E(M_0 + \delta) - E(M_0) = -\{E(M_0 - \delta) - E(M_0)\}$ gives $E''(M_0) = 0$, eliminating leading forward truncation $h E''/2$.
+
+Absolute steps (central $\varepsilon^{1/3}$, forward $\varepsilon^{1/2}$) reduce central errors at $M = 2\pi$ to $5.9 \times 10^{-11}$, comparable with $M = 0$, with maximum $1.1 \times 10^{-10}$.
+For coordinates like angles with arbitrary origins, relative factor $\max(1, \lvert x_i \rvert)$ makes errors depend on coordinate values; choose absolute `DifferenceStep::absolute`.
+At $e = 0.99$, periapsis $\mathrm{d}E/\mathrm{d}M$ reaches 100 and changes over $M$ width about $10^{-3}$, making relative-step central errors reach $2.4 \times 10^{-4}$ at $M = 2\pi$.
+Every error compares with the exact implicit-derivative identity.
+
+## Summary
+
+Prepare methods and workspace once and repeat `gradient_into` to compute stage gradients without reallocating.
+Passing monitored potential to `base` saves one call per stage.
+Verlet energy errors depend on time-step $O(\Delta t^2)$ and exceed default force bias, so conservation cannot distinguish formulas here.
+Force bias appears in analytic-force trajectory differences and angular momentum; forward displacement is about three orders above central.
+Workspace-free `derivative_into` suffices for repeated scalar derivatives, including implicit $E(M)$ checked by implicit differentiation.
+
+## Further reading
+
+- [Reusing Plans, requirements, and workspaces](../../algorithms/plans-workspaces-and-reports/): examine requirements, reservation, reuse, and workspace-free `derivative_into`.
+- [Evaluation limits, reports, and result publication](../../algorithms/budgets-reports-and-publication/): examine reports and publication when force evaluations have limits.
+- [Kepler's equation and eccentricity](../../../scioxide-rootfind/examples/kepler-equation/): solve this $E(M)$ with six methods and compare calls and residuals.
+- [Numerical-differentiation examples](../): review other subjects and independent checks.

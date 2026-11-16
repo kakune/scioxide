@@ -1,0 +1,384 @@
+---
+title: 密行列と構造行列の線形代数
+description: 密行列と構造を持つ行列の分解、解の受理、固有値問題、Krylov 部分空間法、行列関数と行列方程式を提供する scioxide-linalg の API。抵抗回路の節点方程式をワンショット関数で解いて条件数と精度の関係を確かめ、LU 分解のオプション付き形式で終了理由・後退誤差・逆条件数を読み、章の構成を示す。
+sidebar:
+  order: 10
+references:
+  linalg-feature-map: "機能一覧"
+---
+
+`scioxide-linalg` は、連立一次方程式、最小二乗問題、固有値問題、行列関数、行列方程式を解くクレートである。
+密行列の格納と積、LU・Cholesky・LDL・QR・特異値分解、三重対角や Toeplitz のように構造を持つ行列の解法、Krylov 部分空間法と定常反復、行列の指数や対数、Sylvester・Lyapunov・Riccati 方程式を、共通の規約で提供する。
+スカラーは実数と複素数の `f32` と `f64` を扱う。
+許容誤差、上限（`Budget`）、実行コンテキスト、作用素のトレイトは [scioxide-core](../scioxide-core/) の型を使い、疎行列の格納、疎直接法、前処理は [scioxide-sparse](../scioxide-sparse/) が提供する。
+
+## 最初の計算：抵抗回路の節点方程式
+
+三つの節点を抵抗でつなぎ、各節点を 1 kΩ の抵抗で接地して、節点 1 に $I = 1$ mA の電流を流し込む。
+節点 1 と 2 の間の抵抗を $R$、節点 2 と 3 の間を 1 kΩ とし、コンダクタンスを $g_a = 1/R$、$g_0 = g_b = 10^{-3}$ S とする。
+節点電圧 $v$ [V] は Kirchhoff の電流則から次の方程式 $Av = b$ を満たす。
+
+$$
+\begin{bmatrix} g_0 + g_a & -g_a & 0 \\ -g_a & g_a + g_0 + g_b & -g_b \\ 0 & -g_b & g_b + g_0 \end{bmatrix}
+\begin{bmatrix} v_1 \\ v_2 \\ v_3 \end{bmatrix}
+=
+\begin{bmatrix} 10^{-3} \\ 0 \\ 0 \end{bmatrix}
+$$
+
+直列と並列の合成で解くと、節点 2 から先の接地側の合成コンダクタンスは $G_2 = g_0 + g_bg_0/(g_b + g_0)$ で、$v_1 = I/(g_0 + g_aG_2/(g_a + G_2))$、$v_2 = v_1\,g_a/(g_a + G_2)$、$v_3 = v_2\,g_b/(g_b + g_0)$ となる。
+この式は引き算を含まないので、$R$ が極端な値でも丸め誤差の範囲で正確な参照値になる。
+
+条件数 $\kappa_1(A) = \lVert A \rVert_1 \lVert A^{-1} \rVert_1$ は、入力の小さな相対変化が解の相対変化として何倍に拡大されうるかを表す問題の性質である（$\lVert \cdot \rVert_1$ は列の絶対値の和の最大）。
+この $A$ は各列の和がどれも $g_0$ に等しく（$\mathbf 1^{\mathsf T} A = g_0 \mathbf 1^{\mathsf T}$）、$\mathbf 1^{\mathsf T} A^{-1} = \mathbf 1^{\mathsf T}/g_0$ が成り立つ。
+$A$ は非対角成分が 0 以下で狭義の対角優位な行列（M 行列）なので $A^{-1}$ の成分は非負で、$\lVert A^{-1} \rVert_1 = 1/g_0$ となる。
+$g_b = g_0$ なら $\lVert A \rVert_1 = 2g_a + 3g_0$ なので、$\kappa_1(A) = 3 + 2g_a/g_0$ となる。
+$R$ を小さくすると節点 1 と 2 はほぼ短絡し、条件数は $g_a/g_0$ に比例して大きくなる。
+
+次のブロックは、このページの二つのセルが共有する回路のモデルである。
+`circuit` は $R = 10^t$ Ω から係数行列 $A$ と右辺 $b$ を作り、`reference` は直列・並列の合成による参照値、`condition_one` は閉形式の $\kappa_1(A)$ を返す。
+参照値と条件数は `f64` の演算による検算用の値である。
+
+```rust
+//| id: linalg-overview-circuit
+//| kind: definitions
+//| title: 抵抗回路の節点方程式と参照値
+//| crates: [scioxide-linalg]
+use scioxide_linalg::{Matrix, Vector};
+
+/// 接地と節点 2–3 のコンダクタンス g₀ = g_b [S] と注入電流 I [A]。
+pub(crate) const G0: f64 = 1e-3;
+pub(crate) const GB: f64 = 1e-3;
+pub(crate) const CURRENT: f64 = 1e-3;
+
+/// R = 10^t Ω の節点方程式 A v = b（g_a = 1/R）。
+pub(crate) fn circuit(t: f64) -> Result<(Matrix<f64>, Vector<f64>), String> {
+    let ga = 1.0 / 10.0_f64.powf(t);
+    let a = Matrix::from_rows(&[
+        [G0 + ga, -ga, 0.0],
+        [-ga, ga + G0 + GB, -GB],
+        [0.0, -GB, GB + G0],
+    ])
+    .map_err(|e| e.to_string())?;
+    Ok((a, Vector::from_vec(vec![CURRENT, 0.0, 0.0])))
+}
+
+/// 直列・並列の合成による参照値 (v₁, v₂, v₃)。引き算を含まない。
+pub(crate) fn reference(t: f64) -> [f64; 3] {
+    let ga = 1.0 / 10.0_f64.powf(t);
+    let g2 = G0 + GB * G0 / (GB + G0);
+    let v1 = CURRENT / (G0 + ga * g2 / (ga + g2));
+    let v2 = v1 * ga / (ga + g2);
+    [v1, v2, v2 * GB / (GB + G0)]
+}
+
+/// 閉形式の条件数 κ₁(A) = 3 + 2 g_a / g₀。
+pub(crate) fn condition_one(t: f64) -> f64 {
+    3.0 + 2.0 / (10.0_f64.powf(t) * G0)
+}
+```
+
+次のセルはワンショット関数 `solve` でこの方程式を解く。
+`solve(&a, &b)` は部分ピボット付き LU 分解と前進・後退代入を一度に行い、厳密に 0 のピボットがなければ解のベクトルだけを返す。
+入力は $R = 10^t$ Ω の指数 $t$（$-9 \le t \le 6$）である。
+1 つ目の表は節点電圧、参照値、相対差を示す。
+2 つ目の表は閉形式の $\kappa_1(A)$、単位丸め $u = 2^{-53}$ を掛けた $\kappa_1(A)\,u$、相対差の最大を示す。
+テストは $v_1$ と $\kappa_1(A)$ を参照値と比べ、相対差が $\kappa_1(A)\,u$ を超えないことを確かめる。
+
+```rust
+//| id: linalg-overview-first-solve
+//| ref: linalg-overview-first-solve
+//| title: 抵抗回路の節点方程式をワンショット関数で解く
+//| run: reactive
+//| uses: [linalg-overview-circuit]
+//| crates: [scioxide-linalg]
+//| inputs:
+//|   resistance_exponent: {"type":"range","label":"節点 1–2 の抵抗 R = 10^t Ω の t","description":"小さいほど短絡に近く、条件数が大きい。","min":-9,"max":6,"step":1,"value":0}
+//| cases:
+//|   - {"id":"near-short","label":"R = 10⁻⁹ Ω","description":"条件数が 2 × 10¹² になり、相対差は 10⁻⁵ の程度まで増える。","inputs":{"resistance_exponent":-9}}
+//|   - {"id":"open-branch","label":"R = 10⁶ Ω","description":"節点 1 がほぼ切り離され、条件数は 3 程度になる。","inputs":{"resistance_exponent":6}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"voltages","path":"/rows/0/1","approx":{"value":0.4003597841295223,"rtol":1e-12}}
+//|       - {"artifact":"conditioning","path":"/rows/0/0","approx":{"value":2003,"rtol":1e-14}}
+//|       - {"artifact":"conditioning","path":"/rows/0/2","range":{"max":2.2e-13}}
+//|   - case: near-short
+//|     expect:
+//|       - {"artifact":"voltages","path":"/rows/0/1","approx":{"value":0.40000000000036,"rtol":1e-3}}
+//|       - {"artifact":"conditioning","path":"/rows/0/0","approx":{"value":2.000000000003e12,"rtol":1e-12}}
+//|       - {"artifact":"conditioning","path":"/rows/0/2","range":{"max":2.2e-4}}
+//|   - case: open-branch
+//|     expect:
+//|       - {"artifact":"voltages","path":"/rows/0/1","approx":{"value":0.9990016638935109,"rtol":1e-14}}
+//|       - {"artifact":"conditioning","path":"/rows/0/0","approx":{"value":3.002,"rtol":1e-12}}
+use scioxide_linalg::solve;
+
+let t = resistance_exponent;
+let (a, b) = circuit(t)?;
+// ワンショット関数: 分解から求解までを一度に行い、解だけを返す。
+let v = solve(&a, &b).map_err(|e| e.to_string())?;
+let exact = reference(t);
+let names = ["v₁", "v₂", "v₃"];
+let rows: Vec<(&str, f64, f64, f64)> = (0..3)
+    .map(|i| {
+        let x = v.as_slice()[i];
+        (names[i], x, exact[i], (x - exact[i]).abs() / exact[i])
+    })
+    .collect();
+let worst = rows.iter().fold(0.0_f64, |m, row| m.max(row.3));
+let fixed12 = serde_json::json!({ "significantDigits": 12 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let sci4 = serde_json::json!({ "notation": "scientific", "significantDigits": 4 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "節点電圧" },
+    { "key": "1", "label": "solve の解 [V]", "type": "number", "format": fixed12 },
+    { "key": "2", "label": "参照値 [V]", "type": "number", "format": fixed12 },
+    { "key": "3", "label": "相対差 [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "voltages" })
+);
+
+// 閉形式の κ₁(A) に単位丸め u = 2⁻⁵³ を掛けた値を、相対差の目安にする。
+let kappa = condition_one(t);
+let unit_roundoff = f64::EPSILON / 2.0;
+let columns = serde_json::json!([
+    { "key": "0", "label": "条件数 κ₁(A) [-]", "type": "number", "format": sci4 },
+    { "key": "1", "label": "κ₁(A) u [-]", "type": "number", "format": sci2 },
+    { "key": "2", "label": "相対差の最大 [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    columns,
+    vec![(kappa, kappa * unit_roundoff, worst)],
+    metadata = serde_json::json!({ "id": "conditioning" })
+);
+```
+
+既定の $R = 1$ Ω では $\kappa_1(A) = 2003$ で、節点電圧は参照値と相対 $1.5 \times 10^{-13}$ で一致する。
+$R$ を 1 Ω から 1 桁小さくするごとに $\kappa_1(A)$ は 10 倍になり、相対差もおよそそれに比例して増える（$R = 10^{-3}$ Ω で $2.5 \times 10^{-11}$、$10^{-6}$ Ω で $5.7 \times 10^{-8}$、$10^{-9}$ Ω で $5.6 \times 10^{-5}$）。
+$R = 10^{6}$ Ω では節点 1 がほぼ切り離され、$v_1 \approx 0.999$ V、$\kappa_1(A) = 3.002$ で、相対差は $2 \times 10^{-16}$ 以下になる。
+
+相対差が増えるのは、行列の成分を浮動小数点数に格納するときに入る相対 $u$ の丸めが、条件数の分だけ解に拡大されるためである。
+実際、$R = 10^{-9}$ Ω で格納された行列の厳密解を有理数演算で求めると、セルの解との相対差は $4 \times 10^{-13}$ で、参照値との差 $5.6 \times 10^{-5}$ のほとんどは格納の丸めから来ている。
+そのため相対差の目安は $\kappa_1(A)\,u$ になり、セルの相対差は $t = -9, \ldots, 6$ のどの $R$ でもこの値を下回る。
+LU 分解そのものが加える誤差の大きさは、次の節の後退誤差で測る。
+
+## 結果の読み方
+
+`solve` のようなワンショット関数は解だけを返し、計算がどれだけ信頼できるかの情報を返さない。
+分解を残して何度も使うときは、`LuDecomposition::factor(&a)` と `lu.solve(&b)` のように問題のデータだけを取る標準形式を使う。
+設定を最後の引数に取り、解と一緒にレポートを返す `lu.solve_with_options(&b, &options)` をオプション付き形式と呼ぶ。
+呼び出し側の作業領域とコンテキストを使う出力先を指定する API・スコープ付き API、Plan、手法オブジェクトを含む呼び出しの形の定義は、[作業領域・実行コンテキスト・試行記録](oxref:linalg-execution-forms)にある。
+
+この章では計算した解を結果として出力に反映してよいと判定することを「受理」と呼ぶ。
+分解は構造上の破綻（厳密に 0 のピボットなど）だけをエラーとして拒否し、得られた解を受理するかどうかは、求解のときに渡すランクの方針と逆条件数の下限で決まる。
+逆条件数は $\mathrm{rcond}_1 = 1/\kappa_1(A)$ で、0 に近いほど悪条件である。
+
+次のセルは同じ方程式を `LuDecomposition::factor` で分解し、受理の条件 `DirectSolveOptions` をオプション付き形式の `solve_with_options` に渡して、解とレポートを受け取る。
+条件にはランクの方針 `RankPolicy::DimensionScaledEpsilon`、後退誤差の計算（`with_residual(Estimation::Estimate)`）、入力で選ぶ逆条件数の下限を入れる。
+このランクの方針は、絶対値が最大のピボットの $3\varepsilon$ 倍以下のピボットを 0 とみなす（$3$ は次数、$\varepsilon = 2^{-52}$ は機械イプシロン）。
+後退誤差は元の行列について
+
+$$
+\eta = \frac{\lVert b - A\hat x \rVert_\infty}{\lVert A \rVert_\infty \lVert \hat x \rVert_\infty + \lVert b \rVert_\infty}
+$$
+
+で測り、計算した解 $\hat x$ がどれだけ近い問題の厳密解かを表す。
+逆条件数の下限を選ぶと、求解は分解の `condition_estimate` で $\mathrm{rcond}_1$ を推定し、推定値が下限を下回れば解を出力に反映せずに終了理由 `IllConditioned` を返す。
+
+入力は $R = 10^t$ Ω の指数 $t$ と逆条件数の下限（なし、$10^{-6}$、$10^{-9}$）である。
+表は終了理由、数値ランク、後退誤差、分解から求めた $\mathrm{rcond}_1$、オプション付き形式が出力に反映した $v_1$、`into_accepted()` で解を取り出したときの結果を示す。
+解を受理しなかった場合、$v_1$ の欄は「出力に反映されない」になる。
+最後の判定は終了理由で、`Accepted` なら満たした、それ以外なら受理しなかったと示す。
+テストは $\mathrm{rcond}_1$ を閉形式の $1/\kappa_1(A) = 1/(3 + 2g_a/g_0)$ と比べる。
+
+```rust
+//| id: linalg-overview-acceptance
+//| ref: linalg-overview-acceptance
+//| title: LU 分解のオプション付き形式に受理の条件を渡し、レポートを読む
+//| run: reactive
+//| uses: [linalg-overview-circuit]
+//| crates: [scioxide-linalg]
+//| inputs:
+//|   resistance_exponent: {"type":"range","label":"節点 1–2 の抵抗 R = 10^t Ω の t","description":"小さいほど短絡に近く、逆条件数が小さい。","min":-9,"max":6,"step":1,"value":0}
+//|   threshold: {"type":"select","label":"逆条件数の下限","description":"推定値がこれを下回るとオプション付き形式は解を受理しない。","options":["なし","1e-6","1e-9"],"value":"なし"}
+//| cases:
+//|   - {"id":"near-short","label":"R = 10⁻⁹ Ω","description":"下限がなければ、rcond₁ = 5 × 10⁻¹³ でも受理される。","inputs":{"resistance_exponent":-9}}
+//|   - {"id":"rcond-threshold","label":"R = 10⁻⁶ Ω、下限 10⁻⁶","description":"逆条件数が下限を下回り、オプション付き形式は IllConditioned を返す。","inputs":{"resistance_exponent":-6,"threshold":"1e-6"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"report","path":"/rows/0/0","equals":"Accepted"}
+//|       - {"artifact":"report","path":"/rows/0/1","equals":3}
+//|       - {"artifact":"report","path":"/rows/0/2","range":{"max":1e-16}}
+//|       - {"artifact":"report","path":"/rows/0/3","approx":{"value":4.992511233150275e-4,"rtol":1e-12}}
+//|       - {"artifact":"report","path":"/rows/0/4","approx":{"value":0.4003597841295223,"rtol":1e-12}}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+//|   - case: near-short
+//|     expect:
+//|       - {"artifact":"report","path":"/rows/0/0","equals":"Accepted"}
+//|       - {"artifact":"report","path":"/rows/0/3","approx":{"value":4.9999999999925e-13,"rtol":1e-3}}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+//|   - case: rcond-threshold
+//|     expect:
+//|       - {"artifact":"report","path":"/rows/0/0","equals":"IllConditioned"}
+//|       - {"artifact":"report","path":"/rows/0/3","approx":{"value":4.9999999925e-10,"rtol":1e-6}}
+//|       - {"artifact":"report","path":"/rows/0/4","equals":null}
+//|       - {"artifact":"report","path":"/rows/0/5","equals":"Err(NumericalInstability)"}
+//|       - {"path":"/outputs/1/state","equals":"failed"}
+use scioxide_linalg::{
+    DirectSolveOptions, DirectSolveTermination, Estimation, LuDecomposition, RankPolicy,
+    ReciprocalConditionThreshold,
+};
+
+let (a, b) = circuit(resistance_exponent)?;
+// 分解を残し、受理の条件をオプション付き形式に渡して、解とレポートを受け取る。
+let lu = LuDecomposition::factor(&a).map_err(|e| e.to_string())?;
+let mut options = DirectSolveOptions::new(RankPolicy::DimensionScaledEpsilon)
+    .with_residual(Estimation::Estimate);
+if threshold != "なし" {
+    let limit = threshold.parse::<f64>().map_err(|e| e.to_string())?;
+    let limit = ReciprocalConditionThreshold::new(limit).map_err(|e| e.to_string())?;
+    options = options.with_minimum_reciprocal_condition(limit);
+}
+let result = lu
+    .solve_with_options(&b, &options)
+    .map_err(|e| e.to_string())?;
+let report = *result.report();
+let accepted_v1 = result.solution().map(|s| s.as_slice()[0]);
+// レポートの推定値は下限を与えたときだけ入るので、表示用には分解から直接求める。
+let rcond = lu
+    .condition_estimate()
+    .map_err(|e| e.to_string())?
+    .reciprocal()
+    .value();
+// into_accepted() は標準形式の solve と同じ規則で、拒否をエラーに変える。
+let converted = match result.into_accepted() {
+    Ok(_) => "Ok".to_string(),
+    Err(e) => format!("Err({:?})", e.kind()),
+};
+
+// 終了理由は列挙子名で示す。
+let termination = report.termination();
+let name = match termination {
+    DirectSolveTermination::Accepted => "Accepted",
+    DirectSolveTermination::RankDeficient => "RankDeficient",
+    DirectSolveTermination::IllConditioned => "IllConditioned",
+    DirectSolveTermination::ResidualRejected => "ResidualRejected",
+    DirectSolveTermination::StabilityRejected => "StabilityRejected",
+};
+let backward = report.residual().map(|r| r.scaled_norm());
+let fixed12 = serde_json::json!({ "significantDigits": 12 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "終了理由" },
+    { "key": "1", "label": "数値ランク", "type": "integer" },
+    { "key": "2", "label": "後退誤差 η [-]", "type": "number", "format": sci2, "nullText": "なし" },
+    { "key": "3", "label": "逆条件数 rcond₁ [-]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "オプション付き形式の v₁ [V]", "type": "number", "format": fixed12, "nullText": "出力に反映されない" },
+    { "key": "5", "label": "into_accepted() の結果" }
+]);
+let rank = report.rank().rank();
+emit_table_with_columns!(
+    columns,
+    vec![(name, rank, backward, rcond, accepted_v1, converted)],
+    metadata = serde_json::json!({ "id": "report" })
+);
+
+let outcome = if termination.is_success() {
+    Outcome::satisfied("オプション付き形式の求解が解を受理した")
+} else {
+    Outcome::failed("オプション付き形式の求解が解を受理しなかった")
+        .explanation("into_accepted() で解を取り出すと、この拒否はエラーになる。")
+};
+let mut outcome = outcome
+    .status(name)
+    .diagnostic("逆条件数 rcond₁", rcond, None);
+if let Some(eta) = backward {
+    outcome = outcome.diagnostic("後退誤差 η", eta, None);
+}
+emit_outcome!(outcome);
+```
+
+既定の $R = 1$ Ω では、終了理由は `Accepted`、数値ランクは 3、後退誤差は $\eta = 1.9 \times 10^{-17}$ で、オプション付き形式の $v_1$ は前のセルの `solve` の解と同じ値である。
+次数が 4 以下の行列では、`condition_estimate` は $\lVert A^{-1} \rVert_1$ を推定せず、逆行列の各列から計算する。
+そのため $\mathrm{rcond}_1 = 4.99 \times 10^{-4}$ は、閉形式の $1/\kappa_1(A) = 1/2003$ と相対 $1.5 \times 10^{-13}$ で一致する。
+$R$ を変えても後退誤差は $10^{-16}$ 以下にとどまり、分解と求解は後退安定に行われている。
+
+逆条件数の下限を $10^{-6}$ にすると、$\mathrm{rcond}_1 = 5.0 \times 10^{-7}$ になる $R = 10^{-3}$ Ω 以下で終了理由が `IllConditioned` になり、オプション付き形式の解と後退誤差は出力に反映されない。
+`into_accepted()` の列は、この拒否を解に変換しようとすると `NumericalInstability` のエラーになることを示す。
+下限を $10^{-9}$ にすると、$R \le 10^{-6}$ Ω で同じことが起こる。
+同じ $R$ でもワンショット呼び出しの `solve` は下限を持たないので、前のセルのように解を返す。
+
+後退誤差と条件数を組み合わせると、前進誤差を見積もれる。
+$\eta$ が上の正規化した後退誤差で $\kappa_\infty(A)\,\eta < 1$ のとき、格納された $A$ と $b$ の厳密解 $x$ に対する相対前進誤差は
+
+$$
+\frac{\lVert \hat x - x \rVert_\infty}{\lVert x \rVert_\infty} \le \frac{2\,\kappa_\infty(A)\,\eta}{1 - \kappa_\infty(A)\,\eta}
+$$
+
+で抑えられる（Higham, 2002, 定理 7.2）。
+この行列は対称なので $\kappa_\infty(A) = \kappa_1(A)$ で、既定の $R = 1$ Ω では右辺は $2 \cdot 2003 \cdot 1.9 \times 10^{-17} \approx 7.7 \times 10^{-14}$ になる。
+前のセルの参照値との相対差 $1.5 \times 10^{-13}$ がこれより大きいのは、上界が格納された $A$ と $b$ を基準にしていて、格納の丸めによる $\kappa_1(A)\,u$ の程度の差が別に加わるからである。
+次数が 5 以上の行列では `condition_estimate` の値は推定値になり、その性質は[分解と受理を分ける規約](oxref:linalg-acceptance-contract)にある。
+
+失敗と拒否の返し方は、呼び出す形によって次のように異なる。
+
+- 入力の誤りと数値計算の破綻は `Err(SciOxideError)` で返り、分類は `kind()` で読む。
+  形の不一致は `DimensionMismatch`、NaN や無限大を含む入力は `NonFinite`、LU の厳密に 0 のピボットは `Singular`、数値的に正定値でない行列の Cholesky 分解は `DomainError` になる。
+- 直接法のワンショット関数と標準形式の `solve` は、受理した解だけを返す。
+  受理しなければ `DirectSolveTermination::require_accepted` が終了理由をエラーに変え、`RankDeficient` は `Singular`、ほかの終了理由は `NumericalInstability` になる。
+  標準形式が使う既定の条件は `RankPolicy::Exact` だけなので、LU では分解が成功すれば求解は拒否されない。
+- オプション付き形式の `solve_with_options` は受理しなかった場合も `Ok` の `DirectSolveResult` を返す。
+  `solution()` は `None` になり、`report()` の終了理由が理由を示し、拒否した候補のランクと条件数の診断と、残差の検査で拒否した場合はその残差も残る。
+- 出力先を指定する API の `solve_into` はレポートだけを返し、受理しなかった場合は出力を書き換えない。
+- CG や GMRES などの一つの右辺を解く反復法では、標準形式の `solve(a, b)` が許容誤差を満たさずに止まると `ConvergenceFailure` のエラーを返す。
+  オプション付き形式の `solve_with_options(a, b, preconditioning, x0)` は上限で止まっても真の残差を確かめた反復のうち最良のものを `Ok` で返すので、成否はレポートの終了理由 `LinearSolveTermination` の `is_success()` で判定する。
+
+`Err` と未収束などの結果を含む `Ok` の一般的な区別は[エラー仕様と部分結果](../concepts/errors-and-partial-results/)にあり、誤差の測り方と受理の規約は[線形代数の数理と共通の規約](algorithms/)にまとめてある。
+
+## 機能一覧
+
+各行の型と関数を扱うページを示す。
+ワンショット関数がある行では、その関数を最初に書いた。
+
+| 機能 | 主な型・関数 | 扱うページ |
+|---|---|---|
+| 格納・ビュー・密行列の積 | `Matrix`、`Vector`、`MatrixView`、`mul_mat`、`mul_vec`、`MatrixView::norm`、`givens_rotation` | [メモリレイアウト・ビュー・密行列カーネルと精度階層](algorithms/storage-views-and-kernels/) |
+| 作業領域と実行の制御 | `LinalgWorkspace`、`LinalgExecutionOptions`、`LinalgExecutionContext`、`IterativeWorkspace`、`last_attempt` | [作業領域・実行コンテキスト・試行記録](algorithms/workspaces-and-execution/) |
+| 直接法と解の受理 | `solve`、`LuDecomposition`、`CholeskyDecomposition`、`LdlDecomposition`、`DirectSolveOptions`、`RankPolicy` | [LU・Cholesky・LDL 分解と直接解の受理](algorithms/direct-and-structured-solvers/) |
+| 構造を持つ行列 | `solve_triangular`、`solve_structured`、`TriangularPlan`、`TridiagonalLuDecomposition`、`CyclicTridiagonalPlan`、`BandedLuDecomposition`、`StructuredSolvePlan`、`StructuredMatrixView` | [三重対角・帯・Toeplitz 行列と構造行列の直接解法](algorithms/structured-systems/) |
+| 反復改良 | `IterativeRefinement`、`RefinementProblem`、`RefinementOptions`、`RefinementReport` | [混合精度の反復改良と後退誤差](algorithms/iterative-refinement/) |
+| QR と最小二乗 | `least_squares`、`HouseholderDecomposition`、`HouseholderMinimumNormPlan`、`RqDecomposition`、`QrUpdateDecomposition` | [QR・LQ・RQ 分解と最小二乗法](algorithms/qr-and-least-squares/) |
+| 特異値分解と数値ランク | `SvdValues`、`ThinSvdDecomposition`、`SvdDecomposition`、`SvdValues::analyze_rank` | [特異値分解・数値ランク・正則化解](algorithms/svd-and-rank/) |
+| 部分空間と一般化分解 | `null_space`、`orth`、`subspace_angles`、`orthogonal_procrustes`、`GsvdDecomposition`、`CsdDecomposition`、`PolarDecomposition` | [部分空間・GSVD・CS 分解・極分解](algorithms/subspaces-and-generalized-decompositions/) |
+| 固有値と Schur 分解 | `HermitianEigenDecomposition`、`GeneralEigenDecomposition`、`SchurDecomposition` | [固有値問題と Schur 分解](algorithms/eigenproblems/) |
+| 一般化固有値問題 | `GeneralizedHermitianEigenDecomposition`、`GeneralizedSchurDecomposition` | [一般化固有値問題と QZ 分解](algorithms/generalized-eigenproblems/) |
+| Krylov 部分空間法 | `CgSolver`、`MinresSolver`、`GmresSolver`、`BicgstabSolver`、`Preconditioning` | [クリロフ部分空間法と前処理](algorithms/krylov-and-preconditioning/) |
+| そのほかの反復法 | `BicgSolver`、`QmrSolver`、`LsqrSolver`、`LsmrSolver`、`LgmresSolver`、`GcrotSolver`、`SorSolver` | [双直交法・最小二乗 Krylov 法・定常反復](algorithms/advanced-krylov-and-stationary/) |
+| 行列関数 | `matrix_function`、`MatrixFunctionPlan`、`MatrixFunction`、`SparsePowerPlan`、`SparseFunctionPlan` | [行列関数・Fréchet 微分・疎行列関数](algorithms/matrix-functions-and-equations/) |
+| 行列方程式 | `solve_sylvester`、`solve_lyapunov`、`solve_riccati`、`SylvesterPlan`、`LyapunovPlan`、`RiccatiPlan` | [Sylvester・Lyapunov・Riccati 方程式](algorithms/matrix-equations/) |
+| 作用素の関数の作用 | `ExponentialAction`、`FunctionAction`、`PhiFunction` | [行列関数のベクトルへの適用と手法オブジェクト](algorithms/operator-actions-and-partial-spectra/) |
+| 大きな作用素の少数の固有対 | `PartialSpectrumSolver`、`LobpcgSolver`、`SpectrumOperator::ShiftInvert` | [大きな作用素の少数の固有対](algorithms/partial-spectra/) |
+| 部分 SVD と低ランク近似 | `PartialSvdSolver`、`RandomizedLowRank` | [部分 SVD と乱択低ランク近似](algorithms/partial-svd-and-low-rank/) |
+| 1 ノルムの推定と作用素のノルム | `OneNormEstimator`、`operator_norm` | [1 ノルムの推定と作用素の厳密なノルム](algorithms/norm-estimation/) |
+| 外部 BLAS の利用（`blas` 機能） | `BlasProvider`、`BlasDispatch`、`BlasCapabilities`、`BlasFallbackPolicy` | [外部 BLAS プロバイダーの仕様](algorithms/blas-provider/) |
+
+## まとめ
+
+一回だけ解くなら、分解から求解までを一度に行って解だけを返すワンショット関数 `solve` を使い、分解を何度も使うなら標準形式の `LuDecomposition::factor` と `solve` を使う。
+計算した解の相対誤差は入力を格納するときの丸めだけでも $\kappa_1(A)\,u$ の程度になりうるので、悪条件が疑われる問題では条件数か逆条件数を確かめる。
+終了理由・後退誤差・逆条件数を読むならオプション付き形式の `solve_with_options` を使い、`Ok` であることではなく終了理由の `is_success()` で成否を判定する。
+後退誤差が $10^{-17}$ の程度でも、前進誤差の上界は条件数と後退誤差の積で決まるので、精度は二つを組み合わせて見積もる。
+解の精度に要求がある用途では、`with_minimum_reciprocal_condition` で逆条件数の下限を与え、悪条件の問題を `IllConditioned` として受理から外す。
+
+## 次に読むページ
+
+- [線形代数ソルバーの選び方](choosing/)：行列の性質と問題の種類から、分解と反復法のどれを使うかを決める。
+- [線形代数の数理と共通の規約](algorithms/)：記号、誤差の測り方、受理の規約を確かめ、各アルゴリズムページの対象を見る。
+- [作業領域・実行コンテキスト・試行記録](algorithms/workspaces-and-execution/)：標準形式・オプション付き形式・出力先を指定する API・スコープ付き API の違いと、作業領域を事前確保して確保をなくす手順を確かめる。
+- [例題の一覧](examples/)：力学、確率、量子、統計、制御の題材で、各機能を独立な検算とともに試す。
+- [線形代数の API ガイド](api/)：公開されている全項目を用途別の表で引く。

@@ -1,0 +1,574 @@
+---
+title: "Multistart"
+description: "Use the Himmelblau function to examine MultiStart composition, starting point designs, counted random sources, replacement local solvers, per-start reports and basin grouping."
+sidebar:
+  order: 381
+references:
+  optimize-multistart: "multistart-composition"
+  optimize-start-designs: "starting-point-designs-and-random-sources"
+  optimize-local-solver-injection: "replacing-the-local-solver"
+  optimize-global-search-results: "results-and-workspaces"
+---
+
+Multistart runs a local solver from each of many starting points in a box and takes the lowest local solution as a candidate global minimum.
+It retains the speed of local solvers, and independent computations for each start allow parallel execution.
+As explained in [Basin hit probability](oxref:optimize-basin-hit-probability), the required starting point count depends on basin volume ratios.
+
+This page explains the starting point designs, random sources, local solver factory and results composing SciOxide's `MultiStart`.
+Finally, use the Himmelblau function to examine how starting point count and design affect discovered minima, and how local solvers affect evaluation counts and local-solution accuracy.
+The `MultiStart` method does not claim global optimality; completing all starts terminates with unsuccessful `SearchBudgetCompleted`.
+
+## Multistart composition
+
+For $M$ starting points $\mathbf{x}^{(0)}_i$ ($i = 0, \dots, M-1$), perform these steps in starting point order.
+
+1. Generate $\mathbf{x}^{(0)}_i$ from the starting point design.
+2. Minimize from $\mathbf{x}^{(0)}_i$ with a local solver and retain the result in its start report.
+3. Update the best point if its objective is the lowest so far; if the local solve succeeded, compare it with existing local solutions and group it into a basin.
+
+Computation is the sum of $M$ local solves; memory is $O(Md)$ for per-start points and results.
+
+The `MultiStart::new(options, design, factory)` constructor combines search settings `GlobalSearchOptions`, starting point design `StartDesign` and local solver factory `LocalSolverFactory`.
+The `new` constructor returns `InvalidInput` if the tolerance for grouping observed minima is NaN, infinite or nonpositive.
+The search box is supplied on every call through `BoundedObjective` of `minimize_into(problem, output, workspace, scope)` or `minimize(problem)` rather than fixed in the method object.
+The `scioxide_core::Bounds` of `BoundedObjective::new(objective, bounds)` must have finite lower and upper endpoints $l_i < u_i$ for every coordinate; otherwise `minimize_into` returns `InvalidInput`.
+The search converts this box into `FiniteBounds`, representing a finite correctly ordered box, and passes it to the starting point design and local solver.
+
+The `GlobalSearchOptions::default()` defaults are 10 starts, seed 42, no per-local-solve limit, grouping tolerance $\sqrt{\varepsilon}$ (for both coordinates and objectives), sequential execution and no time limit.
+Change these with `with_starts`, `with_seed`, `with_local_budgets`, `with_basin_tolerances`, `with_execution` and `with_time_limit`.
+A time limit requires an execution-context clock; `minimize_into` returns `CapabilityUnavailable` for a context without one.
+Settings do not include global search limits such as evaluation counts.
+Passing a parent `SolveContext` to `scope` applies its limits to the entire search, including local solve evaluations.
+
+Nonsequential execution policies require constructing the problem with `BoundedObjective::new_sync`.
+The search then divides finite remaining parent limits into fixed per-start allocations before parallel execution.
+Unused allocations are not transferred between starts; under finite limits results may therefore differ from sequential execution, but do not depend on worker count.
+
+## Starting point designs and random sources
+
+The `StartDesign` trait defines starting point generation rules.
+The `validate(dimension, starts)` method checks support for the dimension and requested starting point count before the first evaluation.
+The `point(index, bounds, random, output)` method writes starting point $i$ to `output`.
+Points depend only on the index, box and supplied random source, not earlier calls.
+Implementations must write every coordinate of `output`.
+Built-in design `point` methods return `DimensionMismatch` without modifying `output` or drawing randomness if dimensions of the box and `output` differ (also the design dimension for `BorrowedStartDesign` and `QmcPlan`).
+If a returned point is outside the box or nonfinite, the search returns `InvalidInput`.
+
+The three built-in designs are:
+
+- `UniformStartDesign`: draw one uniform random number per coordinate and map it linearly to interval $[l_j, u_j]$.
+- `BorrowedStartDesign::new(points, dimension)`: borrow user-supplied row-wise points and use row $i$ as starting point $i$.
+  Zero dimension, empty points, length not divisible by dimension, or NaN/infinite entries yield `InvalidInput`; if there are fewer rows than requested starts, `validate` returns `InvalidInput`.
+- `QmcPlan` from scioxide-random: map point $i$ of a Sobol or Halton sequence linearly to the box without drawing random numbers.
+
+For other designs such as stratified sampling, supply points with `BorrowedStartDesign` or implement `StartDesign`.
+
+The `SearchRandom` type is the random source supplied to starting point designs and basin hopping perturbations.
+Users do not construct it; trait implementations receive a borrow.
+The `uniform()` method returns a uniform random value in $[0, 1)$.
+The `SearchRandom` type also implements scioxide-random's `BitGenerator` and `Rng`, allowing sampling from its distributions.
+Each random word drawn (for example, a 64-bit word) counts once toward the search sample limit.
+If the limit refuses a draw, the generator does not advance; the search stops with `SampleLimit` and returns its best point so far.
+Multistart uses a separate seeded random sequence for each starting point.
+Starting point $i$ therefore depends on neither other starts nor execution order; identical seeds and settings reproduce it.
+
+## Replacing the local solver
+
+The `LocalSolverFactory` trait creates local solvers that optimize from starting points.
+The `prepare(dimension)` method is called before the first evaluation; one solver is prepared per start, with no state shared between starts.
+A factory's `Debug` output identifies its configuration; changing it causes local solvers in workspace to be prepared again.
+
+The `SearchLocalSolver::minimize_into(problem, start, seed, output, context)` method performs one local solve from `start`.
+Every call must start a new solve without using state from earlier calls.
+Objective evaluations use the supplied `context`.
+Because `context` is a child of the global search context, local evaluations count toward global search limits.
+The `seed` value identifies the start for local solvers using randomness.
+
+If the local solver returns `ConvergenceFailure`, `NumericalInstability` or `Singular` errors, the search records them in the start report and continues to the next start.
+Sequential execution similarly records local solves ending with execution stops (`ExecutionStopped`).
+Other errors stop the search.
+A local solver returning an out-of-box point, nonfinite objective or `NotStarted` termination also stops the search with `InvalidInput`.
+
+The built-in `PowellLocalFactory` factory creates [Powell method](../powell-conjugate-directions/) local solver `PowellSearchLocal` bounded by the search box.
+The `PowellLocalFactory::new(options)` constructor accepts `PowellOptions`, while `default()` uses defaults.
+Each `PowellSearchLocal` line search uses Brent's [scalar minimization](../scalar-minimization/) across the entire segment where the direction intersects the box.
+If the full segment reveals no lower value, evaluate one trial on each side of the current point, each at distance at most 1 without exceeding segment endpoints; minimize again between the current point and a lower trial, or within the bracket formed by two higher trials.
+This searches again for nearby decrease even when drawn toward another valley along the segment.
+Scalar minimization returns pairs `MinimumSample` of points and finite objectives, including the best point and final three points (`ScalarMinimumResult::samples()`).
+See [Lennard-Jones cluster structure search](../../examples/lennard-jones-clusters/) for connecting a gradient-based local solver.
+
+## Results and workspaces
+
+The `GlobalSearchResult::empty()` constructor prepares an allocation-free result that the search sizes on its first call.
+The `starts()` method returns reports `SearchStartReport` for executed starts in starting point order.
+Each report contains starting point `start()`, candidate `candidate()`, local result `local_result()`, failure error `error()`, evaluation count `counts()` and assigned basin number `basin()`.
+
+The `best()` method returns the lowest-objective candidate regardless of local success; `best_successful()` returns the lowest among successful local candidates (whose termination `is_success()` is true).
+Neither proves a global minimum.
+The `successes()`, `failures()` and `completed()` methods return counts of successful local solves, errored local solves and starts producing candidates.
+
+The `basins()` method counts basins grouping successful local solutions.
+For local solutions $\mathbf{a}$ and $\mathbf{b}$, take the objective pair $(f(\mathbf{a}), f(\mathbf{b}))$ and each coordinate pair $(a_j, b_j)$ as $(x, y)$; they are assigned to the same basin if every pair satisfies
+
+$$
+\left| \frac{x}{s} - \frac{y}{s} \right| \le \tau, \qquad s = \max(1, |x|, |y|)
+$$
+
+.
+The $\tau$ values are coordinate and objective tolerances, changed with `with_basin_tolerances`.
+The $s$ form compares quantities below unit magnitude using absolute errors and larger quantities using relative errors.
+The `basin()` method returns the index of the first start assigned to that basin.
+This empirical grouping rule does not prove that solutions belong to the same basin.
+
+Completing all starting points yields `SearchBudgetCompleted` and is not success.
+Evaluation or other limits, cancellation and deadlines preserve reports for executed starts and indicate the stop cause in the termination reason.
+Stopping before the first accepted point returns an error rather than a result.
+
+The `GlobalSearchWorkspace` workspace stores per-start local solvers, seeds and report memory.
+Prepare it with `MultiStart::workspace(dimension)`; calls with the same dimension, starting point count, seed and local settings reuse it without reallocating.
+The `GlobalSearchWorkspaceRequirements` type describes requirements returned by `workspace_requirements(dimension)` and contains `dimension()` and `starts()`.
+The `last_attempt()` and `last_accepted()` methods return records and the best point from the preceding call.
+
+## Himmelblau function and an injected local solver
+
+The Himmelblau function
+
+$$
+f(x, y) = (x^2 + y - 11)^2 + (x + y^2 - 7)^2
+$$
+
+has four local minima in box $[-5, 5]^2$, all satisfying $f = 0$.
+The minima are $(3, 2)$, $(-2.805118, 3.131312)$, $(-3.779310, -3.283186)$ and $(3.584428, -1.848126)$; all except the first were found numerically.
+Its gradient is
+
+$$
+\nabla f = \bigl(4x a + 2b,\; 2a + 4y b\bigr), \qquad a = x^2 + y - 11,\; b = x + y^2 - 7
+$$
+
+.
+
+The following definitions block defines this function as an `ObjectiveFunction` with an analytical gradient and implements a factory injecting L-BFGS-B as the local solver.
+The `LbfgsBFactory::prepare` method prepares one `LbfgsB` and workspace per start; `LbfgsBLocal::minimize_into` performs one local solve with the supplied box-constrained problem and context.
+The `search` helper constructs and solves with `MultiStart` according to starting point design and local solver choice.
+Distance `nearest` to a known minimum and maximum gradient component `gradient_norm` independently check results.
+
+```rust
+//| id: optimize-multistart-himmelblau-model
+//| kind: definitions
+//| title: "Himmelblau function and a factory injecting L-BFGS-B local solvers"
+//| crates: [scioxide-core, scioxide-optimize]
+use scioxide_core::{SciOxideError, SolveContext};
+use scioxide_optimize::{
+    BoundedObjective, GlobalSearchOptions, GlobalSearchResult, LbfgsB, LbfgsBWorkspace,
+    LocalSolverFactory, MultiStart, ObjectiveFunction, OptimizeResult, PowellLocalFactory,
+    SearchLocalSolver, StartDesign,
+};
+
+/// Himmelblau function f = a² + b², a = x² + y − 11, b = x + y² − 7, and its analytical gradient.
+pub(crate) struct Himmelblau;
+impl ObjectiveFunction<f64> for Himmelblau {
+    fn dim(&self) -> usize {
+        2
+    }
+    fn eval(&self, x: &[f64]) -> Result<f64, SciOxideError> {
+        let (a, b) = (x[0] * x[0] + x[1] - 11.0, x[0] + x[1] * x[1] - 7.0);
+        Ok(a * a + b * b)
+    }
+    fn gradient_into(&self, x: &[f64], out: &mut [f64]) -> Result<bool, SciOxideError> {
+        let (a, b) = (x[0] * x[0] + x[1] - 11.0, x[0] + x[1] * x[1] - 7.0);
+        out[0] = 4.0 * x[0] * a + 2.0 * b;
+        out[1] = 2.0 * a + 4.0 * x[1] * b;
+        Ok(true)
+    }
+}
+
+/// Injected local solver factory. The search calls prepare for every start.
+#[derive(Debug)]
+pub(crate) struct LbfgsBFactory;
+pub(crate) struct LbfgsBLocal {
+    solver: LbfgsB<f64>,
+    work: LbfgsBWorkspace<f64>,
+}
+impl LocalSolverFactory<f64> for LbfgsBFactory {
+    type Solver = LbfgsBLocal;
+    fn prepare(&self, dimension: usize) -> Result<LbfgsBLocal, SciOxideError> {
+        let solver = LbfgsB::default();
+        let work = solver.workspace(dimension)?;
+        Ok(LbfgsBLocal { solver, work })
+    }
+}
+impl SearchLocalSolver<f64> for LbfgsBLocal {
+    fn minimize_into(
+        &mut self,
+        problem: &BoundedObjective<'_, f64>,
+        start: &[f64],
+        _: u64,
+        output: &mut OptimizeResult<f64>,
+        context: &mut SolveContext<'_, '_>,
+    ) -> Result<(), SciOxideError> {
+        // The box belongs to problem; evaluations are counted through the supplied context.
+        self.solver
+            .minimize_into(problem, start, output, &mut self.work, context)
+    }
+}
+
+/// Construct and solve with a method object for each design type. If powell is true, use built-in Powell.
+pub(crate) fn search<D: StartDesign<f64>>(
+    options: GlobalSearchOptions<f64>,
+    design: D,
+    powell: bool,
+    problem: &BoundedObjective<'_, f64>,
+) -> Result<GlobalSearchResult<f64>, SciOxideError> {
+    if powell {
+        MultiStart::new(options, design, PowellLocalFactory::default())?.minimize(problem)
+    } else {
+        MultiStart::new(options, design, LbfgsBFactory)?.minimize(problem)
+    }
+}
+
+/// Four known minima (all f = 0). Except for (3, 2), values were computed to double precision with Newton's method.
+pub(crate) const MINIMA: [(f64, f64); 4] = [
+    (3.0, 2.0),
+    (-2.805118086952745, 3.131312518250573),
+    (-3.779310253377747, -3.283185991286170),
+    (3.584428340330492, -1.848126526964404),
+];
+
+/// Distance to the nearest known minimum.
+pub(crate) fn nearest(x: &[f64]) -> f64 {
+    MINIMA
+        .iter()
+        .map(|&(a, b)| (x[0] - a).hypot(x[1] - b))
+        .fold(f64::INFINITY, f64::min)
+}
+
+/// Maximum analytical gradient component ‖∇f‖∞.
+pub(crate) fn gradient_norm(x: &[f64]) -> Result<f64, SciOxideError> {
+    let mut g = [0.0; 2];
+    Himmelblau.gradient_into(x, &mut g)?;
+    Ok(g[0].abs().max(g[1].abs()))
+}
+```
+
+### Starting point count and design
+
+This cell varies starting point count $M$ and design (uniform random, Sobol and Halton) with L-BFGS-B injected into `MultiStart`, examining how many minima are discovered.
+Output includes a scatter plot of starts and local solutions, basin representatives, and a search summary and outcome.
+Use representatives' gradient magnitudes and distances to known minima as independent checks, counting known minima reached within $10^{-4}$.
+
+```rust
+//| id: optimize-multistart-designs
+//| ref: optimize-multistart-designs
+//| title: "Vary starting point count and design to examine discovery of Himmelblau minima"
+//| run: reactive
+//| uses: [optimize-multistart-himmelblau-model]
+//| crates: [scioxide-core, scioxide-optimize, scioxide-random]
+//| inputs:
+//|   starts: {"type":"range","label":"Starting point count M [points]","description":"Number of starts for local solvers.","min":1,"max":40,"step":1,"value":6}
+//|   design: {"type":"select","label":"Starting point design","options":["Uniform random","Sobol sequence","Halton sequence"],"value":"Uniform random"}
+//|   seed: {"type":"range","label":"Random seed [-]","description":"Change uniform random starts. This does not affect quasi-random designs.","min":1,"max":100,"step":1,"value":42}
+//| cases:
+//|   - {"id":"many-starts","label":"M = 40","description":"All four basins are found, and per-basin start counts reveal differences in basin sizes.","inputs":{"starts":40}}
+//|   - {"id":"halton","label":"Halton sequence","description":"With the same six points, Halton finds all four minima.","inputs":{"design":"Halton sequence"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":"SearchBudgetCompleted"}
+//|       - {"artifact":"summary","path":"/rows/0/3","equals":3}
+//|       - {"artifact":"summary","path":"/rows/0/4","equals":3}
+//|       - {"artifact":"basins","path":"/rows/0/5","range":{"min":0,"max":1e-6}}
+//|       - {"path":"/outputs/3/state","equals":"partial"}
+//|   - case: many-starts
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/4","equals":4}
+//|   - case: halton
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/4","equals":4}
+use scioxide_core::{Bounds, Budget, EvaluationRole};
+use scioxide_optimize::{BoundedObjective, GlobalSearchOptions, UniformStartDesign};
+use scioxide_random::QmcPlan;
+
+let bounds = Bounds::new(vec![(Some(-5.0), Some(5.0)); 2]).map_err(|e| e.to_string())?;
+let problem = BoundedObjective::new(&Himmelblau, &bounds).map_err(|e| e.to_string())?;
+let count = Budget::try_from(starts.round() as usize).map_err(|e| e.to_string())?;
+let options = GlobalSearchOptions::default()
+    .with_starts(count)
+    .with_seed(seed.round() as u64);
+// Each design has a different type, so construct method objects inside search.
+let result = match design.as_str() {
+    "Sobol sequence" => search(
+        options,
+        QmcPlan::sobol(2).map_err(|e| e.to_string())?,
+        false,
+        &problem,
+    ),
+    "Halton sequence" => search(
+        options,
+        QmcPlan::halton(2).map_err(|e| e.to_string())?,
+        false,
+        &problem,
+    ),
+    _ => search(options, UniformStartDesign, false, &problem),
+}
+.map_err(|e| e.to_string())?;
+
+let reports = result.starts();
+let start_points: Vec<[f64; 2]> = reports
+    .iter()
+    .map(|r| [r.start()[0], r.start()[1]])
+    .collect();
+let local_points: Vec<[f64; 2]> = reports
+    .iter()
+    .filter_map(|r| r.local_result())
+    .map(|r| [r.x()[0], r.x()[1]])
+    .collect();
+let known: Vec<[f64; 2]> = MINIMA.iter().map(|&(a, b)| [a, b]).collect();
+emit_scatter_chart!(
+    &vec![
+        serde_json::json!({
+            "name": "Starting points",
+            "points": start_points,
+            "style": { "symbol": "circle" }
+        }),
+        serde_json::json!({
+            "name": "Local solutions",
+            "points": local_points,
+            "style": { "symbol": "diamond" }
+        }),
+        serde_json::json!({
+            "name": "Known minima",
+            "points": known,
+            "style": { "symbol": "emptyCircle" }
+        })
+    ],
+    options = &serde_json::json!({
+        "xLabel": "x [-]",
+        "yLabel": "y [-]",
+        "xMin": -5.0,
+        "xMax": 5.0,
+        "yMin": -5.0,
+        "yMax": 5.0
+    })
+);
+// Basin representatives (the first start assigned to each basin) and assigned start counts.
+let mut basins = Vec::new();
+for (index, report) in reports.iter().enumerate() {
+    if let (Some(basin), Some(point)) = (report.basin(), report.local_result())
+        && basin == index
+    {
+        let members = reports.iter().filter(|r| r.basin() == Some(index)).count();
+        let x = point.x();
+        let gradient = gradient_norm(x).map_err(|e| e.to_string())?;
+        basins.push((
+            index,
+            x[0],
+            x[1],
+            point.fun(),
+            members,
+            gradient,
+            nearest(x),
+        ));
+    }
+}
+let found = MINIMA
+    .iter()
+    .filter(|&&(a, b)| {
+        basins
+            .iter()
+            .any(|row| (row.1 - a).hypot(row.2 - b) <= 1e-4)
+    })
+    .count();
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed4 = serde_json::json!({ "fractionDigits": 4 });
+emit_table_with_columns!(
+    serde_json::json!([
+        { "key": "0", "label": "Representative start index", "type": "integer" },
+        { "key": "1", "label": "x [-]", "type": "number", "format": fixed4 },
+        { "key": "2", "label": "y [-]", "type": "number", "format": fixed4 },
+        { "key": "3", "label": "Objective [-]", "type": "number", "format": sci3 },
+        { "key": "4", "label": "Assigned starts [points]", "type": "integer" },
+        { "key": "5", "label": "Gradient magnitude ‖∇f‖∞ [-]", "type": "number", "format": sci3 },
+        { "key": "6", "label": "Distance to known minimum [-]", "type": "number", "format": sci3 }
+    ]),
+    basins,
+    metadata = serde_json::json!({ "id": "basins" })
+);
+let evaluations = result
+    .counts()
+    .total()
+    .map_err(|e| e.to_string())?
+    .provider(EvaluationRole::Objective);
+let best = result.best().map(|r| r.fun());
+emit_table_with_columns!(
+    serde_json::json!([
+        { "key": "0", "label": "Termination reason" },
+        { "key": "1", "label": "Successful local solves [starts]", "type": "integer" },
+        { "key": "2", "label": "Local solve errors [starts]", "type": "integer" },
+        { "key": "3", "label": "Basins [count]", "type": "integer" },
+        { "key": "4", "label": "Known minima found [count]", "type": "integer" },
+        { "key": "5", "label": "Best objective [-]", "type": "number", "format": sci3, "nullText": "None" },
+        { "key": "6", "label": "Objective evaluations [count]", "type": "integer" }
+    ]),
+    vec![(
+        result.termination().to_string(),
+        result.successes(),
+        result.failures(),
+        result.basins(),
+        found,
+        best,
+        evaluations
+    )],
+    metadata = serde_json::json!({ "id": "summary" })
+);
+let mut outcome = Outcome::partial("Exhausted starting points. The best point is a candidate global minimum")
+    .status(result.termination().to_string())
+    .diagnostic("Basin count", result.basins() as f64, None)
+    .diagnostic("Known minima found", found as f64, None)
+    .diagnostic("Objective evaluations", evaluations as f64, None);
+if let Some(value) = best {
+    outcome = outcome.diagnostic("Best objective", value, None);
+}
+emit_outcome!(outcome);
+```
+
+With the default six uniform random points, all six local solves succeed and group into three basins.
+The discovered minima are $(-3.7793, -3.2832)$, $(3.5844, -1.8481)$ and $(3, 2)$; no starting point reaches the basin of $(-2.8051, 3.1313)$.
+Representatives have gradient magnitudes at most $3 \times 10^{-8}$ and distances to known minima at most $6 \times 10^{-10}$, using 100 objective evaluations in total.
+Increasing to 40 starts finds all four basins, with 6, 7, 19 and 8 starting points assigned to them.
+These starting point fractions estimate basin volume ratios for this local solver; the basin of $(3, 2)$ is largest.
+With six points, Halton finds four minima and Sobol finds three.
+Uniform random seed 1 finds four and seed 100 finds three; designs and seeds matter substantially while the starting point count is small.
+
+### Local solver evaluation counts and accuracy
+
+Choose the injected local solver according to what the objective can return and how far to refine local solutions.
+This cell runs built-in derivative-free Powell and analytical-gradient L-BFGS-B from the same seeded uniform starts, placing their rows together for each start.
+The same seed gives identical starts regardless of local solver, enabling paired comparison.
+Output gives per-start termination, objectives, objective and gradient evaluation counts, and per-solver totals and worst values.
+Check local accuracy using maximum gradient component $\|\nabla f\|_\infty$ computed separately from the solver's test and distance to known minima.
+
+```rust
+//| id: optimize-multistart-local-check
+//| ref: optimize-multistart-local-check
+//| title: "Check Powell and L-BFGS-B local solutions by gradients from identical starts"
+//| run: reactive
+//| uses: [optimize-multistart-himmelblau-model]
+//| crates: [scioxide-core, scioxide-optimize]
+//| inputs:
+//|   check_starts: {"type":"range","label":"Starting point count M [points]","description":"Number of starting points to compare.","min":1,"max":20,"step":1,"value":6}
+//|   check_seed: {"type":"range","label":"Random seed [-]","description":"Change the sequence of uniform starting points.","min":1,"max":100,"step":1,"value":42}
+//| cases:
+//|   - {"id":"other-seed","label":"Seed 7","description":"Check whether evaluation-count and accuracy differences follow the same pattern for other starts.","inputs":{"check_seed":7}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"local-check","path":"/rows/0/1","equals":"Powell"}
+//|       - {"artifact":"local-summary","path":"/rows/0/1","equals":6}
+//|       - {"artifact":"local-summary","path":"/rows/0/2","range":{"min":0,"max":1e-10}}
+//|       - {"artifact":"local-summary","path":"/rows/0/4","range":{"min":1000,"max":2000}}
+//|       - {"artifact":"local-summary","path":"/rows/1/1","equals":6}
+//|       - {"artifact":"local-summary","path":"/rows/1/2","range":{"min":0,"max":1e-7}}
+//|       - {"artifact":"local-summary","path":"/rows/1/3","range":{"min":0,"max":1e-6}}
+//|       - {"artifact":"local-summary","path":"/rows/1/4","range":{"min":50,"max":200}}
+//|   - case: other-seed
+//|     expect:
+//|       - {"artifact":"local-summary","path":"/rows/0/1","equals":6}
+//|       - {"artifact":"local-summary","path":"/rows/1/2","range":{"min":0,"max":1e-7}}
+use scioxide_core::{Bounds, Budget, EvaluationRole};
+use scioxide_optimize::{BoundedObjective, GlobalSearchOptions, UniformStartDesign};
+
+let bounds = Bounds::new(vec![(Some(-5.0), Some(5.0)); 2]).map_err(|e| e.to_string())?;
+let problem = BoundedObjective::new(&Himmelblau, &bounds).map_err(|e| e.to_string())?;
+let count = Budget::try_from(check_starts.round() as usize).map_err(|e| e.to_string())?;
+let options = GlobalSearchOptions::default()
+    .with_starts(count)
+    .with_seed(check_seed.round() as u64);
+let powell =
+    search(options.clone(), UniformStartDesign, true, &problem).map_err(|e| e.to_string())?;
+let lbfgsb = search(options, UniformStartDesign, false, &problem).map_err(|e| e.to_string())?;
+let mut rows = Vec::new();
+let mut summary = Vec::new();
+for (name, result) in [("Powell", &powell), ("L-BFGS-B", &lbfgsb)] {
+    // Totals: successful local solves, worst gradient and distance, and objective and gradient evaluation counts.
+    let mut worst = (0.0_f64, 0.0_f64);
+    let (mut objective, mut gradient) = (0, 0);
+    for (index, report) in result.starts().iter().enumerate() {
+        let counts = report.counts().total().map_err(|e| e.to_string())?;
+        let local = report.local_result();
+        // Independent check: analytical gradients at local solutions and distances to known minima.
+        let check = local
+            .map(|r| gradient_norm(r.x()).map(|g| (g, nearest(r.x()))))
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        if let Some((g, d)) = check {
+            worst = (worst.0.max(g), worst.1.max(d));
+        }
+        objective += counts.provider(EvaluationRole::Objective);
+        gradient += counts.provider(EvaluationRole::Gradient);
+        rows.push((
+            index,
+            name,
+            local.map_or("Error".to_string(), |r| r.termination().to_string()),
+            local.map(|r| r.fun()),
+            check.map(|c| c.0),
+            check.map(|c| c.1),
+            counts.provider(EvaluationRole::Objective),
+            counts.provider(EvaluationRole::Gradient),
+        ));
+    }
+    summary.push((name, result.successes(), worst.0, worst.1, objective, gradient));
+}
+rows.sort_by_key(|row| row.0);
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+emit_table_with_columns!(
+    serde_json::json!([
+        { "key": "0", "label": "Start index", "type": "integer" },
+        { "key": "1", "label": "Local solver" },
+        { "key": "2", "label": "Termination reason" },
+        { "key": "3", "label": "Objective [-]", "type": "number", "format": sci3, "nullText": "None" },
+        { "key": "4", "label": "‖∇f‖∞ [-]", "type": "number", "format": sci3, "nullText": "None" },
+        { "key": "5", "label": "Distance to local minimum [-]", "type": "number", "format": sci3, "nullText": "None" },
+        { "key": "6", "label": "Objective evaluations [count]", "type": "integer" },
+        { "key": "7", "label": "Gradient evaluations [count]", "type": "integer" }
+    ]),
+    rows,
+    metadata = serde_json::json!({ "id": "local-check" })
+);
+emit_table_with_columns!(
+    serde_json::json!([
+        { "key": "0", "label": "Local solver" },
+        { "key": "1", "label": "Successful local solves [starts]", "type": "integer" },
+        { "key": "2", "label": "Maximum ‖∇f‖∞ [-]", "type": "number", "format": sci3 },
+        { "key": "3", "label": "Maximum distance to a minimum [-]", "type": "number", "format": sci3 },
+        { "key": "4", "label": "Total objective evaluations [count]", "type": "integer" },
+        { "key": "5", "label": "Total gradient evaluations [count]", "type": "integer" }
+    ]),
+    summary,
+    metadata = serde_json::json!({ "id": "local-summary" })
+);
+```
+
+For six points with default seed 42, all six solves succeed for both local solvers (Powell with `Converged` and L-BFGS-B with `GradientSmall`), and every local solution is near a known minimum.
+Powell uses 1478 objective evaluations in total (163–289 per start), with maximum gradient components at most $5.9 \times 10^{-14}$ and distances to known minima at most $10^{-15}$.
+L-BFGS-B uses 100 objective and 73 gradient evaluations, with maximum gradient components at most $2.6 \times 10^{-8}$ and distances at most $5.4 \times 10^{-10}$.
+L-BFGS-B stops when its gradient test meets the default absolute and relative tolerances $\sqrt{\varepsilon}$, so gradient magnitudes remain at that tolerance scale.
+Powell does not use gradients and continues line searches until both coordinate displacement and objective decrease in one sweep fall below tolerance.
+For this function, Powell uses about 15 times as many objective evaluations as L-BFGS-B and stops much closer to minima.
+With 20 starts, all local solves also succeed; Powell uses 4645 objective evaluations versus 319 for L-BFGS-B (plus 241 gradient evaluations).
+For objectives with cheap gradients, injecting a gradient-based local solver reduces evaluations.
+Use built-in Powell for objectives without gradients.
+For either solver, successful termination alone does not establish a minimum; check gradients or known values.
+
+## Summary
+
+The `MultiStart` method combines a starting point design, local solver factory and settings, returning per-start reports and basin groups.
+Choose starts from `UniformStartDesign`, `BorrowedStartDesign` and `QmcPlan` or implement `StartDesign`; per-start randomness is derived from the seed, reproducing points under identical settings.
+Replace local solvers by implementing `LocalSolverFactory` and `SearchLocalSolver`, counting evaluations through the supplied context.
+Injecting gradient-based local solvers greatly reduces evaluations when gradients are available; for either solver, check gradients or known values rather than inferring minima solely from successful termination.
+Because `SearchBudgetCompleted` is unsuccessful, treat the best point as a candidate to check with other seeds, designs or methods.
+
+## Further reading
+
+- [Limits of global search and basin hit probability](../global-search/): estimate starting point counts from basin volume ratios and compare other global methods.
+- [Differential evolution](../differential-evolution/): examine population search without local solvers and per-generation acceptance and spread.
+- [Multistart, basin hopping, dual annealing and differential evolution API](../../api/global-search/): examine `MultiStart`, starting point designs, local solver traits and result contracts.

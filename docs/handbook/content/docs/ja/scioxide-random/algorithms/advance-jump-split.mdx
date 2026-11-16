@@ -1,0 +1,275 @@
+---
+title: 系列のスキップ・ジャンプ・分割
+description: 漸化式の閉じた形による前進、F₂ 線形の生成器のジャンプ多項式、split と substream の系列の間隔と重なり、Philox と Threefry のカウンター、BoundedSubstream と StreamPartitioner による並列の系列。
+sidebar:
+  order: 308
+references:
+  random-prng-advance-jump-split: "前進ジャンプ分割"
+  random-prng-stream-spacing: "系列の間隔と重なり"
+  random-prng-counter-based: "カウンター型生成器"
+---
+
+並列の計算では、ワーカーごとに別の乱数の系列が要る。
+シードをずらすだけでは系列が重ならないことを保証できないので、`scioxide-random` は一つの根から系列を前進・ジャンプ・分割で切り出す道具を持つ。
+このページはそれぞれの数学的な仕組みと計算量、系列の間隔から何が保証されるかを説明する。
+実行 Plan の分割に系列を割り当てる方法は[範囲付きの系列と実行 Plan の分割](../bounded-streams-and-partitions/)で扱う。
+生成器ごとの漸化式と周期は[生成器の種類](oxref:random-prng-families)にある。
+
+## 前進・ジャンプ・分割
+
+`SkipAhead::skip_ahead(k)` は生成器をネイティブ出力ワード $k$ 個分（$k$ 遷移）進め、`skip_to(i)` は位置 $i$ へ進める。
+`skip_to` は後退できず、現在より前の位置は `OutOfBounds` で拒否する。
+前進はワードを作らず、漸化式の閉じた形を使う。
+
+LCG の一回の遷移は一次写像 $f(x) = a x + c$ である。
+$k$ 回の合成は $f^{k}(x) = a^{k} x + c\,(a^{k-1} + \dots + a + 1)$ で、写像を $(a, c)$ の組で表すと、二乗は $(a, c) \mapsto (a^2, (a + 1) c)$ になる。
+$k$ を二進展開して二乗と合成を繰り返せば、$O(\log k)$ 回の乗算で $f^{k}$ が求まる（Brown 1994）。
+すべての演算は法 $2^{128}$（`Lcg64` は $2^{64}$）で閉じるので、$a - 1$ での除算は要らない。
+`Pcg64` と `Lcg64` の `skip_ahead` はこの方法を使い、`SplitMix64` は状態が等差数列なので $s + k\gamma$ を一回計算する（$O(1)$）。
+`Mrg32k3a` は二つの成分の $3 \times 3$ 同伴行列 $A_1$、$A_2$ を二乗累乗し、$A^{k} s \bmod m$ を $O(\log k)$ 回の行列積で求める。
+カウンター型の生成器はカウンターを書き換えるだけなので $O(1)$ である。
+
+$\mathbb{F}_2$ 線形の生成器（xoshiro）の遷移は行列 $M$ で表せる。
+$M$ の特性多項式を $\chi$ とすると Cayley–Hamilton の定理から $\chi(M) = 0$ なので、$\lambda^{J} \bmod \chi(\lambda) = \sum_i c_i \lambda^i$ を前もって求めておけば $M^{J} s = \sum_i c_i M^i s$ になる。
+`JumpableRng::jump` と `long_jump` はこの多項式（ジャンプ多項式）を使い、生成器を 256 回（`Xoshiro128StarStar` は 128 回）進めながら、係数 $c_i$ が 1 の位置の状態を排他的論理和で足し合わせる。
+ジャンプの距離は `Xoshiro256StarStar` が $2^{128}$ と $2^{192}$ 遷移、`Xoshiro128StarStar` が $2^{64}$ と $2^{96}$ 遷移である。
+位置は `u128` で数えるので、`Xoshiro256StarStar` のジャンプ後の位置は追跡できず `None` になり、`Xoshiro128StarStar` では追跡が続く。
+ジャンプを繰り返して作った区間が重ならないのは、どのワーカーもジャンプ一回の距離より多く読まないときに限る。
+
+`SplittableRng` の `split(i)` と `substream(i, j)` は番号で系列を選ぶ。
+セレクターは、派生した生成器や前進した生成器から呼んでも、派生元の初期状態からの絶対的な選択である。
+選択は親を消費せず、派生した系列の位置は 0 から始まる。
+`split(i)` は `substream(i, 0)` と同じ系列を返す。
+異なるセレクターは異なる系列を指すが、それだけで統計的な独立は保証されない。
+
+## 系列の間隔と重なり
+
+系列が重ならないことは、生成器ごとの系列の間隔と、各系列で消費するワード数の上限から判断する。
+
+| 生成器 | `split(i)` | `substream(i, j)` | 重ならない条件 |
+|---|---|---|---|
+| `Pcg64` | 増分を $2i + 1$ に替えた系列（`i` は `u64` なので $2^{64}$ 本） | 系列 $i$ の $j \cdot 2^{64}$ 遷移目から | 同じ $i$ の部分系列は、それぞれ $2^{64}$ 遷移以下しか読まなければ重ならない。異なる $i$ は増分の異なる別の合同列である |
+| `Mrg32k3a` | 根から $i \cdot 2^{127}$ 遷移目から | さらに $j \cdot 2^{76}$ 遷移目から | 同じ $i$ の部分系列 $j < 2^{51}$ は、それぞれ $2^{76}$ 遷移以下しか読まなければ重ならない（L'Ecuyer ほか 2002） |
+| `Philox4x64`、`Threefry4x64` | カウンターの系列ワードを $i$ にする | 部分系列ワードを $j$ にする | 鍵が同じなら、セレクターの異なる系列は同じカウンターを評価しない。各系列は $2^{66}$ ワードまで読める |
+| `Xoshiro256StarStar`、`Xoshiro128StarStar` | なし（`jump` で区間を分ける） | なし | 各ワーカーがジャンプの距離以下しか読まなければ重ならない |
+
+`Pcg64` の増分は $2^{127}$ 通りの奇数を取りうるが、`split` が選べるのはその一部の $2^{64}$ 本である。
+`Mrg32k3a` の部分系列の区間 $2^{76}$ を $2^{51}$ 個並べると系列の区間 $2^{127}$ をちょうど埋めるので、$j \ge 2^{51}$ の部分系列は別の系列の区間に入る。
+
+## カウンター型生成器
+
+`Philox4x64` と `Threefry4x64` は鍵 $K$ とカウンター $c$ から $w = F_K(c)$ を計算するブロック関数を使う。
+Philox は 64 ビット同士の積の上位半分と排他的論理和を 10 段繰り返し、段の間で鍵に Weyl 定数を足す（鍵は 128 ビット）。
+Threefry は Threefish 暗号の加算・回転・排他的論理和を 20 段繰り返し、4 段ごとに鍵の列を足す（鍵は 256 ビット）。
+どちらも段数は入力によらず一定で、どの鍵とカウンターも有効である。
+
+カウンターは `[block, path, stream, subsequence]` の 4 ワードである。
+系列の $n$ 語目はカウンター $[\lfloor n/4 \rfloor, \text{path}, \text{stream}, \text{subsequence}]$ の出力 4 ワードのうち $n \bmod 4$ 番目なので、一つの系列はブロック $2^{64}$ 個で $2^{66}$ ワード（`WORD_CAPACITY`）を持つ。
+`path` は木の経路の符号で、先頭の `0x01` に子の番号を 1 バイトずつ最大 7 個つなげる。
+`fork(child)` は現在の経路の子、`derive(path)` は根からの絶対的な経路の系列を位置 0 で返し、8 個目の子は `InvalidInput` である。
+`seek(position)` は系列の中の絶対位置へ $O(1)$ で移り、`skip_to` と異なり後退も許す。
+`jump` と `long_jump` は $2^{32}$ ワードと $2^{48}$ 語進める。
+系列の終わりを越える1 ワードの読み出し（`next_u64` など）や前進は `OutOfBounds` で、生成器を変えない。
+`fill_uniforms` のようにまとめて埋める読み出しは、終わりまで書いてから `OutOfBounds` を返す。
+
+同じ鍵の下で系列、部分系列、経路のどれかが異なれば、カウンターの入力は重ならない。
+ただし個々の 64 ビットの出力値が別の系列で繰り返すことはある。
+入力が異なることと出力値が異なることは別で、ブロック関数の出力は一様な 64 ビットの値として偶然一致しうるからである。
+`philox4x64_block` と `threefry4x64_block` は同じ関数を状態なしで評価し、Salmon ほか（2011）の既知の出力ベクトルと一致する。
+
+次のセルは選んだ生成器について、五つの経路の組が同じワードを返すかを確かめる。
+入力は生成器、シード、前進する遷移数 $k$（0〜4,000）である。
+一つ目の表は経路 A と B で読んだワードの下位 32 ビット、読んだ後の位置、二つの 64 ビットのワードで異なるビットの数を示す。
+五つ目の組は根の遷移 8〜11 だけを読ませる範囲付きの系列 `BoundedSubstream::for_chunk(&root, 2, 4)`（[範囲付きの系列](oxref:random-prng-bounded-partitions)）と、根を 8 遷移進めた生成器を比べる。
+二つ目の表は状態のバイト列の長さと、範囲付きの系列から 5 語目を読んだ結果を示す。
+
+```rust
+//| id: random-stream-movement
+//| ref: random-stream-movement
+//| title: 前進・分割・保存・範囲付き系列が逐次の読み出しと同じワードを返すかを確かめる
+//| run: reactive
+//| crates: [scioxide-random]
+//| inputs:
+//|   engine: {"type":"select","label":"生成器","description":"系列を前進・分割できる 4 つの生成器から選ぶ。","options":["Pcg64","Mrg32k3a","Philox4x64","Threefry4x64"],"value":"Pcg64"}
+//|   seed: {"type":"range","label":"乱数のシード [-]","min":1,"max":1000,"step":1,"value":42}
+//|   steps: {"type":"range","label":"前進する遷移数 k [遷移]","description":"skip_ahead と、k 回の next_u32 で進める遷移の数。","min":0,"max":4000,"step":250,"value":1000}
+//| cases:
+//|   - {"id":"mrg32k3a-long","label":"Mrg32k3a、k = 4000","description":"next_u64 が 2 遷移を使うので、読んだ後の位置は k + 2 になる。","inputs":{"engine":"Mrg32k3a","steps":4000}}
+//|   - {"id":"threefry-zero","label":"Threefry4x64、k = 0","description":"前進しない場合も五つの経路の組は同じワードを返す。","inputs":{"engine":"Threefry4x64","seed":7,"steps":0}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"paths","path":"/rows/0/3","equals":1001}
+//|       - {"artifact":"paths","path":"/rows/0/5","equals":0}
+//|       - {"artifact":"paths","path":"/rows/1/5","equals":0}
+//|       - {"artifact":"paths","path":"/rows/2/5","equals":0}
+//|       - {"artifact":"paths","path":"/rows/3/5","equals":0}
+//|       - {"artifact":"paths","path":"/rows/4/5","equals":0}
+//|       - {"artifact":"envelope","path":"/rows/0/0","equals":100}
+//|       - {"artifact":"envelope","path":"/rows/0/1","equals":100}
+//|       - {"artifact":"envelope","path":"/rows/0/2","equals":"OutOfBounds"}
+//|   - case: mrg32k3a-long
+//|     expect:
+//|       - {"artifact":"paths","path":"/rows/0/3","equals":4002}
+//|       - {"artifact":"paths","path":"/rows/0/5","equals":0}
+//|       - {"artifact":"paths","path":"/rows/4/5","equals":0}
+//|       - {"artifact":"envelope","path":"/rows/0/0","equals":148}
+//|   - case: threefry-zero
+//|     expect:
+//|       - {"artifact":"paths","path":"/rows/0/3","equals":1}
+//|       - {"artifact":"paths","path":"/rows/3/5","equals":0}
+//|       - {"artifact":"envelope","path":"/rows/0/0","equals":92}
+use scioxide_random::{
+    BitGenerator, BoundedSubstream, Mrg32k3a, Pcg64, Philox4x64, SeedableRng, SerializableState,
+    SkipAhead, SplittableRng, Threefry4x64,
+};
+
+// (確認項目, 経路 A のワードの下位 32 ビット, 経路 B のワードの下位 32 ビット, A の位置, B の位置, 異なるビット数)
+type Row = (String, u32, u32, u64, u64, u32);
+// (STATE_BYTES, 書き出した長さ, 区画の 5 語目の結果, 区画の残り)
+type Envelope = (usize, usize, Option<String>, u64);
+
+fn position<R: BitGenerator>(rng: &R) -> Result<u64, String> {
+    let tracked = rng.position().ok_or("位置が追跡されていない")?;
+    u64::try_from(tracked).map_err(|e| e.to_string())
+}
+
+fn row(item: &str, a: u64, b: u64, positions: (u64, u64), differing: u32) -> Row {
+    let (pa, pb) = positions;
+    let low = |word: u64| (word & 0xffff_ffff) as u32;
+    (item.to_string(), low(a), low(b), pa, pb, differing)
+}
+
+// 生成器の型によらず同じ五つの比較を行う。
+fn check<R>(seed: u64, k: u128) -> Result<(Vec<Row>, Envelope), String>
+where
+    R: SeedableRng + BitGenerator + SkipAhead + SplittableRng + SerializableState + Clone,
+{
+    let root = R::from_seed(seed);
+    let mut rows = Vec::new();
+    // 1. skip_ahead(k) と、next_u32 を k 回呼ぶ逐次の前進（どちらも k 遷移）。
+    let mut skipped = root.clone();
+    skipped.skip_ahead(k).map_err(|e| e.to_string())?;
+    let mut stepped = root.clone();
+    for _ in 0..k {
+        stepped.next_u32().map_err(|e| e.to_string())?;
+    }
+    let a = skipped.next_u64().map_err(|e| e.to_string())?;
+    let b = stepped.next_u64().map_err(|e| e.to_string())?;
+    let at = (position(&skipped)?, position(&stepped)?);
+    rows.push(row(
+        "skip_ahead(k) と k 回の next_u32",
+        a,
+        b,
+        at,
+        (a ^ b).count_ones(),
+    ));
+    // 2. セレクターは根からの絶対指定なので、前進した生成器の split(1) も根の split(1) と同じ系列。
+    let mut from_root = root.split(1).map_err(|e| e.to_string())?;
+    let mut from_advanced = stepped.split(1).map_err(|e| e.to_string())?;
+    let mut from_substream = root.substream(1, 0).map_err(|e| e.to_string())?;
+    let a = from_root.next_u64().map_err(|e| e.to_string())?;
+    let b = from_advanced.next_u64().map_err(|e| e.to_string())?;
+    let c = from_substream.next_u64().map_err(|e| e.to_string())?;
+    let at = (position(&from_root)?, position(&from_advanced)?);
+    rows.push(row(
+        "根の split(1) と前進後の split(1)",
+        a,
+        b,
+        at,
+        (a ^ b).count_ones(),
+    ));
+    let at = (position(&from_root)?, position(&from_substream)?);
+    rows.push(row(
+        "根の split(1) と substream(1, 0)",
+        a,
+        c,
+        at,
+        (a ^ c).count_ones(),
+    ));
+    // 3. 状態を書き出してから次のワードを読み、書き出した状態から読み直す。
+    let checkpoint = skipped.export_state().map_err(|e| e.to_string())?;
+    let expected = skipped.next_u64().map_err(|e| e.to_string())?;
+    let mut replay = R::import_state(&checkpoint).map_err(|e| e.to_string())?;
+    let again = replay.next_u64().map_err(|e| e.to_string())?;
+    let at = (position(&skipped)?, position(&replay)?);
+    let differing = (expected ^ again).count_ones();
+    rows.push(row(
+        "保存した状態の次のワードと復元後のワード",
+        expected,
+        again,
+        at,
+        differing,
+    ));
+    // 4. 区画 2（長さ 4 遷移）は根の遷移 8..12 だけを読める。A の位置は区画の中で数える。
+    let mut chunk = BoundedSubstream::for_chunk(&root, 2, 4).map_err(|e| e.to_string())?;
+    let mut reference = root.clone();
+    reference.skip_ahead(8).map_err(|e| e.to_string())?;
+    let (mut a, mut b, mut differing) = (0, 0, 0);
+    for _ in 0..4 {
+        a = u64::from(chunk.next_u32().map_err(|e| e.to_string())?);
+        b = u64::from(reference.next_u32().map_err(|e| e.to_string())?);
+        differing += (a ^ b).count_ones();
+    }
+    let at = (position(&chunk)?, position(&reference)?);
+    rows.push(row("区画 2 の 4 ワードと根の遷移 8..12", a, b, at, differing));
+    let fifth = chunk.next_u32().err().map(|e| format!("{:?}", e.kind()));
+    let remaining = u64::try_from(chunk.remaining()).map_err(|e| e.to_string())?;
+    Ok((rows, (R::STATE_BYTES, checkpoint.len(), fifth, remaining)))
+}
+
+let k = steps.round() as u128;
+let seed = seed.round() as u64;
+let (rows, envelope) = match engine.as_str() {
+    "Pcg64" => check::<Pcg64>(seed, k)?,
+    "Mrg32k3a" => check::<Mrg32k3a>(seed, k)?,
+    "Philox4x64" => check::<Philox4x64>(seed, k)?,
+    _ => check::<Threefry4x64>(seed, k)?,
+};
+let path_columns = serde_json::json!([
+    { "key": "0", "label": "確認項目" },
+    { "key": "1", "label": "経路 A のワードの下位 32 ビット", "type": "integer" },
+    { "key": "2", "label": "経路 B のワードの下位 32 ビット", "type": "integer" },
+    { "key": "3", "label": "A の位置 [遷移]", "type": "integer" },
+    { "key": "4", "label": "B の位置 [遷移]", "type": "integer" },
+    { "key": "5", "label": "異なるビット数 [ビット]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    path_columns,
+    rows,
+    metadata = serde_json::json!({ "id": "paths" })
+);
+let envelope_columns = serde_json::json!([
+    { "key": "0", "label": "STATE_BYTES [バイト]", "type": "integer" },
+    { "key": "1", "label": "書き出した長さ [バイト]", "type": "integer" },
+    { "key": "2", "label": "区画の 5 語目", "nullText": "読めた" },
+    { "key": "3", "label": "区画の残り [遷移]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    envelope_columns,
+    vec![envelope],
+    metadata = serde_json::json!({ "id": "envelope" })
+);
+```
+
+既定の入力（`Pcg64`、シード 42、$k = 1\,000$）では、五つの行のどれも異なるビット数が 0 である。
+一つ目の行の位置はどちらも 1001 で、`skip_ahead` と逐次の前進がどちらも $k$ 遷移を数え、続く `next_u64` が 1 遷移を使ったことを示す。
+`Mrg32k3a` を選ぶと、`next_u64` は 32 ビットのネイティブ出力ワードを二つ使うので位置は $k + 2$ になる。
+二つ目と三つ目の行の位置は `Pcg64` で 1 で、派生した系列が位置 0 から始まることを示す。
+区画の行の A の位置は区画の中で数えた 4、B の位置は根で数えた 12 で、5 語目の読み出しは `OutOfBounds` で拒否され、区画の残りは 0 である。
+状態のバイト列の長さは生成器ごとに `STATE_BYTES` で固定され、`Pcg64` は 100 バイト、`Mrg32k3a` は 148 バイト、`Philox4x64` は 76 バイト、`Threefry4x64` は 92 バイトである。
+
+## まとめ
+
+並列の系列はシードをずらして作らず、一つの根から `split`、`substream`、`jump` で選ぶ。
+重ならないことはセレクターの違いではなく、生成器ごとの系列の間隔と各系列で読むワード数の上限で判断する。
+`Pcg64` の部分系列は $2^{64}$ 遷移、`Mrg32k3a` の部分系列は $2^{76}$ 遷移ごとに並び、カウンター型の系列はセレクターが異なれば入力が重ならない。
+前進は `Pcg64`、`Lcg64`、`Mrg32k3a` で $O(\log k)$、`SplitMix64` とカウンター型で $O(1)$ なので、遠い位置へ進むときもワードを作る必要はない。
+`Xoshiro256StarStar` のジャンプの後は位置が `None` になるので、位置で作業量を数える処理には `Xoshiro128StarStar` かほかの生成器を使う。
+
+## 次に読むページ
+
+- [範囲付きの系列と実行 Plan の分割](../bounded-streams-and-partitions/)：系列を実行 Plan の分割に割り当て、読みすぎを止める方法を確かめる。
+- [シード・状態の保存・失敗時の状態](../seeding-and-state/)：分割した系列の状態を保存し、失敗した一括生成から戻す方法を確かめる。
+- [乱数のシードの衝突と系列の分割](../../examples/seed-collisions-and-streams/)：無作為に配ったシードが衝突する確率を見積もり、`seed_sequence`、`split`、ジャンプ、`StreamPartitioner` が系列の重なりについて何を保証するかを確かめる。
+- [生成器と系列の API](../../api/engines-and-streams/)：`SkipAhead`、`JumpableRng`、`SplittableRng` の仕様とエラーを引く。

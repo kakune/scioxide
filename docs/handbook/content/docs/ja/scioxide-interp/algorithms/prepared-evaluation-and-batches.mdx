@@ -1,0 +1,412 @@
+---
+title: 準備済みの評価と一括評価
+description: 評価の共通トレイトと値の成分順、1 変数のスカラー形、問い合わせの作業領域とそのライフタイム、出力を保つ失敗、座標のレポート、evaluate_many と BatchEvaluator による一括評価と実行方針。
+sidebar:
+  order: 360
+references:
+  interp-batch-evaluation: "一括評価"
+  interp-common-traits: "共通トレイトと複数成分"
+  interp-coordinate-report: "座標のレポート"
+  interp-owned-and-reserved: "所有値を返す-api-と事前確保済みの形"
+  interp-query-workspace: "問い合わせの作業領域"
+---
+
+補間を何千回も評価する内側のループでは、評価ごとのメモリの確保や近傍の探索が計算コストの大半を占めることがある。
+SciOxide は一度準備して変えないモデル、問い合わせごとの作業領域、多数の点をまとめて評価する評価器を別々の値として分ける。
+三つは作り直す頻度も、並行して使えるかどうかも異なる。
+このページでは評価の共通の約束事、作業領域の使い方、座標のレポート、一括評価を順に説明する。
+導関数と積分の数学は[補間の導関数と積分](../derivatives-integrals-and-workspaces/)で扱う。
+
+| 値 | 作り方 | 変わるもの | 並行して使うとき |
+|---|---|---|---|
+| 補間器（モデル） | `new`・`with_options`・`build`・`fit` | 作ったあとは変わらない | 共有できる（`Sync`） |
+| 問い合わせの作業領域 | 補間器の `workspace()` | 問い合わせのたびに中身を書き換える | 呼び出し元ごとに一つ |
+| `BatchEvaluator` | `BatchEvaluator::new(model, policy)` | 変わらない | 共有できる |
+| `BatchWorkspace` | `evaluator.workspace(request)` | 一括評価のたびに中身を書き換える | 一括評価ごとに一つ |
+
+## 共通トレイトと複数成分
+
+`Interpolant<S, D>` は $D$ 個の実数座標から値を返す全方式に共通のトレイトである。
+関連型 `Value` は所有値を返す API の評価が返す値の型、`Workspace` は問い合わせの作業領域の型である。
+`domains()` はデータが張る各軸の閉区間、`value_dimension()` は値の実数成分の数を返す。
+定義域の扱いは各方式の領域（区間、箱、凸包、球面）と `ExtrapolationPolicy` で決まり、既定の方針はない。
+
+値は `AffineValue` を実装する型で、実数、複素数、配列、ベクトルを扱える。
+複素数は `[実部, 虚部]` の二つの実数成分として並ぶ。
+複数の成分は同じ幾何と基底を共有し、各成分には同じ実数の計算を当てる。
+出力の成分ごとに別の近傍や基底を選ぶことはない。
+`Differentiable` の勾配は `[軸, 実数成分]`、`TwiceDifferentiable` の Hessian は `[軸, 軸, 実数成分]` の行優先で、`*_into` の出力にはこの順に実数成分を書く。
+所有値を返す API の `gradient` は `[Value; D]`、`hessian` は `[[Value; D]; D]` を返す。
+
+出力を引数の型で受ける総称的なメソッドを持つので、これらのトレイトはトレイトオブジェクト（`dyn Interpolant`）として使えない。
+複数の方式を受ける関数は `I: Interpolant<S, D>` のような型引数で書く。
+`&T` にも同じトレイトが実装されているので、補間器を所有せずに借用して渡せる。
+
+## 問い合わせの作業領域
+
+作業領域は一回の問い合わせの途中の値を置くメモリである。
+補間器の `workspace()` だけが作業領域を作り、`workspace_capacity(&workspace)` が `Capacity::Sufficient` かどうかで足りるかを確かめられる。
+作業領域は評価の途中で大きくならず、足りなければ `DimensionMismatch` で拒否される。
+同じ種類の補間器なら、要求を満たす限り別のモデルの作業領域を流用できる。
+問い合わせは読む部分を毎回初期化するので、失敗した問い合わせのあとも作業領域はそのまま使える。
+
+作業領域の型は方式ごとに決まっていて、関連型 `Workspace` で分かる。
+
+| 作業領域の型 | 使う方式 |
+|---|---|
+| `QueryWorkspace` | 大域多項式（Neville を含む）、Bulirsch–Stoer、Floater–Hormann、区分3次、B スプライン、NURBS、双線形・双3次、大域の RBF |
+| `ScatteredWorkspace` | Delaunay 分割に基づく4方式 |
+| `SphericalSplineWorkspace` | 球面スプライン |
+| `LocalPredictionWorkspace` | 局所多項式、局所 RBF、Gauss 過程の予測 |
+| `()`（作業領域なし） | AAA の `BarycentricRational`、Padé 近似 |
+
+`QueryWorkspace` は 16 スカラーまでの要求をヒープを使わずに保持するので、要求の小さい補間器では実数の値を返す所有値を返す API の問い合わせも確保をしない。
+作業領域の型は `Send` で、スレッドをまたいで渡せるが、同時に二つの問い合わせで共有はできない。
+並行に評価するときは、補間器を共有し、作業領域を呼び出し元ごとに一つずつ作る。
+
+## 所有値を返す API と事前確保済みの形
+
+各評価には二つの形がある。
+所有値を返す API の `evaluate(point, policy)` は呼び出しのたびに作業領域と出力の値を作って返す。
+`evaluate_into(point, policy, out, workspace)` は呼び出し側の出力と作業領域を使い、成功すれば完全で有限な結果を `out` に書き、確保をしない。
+導関数の `gradient_into`・`hessian_into`、積分の `integral_into` も同じ形をとる。
+`evaluate_many(points, policy)` は点の配列を順に評価して値の `Vec` を返す所有値を返す API で、作業領域を一つだけ作り、各値は `evaluate` とビット単位で同じになる。
+途中の点で失敗すれば、その点のエラーを返して値は一つも返さない。
+
+1 変数の補間器（`Interpolant<S, 1>` を実装するもの）には、トレイト `Univariate` のスカラー形もある。
+`value_at(x)`、`values_at(xs)`、`derivative_at(x)`、`integrate(a, b)` は、座標 `[x]` と `ExtrapolationPolicy::Reject` で `evaluate`、`evaluate_many`、`gradient`、`integral` を呼ぶのと同じビットを返す。
+したがって定義域の閉区間の外では `DomainError` になり、`Clamp` などの延長には方針を取る形を使う。
+`Univariate` はすべての `Interpolant<S, 1>` に実装されているので、トレイトを取り込むだけで使え、所有値を返す API と同じく呼び出しごとに作業領域を作る。
+
+`*_into` の形は、SciOxide 全体の約束事として、完全な結果を書くか、エラーのときは `out` を呼び出し前のまま残す（[作業領域と再現性](../../../concepts/workspaces-and-reproducibility/)）。
+補間器の多くは結果をいったん作業領域に置き、全部の成分が有限に計算できたときだけ `out` へ一度に書くことでこれを守る。
+したがって、定義域の外、非有限の座標、出力の形の不一致、数値的な失敗のどれでエラーになっても、`out` は変わらない。
+作業領域の中身はエラーで変わりうるが、そのまま次の問い合わせに使える。
+ループの外で作業領域と出力を一度だけ用意し、ループの中では `*_into` を使えば、反復の中で確保は起こらない。
+
+## 座標のレポート
+
+`report(point, policy, workspace)` は、その問い合わせの座標を方式の領域で分類した `ExtrapolationReport` を返す。
+`original()` は渡した座標、`effective()` は方式が実際に使う座標（`Clamp` のときだけ射影した点）、`outside_distance()` は領域から外への各軸の距離（内側では 0）である。
+これは幾何のレポートであり、精度や安定性の推定ではない。
+`evaluate_into_with_report` は値とレポートを一回の呼び出しで返し、凸包を使う方式では位置の分類を二つで共有する。
+既定の実装ではレポートを先に求めてから評価するので、どちらが失敗しても `out` は変わらない。
+
+## 一括評価
+
+`evaluate_many` は呼び出しのたびに値の配列を確保し、呼び出したスレッドで逐次に評価する。
+呼び出し側の配列ビューへ書き、ワーカーを並列に使うときは `BatchEvaluator` を使う。
+`BatchEvaluator::new(model, policy)` は補間器を実行方針 `ExecutionPolicy` と結び付けた変わらない評価器で、作業領域の大きさを決めるときと一括評価を走らせるときに同じワーカー数を使わせる。
+評価器は前計算を持たず、補間器と実行方針を束ねるだけである。
+補間器を所有させることも、`&model` を渡して借用させることもできる。
+`BatchRequest` は評価する量（`BatchOperation` の `Values`・`Gradients`・`Hessians`）、問い合わせの数、座標のレポートを受け取るかどうかを表し、`BatchRequest::values(n)`、`gradients(n)`、`hessians(n)` と `with_reports()` で作る。
+`evaluator.workspace_requirements(request)` が返す `BatchRequirements` は、問い合わせの数、1件あたりの実数成分の数、ワーカーの数、一時的な格納のメモリ使用量を示す。
+`BatchWorkspace` は `evaluator.workspace(request)` で作るか、`check` で足りるかを確かめてから `try_reserve` で大きくする。
+`try_reserve` は足りないワーカーの作業領域を補間器から作り直し、確保に失敗しても、それまでに得た容量を残したまま使える状態を保つ。
+一つの `BatchWorkspace` は、作業領域の型が同じ補間器の評価器で共有できるが、同時に走る二つの一括評価で共有はできない。
+
+`evaluator.evaluate_into(queries, policy, out, reports, workspace, context)` は、形が `[問い合わせ, D]` の `NdView` の座標を評価し、形が `[問い合わせ, 成分]` の `NdViewMut` に書く。
+`gradient_into` は `Differentiable` の補間器で `[問い合わせ, D, 成分]` に、`hessian_into` は `TwiceDifferentiable` の補間器で `[問い合わせ, D, D, 成分]` に書く。
+入出力は任意の刻みの配置でよく、同じ座標を繰り返す放送の配置（刻み 0）の座標も受け付ける。
+出力の配置の隙間は書き換えない。
+`reports` に `Some(&mut reports)` を渡すと、問い合わせごとの `ExtrapolationReport` も書く。
+
+一括評価はまず全部の形と作業領域の容量を検査し、足りなければ `DimensionMismatch` を返す。
+次に全問い合わせを作業領域の一時的な格納に計算し、全部が成功したときだけ出力とレポートへ書き写す。
+一件でも失敗すれば、出力とレポートは呼び出し前のまま残り、途中までの結果で上書きされない。
+事前確保したあとの一括評価は確保をしない。
+`context` には `ExecutionContext::sequential_native()` などを渡し、中断や期限の確認は問い合わせごとに行われる。
+
+`BatchEvaluator::new` に渡す実行方針がワーカーの数の上限を決める。
+`Sequential` は1ワーカー、`Parallel(n)` は $\min(n,64)$ ワーカーまで、`Auto` は 64 ワーカーまでで、実際の数は問い合わせの数とエグゼキューターでさらに制限される。
+点はワーカーごとの連続した範囲に分け、各点は `evaluate_into` と同じに評価するので、結果はワーカーの数によらない。
+ワーカーはそれぞれ補間器の作業領域を持つので、`Auto` では最大64個の作業領域を事前確保しうる。
+Wasm のセルでは逐次に実行する。
+
+## 一点の評価と一括評価の一致
+
+この節と次の節のセルは、$p(x)=(x,x^2)$ を2成分の値として、節点 $0,1,2$ の `NewtonInterpolator` で補間した同じモデルを使う。
+モデルの構築は次の定義のブロックにまとめる。
+
+```rust
+//| id: interp-batch-curve-model
+//| kind: definitions
+//| title: 2 成分の多項式 p(x) = (x, x²) の Newton 補間
+//| crates: [scioxide-core, scioxide-interp]
+use scioxide_core::SciOxideError;
+use scioxide_interp::NewtonInterpolator;
+
+/// 節点 0, 1, 2 で p(x) = (x, x²) を 2 成分の値として補間する。
+pub(crate) fn curve_model() -> Result<NewtonInterpolator<f64, [f64; 2]>, SciOxideError> {
+    NewtonInterpolator::new(
+        vec![0.0, 1.0, 2.0],
+        vec![[0.0, 0.0], [1.0, 1.0], [2.0, 4.0]],
+    )
+}
+```
+
+一括評価は `BatchEvaluator::new(&model, ExecutionPolicy::Sequential)` で補間器を借用した評価器で行う。
+2次の多項式は3点の Newton 補間で正確に表せるので、値と導関数は解析式と丸め誤差の程度で一致するはずである。
+入力は問い合わせ点 $x\in[0,2]$ で、セルは $x=0$、入力の $x$、$x=2$ の3点を一括で評価する。
+出力は各点の値と導関数、解析式との最大差、同じ点の `evaluate_into` との差である。
+導関数の一括評価の出力は `[問い合わせ, 軸, 成分]` の形で、ここでは軸が一つである。
+
+```rust
+//| id: interp-batch-point-agreement
+//| ref: interp-batch-point-agreement
+//| title: ベクトル値の一点評価と一括評価を比べる
+//| run: reactive
+//| crates: [scioxide-core, scioxide-interp]
+//| uses: [interp-batch-curve-model]
+//| inputs:
+//|   query_x: {"type":"range","label":"問い合わせ点 x [-]","min":0,"max":2,"step":0.1,"value":0.5}
+//| cases:
+//|   - {"id":"right-end","label":"x = 2","description":"定義域の端の点も一括評価と一点の評価で同じビットになる。","inputs":{"query_x":2}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"agreement","path":"/rows/1/1","approx":{"value":0.5,"rtol":1e-15}}
+//|       - {"artifact":"agreement","path":"/rows/1/2","approx":{"value":0.25,"rtol":1e-14}}
+//|       - {"artifact":"agreement","path":"/rows/1/4","approx":{"value":1,"rtol":1e-14}}
+//|       - {"artifact":"agreement","path":"/rows/1/5","range":{"max":1e-14}}
+//|       - {"artifact":"agreement","path":"/rows/1/6","equals":0}
+//|   - case: right-end
+//|     expect:
+//|       - {"artifact":"agreement","path":"/rows/1/2","approx":{"value":4,"rtol":1e-14}}
+//|       - {"artifact":"agreement","path":"/rows/1/6","equals":0}
+use scioxide_core::{ExecutionContext, ExecutionPolicy, NdView, NdViewMut, StridedLayout};
+use scioxide_interp::{BatchEvaluator, BatchRequest, ExtrapolationPolicy, Interpolant};
+
+// p(x) = (x, x²) を 2 成分の値として 3 節点で補間する
+let model = curve_model().map_err(|e| e.to_string())?;
+let policy = ExtrapolationPolicy::Reject;
+let context = ExecutionContext::sequential_native();
+let points = [0.0, query_x, 2.0];
+let queries = NdView::new(
+    &points,
+    StridedLayout::new(&[3, 1], &[1, 1]).map_err(|e| e.to_string())?,
+)
+.map_err(|e| e.to_string())?;
+// 評価器と作業領域はループの外で一度だけ用意する。逐次実行は 1 ワーカー
+let evaluator = BatchEvaluator::new(&model, ExecutionPolicy::Sequential);
+let mut value_workspace = evaluator
+    .workspace(BatchRequest::values(3))
+    .map_err(|e| e.to_string())?;
+let mut gradient_workspace = evaluator
+    .workspace(BatchRequest::gradients(3))
+    .map_err(|e| e.to_string())?;
+let mut values = [0.0; 6];
+let mut gradients = [0.0; 6];
+{
+    // 値は [問い合わせ, 成分]、導関数は [問い合わせ, 軸, 成分] の行優先
+    let mut out = NdViewMut::new(
+        &mut values,
+        StridedLayout::new(&[3, 2], &[2, 1]).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    evaluator
+        .evaluate_into(
+            &queries,
+            policy,
+            &mut out,
+            None,
+            &mut value_workspace,
+            context,
+        )
+        .map_err(|e| e.to_string())?;
+    let mut out = NdViewMut::new(
+        &mut gradients,
+        StridedLayout::new(&[3, 1, 2], &[2, 2, 1]).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    evaluator
+        .gradient_into(
+            &queries,
+            policy,
+            &mut out,
+            None,
+            &mut gradient_workspace,
+            context,
+        )
+        .map_err(|e| e.to_string())?;
+}
+// 一点の評価は補間器の作業領域を使う
+let mut point_workspace = model.workspace().map_err(|e| e.to_string())?;
+let mut rows = Vec::new();
+for (i, &x) in points.iter().enumerate() {
+    let mut single = [0.0; 2];
+    model
+        .evaluate_into([x], policy, &mut single, &mut point_workspace)
+        .map_err(|e| e.to_string())?;
+    let (v, g) = (&values[2 * i..2 * i + 2], &gradients[2 * i..2 * i + 2]);
+    // 独立な検算: p(x) = (x, x²) と p'(x) = (1, 2x)
+    let analytic = [x, x * x, 1.0, 2.0 * x];
+    let computed = [v[0], v[1], g[0], g[1]];
+    let difference = analytic
+        .iter()
+        .zip(computed)
+        .fold(0.0_f64, |m, (a, c)| m.max((a - c).abs()));
+    let agreement = (single[0] - v[0]).abs().max((single[1] - v[1]).abs());
+    rows.push((x, v[0], v[1], g[0], g[1], difference, agreement));
+}
+let fixed4 = serde_json::json!({ "fractionDigits": 4 });
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "x [-]", "type": "number", "format": fixed4 },
+    { "key": "1", "label": "第1成分 [-]", "type": "number", "format": fixed4 },
+    { "key": "2", "label": "第2成分 [-]", "type": "number", "format": fixed4 },
+    { "key": "3", "label": "第1成分の導関数 [-]", "type": "number", "format": fixed4 },
+    { "key": "4", "label": "第2成分の導関数 [-]", "type": "number", "format": fixed4 },
+    { "key": "5", "label": "解析式との最大差 [-]", "type": "number", "format": sci3 },
+    { "key": "6", "label": "一点評価との差 [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "agreement" })
+);
+```
+
+どの点でも値と導関数は解析式と一致し、一括評価と一点の評価の差は 0 である。
+一括評価は各問い合わせで同じ補間器の評価を呼ぶので、結果は一点ずつの評価とビット単位で同じになる。
+導関数の列は `[問い合わせ, 軸, 成分]` の出力を行ごとに読んだものである。
+
+## 失敗した一括評価と座標のレポート
+
+次のセルは同じ補間器で、3番目の座標を定義域 $[0,2]$ の外へ動かす。
+入力は3番目の座標 $x_3\in[2,3]$ で、座標は $[0.5,1.5,x_3]$ である。
+まず出力を既知の値で埋め、`Reject` で一括評価して、成否と出力が変わらなかったかを表にする。
+次に `Clamp` と `MethodDefined` でレポート付きの一括評価を行い、3番目の点の値と座標のレポートを比べる。
+レポートの配列は `ExtrapolationPolicy::resolve` で作ったレポートを初期値として用意する。
+
+```rust
+//| id: interp-batch-failure-and-reports
+//| ref: interp-batch-failure-and-reports
+//| title: 失敗した一括評価の出力と座標のレポートを確かめる
+//| run: reactive
+//| crates: [scioxide-core, scioxide-interp]
+//| uses: [interp-batch-curve-model]
+//| inputs:
+//|   outside_x: {"type":"range","label":"3番目の座標 x₃ [-]","min":2,"max":3,"step":0.1,"value":2.5}
+//| cases:
+//|   - {"id":"on-boundary","label":"x₃ = 2","description":"境界の点は定義域に含まれるので、Reject でも成功して距離は 0 になる。","inputs":{"outside_x":2}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"batches","path":"/rows/0/1","equals":"DomainError"}
+//|       - {"artifact":"batches","path":"/rows/0/2","equals":true}
+//|       - {"artifact":"batches","path":"/rows/1/4","approx":{"value":4,"rtol":1e-14}}
+//|       - {"artifact":"batches","path":"/rows/2/4","approx":{"value":6.25,"rtol":1e-14}}
+//|       - {"artifact":"reports","path":"/rows/0/2","equals":2}
+//|       - {"artifact":"reports","path":"/rows/1/2","equals":2.5}
+//|       - {"artifact":"reports","path":"/rows/1/3","equals":0.5}
+//|   - case: on-boundary
+//|     expect:
+//|       - {"artifact":"batches","path":"/rows/0/1","equals":"成功"}
+//|       - {"artifact":"reports","path":"/rows/0/3","equals":0}
+use scioxide_core::{ExecutionContext, ExecutionPolicy, NdView, NdViewMut, StridedLayout};
+use scioxide_interp::{BatchEvaluator, BatchRequest, ExtrapolationPolicy, Interpolant};
+
+let model = curve_model().map_err(|e| e.to_string())?;
+let context = ExecutionContext::sequential_native();
+let points = [0.5, 1.5, outside_x];
+let queries = NdView::new(
+    &points,
+    StridedLayout::new(&[3, 1], &[1, 1]).map_err(|e| e.to_string())?,
+)
+.map_err(|e| e.to_string())?;
+let evaluator = BatchEvaluator::new(&model, ExecutionPolicy::Sequential);
+let mut workspace = evaluator
+    .workspace(BatchRequest::values(3).with_reports())
+    .map_err(|e| e.to_string())?;
+// レポートの配列の初期値は、定義域の中の点のレポートで作る
+let blank = ExtrapolationPolicy::Reject
+    .resolve(model.domains(), [0.0])
+    .map_err(|e| e.to_string())?;
+let mut outcomes = Vec::new();
+let mut report_rows = Vec::new();
+let policies = [
+    ("Reject", ExtrapolationPolicy::Reject),
+    ("Clamp", ExtrapolationPolicy::Clamp),
+    ("MethodDefined", ExtrapolationPolicy::MethodDefined),
+];
+for (name, policy) in policies {
+    // 出力を既知の値 -1 で埋めてから評価する
+    let mut values = [-1.0; 6];
+    let mut reports = [blank; 3];
+    let result = {
+        let mut out = NdViewMut::new(
+            &mut values,
+            StridedLayout::new(&[3, 2], &[2, 1]).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        evaluator.evaluate_into(
+            &queries,
+            policy,
+            &mut out,
+            Some(&mut reports),
+            &mut workspace,
+            context,
+        )
+    };
+    let status = match &result {
+        Ok(()) => "成功".to_string(),
+        Err(e) => format!("{:?}", e.kind()),
+    };
+    let unchanged = values == [-1.0; 6];
+    outcomes.push((name, status, unchanged, values[4], values[5]));
+    if result.is_ok() {
+        let r = reports[2];
+        report_rows.push((
+            name,
+            r.original()[0],
+            r.effective()[0],
+            r.outside_distance()[0],
+        ));
+    }
+}
+let fixed4 = serde_json::json!({ "fractionDigits": 4 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "方針" },
+    { "key": "1", "label": "結果" },
+    { "key": "2", "label": "出力が初期値のまま", "type": "boolean" },
+    { "key": "3", "label": "3番目の第1成分 [-]", "type": "number", "format": fixed4 },
+    { "key": "4", "label": "3番目の第2成分 [-]", "type": "number", "format": fixed4 }
+]);
+emit_table_with_columns!(
+    columns,
+    outcomes,
+    metadata = serde_json::json!({ "id": "batches" })
+);
+let report_columns = serde_json::json!([
+    { "key": "0", "label": "方針" },
+    { "key": "1", "label": "元の座標 [-]", "type": "number", "format": fixed4 },
+    { "key": "2", "label": "有効な座標 [-]", "type": "number", "format": fixed4 },
+    { "key": "3", "label": "領域の外への距離 [-]", "type": "number", "format": fixed4 }
+]);
+emit_table_with_columns!(
+    report_columns,
+    report_rows,
+    metadata = serde_json::json!({ "id": "reports" })
+);
+```
+
+既定の $x_3=2.5$ では、`Reject` は `DomainError` で失敗し、出力の6成分はすべて初期値 $-1$ のまま残る。
+`Clamp` では3番目の点が境界 $x=2$ へ射影され、値は $(2,4)$、レポートの有効な座標は 2、距離は 0.5 になる。
+`MethodDefined` では多項式をそのまま延長し、値は $(2.5,6.25)$、有効な座標は元の 2.5 のままで、距離は同じ 0.5 である。
+$x_3=2$（`on-boundary`）では点が境界の上にあり、境界は定義域に含まれるので、`Reject` でも成功して距離は 0 になる。
+レポートは座標の分類を示すだけで、延長した値の誤差については何も述べない。
+
+## まとめ
+
+補間器は作ったあと変わらないので複数のスレッドで共有でき、作業領域は補間器の `workspace()` から呼び出し元ごとに作る。
+反復の中では `*_into` と事前確保済みの作業領域を使えば確保が起こらず、失敗した呼び出しは出力を変えない。
+定義域の外へ出たかどうかは `report` や `evaluate_into_with_report` の `ExtrapolationReport` で確かめられるが、これは精度の推定ではない。
+多数の点の値だけが要るなら `evaluate_many`（1 変数なら `values_at`）で一度に評価する。
+呼び出し側の配列へ書くときや並列に評価するときは `BatchEvaluator` と、要求に合わせて事前確保した `BatchWorkspace` を使い、一件でも失敗すれば出力とレポートは呼び出し前のまま残る。
+
+## 次に読むページ
+
+- [補間の導関数と積分](../derivatives-integrals-and-workspaces/)：各方式が導関数や積分を提供するかどうかと、その計算の誤差を確かめる。
+- [共通の仕様とバッチ評価の API](../../api/contracts-and-batches/)：トレイト、外挿方針、作業領域、一括評価の項目と仕様を一覧で引く。
+- [作業領域と再現性](../../../concepts/workspaces-and-reproducibility/)：作業領域、所有する出力、部分結果についての章をまたぐ約束事を確かめる。

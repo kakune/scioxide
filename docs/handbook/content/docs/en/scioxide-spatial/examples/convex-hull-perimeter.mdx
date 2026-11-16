@@ -1,0 +1,413 @@
+---
+title: "Recovering a Convex Hull's Boundary and Missing Area"
+description: "Traverse ConvexHull facets with neighbors to recover the boundary polygon and compute shoelace area. Check Efron's identity linking missing area and vertex count against standard errors, and test containment of all points, canonical/input-row mappings, and agreement between build and new."
+sidebar:
+  order: 442
+references:
+  spatial-hull-efron-identity: "missing-area-and-efrons-identity"
+---
+
+`ConvexHull` returns hull boundaries as facet sets without ordering edges around the boundary, even in two dimensions.
+Computing hull area or testing containment along its boundary requires following facet adjacency to recover cyclic vertex order.
+This example recovers boundaries and computes areas for hulls of uniform points in a square or disk.
+Check the recovered boundary with Efron's identity relating vertex counts and area, containment of all points, and index mappings.
+[Convex-hull vertex counts for random point clouds](../convex-hull-random-points/) covers the expected vertex count itself.
+
+## Convex-hull facets and canonical indices
+
+A hull's boundary edges (faces in three or more dimensions) are called facets.
+`ConvexHull::new` begins by sorting points lexicographically by coordinates and merging equal-coordinate points.
+Sorted point indices are called canonical indices.
+`points()` returns sorted coordinates in canonical-index order; indices returned by `facet(i)` are canonical too.
+Input row $i$ maps to canonical index `input_mapping()[i]`; the first input row for canonical index $j$ is `representatives()[j]`.
+
+In two dimensions, facets are edges and `facet(i)` returns two increasing indices, encoding neither direction nor boundary order.
+Entry $j$ of `neighbors(i)` is the facet sharing the ridge opposite vertex $j$ of facet $i$.
+In two dimensions that opposite ridge is the other vertex, so `neighbors(i)[j]` is the neighboring edge sharing the vertex other than entry $j$.
+After entering an edge from vertex $p$, advance to its other vertex $q$ and move to the adjacent edge sharing $q$.
+Repeating this orders hull vertices around its boundary.
+
+`ConvexHull::build` performs the same construction as `new` under an execution or solve context.
+It differs only in accepting cancellation, deadlines, and node limits counted by an outer solve; it does not add points incrementally across separate calls.
+The resulting hull is the same as `new`.
+
+## Missing area and Efron's identity
+
+Place $n$ independent uniform points in convex region $K$ (area $A(K)$) and let $V_n$ be the vertex count of their hull $P_n$.
+Let $D_n = 1 - A(P_n)/A(K)$ be the fraction of the region's area not covered by the hull.
+Point $n + 1$ is a hull vertex exactly when it lies outside the hull of the remaining $n$ points.
+Fixing the other $n$ points makes this conditional probability equal to $D_n$.
+All $n + 1$ points are exchangeable, so Efron's (1965) identity holds exactly for every convex region:
+
+$$
+E[V_{n+1}] = (n + 1)\,E[D_n]
+$$
+
+
+The left side comes from vertex counts and the right from area, allowing boundary recovery and area computation to be checked against counts.
+Check that $z$, the mean of replicate differences $(n + 1)D_n - V_{n+1}$ divided by its standard error, does not differ significantly from 0.
+
+The following block defines quantities shared by this page's cells.
+`region_points` returns uniform points in square $[0, 1)^2$ or the unit disk in $(x, y)$ order.
+For the disk, radius $\sqrt{u}$ and angle $2\pi v$ ($u, v$ uniform on $[0, 1)$) give density proportional to area.
+`region_area` returns region area.
+`construct_hull` constructs the hull of the first `rows` coordinate rows; if `scoped`, it performs the same construction through `build` with an execution context.
+`hull_cycle` follows `neighbors` to order hull vertices around the boundary; `site` returns coordinates by canonical index.
+`shoelace_area` computes signed area from the cyclic sequence using shoelace formula $\tfrac12\sum_i (x_i y_{i+1} - x_{i+1} y_i)$.
+
+```rust
+//| id: spatial-convex-hull-perimeter-model
+//| kind: definitions
+//| title: "Uniform points and a convex hull's boundary"
+//| crates: [scioxide-core, scioxide-random, scioxide-spatial]
+use scioxide_core::{ExecutionContext, SciOxideError, RealScalar};
+use scioxide_random::{Rng, SplitMix64};
+use scioxide_spatial::{ConvexHull, GeometryOptions, PointSet};
+
+/// Return n uniform points in the unit disk if region is "disk", otherwise in the unit square.
+pub(crate) fn region_points(
+    region: &str,
+    n: usize,
+    rng: &mut SplitMix64,
+) -> Result<Vec<f64>, SciOxideError> {
+    let mut coordinates = Vec::with_capacity(2 * n);
+    for _ in 0..n {
+        let (u, v): (f64, f64) = (rng.next_float()?, rng.next_float()?);
+        if region == "disk" {
+            let (radius, angle) = (RealScalar::sqrt(u), 2.0 * core::f64::consts::PI * v);
+            coordinates.push(radius * RealScalar::cos(angle));
+            coordinates.push(radius * RealScalar::sin(angle));
+        } else {
+            coordinates.push(u);
+            coordinates.push(v);
+        }
+    }
+    Ok(coordinates)
+}
+
+/// Region area A(K).
+pub(crate) fn region_area(region: &str) -> f64 {
+    if region == "disk" {
+        core::f64::consts::PI
+    } else {
+        1.0
+    }
+}
+
+/// Hull of the first rows coordinate rows. If scoped, perform the same construction with build under an execution context.
+pub(crate) fn construct_hull(
+    coordinates: &[f64],
+    rows: usize,
+    scoped: bool,
+) -> Result<ConvexHull<f64>, SciOxideError> {
+    let points = PointSet::from_rows(&coordinates[..2 * rows], 2)?;
+    if scoped {
+        ConvexHull::build(
+            &points,
+            GeometryOptions::new(),
+            ExecutionContext::sequential(),
+        )
+    } else {
+        ConvexHull::new(&points)
+    }
+}
+
+/// Boundary-ordered vertices (canonical indices). Enter facet f from prev, advance to its other vertex next,
+/// then move to the facet opposite prev (sharing next).
+pub(crate) fn hull_cycle(hull: &ConvexHull<f64>) -> Result<Vec<usize>, String> {
+    let first = hull.facet(0).map_err(|e| e.to_string())?;
+    let (start, mut prev, mut facet) = (first[0], first[0], 0);
+    let mut order = vec![start];
+    for _ in 0..hull.facet_count() {
+        let ends = hull.facet(facet).map_err(|e| e.to_string())?;
+        let slot = usize::from(ends[1] == prev);
+        let next = ends[1 - slot];
+        if next == start {
+            break;
+        }
+        order.push(next);
+        let across = hull.neighbors(facet).map_err(|e| e.to_string())?[slot];
+        facet = across.ok_or("Missing neighboring facet")?;
+        prev = next;
+    }
+    Ok(order)
+}
+
+/// Coordinates at canonical index j.
+pub(crate) fn site(hull: &ConvexHull<f64>, j: usize) -> [f64; 2] {
+    [hull.points()[2 * j], hull.points()[2 * j + 1]]
+}
+
+/// Shoelace signed area ½ Σ (x_i y_{i+1} − x_{i+1} y_i). Positive means counterclockwise boundary order.
+pub(crate) fn shoelace_area(hull: &ConvexHull<f64>, order: &[usize]) -> f64 {
+    (0..order.len())
+        .map(|i| {
+            let a = site(hull, order[i]);
+            let b = site(hull, order[(i + 1) % order.len()]);
+            0.5 * (a[0] * b[1] - b[0] * a[1])
+        })
+        .sum()
+}
+```
+
+## Checking Efron's identity
+
+The next cell selects region, point count $n$, replicate count $M$, and random seed, generating $n + 1$ points per replicate.
+It computes vertex count $V_n$ and missing area $D_n$ from the first $n$ points' hull and $V_{n+1}$ from the hull of all $n + 1$ points, checking Efron's identity.
+Hull area uses the shoelace formula on boundary-ordered vertices.
+The table shows means and standard errors of $V_n$, $(n + 1)\bar D_n$, and $V_{n+1}$, plus $z$ for difference $(n + 1)D_n - V_{n+1}$.
+For reference, it also compares the mean $V_n$ with Rényi–Sulanke formulas ($\tfrac83(\ln n + \gamma - \ln 2)$ for the square and leading term $3.3832\,n^{1/3}$ for the disk).
+
+```rust
+//| id: spatial-convex-hull-efron
+//| ref: spatial-convex-hull-efron
+//| title: "Check Efron's identity through missing area and vertex counts"
+//| run: reactive
+//| uses: [spatial-convex-hull-perimeter-model]
+//| crates: [scioxide-core, scioxide-random, scioxide-spatial]
+//| inputs:
+//|   region: {"type":"select","label":"Region","options":[{"label":"Unit square","value":"square"},{"label":"Unit disk","value":"disk"}],"value":"square"}
+//|   point_count: {"type":"range","label":"Point count n [count]","min":10,"max":1000,"step":10,"value":300}
+//|   replicates: {"type":"range","label":"Replicate count M","min":50,"max":400,"step":50,"value":200}
+//|   seed: {"type":"range","label":"Random seed","min":1,"max":100,"step":1,"value":1}
+//| cases:
+//|   - {"id":"disk","label":"Unit disk","description":"A smooth boundary distributes vertices around the entire perimeter; the leading term exceeds the mean.","inputs":{"region":"disk"}}
+//|   - {"id":"few-points","label":"n = 10","description":"Efron's identity holds exactly even with few points.","inputs":{"point_count":10}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"efron","path":"/rows/0/2","approx":{"value":14.900935890661,"rtol":1e-10}}
+//|       - {"artifact":"efron","path":"/rows/0/3","approx":{"value":15.009879682538,"rtol":1e-9}}
+//|       - {"artifact":"efron","path":"/rows/0/7","range":{"min":-3,"max":3}}
+//|   - case: disk
+//|     expect:
+//|       - {"artifact":"efron","path":"/rows/0/2","approx":{"value":22.648449473769,"rtol":1e-9}}
+//|       - {"artifact":"efron","path":"/rows/0/7","range":{"min":-3,"max":3}}
+//|   - case: few-points
+//|     expect:
+//|       - {"artifact":"efron","path":"/rows/0/5","approx":{"value":6.18,"atol":1e-9}}
+//|       - {"artifact":"efron","path":"/rows/0/7","range":{"min":-3,"max":3}}
+use scioxide_core::RealScalar;
+use scioxide_random::{SeedableRng, SplitMix64};
+
+let (n, m) = (point_count as usize, replicates as usize);
+let mut rng = SplitMix64::from_seed(seed as u64);
+let mut samples = Vec::with_capacity(m); // (V_n, D_n, V_{n+1})
+for _ in 0..m {
+    let coordinates = region_points(&region, n + 1, &mut rng).map_err(|e| e.to_string())?;
+    let hull = construct_hull(&coordinates, n, false).map_err(|e| e.to_string())?;
+    let order = hull_cycle(&hull)?;
+    let deficit = 1.0 - shoelace_area(&hull, &order).abs() / region_area(&region);
+    let larger = construct_hull(&coordinates, n + 1, false).map_err(|e| e.to_string())?;
+    samples.push((
+        hull.facet_count() as f64,
+        deficit,
+        larger.facet_count() as f64,
+    ));
+}
+
+// Means and standard errors. Form difference (n + 1) D_n − V_{n+1} from values in the same replicate.
+let stats = |values: Vec<f64>| {
+    let mean = values.iter().sum::<f64>() / m as f64;
+    let variance = values.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / (m - 1) as f64;
+    (mean, RealScalar::sqrt(variance / m as f64))
+};
+let scale = (n + 1) as f64;
+let (vertices, vertices_se) = stats(samples.iter().map(|s| s.0).collect());
+let (efron, efron_se) = stats(samples.iter().map(|s| scale * s.1).collect());
+let (next, next_se) = stats(samples.iter().map(|s| s.2).collect());
+let (gap, gap_se) = stats(samples.iter().map(|s| scale * s.1 - s.2).collect());
+// Rényi–Sulanke values. Γ(5/3) and Euler's constant γ use 16-digit constants.
+let formula = if region == "disk" {
+    2.0 * RealScalar::powf(core::f64::consts::PI, 2.0 / 3.0)
+        * RealScalar::cbrt(2.0 / 3.0)
+        * 0.902_745_292_950_933_6 // Γ(5/3)
+        * RealScalar::cbrt(n as f64)
+} else {
+    8.0 / 3.0 * (RealScalar::ln(n as f64) + 0.577_215_664_901_532_9 - RealScalar::ln(2.0))
+};
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let fixed3 = serde_json::json!({ "fractionDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Mean V_n [count]", "type": "number", "format": fixed2 },
+    { "key": "1", "label": "Standard error of V_n [count]", "type": "number", "format": fixed3 },
+    { "key": "2", "label": "Formula value [count]", "type": "number", "format": fixed2 },
+    { "key": "3", "label": "Mean (n + 1) D_n [count]", "type": "number", "format": fixed2 },
+    { "key": "4", "label": "Standard error of (n + 1) D_n [count]", "type": "number", "format": fixed3 },
+    { "key": "5", "label": "Mean V_(n+1) [count]", "type": "number", "format": fixed2 },
+    { "key": "6", "label": "Standard error of V_(n+1) [count]", "type": "number", "format": fixed3 },
+    { "key": "7", "label": "Efron difference z [-]", "type": "number", "format": fixed2 }
+]);
+let row = (
+    vertices,
+    vertices_se,
+    formula,
+    efron,
+    efron_se,
+    next,
+    next_se,
+    gap / gap_se,
+);
+emit_table_with_columns!(
+    columns,
+    vec![row],
+    metadata = serde_json::json!({ "id": "efron" })
+);
+```
+
+With defaults (square, $n = 300$, $M = 200$, seed 1), mean $14.92 \pm 0.17$ of $V_n$ agrees with formula value $14.90$.
+The difference between $(n + 1)\bar D_n = 15.01 \pm 0.26$ and mean $14.94 \pm 0.17$ of $V_{n+1}$ is $z = 0.29$, consistent with Efron's identity.
+For the disk, mean $22.47$ of $V_n$ is below leading term $22.65$, with Efron difference $z = -0.63$.
+Even at $n = 10$, $(n + 1)\bar D_n = 6.20 \pm 0.08$ and mean $6.18$ of $V_{n+1}$ agree as the identity predicts.
+An error in boundary recovery or area computation would shift only $(n + 1)\bar D_n$, making $z$ large.
+
+## Checking containment and index mappings
+
+The next cell selects region, point count $n$, and random seed, constructs one point set's hull, and checks three properties.
+
+- Every input point lies in the hull.
+  For each boundary edge $(a, b)$ and point $p$, count points whose `orient2d(a, b, p)` sign opposes the boundary orientation.
+- Coordinates of hull vertices (canonical index $j$) equal coordinates of input row `representatives()[j]`, and that row maps back to $j$ through `input_mapping()`.
+- `ConvexHull::build` supplied with `ExecutionContext::sequential()` produces the same facets as `new`.
+
+The table shows check results; all counts zero means all checks pass.
+The plot shows input points and the hull connected in boundary order.
+
+```rust
+//| id: spatial-convex-hull-checks
+//| ref: spatial-convex-hull-checks
+//| title: "Check hull containment and index mappings"
+//| run: reactive
+//| uses: [spatial-convex-hull-perimeter-model]
+//| crates: [scioxide-core, scioxide-random, scioxide-spatial]
+//| inputs:
+//|   region: {"type":"select","label":"Region","options":[{"label":"Unit square","value":"square"},{"label":"Unit disk","value":"disk"}],"value":"square"}
+//|   point_count: {"type":"range","label":"Point count n [count]","min":10,"max":1000,"step":10,"value":300}
+//|   seed: {"type":"range","label":"Random seed","min":1,"max":100,"step":1,"value":1}
+//| cases:
+//|   - {"id":"disk","label":"Unit disk","description":"A smooth boundary distributes vertices around the entire perimeter.","inputs":{"region":"disk"}}
+//|   - {"id":"few-points","label":"n = 10","description":"Containment and index correspondence hold even with few points.","inputs":{"point_count":10}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"checks","path":"/rows/0/1","equals":16}
+//|       - {"artifact":"checks","path":"/rows/0/2","equals":0}
+//|       - {"artifact":"checks","path":"/rows/0/3","equals":0}
+//|       - {"artifact":"checks","path":"/rows/0/4","equals":0}
+//|   - case: disk
+//|     expect:
+//|       - {"artifact":"checks","path":"/rows/0/1","equals":22}
+//|       - {"artifact":"checks","path":"/rows/0/2","equals":0}
+//|       - {"artifact":"checks","path":"/rows/0/3","equals":0}
+//|   - case: few-points
+//|     expect:
+//|       - {"artifact":"checks","path":"/rows/0/1","equals":4}
+//|       - {"artifact":"checks","path":"/rows/0/2","equals":0}
+//|       - {"artifact":"checks","path":"/rows/0/4","equals":0}
+use scioxide_random::{SeedableRng, SplitMix64};
+use scioxide_spatial::{PredicateSign, orient2d};
+
+let n = point_count as usize;
+let mut rng = SplitMix64::from_seed(seed as u64);
+let coordinates = region_points(&region, n, &mut rng).map_err(|e| e.to_string())?;
+let hull = construct_hull(&coordinates, n, false).map_err(|e| e.to_string())?;
+let order = hull_cycle(&hull)?;
+// For a counterclockwise boundary (positive area), exterior points have negative orient2d.
+let wrong = if shoelace_area(&hull, &order) > 0.0 {
+    PredicateSign::Negative
+} else {
+    PredicateSign::Positive
+};
+// Containment: count points lying on the oppositely oriented side of any boundary edge.
+let mut outside = 0;
+for p in coordinates.chunks_exact(2) {
+    let mut escaped = false;
+    for i in 0..order.len() {
+        let a = site(&hull, order[i]);
+        let b = site(&hull, order[(i + 1) % order.len()]);
+        let sign = orient2d(&a, &b, &[p[0], p[1]]).map_err(|e| e.to_string())?;
+        escaped |= sign == wrong;
+    }
+    outside += usize::from(escaped);
+}
+// Index mapping: canonical j → input row representatives()[j] → back to j through input_mapping()?
+let mismatched = order
+    .iter()
+    .filter(|&&j| {
+        let row = hull.representatives()[j];
+        coordinates[2 * row..2 * row + 2] != site(&hull, j) || hull.input_mapping()[row] != j
+    })
+    .count();
+let built = construct_hull(&coordinates, n, true).map_err(|e| e.to_string())?;
+let differing = (0..hull.facet_count().max(built.facet_count()))
+    .filter(|&i| hull.facet(i).ok() != built.facet(i).ok())
+    .count();
+
+let check_columns = serde_json::json!([
+    { "key": "0", "label": "Hull facets [count]", "type": "integer" },
+    { "key": "1", "label": "Boundary vertices [count]", "type": "integer" },
+    { "key": "2", "label": "Points outside hull [count]", "type": "integer" },
+    { "key": "3", "label": "Index-mapping mismatches [count]", "type": "integer" },
+    { "key": "4", "label": "Facets differing between build and new [count]", "type": "integer" }
+]);
+let summary = (
+    hull.facet_count(),
+    order.len(),
+    outside,
+    mismatched,
+    differing,
+);
+emit_table_with_columns!(
+    check_columns,
+    vec![summary],
+    metadata = serde_json::json!({ "id": "checks" })
+);
+let polygon: Vec<[f64; 2]> = order
+    .iter()
+    .chain(order.first())
+    .map(|&j| site(&hull, j))
+    .collect();
+let cloud: Vec<[f64; 2]> = coordinates.chunks_exact(2).map(|p| [p[0], p[1]]).collect();
+let (low, high) = if region == "disk" {
+    (-1.05, 1.05)
+} else {
+    (-0.05, 1.05)
+};
+emit_chart!(
+    serde_json::json!({
+        "kind": "xy",
+        "xLabel": "x [-]",
+        "yLabel": "y [-]",
+        "xMin": low,
+        "xMax": high,
+        "yMin": low,
+        "yMax": high,
+        "dataZoom": true,
+        "tooltip": true,
+        "layers": [
+            { "id": "points", "kind": "scatter", "name": "Point", "points": cloud },
+            { "id": "hull", "kind": "line", "name": "Convex hull", "points": polygon }
+        ]
+    }),
+    metadata = serde_json::json!({ "id": "hull" })
+);
+```
+
+The default hull (square, $n = 300$, seed 1) has 16 facets and 16 vertices traversed around its boundary.
+Exterior points, index-mapping mismatches, and facets differing between `build` and `new` all number 0.
+The disk has 22 facets and $n = 10$ has four; both have equal boundary-vertex and facet counts, with all check counts zero.
+The plot places every point inside or on the hull boundary.
+
+## Summary
+
+Two-dimensional `ConvexHull` facets are increasing-index pairs; recover boundary order by traversing adjacent edges with `neighbors`.
+Check shoelace area of the recovered boundary against vertex counts through Efron's identity $E[V_{n+1}] = (n + 1)E[D_n]$, valid exactly for every convex region.
+Assess the identity using $z$ from the mean and standard error of paired replicate differences $(n + 1)D_n - V_{n+1}$.
+Containment can be tested exactly by `orient2d` signs on each boundary edge, with boundary orientation determined by signed area.
+`ConvexHull` indices are sorted-point canonical indices; map back to input rows with `representatives` and `input_mapping`.
+
+## Further reading
+
+- [Convex-hull vertex counts for random point clouds](../convex-hull-random-points/): compare expected vertex counts with Rényi–Sulanke formulas and examine growth differences from boundary shape.
+- [Convex hulls, Delaunay triangulations, and Voronoi diagrams](../../algorithms/delaunay-voronoi-and-hulls/): examine randomized incremental construction, sorting to canonical indices, and symbolic perturbation.
+- [Delaunay maximization of the minimum angle](../delaunay-min-angle/): examine triangulations bounded by convex hulls and index mappings through `input_mapping`.

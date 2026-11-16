@@ -1,0 +1,352 @@
+---
+title: "Checking Thiessen Regions on Grid Points"
+description: "Check on catchment grid points that halfplane-clipped Thiessen regions for six stations belong to the nearest station. Use exhaustive nearest-neighbor references to compare KD-tree nearest_into, polygon membership, and area estimates from grid counts."
+sidebar:
+  order: 412
+---
+
+[Thiessen regions and area-weighted rainfall for weather stations](../voronoi-territory/) clips each station's convex polygon by passing neighboring-station bisectors from Voronoi ridges and the catchment rectangle to `HalfspaceIntersection`.
+Correct clipping places every catchment point only in the polygon of its nearest station.
+This example finds nearest stations exhaustively on a catchment grid, using them as references for `KdTree` neighbors and polygon membership.
+The catchment is fixed to the preceding page's default rectangle (width $W = 50$ km, height $H = 60$ km).
+
+## Grid points and exhaustive references
+
+Grid points are $((k + \tfrac12)h, (l + \tfrac12)h)$ ($k = 0, \ldots, W/h - 1$, $l = 0, \ldots, H/h - 1$), with spacing $h$ selected from 0.25, 0.5, 1, and 2.5 km, all dividing 5 km.
+At each grid point, compute squared distances to every station and use the set attaining the minimum as reference.
+Station coordinates are integers [km] and grid coordinates multiples of 1/8 km, so squared distances are exact in `f64` without rounding.
+Points equidistant from two or more stations, on Voronoi boundaries, can therefore be identified exactly.
+
+Also compare clipped polygon areas with grid-count estimates.
+If station $i$ is nearest to $m_i$ grid points, $m_i h^2$ estimates its Thiessen area $A_i$.
+Boundary grid points count equally toward equidistant stations.
+Estimation errors arise only from grid squares crossing region boundaries.
+There are roughly $L_i/h$ such squares for perimeter $L_i$, bounding relative error by $O(L_i h / A_i)$; positive/negative cancellation makes actual errors smaller.
+
+The following block defines quantities shared by two cells.
+`STATIONS` holds the preceding page's station coordinates; `BASIN` gives catchment width and height.
+`grid_points` returns grid points; `closest_stations` exhaustively returns the minimum squared distance and its station set.
+`thiessen_polygons` combines the preceding page's two-cell procedure, finding station neighbors through `Voronoi` ridges and clipping each polygon with bisectors and four rectangular halfplanes.
+Order polygon vertices by following neighboring edges with `neighbors`, then orient counterclockwise.
+
+```rust
+//| id: spatial-thiessen-grid-model
+//| kind: definitions
+//| title: "Stations, grid points, and Thiessen regions"
+//| crates: [scioxide-spatial]
+use scioxide_spatial::{HalfspaceIntersection, IntersectionKind, PointSet, Voronoi};
+
+/// Coordinates (x, y) [km] for stations 0–5. Hypothetical arrangement with origin at the catchment's southwest corner.
+pub(crate) const STATIONS: [[f64; 2]; 6] = [
+    [10.0, 10.0],
+    [30.0, 15.0],
+    [15.0, 35.0],
+    [40.0, 40.0],
+    [5.0, 50.0],
+    [25.0, 25.0],
+];
+
+/// Catchment width W and height H [km].
+pub(crate) const BASIN: [f64; 2] = [50.0, 60.0];
+
+/// Grid-point sequence ((k + ½)h, (l + ½)h).
+pub(crate) fn grid_points(spacing: f64) -> Vec<[f64; 2]> {
+    let columns = (BASIN[0] / spacing).round() as usize;
+    let rows = (BASIN[1] / spacing).round() as usize;
+    let mut points = Vec::with_capacity(columns * rows);
+    for k in 0..columns {
+        for l in 0..rows {
+            points.push([(k as f64 + 0.5) * spacing, (l as f64 + 0.5) * spacing]);
+        }
+    }
+    points
+}
+
+/// Exhaustive minimum squared distance and the stations attaining it.
+pub(crate) fn closest_stations(p: &[f64; 2]) -> (f64, Vec<usize>) {
+    let squared = STATIONS.map(|s| {
+        let (dx, dy) = (p[0] - s[0], p[1] - s[1]);
+        dx * dx + dy * dy
+    });
+    let least = squared.iter().copied().fold(f64::INFINITY, f64::min);
+    let closest = (0..STATIONS.len())
+        .filter(|&i| squared[i] == least)
+        .collect();
+    (least, closest)
+}
+
+/// Return each station's Thiessen region as a counterclockwise vertex sequence.
+pub(crate) fn thiessen_polygons() -> Result<Vec<Vec<[f64; 2]>>, String> {
+    let sites = PointSet::from_points(&STATIONS).map_err(|e| e.to_string())?;
+    let voronoi = Voronoi::new(&sites).map_err(|e| e.to_string())?;
+    // Ridge sites() uses canonical indices. Map back to station indices with representatives().
+    let station_of = voronoi.delaunay().representatives();
+    let mut neighbors = vec![Vec::new(); STATIONS.len()];
+    for ridge in voronoi.ridges() {
+        let [a, b] = ridge.sites();
+        neighbors[station_of[a]].push(station_of[b]);
+        neighbors[station_of[b]].push(station_of[a]);
+    }
+    let [width, height] = BASIN;
+    let mut polygons = Vec::with_capacity(STATIONS.len());
+    for (i, si) in STATIONS.iter().enumerate() {
+        // Bisector 2(s_j − s_i)·x + |s_i|² − |s_j|² ≤ 0 and the rectangle's four sides (rows [a₁, a₂, b]).
+        let mut planes = Vec::new();
+        for &j in &neighbors[i] {
+            let sj = STATIONS[j];
+            let b = si[0] * si[0] + si[1] * si[1] - sj[0] * sj[0] - sj[1] * sj[1];
+            planes.extend([2.0 * (sj[0] - si[0]), 2.0 * (sj[1] - si[1]), b]);
+        }
+        planes.extend([
+            -1.0, 0.0, 0.0, 1.0, 0.0, -width, 0.0, -1.0, 0.0, 0.0, 1.0, -height,
+        ]);
+        let halfspaces = PointSet::from_rows(&planes, 3).map_err(|e| e.to_string())?;
+        // Each station lies strictly inside the rectangle and its own bisectors, so use it directly as the interior point.
+        let cell = HalfspaceIntersection::new(&halfspaces, si).map_err(|e| e.to_string())?;
+        if cell.kind() != IntersectionKind::Bounded {
+            return Err(format!("Station {i} has an unbounded region"));
+        }
+        let count = cell.vertices().len() / 2;
+        let mut order = vec![0];
+        while order.len() < count {
+            let last = order[order.len() - 1];
+            let next = cell
+                .neighbors(last)
+                .map_err(|e| e.to_string())?
+                .find(|v| !order.contains(v))
+                .ok_or("Cannot traverse polygon boundary")?;
+            order.push(next);
+        }
+        let mut ring: Vec<[f64; 2]> = order
+            .iter()
+            .map(|&v| [cell.vertices()[2 * v], cell.vertices()[2 * v + 1]])
+            .collect();
+        let twice_area: f64 = (0..count)
+            .map(|k| {
+                let (p, q) = (ring[k], ring[(k + 1) % count]);
+                p[0] * q[1] - q[0] * p[1]
+            })
+            .sum();
+        if twice_area < 0.0 {
+            ring.reverse();
+        }
+        polygons.push(ring);
+    }
+    Ok(polygons)
+}
+```
+
+## KD-tree nearest neighbors
+
+The next cell selects spacing $h$ and queries each grid point's nearest station through `nearest_into` on a station `KdTree`, comparing with references.
+KD-tree `Neighbor::index` is the point-set row index and directly identifies stations, without Voronoi canonical-index mapping.
+`nearest_into` receives preallocated output and workspace, allocating nothing per query.
+At equidistant grid points, the KD tree returns one station; accept it if it belongs to the reference set.
+The table shows grid count, tied-grid count, points whose nearest station is outside the reference set, and largest KD-tree distance `Neighbor::distance` difference from exhaustive search.
+
+```rust
+//| id: spatial-thiessen-kdtree-check
+//| ref: spatial-thiessen-kdtree-check
+//| title: "Check KD-tree nearest stations against exhaustive search on grid points"
+//| run: reactive
+//| uses: [spatial-thiessen-grid-model]
+//| crates: [scioxide-core, scioxide-spatial]
+//| inputs:
+//|   grid_spacing: {"type":"select","label":"Grid spacing h [km]","description":"Select a spacing dividing 5 km.","options":["0.25","0.5","1","2.5"],"value":"0.5"}
+//| cases:
+//|   - {"id":"fine","label":"h = 0.25 km","description":"Check 48000 points, including 156 equidistant grid points.","inputs":{"grid_spacing":"0.25"}}
+//|   - {"id":"coarse","label":"h = 2.5 km","description":"Even on a coarse 480-point grid, KD-tree neighbors agree with references.","inputs":{"grid_spacing":"2.5"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"kdtree","path":"/rows/0/0","equals":12000}
+//|       - {"artifact":"kdtree","path":"/rows/0/1","equals":77}
+//|       - {"artifact":"kdtree","path":"/rows/0/2","equals":0}
+//|       - {"artifact":"kdtree","path":"/rows/0/3","range":{"max":1e-13}}
+//|   - case: fine
+//|     expect:
+//|       - {"artifact":"kdtree","path":"/rows/0/1","equals":156}
+//|       - {"artifact":"kdtree","path":"/rows/0/2","equals":0}
+//|   - case: coarse
+//|     expect:
+//|       - {"artifact":"kdtree","path":"/rows/0/0","equals":480}
+//|       - {"artifact":"kdtree","path":"/rows/0/2","equals":0}
+use scioxide_core::{ExecutionContext, RealScalar};
+use scioxide_spatial::{KdTree, Neighbor, PointSet, SearchOptions, SearchWorkspaceRequest};
+
+let spacing: f64 = grid_spacing.parse().map_err(|_| "Grid spacing is not numeric")?;
+// KD-tree Neighbor::index is the point-set row index, directly identifying stations.
+let sites = PointSet::from_points(&STATIONS).map_err(|e| e.to_string())?;
+let tree = KdTree::new(&sites).map_err(|e| e.to_string())?;
+let options = SearchOptions::new();
+let mut workspace = tree
+    .workspace(SearchWorkspaceRequest::new(1, options))
+    .map_err(|e| e.to_string())?;
+let mut nearest = [Neighbor::default()];
+
+let grid = grid_points(spacing);
+let (mut ties, mut misses, mut distance_gap) = (0_usize, 0_usize, 0.0_f64);
+for p in &grid {
+    let (least, closest) = closest_stations(p);
+    tree.nearest_into(
+        p,
+        1,
+        options,
+        &mut nearest,
+        &mut workspace,
+        ExecutionContext::sequential(),
+    )
+    .map_err(|e| e.to_string())?;
+    ties += usize::from(closest.len() > 1);
+    misses += usize::from(!closest.contains(&nearest[0].index));
+    distance_gap = distance_gap.max((nearest[0].distance - RealScalar::sqrt(least)).abs());
+}
+
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Grid points [count]", "type": "integer" },
+    { "key": "1", "label": "Equidistant grid points [count]", "type": "integer" },
+    { "key": "2", "label": "Nearest station differs from reference [count]", "type": "integer" },
+    { "key": "3", "label": "Largest distance difference [km]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    columns,
+    vec![(grid.len(), ties, misses, distance_gap)],
+    metadata = serde_json::json!({ "id": "kdtree" })
+);
+```
+
+At default $h = 0.5$ km, 77 of 12000 points are equidistant; every KD-tree neighbor belongs to its reference set.
+KD-tree and exhaustive distances $\sqrt{\text{minimum squared distance}}$ also differ by 0 everywhere.
+At “h = 0.25 km,” 156 of 48000 points are equidistant; at “h = 2.5 km,” 16 of 480 are, with zero mismatches in both cases.
+
+## Polygon membership and area
+
+For polygons clipped with `thiessen_polygons`, the next cell finds all polygons containing each grid point and compares them with references.
+A point belongs to a counterclockwise convex polygon (including its boundary) exactly when it is never right of any boundary edge: `orient2d` must be nonnegative everywhere.
+Count comparisons separately for points with one reference station (region interiors) and at least two (boundaries).
+The first table shows polygon area, grid estimate $m_i h^2$, and their relative difference per station.
+The second shows membership mismatches separately for interiors and boundaries.
+
+```rust
+//| id: spatial-thiessen-membership-check
+//| ref: spatial-thiessen-membership-check
+//| title: "Check Thiessen-region membership and areas on grid points"
+//| run: reactive
+//| uses: [spatial-thiessen-grid-model]
+//| crates: [scioxide-core, scioxide-spatial]
+//| inputs:
+//|   grid_spacing: {"type":"select","label":"Grid spacing h [km]","description":"Select a spacing dividing 5 km.","options":["0.25","0.5","1","2.5"],"value":"0.5"}
+//| cases:
+//|   - {"id":"fine","label":"h = 0.25 km","description":"Relative area-estimate differences fall below 10⁻⁴.","inputs":{"grid_spacing":"0.25"}}
+//|   - {"id":"coarse","label":"h = 2.5 km","description":"Coarse-grid area differences reach the 10⁻³ scale, while interior membership still agrees.","inputs":{"grid_spacing":"2.5"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"membership","path":"/rows/0/0","equals":0}
+//|       - {"artifact":"grid-areas","path":"/rows/3/3","range":{"min":-1e-3,"max":1e-3}}
+//|       - {"artifact":"grid-areas","path":"/rows/5/2","approx":{"value":275,"atol":1e-9}}
+//|   - case: fine
+//|     expect:
+//|       - {"artifact":"membership","path":"/rows/0/0","equals":0}
+//|       - {"artifact":"grid-areas","path":"/rows/3/3","range":{"min":-1e-4,"max":1e-4}}
+//|   - case: coarse
+//|     expect:
+//|       - {"artifact":"membership","path":"/rows/0/0","equals":0}
+//|       - {"artifact":"grid-areas","path":"/rows/2/3","range":{"min":1e-3,"max":1e-2}}
+use scioxide_core::SciOxideError;
+use scioxide_spatial::{PredicateSign, orient2d};
+
+// Counterclockwise convex-polygon containment (including boundary): orient2d is nonnegative for every edge.
+fn contains(ring: &[[f64; 2]], p: &[f64; 2]) -> Result<bool, SciOxideError> {
+    for k in 0..ring.len() {
+        let next = ring[(k + 1) % ring.len()];
+        if orient2d(&ring[k], &next, p)? == PredicateSign::Negative {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+let spacing: f64 = grid_spacing.parse().map_err(|_| "Grid spacing is not numeric")?;
+let polygons = thiessen_polygons()?;
+let n = STATIONS.len();
+let mut weights = vec![0.0_f64; n];
+let (mut interior_misses, mut boundary_misses) = (0_usize, 0_usize);
+for p in grid_points(spacing) {
+    let (_, closest) = closest_stations(&p);
+    let mut inside = Vec::new();
+    for (i, ring) in polygons.iter().enumerate() {
+        if contains(ring, &p).map_err(|e| e.to_string())? {
+            inside.push(i);
+        }
+    }
+    // Split boundary grid points equally among equidistant stations for area estimates.
+    for &i in &closest {
+        weights[i] += 1.0 / closest.len() as f64;
+    }
+    if closest.len() > 1 {
+        boundary_misses += usize::from(inside != closest);
+    } else {
+        interior_misses += usize::from(inside != closest);
+    }
+}
+
+// Compute polygon areas with shoelace formula ½ Σ (x_k y_{k+1} − x_{k+1} y_k).
+let area = |ring: &[[f64; 2]]| -> f64 {
+    let count = ring.len();
+    let twice: f64 = (0..count)
+        .map(|k| ring[k][0] * ring[(k + 1) % count][1] - ring[(k + 1) % count][0] * ring[k][1])
+        .sum();
+    0.5 * twice
+};
+let cell_area = spacing * spacing;
+let rows: Vec<(usize, f64, f64, f64)> = (0..n)
+    .map(|i| {
+        let (exact, estimate) = (area(&polygons[i]), weights[i] * cell_area);
+        (i, exact, estimate, (estimate - exact) / exact)
+    })
+    .collect();
+let fixed1 = serde_json::json!({ "fractionDigits": 1 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let area_columns = serde_json::json!([
+    { "key": "0", "label": "Station", "type": "integer" },
+    { "key": "1", "label": "Polygon area [km²]", "type": "number", "format": fixed1 },
+    { "key": "2", "label": "Grid-point estimate [km²]", "type": "number", "format": fixed1 },
+    { "key": "3", "label": "Relative difference [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    area_columns,
+    rows,
+    metadata = serde_json::json!({ "id": "grid-areas" })
+);
+let tally_columns = serde_json::json!([
+    { "key": "0", "label": "Membership mismatches (interior) [count]", "type": "integer" },
+    { "key": "1", "label": "Membership mismatches (boundary) [count]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    tally_columns,
+    vec![(interior_misses, boundary_misses)],
+    metadata = serde_json::json!({ "id": "membership" })
+);
+```
+
+At default $h = 0.5$ km, all 11923 interior points belong only to their reference station's polygon, giving zero membership mismatches.
+Of 77 boundary points, 48 were not contained in both equidistant stations' polygons.
+Rounded vertices shift edges about $10^{-15}$ km from exact bisectors, putting exactly equidistant points slightly inside or outside.
+`orient2d` signs are exact for supplied vertices, but rounded vertices do not define the exact bisectors, leaving boundary membership unresolved.
+Largest relative area-estimate difference is $3.4\times10^{-4}$, becoming $4.9\times10^{-5}$ at “h = 0.25 km” and $5.7\times10^{-3}$ at “h = 2.5 km”; finer grids approach polygon areas.
+
+## Summary
+
+Thiessen regions can be checked with exhaustive nearest stations at grid points; coordinates in multiples of 1/8 km also permit exact tie tests.
+`nearest_into` of `KdTree` returns a reference station at every grid point; `Neighbor::index` is a point-set row index directly usable as station index.
+Clipped polygons match reference stations at all interior grid points; only points exactly on bisectors disagree.
+Rounded vertices cannot determine which region receives a boundary point; test equal distances using station coordinates.
+Grid-count area estimates approach polygon areas as $h$ decreases, independently checking clipped areas.
+
+## Further reading
+
+- [Thiessen regions and area-weighted rainfall for weather stations](../voronoi-territory/): clip the same station regions and compute catchment-average rainfall weighted by area.
+- [Neighbor search with KD trees](../../algorithms/spatial-trees-and-distance/): examine nearest-neighbor queries, workspaces, and distance definitions.
+- [Exact geometric predicates](../../algorithms/exact-predicates/): examine exact `orient2d` signs for supplied coordinates and how they are evaluated.

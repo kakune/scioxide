@@ -1,0 +1,372 @@
+---
+title: "Stiffness assembly from local spring contributions"
+description: "Assemble a point-mass stiffness matrix with grounding and coupling springs using SparseBuilder, independently checking duplicate summation with row sums and closed forms, and CSR products with difference formulas, sinusoidal closed forms, and elastic energy."
+sidebar:
+  order: 405
+references:
+  sparse-spring-duplicates: "duplicate-summation-and-finalization"
+---
+
+Finite-element (FEM) and finite-volume (FVM) methods construct global matrices by adding element-local matrices at global degree-of-freedom indices.
+This process is called **assembly**.
+Adjacent elements share nodes, so multiple contributions enter the same position $(i, j)$.
+
+This example assembles global stiffness from the elastic energy of one-dimensional point masses linked by grounding and coupling springs.
+Closed-form entry counts and row sums check duplicate summation with `SparseBuilder` and finalization into `CsrMatrix`.
+Matrix–vector products are then independently checked with a difference formula, a closed form for sinusoidal displacement, and elastic energy.
+
+## Local elastic energy and stiffness matrices
+
+Let $n$ point masses have displacements $x_i$ [m] ($i = 0, \dots, n - 1$).
+Each mass is attached to a wall by a grounding spring of stiffness $a$ [N/m]; adjacent masses $i$ and $i + 1$ are joined by a coupling spring of stiffness $k$ [N/m].
+The system's elastic energy [J] is
+
+$$
+E(\mathbf{x}) = \frac{a}{2} \sum_{i=0}^{n-1} x_i^2 + \frac{k}{2} \sum_{i=0}^{n-2} (x_{i+1} - x_i)^2
+$$
+
+the expression above.
+Its gradient $\nabla E(\mathbf{x}) = \mathbf{A}\mathbf{x}$ is the **nodal force** [N] applied to each mass to maintain displacement $\mathbf{x}$, with entries
+
+$$
+(\mathbf{A}\mathbf{x})_i = \frac{\partial E}{\partial x_i} = a x_i + k (x_i - x_{i-1}) + k (x_i - x_{i+1})
+$$
+
+where the left-neighbor term is absent at $i = 0$ and the right-neighbor term at $i = n - 1$.
+The springs' restoring force on the masses is the negated nodal force $-\mathbf{A}\mathbf{x}$.
+
+Element $e = (i, i + 1)$ has energy $\frac{k}{2}(x_{i+1} - x_i)^2 = \frac{1}{2} [x_i, x_{i+1}]\, \mathbf{K}_e\, [x_i, x_{i+1}]^{\mathsf{T}}$ and local stiffness
+
+$$
+\mathbf{K}_e = k \begin{bmatrix} 1 & -1 \\ -1 & 1 \end{bmatrix}
+$$
+
+the expression above.
+Global stiffness $\mathbf{A}$ sums $n$ grounding-spring diagonal contributions $(i, i, a)$ and four contributions $(i, i, k)$, $(i+1, i+1, k)$, $(i, i+1, -k)$, and $(i+1, i, -k)$ from each element.
+There are $n + 4(n - 1) = 5n - 4$ inserted triplets and $3n - 2$ tridiagonal nonzeros after duplicate summation.
+Diagonals are $a + k$ at endpoints and $a + 2k$ in the interior.
+Every row sum of $\mathbf{K}_e$ is zero, so row sums of $\mathbf{A}$ equal grounding stiffness $a$, giving $\mathbf{A}\mathbf{1} = a\mathbf{1}$.
+This expresses that uniform displacement does not stretch coupling springs and checks the assembled matrix.
+
+When $a > 0$, $\mathbf{x} \ne \mathbf{0}$ implies $\mathbf{x}^{\mathsf{T}}\mathbf{A}\mathbf{x} = 2E(\mathbf{x}) \ge a\lVert\mathbf{x}\rVert_2^2 > 0$, so $\mathbf{A}$ is symmetric positive definite.
+Without grounding springs, $a = 0$ gives zero energy at $\mathbf{x} = \mathbf{1}$, making $\mathbf{A}$ singular.
+
+The following block defines helpers shared by two cells.
+`GROUND_STIFFNESS` corresponds to grounding stiffness $a = 0.5$ N/m, and `spring_builder` to the function returning `SparseBuilder` containing the $5n - 4$ triplets above.
+
+```rust
+//| id: sparse-spring-assembly-model
+//| kind: definitions
+//| title: "Inserting local spring contributions"
+//| crates: [scioxide-core, scioxide-sparse]
+use scioxide_core::SciOxideError;
+use scioxide_sparse::SparseBuilder;
+
+/// Grounding-spring stiffness a [N/m].
+pub(crate) const GROUND_STIFFNESS: f64 = 0.5;
+
+/// An n × n SparseBuilder containing grounding contributions (i, i, a) and, for each element (i, i + 1),
+/// the four contributions of k [[1, −1], [−1, 1]] (5n − 4 triplets).
+pub(crate) fn spring_builder(n: usize, k: f64) -> Result<SparseBuilder<f64>, SciOxideError> {
+    let mut builder = SparseBuilder::new(n, n);
+    for i in 0..n {
+        builder.push(i, i, GROUND_STIFFNESS)?;
+    }
+    for (i, j) in (0..n).zip(1..n) {
+        for (row, col, value) in [(i, i, k), (j, j, k), (i, j, -k), (j, i, -k)] {
+            builder.push(row, col, value)?;
+        }
+    }
+    Ok(builder)
+}
+```
+
+## Duplicate summation and finalization
+
+`SparseBuilder::push` checks index bounds (`OutOfBounds`) and value finiteness (`NonFinite`) on every insertion.
+`finish_csr` sorts triplets in row-major order ($O(t \log t)$ for $t$ triplets), handles duplicates with `DuplicatePolicy` and then exact zeros with `ExplicitZeroPolicy`, and builds CSR.
+`DuplicatePolicy::Sum` accumulates equal-coordinate values exactly and rounds once, independent of insertion order.
+`DuplicatePolicy::Reject` rejects the first sorted duplicate with `InvalidInput`, so it cannot assemble these overlapping diagonal contributions.
+`ExplicitZeroPolicy::Drop` removes exactly zero sums, but this model has no coordinate summing to zero, giving the same matrix as `Preserve`.
+`CsrMatrix::from_triplets` performs the same process directly with `(Sum, Preserve)`.
+
+## Duplicate summation and row sums
+
+The following cell inserts triplets using the number of degrees of freedom $n$ and coupling stiffness $k$ as inputs, then finalizes with both `Sum` and `Reject`.
+The first table compares triplet and stored-entry counts with closed forms $5n - 4$ and $3n - 2$ and shows the result under `Reject`.
+The second compares summed diagonals with $a + k$ and $a + 2k$ and row sums with $a$ for endpoint rows 0 and $n - 1$ and interior row 1.
+Row sums are nodal forces $(\mathbf{A}\mathbf{1})_i$ [N] under uniform 1 m displacement, computed by product `apply`.
+
+```rust
+//| id: sparse-spring-assembly
+//| ref: sparse-spring-assembly
+//| title: "Sum duplicate local spring contributions and finalize CSR"
+//| run: reactive
+//| uses: [sparse-spring-assembly-model]
+//| crates: [scioxide-core, scioxide-sparse]
+//| inputs:
+//|   sparse_dimension: {"type":"range","label":"Degrees of freedom n","description":"Number of point masses.","min":16,"max":96,"step":8,"value":32}
+//|   spring_stiffness: {"type":"range","label":"Coupling-spring stiffness k [N/m]","description":"Stiffness of springs joining adjacent masses.","min":0.2,"max":5,"step":0.2,"value":1}
+//| cases:
+//|   - {"id":"many-masses","label":"n = 96","description":"There are 3n − 2 = 286 stored entries, about 3 % of dense n² = 9216 entries.","inputs":{"sparse_dimension":96}}
+//|   - {"id":"inexact-stiffness","label":"k = 0.2 N/m","description":"k is not exactly representable in binary, so rounding shifts the row sum from a by one last-place unit.","inputs":{"spring_stiffness":0.2}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"counts","path":"/rows/0/0","equals":156}
+//|       - {"artifact":"counts","path":"/rows/0/1","equals":156}
+//|       - {"artifact":"counts","path":"/rows/0/2","equals":94}
+//|       - {"artifact":"counts","path":"/rows/0/3","equals":94}
+//|       - {"artifact":"counts","path":"/rows/0/5","equals":"InvalidInput"}
+//|       - {"artifact":"rows","path":"/rows/0/1","approx":{"value":1.5,"atol":1e-15}}
+//|       - {"artifact":"rows","path":"/rows/1/1","approx":{"value":2.5,"atol":1e-15}}
+//|       - {"artifact":"rows","path":"/rows/1/3","approx":{"value":0.5,"atol":1e-15}}
+//|       - {"artifact":"rows","path":"/rows/1/4","equals":0}
+//|   - case: many-masses
+//|     expect:
+//|       - {"artifact":"counts","path":"/rows/0/0","equals":476}
+//|       - {"artifact":"counts","path":"/rows/0/2","equals":286}
+//|       - {"artifact":"counts","path":"/rows/0/4","equals":9216}
+//|       - {"artifact":"rows","path":"/rows/2/3","approx":{"value":0.5,"atol":1e-15}}
+//|   - case: inexact-stiffness
+//|     expect:
+//|       - {"artifact":"rows","path":"/rows/0/1","approx":{"value":0.7,"atol":1e-15}}
+//|       - {"artifact":"rows","path":"/rows/0/4","approx":{"value":-5.551115123125783e-17,"atol":1e-30}}
+use scioxide_sparse::{DuplicatePolicy, ExplicitZeroPolicy};
+
+let n = sparse_dimension as usize;
+let k = spring_stiffness;
+let a = GROUND_STIFFNESS;
+let builder = spring_builder(n, k).map_err(|e| e.to_string())?;
+let triplets = builder.triplet_count();
+// Rejecting duplicates fails finalization on overlapping diagonal contributions.
+let rejected = match builder
+    .clone()
+    .finish_csr(DuplicatePolicy::Reject, ExplicitZeroPolicy::Drop)
+{
+    Ok(_) => "Success".to_string(),
+    Err(e) => format!("{:?}", e.kind()),
+};
+// Sum duplicates exactly and round once, removing entries that become zero afterward.
+let matrix = builder
+    .finish_csr(DuplicatePolicy::Sum, ExplicitZeroPolicy::Drop)
+    .map_err(|e| e.to_string())?;
+// Row sum (A1)ᵢ [N]: nodal force for uniform displacement of 1 m.
+let row_sums = matrix.apply(&vec![1.0; n]).map_err(|e| e.to_string())?;
+
+let counts = serde_json::json!([
+    { "key": "0", "label": "Inserted triplets t", "type": "integer" },
+    { "key": "1", "label": "5n − 4", "type": "integer" },
+    { "key": "2", "label": "Stored entries nnz(A)", "type": "integer" },
+    { "key": "3", "label": "3n − 2", "type": "integer" },
+    { "key": "4", "label": "Dense entries n²", "type": "integer" },
+    { "key": "5", "label": "Finalization result with Reject" }
+]);
+let count_row = (
+    triplets,
+    5 * n - 4,
+    matrix.nnz(),
+    3 * n - 2,
+    n * n,
+    rejected,
+);
+emit_table_with_columns!(
+    counts,
+    vec![count_row],
+    metadata = serde_json::json!({ "id": "counts" })
+);
+
+// Compare endpoint rows 0 and n − 1 and interior row 1 diagonals and row sums with closed forms.
+let mut rows = Vec::new();
+for (i, expected) in [(0, a + k), (1, a + 2.0 * k), (n - 1, a + k)] {
+    let diagonal = matrix.get(i, i).map_err(|e| e.to_string())?;
+    rows.push((i, diagonal, expected, row_sums[i], row_sums[i] - a));
+}
+let sig17 = serde_json::json!({ "significantDigits": 17 });
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Row i", "type": "integer" },
+    { "key": "1", "label": "Summed diagonal Aᵢᵢ [N/m]", "type": "number", "format": sig17 },
+    { "key": "2", "label": "a + k or a + 2k [N/m]", "type": "number", "format": sig17 },
+    { "key": "3", "label": "Row sum (A1)ᵢ [N]", "type": "number", "format": sig17 },
+    { "key": "4", "label": "Row sum − a [N]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "rows" })
+);
+```
+
+At the default $n = 32$, 156 inserted triplets and 94 stored entries match $5n - 4$ and $3n - 2$, far fewer than 1024 dense entries.
+Finalizing the same triplets with `Reject` returns `InvalidInput` for duplicated diagonals.
+Endpoint diagonals sum the grounding and one coupling spring to $a + k = 1.5$ N/m; interior diagonals add two coupling springs for $a + 2k = 2.5$ N/m; all row sums equal $a = 0.5$ N.
+All input values here are binary-exact, so neither summation nor products round, and row sums equal $a$ exactly.
+$k = 0.2$ N/m is not binary-exact, so summed diagonal $0.7$ and intermediate product sums round, making row sums one last-place unit ($2^{-54} \approx 5.6 \times 10^{-17}$ N) smaller than $a$.
+This difference is rounding-scale; an assembly error would instead appear on the scale of $k$.
+
+At $n = 96$, 286 stored entries are about 3 % of the 9216 dense entries.
+The dense-storage ratio $(3n - 2)/n^2$ decreases roughly inversely with $n$.
+
+## Nodal forces for sinusoidal displacement
+
+With $\theta = 2\pi/(n - 1)$ and amplitude $X$ [m], prescribe sinusoidal displacement $x_i = X\sin(i\theta)$, zero at both endpoints.
+For interior masses ($1 \le i \le n - 2$), $x_{i-1} + x_{i+1} = 2\cos\theta\, x_i$, giving
+
+$$
+(\mathbf{A}\mathbf{x})_i = (a + 2k)\,x_i - k\,(x_{i-1} + x_{i+1}) = \lambda x_i, \qquad \lambda = a + 4k\sin^2\frac{\theta}{2}
+$$
+
+so nodal force is proportional to displacement.
+Endpoint masses have coupling springs on only one side and do not follow this proportionality.
+Using $x_0 = x_{n-1} = 0$ and $x_{n-2} = -X\sin\theta$ gives $(\mathbf{A}\mathbf{x})_0 = -kX\sin\theta$ and $(\mathbf{A}\mathbf{x})_{n-1} = kX\sin\theta$.
+Interior force magnitude is at most $\lambda X$, so endpoint forces are largest when $k\sin\theta > \lambda$.
+This condition is equivalent to $k(\sin\theta - 4\sin^2(\theta/2)) > a$; for $n = 32$ and $a = 0.5$ N/m it becomes $k > 3.12$ N/m.
+
+## Checking CSR products
+
+The following cell assembles the same matrix and computes nodal forces $\mathbf{A}\mathbf{x}$ for sinusoidal displacement of amplitude $X = 0.01$ m.
+It uses standard product form `apply`.
+`apply` is a `Accuracy::Standard` (ordinary floating-point) product visiting each stored entry once, costing $O(\mathrm{nnz}(\mathbf{A}) + n)$.
+
+There are three independent checks.
+The first directly evaluates the entrywise difference formula with double-precision arithmetic; the second uses interior proportionality $\lambda x_i$; the third compares energy $2E(\mathbf{x})$ with quadratic form $\mathbf{x}^{\mathsf{T}}(\mathbf{A}\mathbf{x})$.
+The chart shows CSR products as symbols and interior proportionality $\lambda x_i$ as a dashed line.
+The table shows maximum nodal force and all three checks.
+
+```rust
+//| id: sparse-spring-product
+//| ref: sparse-spring-product
+//| title: "Check CSR products for sinusoidal displacement in three ways"
+//| run: reactive
+//| uses: [sparse-spring-assembly-model]
+//| crates: [scioxide-core, scioxide-sparse]
+//| inputs:
+//|   sparse_dimension: {"type":"range","label":"Degrees of freedom n","description":"Number of point masses.","min":16,"max":96,"step":8,"value":32}
+//|   spring_stiffness: {"type":"range","label":"Coupling-spring stiffness k [N/m]","description":"Stiffness of springs joining adjacent masses.","min":0.2,"max":5,"step":0.2,"value":1}
+//| cases:
+//|   - {"id":"stiff-coupling","label":"k = 5 N/m","description":"Endpoint force kX sin θ exceeds the maximum interior force.","inputs":{"spring_stiffness":5}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"checks","path":"/rows/0/0","approx":{"value":5.402458247333163e-3,"rtol":1e-12}}
+//|       - {"artifact":"checks","path":"/rows/0/1","range":{"max":2e-17}}
+//|       - {"artifact":"checks","path":"/rows/0/2","range":{"max":2e-17}}
+//|       - {"artifact":"checks","path":"/rows/0/5","range":{"max":1e-14}}
+//|   - case: stiff-coupling
+//|     expect:
+//|       - {"artifact":"checks","path":"/rows/0/0","approx":{"value":1.0064926004433e-2,"rtol":1e-12}}
+//|       - {"artifact":"checks","path":"/rows/0/1","range":{"max":1e-16}}
+//|       - {"artifact":"checks","path":"/rows/0/2","range":{"max":1e-16}}
+//|       - {"artifact":"checks","path":"/rows/0/5","range":{"max":1e-14}}
+use scioxide_core::RealScalar;
+use scioxide_sparse::{DuplicatePolicy, ExplicitZeroPolicy};
+
+let n = sparse_dimension as usize;
+let k = spring_stiffness;
+let a = GROUND_STIFFNESS;
+let matrix = spring_builder(n, k)
+    .and_then(|b| b.finish_csr(DuplicatePolicy::Sum, ExplicitZeroPolicy::Drop))
+    .map_err(|e| e.to_string())?;
+
+// Nodal forces Ax [N] for sinusoidal displacement xᵢ = X sin(iθ) [m].
+let amplitude = 0.01_f64;
+let theta = 2.0 * core::f64::consts::PI / (n - 1) as f64;
+let x: Vec<f64> = (0..n)
+    .map(|i| amplitude * RealScalar::sin(theta * i as f64))
+    .collect();
+let force = matrix.apply(&x).map_err(|e| e.to_string())?;
+
+// Independent check 1: entrywise difference formula (f64 arithmetic).
+let max_difference = (0..n)
+    .map(|i| {
+        let left = if i > 0 { x[i] - x[i - 1] } else { 0.0 };
+        let right = if i + 1 < n { x[i] - x[i + 1] } else { 0.0 };
+        (force[i] - (a * x[i] + k * (left + right))).abs()
+    })
+    .fold(0.0_f64, f64::max);
+// Independent check 2: (Ax)ᵢ = λxᵢ for interior masses (λ is a reference from f64 standard functions).
+let lambda = a + 4.0 * k * (theta / 2.0).sin().powi(2);
+let interior_gap = (1..n - 1)
+    .map(|i| (force[i] - lambda * x[i]).abs())
+    .fold(0.0_f64, f64::max);
+// Independent check 3: quadratic form xᵀ(Ax) and twice the elastic energy 2E(x) [J].
+let quadratic: f64 = x.iter().zip(&force).map(|(p, q)| p * q).sum();
+let stretch: f64 = x.windows(2).map(|w| (w[1] - w[0]) * (w[1] - w[0])).sum();
+let energy2 = a * x.iter().map(|v| v * v).sum::<f64>() + k * stretch;
+let max_force = force.iter().map(|f| f.abs()).fold(0.0_f64, f64::max);
+
+let observed: Vec<[f64; 2]> = (0..n).map(|i| [i as f64, force[i]]).collect();
+let proportional: Vec<[f64; 2]> = (0..n).map(|i| [i as f64, lambda * x[i]]).collect();
+emit_chart!(
+    serde_json::json!({
+        "kind": "xy",
+        "dataZoom": true,
+        "tooltip": true,
+        "xLabel": "Mass index i [-]",
+        "yLabel": "Nodal force (Ax)ᵢ [N]",
+        "layers": [
+            {
+                "id": "proportional",
+                "kind": "line",
+                "name": "λxᵢ (interior closed form)",
+                "points": proportional,
+                "style": { "lineType": "dashed", "showSymbol": false }
+            },
+            { "id": "csr", "kind": "scatter", "name": "CSR product (Ax)ᵢ", "points": observed }
+        ]
+    }),
+    metadata = serde_json::json!({ "id": "forces" })
+);
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let sig16 = serde_json::json!({ "significantDigits": 16 });
+let checks = serde_json::json!([
+    { "key": "0", "label": "Maximum nodal force max|(Ax)ᵢ| [N]", "type": "number", "format": sci3 },
+    { "key": "1", "label": "Maximum difference from difference formula [N]", "type": "number", "format": sci3 },
+    { "key": "2", "label": "Maximum interior difference from λxᵢ [N]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "xᵀ(Ax) [J]", "type": "number", "format": sig16 },
+    { "key": "4", "label": "2E(x) [J]", "type": "number", "format": sig16 },
+    { "key": "5", "label": "Relative difference [-]", "type": "number", "format": sci3 }
+]);
+let relative = (quadratic - energy2).abs() / energy2;
+let check_row = (
+    max_force,
+    max_difference,
+    interior_gap,
+    quadratic,
+    energy2,
+    relative,
+);
+emit_table_with_columns!(
+    checks,
+    vec![check_row],
+    metadata = serde_json::json!({ "id": "checks" })
+);
+```
+
+At defaults $n = 32$ and $k = 1$ N/m, the 30 interior symbols lie on dashed $\lambda x_i$, with only the two endpoints departing from it.
+Endpoint forces are $(\mathbf{A}\mathbf{x})_0 = -2.01 \times 10^{-3}$ N and $(\mathbf{A}\mathbf{x})_{n-1} = 2.01 \times 10^{-3}$ N, smaller than the interior maximum $\lambda X \max_i \lvert\sin(i\theta)\rvert = 5.40 \times 10^{-3}$ N.
+At $k = 5$ N/m, endpoint force $1.0065 \times 10^{-2}$ N exceeds the interior maximum $7.04 \times 10^{-3}$ N, and the table maximum agrees with closed form $kX\sin\theta$ within rounding.
+
+Maximum differences are $1.7 \times 10^{-18}$ N from the difference formula and $5.2 \times 10^{-18}$ N from interior proportionality.
+Both are on the scale of $5.6 \times 10^{-18}$ N, entry scale $(a + 2k)X = 2.5 \times 10^{-2}$ N times machine epsilon $\varepsilon \approx 2.2 \times 10^{-16}$, explained by rounding in both product and checks.
+Differences well beyond rounding suggest endpoint or local-assembly errors.
+To compare with a once-rounded product, use `matrix.view().with_accuracy(Accuracy::Exact)` as the operator.
+
+$\mathbf{x}^{\mathsf{T}}(\mathbf{A}\mathbf{x})$ and $2E(\mathbf{x})$ are mathematically equal, with computed relative difference $2.6 \times 10^{-16}$.
+The energy formula uses no matrix, so agreement independently confirms that assembly represents the model's quadratic form.
+A positive value only shows consistency with positive definiteness for this $\mathbf{x}$; the proof of positive definiteness is the earlier inequality $2E(\mathbf{x}) \ge a\lVert\mathbf{x}\rVert_2^2$.
+
+## Summary
+
+Insert local contributions into `SparseBuilder` in any order, sum duplicates exactly with `DuplicatePolicy::Sum`, and finalize CSR once.
+Overlapping diagonal assembly fails with `InvalidInput` under `Reject`; use duplicate rejection to check inputs known to have no overlapping contributions.
+Stored entries match tridiagonal $3n - 2$, giving memory use $O(n)$ rather than dense $n^2$.
+Check assembly with row sums $\mathbf{A}\mathbf{1} = a\mathbf{1}$ and CSR products against the difference formula, interior proportionality, and elastic energy; assembly and boundary errors then appear as differences exceeding rounding.
+
+## Further reading
+
+- [Sparse storage formats and assembly](../../algorithms/storage-and-assembly/): examine CSR arrays, duplicate/zero policies, and value-only updates.
+- [Sparse Cholesky and block LDL factorization](../../algorithms/symmetric-factorizations/): examine elimination trees and direct-factorization mathematics for the assembled positive definite matrix.
+- [Reordering and fill for a two-dimensional Poisson matrix](../poisson-reordering-fill/): assemble grid difference matrices and examine elimination-order effects on Cholesky fill.

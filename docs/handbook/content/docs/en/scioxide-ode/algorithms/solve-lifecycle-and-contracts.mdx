@@ -1,0 +1,637 @@
+---
+title: "Solving procedure and result contracts"
+description: "One-shot functions and integrator solve, workspace, and advance methods; roles of problems, settings, states, and workspaces; work limits and nested accounting; accepted states versus attempts; limit stops and failures; error categories; state domains; complex states."
+sidebar:
+  order: 375
+references:
+  ode-one-shot-and-method-values: "one-shot-functions-and-integrator-objects"
+  ode-problem-options-state-workspace: "problems-settings-states-and-workspaces"
+  ode-budgets-and-accounting: "work-limits-and-accounting"
+  ode-accepted-state-and-trials: "accepted-states-and-attempts"
+  ode-termination-and-partial-results: "termination-statuses-and-partial-results"
+  ode-error-classes: "error-classifications"
+  ode-admissible-states: "state-domains"
+  ode-complex-states: "complex-states"
+---
+
+This page summarizes caller inputs and outputs for initial value problems and what remains after early termination.
+Other pages cover method algorithms; here we explain procedures and contracts shared by all methods.
+Delay equations (`DdePlan`), SDEs (`SdeMethod`), DAEs (`DaeBdf`), and dynamical systems (`StormerVerlet`, `Rattle`) also provide `advance` in the same form.
+Their pages describe family-specific differences.
+
+## One-shot functions and integrator objects
+
+Initial value APIs have two forms.
+
+One-shot `solve_ivp(rhs, t0, t1, y0)` and `solve_ivp_at(rhs, times, y0)` accept right-hand-side closure `Fn(t, y, dy) -> Result<(), SciOxideError>` and solve with Dormand–Prince 5(4).
+Local tolerances are absolute $10^{-6}$ and relative $10^{-3}$, with root-mean-square (RMS) norm.
+The function `solve_ivp` returns state at endpoint $t_1$ as `Vector`.
+The function `solve_ivp_at` returns `Matrix` with one state row per time in `times`, starting with `y0`.
+The times `times` must contain at least two entries, monotone in either direction.
+Repeated times yield identical rows.
+Intermediate values come from dense output, so the time sequence does not change steps.
+One-shot functions accept neither settings nor workspace.
+Failure to reach the endpoint always gives an error, including limit stops.
+
+Integrator objects are values such as `DormandPrince5::new()` or `RadauIia::new()`, providing these `OdeMethod` methods.
+
+| Method | Role | Failure handling |
+|---|---|---|
+| `validate(&options, dimension)` | Validate the method/settings combination | `Err(SciOxideError)` |
+| `workspace_requirements(&problem, &options)` | Return workspace requirements `OdeRequirements` | `Err(SciOxideError)` |
+| `workspace(&problem, &options)` | Allocate workspace `OdeWorkspace` | `Err(SciOxideError)` |
+| `advance(&problem, &options, &mut state, &mut sink, &mut workspace, scope)` | Advance state in place to the endpoint | Limit stops return `Ok`; failures `Err(SciOxideError)` |
+| `solve(&problem, &options, initial)` | Allocate new workspace and trajectory, then solve | Limit stops return `Ok`; failures `Err(PartialFailure<OdeProgress>)` |
+
+Integrator objects hold no tolerances or output policies; supply them per call through `OdeOptions`.
+Reuse the same integrator and workspace across settings and problems.
+The method `solve` supplies new workspace, trajectory-storing `OdeTrajectory`, and sequential context `ExecutionContext::sequential_native()` to `advance`.
+Use `workspace` and `advance` for repeated solves or to avoid allocation.
+The type `BuiltinOdeMethod` selects built-in methods at runtime and provides the same methods.
+
+## Problems, settings, states, and workspaces
+
+Arguments of `advance` are separated by role.
+
+- `OdeProblem::new(&system, end)` borrows the system and holds terminal time.
+  Add event functions through `with_events` and user stage solvers through `with_stage_solver`.
+  Integration goes from state time to `end`, backward if `end` precedes state time.
+- `OdeOptions` holds local tolerances (same defaults as one-shot functions), initial step, minimum and maximum step sizes, controller, output policy, events, and step/evaluation limits.
+  Setters of `with_…` do not validate.
+  The methods `validate` and `advance` validate the full combination.
+- `OdeState` holds time and state values, modified in place by `advance`.
+  After return, it holds the last accepted point.
+- An output sink implements `OdeOutputSink`, receiving policy-selected states and events upon step acceptance.
+  The sink `OdeTrajectory` stores everything in memory; `()` discards everything.
+- `OdeWorkspace` holds method workspace, event records, and latest-call record `last_attempt()`.
+  The requirements `OdeRequirements` report state dimension, event-function count, potential event records per step, and user stage-solver presence.
+  The method `OdeWorkspace::check(&requirements)` checks sufficient workspace; `try_reserve(&requirements)` allocates missing capacity.
+  If insufficient, `advance` grows workspace during validation; preallocating with `workspace` does not change results.
+
+Each `advance` is a new execution, inheriting neither step size nor multistep history from the preceding call.
+With sufficient workspace and nonallocating right-hand sides and sinks, `advance` avoids allocation even for events and scheduled output.
+Storing in `OdeTrajectory` allocates output memory separately.
+
+## Work limits and accounting
+
+The setting `OdeOptions::with_max_steps(n)` limits attempted steps, counting rejections and retries individually.
+The setting `with_max_evaluations(n)` limits callback evaluations (right-hand sides, Jacobians, mass matrices, events, stage solvers).
+Construct limits through `Budget::try_from(n)?`.
+At a limit, `advance` returns a report with status `BudgetLimit(kind)` as `Ok`; `kind` is `Proposal` for steps or `Evaluation` for evaluations.
+
+The final argument `scope` accepts `ExecutionContext` for a new solve or an outer solve's `&mut SolveContext`.
+The latter extends outer limits and cancellation to this integration.
+Right-hand-side, event, and other callbacks receive the calling step's `SolveContext`.
+For nested callback solves, such as root finding for implicit relations, pass that context to the nested solve's `scope`.
+Inner evaluations then share the evaluation limit; inner and outer iterations are recorded separately ([Nested solves and accounting](oxref:core-nested-accounting)).
+Report `counts()` returns this call's own evaluations and iterations, while `accounting()` includes nested solves.
+
+## Accepted states and attempts
+
+During adaptive integration, intermediate rejected-step values must not overwrite accepted states.
+The method `scioxide-ode` separates caller `OdeState` from workspace trial candidates, advancing each step as follows.
+
+1. Compute stages from the accepted state and write a candidate into workspace.
+   Check stage inputs and candidate states against the system domain through `OdeSystem::admits` ([State domains](#state-domains)).
+2. Normalize estimated local error by tolerances; above 1, discard the candidate, shrink the step, and restart at 1.
+   The accepted state remains unchanged during this.
+3. If the candidate can be accepted, search dense output for events within the step and emit policy-selected states and events to the sink.
+4. Only after all fallible work succeeds, swap candidate and accepted state.
+
+This order leaves `OdeState` at the last accepted point regardless of when an error occurs.
+Samples and events emitted in step 3, however, are not retracted.
+After a sink error, samples emitted earlier in that step remain in the sink.
+
+## Termination statuses and partial results
+
+The result of `advance` has three forms.
+
+- Reaching the endpoint or a terminal event returns `Ok`, with true report `is_success()`.
+  Status is `ReachedEnd` or `TerminalEvent`.
+- Step/evaluation limits, minimum step sizes, cancellation, and deadlines also return `Ok`, but `is_success()` is false.
+  Status is `BudgetLimit(kind)`, `StepSizeLimit`, or `ExecutionStopped(reason)`, with state retaining the last accepted point at the stop.
+- Other failures return `Err(SciOxideError)`.
+  State retains the last accepted point; workspace `last_attempt()` records progress `OdeProgress` (time, state, step counts, latest local estimate, and trust category).
+
+The result `Ok` does not imply success; always check report `is_success()` or `termination()`.
+The method `termination()` returns `Option`, always `Some` for `OdeSolveReport`.
+Report `trust()` gives last-accepted-point trust category `PartialResultTrust`; points satisfying acceptance rules are `Admissible`.
+The `outcome()` of `last_attempt()` is `Succeeded` on success, `Stopped` for limit stops, `Failed` for errors, and `PreflightRejected` for preflight rejection ([Attempt records](oxref:core-attempt-records)).
+
+On failure, `solve` returns `PartialFailure<OdeProgress>`, with cause in `error()` and the last accepted point in `progress()`.
+After removing the cause, restore `OdeState` through `OdeProgress::into_state()` and continue with `advance`.
+The method `solve` returns no trajectory on failure; supply a custom sink to `advance` when partial output is needed.
+One-shot functions convert limit stops to `ConvergenceFailure` (`ExecutionStopped` for cancellation or deadlines), returning `PartialFailure` as for other failures.
+
+### Checking a cooling problem
+
+Consider cooling with an ambient-temperature table available only over $0 \le t \le t_{\mathrm{table}}$ [h],
+
+$$
+T' = -k\bigl(T - T_a(t)\bigr), \qquad T_a(t) = 15 + 5\sin\frac{2\pi t}{24}\ [^\circ\mathrm{C}], \qquad k = 0.3\ \mathrm{h^{-1}}, \qquad T(0) = 80\ ^\circ\mathrm{C}
+$$
+
+integrated through $t = 12$ h.
+Here $T$ is object temperature [°C], $T_a$ ambient temperature [°C], and $k$ the heat-exchange rate constant.
+Right-hand-side evaluation outside the table's times returns `InvalidInput` (`OutOfRange`).
+Trial stages evaluate through the step endpoint, so an out-of-table evaluation fails before the last accepted time reaches $t_{\mathrm{table}}$.
+
+The following block defines helpers shared by two cells.
+The function `cooling` is the right-hand side; `cooling_options` sets absolute and relative tolerance $10^{-8}$ and output at all accepted steps.
+
+```rust
+//| id: ode-cooling-table-model
+//| kind: definitions
+//| title: "Cooling right-hand side with a truncated ambient-temperature table and settings"
+//| crates: [scioxide-core, scioxide-ode]
+use scioxide_core::{
+    ErrorTolerance, SciOxideError, InvalidInputReason, NormSelection, RealScalar, argument,
+};
+use scioxide_ode::{OdeOptions, OdeOutputSchedule};
+
+/// Cooling T' = −k (T − Tₐ(t)), k = 0.3 /h. Ambient Tₐ is tabulated only for 0 ≤ t ≤ table [h].
+pub(crate) fn cooling(
+    t: f64,
+    y: &[f64],
+    dy: &mut [f64],
+    table: f64,
+) -> Result<(), SciOxideError> {
+    if t > table {
+        let reason = InvalidInputReason::OutOfRange;
+        return Err(SciOxideError::invalid_input(
+            argument!("time"),
+            reason,
+            "no table entry",
+        ));
+    }
+    let ambient = 15.0 + 5.0 * RealScalar::sin(2.0 * core::f64::consts::PI * t / 24.0);
+    dy[0] = -0.3 * (y[0] - ambient);
+    Ok(())
+}
+
+/// Tolerance 10⁻⁸ (absolute and relative, RMS norm), outputting all accepted states.
+pub(crate) fn cooling_options() -> Result<OdeOptions<f64>, SciOxideError> {
+    let tolerance = ErrorTolerance::scalar(1e-8, 1e-8, NormSelection::RootMeanSquare)?;
+    Ok(OdeOptions::new()
+        .with_error_tolerance(tolerance)
+        .with_output_schedule(OdeOutputSchedule::AcceptedSteps))
+}
+```
+
+The next cell calls `advance` twice with the same integrator and workspace.
+The first call uses full-interval table coverage with a step limit; the second uses a table ending at $t_{\mathrm{table}}$ without a limit.
+The table gives return value, status or error classification, time in `OdeState`, progress time from `last_attempt()`, accepted steps, retained sink samples, and attempt record.
+The plot shows temperatures retained by each call's sink, with a vertical table-end line.
+
+```rust
+//| id: ode-failure-partial
+//| ref: ode-failure-partial
+//| title: "advance stopped at a step limit and advance failed by a right-hand-side error"
+//| run: reactive
+//| uses: [ode-cooling-table-model]
+//| crates: [scioxide-core, scioxide-ode]
+//| exports: [table_end]
+//| inputs:
+//|   step_budget: {"type":"range","label":"Step limit [count]","description":"Maximum attempted steps in the first call.","min":2,"max":40,"step":1,"value":10}
+//|   table_end: {"type":"range","label":"Ambient-table endpoint t_table [h]","description":"The right-hand side errors beyond this time. At 12 h, the table covers the full interval.","min":2,"max":12,"step":0.5,"value":6}
+//| cases:
+//|   - {"id":"large-budget","label":"Step limit 40","description":"Sufficient allowance lets the first call also reach the endpoint.","inputs":{"step_budget":40}}
+//|   - {"id":"full-table","label":"t_table = 12 h","description":"Full table coverage lets the second call also reach the endpoint.","inputs":{"table_end":12}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"advance","path":"/rows/0/1","equals":"Ok"}
+//|       - {"artifact":"advance","path":"/rows/0/2","equals":"BudgetLimit(Proposal)"}
+//|       - {"artifact":"advance","path":"/rows/0/5","equals":10}
+//|       - {"artifact":"advance","path":"/rows/0/7","equals":"Stopped"}
+//|       - {"artifact":"advance","path":"/rows/1/1","equals":"Err"}
+//|       - {"artifact":"advance","path":"/rows/1/2","equals":"InvalidInput"}
+//|       - {"artifact":"advance","path":"/rows/1/3","range":{"min":4,"max":6}}
+//|       - {"artifact":"advance","path":"/rows/1/7","equals":"Failed"}
+//|   - case: large-budget
+//|     expect:
+//|       - {"artifact":"advance","path":"/rows/0/2","equals":"ReachedEnd"}
+//|       - {"artifact":"advance","path":"/rows/0/3","approx":{"value":12,"atol":1e-12}}
+//|   - case: full-table
+//|     expect:
+//|       - {"artifact":"advance","path":"/rows/1/2","equals":"ReachedEnd"}
+//|       - {"artifact":"advance","path":"/rows/1/7","equals":"Succeeded"}
+use scioxide_core::{Budget, ExecutionContext};
+use scioxide_ode::{
+    DormandPrince5, OdeFn, OdeMethod, OdeOptions, OdeProblem, OdeState, OdeSystem,
+    OdeTrajectory,
+};
+
+let end = 12.0;
+let full = OdeFn::new(1, |t: f64, y: &[f64], dy: &mut [f64]| {
+    cooling(t, y, dy, end)
+})
+.map_err(|e| e.to_string())?;
+let short = OdeFn::new(1, |t: f64, y: &[f64], dy: &mut [f64]| {
+    cooling(t, y, dy, table_end)
+})
+.map_err(|e| e.to_string())?;
+let options = cooling_options().map_err(|e| e.to_string())?;
+let budget = Budget::try_from(step_budget as usize).map_err(|e| e.to_string())?;
+let limited = options.clone().with_max_steps(budget);
+let method = DormandPrince5::new();
+// First use a full table with a step limit; then a truncated table. Share workspace.
+let mut workspace = method
+    .workspace(&OdeProblem::new(&full, end), &options)
+    .map_err(|e| e.to_string())?;
+let runs: [(&str, &dyn OdeSystem<f64>, &OdeOptions<f64>); 2] = [
+    ("Step limit", &full, &limited),
+    ("Time outside the table", &short, &options),
+];
+let (mut rows, mut series) = (Vec::new(), Vec::new());
+for (cause, system, settings) in runs {
+    let problem = OdeProblem::new(system, end);
+    let mut state = OdeState::from_slice(0.0, &[80.0]).map_err(|e| e.to_string())?;
+    let mut sink = OdeTrajectory::new();
+    let context = ExecutionContext::sequential();
+    let result = method.advance(
+        &problem,
+        settings,
+        &mut state,
+        &mut sink,
+        &mut workspace,
+        context,
+    );
+    let returned = if result.is_ok() { "Ok" } else { "Err" };
+    let status = match &result {
+        Ok(report) => report.termination().map(|t| t.to_string()),
+        Err(error) => Some(format!("{:?}", error.kind())),
+    };
+    // The latest-call record and progress remain in workspace regardless of return value.
+    let record = workspace.last_attempt().ok_or("No attempt record")?;
+    let progress = record.progress().ok_or("No progress")?;
+    let outcome = format!("{:?}", record.outcome());
+    let samples = sink.times().len();
+    let steps = progress.accepted_steps();
+    rows.push((
+        cause,
+        returned,
+        status,
+        state.time(),
+        progress.time(),
+        steps,
+        samples,
+        outcome,
+    ));
+    let states = sink.states().iter().map(|y| y.as_slice()[0]);
+    let points: Vec<_> = sink
+        .times()
+        .iter()
+        .zip(states)
+        .map(|(&t, y)| [t, y])
+        .collect();
+    series.push(serde_json::json!({ "name": cause, "points": points, "kind": "scatter" }));
+}
+emit_line_chart!(
+    &series,
+    options = &serde_json::json!({
+        "xLabel": "Time t [h]",
+        "yLabel": "Temperature T retained in sink [°C]",
+        "xMin": 0.0,
+        "xMax": end,
+        "annotations": [{ "kind": "line", "axis": "x", "value": table_end, "label": "Table endpoint" }]
+    })
+);
+let fixed3 = serde_json::json!({ "fractionDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Stop cause" },
+    { "key": "1", "label": "Return value" },
+    { "key": "2", "label": "Termination status / error classification" },
+    { "key": "3", "label": "State time [h]", "type": "number", "format": fixed3 },
+    { "key": "4", "label": "Progress time [h]", "type": "number", "format": fixed3 },
+    { "key": "5", "label": "Accepted steps [count]", "type": "integer" },
+    { "key": "6", "label": "Sink samples [count]", "type": "integer" },
+    { "key": "7", "label": "Attempt record" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "advance" })
+);
+export!(table_end, table_end);
+```
+
+With defaults (10-step limit, $t_{\mathrm{table}} = 6$ h), the first call accepts 10 steps and stops at $t = 2.662$ h, returning `Ok` and a `BudgetLimit(Proposal)` report.
+The attempt record is `Stopped`; the sink retains 11 samples, initial values plus 10 steps.
+The second call accepts 19 steps through $t = 5.778$ h, then evaluates outside the table on its next attempt, returning `Err` (`InvalidInput`).
+Both `OdeState` time and progress time are then 5.778 h, and all 20 sink samples remain.
+The attempt record is `Failed`.
+Extending table coverage to 12 h lets the second call reach the endpoint in 33 steps with `ReachedEnd`.
+
+The next cell receives the table endpoint and compares owned-value `solve` with one-shot functions.
+Rows from the second onward for `solve` and `solve_ivp_at` read failed `PartialFailure` values; no trajectory or report is returned.
+
+```rust
+//| id: ode-failure-owned-forms
+//| ref: ode-failure-owned-forms
+//| title: "What solve and one-shot functions return on failure"
+//| run: reactive
+//| uses: [ode-cooling-table-model]
+//| crates: [scioxide-core, scioxide-ode]
+//| dependsOn:
+//|   partial: ode-failure-partial
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"owned","path":"/rows/0/1","equals":"Err"}
+//|       - {"artifact":"owned","path":"/rows/0/4","equals":19}
+//|       - {"artifact":"owned","path":"/rows/1/2","equals":"InvalidInput"}
+//|       - {"artifact":"owned","path":"/rows/2/3","range":{"min":0.5,"max":6}}
+use scioxide_core::PartialFailure;
+use scioxide_ode::{
+    DormandPrince5, OdeFn, OdeMethod, OdeProblem, OdeProgress, OdeState, solve_ivp,
+    solve_ivp_at,
+};
+
+let table_end = partial["table_end"].as_f64().ok_or("Missing table endpoint")?;
+let end = 12.0;
+let rhs = |t: f64, y: &[f64], dy: &mut [f64]| cooling(t, y, dy, table_end);
+// Failed row: (call, return value, error classification, progress time, accepted steps).
+let failed = |call, failure: PartialFailure<OdeProgress<f64>>| {
+    let kind = Some(format!("{:?}", failure.error().kind()));
+    let time = failure.progress().map(|p| p.time());
+    let steps = failure.progress().map(|p| p.accepted_steps());
+    (call, "Err", kind, time, steps)
+};
+// solve: integrator owned-value API. Returns report and trajectory on success, PartialFailure on failure.
+let system = OdeFn::new(1, rhs).map_err(|e| e.to_string())?;
+let problem = OdeProblem::new(&system, end);
+let options = cooling_options().map_err(|e| e.to_string())?;
+let initial = OdeState::from_slice(0.0, &[80.0]).map_err(|e| e.to_string())?;
+let mut rows = vec![
+    match DormandPrince5::new().solve(&problem, &options, initial) {
+        Ok(solution) => {
+            let report = solution.report();
+            let status = report.termination().map(|t| t.to_string());
+            (
+                "solve",
+                "Ok",
+                status,
+                Some(end),
+                Some(report.accepted_steps()),
+            )
+        }
+        Err(failure) => failed("solve", failure),
+    },
+];
+// solve_ivp and solve_ivp_at: one-shot functions return no report (default tolerances).
+rows.push(match solve_ivp(rhs, 0.0, end, &[80.0]) {
+    Ok(_) => ("solve_ivp", "Ok", None, Some(end), None),
+    Err(failure) => failed("solve_ivp", failure),
+});
+let times: Vec<f64> = (0..=24).map(|i| 0.5 * f64::from(i)).collect();
+rows.push(match solve_ivp_at(rhs, &times, &[80.0]) {
+    Ok(_) => ("solve_ivp_at", "Ok", None, Some(end), None),
+    Err(failure) => failed("solve_ivp_at", failure),
+});
+let fixed3 = serde_json::json!({ "fractionDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Call" },
+    { "key": "1", "label": "Return value" },
+    { "key": "2", "label": "Termination status / error classification", "nullText": "Not returned" },
+    { "key": "3", "label": "Last accepted time [h]", "type": "number", "format": fixed3 },
+    { "key": "4", "label": "Accepted steps [count]", "type": "integer", "nullText": "Not returned" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "owned" })
+);
+```
+
+The method `solve` uses the same tolerance $10^{-8}$ as `advance`, stopping after 19 accepted steps at 5.778 h.
+One-shot functions use default tolerance $10^{-3}$ and larger steps, evaluating outside the table after three accepted steps through 3.975 h.
+The function `solve_ivp_at` selects the same steps as `solve_ivp` and stops at the same time.
+One-shot functions fix tolerances and lose two hours of results preceding the table endpoint.
+Use integrator objects and a custom sink when partial results are needed.
+
+## Error classifications
+
+Errors are classified through `SciOxideError::kind()` (`SciOxideErrorKind`).
+This crate's classifications are:
+
+| Classification | Trigger |
+|---|---|
+| `InvalidInput` | Invalid settings (nonpositive step bounds, mismatched tolerance vectors). Unsupported features (events or scheduled output without dense output, step control for fixed-step methods; reason `UnsupportedConfiguration`). Equal initial and terminal times |
+| `NonFinite` | NaN or infinity in time, initial state, or settings (source `Input`); in callback output (source `Callback`) |
+| `DimensionMismatch` | System, state, or output dimensions disagree with the problem dimension |
+| `ConvergenceFailure`, `Singular`, `NumericalInstability` | Failed fixed-step stage solves, DAE initialization, or BVP Newton nonconvergence |
+| `ResourceLimit`, `AllocationFailure`, `SizeOverflow` | Workspace, history, or checkpoint memory exceeds limits or cannot be allocated |
+
+All input validation precedes the first callback; rejected calls leave state unchanged.
+Callback errors stop integration and propagate unchanged.
+Adaptive methods treat stage-solve failure or singular iteration matrices as rejection, halving steps and retrying.
+If no further shrinking is possible, stop with `StepSizeLimit`.
+Fixed-step methods return errors without retrying.
+
+## State domains
+
+Trial stages can leave the domain for quantities required to remain nonnegative, such as concentrations or densities.
+With `OdeSystem::admits(time, state, cx)` implemented, the integrator checks domain membership before evaluating stage right-hand sides and at candidate endpoints.
+Returning `false` rejects the step independently of its error estimate, halving it and retrying from the accepted state.
+This also applies to fixed-step methods.
+If minimum-size steps remain unacceptable, stop with `StepSizeLimit`.
+Errors from `admits` stop integration without smaller-step retries.
+The default always returns `true`.
+Calls to `admits` do not count as evaluations; account for expensive internal work through the received context.
+
+## Complex states
+
+State type `T` in `OdeSystem<S, T>` is real `S` or complex `Complex<S>`; time is always real.
+Explicit methods accept arbitrary right-hand sides.
+Implicit methods and Jacobian evaluation, including differences, assume a right-hand side holomorphic in $y$ and complex-linear $\partial f/\partial y$.
+For nonholomorphic right-hand sides with implicit methods, separate real and imaginary parts into a real system of twice the dimension.
+
+Schrödinger equation $\mathrm{i}\,\dot\psi = H\psi$ is a typical complex-state ODE.
+Here use the same rotating-frame Hamiltonian as [Rabi oscillations and matrix exponentials in a two-level quantum system](../../../scioxide-linalg/examples/two-level-rabi/),
+
+$$
+H = \frac12 \begin{bmatrix} -\Delta & \Omega \\ \Omega & \Delta \end{bmatrix}\ [\mathrm{rad}/\mu\mathrm{s}], \qquad \psi(0) = (1, 0)
+$$
+
+integrating it as $\dot\psi = -\mathrm{i}H\psi$ without a matrix exponential.
+Here $\Omega$ is Rabi frequency, $\Delta$ detuning, and $\Omega_R = \sqrt{\Omega^2 + \Delta^2}$ generalized Rabi frequency.
+The exact solution is
+
+$$
+\psi(t) = \left( \cos\frac{\Omega_R t}{2} + \mathrm{i}\,\frac{\Delta}{\Omega_R} \sin\frac{\Omega_R t}{2},\; -\mathrm{i}\,\frac{\Omega}{\Omega_R} \sin\frac{\Omega_R t}{2} \right)
+$$
+
+with excited-state probability $P_e = |\psi_1|^2$ following Rabi formula $P_e(t) = (\Omega^2/\Omega_R^2)\sin^2(\Omega_R t/2)$.
+Hermitian $H$ preserves total probability $\lVert\psi\rVert^2$ at 1.
+
+The quantity $\lVert\psi\rVert^2$ is a quadratic state invariant.
+Gauss–Legendre Runge–Kutta (`GaussRk`) preserves quadratic invariants to stage-solve accuracy.
+Dormand–Prince 5(4) does not; norm drift accumulates stepwise at the scale of local tolerances.
+The next cell solves with `DormandPrince5` (adaptive) and `GaussRk` (fixed step $T/2^k$), comparing exact-solution differences, Rabi-formula differences, and norm drift.
+The two plots have linked time axes.
+
+```rust
+//| id: ode-complex-rabi
+//| ref: ode-complex-rabi
+//| title: "Integrate a two-level system with complex states using two methods"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-linalg, scioxide-ode]
+//| inputs:
+//|   rabi: {"type":"range","label":"Rabi frequency Ω [rad/μs]","description":"Driving strength.","min":0.5,"max":20,"step":0.5,"value":6}
+//|   detuning: {"type":"range","label":"Detuning Δ [rad/μs]","description":"Resonance at 0.","min":-20,"max":20,"step":0.5,"value":2}
+//|   duration: {"type":"range","label":"Duration T [μs]","description":"Integration duration.","min":0.5,"max":10,"step":0.5,"value":3}
+//|   tolerance_exponent: {"type":"range","label":"Exponent q of DormandPrince5 tolerance 10^q","description":"Absolute and relative local tolerances.","min":-12,"max":-4,"step":1,"value":-8}
+//|   gauss_log2: {"type":"range","label":"Exponent k of GaussRk step count 2^k","description":"Number of fixed steps of size T/2^k.","min":4,"max":10,"step":1,"value":7}
+//| cases:
+//|   - {"id":"resonance","label":"Δ = 0","description":"At resonance, amplitude reaches 1, completely transferring to the excited state.","inputs":{"detuning":0}}
+//|   - {"id":"loose","label":"q = −4, k = 4","description":"Coarser steps increase DormandPrince5 norm drift to tolerance magnitude; GaussRk drift stays small.","inputs":{"tolerance_exponent":-4,"gauss_log2":4}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/0/3","range":{"max":1e-6}}
+//|       - {"artifact":"methods","path":"/rows/0/5","range":{"min":1e-9,"max":1e-6}}
+//|       - {"artifact":"methods","path":"/rows/1/1","equals":128}
+//|       - {"artifact":"methods","path":"/rows/1/3","range":{"max":1e-5}}
+//|       - {"artifact":"methods","path":"/rows/1/5","range":{"max":1e-10}}
+//|   - case: resonance
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/0/4","range":{"max":1e-6}}
+//|   - case: loose
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/0/5","range":{"min":1e-5}}
+//|       - {"artifact":"methods","path":"/rows/1/5","range":{"max":1e-8}}
+use scioxide_core::{Complex, ErrorTolerance, EvaluationRole, NormSelection};
+use scioxide_linalg::Vector;
+use scioxide_ode::{
+    DormandPrince5, GaussRk, OdeFn, OdeMethod, OdeOptions, OdeOutputSchedule, OdeProblem,
+    OdeSolution, OdeState,
+};
+
+// ψ' = −iHψ, H = ½[[−Δ, Ω], [Ω, Δ]] [rad/μs]. Components are (ground-state, excited-state) probability amplitudes.
+let rhs = OdeFn::new(
+    2,
+    |_t: f64, psi: &[Complex<f64>], dpsi: &mut [Complex<f64>]| {
+        let minus_i = Complex::new(0.0, -1.0);
+        dpsi[0] = minus_i * (psi[0] * (-0.5 * detuning) + psi[1] * (0.5 * rabi));
+        dpsi[1] = minus_i * (psi[0] * (0.5 * rabi) + psi[1] * (0.5 * detuning));
+        Ok(())
+    },
+)
+.map_err(|e| e.to_string())?;
+// Independent check: closed-form ψ(t) (reference from f64 inherent methods).
+let omega_r = rabi.hypot(detuning);
+let exact = |t: f64| {
+    let (s, c) = (0.5 * omega_r * t).sin_cos();
+    [
+        Complex::new(c, detuning / omega_r * s),
+        Complex::new(0.0, -rabi / omega_r * s),
+    ]
+};
+let problem = OdeProblem::new(&rhs, duration);
+let ground = vec![Complex::new(1.0, 0.0), Complex::new(0.0, 0.0)];
+let output = OdeOptions::new().with_output_schedule(OdeOutputSchedule::AcceptedSteps);
+let epsilon = 10.0_f64.powf(tolerance_exponent);
+let tolerance = ErrorTolerance::scalar(epsilon, epsilon, NormSelection::RootMeanSquare)
+    .map_err(|e| e.to_string())?;
+let adaptive = output.clone().with_error_tolerance(tolerance);
+// T/2^k is exactly representable in binary, so 2^k steps reach the endpoint exactly.
+let steps = 2.0_f64.powi(gauss_log2 as i32);
+let fixed = output.with_initial_step(duration / steps);
+let start = || OdeState::new(0.0, Vector::from_vec(ground.clone()));
+let dp5 = DormandPrince5::new().solve(&problem, &adaptive, start());
+let gauss = GaussRk::new().solve(&problem, &fixed, start());
+let solutions: [(&str, OdeSolution<f64, Complex<f64>>); 2] = [
+    ("DormandPrince5", dp5.map_err(|f| f.error().to_string())?),
+    ("GaussRk", gauss.map_err(|f| f.error().to_string())?),
+];
+let (mut rows, mut probability, mut drift) = (Vec::new(), Vec::new(), Vec::new());
+for (name, solution) in &solutions {
+    let path = solution.trajectory();
+    let (mut state_error, mut formula_error, mut norm_error) = (0.0_f64, 0.0_f64, 0.0_f64);
+    let (mut pe, mut norm) = (Vec::new(), Vec::new());
+    for (&t, psi) in path.times().iter().zip(path.states()) {
+        let (psi, reference) = (psi.as_slice(), exact(t));
+        let distance = (psi[0] - reference[0]).norm_sqr() + (psi[1] - reference[1]).norm_sqr();
+        let excited = psi[1].norm_sqr();
+        let deviation = (psi[0].norm_sqr() + excited - 1.0).abs();
+        state_error = state_error.max(distance.sqrt());
+        formula_error = formula_error.max((excited - reference[1].norm_sqr()).abs());
+        norm_error = norm_error.max(deviation);
+        pe.push([t, excited]);
+        // Omit zero values from logarithmic axes.
+        if deviation > 0.0 {
+            norm.push([t, deviation]);
+        }
+    }
+    let report = solution.report();
+    let evaluations = report.counts().provider(EvaluationRole::RightHandSide);
+    rows.push((
+        *name,
+        report.accepted_steps(),
+        evaluations,
+        state_error,
+        formula_error,
+        norm_error,
+    ));
+    probability.push(serde_json::json!({ "name": name, "points": pe, "kind": "scatter" }));
+    drift.push(serde_json::json!({ "name": name, "points": norm, "kind": "scatter" }));
+}
+let formula: Vec<_> = (0..=400)
+    .map(|i| f64::from(i) * duration / 400.0)
+    .map(|t| [t, exact(t)[1].norm_sqr()])
+    .collect();
+let style = serde_json::json!({ "lineType": "dashed", "showSymbol": false });
+probability
+    .push(serde_json::json!({ "name": "Rabi formula", "points": formula, "style": style }));
+emit_line_chart!(
+    &probability,
+    options = &serde_json::json!({
+        "link": { "group": "rabi-time" },
+        "xLabel": "Time t [μs]",
+        "yLabel": "Excitation probability Pₑ [-]",
+        "yMin": 0.0
+    })
+);
+emit_line_chart!(
+    &drift,
+    options = &serde_json::json!({
+        "link": { "group": "rabi-time" },
+        "xLabel": "Time t [μs]",
+        "yLabel": "Norm drift |‖ψ‖² − 1| [-]",
+        "yType": "log"
+    })
+);
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Method" },
+    { "key": "1", "label": "Accepted steps [count]", "type": "integer" },
+    { "key": "2", "label": "Right-hand-side evaluations [count]", "type": "integer" },
+    { "key": "3", "label": "max ‖ψ − ψ_exact‖ [-]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "max |Pₑ − formula| [-]", "type": "number", "format": sci3 },
+    { "key": "5", "label": "max |‖ψ‖² − 1| [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "methods" })
+);
+```
+
+With defaults ($\Omega = 6$, $\Delta = 2$ rad/μs, $T = 3$ μs), `DormandPrince5` (tolerance $10^{-8}$) takes 88 steps and 530 right-hand-side evaluations, with exact-solution difference $4.1 \times 10^{-8}$ and norm drift $8.0 \times 10^{-8}$.
+The method `GaussRk` (128 steps) uses 929 evaluations and has larger exact-solution difference $4.0 \times 10^{-7}$, but norm drift only $8.4 \times 10^{-13}$.
+Tolerance $10^{-4}$ and 16 steps increase `DormandPrince5` norm drift to $4.1 \times 10^{-4}$.
+Even with exact-solution difference $1.6 \times 10^{-3}$, `GaussRk` has norm drift $9.1 \times 10^{-11}$.
+This drift follows the Newton stopping accuracy; 1024 steps reduce it to rounding magnitude $1.8 \times 10^{-15}$.
+The method `GaussRk` reduces exact-solution differences from $4.0 \times 10^{-7}$ to $9.7 \times 10^{-11}$ between 128 and 1024 steps, a ratio of about $8^4$ consistent with fourth-order convergence.
+Preserving quadratic invariants does not establish trajectory accuracy; verify against exact solutions or solutions at different steps.
+
+## Summary
+
+One-shot `solve_ivp` and `solve_ivp_at` quickly solve with default Dormand–Prince 5(4), treating every failure to reach the endpoint, including limits, as an error.
+Use integrator `advance` for configurable tolerances, output, limits, or workspace reuse; check report `is_success()` even with `Ok`.
+Limit stops retain the last accepted state; errors retain progress through workspace `last_attempt()` and `PartialFailure` of `solve`, allowing continuation after removing the cause.
+Emitted samples and events are not retracted; supply a custom sink when partial output is needed.
+Complex states integrate directly; implicit methods require holomorphic right-hand sides.
+
+[Explicit Runge–Kutta methods and step control](../explicit-runge-kutta-and-control/) covers step selection, [Dense output and events](../dense-output-and-events/) interpolation and events, and [Solve lifecycle and work accounting](../../../scioxide-core/algorithms/solve-lifecycle-and-accounting/) general limits and attempt-record contracts.

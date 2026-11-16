@@ -1,0 +1,529 @@
+---
+title: "Partial SVD and randomized low-rank approximation"
+description: "Compute leading singular triplets by thick-restart Golub–Kahan bidiagonalization and randomized SVD or column interpolative decompositions from caller-provided sketches with PartialSvdSolver and RandomizedLowRank, distinguishing acceptance by left and right residuals, probe residuals, and bounds on expectations."
+sidebar:
+  order: 385
+references:
+  linalg-partial-svd-settings: "partialsvdsolver-settings-results-and-reports"
+  linalg-randomized-low-rank-settings: "randomizedlowrank-settings-results-and-reports"
+  linalg-golub-kahan-restart: "thick-restart-golubkahan-bidiagonalization"
+  linalg-randomized-low-rank: "randomized-low-rank-approximation"
+---
+
+Even when a full singular value decomposition of a large matrix or operator is infeasible, a few leading singular values and vectors or a low-rank approximation can be computed from products alone.
+Examples include principal components of a data matrix and estimates of numerical rank.
+This page explains the two method objects `PartialSvdSolver` and `RandomizedLowRank`.
+Norm and condition-number estimation are covered in [Estimating the 1-norm and exact operator norms](../norm-estimation/).
+Shared conventions for method objects, workspace requirements, APIs returning owned values and accepting caller-provided output, and the termination reason `SpectralTermination` are in [Applying matrix functions to vectors and method objects](oxref:linalg-action-conventions).
+
+---
+
+## Partial SVD
+
+### Thick-restart Golub–Kahan bidiagonalization
+
+`PartialSvdSolver` computes the `count` leading singular triplets $(\sigma_j, u_j, v_j)$ ($Av_j = \sigma_j u_j$, $A^{\mathsf H}u_j = \sigma_j v_j$) of an $m \times n$ operator $A$.
+$A$ is used only through products $Ax$ and $A^{\mathsf H}y$; $A^{\mathsf H}A$ is never formed.
+Starting from a right vector, Golub–Kahan bidiagonalization constructs orthonormal bases $V$ and $U$ of dimension up to $m_b$ and an upper bidiagonal matrix $B$ satisfying $AV = UB$.
+Each new vector is orthogonalized against the entire basis by classical Gram–Schmidt, with another pass if its norm drops below $1/\sqrt 2$ times its previous value.
+The SVD of $B$ gives Ritz triplets (approximate singular triplets formed from the projected problem).
+A restart retains $\max(\text{count}, d/2)$ Ritz vectors, capped at $d - 1$, together with their coupling coefficients to the residual (the augmented restart of Baglama and Reichel, 2005).
+Triplets already meeting the tolerance are retained first and checked again in later cycles.
+
+A triplet is accepted only when both residuals computed with fresh products by $A$ and $A^{\mathsf H}$ meet the tolerance.
+
+```text
+max(‖A v − σ u‖₂, ‖Aᴴ u − σ v‖₂) ≤ τ_abs + τ_rel σ
+```
+
+A single residual can be small even for a poor triplet.
+This check runs in the first and last cycles, when the basis becomes invariant, and in any cycle where the estimate $\beta \lvert e_{m_b}^{\mathsf T} \tilde u \rvert$ meets the tolerance for a requested triplet ($\tilde u$ is a left singular vector of $B$, and $\beta$ is the final coefficient from extending the bidiagonalization).
+A cycle costs about $2(m_b - \text{retained count})$ products plus two products per checked triplet.
+
+### PartialSvdSolver settings, results, and reports
+
+Defaults for `PartialSvdSolver::new(count)` are basis dimension 30 (`with_basis`, at least `count + 2` or at least $\min(m, n)$), at most 100,000 total forward and adjoint applications including residual checks, and tolerances $\tau_{\mathrm{abs}} = \tau_{\mathrm{rel}} = \sqrt{\varepsilon}$.
+`count` exceeding $\min(m, n)$ gives `InvalidInput` (`OutOfRange`), and an insufficient basis dimension gives `InvalidInput` (`Inconsistent`).
+The execution options' iteration limit counts restart cycles (100 by default); the dense SVD of the projected matrix is solved without an iteration limit.
+
+Call the API returning owned values `solve(&a, &initial)` or accepting caller-provided output `solve_into(&a, &initial, &mut buffer, &mut workspace, cx)`; the starting vector `initial` is a nonzero vector of length $n$.
+The result `PartialSvdBuffer` (prepared with `PartialSvdBuffer::new(m, n, count)` for caller-provided output) holds descending singular values `singular_values()`, $m \times r$ `left_vectors()` with left singular vectors as columns, $n \times r$ `right_vectors()` with right singular vectors as columns ($V$ rather than $V^{\mathsf H}$; $r$ is the number of returned triplets), and the two residuals `residuals()` for each triplet.
+It may contain fewer triplets than requested; all meet the tolerance only on `Converged`.
+On a limit or cancellation, it contains the most recent triplets with both residuals computed, possibly none.
+The report `PartialSvdReport` holds the termination reason, application count, and cycle number `cycles()` of the returned triplets (counted from 1, or 0 if none).
+The workspace `PartialSvdWorkspace` holds $O((m + n) m_b)$ scalars and storage for the projected-matrix SVD, reserved using `PartialSvdRequirements`.
+
+### Test matrix with known singular values
+
+To compare against exact values, construct an $m \times n$ matrix ($m = 200$, $n = 120$) with known singular values.
+The discrete sine transform matrix $S^{(N)}_{ij} = \sqrt{2/(N+1)}\,\sin(ij\pi/(N+1))$ is orthogonal; using the first $n$ columns of $U = S^{(m)}$ and $V = S^{(n)}$, form
+
+```text
+A = U diag(σ₁, …, σₙ) Vᵀ,   σⱼ = j^(−α)
+```
+
+whose singular values are exactly $\sigma_j$.
+Larger $\alpha$ gives faster singular-value decay.
+By the Eckart–Young–Mirsky theorem, the best rank-$k$ approximation in the 2-norm is the truncated SVD $A_k$, with error $\lVert A - A_k \rVert_2 = \sigma_{k+1}$.
+
+The following definitions block shares this test matrix between two cells.
+`test_matrix` provides $A$, `singular_value` provides $\sigma_j$, `gaussian` provides seeded standard-normal pseudorandom values (xorshift64* and Box–Muller), and `truncation_error` verifies the error $\lVert A - \tilde A \rVert_2$ of the approximation $\tilde A = \sum_j \sigma_j u_j v_j^{\mathsf H}$ using a dense SVD of the difference.
+
+```rust
+//| id: linalg-low-rank-model
+//| kind: definitions
+//| title: "Test matrix with known singular values and verification"
+//| crates: [scioxide-core, scioxide-linalg]
+use scioxide_core::SciOxideError;
+use scioxide_linalg::{Matrix, MatrixView, SpectralTermination, SvdValues};
+
+/// Singular values σⱼ = j^(−α) (reference values).
+pub(crate) fn singular_value(j: usize, alpha: f64) -> f64 {
+    (j as f64).powf(-alpha)
+}
+
+/// A = U diag(σ) Vᵀ (m ≥ n). U and V are the first n columns of orthonormal discrete sine transforms.
+pub(crate) fn test_matrix(m: usize, n: usize, alpha: f64) -> Result<Matrix<f64>, SciOxideError> {
+    let pi = std::f64::consts::PI;
+    let basis = |size: usize, i: usize, j: usize| {
+        let scale = (2.0 / (size + 1) as f64).sqrt();
+        scale * (pi * ((i + 1) * (j + 1)) as f64 / (size + 1) as f64).sin()
+    };
+    let mut a = Matrix::zeros(m, n)?;
+    for (idx, value) in a.as_mut_slice().iter_mut().enumerate() {
+        let (i, l) = (idx / n, idx % n);
+        *value = (0..n)
+            .map(|j| basis(m, i, j) * singular_value(j + 1, alpha) * basis(n, l, j))
+            .sum();
+    }
+    Ok(a)
+}
+
+/// Seeded standard-normal pseudorandom numbers (xorshift64* and Box–Muller).
+pub(crate) fn gaussian(seed: u64, len: usize) -> Vec<f64> {
+    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut uniform = move || {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        ((state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+    };
+    (0..len)
+        .map(|_| {
+            let (u, v) = (uniform(), uniform());
+            (-2.0 * u.ln()).sqrt() * (2.0 * std::f64::consts::PI * v).cos()
+        })
+        .collect()
+}
+
+/// Compute the error ‖A − Ã‖₂ of the rank-r approximation Ã = Σⱼ σⱼ uⱼ vⱼᴴ as the largest singular value in a dense SVD of the difference
+/// (independent verification). `v` is an n × r matrix with columns vⱼ.
+pub(crate) fn truncation_error(
+    a: &Matrix<f64>,
+    u: MatrixView<'_, f64>,
+    sigma: &[f64],
+    v: MatrixView<'_, f64>,
+) -> Result<f64, SciOxideError> {
+    let n = a.cols();
+    let mut difference = a.clone();
+    for (idx, value) in difference.as_mut_slice().iter_mut().enumerate() {
+        let (i, l) = (idx / n, idx % n);
+        for (j, &s) in sigma.iter().enumerate() {
+            *value -= u.get(i, j)? * s * v.get(l, j)?;
+        }
+    }
+    Ok(SvdValues::compute(&difference)?.singular_values()[0])
+}
+
+/// Convert a termination reason to its variant name.
+pub(crate) fn termination_name(termination: SpectralTermination) -> &'static str {
+    match termination {
+        SpectralTermination::Converged => "Converged",
+        SpectralTermination::EvaluationLimit => "EvaluationLimit",
+        SpectralTermination::IterationLimit => "IterationLimit",
+        SpectralTermination::InvariantSubspace => "InvariantSubspace",
+        SpectralTermination::AccuracyLimit => "AccuracyLimit",
+        SpectralTermination::ExecutionStopped(_) => "ExecutionStopped",
+    }
+}
+```
+
+The following cell computes the $k$ leading singular triplets with the API of `PartialSvdSolver` that returns owned values.
+Inputs are decay $\alpha \in [0.5, 3]$, rank $k \in [1, 10]$, and basis dimension $m_b \in [12, 40]$.
+The first table shows each triplet's exact $\sigma_j$, computed value, relative error, and two residuals; the second places the termination reason, application count, cycle, and error $\lVert A - \tilde A_k \rVert_2$ of the rank-$k$ approximation formed from the triplets alongside the optimum $\sigma_{k+1}$.
+$\alpha$, $k$, and the computed singular values are passed to the following randomized-SVD cell.
+
+```rust
+//| id: linalg-partial-svd
+//| ref: linalg-partial-svd
+//| title: "Compute leading singular triplets with partial SVD"
+//| run: button
+//| uses: [linalg-low-rank-model]
+//| crates: [scioxide-core, scioxide-linalg]
+//| exports: [decay, rank, partial]
+//| inputs:
+//|   decay: {"type":"range","label":"Singular-value decay α","description":"σⱼ = j^(−α).","min":0.5,"max":3,"step":0.25,"value":2}
+//|   rank: {"type":"range","label":"Rank k","description":"Number of requested singular triplets.","min":1,"max":10,"step":1,"value":5}
+//|   basis: {"type":"range","label":"Basis dimension m_b","description":"Value passed to with_basis (30 by default).","min":12,"max":40,"step":1,"value":30}
+//| cases:
+//|   - {"id":"slow-decay","label":"α = 0.5, k = 10, m = 12","description":"Closely spaced singular values and a small basis increase the restart-cycle count.","inputs":{"decay":0.5,"rank":10,"basis":12}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":"Converged"}
+//|       - {"artifact":"summary","path":"/rows/0/3","approx":{"value":0.027777777778,"rtol":1e-9}}
+//|       - {"artifact":"triplets","path":"/rows/4/3","range":{"max":1e-12}}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+//|   - case: slow-decay
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":"Converged"}
+//|       - {"artifact":"summary","path":"/rows/0/2","range":{"min":10}}
+//|       - {"artifact":"summary","path":"/rows/0/3","approx":{"value":0.30151134458,"rtol":1e-9}}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+use scioxide_core::Budget;
+use scioxide_linalg::{PartialSvdSolver, SpectralTermination};
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let sig12 = serde_json::json!({ "significantDigits": 12 });
+let (m, n) = (200_usize, 120_usize);
+let k = rank.round() as usize;
+let a = test_matrix(m, n, decay).map_err(|e| e.to_string())?;
+// A checked dense-matrix view is an operator that also provides adjoint products.
+let op = a.view().try_finite().map_err(|e| e.to_string())?;
+// The right starting vector has length n (the column count).
+let initial: Vec<f64> = (0..n).map(|i| 1.0 + ((i * 7) % 5) as f64 / 10.0).collect();
+let solver = PartialSvdSolver::new(k)
+    .with_basis(Budget::try_from(basis.round() as usize).map_err(|e| e.to_string())?);
+let (output, report) = solver.solve(&op, &initial).map_err(|e| e.to_string())?;
+let values = output.singular_values();
+let error = truncation_error(&a, output.left_vectors(), values, output.right_vectors())
+    .map_err(|e| e.to_string())?;
+
+let triplet_columns = serde_json::json!([
+    { "key": "0", "label": "j", "type": "integer" },
+    { "key": "1", "label": "σⱼ (exact) [-]", "type": "number", "format": sig12 },
+    { "key": "2", "label": "Partial-SVD σⱼ [-]", "type": "number", "format": sig12 },
+    { "key": "3", "label": "Relative error [-]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "‖Av − σu‖₂ [-]", "type": "number", "format": sci3 },
+    { "key": "5", "label": "‖Aᴴu − σv‖₂ [-]", "type": "number", "format": sci3 }
+]);
+let triplets: Vec<(usize, f64, f64, f64, f64, f64)> = values
+    .iter()
+    .zip(output.residuals())
+    .enumerate()
+    .map(|(j, (&v, r))| {
+        let exact = singular_value(j + 1, decay);
+        (j + 1, exact, v, (v - exact).abs() / exact, r[0], r[1])
+    })
+    .collect();
+emit_table_with_columns!(
+    triplet_columns,
+    triplets,
+    metadata = serde_json::json!({ "id": "triplets" })
+);
+let summary_columns = serde_json::json!([
+    { "key": "0", "label": "Termination reason" },
+    { "key": "1", "label": "Applications [count]", "type": "integer" },
+    { "key": "2", "label": "Cycle of the triplets", "type": "integer" },
+    { "key": "3", "label": "‖A − Ãₖ‖₂ [-]", "type": "number", "format": sig12 },
+    { "key": "4", "label": "σₖ₊₁ (optimal error) [-]", "type": "number", "format": sig12 }
+]);
+let summary = (
+    termination_name(report.termination()),
+    report.applications(),
+    report.cycles(),
+    error,
+    singular_value(k + 1, decay),
+);
+emit_table_with_columns!(
+    summary_columns,
+    vec![summary],
+    metadata = serde_json::json!({ "id": "summary" })
+);
+export!(decay, decay);
+export!(rank, k);
+export!(partial, values.to_vec());
+
+let outcome = match report.termination() {
+    SpectralTermination::Converged => {
+        Outcome::satisfied("The k triplets passed the left and right residual checks")
+    }
+    SpectralTermination::AccuracyLimit => Outcome::failed("The triplets failed the accuracy check"),
+    _ => Outcome::partial("Stopped at a limit; output triplets may exceed the tolerance"),
+};
+emit_outcome!(
+    outcome
+        .status(termination_name(report.termination()))
+        .diagnostic("Applications", report.applications() as f64, None)
+        .diagnostic("‖A − Ãₖ‖₂", error, None)
+);
+```
+
+With the defaults $\alpha = 2$, $k = 5$, and $m_b = 30$, partial SVD returns 5 triplets with `Converged` in cycle 1, using 70 total forward and adjoint applications.
+Singular-value relative errors are at most $5.6 \times 10^{-16}$ and both residuals at most $7.3 \times 10^{-16}$; the rank-5 approximation formed from the triplets has error $0.0277777777778$, agreeing with the optimum $\sigma_6 = 1/36$ to rounding accuracy.
+With $\alpha = 0.5$, $k = 10$, and $m_b = 12$, the smaller relative gaps between singular values and fewer retained vectors require 548 applications through cycle 22 (the error agrees with $\sigma_{11} = 0.3015$).
+For the same $\alpha$ and $k$, restoring the default basis dimension 30 requires only cycle 2 and 130 applications.
+
+## Randomized low-rank approximation
+
+### A sketch capturing the range
+
+`RandomizedLowRank` uses the method of Halko, Martinsson, and Tropp (2011) to capture the range of $A$ with a few test vectors and form a low-rank approximation.
+The caller supplies an $n \times w$ test matrix $\Omega$ (a sketch, usually with independent standard-normal entries) and at least one probe vector unused in construction.
+`RandomizedLowRank` generates no random numbers, so identical inputs produce identical results; the caller controls sketch selection and reproducibility.
+
+The method proceeds as follows.
+
+1. Construct an orthonormal basis $Q$ for the range of $A\Omega$ by Gram–Schmidt.
+   Discard a vector as dependent if its post-orthogonalization norm is at most the threshold determined from its original norm by the rank policy `RankPolicy`.
+2. Perform $q$ subspace iterations, each replacing $Q$ with an orthonormal basis of $A(A^{\mathsf H}Q)$.
+3. Use adjoint products to form the small matrix $Q^{\mathsf H}A$ (at most $w \times n$).
+4. `svd`/`svd_into` computes $Q^{\mathsf H}A = \tilde U \Sigma V^{\mathsf H}$ and sets $U = Q\tilde U$; `interpolative`/`interpolative_into` uses column-pivoted QR $Q^{\mathsf H}AP = \tilde Q [R_{11}\ R_{12}]$ to select $r$ columns of $A$ and forms $A \approx CZ$ with $Z = [I,\ R_{11}^{-1}R_{12}]P^{\mathsf T}$ ($C$ contains the selected columns, each computed with one product $Ae_j$).
+
+The cost is at most $w(2q + 2)$ products, plus one per probe and an additional $r$ for a column interpolative decomposition.
+The resulting rank $r$ is the minimum of the target rank, the rank of $Q$, and the numerical rank according to the small factorization's rank policy.
+Each probe $g$ gives a residual $\lVert Ag - \tilde Ag \rVert_2$; if $\lVert Ag - \tilde Ag \rVert_2 \le \tau_{\mathrm{abs}} + \tau_{\mathrm{rel}} \lVert Ag \rVert_2$ holds for all $g$, the result is `Converged`, otherwise `AccuracyLimit`.
+The probes are independent of the sketch, so their residuals independently check the approximation.
+These residuals give only a lower bound on the error through $\lVert (A - \tilde A)g \rVert_2 \le \lVert A - \tilde A \rVert_2 \lVert g \rVert_2$; they give no upper bound.
+
+### Bounds on expectations and subspace iteration
+
+Accuracy depends on the sketch column count $w = k + p$ (rank $k$ plus $p$ extra columns) and singular-value decay.
+If $\Omega$ has independent standard-normal entries and $p \ge 2$, the basis $Q$ obtained without subspace iteration satisfies
+
+```text
+E ‖A − Q Qᴴ A‖₂ ≤ (1 + √(k/(p − 1))) σₖ₊₁ + (e √(k + p) / p) (Σ_{j>k} σⱼ²)^{1/2}
+```
+
+where $e$ is the base of natural logarithms (Halko, Martinsson, and Tropp, 2011, Theorem 10.6).
+Furthermore, the approximation $\tilde A_k$ obtained by truncating the SVD of $Q^{\mathsf H}A$ to rank $k$ satisfies $\lVert A - \tilde A_k \rVert_2 \le \sigma_{k+1} + \lVert A - QQ^{\mathsf H}A \rVert_2$ (ibid., Section 9.3).
+The second term on the right grows for matrices with slowly decaying singular values.
+With $q$ subspace iterations, the range of $(AA^{\mathsf H})^qA$ is captured instead of $A$, changing the singular values to $\sigma_j^{2q+1}$ and accelerating decay.
+Replacing $\sigma_j$ with $\sigma_j^{2q+1}$ on the right above and raising the result to the power $1/(2q+1)$ then bounds $E\lVert A - QQ^{\mathsf H}A \rVert_2$ from above (ibid., Corollary 10.10).
+These bounds on expectations apply only when the caller supplies a Gaussian sketch; a single result need not fall within them, so verify it using probe residuals.
+
+### RandomizedLowRank settings, results, and reports
+
+Defaults for `RandomizedLowRank::new(rank)` are rank policy `RankPolicy::Exact` (`with_rank_policy`), no subspace iterations (`with_power_steps`), at most 100,000 applications, and probe tolerances $\tau_{\mathrm{abs}} = \tau_{\mathrm{rel}} = \sqrt{\varepsilon}$.
+The sketch column count $w$ is read from `sketch.cols()` on each call; a target rank exceeding $w$ or $w$ exceeding $\min(m, n)$ gives `InvalidInput` (`OutOfRange`), and zero probes gives `InvalidInput` (`OutOfRange`).
+Prepare the workspace with `workspace(&a, w)`; `RandomizedLowRankWorkspace` holds $O((m + n)w)$ scalars and storage for small SVD and QR factorizations (requirements `RandomizedLowRankRequirements`).
+`RandomizedSvdBuffer` returns $m \times r$ `u()`, $r \times n$ `vt()` ($V^{\mathsf H}$), and descending `singular_values()`; `InterpolativeBuffer` returns selected columns `columns()`, an $r \times n$ interpolation matrix `coefficients()`, and column indices `column_indices()`.
+Column `column_indices()[j]` of $Z$ is the unit vector $e_j$, so the selected columns are reproduced exactly.
+The report `LowRankReport` holds the termination reason, rank `rank()`, maximum probe residual `probe_residual()` and maximum relative residual `relative_probe_residual()` (`None` if every probe has $Ag = 0$), number `completed_probes()` of probes with computed residuals, and application count.
+On a limit or cancellation, the output contains the approximation if construction completed, otherwise zeros (rank 0).
+Residuals then cover only completed probes; with zero completed probes, zero residual fields provide no accuracy information.
+
+The following cell receives $\alpha$ and $k$ from the previous cell and computes a rank-$k$ approximation to the same test matrix by randomized SVD.
+Inputs are extra columns $p \in [2, 10]$, subspace-iteration count $q \in [0, 3]$, probe relative tolerance $\tau_{\mathrm{rel}}$, and the random seed.
+The table places the randomized SVD's termination reason, application count, error $\lVert A - \tilde A_k \rVert_2$, maximum relative error of the leading $k$ singular values, relative probe residual, and rank alongside the optimal error $\sigma_{k+1}$ and a bound on the expectation (the sum of $\sigma_{k+1}$ and a bound on $E\lVert A - QQ^{\mathsf H}A \rVert_2$).
+The chart shows the exact singular values (dashed) and those obtained by partial and randomized SVD on a logarithmic axis.
+
+```rust
+//| id: linalg-randomized-svd
+//| ref: linalg-randomized-svd
+//| title: "Randomized SVD with a caller-provided sketch"
+//| run: button
+//| uses: [linalg-low-rank-model]
+//| crates: [scioxide-core, scioxide-linalg]
+//| dependsOn:
+//|   solve: linalg-partial-svd
+//| inputs:
+//|   oversampling: {"type":"range","label":"Extra columns p","description":"Sketch column count w = k + p.","min":2,"max":10,"step":1,"value":5}
+//|   power: {"type":"range","label":"Subspace iterations q","description":"Value passed to with_power_steps (0 by default).","min":0,"max":3,"step":1,"value":0}
+//|   tolerance: {"type":"select","label":"Probe relative tolerance τ_rel","description":"Acceptance criterion for probe residuals (τ_abs = 0).","options":["0.2","0.1","1e-8"],"value":"0.2"}
+//|   seed: {"type":"range","label":"Random seed","description":"Pseudorandom seed for the sketch and probe vectors.","min":1,"max":100,"step":1,"value":1}
+//| cases:
+//|   - {"id":"power-steps","label":"q = 2","description":"The leading singular values become accurate to about 6 digits, and the error matches the optimum.","inputs":{"power":2}}
+//|   - {"id":"strict","label":"τ_rel = 1e-8","description":"Even near-optimal approximations have probe residuals determined by the tail magnitude and give AccuracyLimit.","inputs":{"tolerance":"1e-8"}}
+//|   - {"id":"another-seed","label":"Seed 2","description":"The approximation is near optimal, but the two probes give larger relative residuals and AccuracyLimit.","inputs":{"seed":2}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"randomized","path":"/rows/0/1","equals":"Converged"}
+//|       - {"artifact":"randomized","path":"/rows/0/2","equals":22}
+//|       - {"artifact":"randomized","path":"/rows/0/3","range":{"min":0.0277,"max":0.163}}
+//|       - {"artifact":"randomized","path":"/rows/1/3","approx":{"value":0.027777777778,"rtol":1e-9}}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+//|   - case: power-steps
+//|     expect:
+//|       - {"artifact":"randomized","path":"/rows/0/3","approx":{"value":0.027777777778,"rtol":1e-6}}
+//|       - {"artifact":"randomized","path":"/rows/0/4","range":{"max":1e-5}}
+//|       - {"artifact":"randomized","path":"/rows/2/3","approx":{"value":0.064206526390,"rtol":1e-8}}
+//|   - case: strict
+//|     expect:
+//|       - {"artifact":"randomized","path":"/rows/0/1","equals":"AccuracyLimit"}
+//|       - {"artifact":"randomized","path":"/rows/0/3","range":{"min":0.0277,"max":0.163}}
+//|       - {"path":"/outputs/2/state","equals":"failed"}
+//|   - case: another-seed
+//|     expect:
+//|       - {"artifact":"randomized","path":"/rows/0/1","equals":"AccuracyLimit"}
+//|       - {"artifact":"randomized","path":"/rows/0/3","range":{"max":0.03}}
+use scioxide_core::ResidualTolerance;
+use scioxide_linalg::{Matrix, RandomizedLowRank, SpectralTermination};
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let decay = solve["decay"].as_f64().ok_or("Missing decay α")?;
+let k = solve["rank"].as_u64().ok_or("Missing rank k")? as usize;
+let partial: Vec<f64> =
+    serde_json::from_value(solve["partial"].clone()).map_err(|e| e.to_string())?;
+let (m, n) = (200_usize, 120_usize);
+let w = k + oversampling.round() as usize;
+let q = power.round() as usize;
+let a = test_matrix(m, n, decay).map_err(|e| e.to_string())?;
+let op = a.view().try_finite().map_err(|e| e.to_string())?;
+let sigma = |j: usize| singular_value(j, decay);
+
+// RandomizedLowRank generates no random numbers. Supply a Gaussian sketch Ω (n × w) and two probes unused in construction.
+let seed = seed.round() as u64;
+let sketch = Matrix::from_vec(n, w, gaussian(seed, n * w)).map_err(|e| e.to_string())?;
+let probes = Matrix::from_vec(n, 2, gaussian(seed + 1000, n * 2)).map_err(|e| e.to_string())?;
+let tolerance = tolerance.parse::<f64>().map_err(|e| e.to_string())?;
+let method = RandomizedLowRank::new(k)
+    .with_power_steps(q)
+    .with_tolerance(ResidualTolerance::new(0.0, tolerance).map_err(|e| e.to_string())?);
+let (approx, report) = method
+    .svd(&op, sketch.view(), probes.view())
+    .map_err(|e| e.to_string())?;
+let values = approx.singular_values();
+// vt() is Vᴴ (r × n), so transpose it to put vⱼ in columns.
+let error = truncation_error(&a, approx.u(), values, approx.vt().transpose())
+    .map_err(|e| e.to_string())?;
+let worst = values
+    .iter()
+    .enumerate()
+    .map(|(j, &v)| (v - sigma(j + 1)).abs() / sigma(j + 1))
+    .reduce(f64::max);
+
+// HMT bound on the expectation: the sum of σₖ₊₁ and a bound on range error E‖A − QQᴴA‖₂.
+// With q subspace iterations, replace σⱼ by σⱼ^(2q+1) and take the 1/(2q+1) power (Corollary 10.10).
+let p = (w - k) as f64;
+let order = (2 * q + 1) as i32;
+let tail = (k + 1..=n)
+    .map(|j| sigma(j).powi(2 * order))
+    .sum::<f64>()
+    .sqrt();
+let range_bound = ((1.0 + (k as f64 / (p - 1.0)).sqrt()) * sigma(k + 1).powi(order)
+    + std::f64::consts::E * (w as f64).sqrt() / p * tail)
+    .powf(1.0 / order as f64);
+let bound = sigma(k + 1) + range_bound;
+let columns = serde_json::json!([
+    { "key": "0", "label": "Quantity" },
+    { "key": "1", "label": "Termination reason", "nullText": "—" },
+    { "key": "2", "label": "Applications [count]", "type": "integer", "nullText": "—" },
+    { "key": "3", "label": "‖A − Ãₖ‖₂ [-]", "type": "number", "format": sci3, "nullText": "—" },
+    { "key": "4", "label": "Maximum relative error of σ [-]", "type": "number", "format": sci3, "nullText": "—" },
+    { "key": "5", "label": "Relative probe residual [-]", "type": "number", "format": sci3, "nullText": "—" },
+    { "key": "6", "label": "Rank r", "type": "integer", "nullText": "—" }
+]);
+let rows = vec![
+    (
+        "Randomized SVD",
+        Some(termination_name(report.termination())),
+        Some(report.applications()),
+        Some(error),
+        worst,
+        report.relative_probe_residual(),
+        Some(report.rank()),
+    ),
+    (
+        "Optimal rank-k approximation σₖ₊₁",
+        None,
+        None,
+        Some(sigma(k + 1)),
+        None,
+        None,
+        None,
+    ),
+    (
+        "Bound on expectation (HMT)",
+        None,
+        None,
+        Some(bound),
+        None,
+        None,
+        None,
+    ),
+];
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "randomized" })
+);
+
+let exact: Vec<[f64; 2]> = (1..=w + 5).map(|j| [j as f64, sigma(j)]).collect();
+let indexed = |v: &[f64]| -> Vec<[f64; 2]> {
+    v.iter()
+        .enumerate()
+        .map(|(j, &x)| [(j + 1) as f64, x])
+        .collect()
+};
+emit_chart!(serde_json::json!({
+    "kind": "xy",
+    "dataZoom": true,
+    "tooltip": true,
+    "xLabel": "Index j [-]",
+    "yLabel": "Singular value σⱼ [-]",
+    "yType": "log",
+    "layers": [
+        {
+            "id": "exact",
+            "kind": "line",
+            "name": "σⱼ = j^(−α) (exact)",
+            "points": exact,
+            "style": { "lineType": "dashed", "showSymbol": false }
+        },
+        { "id": "partial", "kind": "scatter", "name": "Partial SVD", "points": indexed(&partial) },
+        {
+            "id": "randomized",
+            "kind": "scatter",
+            "name": "Randomized SVD",
+            "points": indexed(values),
+            "style": { "symbol": "diamond" }
+        }
+    ],
+    "annotations": [{ "kind": "line", "axis": "x", "value": k as f64 + 0.5, "label": "Rank k" }]
+}));
+
+let outcome = match report.termination() {
+    SpectralTermination::Converged => Outcome::satisfied("Probe residuals met the criterion"),
+    SpectralTermination::AccuracyLimit => {
+        Outcome::failed("Probe residuals did not meet the criterion")
+            .explanation("Reconsider the rank, subspace-iteration count, and tolerance.")
+    }
+    _ => Outcome::partial("Stopped at a limit"),
+};
+let mut outcome = outcome
+    .status(termination_name(report.termination()))
+    .diagnostic("Applications", report.applications() as f64, None)
+    .diagnostic("‖A − Ãₖ‖₂", error, None);
+if let Some(residual) = report.relative_probe_residual() {
+    outcome = outcome.diagnostic("Relative probe residual", residual, None);
+}
+emit_outcome!(outcome);
+```
+
+With the defaults $p = 5$, $q = 0$, $\tau_{\mathrm{rel}} = 0.2$, and seed 1, randomized SVD reaches `Converged` in 22 applications (20 forward and adjoint products for 10 sketch columns, plus 2 probes).
+The error $\lVert A - \tilde A_5 \rVert_2 = 0.0362$ is 1.3 times the optimum $\sigma_6 = 0.0278$ and lies within the expectation bound $0.163$.
+The maximum relative error of the leading singular values is nevertheless large at $0.18$; `Converged` means only that the relative probe residual $0.14$ fell below $\tau_{\mathrm{rel}} = 0.2$.
+Setting $q = 2$ increases applications to 62 but reduces singular-value relative error to $4.3 \times 10^{-7}$; the approximation error matches $\sigma_6$ with a relative difference of $3 \times 10^{-11}$.
+The bound on the expectation also falls to $0.0642$ and approaches $2\sigma_6$ as $q$ increases.
+Even this near-optimal approximation retains a relative probe residual $0.13$ because the tail singular values $\sigma_6, \sigma_7, \dots$ contribute to $Ag$.
+A tolerance below the tail, such as $\tau_{\mathrm{rel}} = 10^{-8}$, therefore yields `AccuracyLimit` regardless of the quality of the approximation.
+With seed 2, the error $0.0281$ is even nearer the optimum, but the relative probe residual is $0.28$ and the result is `AccuracyLimit`.
+A decision based on two probes depends on their directions, so interpret probe residuals as an independent check of the approximation.
+
+---
+
+## Summary
+
+`PartialSvdSolver` uses Golub–Kahan bidiagonalization to compute leading singular triplets and returns `Converged` only when both left and right residuals meet the tolerance.
+`RandomizedLowRank` captures the range using a caller-provided sketch and constructs a low-rank approximation with few products, but `Converged` means only that the probe residuals met the criterion.
+For slowly decaying singular values, increase extra columns $p$ and subspace iterations $q$ to approach the optimal error $\sigma_{k+1}$, estimating the added products with $w(2q + 2)$.
+Set the probe tolerance to match the singular-value tail, and remember that decisions using only about two probes depend on their directions.
+Choose partial SVD for accurate leading singular values themselves, or randomized SVD to capture the range with few products.
+
+## Further reading
+
+- [Singular value decomposition, numerical rank, and regularized solutions](../svd-and-rank/): examine numerical rank determination with dense SVD, truncated SVD, and Tikhonov regularization.
+- [Diagnosing the singular-value spectrum of a multicollinear data matrix](../../examples/collinear-svd/): examine how small singular values affect coefficient estimation in an example.
+- [Estimating the 1-norm and exact operator norms](../norm-estimation/): estimate $\lVert A \rVert_1$ and condition numbers using products alone and compare with exact values.

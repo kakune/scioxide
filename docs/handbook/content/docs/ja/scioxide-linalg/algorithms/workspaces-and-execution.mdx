@@ -1,0 +1,649 @@
+---
+title: 作業領域・実行コンテキスト・試行記録
+description: ワンショット関数・標準形式・オプション付き形式・出力先を指定する API・スコープ付き API・Plan・手法オブジェクトの定義と使い分け、要求から要件を求めて LinalgWorkspace を事前確保する手順と分解ごとの要求型、固有値の出力バッファー、実行オプションとコンテキストの役割分担、取り消しと反復上限で止まったときの出力と試行記録、下位の部品 backend。
+sidebar:
+  order: 310
+references:
+  linalg-execution-forms: "呼び出しの形"
+  linalg-workspace-reservation: "要求から作業領域を事前確保する手順"
+  linalg-execution-options: "実行の制御オプションとコンテキスト"
+  linalg-attempt-records: "取り消し上限到達と試行記録"
+  linalg-backend-components: "下位の部品-backend"
+  linalg-eigenvalue-buffers: "固有値の出力バッファー"
+---
+
+同じ大きさの行列を何度も分解する時間発展や最適化の内側で作業用のメモリ領域を毎回確保すると、その時間と確保の失敗の可能性が計算とは別に積み重なる。
+`scioxide-linalg` では一つの計算を必要な制御の量に応じた形で呼べ、作業用のメモリ領域を `LinalgWorkspace` として呼び出し側が持つこともできる。
+このページはこの章で使う呼び出しの形を定義し、作業領域を事前確保する手順、実行の上限と機能を指定する場所、計算が止まったときに残るものを説明する。
+SciOxide 全体に共通する考え方と再現性の説明は[実行形式・作業領域・再現性](../../../concepts/workspaces-and-reproducibility/)にある。
+
+## 呼び出しの形
+
+この章では引数と戻り値の形を次の名前で呼ぶ。
+標準形式とオプション付き形式をまとめて所有値を返す API と呼ぶ。
+所有値を返す API とワンショット関数は結果のメモリ領域を自分で確保し、`ExecutionContext::sequential_native()` の上で逐次に実行する。
+このコンテキストは、`std` があれば実行時に検出した CPU の命令を使うカーネルへ振り分け、`std` がなければ移植可能なスカラーのカーネルを使い、クロック・取り消し・乱数源を持たない。
+表の「拒否」は計算した解を結果として出力に反映してよいと判定しない（受理しない）ことで、終了理由は `DirectSolveTermination` や `LinearSolveTermination` のように求解の終わり方を表す値である。
+
+| 形 | 例 | 受け取るもの | 返すもの | 拒否と未収束 | 実行コンテキスト |
+|---|---|---|---|---|---|
+| ワンショット関数 | `solve(&a, &b)`、`least_squares`、`solve_triangular`、`solve_structured`、`matrix_function`、`solve_sylvester`、`solve_lyapunov`、`solve_riccati` | 問題のデータだけ | 答え（解ベクトルなど） | エラー | `sequential_native()` |
+| 標準形式 | `LuDecomposition::factor(&a)`、`lu.solve(&b)`、`CgSolver` の `solve(a, b)`、`x.norm2()` | 問題のデータだけ。既定のオプションを使う | 確保した結果。求解は解だけ | エラー | `sequential_native()` |
+| オプション付き形式 | `factor_with_options(&a, &options)`、`lu.solve_with_options(&b, &accept)`、`solve_with_options(a, b, preconditioning, x0)` | データと、最後にオプション | 確保した結果。求解は結果とレポート | `Ok` の結果の終了理由 | `sequential_native()` |
+| 出力先を指定する API | `factor_into(&a, &options, &mut factor, &mut ws, cx)`、`lu.solve_into(&b, &accept, out, &mut ws, cx)` | 入力（オプションを含む）、出力、作業領域、コンテキストの順 | 出力に書く。求解はレポートを返す | レポートの終了理由。拒否された求解は出力を変えない | 渡したコンテキスト |
+| スコープ付き API | `x.norm2_scoped(&options, cx)`、`lu.condition_estimate_scoped(&options, &mut ws, cx)` | 入力、オプション、作業領域（あれば）、最後にコンテキスト | 値 | エラー | 渡したコンテキスト |
+
+ワンショット関数は問題を一回解いて答えだけを返す自由関数である。
+内部の分解や Plan は、その関数が定める設定で作る。
+たとえば `solve(&a, &b)` は部分ピボット付き LU 分解と `RankPolicy::Exact`（厳密に 0 のピボットだけを拒む）で $Ax = b$ を解き、`least_squares` は列ピボット付き QR と `RankPolicy::DimensionScaledEpsilon` で最小ノルム解を求める。
+部分的な結果を返せないので、受理されなかった解と収束しなかった計算はエラーになる。
+
+標準形式は分解や解法の型のメソッドで、問題のデータだけを受け取って既定のオプションを使う。
+分解型（`LuDecomposition` など）の標準形式の `solve` は解の `Vector` を返し、受理されなかった解を `DirectSolveTermination::require_accepted` でエラーに変える。
+ランク不足は `Singular`、ほかの理由の拒否は `NumericalInstability` になる。
+行列方程式の Plan（`SylvesterPlan` など）の `solve` は例外で、オプションを取らないが、オプション付き形式と同じくレポート付きの結果を返す。
+単一ベクトルの反復解法 16 種類の標準形式 `solve(a, b)` は零ベクトルから前処理なしで始め、許容誤差を満たさずに終わると `ConvergenceFailure` を返す。
+
+オプション付き形式は名前が `_with_options` で終わり、オプションを最後の引数に受け取るので、精度階層 `Accuracy::Exact` やバイト上限を選べる。
+分解型の `solve_with_options(&b, &DirectSolveOptions)` は解とレポートを持つ `DirectSolveResult` を返し、方針で拒否した解をエラーにせず、解を持たない `Ok` の結果として返す。
+`into_accepted()` は、この結果を標準形式と同じ規則で解かエラーに変える。
+`DirectSolveOptions::default()` は `RankPolicy::Exact` だけで受理を判定し、条件数の下限を持たず、後退誤差も計算しない。
+反復解法の `solve_with_options(a, b, preconditioning, x0)` は前処理と初期値を受け取り、反復や評価の上限で止まった場合も、終了理由と検証した残差が最小の反復解を `Ok` の結果に入れて返す。
+所有値を返す API のコンテキストにはクロックがないので、`with_time_limit` を設定したオプションは計算を始める前に `CapabilityUnavailable` で拒否される。
+
+出力先を指定する API は名前が `_into` で終わり、呼び出し側が用意した出力・作業領域・コンテキストを受け取る。
+出力の現在の値を入力に使う更新は `_in_place` の名前を持ち、同じ順に引数を取る。
+出力先を指定する API は失敗すると出力を変えずにエラーを返し、方針で拒否した直接解ではレポートに終了理由を残して出力を変えない。
+
+スコープ付き API は名前が `_scoped` で終わり、ノルムや条件数の推定のように配列ではなく値を返す演算を、呼び出し側のコンテキストの中で行う形である。
+反復する演算はその回数を呼び出し側の求解に数え入れ、計算量が一定のカーネルでも、コンテキストの BLAS プロバイダーを使えるものはこの形を持つ（[密行列カーネル](oxref:linalg-dense-kernels)）。
+並列エグゼキューター、取り消し、期限、外部 BLAS プロバイダーはコンテキストを通じて参照するので、これらを使えるのは出力先を指定する API とスコープ付き API だけである。
+
+Plan は、名前が `Plan` で終わり、作るときに再利用するデータを前もって計算して保持する型である。
+`MatrixFunctionPlan` は $A$ の Schur 形（指数関数では $A$ そのもの）を、`HouseholderMinimumNormPlan` は数値ランクで切り詰めた完全直交分解を、`TriangularPlan` は有限性と対角を検査した結果と成分の大きさの最大を、作るときに一度だけ求める。
+手法オブジェクトは検証済みの設定だけを持ち、問題の作用素やデータとその次元を呼び出しのたびに受け取る型である。
+`ExponentialAction`、`FunctionAction`、`LobpcgSolver`、`PartialSpectrumSolver`、`PartialSvdSolver`、`RandomizedLowRank`、`OneNormEstimator`、`IterativeRefinement` と、`CgSolver` などの反復解法がこれにあたる。
+前計算したデータを持たないので、一つの値を大きさの違う問題に使い回せる。
+`BorderedSystem` は作るときに作用素と零空間の基底を借用して検査するので、手法オブジェクトではない。
+Plan と手法オブジェクトのメソッドも、上の表と同じ名前の規則に従う（`ExponentialAction` の `apply` と `apply_into` など）。
+
+答えだけが必要な一回の計算にはワンショット関数を、同じ行列の分解を何度も使うときは標準形式の分解を使う。
+終了理由、ランク、条件数の推定、残差を読むときや、`Exact` やバイト上限を選ぶときはオプション付き形式を使う。
+反復の内側で確保をなくすとき、並列実行や取り消し・期限を使うとき、外部 BLAS を使うときは出力先を指定する API とスコープ付き API を使う。
+
+## 要求から作業領域を事前確保する手順
+
+作業領域の大きさは演算ごとの要求（request）から決まる。
+要求は演算の種類・形状・実行オプションだけを持つ値で、行列の成分も実行の機能も持たない。
+要求から求めた必要な長さを要件（requirements）と呼ぶ。
+
+1. 要求を作る。
+   LU なら `LuWorkspaceRequest::factor(n, &options)`、`solve`、`solve_matrix` のように、演算ごとのコンストラクターを使う。
+2. 要件を問い合わせる。
+   `LuDecomposition::<f64>::workspace_requirements(&request)` のように、その演算を行う型の関連関数に要求を渡すと `LinalgRequirements` が返る。
+3. 作業領域を用意する。
+   `LuDecomposition::<f64>::workspace(&request)` は要件どおりに確保した作業領域を返す。
+   既存の作業領域には `ws.try_reserve(&requirements)` で不足分だけを確保する。
+4. 確保せずに確かめる。
+   `ws.check(&requirements)` は `Capacity::Sufficient`（このまま実行できる）か `Capacity::NeedsGrowth`（確保が要る）を返す。
+
+`LinalgRequirements` は、スカラー・実数・添字・`Exact` の累積器・拡張範囲の値などの領域ごとの長さと、オプションのバイト上限を持つ。
+`scalar_len()` はスカラー領域の長さを、`required_bytes::<S>()` はスカラー型 `S` での合計バイト数を返す。
+どちらも計算が `usize` に収まらなければ `SizeOverflow` を返し、後者はバイト上限を超えると `ResourceLimit` を返す。
+複数の演算を同じ作業領域で続けて行うときは、`a.max(&b)` で領域ごとに大きい方をとって一度に事前確保する（バイト上限は厳しい方が残る）。
+事前確保は保持している容量を減らさず、バイト上限は以前の演算から残った容量も含めて数え、確保に失敗すると `AllocationFailure` になる。
+`ws.reservation_bytes(&requirements)` は事前確保した後に保持するバイト数を確保せずに返し、`ws.retained_bytes()` は今保持しているバイト数を返す。
+分解の結果を入れるメモリ領域は作業領域とは別で、LU なら `LuDecomposition::empty()` に `try_reserve(n)` で前もって確保し、`check(n)` で確かめ、大きさを `factor_storage_bytes(n)` で求める。
+
+要求の型は二種類ある。
+sealed トレイト `LinalgWorkspaceRequest<S>` を実装する要求は、`LinalgWorkspace::<S>::workspace_requirements(&request)` と `LinalgWorkspace::<S>::workspace(&request)` に直接渡せる。
+トレイトは利用者の型では実装できないので、どの要求も同じ規則で事前確保される。
+ほかの要求型は、次の表の「要件を返す型」の `workspace_requirements` と `workspace` が受け取り、種類の違う要求は取り違えられない（一般化固有値の要求を通常の固有値のバッファーに渡すとコンパイルエラーになる）。
+
+| 計算 | 要求型（コンストラクター） | 要件を返す型 | 作業領域 |
+|---|---|---|---|
+| 密行列の積・ベクトル演算 | `DenseWorkspaceRequest`（`vector`、`in_place_vector`、`vector_pair`、`product`、`triangular_product`、`triangular_solve`、`structured`、`rank_two`） | `LinalgWorkspace`（sealed トレイト） | `LinalgWorkspace` |
+| 作用素のノルム・具体化・積・Kronecker とブロック対角の求解 | `OperatorWorkspaceRequest`（`norm`、`materialize`、`block`、`kronecker_solve`、`block_diagonal_solve`） | `LinalgWorkspace`（sealed トレイト） | `LinalgWorkspace` |
+| 部分空間の基底、主角度、直交 Procrustes 問題 | `SubspaceBasisWorkspaceRequest`（`orth`、`null_space`）、`SubspaceAnglesWorkspaceRequest`、`ProcrustesWorkspaceRequest`（`new`） | `LinalgWorkspace`（sealed トレイト） | `LinalgWorkspace` |
+| LU、Cholesky、LDLᴴ | `LuWorkspaceRequest`、`CholeskyWorkspaceRequest`、`LdlWorkspaceRequest`（`factor`、`solve`、`solve_matrix`） | `LuDecomposition`、`CholeskyDecomposition`、`LdlDecomposition` | `LinalgWorkspace` |
+| Householder QR・LQ | `HouseholderWorkspaceRequest`（`factor`、`solve`、`solve_matrix`、`damped_solve`、`q_matrix`、`apply_q`、`reconstruct`、`with_residual`） | `HouseholderDecomposition` | `LinalgWorkspace` |
+| RQ、QR の更新 | `RqWorkspaceRequest`、`QrUpdateWorkspaceRequest`（`new`） | `RqDecomposition`、`QrUpdateDecomposition` | `LinalgWorkspace` |
+| SVD | `SvdWorkspaceRequest`（`new`、`solve`、`pseudoinverse`） | `SvdValues`、`ThinSvdDecomposition`、`SvdDecomposition` | `LinalgWorkspace` |
+| GSVD、CS 分解、極分解 | `GsvdWorkspaceRequest`、`CsdWorkspaceRequest`、`PolarWorkspaceRequest`（`new`） | `GsvdDecomposition`、`CsdDecomposition`、`PolarDecomposition` | `LinalgWorkspace` |
+| 一般の固有値 | `GeneralEigenWorkspaceRequest`（`new`） | `GeneralEigenvaluesBuffer`、`GeneralEigenDecomposition` | `LinalgWorkspace`（スカラー型は `Complex<R>`） |
+| Hermitian・一般化 Hermitian の固有値 | `HermitianEigenWorkspaceRequest`（`new`、`tridiagonal`）、`GeneralizedHermitianEigenWorkspaceRequest`（`new`） | `HermitianEigenvaluesBuffer`、`HermitianEigenDecomposition`、`HermitianEigenFirstComponents`、`GeneralizedHermitianEigenvaluesBuffer`、`GeneralizedHermitianEigenDecomposition` | `LinalgWorkspace` |
+| Schur、一般化 Schur（QZ） | `SchurWorkspaceRequest`、`GeneralizedSchurWorkspaceRequest`（`new`、`reorder`） | `SchurDecomposition`、`GeneralizedSchurDecomposition` | `LinalgWorkspace` |
+| 帯・三重対角・三角・Toeplitz などの構造化行列 | `StructuredWorkspaceRequest`（`factor`、`solve`、`solve_matrix`、`with_dense_fallback`） | `BandedLuDecomposition`、`BandedCholeskyDecomposition`、`TridiagonalLuDecomposition`、Plan `CyclicTridiagonalPlan`、`TriangularPlan`、`StructuredSolvePlan` | `LinalgWorkspace` |
+| 行列関数 | 列挙型 `MatrixFunctionWorkspaceRequest`（`Evaluate`、`Frechet`、`Condition`） | Plan `MatrixFunctionPlan` のメソッド | `LinalgWorkspace`（スカラー型は `Complex<R>`） |
+| 縁付き系 | 列挙型 `BorderedSystemWorkspaceRequest`（`PrepareRhs`、`Diagnose`） | `BorderedSystem` のメソッド | `LinalgWorkspace` |
+| 反復解法 | `IterativeWorkspaceRequest`（`operator`、`adjoint`、`matrix`、`with_right_hand_sides`、`with_preconditioner`、`with_recycle_space`） | 各解法（`CgSolver` など）のメソッド | `IterativeWorkspace` |
+| Krylov 部分空間の再利用 | `KrylovRecycleWorkspaceRequest`（`new`） | `KrylovRecycleSpace` | `KrylovRecycleWorkspace` |
+| 反復改良 | `RefinementWorkspaceRequest`（`new`、`with_right_hand_sides`） | 手法オブジェクト `IterativeRefinement` のメソッド | `RefinementWorkspace` |
+
+要求型を持たない Plan と手法オブジェクトもある。
+`SylvesterPlan`、`LyapunovPlan`、`RiccatiPlan` と、疎行列の `SparsePowerPlan`、`SparseFunctionPlan` は作るときに大きさが決まるので、要求の代わりに `()` を受け取る。
+`HouseholderMinimumNormPlan` は右辺の数を、作用素の作用と部分スペクトルの手法オブジェクトは作用素と列の数を受け取る（[行列関数のベクトルへの適用と手法オブジェクト](../operator-actions-and-partial-spectra/)）。
+
+並列実行ではワーカーごとにパック用の領域を持つので、要件は実行方針が許すワーカーの数とともに増える。
+`DenseWorkspaceRequest` と、LU・Cholesky・LDL・Householder・RQ・QR の更新・SVD・Hermitian と一般化 Hermitian の固有値・GSVD・極分解・部分空間の基底・主角度・Procrustes 問題の要求型は、その数を `with_worker_bound(workers)` で上から抑えられる。
+同じ要求型の `with_provider_packing()` は外部 BLAS プロバイダーへ渡す被演算子の全体を詰め直す領域も含め、`for_context(&cx)` は実行コンテキストのワーカー数と BLAS プロバイダーの有無から両方を決める。
+精度階層はコンテキストではなく要求に渡したオプションから決まる。
+
+所有する作業領域（`LinalgWorkspace::new()`）は、出力先を指定する API の呼び出しの準備段階で不足分を自動的に確保する。
+呼び出し側のスカラーのスライスへの参照を渡す `LinalgWorkspace::from_scalar_slice` は大きくならず、スカラーの容量が足りないときや、演算がスカラー以外の領域を要求するときは `DimensionMismatch` を返す。
+要件を満たした作業領域と出力を渡したとき、SciOxide の数値処理は確保を行わない。
+並列エグゼキューターや注入した BLAS プロバイダーの確保は、それぞれの仕様に従う。
+
+次のセルは三重対角行列 $A_s = \operatorname{tridiag}(-1,\ 2 + s,\ -1)$ をシフト $s = 0, 1, \dots$ を変えながら同じ作業領域で分解して解く。
+入力は次数 $n$（2〜200）と解く回数（1〜8）で、右辺は $b = (1, \dots, 1)$ である。
+一つ目の表は分解と求解の要件と二つを `max` で合わせた要件、それに作業領域とは別の因子のメモリ領域の大きさを示す。
+二つ目の表は事前確保の前と後の `check` の結果と、求解に足りない長さ 1 のスライスへの参照を渡したときの結果を示す。
+三つ目の表はシフトごとに、解いた後の `check`、作業領域と因子が保持するバイト数、出力先を指定する API で解いたときの終了理由、ワンショット関数 `solve` の解との差、相対残差 $\lVert b - A_s x \rVert_\infty / (\lVert A_s \rVert_\infty \lVert x \rVert_\infty + \lVert b \rVert_\infty)$ を並べる。
+相対残差は三重対角の積を手で計算して求める独立な検算で、保持バイト数が変わらなければ事前確保の後に確保がなかったことが分かる。
+
+```rust
+//| id: linalg-workspace-reuse
+//| ref: linalg-workspace-reuse
+//| title: LU の作業領域を一度だけ事前確保して繰り返し解く
+//| run: reactive
+//| crates: [scioxide-core, scioxide-linalg]
+//| inputs:
+//|   order: {"type":"range","label":"次数 n","description":"係数行列 tridiag(−1, 2 + s, −1) の次数。","min":2,"max":200,"step":1,"value":50}
+//|   repeats: {"type":"range","label":"解く回数","description":"シフト s = 0, 1, … を変えて同じ作業領域で解く回数。","min":1,"max":8,"step":1,"value":4}
+//| cases:
+//|   - {"id":"order-two","label":"n = 2","description":"小さな次数でも、事前確保の後は保持バイト数が変わらない。","inputs":{"order":2}}
+//|   - {"id":"large","label":"n = 200、8 回","description":"大きな次数で 8 回解いても、事前確保は最初の 1 回だけで足りる。","inputs":{"order":200,"repeats":8}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"sizes","path":"/rows/2/1","equals":13416}
+//|       - {"artifact":"states","path":"/rows/0/0","equals":"NeedsGrowth"}
+//|       - {"artifact":"states","path":"/rows/0/1","equals":"Sufficient"}
+//|       - {"artifact":"states","path":"/rows/0/2","equals":"DimensionMismatch"}
+//|       - {"artifact":"solves","path":"/rows/3/1","equals":"Sufficient"}
+//|       - {"artifact":"solves","path":"/rows/3/4","equals":"Accepted"}
+//|       - {"artifact":"solves","path":"/rows/3/5","range":{"max":0}}
+//|       - {"artifact":"solves","path":"/rows/3/6","range":{"max":1e-15}}
+//|       - {"path":"/outputs/3/state","equals":"satisfied"}
+//|   - case: order-two
+//|     expect:
+//|       - {"artifact":"sizes","path":"/rows/2/1","equals":12}
+//|       - {"artifact":"solves","path":"/rows/0/6","range":{"max":1e-15}}
+//|       - {"path":"/outputs/3/state","equals":"satisfied"}
+//|   - case: large
+//|     expect:
+//|       - {"artifact":"solves","path":"/rows/7/1","equals":"Sufficient"}
+//|       - {"artifact":"solves","path":"/rows/7/6","range":{"max":1e-15}}
+//|       - {"path":"/outputs/3/state","equals":"satisfied"}
+use scioxide_core::{Capacity, ExecutionContext, SciOxideErrorKind};
+use scioxide_linalg::{DirectSolveOptions, DirectSolveTermination, LinalgExecutionOptions};
+use scioxide_linalg::{LinalgRequirements, LinalgWorkspace, LuDecomposition, LuWorkspaceRequest};
+use scioxide_linalg::{Matrix, Vector, solve};
+
+let n = order.round() as usize;
+let options = LinalgExecutionOptions::new();
+// 既定の受理は RankPolicy::Exact だけで、条件数の下限も後退誤差の計算も持たない。
+let accept = DirectSolveOptions::default();
+let capacity = |c: Capacity| match c {
+    Capacity::Sufficient => "Sufficient",
+    Capacity::NeedsGrowth => "NeedsGrowth",
+};
+let lu_requirements = |request: LuWorkspaceRequest| {
+    LuDecomposition::<f64>::workspace_requirements(&request).map_err(|e| e.to_string())
+};
+// 分解と求解の要件を求め、max で合わせて一度だけ事前確保する。
+let factor_req = lu_requirements(LuWorkspaceRequest::factor(n, &options))?;
+let solve_req = lu_requirements(LuWorkspaceRequest::solve(n, &options))?;
+let both = factor_req.max(&solve_req);
+let sizes = |name: &'static str, r: &LinalgRequirements| -> Result<_, String> {
+    let scalars = r.scalar_len().map_err(|e| e.to_string())?;
+    Ok((
+        name,
+        Some(scalars),
+        r.required_bytes::<f64>().map_err(|e| e.to_string())?,
+    ))
+};
+let factor_bytes =
+    LuDecomposition::<f64>::factor_storage_bytes(n).map_err(|e| e.to_string())?;
+let size_rows = vec![
+    sizes("分解", &factor_req)?,
+    sizes("求解", &solve_req)?,
+    sizes("max（両方）", &both)?,
+    ("因子のメモリ領域（作業領域の外）", None, factor_bytes),
+];
+let columns = serde_json::json!([
+    { "key": "0", "label": "要件" },
+    { "key": "1", "label": "スカラー領域の長さ [要素]", "type": "integer", "nullText": "－" },
+    { "key": "2", "label": "必要なバイト数 [B]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    size_rows,
+    metadata = serde_json::json!({ "id": "sizes" })
+);
+
+let mut workspace = LinalgWorkspace::<f64>::new();
+let before = capacity(workspace.check(&both).map_err(|e| e.to_string())?);
+workspace.try_reserve(&both).map_err(|e| e.to_string())?;
+let after = capacity(workspace.check(&both).map_err(|e| e.to_string())?);
+// 因子のメモリ領域も先に確保する。
+let mut factor = LuDecomposition::<f64>::empty();
+factor.try_reserve(n).map_err(|e| e.to_string())?;
+let termination_name = |t: DirectSolveTermination| match t {
+    DirectSolveTermination::Accepted => "Accepted",
+    DirectSolveTermination::RankDeficient => "RankDeficient",
+    _ => "その他の拒否",
+};
+let b = Vector::from_vec(vec![1.0_f64; n]);
+let mut x = Vector::<f64>::zeros(n).map_err(|e| e.to_string())?;
+// 所有値を返す API と同じ振り分け（sequential_native）で出力先を指定する API を呼ぶ。
+let cx = ExecutionContext::sequential_native();
+let (mut rows, mut accepted, mut worst) = (Vec::new(), true, 0.0_f64);
+for k in 0..repeats.round() as usize {
+    let s = k as f64;
+    // A_s = tridiag(−1, 2 + s, −1) を行優先に並べる。
+    let entry = |index: usize| match (index / n).abs_diff(index % n) {
+        0 => 2.0 + s,
+        1 => -1.0,
+        _ => 0.0,
+    };
+    let a =
+        Matrix::from_vec(n, n, (0..n * n).map(entry).collect()).map_err(|e| e.to_string())?;
+    LuDecomposition::factor_into(&a, &options, &mut factor, &mut workspace, cx)
+        .map_err(|e| e.to_string())?;
+    let report = factor
+        .solve_into(&b, &accept, x.view_mut(), &mut workspace, cx)
+        .map_err(|e| e.to_string())?;
+    accepted &= report.termination().is_success();
+    // ワンショット関数で別に解いた解との差。
+    let reference = solve(&a, &b).map_err(|e| e.to_string())?;
+    let xs = x.as_slice();
+    let gap = xs
+        .iter()
+        .zip(reference.as_slice())
+        .fold(0.0_f64, |m, (p, q)| m.max((p - q).abs()));
+    // 三重対角の積を手で計算した相対残差（独立な検算）。‖A_s‖∞ は行和の最大、‖b‖∞ = 1。
+    let (mut residual, mut a_norm) = (0.0_f64, 0.0_f64);
+    for i in 0..n {
+        let left = if i > 0 { xs[i - 1] } else { 0.0 };
+        let right = if i + 1 < n { xs[i + 1] } else { 0.0 };
+        residual = residual.max((1.0 - (-left + (2.0 + s) * xs[i] - right)).abs());
+        a_norm = a_norm.max(2.0 + s + f64::from(u8::from(i > 0) + u8::from(i + 1 < n)));
+    }
+    let x_norm = xs.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+    let relative = residual / (a_norm * x_norm + 1.0);
+    worst = worst.max(relative);
+    let check = capacity(workspace.check(&both).map_err(|e| e.to_string())?);
+    let retained = workspace.retained_bytes().map_err(|e| e.to_string())?;
+    let kept = factor.retained_bytes().map_err(|e| e.to_string())?;
+    rows.push((
+        k,
+        check,
+        retained,
+        kept,
+        termination_name(report.termination()),
+        gap,
+        relative,
+    ));
+}
+// 呼び出し側の長さ 1 のスライスへの参照を渡した作業領域は大きくならない。
+let mut scratch = [0.0_f64; 1];
+let mut lent = LinalgWorkspace::from_scalar_slice(&mut scratch);
+let lent_result = match factor.solve_into(&b, &accept, x.view_mut(), &mut lent, cx) {
+    Ok(_) => "Ok".to_string(),
+    Err(e) if e.kind() == SciOxideErrorKind::DimensionMismatch => "DimensionMismatch".to_string(),
+    Err(e) => e.to_string(),
+};
+let states = serde_json::json!([
+    { "key": "0", "label": "事前確保前の check" },
+    { "key": "1", "label": "事前確保後の check" },
+    { "key": "2", "label": "長さ 1 のスライスへの参照を渡した求解" }
+]);
+let state_rows = vec![(before, after, lent_result)];
+emit_table_with_columns!(
+    states,
+    state_rows,
+    metadata = serde_json::json!({ "id": "states" })
+);
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "シフト s", "type": "integer" },
+    { "key": "1", "label": "解いた後の check" },
+    { "key": "2", "label": "作業領域の保持 [B]", "type": "integer" },
+    { "key": "3", "label": "因子の保持 [B]", "type": "integer" },
+    { "key": "4", "label": "終了理由" },
+    { "key": "5", "label": "solve との差 [-]", "type": "number", "format": sci2 },
+    { "key": "6", "label": "相対残差 [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "solves" })
+);
+let outcome = if accepted {
+    Outcome::satisfied("どのシフトの解も受理された")
+} else {
+    Outcome::failed("受理されなかった解がある")
+};
+let status = if accepted {
+    "Accepted"
+} else {
+    "RankDeficient"
+};
+emit_outcome!(
+    outcome
+        .status(status)
+        .diagnostic("最大の相対残差", worst, None)
+);
+```
+
+既定の $n = 50$ では分解の要件が 107,928 B、求解の要件が 4,000 B で、二つは別の領域も使うので、領域ごとに大きい方をとる `max` の合計 111,128 B はどちらよりも大きい。
+因子のメモリ領域は作業領域とは別に 40,600 B を使う。
+Wasm では添字が 32 ビットなので、64 ビットのネイティブ環境より添字の領域の分だけバイト数が小さい（ネイティブでは `max` が 111,728 B、因子が 40,800 B）。
+事前確保前の `check` は `NeedsGrowth` で、事前確保後はどのシフトでも `Sufficient` のまま、作業領域と因子の保持バイト数が変わらない。
+出力先を指定する API にも所有値を返す API と同じ `sequential_native()` を渡しているので、出力先を指定する API とワンショット関数 `solve` は同じカーネルで同じ順序に計算し、解の差は 0 になる。
+相対残差は $10^{-16}$ 程度で、LU 分解の後退安定性のとおり小さい。
+前進誤差は条件数にも比例する。
+$s \ge 1$ では $A_s$ が狭義の対角優位で $\kappa_\infty(A_s) \le (4 + s)/s$ なので前進誤差も小さいが、$s = 0$ の $\operatorname{tridiag}(-1, 2, -1)$ の条件数は $n^2$ に比例し（$n = 50$ で約 $10^3$）、前進誤差は相対残差より 3 桁ほど大きくなりうる。
+足りないスライスへの参照を渡すと、確保する代わりに `DimensionMismatch` が返る。
+$n = 2$ でも、$n = 200$ で 8 回解いても、事前確保の後に保持バイト数は増えない。
+
+## 固有値の出力バッファー
+
+固有値だけを求める出力先を指定する API は、結果を呼び出し側のバッファーに書く。
+`GeneralEigenvaluesBuffer<R>`（一般の正方行列の複素固有値）、`HermitianEigenvaluesBuffer<R>`（Hermitian 行列と実対称三重対角行列の実固有値）、`GeneralizedHermitianEigenvaluesBuffer<R>`（Hermitian 定値な行列対 $(A, B)$ の実固有値）の三つがある。
+バッファーは `empty()` で空のものを作るか、所有値を返す API の結果（`HermitianEigenvaluesResult` など）の `into_parts()` で値のメモリ領域とレポート `EigenReport` に分けて得る。
+これを `HermitianEigenvaluesBuffer::compute_into(&a, input, &options, &mut values, &mut ws, cx)`（三重対角は `tridiagonal_into`）のように渡すと、成功したときだけ値が書き換わって `EigenReport` が返り、失敗したときはバッファーが変わらない。
+作業領域は同じ型の `workspace::<S>(&request)` で作り、バッファーと作業領域が一度その次数まで大きくなれば、以後の呼び出しは確保しない。
+一般の固有値のバッファーの作業領域は、実数の入力でも複素数のスカラー型 `Complex<R>` で作られる。
+
+## 実行の制御：オプションとコンテキスト
+
+実行に関する指定は計算の前に決まる上限と、呼び出しのときに参照を渡す機能に分かれる。
+前者は値 `LinalgExecutionOptions` に置き、後者はコンテキストを通じて参照する。
+
+| 値 | 持つもの | 渡し方 |
+|---|---|---|
+| `LinalgExecutionOptions` | 実行方針 `with_execution_policy`（`ExecutionPolicy`、既定は `Auto`）、精度階層 `with_accuracy`（[`Standard` と `Exact`](oxref:linalg-accuracy-levels)）、経過時間の上限 `with_time_limit`、作業領域のバイト上限 `with_byte_limit`、反復の上限 `with_iteration_budget` | 密行列の演算と分解は直接受け取る。`DirectSolveOptions` や固有値・行列関数・反復改良などのオプションは `with_execution_options` で一度だけ合成し、自分ではランクの方針や許容誤差などの数学的な設定だけを持つ |
+| `Estimation` | 並べ替えの条件数、閉ループの安定性、直接解の残差などの任意の診断値を計算するか（`Skip` か `Estimate`） | 各族のオプション。`Skip` ならレポートの該当欄は空になる |
+| `ExecutionContext`（scioxide-core） | 並列エグゼキューター、取り消し（`with_cancellation`）、クロックと期限、命令セットを調べるプロセッサ機能 | 出力先を指定する API とスコープ付き API の最後の引数 |
+| `LinalgExecutionContext` | 上の機能に、命令セットに応じたカーネルの振り分けと BLAS プロバイダー（`with_blas`）を加えたもの | `ExecutionContext` から作ると新しい求解の根になり、親の `&mut SolveContext` から作ると親の回数を共有する子になる。振り分けは作るときに一度だけ決まり、`reborrow` で別の呼び出しに参照を渡しても変わらない |
+
+実行方針は出力先を指定する API が使ってよいワーカーの数の上限で、ワーカーそのものはコンテキストのエグゼキューターから来るので、所有値を返す API はどの方針でも逐次に実行する。
+`LinalgExecutionContext::sequential()` は移植可能なスカラーのカーネルで、クロック・取り消し・BLAS プロバイダーを持たないコンテキストである。
+`LinalgExecutionContext::with_iteration_budget` は、そのコンテキストで動く反復解法の回数を解法自身の上限との小さい方に抑える。
+二度呼べば小さい方の上限が残り、`reborrow` で参照を渡しても保たれる。
+この上限はその求解自身のスコープにだけ掛かり、親のスコープの反復の上限も、解法が内部で動かす入れ子の求解の上限も変えない（入れ子の反復はそれぞれのスコープに数える）。
+
+反復の上限はアルゴリズムごとに数え方と既定値が決まっている。
+特異値だけを求める SVD は dqds 法の変換を $100k$ 回、特異ベクトルも求める SVD は QR の掃引を $30k$ 回（分割統治では $30k(1 + \lceil \log_2 \lceil k/32 \rceil \rceil)$ 回）まで許す（$k = \min(m, n)$）。
+密な固有値問題の QR 反復と QZ 反復は $30n$ 回を許し、Hermitian 行列の分割統治と二分法はそれより多くを許す。
+GSVD と CS 分解は Jacobi の掃引を 40 回、部分固有値・部分特異値・LOBPCG は再出発か外側の反復を 100 回、反復改良は右辺ごとに 10 回の補正を許す。
+反復解法は自分の `max_iterations` とこの上限の小さい方まで反復し、作用素の作用、1 ノルムの推定、ランダム化低ランク近似には既定の上限がない。
+積のような反復しないカーネルは回数を数えない。
+このハンドブックのセルは Wasm の上で逐次に動くので、並列実行と `StdClock` は使えず、経過時間の上限も設定できない。
+取り消しの合図は使える。
+
+## 取り消し・上限到達と試行記録
+
+直接法とカーネルでは、取り消しや期限による停止も `ExecutionStopped` のエラーになり、出力先を指定する API の出力は変わらない。
+反復解法・部分スペクトル・作用素の作用・反復改良のオプション付き形式と出力先を指定する API は、上限や取り消しで止まっても受理済みの値を `Ok` で返し、停止を終了理由で示す（[取り消し・回数上限による停止と受理済み反復解](../../examples/accepted-state-and-cancellation/)）。
+密な固有値と SVD の反復が上限に達したときは、部分的な結果を返さずに `ConvergenceFailure` のエラーになる。
+
+分解（LU、Cholesky、LDL、QR とその変種）、SVD・GSVD・CS 分解・極分解、固有値と Schur・QZ、行列関数、行列方程式、条件数の推定、部分空間、構造化行列、作用素のノルムの計算は、作業領域の中で求解のエポックを始め、その結果を `ws.last_attempt()` の試行記録 `AttemptRecord` に残す。
+記録は結果と、自分の反復回数（`counts().own()`）と入れ子の計算の回数（`counts().nested()`）を持つ。
+結果 `outcome()`（`AttemptOutcome`）は、エポックを始める前の検査で拒否された `PreflightRejected`、成功した `Succeeded`、取り消し・期限・反復や評価の上限で止まった `Stopped`、それ以外の数値的な失敗の `Failed` に分かれる。
+上限や取り消しで止まった計算は `Err` を返しても `Stopped` と記録されるので、`Failed` と区別できる。
+数値の途中結果は記録に残らず、密行列のカーネル（積など）はエポックを始めないので試行記録も残さない。
+
+次のセルは、計算量が一定のカーネルである行列の積が止まったときに何が残るかを調べる。
+$40 \times 40$ の単位行列どうしの積を、取り消し済みのコンテキストと通常のコンテキストで出力先を指定する API として行い、時間上限を付けたオプションでオプション付き形式を呼ぶ。
+入力はない。
+表は三つの呼び出しについて、結果の分類、7 で埋めておいた出力が書き換わったか、作業領域の試行記録を示す。
+
+```rust
+//| id: linalg-kernel-cancellation
+//| ref: linalg-kernel-cancellation
+//| title: 取り消しと時間上限で止まった積の出力と試行記録
+//| run: reactive
+//| crates: [scioxide-core, scioxide-linalg]
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"products","path":"/rows/0/1","equals":"ExecutionStopped"}
+//|       - {"artifact":"products","path":"/rows/0/2","equals":"変わらない"}
+//|       - {"artifact":"products","path":"/rows/0/3","equals":"記録なし"}
+//|       - {"artifact":"products","path":"/rows/1/1","equals":"Ok"}
+//|       - {"artifact":"products","path":"/rows/1/2","equals":"書き込まれた"}
+//|       - {"artifact":"products","path":"/rows/2/1","equals":"CapabilityUnavailable"}
+use core::time::Duration;
+use scioxide_core::{CancellationToken, ExecutionContext, SciOxideError, SciOxideErrorKind};
+use scioxide_linalg::{DenseWorkspaceRequest, LinalgExecutionOptions, LinalgWorkspace, Matrix};
+
+// エラーの分類 kind() を列挙子名の文字列にする。
+let kind_name = |result: Result<(), SciOxideError>| match result.map_err(|e| e.kind()) {
+    Ok(()) => "Ok",
+    Err(SciOxideErrorKind::ExecutionStopped) => "ExecutionStopped",
+    Err(SciOxideErrorKind::CapabilityUnavailable) => "CapabilityUnavailable",
+    Err(_) => "その他のエラー",
+};
+let n = 40_usize;
+let a = Matrix::<f64>::identity(n).map_err(|e| e.to_string())?;
+let options = LinalgExecutionOptions::new();
+let request = DenseWorkspaceRequest::product(n, n, n, &options);
+let mut workspace = LinalgWorkspace::<f64>::workspace(&request).map_err(|e| e.to_string())?;
+let mut rows = Vec::new();
+let token = CancellationToken::new();
+for cancelled in [true, false] {
+    if cancelled {
+        token.cancel();
+    } else {
+        token.reset();
+    }
+    // 出力を 7 で埋めておき、呼び出しの後に変わったかを調べる。
+    let mut out = Matrix::from_vec(n, n, vec![7.0_f64; n * n]).map_err(|e| e.to_string())?;
+    let cx = ExecutionContext::sequential().with_cancellation(&token);
+    let result = a
+        .view()
+        .mul_mat_into(&a, &options, out.view_mut(), &mut workspace, cx);
+    let unchanged = out.as_slice().iter().all(|&v| v == 7.0);
+    // 積はエポックを始めないので、試行記録は残らない。
+    let record = if workspace.last_attempt().is_some() {
+        "記録あり"
+    } else {
+        "記録なし"
+    };
+    rows.push((
+        if cancelled {
+            "出力先を指定する API、取り消し済みのコンテキスト"
+        } else {
+            "出力先を指定する API、通常のコンテキスト"
+        },
+        kind_name(result),
+        if unchanged {
+            "変わらない"
+        } else {
+            "書き込まれた"
+        },
+        record,
+    ));
+}
+// 所有値を返す API のコンテキストにはクロックがないので、時間上限は計算の前に拒否される。
+let timed = options.with_time_limit(Duration::from_secs(1));
+let owned = a.view().mul_mat_with_options(&a, &timed).map(|_| ());
+rows.push((
+    "オプション付き形式、時間上限 1 s",
+    kind_name(owned),
+    "（出力を受け取らない）",
+    "（作業領域を受け取らない）",
+));
+let columns = serde_json::json!([
+    { "key": "0", "label": "積の呼び出し" },
+    { "key": "1", "label": "結果" },
+    { "key": "2", "label": "出力" },
+    { "key": "3", "label": "試行記録" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "products" })
+);
+```
+
+取り消し済みのコンテキストでは、積は `ExecutionStopped` を返し、出力の 7 がそのまま残る。
+通常のコンテキストでは同じ呼び出しが成功して出力を書き換えるが、どちらの場合も積はエポックを始めないので、試行記録は残らない。
+時間上限を付けたオプション付き形式の積は、所有値を返す API のコンテキストにクロックがないので、計算の前に `CapabilityUnavailable` で拒否される。
+
+次のセルは、反復の上限で止まった密な SVD が何を残すかを調べる。
+特異値だけを求める `SvdValues` は二重対角化の後に dqds 法の変換を繰り返し、その回数を反復の上限に対して数える。
+入力は反復の上限（1〜240）で、行列は決定論的な擬似乱数で作った成分 $[-0.5, 0.5)$ の $40 \times 40$ 行列である。
+表は出力先を指定する API `compute_into` の結果の分類、出力の特異値が書き換わったか、試行記録の結果と反復回数を示す。
+検算として、最大特異値を、既定の上限で動く標準形式 `SvdValues::compute` で別に求めた値と比べる。
+最後の判定は試行記録で決め、`Succeeded` なら満たした、それ以外は特異値を出力に反映しないので失敗とする。
+
+```rust
+//| id: linalg-svd-iteration-limit
+//| ref: linalg-svd-iteration-limit
+//| title: 反復の上限で止まった SVD の出力と試行記録
+//| run: reactive
+//| crates: [scioxide-core, scioxide-linalg]
+//| inputs:
+//|   iteration_budget: {"type":"range","label":"SVD の反復の上限 [回]","description":"40×40 行列の特異値を求める dqds 法の変換回数の上限。","min":1,"max":240,"step":1,"value":100}
+//| cases:
+//|   - {"id":"enough","label":"上限 240","description":"上限が足りると Succeeded になり、必要だった変換の回数が記録される。","inputs":{"iteration_budget":240}}
+//|   - {"id":"one","label":"上限 1","description":"上限 1 では最初の変換で止まり、特異値は書かれない。","inputs":{"iteration_budget":1}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"svd","path":"/rows/0/0","equals":"ConvergenceFailure"}
+//|       - {"artifact":"svd","path":"/rows/0/1","equals":"変わらない"}
+//|       - {"artifact":"svd","path":"/rows/0/2","equals":"Stopped"}
+//|       - {"artifact":"svd","path":"/rows/0/3","equals":100}
+//|       - {"artifact":"svd","path":"/rows/0/4","equals":null}
+//|       - {"path":"/outputs/1/state","equals":"failed"}
+//|   - case: enough
+//|     expect:
+//|       - {"artifact":"svd","path":"/rows/0/2","equals":"Succeeded"}
+//|       - {"artifact":"svd","path":"/rows/0/3","range":{"min":100,"max":240}}
+//|       - {"artifact":"svd","path":"/rows/0/4","range":{"max":1e-14}}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+//|   - case: one
+//|     expect:
+//|       - {"artifact":"svd","path":"/rows/0/3","equals":1}
+//|       - {"path":"/outputs/1/state","equals":"failed"}
+use scioxide_core::{AttemptOutcome, AttemptRecord, Budget, ExecutionContext, SciOxideErrorKind};
+use scioxide_linalg::{LinalgExecutionOptions, Matrix, SvdValues, SvdWorkspaceRequest};
+
+let outcome_name = |r: Option<&AttemptRecord<()>>| match r.map(|r| r.outcome()) {
+    None => "記録なし",
+    Some(AttemptOutcome::PreflightRejected) => "PreflightRejected",
+    Some(AttemptOutcome::Failed) => "Failed",
+    Some(AttemptOutcome::Stopped) => "Stopped",
+    Some(AttemptOutcome::Succeeded) => "Succeeded",
+    Some(_) => "その他の結果", // AttemptOutcome は #[non_exhaustive]
+};
+let n = 40_usize;
+// 決定論的な擬似乱数で作った [-0.5, 0.5) の成分。
+let entries = (0..n * n).map(|k| ((k * 7919 + 13) % 1009) as f64 / 1009.0 - 0.5);
+let a = Matrix::from_vec(n, n, entries.collect()).map_err(|e| e.to_string())?;
+let budget = Budget::try_from(iteration_budget.round() as usize).map_err(|e| e.to_string())?;
+let options = LinalgExecutionOptions::new().with_iteration_budget(budget);
+let request = SvdWorkspaceRequest::new(n, n, &options);
+let mut workspace = SvdValues::<f64>::workspace::<f64>(&request).map_err(|e| e.to_string())?;
+let mut values = SvdValues::<f64>::empty();
+let cx = ExecutionContext::sequential();
+let result = SvdValues::compute_into(&a, &options, &mut values, &mut workspace, cx);
+let kind = match result.map_err(|e| e.kind()) {
+    Ok(_) => "Ok",
+    Err(SciOxideErrorKind::ConvergenceFailure) => "ConvergenceFailure",
+    Err(_) => "その他のエラー",
+};
+let record = workspace.last_attempt();
+let iterations = record.map(|r| r.counts().own().iterations());
+// 検算: 既定の上限（100k）の標準形式で別に求めた最大特異値との相対差。
+let reference = SvdValues::compute(&a)
+    .map_err(|e| e.to_string())?
+    .singular_values()[0];
+let gap = values
+    .singular_values()
+    .first()
+    .map(|&s| (s - reference).abs() / reference);
+let written = if values.singular_values().is_empty() {
+    "変わらない"
+} else {
+    "書き込まれた"
+};
+let rows = vec![(kind, written, outcome_name(record), iterations, gap)];
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "結果" },
+    { "key": "1", "label": "出力の特異値" },
+    { "key": "2", "label": "試行記録" },
+    { "key": "3", "label": "反復回数 [回]", "type": "integer", "nullText": "－" },
+    { "key": "4", "label": "最大特異値の相対差 [-]", "type": "number", "format": sci2, "nullText": "－" }
+]);
+emit_table_with_columns!(columns, rows, metadata = serde_json::json!({ "id": "svd" }));
+let outcome = if record.is_some_and(|r| r.outcome() == AttemptOutcome::Succeeded) {
+    Outcome::satisfied("SVD は反復の上限の範囲で収束した")
+} else {
+    Outcome::failed("SVD は反復の上限で止まり、特異値を出力に反映しなかった")
+        .explanation("試行記録は Stopped だが、密な SVD は途中の値を出力に書かない。")
+};
+let outcome =
+    outcome
+        .status(outcome_name(record))
+        .diagnostic("上限", budget.get() as f64, None);
+let outcome = match iterations {
+    Some(count) => outcome.diagnostic("記録された反復回数", count as f64, None),
+    None => outcome,
+};
+emit_outcome!(outcome);
+```
+
+既定の上限 100 では、SVD は `ConvergenceFailure` を返す。
+出力の特異値は空のまま書き換えられず、試行記録は上限で止まったことを示す `Stopped` で、反復回数は上限と同じ 100 である。
+上限を 156 以上にすると `Succeeded` になり、記録された 156 回がこの行列に必要だった変換の回数である（特異値 1 個あたり 4 回程度）。
+このとき最大特異値は標準形式で別に求めた値と Wasm では一致し（相対差 0）、ネイティブのベクトル命令の環境でも $10^{-15}$ より小さい差に収まる。
+上限 1 では最初の変換で止まり、記録の反復回数は 1 になる。
+上限を指定しない場合の既定値は $100k = 4000$ 回なので、通常の行列で上限に達することはまれである。
+
+## 下位の部品 backend
+
+`scioxide_linalg::backend` は、他の SciOxide クレートが反復の内側で使う下位の部品を出力に反映する。
+この名前空間の部品はここまでに述べた規則の一部に従わない。
+エラーのときに右辺や作業用のメモリ領域の一部が書き換わることがあり、ランクの方針を適用せず、残差や条件数を診断せず、求解の回数も数えない。
+メモリ領域の大きさ、非有限値、厳密に 0 のピボットは検査する。
+アプリケーションは、通常はこの章のほかの型（`LuDecomposition`、`TridiagonalLuDecomposition` など）を使う。
+
+`backend::lu::LuFactor<S>` は、同じ次数の行列を何度も分解し直す計算のための、平衡化付きの部分ピボット LU 分解 $P D_r A D_c = LU$ である（$D_r, D_c$ は 2 の冪の対角の尺度）。
+`LuFactor::new(order)` が次数 `order` までのメモリ領域を $O(n^2)$ で用意し、`try_reserve(order)` は今の因子を変えずに容量を増やす。
+`factor(matrix, cx)` は `LuDecomposition` と同じ平衡化付きのブロック消去を用意した容量の中で確保せずに行い、容量より大きい行列は `ResourceLimit`、厳密に 0 のピボットは `Singular` で拒む。
+分解に失敗すると前の因子は使えなくなる。
+`solve_into(rhs, output, cx)` は $O(n^2)$ の代入で解き、有限な結果だけを出力に書く。
+元の行列も条件数の推定も保持しないので、解を受理するかどうかは呼び出し側が決める。
+後退誤差は成分ごとに $\gamma_{6n} \lvert L \rvert \lvert U \rvert = 3n\varepsilon/(1 - 3n\varepsilon) \cdot \lvert L \rvert \lvert U \rvert$ の程度で、ピボットの成長は $\lvert L \rvert \lvert U \rvert$ を通して効く。
+
+`backend::dense::DenseOperatorWorkspace<T>` は、行優先の行列と、検証した成分の大きさの上限を一緒に持つ作業領域である。
+`new(rows, cols)` が零行列を確保し、`update(fill)` は全成分を NaN で埋めてから `fill` に書かせ、有限性を一度だけ調べる。
+書き残しや非有限値があればエラーになり、成功する `update` までは作用素への参照を渡さない。
+`operator()` は成分を読み直さずに `FiniteMatrixView` への参照を渡すので、ヤコビ行列のように値を入れ替えながら同じ形の作用素を何度も使う反復で、確保と有限性の再検査を避けられる。
+更新は $O(mn)$、作用素の借用は $O(1)$ で、構築の後の更新と積は確保せず、積の算術と精度は `FiniteMatrixView` と同じである。
+
+この名前空間にはほかに三重対角の因子（`backend::tridiagonal`）、Hessenberg 行列の部品（`backend::hessenberg`）、縁付き二重対角の因子（`backend::bordered_bidiagonal`）がある。
+
+---
+
+## まとめ
+
+ワンショット関数と標準形式は答えだけを返して失敗をエラーにし、オプション付き形式は終了理由とレポートを `Ok` の結果で返すので、読む情報があるかで形を選ぶ。
+出力先を指定する API とスコープ付き API だけがコンテキストを受け取るので、並列実行、取り消し、期限、外部 BLAS を使うときや、反復の内側で確保をなくすときはこの二つを使う。
+出力先を指定する API には演算ごとの要求から求めた要件で事前確保した作業領域を渡し、複数の演算は `LinalgRequirements::max` で合わせて一度に事前確保し、分解の因子を入れるメモリ領域は型ごとの `try_reserve` で別に確保する。
+所有する作業領域は不足分を自動で確保し、参照を渡したスライスは大きくならずに `DimensionMismatch` を返すので、確保を許すかどうかを作業領域の作り方で選べる。
+直接法とカーネルは止まると出力を変えずにエラーを返し、エポックを始める計算はその結果と反復回数を `last_attempt()` に残すので、`Err` でも上限による停止（`Stopped`）と数値的な失敗（`Failed`）を区別できる。
+
+## 次に読むページ
+
+- [LU・Cholesky・LDL 分解と直接解の受理](../direct-and-structured-solvers/)：ここで事前確保した作業領域で動く直接法と、解を受理する判定を確かめる。
+- [固有値問題](../eigenproblems/)：固有値の出力バッファーを渡す `compute_into` と、レポート `EigenReport` の読み方を確かめる。
+- [クリロフ部分空間法と前処理](../krylov-and-preconditioning/)：反復解法の作業領域 `IterativeWorkspace` と、止まったときに `Ok` で返る受理済みの反復解を確かめる。
+- [外部 BLAS プロバイダーの仕様](../blas-provider/)：`with_provider_packing` と `for_context` で事前確保する領域が、どの呼び出しで使われるかを確かめる。

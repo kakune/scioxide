@@ -1,0 +1,672 @@
+---
+title: "Conservation-law reconstruction and boundaries"
+description: "MUSCL and Barth–Jespersen face reconstruction for finite-volume conservation laws, gradient scaling for face bounds and admissibility, exterior boundary states, and total balance."
+sidebar:
+  order: 352
+references:
+  pde-conservation-muscl: "muscl-reconstruction"
+  pde-conservation-barth-jespersen: "barthjespersen-reconstruction-on-simplex-meshes"
+  pde-conservation-boundaries: "exterior-boundary-states"
+---
+
+The semidiscrete system in [Conservation laws and numerical fluxes](../conservation-laws/) closes once the states on both sides of each face are specified.
+This page explains reconstruction of face states from cell averages and the states outside exterior faces.
+Step limits, time integration, and spatial plans are covered in [CFL conditions and time integration for conservation laws](../conservation-time-integration/).
+
+## MUSCL reconstruction
+
+A first-order method uses cell averages directly as face states and is first-order accurate in space.
+MUSCL (van Leer) constructs a linear distribution in each cell,
+
+$$
+u_K(x) = \bar u_K + g_K\cdot(x - x_K)
+$$
+
+and passes its value $u_K(x_f)$ at the face centroid $x_f$ to the numerical flux.
+$x_K$ is the cell centroid, and $g_K$ is a gradient estimate.
+The cell average of the linear distribution remains $\bar u_K$, preserving conservation.
+
+Using an unrestricted gradient near a discontinuity makes face values exceed neighboring cell values, creating new extrema (oscillations).
+Godunov's theorem states that a monotone linear method is at most first order, so combining second-order accuracy with monotonicity requires a nonlinear limiter that restricts gradients according to the solution.
+
+On structured grids, each gradient component is selected from the one-sided difference quotients to the left and right neighboring cells along that axis:
+
+$$
+a = \frac{\bar u_K - \bar u_{K-}}{h_-},\qquad b = \frac{\bar u_{K+} - \bar u_K}{h_+}
+$$
+
+
+$h_\pm$ are distances between cell centroids.
+The two limiters in `scioxide-pde` are as follows.
+
+- minmod: $g = \operatorname{minmod}(a, b)$.
+  $\operatorname{minmod}$ returns the argument of smallest absolute value if all arguments have the same sign, and 0 otherwise.
+- MC (monotonized central): $g = \operatorname{minmod}\bigl(c,\ 2a,\ 2b\bigr)$.
+  $c = (h_+ a + h_- b)/(h_- + h_+)$ is the derivative at the center of a three-point quadratic interpolant, equal to $(a+b)/2$ on a uniform grid.
+
+Both set the gradient to 0 in cells at extrema, where $a$ and $b$ have different signs.
+For one-dimensional scalar problems on uniform grids, either reconstruction combined with forward Euler under the [CFL condition](oxref:pde-conservation-cfl) is TVD (does not increase total variation $\sum_i |\bar u_{i+1} - \bar u_i|$) and is second-order accurate in smooth monotone regions.
+minmod selects the smaller of the two difference quotients and is more diffusive, while MC uses central differences whenever possible and preserves sharper discontinuities.
+
+If a cell touching an exterior face has no neighbor in that direction, the exterior boundary state ([Exterior boundary states](#exterior-boundary-states) below) is used in the one-sided difference quotient at the distance to the face centroid.
+If neither a neighbor nor an exterior state exists on one side, that gradient component is set to 0.
+
+### Face bounds and admissibility
+
+After selecting a gradient, `scioxide-pde` applies two scaling operations to every reconstruction.
+
+The first imposes componentwise bounds.
+Let $m_K$ and $M_K$ be the minimum and maximum among the cell average, face-neighbor cell averages, and exterior boundary states; multiply the gradient by a factor $\theta \in [0, 1]$ so that all face values lie in $[m_K, M_K]$.
+The exterior states used for these bounds are constructed from cell averages rather than reconstructed face values (`Exterior` uses the specified value), so extrapolated face values cannot introduce new extrema.
+
+The second enforces admissibility.
+If any face value fails `ConservationLaw::admissible`, all gradient components are repeatedly halved by a common factor, ultimately reverting to constant reconstruction.
+Because cell averages are admissible, the face values of constant reconstruction are also admissible.
+For Euler states with density or pressure near 0, this prevents passing negative-density face values to the numerical flux.
+
+`ConservationReport::limited_cells` counts cells where the gradient differs from the central difference quotient $c$, a one-sided difference quotient was unavailable, or either scaling operation above reduced the gradient.
+With minmod, cells where $a \ne b$ are counted (except when $a = -b$ on a uniform grid), so the count is nonzero even for a smooth solution.
+
+## Barth–Jespersen reconstruction on simplex meshes
+
+Triangles and tetrahedra have no axis-wise neighbors, so a weighted least-squares fit computes the gradient using displacements $d_j = x_j - x_K$ to the centroids of face-neighbor cells.
+
+$$
+g_K = \operatorname*{arg\,min}_{g}\ \sum_j \frac{\bigl(g\cdot d_j - (\bar u_j - \bar u_K)\bigr)^2}{|d_j|^2}
+$$
+
+Boundary cells can have fewer than $D$ neighbors, making the normal equations singular (rank deficient).
+In that case, the gradient is set to 0 and the cell is counted in `ConservationReport::rank_deficient_cells`.
+The gradient is scaled using the bounds in the preceding section.
+This scaling is the Barth–Jespersen limiter itself, keeping face values within the range of neighboring cell averages.
+
+The four `ConservationReconstruction` values and their supported meshes are listed below.
+
+| Value | Method | Structured grid | Simplex mesh |
+|---|---|---|---|
+| `Constant` | Piecewise constant (first order) | Supported | Supported |
+| `Minmod` | MUSCL, minmod | Supported | Unsupported |
+| `MonotonizedCentral` | MUSCL, MC | Supported | Unsupported |
+| `BarthJespersen` | Weighted least-squares gradient and face extrema limiting | Unsupported | Supported |
+
+Unsupported combinations are rejected with `InvalidInput` during plan preparation.
+
+## Exterior boundary states
+
+At an exterior face, the exterior state is paired with the interior face value to solve a Riemann problem with the same numerical flux as at interior faces.
+`ConservationBoundary` specifies how to construct the exterior state.
+
+- `Transmissive`: copies the interior face value to the exterior state.
+  Flux consistency makes the face flux equal to the interior state's physical flux.
+  Use it for outflow boundaries where waves leave without reflection.
+- `Exterior(f)`: specifies the exterior state through `f(x, t)`, where `x` is the face centroid and `t` is physical time.
+  Use it for inflow boundaries or uniform far-field flow, constructing it with `ConservationBoundary::exterior(closure)`.
+- `SlipWall`: uses `ConservationLaw::reflect` to place a state with reversed normal momentum outside.
+  This produces a symmetric Riemann problem, so mass flux through the wall is 0.
+  It is supported only for equations implementing `reflect` (`IdealGasEuler` among the built-ins).
+
+If an exterior state is inadmissible, residual evaluation fails with `InvalidInput`.
+
+`ConservationReport::boundary_flux()` is the componentwise sum of outward exterior-face fluxes integrated over face measure.
+Interior fluxes cancel, so the total quantity $Q = \sum_K |K|\,\bar u_K$ satisfies the following up to roundoff.
+
+$$
+\frac{dQ}{dt} = -\,(\text{boundary\_flux})
+$$
+
+
+No conditions are placed at periodic seams; seam faces are treated as interior faces.
+
+## Advection of a rectangular pulse through boundaries
+
+The two cells in this section advance linear advection $u_t + u_x = 0$ at speed 1 on $[0, 1]$ from an initial rectangular pulse (1 for $0.1 \le x < 0.4$, 0 elsewhere) to final time $T$.
+The left inflow boundary uses `Exterior` with value $u_{\mathrm{in}}$, while the right outflow boundary is either `Transmissive` or `Exterior` with value 0.
+The exact solution is $u_0(x - t)$ for $x \ge t$ and $u_{\mathrm{in}}$ for $x < t$, lying between $\min(0, u_{\mathrm{in}})$ and $\max(1, u_{\mathrm{in}})$.
+Space is discretized with `StructuredConservationPlan` and `Godunov`, time with `Heun`, and steps are set to the CFL limit $\Delta t_{\max} = 0.45\,h/2$.
+The following definitions block shares this computation and the exact cell averages between the two cells.
+
+```rust
+//| id: pde-conservation-advection-model
+//| kind: definitions
+//| title: "Linear advection with inflow and outflow boundaries and exact cell averages"
+//| crates: [scioxide-core, scioxide-ode, scioxide-pde, scioxide-spatial]
+use scioxide_core::{ExecutionContext, NumericScalar, RealScalar};
+use scioxide_ode::{Heun, OdeMethod, OdeOptions, OdeOutputSchedule, OdeProblem, OdeState};
+use scioxide_pde::{ConservationBoundary, ConservationOptions, ConservationReconstruction};
+use scioxide_pde::{Godunov, LinearAdvection, StructuredConservationPlan};
+use scioxide_spatial::SegmentMesh;
+use scioxide_spatial::{AxisSide, AxisTopology, BoundarySet, CellField, CoordinateAxis, Grid1d};
+
+/// Average of the exact solution u(x, T) over [a, b]. Interfaces are T, 0.1 + T, and 0.4 + T.
+pub(crate) fn exact_average(inflow: f64, end: f64, a: f64, b: f64) -> f64 {
+    let pieces = [
+        (f64::NEG_INFINITY, end, inflow),
+        (0.1 + end, 0.4 + end, 1.0),
+    ];
+    let overlap =
+        |lo: f64, hi: f64| RealScalar::max(RealScalar::min(b, hi) - RealScalar::max(a, lo), 0.0);
+    pieces
+        .iter()
+        .map(|&(lo, hi, v)| v * overlap(lo, hi))
+        .sum::<f64>()
+        / (b - a)
+}
+
+/// Result of one run. low and high are the minimum and maximum cell averages over all accepted steps.
+pub(crate) struct AdvectionRun {
+    pub(crate) centers: Vec<f64>,
+    pub(crate) values: Vec<f64>,
+    pub(crate) status: String,
+    pub(crate) steps: usize,
+    pub(crate) maximum_step: Option<f64>,
+    pub(crate) low: f64,
+    pub(crate) high: f64,
+    pub(crate) error: f64,
+    pub(crate) limited: usize,
+}
+
+/// Advance N cells to time T and compute the L¹ error against exact cell averages.
+pub(crate) fn advect(
+    reconstruction: ConservationReconstruction,
+    inflow: f64,
+    zero_outlet: bool,
+    cells: usize,
+    end: f64,
+) -> Result<AdvectionRun, String> {
+    let h = 1.0 / cells as f64;
+    let axis = CoordinateAxis::uniform(0.0, 1.0, cells + 1).map_err(|e| e.to_string())?;
+    let grid = Grid1d::new([axis], [AxisTopology::Bounded]).map_err(|e| e.to_string())?;
+    let mesh = SegmentMesh::new(grid).map_err(|e| e.to_string())?;
+    let start = BoundarySet::axis_side(&mesh, 0, AxisSide::Start).map_err(|e| e.to_string())?;
+    let finish = BoundarySet::axis_side(&mesh, 0, AxisSide::End).map_err(|e| e.to_string())?;
+    let outlet = if zero_outlet {
+        ConservationBoundary::exterior(|_, _| Ok([0.0]))
+    } else {
+        ConservationBoundary::Transmissive
+    };
+    let conditions = vec![
+        (
+            start,
+            ConservationBoundary::exterior(move |_, _| Ok([inflow])),
+        ),
+        (finish, outlet),
+    ];
+    let options = ConservationOptions::new().with_reconstruction(reconstruction);
+    let plan = StructuredConservationPlan::with_options(mesh, conditions, options)
+        .map_err(|e| e.to_string())?;
+    let initial = CellField::from_fn(plan.mesh(), |i| {
+        let x = plan.centers()[i][0];
+        [if (0.1..0.4).contains(&x) { 1.0 } else { 0.0 }]
+    })
+    .map_err(|e| e.to_string())?;
+    let law = LinearAdvection { velocity: [1.0] };
+    let mut workspace = plan.workspace().map_err(|e| e.to_string())?;
+    let system = plan
+        .bind(&law, &Godunov, &mut workspace)
+        .map_err(|e| e.to_string())?;
+    let problem = OdeProblem::new(&system, end);
+    // Give fixed-step Heun a large initial step so that each step uses the CFL limit.
+    let options = OdeOptions::new()
+        .with_initial_step(1.0)
+        .with_output_schedule(OdeOutputSchedule::AcceptedSteps);
+    let vector = plan
+        .initial_state(&law, initial.view())
+        .map_err(|e| e.to_string())?;
+    let mut state = OdeState::new(0.0, vector);
+    let (mut low, mut high) = (0.0_f64, 1.0_f64);
+    let mut sink = |_: f64, u: &[f64]| {
+        for &v in u {
+            low = RealScalar::min(low, v);
+            high = RealScalar::max(high, v);
+        }
+        Ok(())
+    };
+    let method = Heun::new();
+    let mut ode_workspace = method
+        .workspace(&problem, &options)
+        .map_err(|e| e.to_string())?;
+    let execution = ExecutionContext::sequential();
+    let solve = method
+        .advance(
+            &problem,
+            &options,
+            &mut state,
+            &mut sink,
+            &mut ode_workspace,
+            execution,
+        )
+        .map_err(|e| e.to_string())?;
+    let report = system
+        .report(state.time(), state.values(), execution)
+        .map_err(|e| e.to_string())?;
+    let values = state.values().to_vec();
+    let error = values
+        .iter()
+        .enumerate()
+        .map(|(i, &u)| {
+            let a = i as f64 * h;
+            h * NumericScalar::abs(u - exact_average(inflow, end, a, a + h))
+        })
+        .sum();
+    Ok(AdvectionRun {
+        centers: plan.centers().iter().map(|x| x[0]).collect(),
+        values,
+        status: solve.termination().map_or("None".into(), |t| t.to_string()),
+        steps: solve.accepted_steps(),
+        maximum_step: report.maximum_step(),
+        low,
+        high,
+        error,
+        limited: report.limited_cells(),
+    })
+}
+```
+
+The first cell solves with three reconstructions under the same conditions and compares solution profiles and the minimum and maximum cell averages over all accepted steps.
+The Godunov outflow flux depends only on the upwind interior face value, but with zero-valued `Exterior`, 0 enters the rightmost cell's one-sided difference quotient and bounds used to construct that face value.
+With `Transmissive`, the exterior state equals the cell average, so the rightmost cell's gradient is 0.
+
+```rust
+//| id: pde-conservation-boundary-advection
+//| ref: pde-conservation-boundary-advection
+//| title: "Compare three reconstructions for rectangular-pulse advection with inflow and outflow boundaries"
+//| run: reactive
+//| uses: [pde-conservation-advection-model]
+//| crates: [scioxide-core, scioxide-ode, scioxide-pde, scioxide-spatial]
+//| inputs:
+//|   inflow: {"type":"range","label":"Inflow value u_in [-]","description":"Exterior state at the left end.","min":0,"max":1,"step":0.25,"value":0.5}
+//|   outlet: {"type":"select","label":"Right boundary","options":["Transmissive","Exterior (value 0)"],"value":"Exterior (value 0)"}
+//|   cells: {"type":"select","label":"Cell count N","options":["50","100","200","400"],"value":"200"}
+//|   end_time: {"type":"range","label":"Final time T [-]","description":"The rectangular pulse starts leaving the right end at time 0.6.","min":0.1,"max":1,"step":0.05,"value":0.75}
+//| cases:
+//|   - {"id":"transmissive","label":"Transmissive right boundary","description":"Using the interior value as the exterior outflow state leaves the L¹ error unchanged to seven digits.","inputs":{"outlet":"Transmissive"}}
+//|   - {"id":"coarse","label":"N = 50","description":"A coarser mesh makes the error differences among the three reconstructions clearer.","inputs":{"cells":"50"}}
+//|   - {"id":"full-inflow","label":"u_in = 1","description":"Match the inflow value to the pulse height. The solution range remains [0, 1].","inputs":{"inflow":1}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"runs","path":"/rows/0/1","equals":"ReachedEnd"}
+//|       - {"artifact":"runs","path":"/rows/0/3","approx":{"value":0.001125,"rtol":1e-9}}
+//|       - {"artifact":"runs","path":"/rows/0/2","equals":667}
+//|       - {"artifact":"runs","path":"/rows/1/4","range":{"min":-1e-14}}
+//|       - {"artifact":"runs","path":"/rows/2/4","range":{"min":-1e-14}}
+//|       - {"artifact":"runs","path":"/rows/2/5","range":{"max":1.00000000000001}}
+//|       - {"artifact":"runs","path":"/rows/0/6","approx":{"value":0.06937788227,"rtol":1e-6}}
+//|       - {"artifact":"runs","path":"/rows/2/6","approx":{"value":0.01624117672,"rtol":1e-6}}
+//|   - case: transmissive
+//|     expect:
+//|       - {"artifact":"runs","path":"/rows/1/6","approx":{"value":0.02741464296,"rtol":1e-6}}
+//|       - {"artifact":"runs","path":"/rows/1/4","range":{"min":-1e-14}}
+//|   - case: coarse
+//|     expect:
+//|       - {"artifact":"runs","path":"/rows/0/2","equals":167}
+//|       - {"artifact":"runs","path":"/rows/0/6","approx":{"value":0.09465290019,"rtol":1e-6}}
+//|   - case: full-inflow
+//|     expect:
+//|       - {"artifact":"runs","path":"/rows/2/4","range":{"min":-1e-14}}
+//|       - {"artifact":"runs","path":"/rows/2/5","range":{"max":1.00000000000001}}
+use scioxide_pde::ConservationReconstruction;
+
+let fixed4 = serde_json::json!({ "fractionDigits": 4 });
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let n: usize = cells.parse().map_err(|_| "Invalid cell count")?;
+let zero_outlet = outlet != "Transmissive";
+let mut rows = Vec::new();
+let mut layers = Vec::new();
+for (name, reconstruction) in [
+    ("Constant", ConservationReconstruction::Constant),
+    ("minmod", ConservationReconstruction::Minmod),
+    ("MC", ConservationReconstruction::MonotonizedCentral),
+] {
+    let run = advect(reconstruction, inflow, zero_outlet, n, end_time)?;
+    let points: Vec<[f64; 2]> = run
+        .centers
+        .iter()
+        .zip(&run.values)
+        .map(|(&x, &u)| [x, u])
+        .collect();
+    layers.push(
+        serde_json::json!({ "id": name, "kind": "line", "name": name, "points": points }),
+    );
+    rows.push((
+        name,
+        run.status,
+        run.steps,
+        run.maximum_step,
+        run.low,
+        run.high,
+        run.error,
+        run.limited,
+    ));
+}
+// Plot the exact solution on a fine set of points (reference curve).
+let exact: Vec<[f64; 2]> = (0..=500)
+    .map(|k| {
+        let x = k as f64 / 500.0;
+        [x, exact_average(inflow, end_time, x - 1e-9, x + 1e-9)]
+    })
+    .collect();
+layers.push(serde_json::json!({
+    "id": "exact",
+    "kind": "line",
+    "name": "Exact solution",
+    "points": exact,
+    "style": { "lineType": "dashed", "showSymbol": false }
+}));
+emit_chart!(
+    serde_json::json!({
+        "kind": "xy",
+        "xLabel": "Position x [-]",
+        "yLabel": "u(x, T) [-]",
+        "yMin": -0.1,
+        "yMax": 1.1,
+        "dataZoom": true,
+        "tooltip": true,
+        "layers": layers
+    }),
+    metadata = serde_json::json!({ "id": "profiles" })
+);
+let columns = serde_json::json!([
+    { "key": "0", "label": "Reconstruction" },
+    { "key": "1", "label": "Termination reason" },
+    { "key": "2", "label": "Accepted steps [count]", "type": "integer" },
+    { "key": "3", "label": "Last Δt_max [-]", "type": "number", "format": sci3, "nullText": "None" },
+    { "key": "4", "label": "Minimum over all steps [-]", "type": "number", "format": fixed4 },
+    { "key": "5", "label": "Maximum over all steps [-]", "type": "number", "format": fixed4 },
+    { "key": "6", "label": "L¹ error [-]", "type": "number", "format": sci3 },
+    { "key": "7", "label": "Limited cells [count]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "runs" })
+);
+```
+
+At the defaults ($u_{\mathrm{in}} = 0.5$, zero-valued `Exterior` at the right end, $N = 200$, $T = 0.75$), all three runs ended with `ReachedEnd`, and all 667 steps had $\Delta t_{\max} = 0.45 \times 0.005/2 = 1.125 \times 10^{-3}$.
+Cell averages stayed within $[0, 1]$ at every accepted step.
+MC's minimum $-7.6 \times 10^{-20}$ is at roundoff level, with no out-of-range values near the boundaries.
+The $L^1$ error is $6.94 \times 10^{-2}$ for constant reconstruction, $2.74 \times 10^{-2}$ for minmod, and $1.62 \times 10^{-2}$ for MC; the chart shows the sharpest pulse corners with MC.
+MC limits 34 cells compared with minmod's 138, using the central difference quotient more often.
+Changing the right boundary to `Transmissive` changes minmod's error in the eighth digit and MC's in the thirteenth digit.
+The effect is small because the right exterior state changes outflow flux only through the rightmost cell's gradient.
+
+For discontinuous solutions, $L^1$ error converges more slowly than the method's order.
+Advecting discontinuous initial data with a linear method of order $p$ spreads the discontinuity over a width of order $h^{p/(p+1)}$, giving $L^1$ error $O(h^{p/(p+1)})$ ($h^{1/2}$ for first order, $h^{2/3}$ for second order; LeVeque, *Finite Volume Methods for Hyperbolic Problems*, 2002).
+The next cell sets inflow to 0 and outflow to `Transmissive`, doubles the cell count from 25 upward, and shows the $L^1$ error and observed order $\log_2(e_{N/2}/e_N)$ from adjacent $N$ values.
+Dashed reference lines have slopes $-1/2$ and $-2/3$ and pass through the constant-reconstruction error at $N = 25$.
+
+```rust
+//| id: pde-conservation-advection-refinement
+//| ref: pde-conservation-advection-refinement
+//| title: "Measure L¹ error convergence orders for rectangular-pulse advection by reconstruction"
+//| run: button
+//| uses: [pde-conservation-advection-model]
+//| crates: [scioxide-core, scioxide-ode, scioxide-pde, scioxide-spatial]
+//| inputs:
+//|   finest: {"type":"select","label":"Maximum cell count","options":["200","400","800"],"value":"400"}
+//|   end_time: {"type":"range","label":"Final time T [-]","description":"Choose a time before the rectangular pulse reaches the right end.","min":0.1,"max":0.6,"step":0.1,"value":0.5}
+//| timeoutMs: 30000
+//| cases:
+//|   - {"id":"short","label":"T = 0.1, N ≤ 200","description":"At short times the discontinuity spreads less, so coarse-grid orders are below their asymptotic values.","inputs":{"end_time":0.1,"finest":"200"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"orders","path":"/rows/4/2","approx":{"value":0.491,"atol":0.01}}
+//|       - {"artifact":"orders","path":"/rows/4/4","approx":{"value":0.653,"atol":0.01}}
+//|       - {"artifact":"orders","path":"/rows/4/6","approx":{"value":0.688,"atol":0.01}}
+//|       - {"artifact":"orders","path":"/rows/0/2","equals":null}
+//|   - case: short
+//|     expect:
+//|       - {"artifact":"orders","path":"/rows/3/0","equals":200}
+//|       - {"artifact":"orders","path":"/rows/3/2","approx":{"value":0.495,"atol":0.01}}
+use scioxide_core::RealScalar;
+use scioxide_pde::ConservationReconstruction;
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let finest: usize = finest.parse().map_err(|_| "Invalid cell count")?;
+let sizes: Vec<usize> = (0..)
+    .map(|k| 25 << k)
+    .take_while(|&n| n <= finest)
+    .collect();
+let methods = [
+    ("Constant", ConservationReconstruction::Constant),
+    ("minmod", ConservationReconstruction::Minmod),
+    ("MC", ConservationReconstruction::MonotonizedCentral),
+];
+let mut errors = vec![Vec::new(); methods.len()];
+for &n in &sizes {
+    for (k, &(_, reconstruction)) in methods.iter().enumerate() {
+        errors[k].push(advect(reconstruction, 0.0, false, n, end_time)?.error);
+    }
+}
+let order = |e: &[f64], i: usize| (i > 0).then(|| RealScalar::log2(e[i - 1] / e[i]));
+let rows: Vec<_> = sizes
+    .iter()
+    .enumerate()
+    .map(|(i, &n)| {
+        let [c, m, mc] = [&errors[0], &errors[1], &errors[2]];
+        (n, c[i], order(c, i), m[i], order(m, i), mc[i], order(mc, i))
+    })
+    .collect();
+let columns = serde_json::json!([
+    { "key": "0", "label": "Cell count N", "type": "integer" },
+    { "key": "1", "label": "Constant L¹ error [-]", "type": "number", "format": sci3 },
+    { "key": "2", "label": "Constant order [-]", "type": "number", "format": fixed2, "nullText": "—" },
+    { "key": "3", "label": "minmod L¹ error [-]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "minmod order [-]", "type": "number", "format": fixed2, "nullText": "—" },
+    { "key": "5", "label": "MC L¹ error [-]", "type": "number", "format": sci3 },
+    { "key": "6", "label": "MC order [-]", "type": "number", "format": fixed2, "nullText": "—" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "orders" })
+);
+// Observations use markers joined by dotted lines; reference lines are dashed. Use a line chart because xy charts do not have a logarithmic x axis.
+let markers = ["circle", "diamond", "triangle"];
+let mut series: Vec<serde_json::Value> = methods
+    .iter()
+    .zip(&errors)
+    .zip(markers)
+    .map(|((&(name, _), e), symbol)| {
+        let points: Vec<[f64; 2]> = sizes.iter().zip(e).map(|(&n, &v)| [n as f64, v]).collect();
+        let style =
+            serde_json::json!({ "lineType": "dotted", "showSymbol": true, "symbol": symbol });
+        serde_json::json!({ "name": name, "style": style, "points": points })
+    })
+    .collect();
+for (name, slope) in [("Slope −1/2", 0.5), ("Slope −2/3", 2.0 / 3.0)] {
+    let points: Vec<[f64; 2]> = sizes
+        .iter()
+        .map(|&n| {
+            [
+                n as f64,
+                errors[0][0] * RealScalar::powf(25.0 / n as f64, slope),
+            ]
+        })
+        .collect();
+    let style = serde_json::json!({ "lineType": "dashed" });
+    series.push(serde_json::json!({ "name": name, "style": style, "points": points }));
+}
+emit_chart!(
+    serde_json::json!({
+        "kind": "line",
+        "xLabel": "Cell count N",
+        "yLabel": "L¹ error [-]",
+        "xType": "log",
+        "yType": "log",
+        "dataZoom": true,
+        "tooltip": true,
+        "series": series
+    }),
+    metadata = serde_json::json!({ "id": "convergence" })
+);
+```
+
+At the defaults ($T = 0.5$, at most 400 cells), the observed orders at $N = 400$ are 0.49 for constant reconstruction, 0.65 for minmod, and 0.69 for MC, close to the theoretical $1/2$ and $2/3$.
+Even with second-order reconstruction, the $L^1$ error does not decrease as $h^2$; spreading of the discontinuity determines convergence.
+For the same $N$, MC's error is about one fifth of constant reconstruction's, so second-order reconstruction achieves the same accuracy with fewer cells even for discontinuous problems.
+Coarse-grid orders ($N = 25 \to 50$) are 0.3–0.44 and have not reached their asymptotic values.
+
+## Barth–Jespersen reconstruction on triangular meshes
+
+The next cell divides the unit square into $n \times n$ squares, splits each along a diagonal into two triangles, and evaluates the residual of linear advection with velocity $(\cos\theta, \sin\theta)$ once on this mesh.
+The initial value is 1 inside the circle centered at $(0.5, 0.5)$ with radius 0.25 and 0 outside; all exterior boundary states are 0.
+For constant and Barth–Jespersen reconstruction, it compares `ConservationReport` values, the range after one forward Euler stage at the maximum step, and the total balance $\sum_K |K|\,r_K + (\text{boundary\_flux})$.
+$r_K$ is the residual returned by `residual_into`.
+
+```rust
+//| id: pde-conservation-simplex-limiter
+//| ref: pde-conservation-simplex-limiter
+//| title: "Compare constant and Barth–Jespersen reconstruction reports on a triangular mesh"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-pde, scioxide-spatial]
+//| inputs:
+//|   divisions: {"type":"select","label":"Divisions per side n","options":["8","16","32"],"value":"16"}
+//|   angle: {"type":"range","label":"Advection direction θ [deg]","min":0,"max":90,"step":15,"value":30}
+//| cases:
+//|   - {"id":"fine","label":"n = 32","description":"More cells are limited, but rank deficiency remains confined to the triangles at two corners.","inputs":{"divisions":"32"}}
+//|   - {"id":"axis","label":"θ = 0°","description":"For x-directed advection, Δt_max = 0.45 × (h²/2)/(2h) = 0.45h/4.","inputs":{"angle":0}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"reports","path":"/rows/0/1","approx":{"value":0.00811898816,"rtol":1e-8}}
+//|       - {"artifact":"reports","path":"/rows/1/2","equals":54}
+//|       - {"artifact":"reports","path":"/rows/1/3","equals":2}
+//|       - {"artifact":"reports","path":"/rows/0/3","equals":0}
+//|       - {"artifact":"reports","path":"/rows/1/4","range":{"min":-1e-14}}
+//|       - {"artifact":"reports","path":"/rows/1/5","range":{"max":1.00000000000001}}
+//|       - {"artifact":"reports","path":"/rows/1/6","range":{"max":1e-14}}
+//|   - case: fine
+//|     expect:
+//|       - {"artifact":"reports","path":"/rows/1/3","equals":2}
+//|       - {"artifact":"reports","path":"/rows/1/2","equals":108}
+//|   - case: axis
+//|     expect:
+//|       - {"artifact":"reports","path":"/rows/0/1","approx":{"value":0.00703125,"rtol":1e-12}}
+use scioxide_core::{ExecutionContext, NumericScalar, RealScalar};
+use scioxide_pde::{ConservationBoundary, ConservationOptions, ConservationReconstruction};
+use scioxide_pde::{Godunov, LinearAdvection, SimplexConservationPlan};
+use scioxide_spatial::{CellField, Point, SimplexBoundaryTags, TriangleMesh};
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed4 = serde_json::json!({ "fractionDigits": 4 });
+let n: usize = divisions.parse().map_err(|_| "Invalid division count")?;
+let points = (0..=n)
+    .flat_map(|j| (0..=n).map(move |i| Point::new([i as f64 / n as f64, j as f64 / n as f64])))
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(|e| e.to_string())?;
+// Split square (a, b, c, d) into two triangles along diagonal a–c.
+let triangles: Vec<[usize; 3]> = (0..n)
+    .flat_map(|j| {
+        (0..n).flat_map(move |i| {
+            let a = j * (n + 1) + i;
+            [[a, a + 1, a + n + 2], [a, a + n + 2, a + n + 1]]
+        })
+    })
+    .collect();
+let theta = angle * <f64 as RealScalar>::PI / 180.0;
+let law = LinearAdvection {
+    velocity: [RealScalar::cos(theta), RealScalar::sin(theta)],
+};
+let mut rows = Vec::new();
+for (name, reconstruction) in [
+    ("Constant", ConservationReconstruction::Constant),
+    (
+        "Barth–Jespersen",
+        ConservationReconstruction::BarthJespersen,
+    ),
+] {
+    let mesh =
+        TriangleMesh::new(points.clone(), triangles.clone()).map_err(|e| e.to_string())?;
+    let entries = mesh.boundary_faces().map(|face| (face, 0)).collect();
+    let tags = SimplexBoundaryTags::new(&mesh, entries).map_err(|e| e.to_string())?;
+    let conditions = vec![(0, ConservationBoundary::exterior(|_, _| Ok([0.0])))];
+    let options = ConservationOptions::new().with_reconstruction(reconstruction);
+    let plan = SimplexConservationPlan::with_options(mesh, &tags, conditions, options)
+        .map_err(|e| e.to_string())?;
+    let field = CellField::from_fn(plan.mesh(), |k| {
+        let [x, y] = plan.centers()[k];
+        [if (x - 0.5) * (x - 0.5) + (y - 0.5) * (y - 0.5) < 0.0625 {
+            1.0
+        } else {
+            0.0
+        }]
+    })
+    .map_err(|e| e.to_string())?;
+    let mut residual = vec![[0.0]; plan.volumes().len()];
+    let mut workspace = plan.workspace().map_err(|e| e.to_string())?;
+    let report = plan
+        .residual_into(
+            &law,
+            &Godunov,
+            0.0,
+            field.view(),
+            &mut residual,
+            &mut workspace,
+            ExecutionContext::sequential(),
+        )
+        .map_err(|e| e.to_string())?;
+    let dt = report.maximum_step().ok_or("Zero wave speed gives no limit")?;
+    let updated: Vec<f64> = field
+        .values()
+        .iter()
+        .zip(&residual)
+        .map(|(u, r)| u[0] + dt * r[0])
+        .collect();
+    let low = updated.iter().copied().fold(f64::INFINITY, f64::min);
+    let high = updated.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let total: f64 = residual
+        .iter()
+        .zip(plan.volumes())
+        .map(|(r, v)| r[0] * v)
+        .sum();
+    let balance = NumericScalar::abs(total + report.boundary_flux()[0]);
+    rows.push((
+        name,
+        dt,
+        report.limited_cells(),
+        report.rank_deficient_cells(),
+        low,
+        high,
+        balance,
+    ));
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "Reconstruction" },
+    { "key": "1", "label": "Δt_max [-]", "type": "number", "format": sci3 },
+    { "key": "2", "label": "Limited cells [count]", "type": "integer" },
+    { "key": "3", "label": "Rank-deficient cells [count]", "type": "integer" },
+    { "key": "4", "label": "Minimum after one stage [-]", "type": "number", "format": fixed4 },
+    { "key": "5", "label": "Maximum after one stage [-]", "type": "number", "format": fixed4 },
+    { "key": "6", "label": "Total balance remainder [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "reports" })
+);
+```
+
+At the defaults ($n = 16$, $\theta = 30^\circ$), both reconstructions have $\Delta t_{\max}$ equal to $8.12 \times 10^{-3}$.
+The CFL limit depends on face wave speeds, which are independent of state for linear advection, so changing reconstruction leaves the limit unchanged.
+Barth–Jespersen limited gradients in 54 cells, and 2 cells were rank deficient.
+These are the triangles at the lower-right and upper-left corners, each with two exterior edges and only one neighbor.
+After one forward Euler stage, both reconstructions remain within $[0, 1]$, and the total balance remainder is $2 \times 10^{-17}$, confirming discrete conservation within roundoff.
+
+## Summary
+
+Second-order reconstruction obtains face values from linear distributions, using minmod or MC on structured grids and weighted least-squares gradients with Barth–Jespersen limiting on simplex meshes.
+For every reconstruction, `scioxide-pde` keeps face values within the range of the cell average, neighboring cell averages, and exterior states, repeatedly halving gradients if inadmissible face values occur.
+Thus, even with prescribed inflow or zero exterior boundary states, scalar advection solutions stay within the initial and boundary value range at every accepted step.
+For discontinuous solutions, the $L^1$ error decreases approximately as $h^{1/2}$ with constant reconstruction and $h^{2/3}$ with second-order reconstruction; compare grid-refinement results against these orders.
+`limited_cells` and `rank_deficient_cells` report how many gradients were limited and how many cells could not use least squares at each residual evaluation.
+
+## Further reading
+
+- [CFL conditions and time integration for conservation laws](../conservation-time-integration/) derives the step limit $\Delta t_{\max}$ used here and explains rejection of trials by admissibility checks.
+- [Conservation laws and numerical fluxes](../conservation-laws/) examines the properties of numerical fluxes receiving reconstructed face values.
+- [Multidimensional finite-volume methods](../multidimensional-finite-volumes/) compares plans for linear diffusion and advection with the nonlinear conservation-law plans on this page.
+- [Shocks and Riemann solutions of the Burgers equation](../../examples/burgers-riemann/) examines how reconstruction affects shocks and rarefactions with a nonlinear flux.

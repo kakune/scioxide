@@ -1,0 +1,506 @@
+---
+title: 大きな作用素の少数の固有対
+description: Krylov–Schur 法と厚い再始動 Lanczos 法による少数の固有対、最小・内部の固有値を大きさ最大の問題に変えるシフト反転、前処理付き LOBPCG による Hermitian 定値の組の端の固有対を PartialSpectrumSolver と LobpcgSolver で求め、残差による受理、部分結果、終了理由を確かめる。
+sidebar:
+  order: 380
+references:
+  linalg-krylov-schur-lanczos: "krylovschur-法と厚い再始動-lanczos-法"
+  linalg-partial-spectrum-settings: "partialspectrumsolver-の設定結果レポート"
+  linalg-preconditioned-block-iteration: "前処理付きのブロック反復"
+  linalg-shift-invert: "シフト反転"
+---
+
+大きな疎行列や行列を作らない作用素では、固有分解全体ではなく、大きさが最大の数個や最小の数個の固有対だけが要ることが多い。
+振動の低い固有振動数、Markov 連鎖の混合の速さを決める第 2 固有値、量子系の基底状態はその例である。
+このページは作用素の積だけを使ってそれらを求める `PartialSpectrumSolver` と `LobpcgSolver` を説明する。
+手法オブジェクト、作業領域の要件、所有値を返す API と出力先を指定する API、終了理由 `SpectralTermination` の共通の規約は[行列関数のベクトルへの適用と手法オブジェクト](oxref:linalg-action-conventions)にある。
+
+---
+
+## 部分スペクトル
+
+### Krylov–Schur 法と厚い再始動 Lanczos 法
+
+`PartialSpectrumSolver` は $n \times n$ の作用素 $A$ の固有対を `count` 個だけ求める。
+各周期は Arnoldi 基底を次元 $m$ まで伸ばし（最初の周期は開始ベクトルから、以後は前の周期で残したベクトルから）、射影した $m \times m$ の小さな行列の Ritz 対（射影した問題の固有対から作る近似固有対）を求めてから再始動する。
+基底の直交化は古典 Gram–Schmidt 法で、ノルムが $1/\sqrt 2$ 倍より小さくなったときにもう一度直交化する（Daniel、Gragg、Kaufman、Stewart、1976）。
+再始動の仕方は作用素の構造で分かれる。
+
+- 一般の作用素には Krylov–Schur 法（Stewart、2001）を使う。
+  射影した行列の Schur 形を、求める Ritz 値が先頭に来るように並べ替え、その不変部分空間を残す。
+- `OperatorStructure::Hermitian` を指定した作用素には厚い再始動 Lanczos 法（Wu と Simon、2000）を使う。
+  求める Ritz ベクトルを、残差との結合の係数とともに残す。
+
+再始動で残すベクトルは $\max(\text{count}, d/2)$ 本、ただし $d - 2$ 本以下である（$d$ は到達した基底の次元）。
+許容誤差をすでに満たした対は先頭に残し、後の周期でも検査し直す。
+1 周期の計算コストは約 $m - (\text{残した本数})$ 回の積、直交化の $O(nm^2)$、射影した固有値問題の $O(m^3)$ である。
+
+Ritz 対は作用素との新しい積から計算した残差だけで受理する。
+この検査は最初と最後の周期、基底が不変になったとき、求める対のどれかについて Arnoldi の推定 $\beta \lvert e_m^{\mathsf T} y \rvert$ が許容誤差を満たした周期に行う（$y$ は射影した行列の固有ベクトル、$\beta$ は基底を伸ばしたときの最後の副対角成分）。
+Hermitian の場合は、同じ積から Ritz 値を Rayleigh 商 $x^{\mathsf H}Ax / x^{\mathsf H}x$ として計算し直す（シフト反転では変換した作用素の Rayleigh 商）。
+Hermitian の仮定は射影した行列ごとに確かめ、要素の丸め誤差と許容誤差を超えて非対称なら `InvalidInput`（`Inconsistent`）で止まる。
+
+Hermitian の場合、再始動しない Krylov 部分空間 $\mathcal K_m$ での収束の速さは Kaniel、Paige、Saad の理論で見積もれる。
+最大の固有値 $\lambda_1 > \lambda_2 \ge \dots \ge \lambda_n$ の固有ベクトル $x_1$ と $\mathcal K_m$ のなす角は
+
+```text
+tan ∠(x₁, 𝒦ₘ) ≤ tan ∠(x₁, v) / T_{m−1}(1 + 2γ),   γ = (λ₁ − λ₂) / (λ₂ − λₙ)
+```
+
+で抑えられる（$v$ は開始ベクトル、$T_{m-1}$ は次数 $m - 1$ の Chebyshev 多項式。
+Saad、1980）。
+最小の固有値には、順序を逆にした同じ式が当てはまる。
+$\gamma$ が小さいときは $T_{m-1}(1 + 2\gamma) \approx \tfrac12 e^{2(m-1)\sqrt\gamma}$ なので、上界は 1 次元あたり $e^{-2\sqrt\gamma}$ 倍ほどしか減らない。
+この上界は $\gamma$ と開始ベクトルだけで決まる最悪の場合の見積もりで、実際の収束がもっと速いこともある。
+それでも、求める固有値と次の固有値の間隔がスペクトルの幅に比べて狭いと、端の固有値でも収束に多くの周期を要する。
+
+### PartialSpectrumSolver の設定・結果・レポート
+
+`PartialSpectrumSolver::new(count)` の既定は基底の次元 30（`with_basis`）、作用の回数 10 万回まで（残差の検査を含む）、許容誤差 $\tau_{\mathrm{abs}} = \tau_{\mathrm{rel}} = \sqrt{\varepsilon}$（`with_tolerance` に `ResidualTolerance` を渡す）、選択 `LargestMagnitude`、構造 `General` である。
+基底の次元は `count + 2` 以上でなければならず（次元が $n$ 以上なら制限はない）、満たさない設定は `InvalidInput`（`Inconsistent`）、`count` が $n$ を超える設定は `InvalidInput`（`OutOfRange`）として、要件を求める段階で拒否される。
+受理の判定は、$\lVert x \rVert_2 = 1$ の Ritz 対 $(\lambda, x)$ に対して
+
+```text
+‖A x − λ x‖₂ ≤ τ_abs + τ_rel ‖A x‖₂
+```
+
+である。
+`SpectrumSelection` は大きさ最大（`LargestMagnitude`）、大きさ最小（`SmallestMagnitude`）、実部最小（`SmallestReal`）、実部最大（`LargestReal`）のどれを求めるかと結果の順序を選び、同じ値は虚部の小さい順に並ぶ。
+実行オプションの反復の上限は再始動の周期を数え（既定 100 周期）、射影した小さな固有値問題はそれとは別に、反復の上限なしで解く。
+
+呼び出しは所有値を返す API `solve(op, initial)` か出力先を指定する API `solve_into(op, initial, &mut buffer, &mut workspace, cx)` で、`op` には作用素の参照（`Direct` に変換される）か `SpectrumOperator` を渡す。
+開始ベクトル `initial` は長さ $n$ の 0 でないベクトルで、0 なら `InvalidInput`（`OutOfRange`）になる。
+結果の `PartialSpectrumBuffer`（出力先を指定する API では `PartialSpectrumBuffer::new(n, count)` で用意する）は、実の作用素でも複素数の Ritz 値 `eigenvalues()` と、2 ノルムが 1 の Ritz ベクトルを列に持つ `eigenvectors()`、新しい積から計算した残差 `residuals()` を、選択の順に持つ。
+バッファーには求めた数より少ない対しか入らないことがあり、すべての対が許容誤差を満たすのは `Converged` のときだけである。
+上限や取り消しで止まったときは、残差を計算した直近の対が入り、0 個のこともある。
+レポート `PartialSpectrumReport` は終了理由、残差の検査を含む作用の回数 `applications()`、返した対を計算した周期の番号 `cycles()`（1 から数え、対がなければ 0）を持つ。
+作業領域 `PartialSpectrumWorkspace` は $O(nm + m^2)$ のスカラーを持ち、要件 `PartialSpectrumRequirements` で事前確保する。
+
+### シフト反転
+
+最小や内部の固有値には、`SpectrumOperator::ShiftInvert { a, inverse, mass, shift }` を使う。
+シフト $\sigma$ に対して $(A - \sigma M)^{-1}M$ の積から Krylov 部分空間を作ると、方法が見る固有値は $\theta = 1/(\lambda - \sigma)$ で、選択も $\theta$ に対して働く。
+したがって `LargestMagnitude` は $\sigma$ に最も近い固有値を求め、各 Ritz 値は $\lambda = \sigma + 1/\theta$ で元に戻す。
+`mass` を `None` にすると $M = I$ で、標準の固有値問題 $Ax = \lambda x$ になる。
+Krylov 基底は Euclid 内積で正規直交なので、Hermitian な $A$、$M$ と実数の $\sigma$ でも $(A - \sigma M)^{-1}M$ が Hermitian になるのは $M$ が $A$ と可換な場合（$M = I$ など）だけである。
+それ以外の質量行列では `OperatorStructure::General` を選び、`Hermitian` を指定すると `InvalidInput`（`Inconsistent`）で止まる。
+逆作用素 `inverse` は呼び出し側が分解とその解き方を選んで用意し、`shift` はその逆作用素が使ったシフトである。
+`M` の積と逆作用素の作用は合わせて 1 回の作用と数える。
+残差は $A$ と $M$ そのもので計算し、判定は $\lVert Ax - \lambda Mx \rVert_2 \le \tau_{\mathrm{abs}} + \tau_{\mathrm{rel}} \max(\lVert Ax \rVert_2, \lvert\lambda\rvert \lVert Mx \rVert_2)$ である。
+変換後の Ritz 値が 0 になると $\lambda$ に戻せないので、`NumericalInstability`（`Breakdown`）で止まる。
+
+例として、一次元ラプラシアン $A = \operatorname{tridiag}(-1, 2, -1)/h^2$（$h = 1/(n+1)$ m）の小さい方の固有値を求める。
+閉じた形は $\lambda_j = \tfrac{4}{h^2}\sin^2\tfrac{j\pi h}{2}$、固有ベクトルは $\sin(j\pi x_i)$ である。
+$n = 100$ の最小の固有値では $\gamma = (\lambda_2 - \lambda_1)/(\lambda_n - \lambda_2) \approx 7 \times 10^{-4}$ と小さく、上界は 1 次元あたり $e^{-2\sqrt\gamma} \approx 0.95$ 倍にしか減らない。
+$A^{-1}$ では最小の固有値が大きさ最大の $1/\lambda_1 \approx 0.10$ になり、次の $1/\lambda_2 \approx 0.025$ との $\gamma$ は約 3.0 と大きい。
+$T_{m-1}(7) \approx \tfrac12 (7 + \sqrt{48})^{m-1}$ なので、上界は 1 次元あたり約 1/14 倍に減る。
+
+次の定義のブロックはこの例を二つのセルで共有する。
+`laplacian` が三重対角の $A$ と、逆作用素に使う密な Cholesky 分解、`exact_eigenvalue` が閉じた形、`compare` が得た値を閉じた形と比べる検算、`termination_name` が終了理由の名前に対応する。
+
+```rust
+//| id: linalg-laplacian-model
+//| kind: definitions
+//| title: 一次元ラプラシアンと閉じた形の固有値
+//| crates: [scioxide-core, scioxide-linalg]
+use scioxide_core::SciOxideError;
+use scioxide_linalg::{
+    CholeskyDecomposition, CholeskyPivoting, HermitianInput, Matrix, SpectralTermination,
+    TridiagonalMatrix,
+};
+
+/// A = tridiag(−1, 2, −1)/h²（h = 1/(n + 1)）の三重対角の形と、密な形の Cholesky 分解。
+pub(crate) fn laplacian(
+    n: usize,
+) -> Result<(TridiagonalMatrix<f64>, CholeskyDecomposition<f64>), SciOxideError> {
+    let s = ((n + 1) as f64).powi(2);
+    let tridiagonal = TridiagonalMatrix::new(vec![-s; n - 1], vec![2.0 * s; n], vec![-s; n - 1])?;
+    let mut dense = Matrix::zeros(n, n)?;
+    for (idx, value) in dense.as_mut_slice().iter_mut().enumerate() {
+        let (i, j) = (idx / n, idx % n);
+        *value = if i == j {
+            2.0 * s
+        } else if i.abs_diff(j) == 1 {
+            -s
+        } else {
+            0.0
+        };
+    }
+    let factor =
+        CholeskyDecomposition::factor(&dense, HermitianInput::Exact, CholeskyPivoting::None)?;
+    Ok((tridiagonal, factor))
+}
+
+/// 閉じた形 λⱼ = (4/h²) sin²(jπh/2)（参照値。f64 の標準関数）。
+pub(crate) fn exact_eigenvalue(n: usize, j: usize) -> f64 {
+    let h = 1.0 / (n + 1) as f64;
+    4.0 / (h * h) * (0.5 * j as f64 * std::f64::consts::PI * h).sin().powi(2)
+}
+
+/// 昇順に並べた値の最小値と、λ_first, λ_first+1, … との相対差の最大（値がなければ None）。
+pub(crate) fn compare(values: &[f64], n: usize, first: usize) -> (Option<f64>, Option<f64>) {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let error = sorted
+        .iter()
+        .enumerate()
+        .map(|(j, &v)| {
+            let exact = exact_eigenvalue(n, first + j);
+            (v - exact).abs() / exact
+        })
+        .reduce(f64::max);
+    (sorted.first().copied(), error)
+}
+
+/// 終了理由を列挙子の名前にする。
+pub(crate) fn termination_name(termination: SpectralTermination) -> &'static str {
+    match termination {
+        SpectralTermination::Converged => "Converged",
+        SpectralTermination::EvaluationLimit => "EvaluationLimit",
+        SpectralTermination::IterationLimit => "IterationLimit",
+        SpectralTermination::InvariantSubspace => "InvariantSubspace",
+        SpectralTermination::AccuracyLimit => "AccuracyLimit",
+        SpectralTermination::ExecutionStopped(_) => "ExecutionStopped",
+    }
+}
+```
+
+次のセルは小さい方から $k$ 個の固有値を、`SmallestMagnitude` で直接求める方法と、$\sigma = 0$ のシフト反転とで、どちらも厚い再始動 Lanczos 法の所有値を返す API `solve` で求める。
+入力は次数 $n \in [20, 200]$、個数 $k \in [1, 6]$、基底の次元 $m \in [8, 40]$ である。
+表は各方法の終了理由、得た固有値の数、作用の回数、返した対の周期、最小の固有値、閉じた形との相対差の最大、残差の最大を示し、もう一つの表は閉じた形の $\lambda_1, \dots, \lambda_k$ である。
+シフト反転の逆作用素は $A$ の密な Cholesky 分解の `inverse_operator()` で、作用ごとに三角系を二回解く。
+
+```rust
+//| id: linalg-shift-invert-spectrum
+//| ref: linalg-shift-invert-spectrum
+//| title: シフト反転による最小固有値の部分スペクトル
+//| run: button
+//| uses: [linalg-laplacian-model]
+//| crates: [scioxide-core, scioxide-linalg]
+//| inputs:
+//|   points: {"type":"range","label":"次数 n","description":"一次元ラプラシアンの次数。格子幅 h = 1/(n + 1) m。","min":20,"max":200,"step":10,"value":100}
+//|   count: {"type":"range","label":"求める固有値の数 k","description":"小さい方から k 個。","min":1,"max":6,"step":1,"value":3}
+//|   basis: {"type":"range","label":"基底の次元 m","description":"with_basis に渡す値（既定 30）。","min":8,"max":40,"step":1,"value":30}
+//| cases:
+//|   - {"id":"small-basis","label":"m = 8","description":"直接の方法が再始動の上限 100 周期で止まり、出力に反映された対は許容誤差を超える。","inputs":{"basis":8}}
+//|   - {"id":"large-order","label":"n = 200","description":"直接の方法の周期が増え、シフト反転は 1 周期のまま。","inputs":{"points":200}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"spectrum","path":"/rows/0/1","equals":"Converged"}
+//|       - {"artifact":"spectrum","path":"/rows/1/1","equals":"Converged"}
+//|       - {"artifact":"spectrum","path":"/rows/1/3","approx":{"value":33,"atol":3}}
+//|       - {"artifact":"spectrum","path":"/rows/1/5","approx":{"value":9.8688086789,"rtol":1e-9}}
+//|       - {"artifact":"spectrum","path":"/rows/1/6","range":{"max":1e-12}}
+//|       - {"artifact":"exact","path":"/rows/0/1","approx":{"value":9.8688086789,"rtol":1e-9}}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+//|   - case: small-basis
+//|     expect:
+//|       - {"artifact":"spectrum","path":"/rows/0/1","equals":"IterationLimit"}
+//|       - {"artifact":"spectrum","path":"/rows/0/4","equals":100}
+//|       - {"artifact":"spectrum","path":"/rows/0/7","range":{"min":1e-3}}
+//|       - {"artifact":"spectrum","path":"/rows/1/6","range":{"max":1e-12}}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+//|   - case: large-order
+//|     expect:
+//|       - {"artifact":"spectrum","path":"/rows/1/4","equals":1}
+//|       - {"artifact":"spectrum","path":"/rows/1/6","range":{"max":1e-12}}
+//|       - {"artifact":"exact","path":"/rows/0/1","approx":{"value":9.8694034814,"rtol":1e-9}}
+use scioxide_core::Budget;
+use scioxide_linalg::{
+    OperatorStructure, PartialSpectrumSolver, SpectralTermination, SpectrumOperator,
+    SpectrumSelection,
+};
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let sig11 = serde_json::json!({ "significantDigits": 11 });
+let (n, k) = (points.round() as usize, count.round() as usize);
+let (matrix, factor) = laplacian(n).map_err(|e| e.to_string())?;
+let a = matrix.view();
+let inverse = factor.inverse_operator();
+let initial: Vec<f64> = (0..n).map(|i| 1.0 + ((i * 7) % 5) as f64 / 10.0).collect();
+let lanczos = PartialSpectrumSolver::new(k)
+    .with_structure(OperatorStructure::Hermitian)
+    .with_basis(Budget::try_from(basis.round() as usize).map_err(|e| e.to_string())?);
+let mut rows = Vec::new();
+let mut summary = (SpectralTermination::Converged, 0, None);
+for shift_invert in [false, true] {
+    // シフト反転では (A − σI)⁻¹ の大きさ最大の固有値が σ に最も近い固有値に当たる。
+    let (method, op, selection) = if shift_invert {
+        let op = SpectrumOperator::ShiftInvert {
+            a: &a,
+            inverse: &inverse,
+            mass: None,
+            shift: 0.0,
+        };
+        ("シフト反転 σ = 0", op, SpectrumSelection::LargestMagnitude)
+    } else {
+        (
+            "最小の大きさを直接",
+            SpectrumOperator::Direct(&a),
+            SpectrumSelection::SmallestMagnitude,
+        )
+    };
+    let (output, report) = lanczos
+        .with_selection(selection)
+        .solve(op, &initial[..])
+        .map_err(|e| e.to_string())?;
+    let values: Vec<f64> = output.eigenvalues().iter().map(|z| z.re).collect();
+    let (smallest, error) = compare(&values, n, 1);
+    if shift_invert {
+        summary = (report.termination(), report.applications(), error);
+    }
+    rows.push((
+        method,
+        termination_name(report.termination()),
+        values.len(),
+        report.applications(),
+        report.cycles(),
+        smallest,
+        error,
+        output.residuals().iter().copied().reduce(f64::max),
+    ));
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "方法" },
+    { "key": "1", "label": "終了理由" },
+    { "key": "2", "label": "得た固有値 [個]", "type": "integer" },
+    { "key": "3", "label": "作用の回数 [回]", "type": "integer" },
+    { "key": "4", "label": "対を計算した周期", "type": "integer" },
+    { "key": "5", "label": "最小の固有値 [m⁻²]", "type": "number", "format": sig11, "nullText": "なし" },
+    { "key": "6", "label": "閉じた形との相対差の最大 [-]", "type": "number", "format": sci3, "nullText": "なし" },
+    { "key": "7", "label": "残差の最大 [m⁻²]", "type": "number", "format": sci3, "nullText": "なし" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "spectrum" })
+);
+let exact_columns = serde_json::json!([
+    { "key": "0", "label": "j", "type": "integer" },
+    { "key": "1", "label": "閉じた形 λⱼ [m⁻²]", "type": "number", "format": sig11 }
+]);
+let exact_rows: Vec<(usize, f64)> = (1..=k).map(|j| (j, exact_eigenvalue(n, j))).collect();
+emit_table_with_columns!(
+    exact_columns,
+    exact_rows,
+    metadata = serde_json::json!({ "id": "exact" })
+);
+
+let (termination, applications, error) = summary;
+let outcome = match termination {
+    SpectralTermination::Converged => {
+        Outcome::satisfied("シフト反転の k 個の対が残差の検査に通った")
+    }
+    SpectralTermination::AccuracyLimit => {
+        Outcome::failed("シフト反転の対が精度の検査に通らなかった")
+    }
+    _ => Outcome::partial("シフト反転が上限で止まり、出力に反映された対は許容誤差を超えうる"),
+};
+let mut outcome = outcome.status(termination_name(termination)).diagnostic(
+    "シフト反転の作用の回数",
+    applications as f64,
+    None,
+);
+if let Some(error) = error {
+    outcome = outcome.diagnostic("閉じた形との相対差の最大", error, None);
+}
+emit_outcome!(outcome);
+```
+
+既定の $n = 100$、$k = 3$、$m = 30$ では、どちらの方法も 3 個の固有値を `Converged` で返す。
+直接の方法は第 9 周期（8 回の再始動）までに 159 回の作用を要し、シフト反転は第 1 周期の 33 回で済む。
+閉じた形との相対差は直接の方法で $1.8 \times 10^{-16}$、シフト反転で $1.3 \times 10^{-14}$ である。
+最小の固有値 $\lambda_1 = 9.8688086789$ m⁻² と連続問題の固有値 $\pi^2 \approx 9.8696$ m⁻² の差 $8.0 \times 10^{-4}$ m⁻² は、二階差分の離散化誤差の主要項 $\pi^4h^2/12$ に一致する。
+直接の手法オブジェクトは同じ積から計算し直した $A$ の Rayleigh 商だが、シフト反転の値は変換した問題の Ritz 値 $\theta$ から $\lambda = \sigma + 1/\theta$ で戻した値で、$\theta$ には Cholesky 分解による求解の丸め誤差が含まれる。
+相対差がシフト反転でやや大きいのはこの違いによるもので、残差の最大はシフト反転の方が小さい（$1.3 \times 10^{-11}$ m⁻² と $5.4 \times 10^{-9}$ m⁻²）。
+$n = 200$ では直接の方法が第 20 周期・333 回に増える一方、シフト反転は第 1 周期・33 回のままである。
+
+基底の次元を $m = 8$ に下げると、直接の方法は再始動のたびに残せる情報が少なくなり、100 周期の上限で `IterationLimit` になる。
+このとき返された 3 個の対の残差の最大は $0.56$ m⁻² で、許容誤差（$\lambda_3$ でおよそ $1.3 \times 10^{-6}$ m⁻²）を大きく超え、相対差も $8.6 \times 10^{-6}$ にとどまる。
+終了理由を読まずにこの値を使うと、5 桁ほどしか正しくない固有値を受け取ることになる。
+同じ $m = 8$ でもシフト反転は第 3 周期・25 回で収束する。
+シフト反転の計算コストは逆作用素の準備で、ここでは密な Cholesky 分解の $n^3/3$ 回の演算と、作用ごとの $2n^2$ 回の三角系の求解である。
+
+## LOBPCG
+
+### 前処理付きのブロック反復
+
+`LobpcgSolver` は一般化固有値問題 $Ax = \lambda Bx$（$A$ は Hermitian、$B$ は Hermitian 正定値で既定は単位行列）の、代数的に最小か最大の固有対を、局所最適なブロック前処理付き共役勾配法（LOBPCG、Knyazev、2001）で求める。
+各反復は現在のブロック $X$、前処理した残差 $TR$、前の探索方向 $P$ を、再直交化つきの古典 Gram–Schmidt 法で制約 $Y$ と互いに $B$ 直交にしてから、その張る空間で Rayleigh–Ritz 法を使う。
+射影した固有値問題の次数はブロック幅 $k$ に対して $3k$ 以下で、`HermitianEigenDecomposition` で解く。
+$A$ と $B$ は $TR$ と $P$ の新しい列を正規化して $B$ 直交にした後で作用させるので、その積には射影の桁落ちによる誤差が入らない。
+そのため 1 回の反復では $A$ を $2k$ 回、$B$ を（渡した場合）$2k$ 回、前処理を $k$ 回作用させる。
+$AX$ と $BX$ は Rayleigh–Ritz 法の更新から求め、最初の反復の後、50 反復ごと、見かけの収束時、上限に達したときに新しい積から計算し直し、受理はその新しい積による残差だけで判定する。
+Hermitian の仮定は射影した行列で確かめ、$v_i^{\mathsf H}Av_j$ と $\overline{v_j^{\mathsf H}Av_i}$ の差が $2\tau\alpha \lVert v_i \rVert_2 \lVert v_j \rVert_2$ を超えると `InvalidInput`（`Inconsistent`）で止まる。
+ここで $\tau = \max(\sqrt{\varepsilon}, n\varepsilon)$、$\alpha$ は試行基底の列 $v$ についての $\lVert Av \rVert_2 / \lVert v \rVert_2$ の最大である。
+この判定は $A$ の尺度に依らず、残差の許容誤差とも関係しないので、厳密に Hermitian な作用素は通り、試行基底の上で $\tau \lVert A \rVert_2$ 程度より大きい歪 Hermitian 部分を持つ作用素は止まる。
+前処理 $T$ は固有値問題を変えず、収束の速さだけを変える。
+
+作用素は `LobpcgOperator::new(&a)` で作り、`with_mass(&b)` で質量行列 $B$、`with_preconditioner(&t)` で前処理 $T$（scioxide-core の `Preconditioner`）を加える。
+作用素の参照をそのまま渡すと、前処理のない標準の問題 $Ax = \lambda x$ になる。
+`LobpcgSolver::new(count)` の既定は最小の端（`LobpcgSelection::Smallest`。
+`Largest` も選べ、`SpectrumSelection` の大きさの順は受け付けない）、$A$・$B$・前処理の作用の合計 10 万回まで、許容誤差 $\tau_{\mathrm{abs}} = \tau_{\mathrm{rel}} = \sqrt{\varepsilon}$ で、受理の判定は $\lVert Ax - \lambda Bx \rVert_2 \le \tau_{\mathrm{abs}} + \tau_{\mathrm{rel}} \lVert Ax \rVert_2$ である。
+実行オプションの反復の上限は外側の反復を数え（既定 100 回）、Rayleigh–Ritz 法の小さな固有値問題は反復の上限なしで解く。
+
+呼び出しは所有値を返す API `solve(op, initial, constraints)` か出力先を指定する API `solve_into(op, initial, constraints, &mut buffer, &mut workspace, cx)` で、`initial` は $n \times k$、`constraints` は $n \times c$ の `BlockVectorView`（列を順に並べたメモリ領域）である。
+制約の列数 $c$ は呼び出しごとに読み、作業領域は `workspace(op, c)` で用意する。
+$k + c$ が $n$ を超えると `InvalidInput`（`OutOfRange`）で、数値的に従属な制約の列は捨てる。
+初期ブロックが制約と $B$ 直交にした後に線形従属になると `InvalidInput`（`Inconsistent`）、$B$ が探索部分空間で正定値でないと `DomainError` になる。
+結果の `LobpcgBuffer` は選んだ端から並べた実数の Ritz 値、$x^{\mathsf H}Bx = 1$ に正規化した Ritz ベクトル、残差 $\lVert Ax - \lambda Bx \rVert_2$ を持つ。
+上限や取り消しで止まったときは、新しい積で残差を計算し直した最後のブロックが入り、それがなければバッファーは空で `iterations()` は 0 になる。
+レポート `LobpcgReport` は終了理由、$A$・$B$・前処理の作用の回数 `applications()`、バッファーのブロックを計算した反復の番号 `iterations()` を持つ。
+作業領域 `LobpcgWorkspace` は $O(n(c + k))$ のスカラーを持ち、要件は `LobpcgRequirements` である。
+
+次のセルは同じラプラシアンの小さい方の固有対を LOBPCG の所有値を返す API で求める。
+入力は次数 $n$、ブロック幅 $k$、前処理 $T = A^{-1}$（前のセルと同じ Cholesky 分解の逆作用素）の有無、最小の固有ベクトル $\sin(\pi x_i)$ を制約に渡すかどうかである。
+制約を渡すと $\lambda_1$ の固有ベクトルと $B$ 直交な部分空間で解くので、得られる値は $\lambda_2, \dots, \lambda_{k+1}$ になるはずである。
+表は終了理由、作用の回数、反復の回数、最小の固有値、閉じた形との相対差の最大、残差の最大、Ritz ベクトルの正規化 $\max_j \lvert x_j^{\mathsf H}x_j - 1 \rvert$ を示す。
+
+```rust
+//| id: linalg-lobpcg-spectrum
+//| ref: linalg-lobpcg-spectrum
+//| title: 前処理と制約を持つ LOBPCG の最小固有対
+//| run: button
+//| uses: [linalg-laplacian-model]
+//| crates: [scioxide-core, scioxide-linalg]
+//| inputs:
+//|   points: {"type":"range","label":"次数 n","description":"一次元ラプラシアンの次数。格子幅 h = 1/(n + 1) m。","min":20,"max":200,"step":10,"value":100}
+//|   count: {"type":"range","label":"ブロック幅 k","description":"求める固有対の数。","min":1,"max":6,"step":1,"value":3}
+//|   precondition: {"type":"checkbox","label":"前処理 T = A⁻¹ を渡す","description":"外すと前処理のない LOBPCG になる。","value":true}
+//|   constrain: {"type":"checkbox","label":"sin(πx) を制約に渡す","description":"最小の固有ベクトルと直交な部分空間で解く。","value":false}
+//| cases:
+//|   - {"id":"no-preconditioner","label":"前処理なし","description":"外側の反復の上限 100 回で止まり、出力に反映されたブロックは許容誤差を満たさない。","inputs":{"precondition":false}}
+//|   - {"id":"constrained","label":"制約あり","description":"得られる値が λ₂ から始まる。","inputs":{"constrain":true}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"lobpcg","path":"/rows/0/0","equals":"Converged"}
+//|       - {"artifact":"lobpcg","path":"/rows/0/4","approx":{"value":9.8688086789,"rtol":1e-9}}
+//|       - {"artifact":"lobpcg","path":"/rows/0/5","range":{"max":1e-12}}
+//|       - {"artifact":"lobpcg","path":"/rows/0/7","range":{"max":1e-12}}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+//|   - case: no-preconditioner
+//|     expect:
+//|       - {"artifact":"lobpcg","path":"/rows/0/0","equals":"IterationLimit"}
+//|       - {"artifact":"lobpcg","path":"/rows/0/3","equals":100}
+//|       - {"artifact":"lobpcg","path":"/rows/0/5","range":{"min":1e-8,"max":1e-4}}
+//|       - {"path":"/outputs/1/state","equals":"partial"}
+//|   - case: constrained
+//|     expect:
+//|       - {"artifact":"lobpcg","path":"/rows/0/0","equals":"Converged"}
+//|       - {"artifact":"lobpcg","path":"/rows/0/4","approx":{"value":39.465687280,"rtol":1e-9}}
+//|       - {"artifact":"lobpcg","path":"/rows/0/5","range":{"max":1e-12}}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+use scioxide_core::BlockVectorView;
+use scioxide_linalg::{LobpcgOperator, LobpcgSolver, SpectralTermination};
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let sig11 = serde_json::json!({ "significantDigits": 11 });
+let (n, k) = (points.round() as usize, count.round() as usize);
+let (matrix, factor) = laplacian(n).map_err(|e| e.to_string())?;
+let a = matrix.view();
+let inverse = factor.inverse_operator();
+let pencil = if precondition {
+    LobpcgOperator::new(&a).with_preconditioner(&inverse)
+} else {
+    LobpcgOperator::new(&a)
+};
+// 初期ブロック n × k（列を順に並べる）は決定論的な準乱数で作る。
+let block: Vec<f64> = (0..n * k)
+    .map(|idx| ((idx as f64 + 1.0) * 0.618_033_988_75).fract() - 0.5)
+    .collect();
+// 制約は最小の固有ベクトル sin(πxᵢ) の 1 列か、0 列。
+let h = 1.0 / (n + 1) as f64;
+let mode: Vec<f64> = if constrain {
+    (1..=n)
+        .map(|i| (std::f64::consts::PI * i as f64 * h).sin())
+        .collect()
+} else {
+    Vec::new()
+};
+let (output, report) = LobpcgSolver::new(k)
+    .solve(
+        pencil,
+        BlockVectorView::new(&block, n, k).map_err(|e| e.to_string())?,
+        BlockVectorView::new(&mode, n, usize::from(constrain)).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+let first = if constrain { 2 } else { 1 };
+let (smallest, error) = compare(output.eigenvalues(), n, first);
+// 単位行列の質量では xᴴ B x = xᴴ x = 1 になるはずである（検算）。
+let vectors = output.eigenvectors();
+let normalization = (0..vectors.cols())
+    .map(|j| {
+        let norm2: f64 = (0..n)
+            .map(|i| vectors.get(i, j).map_or(0.0, |v| v * v))
+            .sum();
+        (norm2 - 1.0).abs()
+    })
+    .reduce(f64::max);
+
+let columns = serde_json::json!([
+    { "key": "0", "label": "終了理由" },
+    { "key": "1", "label": "得た固有値 [個]", "type": "integer" },
+    { "key": "2", "label": "作用の回数 [回]", "type": "integer" },
+    { "key": "3", "label": "ブロックの反復", "type": "integer" },
+    { "key": "4", "label": "最小の固有値 [m⁻²]", "type": "number", "format": sig11, "nullText": "なし" },
+    { "key": "5", "label": "閉じた形との相対差の最大 [-]", "type": "number", "format": sci3, "nullText": "なし" },
+    { "key": "6", "label": "残差の最大 [m⁻²]", "type": "number", "format": sci3, "nullText": "なし" },
+    { "key": "7", "label": "max |xᴴx − 1| [-]", "type": "number", "format": sci3, "nullText": "なし" }
+]);
+let row = (
+    termination_name(report.termination()),
+    output.eigenvalues().len(),
+    report.applications(),
+    report.iterations(),
+    smallest,
+    error,
+    output.residuals().iter().copied().reduce(f64::max),
+    normalization,
+);
+emit_table_with_columns!(
+    columns,
+    vec![row],
+    metadata = serde_json::json!({ "id": "lobpcg" })
+);
+
+let outcome = match report.termination() {
+    SpectralTermination::Converged => {
+        Outcome::satisfied("ブロックの k 個の対が残差の検査に通った")
+    }
+    SpectralTermination::AccuracyLimit => Outcome::failed("ブロックが精度の検査に通らなかった"),
+    _ => Outcome::partial("上限で止まり、出力に反映されたブロックは許容誤差を満たさない")
+        .explanation("前処理を渡すか、反復の上限を上げる。"),
+};
+emit_outcome!(
+    outcome
+        .status(termination_name(report.termination()))
+        .diagnostic("作用の回数", report.applications() as f64, None)
+        .diagnostic("反復", report.iterations() as f64, None)
+);
+```
+
+既定の $n = 100$、$k = 3$ で前処理 $T = A^{-1}$ を渡すと、LOBPCG は 11 回の反復で `Converged` になり、作用の回数は $A$ と前処理を合わせて 96 回である。
+閉じた形との相対差は $1.3 \times 10^{-14}$、残差の最大は $1.0 \times 10^{-6}$ m⁻² で、Ritz ベクトルは $\lvert x^{\mathsf H}x - 1 \rvert \le 4.4 \times 10^{-16}$ で正規化されている。
+残差に比べて固有値の誤差がずっと小さいのは、Hermitian の場合に Rayleigh 商の誤差が残差の 2 乗を固有値の間隔で割った程度になるためである。
+前処理を外すと、条件数 $\lambda_n/\lambda_1 \approx 4 \times 10^{3}$ の影響で収束が遅くなり、100 回の反復の上限で `IterationLimit` になる（作用 603 回、相対差 $1.0 \times 10^{-6}$、残差の最大 $0.26$ m⁻²）。
+作用の回数は反復ごとの $A$ の $2k = 6$ 回に 100 回の反復を掛けた値にほぼ等しい。
+$\sin(\pi x_i)$ を制約に渡すと、12 回の反復（作用 106 回）で $\lambda_2 = 39.465687280$ m⁻² から始まる 3 個の値が返り、閉じた形との相対差は $5.0 \times 10^{-15}$ である。
+ブロック幅を $k = 6$ に広げても、前処理を渡せば 14 回の反復（作用 241 回）で 6 個の対が `Converged` になる。
+既知の固有ベクトルを制約にすれば、その方向を除いた次の固有対を、収束済みの対を求め直さずに得られる。
+
+---
+
+## まとめ
+
+一般の作用素の少数の固有対は `PartialSpectrumSolver`（Krylov–Schur 法）で求め、Hermitian と分かっていれば `OperatorStructure::Hermitian` を指定して厚い再始動 Lanczos 法と実の固有値を使う。
+最小や内部の固有値は、$A - \sigma M$ を分解できるなら逆作用素を `SpectrumOperator::ShiftInvert` に渡すと、$\gamma$ の大きい問題に変わって少ない周期で収束し、計算コストは分解と作用ごとの求解になる。
+Hermitian 定値の組の端の固有対で良い前処理があるなら `LobpcgSolver` を使い、既知の固有ベクトルを制約に渡せばその方向を除いた次の固有対を求められる。
+どちらも新しい積で計算した残差だけで対を受理し、上限で止まると許容誤差を満たさない対も `Ok` で返すので、終了理由、得た対の数、残差を読んでから値を使う。
+
+## 次に読むページ
+
+- [部分 SVD と乱択低ランク近似](../partial-svd-and-low-rank/)：同じ規約で、上位の特異値と低ランク近似を求める。
+- [固有値問題と Schur 分解](../eigenproblems/)：小さな密行列の固有値計算と、べき乗法・Rayleigh 商の収束を確かめる。
+- [連成振動系の固有モードと軽い不純物による局在モード](../../examples/vibration-modes/)：Hermitian 定値の組の固有値問題を力学のモデルで確かめる。

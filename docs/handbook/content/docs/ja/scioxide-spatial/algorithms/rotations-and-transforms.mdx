@@ -1,0 +1,322 @@
+---
+title: 3 次元回転と姿勢補間
+description: 回転を単位四元数で表して符号を正準化し、合成の順序、Euler 角の 12 系列と内在・外在、ジンバルロックの判定と角の条件数、Slerp の一定の角速度と節点での跳び、一括評価の作業領域を確かめる。
+sidebar:
+  order: 350
+references:
+  spatial-rotation-quaternion: "回転行列と単位四元数"
+  spatial-rotation-composition: "合成の順序と逆回転"
+  spatial-euler-sequences: "系列と内在外在"
+  spatial-gimbal-lock: "角の範囲とジンバルロック"
+  spatial-slerp: "球面線形補間slerp"
+  spatial-rotation-batches: "一括評価と作業領域"
+---
+
+剛体の姿勢は 3 次元の回転で表され、ロボットの関節、宇宙機の姿勢制御、分子の向きの比較など多くの計算に現れる。
+回転は合成の順序で結果が変わり、3 つの角による表し方には特異点がある。
+いくつかのキー姿勢を時刻に沿ってつなぐときは、補間した姿勢の角速度がどう振る舞うかも問題になる。
+このページでは `Rotation` による回転の表現と合成、Euler 角とジンバルロック、最も基本的な姿勢の補間である `Slerp` を、式の導出と数値実験で説明する。
+角加速度まで連続な補間は[回転スプライン](../rotation-spline/)で扱う。
+
+## 回転行列と単位四元数
+
+3 次元の回転は特殊直交群
+
+$$
+\mathrm{SO}(3) = \{ R \in \mathbb{R}^{3\times 3} : R^\top R = I,\ \det R = 1 \}
+$$
+
+の元である。
+単位ベクトル $\hat u$ のまわりに角 $\theta$ [rad] だけ回す回転は、単位四元数
+
+$$
+q = \left(\hat u \sin\frac{\theta}{2},\ \cos\frac{\theta}{2}\right) = (x, y, z, w), \qquad x^2 + y^2 + z^2 + w^2 = 1
+$$
+
+で表せる。
+$q$ と $-q$ は同じ回転を表すので、単位四元数は $\mathrm{SO}(3)$ を二重に覆う。
+回転行列の 9 成分には 6 つの直交性の拘束が掛かるが、四元数の拘束はノルムが 1 という 1 つの条件だけである。
+そのため、合成の後に正規化し直せば、丸めが積み重なっても回転以外のものにはならない。
+
+`scioxide-spatial` の `Rotation` は能動的な右手系の回転で、`apply` は固定した座標系でベクトルを回す。
+$z$ 軸まわりの正の角は $x$ 軸を $y$ 軸の向きへ回す。
+四元数はスカラー部を最後に置いた $[x, y, z, w]$ の順で保持する。
+$q$ と $-q$ のうち、$(w, x, y, z)$ の順で最初の 0 でない成分が正になるほうを保持するので、$w \ge 0$ になり、半回転（$w = 0$）でもベクトル部の符号で代表が一つに決まる。
+行列は行優先で、列ベクトルに作用する。
+
+### 構成と取り出し
+
+| 関数 | 入力 | 処理と失敗 |
+|---|---|---|
+| `Rotation::identity()` | なし | 恒等回転 $[0, 0, 0, 1]$ |
+| `Rotation::from_quaternion(q)` | 長さが 0 でない任意の四元数 $[x, y, z, w]$ | 最大の成分で割ってから正規化するので、二乗和は $[1, 4]$ に入り、あふれもアンダーフローも起きない。0 の四元数は `InvalidInput`、NaN や無限大は `NonFinite` |
+| `Rotation::from_axis_angle(axis, angle)` | 単位でなくてよい軸、角 [rad] | 角が 0 なら軸によらず恒等回転。角が 0 でなく軸が 0 なら `InvalidInput`、NaN や無限大は `NonFinite` |
+| `Rotation::from_rotation_vector(v)` | 回転ベクトル $v = \theta\hat u$ | NaN や無限大は `NonFinite`、$\lvert v\rvert$ が表せないと `NumericalInstability` |
+| `Rotation::from_matrix(m, tolerance)` | 行優先の 3×3 行列 | 下で説明する許容誤差の検査を通った行列だけを受け付ける |
+| `as_quaternion()` | なし | 正準化した $[x, y, z, w]$ |
+| `as_axis_angle()` | なし | 単位軸と $[0, \pi]$ の角。恒等回転は $x$ 軸と角 0 を返す |
+| `as_rotation_vector()` | なし | 軸に角を掛けたベクトル（長さは $[0, \pi]$） |
+| `as_matrix()` | なし | 行優先の回転行列 |
+
+`as_axis_angle` は角を $\theta = 2\,\mathrm{atan2}(\lvert(x, y, z)\rvert, w)$ で求める。
+$2\arccos w$ は $w \to 1$（$\theta \to 0$）で導関数が発散し、$2\arcsin\lvert(x, y, z)\rvert$ は $\theta \to \pi$ で同じことが起きるが、$\mathrm{atan2}$ は $[0, \pi]$ のすべての角で条件がよい。
+
+`from_matrix` は行列を最も近い回転へ射影しない。
+許容誤差 `tolerance` の $\mathrm{atol}$ と $\mathrm{rtol}$ から閾値 $\mathrm{atol} + \mathrm{rtol}\cdot 1$ を作り、$M M^\top - I$ の 9 つの成分の絶対値と $\lvert\det M - 1\rvert$ がすべて閾値以下であることを確かめる。
+直交でなければ、また行列式が負の鏡映なら `InvalidInput` を返す。
+四元数は Shepperd の方法で求める。
+跡と 3 つの対角成分のうち最大のものから、それに対応する四元数の成分を求め、残りの成分は非対角成分の和と差から作る。
+最初に求める成分の大きさが $1/2$ 以上になるので、半回転の近くでも桁落ちしない。
+
+### 合成の順序と逆回転
+
+`r.compose(other)` は `other` を先に、`r` を後に適用する回転 $R_{\text{self}} R_{\text{other}}$ を返す。
+Hamilton 積の結果を `from_quaternion` に通すので、合成を繰り返しても単位長さからずれず、符号も正準化される。
+`inverse()` はベクトル部の符号を反転した四元数を返す。
+半回転は自分自身が逆なので、そのまま返して正準な符号を保つ。
+回転の合成は非可換で、たとえば $x$ 軸と $y$ 軸まわりの 90° 回転を順に適用すると、順序を入れ替えた場合と異なる姿勢になる。
+
+`r.apply(v)` はベクトル $v$ を回した $Rv$ を返す。
+回転行列の成分は通常の浮動小数点演算で作り、$Rv$ の各成分は 3 つの積の厳密な和から 1 回だけ丸める（[検査付き算術関数の誤差の保証](oxref:core-checked-arithmetic)）。
+途中の積や和はあふれもアンダーフローもしないので、`NumericalInstability` を返すのは結果の成分が表せないときだけである。
+誤差は回転行列の成分の丸め（数 $\varepsilon$）に $\lvert v\rvert$ を掛けた程度と、最後の 1 回の丸めである。
+$v$ が NaN や無限大を含めば `NonFinite` を返す。
+メモリ領域は確保しない。
+
+二つの回転 $R_a$ と $R_b$ の差は、相対回転 $R_a^{-1}R_b$ の角
+
+$$
+d(R_a, R_b) = \angle\left(R_a^{-1} R_b\right) \in [0, \pi]
+$$
+
+で測る。
+これは $\mathrm{SO}(3)$ の測地線距離で、このページと例題の「回転の誤差」はすべてこの角である。
+
+## Euler 角
+
+### 系列と内在・外在
+
+Euler 角は回転を 3 つの座標軸まわりの回転の積で表す。
+軸は `RotationAxis::X`、`Y`、`Z` で指定し、`EulerSequence::new(axes, frame)` で 3 軸の系列と枠 `EulerFrame` を組にする。
+隣り合う軸が同じ系列は `InvalidInput` で拒む。
+したがって使える系列は、両端の軸が同じ固有 Euler 系列 6 つ（Z-X-Z、X-Y-X、Y-Z-Y、Z-Y-Z、X-Z-X、Y-X-Y）と、3 軸が異なる Tait–Bryan 系列 6 つ（X-Y-Z、Y-Z-X、Z-X-Y、X-Z-Y、Z-Y-X、Y-X-Z）で、それぞれに内在と外在がある。
+
+`EulerFrame::Intrinsic`（内在）では各回転を直前までの回転で動いた機体の軸のまわりに行う。
+`EulerFrame::Extrinsic`（外在）では各回転を固定した基準座標系の軸のまわりに行う。
+軸 $a_k$ のまわりの角 $\alpha_k$ の回転を $R_k$ と書くと、`Rotation::from_euler(sequence, [α₁, α₂, α₃])` は
+
+$$
+R_{\text{内在}} = R_1 R_2 R_3, \qquad R_{\text{外在}} = R_3 R_2 R_1
+$$
+
+を返す。
+内在では後の回転ほど先に（右から）掛かり、外在では与えた順に左から掛かる。
+この式から、内在の系列 $(a_1, a_2, a_3)$ と角 $(\alpha_1, \alpha_2, \alpha_3)$ は、外在の逆順の系列 $(a_3, a_2, a_1)$ と角 $(\alpha_3, \alpha_2, \alpha_1)$ と同じ回転になる。
+航空機や宇宙機でよく使うヨー $\psi$・ピッチ $\theta$・ロール $\phi$ は、内在の Z-Y-X 系列で $R = R_z(\psi) R_y(\theta) R_x(\phi)$ と書ける。
+`from_euler` は角が NaN や無限大のときだけ `NonFinite` を返す。
+
+### 角の範囲とジンバルロック
+
+`rotation.as_euler(sequence, tolerance)` は回転を `EulerAngles` に戻す。
+`angles` は系列の順の 3 つの角 [rad]、`gimbal_lock` はジンバルロックの判定である。
+中央の角 $\beta$ は固有 Euler 系列で $[0, \pi]$、Tait–Bryan 系列で $[-\pi/2, \pi/2]$ に入り、両端の角は $[-\pi, \pi]$ に入る。
+角は回転行列の成分から Shoemake の方法で $\mathrm{atan2}$ を使って求める。
+
+固有 Euler 系列では $\sin\beta = 0$、Tait–Bryan 系列では $\cos\beta = 0$ のとき、1 番目と 3 番目の回転軸が一直線に並び、自由度が 1 つ失われる。
+これがジンバルロックで、1 番目と 3 番目の角はそれぞれには決まらず、和か差だけが決まる。
+たとえば Z-Y-X 内在で $\theta = +\pi/2$ なら、$R_y(\pi/2) R_x(\phi) = R_z(-\phi) R_y(\pi/2)$ から $R = R_z(\psi - \phi) R_y(\pi/2)$ となり、決まるのは $\psi - \phi$ だけである。
+
+ロックの手前でも、両端の角は悪条件になる。
+両端の角は $\cos\beta$（固有 Euler 系列では $\sin\beta$）に比例する二つの行列成分の $\mathrm{atan2}$ で決まるので、成分の丸め誤差 $\varepsilon$ は角の誤差 $\varepsilon/\lvert\cos\beta\rvert$ に拡大される。
+`as_euler` は、この大きさ $\lvert\cos\beta\rvert$（固有 Euler 系列では $\lvert\sin\beta\rvert$）が `tolerance` の閾値 $\mathrm{atol} + \mathrm{rtol}\cdot 1$ 以下のとき `gimbal_lock` を真にし、3 番目の角を 0 にして決まる組み合わせを 1 番目の角に集める。
+`Tolerance::from_sqrt_epsilon()` では閾値が $2\sqrt{\varepsilon} \approx 2.98 \times 10^{-8}$ で、Tait–Bryan 系列ならピッチが $\pm 90°$ から約 $1.7 \times 10^{-6}$ 度以内でロックと判定される。
+閾値があふれるときだけ `NumericalInstability` を返す。
+
+次のセルでは Z-Y-X 内在の系列でヨー $\psi$ とロール $\phi$ を固定し、ピッチを $\theta = 90° - \delta$ として $\delta$ を 10° から 0 まで小さくする。
+各 $\delta$ で `from_euler` で回転を作り、`as_euler` で角に戻し、戻した角からもう一度 `from_euler` で回転を作る。
+表 `roundtrip` は戻した 3 つの角 [deg]、ロックの判定、両端の角の誤差の大きいほう [deg]、元の回転と作り直した回転の距離 $d$ [rad] を示す。
+表 `frames` は、内在の Z-Y-X と外在の X-Y-Z（角を逆順）が同じ回転で、外在の Z-Y-X（同じ角）は別の回転であることを、回転の距離で確かめる。
+
+```rust
+//| id: spatial-euler-gimbal-lock
+//| ref: spatial-euler-gimbal-lock
+//| title: ピッチを 90° に近づけて Euler 角の往復とジンバルロックを確かめる
+//| run: reactive
+//| crates: [scioxide-core, scioxide-spatial]
+//| inputs:
+//|   yaw: {"type":"range","label":"ヨー ψ [deg]","description":"Z-Y-X 内在の 1 番目の角。","min":-180,"max":180,"step":5,"value":30}
+//|   roll: {"type":"range","label":"ロール φ [deg]","description":"Z-Y-X 内在の 3 番目の角。","min":-180,"max":180,"step":5,"value":20}
+//| cases:
+//|   - {"id":"equal-yaw-roll","label":"ψ = φ = 45°","description":"ロックすると決まる差 ψ − φ が 0 になり、1 番目の角も 0 に戻る。","inputs":{"yaw":45,"roll":45}}
+//|   - {"id":"negative-roll","label":"ψ = −120°, φ = −150°","description":"両端の角が負でも、ロックの外では往復で同じ角に戻る。","inputs":{"yaw":-120,"roll":-150}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"roundtrip","path":"/rows/0/4","equals":false}
+//|       - {"artifact":"roundtrip","path":"/rows/0/5","range":{"max":1e-12}}
+//|       - {"artifact":"roundtrip","path":"/rows/7/4","equals":true}
+//|       - {"artifact":"roundtrip","path":"/rows/7/1","approx":{"value":10,"atol":1e-6}}
+//|       - {"artifact":"roundtrip","path":"/rows/7/3","equals":0}
+//|       - {"artifact":"roundtrip","path":"/rows/9/6","range":{"max":1e-14}}
+//|       - {"artifact":"frames","path":"/rows/0/1","range":{"max":1e-15}}
+//|       - {"artifact":"frames","path":"/rows/1/1","range":{"min":0.1}}
+//|   - case: equal-yaw-roll
+//|     expect:
+//|       - {"artifact":"roundtrip","path":"/rows/9/1","approx":{"value":0,"atol":1e-6}}
+//|   - case: negative-roll
+//|     expect:
+//|       - {"artifact":"roundtrip","path":"/rows/0/1","approx":{"value":-120,"atol":1e-9}}
+//|       - {"artifact":"roundtrip","path":"/rows/0/3","approx":{"value":-150,"atol":1e-9}}
+use scioxide_core::{NumericScalar, RealScalar, Tolerance};
+use scioxide_spatial::{EulerFrame, EulerSequence, Rotation, RotationAxis};
+
+let axes = [RotationAxis::Z, RotationAxis::Y, RotationAxis::X];
+let intrinsic = EulerSequence::new(axes, EulerFrame::Intrinsic).map_err(|e| e.to_string())?;
+let tolerance = Tolerance::from_sqrt_epsilon();
+// 回転の距離 d(a, b): 相対回転 a⁻¹ b の角 [rad]。
+let distance = |a: Rotation<f64>, b: Rotation<f64>| -> Result<f64, String> {
+    let relative = a.inverse().compose(b).map_err(|e| e.to_string())?;
+    Ok(relative.as_axis_angle().1)
+};
+// 角の差を (−180°, 180°] に折り返す。
+let wrapped = |x: f64| x - 360.0 * RealScalar::round(x / 360.0);
+
+// δ = 90° − θ [deg] を 10° から 0 まで小さくする。
+let offsets = [10.0, 1.0, 1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 0.0];
+let mut rows = Vec::new();
+for delta in offsets {
+    let input = [yaw, 90.0 - delta, roll];
+    let rotation = Rotation::from_euler(intrinsic, input.map(RealScalar::to_radians))
+        .map_err(|e| e.to_string())?;
+    let euler = rotation
+        .as_euler(intrinsic, tolerance)
+        .map_err(|e| e.to_string())?;
+    let output = euler.angles.map(RealScalar::to_degrees);
+    let rebuilt = Rotation::from_euler(intrinsic, euler.angles).map_err(|e| e.to_string())?;
+    let outer_error = NumericScalar::abs(wrapped(output[0] - input[0]))
+        .max(NumericScalar::abs(wrapped(output[2] - input[2])));
+    rows.push((
+        delta,
+        output[0],
+        output[1],
+        output[2],
+        euler.gimbal_lock,
+        outer_error,
+        distance(rotation, rebuilt)?,
+    ));
+}
+let fixed = serde_json::json!({ "notation": "standard", "significantDigits": 10 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "δ = 90° − θ [deg]", "type": "number", "format": sci2 },
+    { "key": "1", "label": "戻した ψ [deg]", "type": "number", "format": fixed },
+    { "key": "2", "label": "戻した θ [deg]", "type": "number", "format": fixed },
+    { "key": "3", "label": "戻した φ [deg]", "type": "number", "format": fixed },
+    { "key": "4", "label": "ジンバルロック", "type": "boolean" },
+    { "key": "5", "label": "両端の角の誤差 [deg]", "type": "number", "format": sci2 },
+    { "key": "6", "label": "回転の距離 d [rad]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "roundtrip" })
+);
+
+// 内在 Z-Y-X と、外在 X-Y-Z（角を逆順）・外在 Z-Y-X（同じ角）を比べる。
+let angles = [yaw, 80.0, roll].map(RealScalar::to_radians);
+let reference = Rotation::from_euler(intrinsic, angles).map_err(|e| e.to_string())?;
+let reversed_axes = [RotationAxis::X, RotationAxis::Y, RotationAxis::Z];
+let extrinsic_reversed =
+    EulerSequence::new(reversed_axes, EulerFrame::Extrinsic).map_err(|e| e.to_string())?;
+let extrinsic_same =
+    EulerSequence::new(axes, EulerFrame::Extrinsic).map_err(|e| e.to_string())?;
+let reversed = Rotation::from_euler(extrinsic_reversed, [angles[2], angles[1], angles[0]])
+    .map_err(|e| e.to_string())?;
+let same = Rotation::from_euler(extrinsic_same, angles).map_err(|e| e.to_string())?;
+let frames = vec![
+    ("外在 X-Y-Z、角は (φ, θ, ψ)", distance(reference, reversed)?),
+    ("外在 Z-Y-X、角は (ψ, θ, φ)", distance(reference, same)?),
+];
+let frame_columns = serde_json::json!([
+    { "key": "0", "label": "内在 Z-Y-X (ψ, 80°, φ) と比べる回転" },
+    { "key": "1", "label": "回転の距離 d [rad]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    frame_columns,
+    frames,
+    metadata = serde_json::json!({ "id": "frames" })
+);
+```
+
+既定値（$\psi = 30°$、$\phi = 20°$）では、$\delta = 10°$ から $10^{-5}$ 度まではロックと判定されず、戻した角は与えた角に一致する。
+両端の角の誤差は $\delta = 10°$ の $2.5 \times 10^{-14}$ 度から $\delta = 10^{-5}$ 度の $2.6 \times 10^{-8}$ 度まで増える。
+$\delta$ を 6 桁小さくすると誤差はおよそ 6 桁増え、桁ごとの増え方は丸めの出方でばらつくが、全体として $1/\delta$ の傾向に沿う。
+戻した角から作り直した回転の距離 $d$ も、$2.5 \times 10^{-16}$ rad から $3.0 \times 10^{-10}$ rad まで増える。
+角を経由すると、回転そのものも同じ程度の精度を失う。
+
+$\delta = 10^{-6}$ 度では $\lvert\cos\theta\rvert = 1.7 \times 10^{-8}$ が閾値を下回り、`gimbal_lock` が真になって、戻した角は $(10°, 90°, 0°)$ になる。
+1 番目の角 10° は決まる組み合わせ $\psi - \phi$ で、両端の角はそれぞれ 20° ずれるが、回転の距離は $d = 6.1 \times 10^{-9}$ rad にとどまる。
+この $d$ はロックとみなして捨てた項の大きさ $\lvert\phi\rvert\,\lvert\cos\theta\rvert \approx 0.35 \times 1.7 \times 10^{-8}$ rad にあたる。
+閾値 $2\sqrt\varepsilon$ の近くでは、ロックとみなさない場合の誤差 $\varepsilon/\lvert\cos\theta\rvert$ も、みなした場合の誤差 $\lvert\phi\rvert\,\lvert\cos\theta\rvert$ も $\sqrt\varepsilon$ の程度になる。
+$\delta = 0$ では $d = 2.3 \times 10^{-16}$ rad である。
+表 `frames` では、内在の Z-Y-X と外在の X-Y-Z（角を逆順）の距離が $3.1 \times 10^{-17}$ rad で同じ回転であり、外在の Z-Y-X（同じ角）とは 0.81 rad 離れている。
+
+ジンバルロックの近くでは、Euler 角を経由するたびに精度を失う。
+補間や合成は四元数のまま行い、Euler 角は入出力の表示に限るのがよい。
+
+## 球面線形補間（Slerp）
+
+時刻 $t_0 < t_1 < \cdots < t_{n-1}$ と各時刻の回転 $R_i$ が与えられたとき、`Slerp` は区間 $[t_i, t_{i+1}]$ で
+
+$$
+R(t) = R_i \exp\left(u\, \hat v_i\right), \qquad u = \frac{t - t_i}{\Delta t_i}, \qquad \Delta t_i = t_{i+1} - t_i
+$$
+
+と補間する。
+$v_i$ は相対回転 $R_i^{-1}R_{i+1}$ の回転ベクトル（角は $\pi$ 以下の主値）で、$\hat v$ は $v$ の外積行列、$\exp$ は回転ベクトルから回転への写像である。
+角が $\pi$ 以下の回転ベクトルを選ぶので、補間は短いほうの弧をたどり、ちょうど半回転のときは `Rotation` の符号の規約で向きが決まる。
+これは単位四元数の球面上の大円に沿った一定速度の運動にあたる（Shoemake 1985）。
+
+$\exp(u\hat v_i)$ は $v_i$ と可換なので、機体座標系の角速度は区間の中で一定の
+
+$$
+\omega(t) = \frac{v_i}{\Delta t_i}, \qquad \lvert\omega\rvert = \frac{\angle(R_i^{-1}R_{i+1})}{\Delta t_i}
+$$
+
+になり、角加速度は区間の中で 0 である。
+節点 $t_i$ では左右の角速度 $v_{i-1}/\Delta t_{i-1}$ と $v_i/\Delta t_i$ が一般に異なり、角速度は跳び、角加速度は節点で衝撃（デルタ関数）になる。
+`Slerp` は角速度を返す関数を持たないので、この値は相対回転から上の式で求める。
+
+`Slerp::new(times, rotations)` は節点を検査し、時刻と回転と各区間の $v_i$ を保存する。
+メモリ使用量は $O(n)$ である。
+時刻が 2 つ未満、または狭義単調増加でなければ `InvalidInput`、時刻が NaN や無限大なら `NonFinite`、隣り合う時刻の差が表せなければ `NumericalInstability`、二つの配列の長さが違えば `DimensionMismatch`、メモリ領域を確保できなければ `AllocationFailure` を返す。
+`evaluate(t)` は二分探索で区間を探し、$O(\log n)$ の計算でメモリ領域を確保しない。
+節点の時刻では与えた回転をそのまま返す。
+外挿はせず、$[t_0, t_{n-1}]$ の外の時刻は `InvalidInput`、NaN や無限大の時刻は `NonFinite` になる。
+
+Slerp の角速度の跳びはキー姿勢の間で運動の向きを急に変えることにあたり、剛体を追従させると節点でトルクの衝撃が要る。
+角速度と角加速度を連続にするには、区間ごとの回転ベクトルを 3 次式にした[回転スプライン](../rotation-spline/)を使う。
+
+## 一括評価と作業領域
+
+多数の時刻で回転だけが必要なときは、`Slerp::evaluate_rotations_into` と、回転スプラインの同名の関数 `RotationSpline::evaluate_rotations_into` が時刻の配列を受け取り、回転を出力の配列に書く。
+`evaluate_rotations(&times)` は同じ評価を既定の設定で行い、作業領域と結果の `Vec` を確保して返す。
+時刻は任意の順でよく、重複してもよい。
+多数の回転の Euler 角は `Rotation::as_euler_batch_into` で求める。
+どちらも `TransformWorkspace` に結果をいったん書き、すべてが成功してから出力へ写すので、エラーのときは出力が変わらない。
+作業領域の大きさは `TransformWorkspaceRequest::rotations(count, options)` と `TransformWorkspaceRequest::euler(count, options)` で決める。
+事前確保の手順は[一括変換と作業領域](oxref:spatial-transform-batches)で説明する。
+
+## まとめ
+
+`Rotation` は回転を正準な符号の単位四元数 $[x, y, z, w]$ で保持し、`compose` は引数を先に適用し、`from_matrix` は許容誤差の検査を通った行列だけを受け付ける。
+Euler 角は `EulerSequence` で 12 系列と内在・外在を選び、内在は $R_1R_2R_3$、外在は $R_3R_2R_1$ の順に合成される。
+ジンバルロックの近くでは両端の角の誤差が $\varepsilon/\lvert\cos\beta\rvert$ に拡大され、角から作り直した回転も同じ程度に精度を失うので、補間と合成は四元数のまま行い、`gimbal_lock` が真のときは両端の角を個別に解釈しない。
+`Slerp` は区間ごとに一定の角速度で最短の弧をたどり、角速度は節点で跳ぶので、角速度の連続が要るなら回転スプラインを選ぶ。
+多数の時刻や回転をまとめて処理するときは、`TransformWorkspaceRequest` で作業領域を一度事前確保して `*_into` の関数を使う。
+
+## 次に読むページ
+
+- [回転スプライン](../rotation-spline/)：角速度と角加速度が連続な姿勢の補間を、Hermite 条件、ブロック三重対角系、不動点反復の順に導いて確かめる。
+- [剛体変換と一括変換](../rigid-transforms/)：回転に並進を加えた `RigidTransform` の合成と逆変換、一括変換の作業領域の事前確保を確かめる。
+- [宇宙機の姿勢補間と角速度](../../examples/attitude-interpolation/)：Euler 角で与えたキー姿勢を補間し、区間ごとの角速度とピッチ 90° 付近の往復誤差を確かめる。

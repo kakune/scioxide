@@ -1,0 +1,830 @@
+---
+title: FIR フィルタの設計と最小位相への変換
+description: 線形位相 FIR の四つの型、窓関数法・周波数標本化・重み付き最小二乗・Remez 交換法による設計、交代定理による等リプルの検算、ケプストラムによる最小位相への変換。
+sidebar:
+  order: 315
+references:
+  signal-fir-linear-phase-types: "線形位相と四つの型"
+  signal-fir-window-method: "窓関数法"
+  signal-fir-frequency-sampling: "周波数標本化"
+  signal-fir-least-squares: "重み付き最小二乗"
+  signal-fir-remez: "remez-交換法"
+  signal-fir-applying: "設計した係数の適用"
+  signal-minimum-phase: "最小位相への変換"
+---
+
+有限インパルス応答（FIR）フィルタは、$n$ 個の係数（タップ）$h[0], \dots, h[n-1]$ と入力 $x$ から
+
+$$
+y[k] = \sum_{i=0}^{n-1} h[i]\, x[k-i]
+$$
+
+を出力する。
+FIR の設計とは帯域ごとに与えた希望の振幅に近い周波数応答を持つ $h$ を求める問題である。
+このページは、線形位相という制約の意味、四つの設計法がそれぞれ最小化する量、Remez 交換法の終了状態の読み方、設計した係数を最小位相に変換する方法を扱う。
+
+周波数 $f$ は Nyquist 周波数に対する比で、$f = 1$ が標本化周波数の半分に当たる。
+角周波数は $\omega = \pi f$ [rad/標本] である。
+周波数応答は $z = e^{i\pi f}$ で評価した
+
+$$
+H(f) = \sum_{i=0}^{n-1} h[i]\, e^{-i\pi f i}
+$$
+
+で、`FirDesign::response(f)` がこの和を直接計算する。
+周波数の単位の規約は章全体で共通で、[数理とアルゴリズムの概要](../)にまとめてある。
+
+## 線形位相と四つの型
+
+$c = (n-1)/2$ とする。
+係数が偶対称 $h[i] = h[n-1-i]$ なら $H(f) = e^{-i\pi f c} A(f)$、奇対称 $h[i] = -h[n-1-i]$ なら $H(f) = i\, e^{-i\pi f c} A(f)$ と書ける。
+ここで $A(f)$ は実数の**零位相振幅**で、偶対称では $A(f) = \sum_i h[i] \cos(\pi f (c-i))$、奇対称では $A(f) = \sum_i h[i] \sin(\pi f (c-i))$ である。
+位相は $f$ の一次式なので、すべての周波数が同じ $c$ 標本だけ遅れる。
+この性質を**線形位相**といい、波形の形を保ちたい用途で FIR を選ぶ主な理由になる。
+
+対称性（`FirSymmetry::Even` か `Odd`）と $n$ の偶奇の組で、四つの型が決まる。
+
+| 対称性 | $n$ が奇数 | $n$ が偶数 |
+|---|---|---|
+| 偶対称 `Even` | I 型 | II 型、$A(1) = 0$ |
+| 奇対称 `Odd` | III 型、$A(0) = A(1) = 0$ | IV 型、$A(0) = 0$ |
+
+零が強制される理由は余弦と正弦の値にある。
+II 型では $c - i$ が半整数なので、$f = 1$ で $\cos(\pi(c-i)) = 0$ になる。
+奇対称では $f = 0$ で $\sin 0 = 0$ になり、III 型では $c - i$ が整数なので $f = 1$ でも $\sin(\pi(c-i)) = 0$ になる。
+強制された零の位置で 0 でない希望振幅を与えると、どの設計関数も `InvalidInput` を返す。
+したがって高域通過には I 型か IV 型、Hilbert 変換器には III 型、微分器には IV 型が向く。
+
+独立に選べる係数の個数 $m$ は、偶対称で $\lceil n/2 \rceil$、奇対称で $\lfloor n/2 \rfloor$ である。
+奇対称で $n = 1$ は係数を持てないので `InvalidInput` になる。
+
+帯域は `FirBand::new(lower, upper, desired_lower, desired_upper)` で与える。
+閉区間 $[\mathrm{lower}, \mathrm{upper}]$ の上で、希望の零位相振幅 $D(f)$ が `desired_lower` から `desired_upper` へ一次式で変わる。
+`with_weight` で正の重み $W$ を付ける（既定は 1）。
+帯域の間の区間は制約されず、遷移帯になる。
+帯域が空、端が $[0, 1]$ の外、`lower` ≥ `upper`、重みが正でない、昇順に並んでいない、のどれかに当たると `InvalidInput` になり、非有限の値は `NonFinite` になる。
+
+設計の結果 `FirDesign` は、畳み込みの順に並んだ係数（`coefficients`）、対称性、終了状態（`termination`、`is_success`）、交換の反復回数（`iterations`）、Remez 法の重み付きリプル（`weighted_ripple`）と最後の参照点（`extrema`）、最小二乗法の条件数の推定値（`condition_estimate`）を持つ。
+`termination()` は設計の終了を表す唯一の値で、直接の設計（窓関数法、周波数標本化、最小二乗）は反復 0 回の `FirTermination::Completed` を返す。
+`Completed` は計算を終えたことだけを示し、精度を主張しない。
+
+次の定義のブロックは、このページの二つのセルが独立な検算に使う零位相振幅 $A(f)$ を、上の式の直接の和で計算する。
+$f$ ごとに $O(n)$ の演算で、`f64` の固有メソッド `cos`・`sin` による参照計算である。
+
+```rust
+//| id: signal-fir-amplitude
+//| kind: definitions
+//| title: 線形位相 FIR の零位相振幅（直接の和による参照計算）
+//| crates: [scioxide-signal]
+/// 零位相振幅 A(f)。偶対称は Σ h[i] cos(πf(c − i))、奇対称は Σ h[i] sin(πf(c − i))。
+/// f は Nyquist 比、c = (n − 1)/2。f64 の固有メソッドによる参照計算である。
+pub(crate) fn zero_phase_amplitude(taps: &[f64], antisymmetric: bool, f: f64) -> f64 {
+    let center = 0.5 * (taps.len() as f64 - 1.0);
+    taps.iter()
+        .enumerate()
+        .map(|(i, &h)| {
+            let angle = std::f64::consts::PI * f * (center - i as f64);
+            if antisymmetric {
+                h * angle.sin()
+            } else {
+                h * angle.cos()
+            }
+        })
+        .sum()
+}
+```
+
+## 窓関数法
+
+理想の低域通過フィルタ（$|f| \le f_c$ で 1、ほかで 0）のインパルス応答は $\sin(\pi f_c k)/(\pi k)$ で、両側に無限に続く。
+窓関数法は帯域ごとに一定の希望振幅 $D_b$ を持つ理想応答のインパルス応答を中心 $c$ のまわりで $n$ 個に切り詰め、長さ $n$ の対称なウインドウ $w$ を掛ける。
+偶対称では
+
+$$
+h[i] = w[i] \sum_b D_b \int_{l_b}^{u_b} \cos\bigl(\pi (c-i) f\bigr)\, df
+$$
+
+で、奇対称では余弦を正弦に置き換える（$[l_b, u_b]$ は帯域 $b$ の端）。
+積分は閉じた形で計算するので、帯域が $B$ 個なら計算コストは $O(nB)$ とウインドウの計算である。
+
+窓関数法 `design_fir_window(n, symmetry, bands, window, normalization)` は帯域の重みを使わず、帯域の間の希望振幅を 0 とみなす。
+帯域の中で希望振幅が変わる帯域（`desired_lower` ≠ `desired_upper`）は `InvalidInput`（`UnsupportedConfiguration`）になる。
+切り詰めは周波数領域ではウインドウのスペクトルとの畳み込みに当たるので、遮断の近くのリプルの大きさは主にウインドウの種類で決まり、$n$ を増やすと遷移帯の幅が狭くなる。
+ウインドウの種類と特性は[窓関数と DPSS](../windows-and-dpss/)で扱う。
+
+`FirNormalization::At { frequency, gain }` は、設計の後に係数全体を尺度して $A(\mathrm{frequency}) = \mathrm{gain}$ にする。
+低域通過なら `frequency: 0.0, gain: 1.0` で直流の利得を 1 にそろえる。
+周波数が $[0, 1]$ の外なら `InvalidInput`、その周波数で振幅が 0（型による強制零を含む）なら `DomainError` になる。
+`FirNormalization::None` は尺度を変えない。
+
+## 周波数標本化
+
+周波数標本化 `design_fir_frequency_sampling(n, symmetry, frequencies, amplitudes, mesh_size, window, normalization)` は、節点 $(f_j, a_j)$ を結ぶ折れ線を希望の振幅 $A(f)$ とする。
+節点は 0 から 1 へ狭義に増加し、0 と 1 を含む。
+長さ $N$（`mesh_size`）の格子 $f_k = 2k/N$ で線形位相の応答 $H_k = e^{-i\pi f_k c} A(f_k)$（奇対称では $i$ を掛ける）を標本化し、長さ $N$ の実数の逆 DFT の先頭 $n$ 個を取り、対称性を課してウインドウを掛ける。
+ウインドウを `None` にすると矩形ウインドウになる。
+計算コストは $O(N \log N)$ である。
+
+格子点の上では希望の振幅に一致するが、格子点の間の応答は制御しない。
+$N$ は偶数で $2n$ 以上でなければならず、満たさなければ `InvalidInput` になる。
+$N$ が $n$ に比べて小さいと、理想応答のインパルス応答が時間領域で折り返す。
+
+## 重み付き最小二乗
+
+重み付き最小二乗 `design_fir_least_squares(n, symmetry, bands)` は、帯域の上の二乗誤差の積分
+
+$$
+E = \sum_b W_b \int_{l_b}^{u_b} \bigl(A(f) - D_b(f)\bigr)^2\, df
+$$
+
+を最小にする。
+$A$ は $m$ 個の独立な係数の一次式なので、$E$ の最小化は $m \times m$ の正規方程式になる。
+その係数は余弦の積の積分で、閉じた形で計算する。
+組み立てに $O(m^2 B)$、列ピボット付きの Householder QR 分解による解に $O(m^3)$ かかる。
+
+`condition_estimate()` は、この正規方程式の 1 ノルム条件数の推定値を返す。
+遷移帯が広いほど、また $m$ が大きいほど、帯域に制限した余弦の基底は互いに似てきて、条件数が増える。
+推定値は解の誤差の保証ではない。
+正規方程式が数値的に階数落ちすれば `NumericalInstability`（`LossOfSignificance`）、最小と最大の重みの比がアンダーフローすれば `NumericalInstability`（`Underflow`）になる。
+最小二乗の設計は誤差のエネルギーを小さくするが、遮断の近くに大きな誤差の山が残ることがある。
+
+## Remez 交換法
+
+Remez 交換法（Parks–McClellan 法）`design_fir_remez(n, symmetry, bands)` は、重み付き誤差の最大値
+
+$$
+\delta = \max_b \max_{f \in [l_b, u_b]} W_b \bigl| A(f) - D_b(f) \bigr|
+$$
+
+を最小にする（ミニマックス近似）。
+
+I 型では $A(f) = \sum_{k=0}^{m-1} a_k \cos(k \pi f)$ であり、$x = \cos(\pi f)$ とおくと $A$ は $x$ の $m-1$ 次多項式になる。
+II〜IV 型では $A(f) = Q(f) P(f)$ と分け、$Q(f)$ は $\cos(\pi f/2)$、$\sin(\pi f)$、$\sin(\pi f/2)$ のどれかで、$P$ は $x$ の多項式である。
+$D/Q$ を重み $W Q$ で近似すれば、どの型も多項式の重み付きミニマックス近似になる。
+
+**交代定理**（Chebyshev の交代定理）によれば、最良近似はただ一つで、次の性質で特徴づけられる。
+帯域の中に $m + 1$ 個以上の周波数 $f_0 < f_1 < \dots < f_m$ があり、そこで重み付き誤差 $E(f) = W(f)\bigl(A(f) - D(f)\bigr)$ が $\pm\delta$ を交互の符号で取る。
+誤差の極値がすべて同じ大きさになるので、この設計を**等リプル**という。
+
+交換法はこの性質を反復で満たす。
+帯域の上に間隔が $1/((m+1) \cdot \mathrm{grid\_density})$ 以下の格子を作り、型による強制零の点を除く。
+初めの参照点の組は帯域の上の平衡測度（交代点の漸近分布）の等分点に置く。
+各反復では、参照点で $E$ が $\pm\delta$ を交互に取るような $\delta$ を重心型の公式で求め、参照点の値 $D \mp \delta/W$ を通る多項式を重心型の補間で表す。
+次に格子の上で誤差を評価し、大きさが $|\delta|$ 以上の交互の極値を新しい参照点にする。
+密な連立方程式は解かないので、1 回の反復は格子点 $g$ 個について $O(m^2 + gm)$ の演算、メモリは $O(g + m)$ であり、`condition_estimate()` は `None` になる。
+
+交互の誤差の広がり（最大と最小の差）が許容誤差を満たすと、終了状態は `FirTermination::Converged` になる。
+上限の反復回数に達すれば `IterationLimit`、格子の上に $|\delta|$ 以上の交互の極値が $m + 1$ 個見つからなければ `ExchangeStalled` になる。
+`weighted_ripple()` は格子の上で測った重み付き誤差の最大値で、連続な帯域の上の誤差の推定値であって上界ではない。
+
+`RemezOptions` は反復の上限（既定 64 回）、格子の密度（既定 32、独立な係数あたり・正規化周波数 1 あたりの格子点数）、交互の誤差の広がりの許容誤差（既定は絶対 $16\varepsilon$、相対 $\sqrt{\varepsilon}$、$\varepsilon$ は機械イプシロン）を持つ。
+反復の上限 0 か格子の密度 16 未満は `InvalidInput` になる。
+呼び出しの形は三つある。
+
+- `design_fir_remez` は既定の `RemezOptions` で設計し、収束しなければ `ConvergenceFailure`（`IterationLimit` か `Stagnation`）を返す。
+- `design_fir_remez_with_options` は `RemezOptions` を受け取り、収束しない場合も最後の有限な係数を `Ok` で返す。
+  `termination()` が `IterationLimit` か `ExchangeStalled` なら、係数は近似として扱う。
+- `design_fir_remez_scoped` は最後の引数に実行コンテキストか外側の解法の `SolveContext` を受け取り、交換の反復をそのスコープの上限に数える。
+  スコープの上限に達すると `ConvergenceFailure`、取り消しと期限の超過は `ExecutionStopped` になる。
+
+帯域に強制零以外の格子点がない場合、帯域が格子の上で分離できない場合、格子点が $m + 1$ 個未満の場合は `InvalidInput` になる。
+
+## 四つの設計法の比較
+
+次のセルは通過域 $[0, 0.3]$ で 1、阻止域 $[0.4, 1]$ で 0 という同じ仕様の I 型低域通過を、四つの方法で設計する。
+窓関数法には Hamming ウインドウと遷移帯の中央 0.35 に置いた理想の遮断を、周波数標本化には長さ 1024 の格子と矩形ウインドウを使い、どちらも直流の利得を 1 にそろえる。
+入力は係数の個数 $n$ と阻止域の重み $W$ で、重みは最小二乗法と Remez 法だけに効く。
+表は、定義のブロックの直接の和で $\Delta f = 1/4000$ の格子に評価した通過域の最大偏差 $\max|A - 1|$、阻止域の最大振幅 $\max|A|$ と減衰量、重み付き最大誤差 $\delta$、台形則で求めた重み付き二乗誤差の積分 $E$、条件数の推定値を示す。
+Remez 法は $\delta$ を、最小二乗法は $E$ を最小にするので、それぞれの列でその方法が最も小さくなるはずである。
+図は振幅応答 $|H|$ を対数軸で描き、遷移帯の端を縦線で示す。
+
+```rust
+//| id: signal-fir-design-comparison
+//| ref: signal-fir-design-comparison
+//| title: 同じ仕様の低域通過 FIR を四つの方法で設計する
+//| run: reactive
+//| uses: [signal-fir-amplitude]
+//| crates: [scioxide-signal]
+//| inputs:
+//|   taps: {"type":"range","label":"係数の個数 n","description":"I 型にするため奇数だけを選ぶ。","min":21,"max":81,"step":4,"value":41}
+//|   stop_weight: {"type":"range","label":"阻止域の重み W [-]","description":"最小二乗法と Remez 法で阻止域の誤差を重くする。","min":1,"max":30,"step":1,"value":10}
+//| cases:
+//|   - {"id":"short-equal-weight","label":"n = 21、W = 1","description":"係数が少なく重みが等しいと、どの方法も遷移帯の近くで誤差が大きい。","inputs":{"taps":21,"stop_weight":1}}
+//|   - {"id":"long","label":"n = 81、W = 10","description":"係数を増やすと阻止域の減衰が深くなり、最小二乗の条件数が増える。","inputs":{"taps":81}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/3/1","equals":"Converged"}
+//|       - {"artifact":"methods","path":"/rows/3/5","approx":{"value":2.9779e-2,"rtol":1e-3}}
+//|       - {"artifact":"methods","path":"/rows/3/4","approx":{"value":50.52,"atol":0.05}}
+//|       - {"artifact":"methods","path":"/rows/2/6","approx":{"value":2.849e-5,"rtol":1e-3}}
+//|       - {"artifact":"methods","path":"/rows/3/6","approx":{"value":1.587e-4,"rtol":1e-3}}
+//|       - {"artifact":"methods","path":"/rows/2/7","approx":{"value":792.77,"rtol":1e-4}}
+//|       - {"artifact":"methods","path":"/rows/0/4","approx":{"value":22.16,"atol":0.05}}
+//|       - {"artifact":"methods","path":"/rows/0/7","equals":null}
+//|   - case: short-equal-weight
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/3/5","approx":{"value":5.555e-2,"rtol":1e-3}}
+//|       - {"artifact":"methods","path":"/rows/2/7","approx":{"value":16.94,"rtol":1e-3}}
+//|   - case: long
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/3/4","approx":{"value":80.19,"atol":0.05}}
+//|       - {"artifact":"methods","path":"/rows/2/4","approx":{"value":64.56,"atol":0.05}}
+//|       - {"artifact":"methods","path":"/rows/1/4","approx":{"value":32.03,"atol":0.05}}
+//|       - {"artifact":"methods","path":"/rows/2/7","approx":{"value":2.993e5,"rtol":1e-3}}
+use scioxide_signal::{
+    FirBand, FirDesign, FirNormalization, FirSymmetry, WindowKind,
+    design_fir_frequency_sampling, design_fir_least_squares, design_fir_remez,
+    design_fir_window,
+};
+
+let n = taps.round() as usize;
+let (pass_edge, stop_edge) = (0.3, 0.4);
+let bands = [
+    FirBand::new(0.0, pass_edge, 1.0, 1.0),
+    FirBand::new(stop_edge, 1.0, 0.0, 0.0).with_weight(stop_weight),
+];
+// 窓関数法は重みを使わない。理想の遮断を遷移帯の中央に置き、直流の利得を 1 にする
+let ideal = [FirBand::new(0.0, 0.5 * (pass_edge + stop_edge), 1.0, 1.0)];
+let unit_dc = FirNormalization::At {
+    frequency: 0.0,
+    gain: 1.0,
+};
+let even = FirSymmetry::Even;
+let knots = [0.0, pass_edge, stop_edge, 1.0];
+let designs: Vec<(&str, FirDesign<f64>)> = vec![
+    (
+        "窓関数法（Hamming）",
+        design_fir_window(n, even, &ideal, WindowKind::Hamming, unit_dc)
+            .map_err(|e| e.to_string())?,
+    ),
+    (
+        "周波数標本化",
+        design_fir_frequency_sampling(
+            n,
+            even,
+            &knots,
+            &[1.0, 1.0, 0.0, 0.0],
+            1024,
+            None,
+            unit_dc,
+        )
+        .map_err(|e| e.to_string())?,
+    ),
+    (
+        "重み付き最小二乗",
+        design_fir_least_squares(n, even, &bands).map_err(|e| e.to_string())?,
+    ),
+    (
+        "Remez 交換法",
+        design_fir_remez(n, even, &bands).map_err(|e| e.to_string())?,
+    ),
+];
+
+// 独立な検算: 直接の和で A(f) を評価し、帯域ごとの誤差を測る（台形則で E を積分する）
+let step = 1.0 / 4000.0;
+let mut rows = Vec::new();
+let mut series = Vec::new();
+for (name, design) in &designs {
+    let h = design.coefficients();
+    let (mut pass_dev, mut stop_max, mut energy) = (0.0_f64, 0.0_f64, 0.0);
+    for (lower, upper, desired, weight) in [
+        (0.0, pass_edge, 1.0, 1.0),
+        (stop_edge, 1.0, 0.0, stop_weight),
+    ] {
+        let count = ((upper - lower) / step).round() as usize;
+        for j in 0..=count {
+            let error = zero_phase_amplitude(h, false, lower + j as f64 * step) - desired;
+            let end = if j == 0 || j == count { 0.5 } else { 1.0 };
+            energy += end * step * weight * error * error;
+            if desired == 1.0 {
+                pass_dev = pass_dev.max(error.abs());
+            } else {
+                stop_max = stop_max.max(error.abs());
+            }
+        }
+    }
+    let attenuation = -20.0 * scioxide_core::RealScalar::log10(stop_max);
+    let weighted = pass_dev.max(stop_weight * stop_max);
+    let termination = format!("{:?}", design.termination());
+    rows.push((
+        name.to_string(),
+        termination,
+        pass_dev,
+        stop_max,
+        attenuation,
+        weighted,
+        energy,
+        design.condition_estimate(),
+    ));
+    let points: Vec<[f64; 2]> = (0..=800)
+        .map(|i| i as f64 / 800.0)
+        .map(|f| [f, zero_phase_amplitude(h, false, f).abs()])
+        .filter(|p| p[1] > 0.0)
+        .collect();
+    series.push(serde_json::json!({ "name": name, "points": points }));
+}
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed1 = serde_json::json!({ "fractionDigits": 1 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "方法" },
+    { "key": "1", "label": "終了状態" },
+    { "key": "2", "label": "通過域の最大偏差 [-]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "阻止域の最大振幅 [-]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "阻止域の減衰 [dB]", "type": "number", "format": fixed1 },
+    { "key": "5", "label": "重み付き最大誤差 δ [-]", "type": "number", "format": sci3 },
+    { "key": "6", "label": "重み付き二乗誤差 E [-]", "type": "number", "format": sci3 },
+    { "key": "7", "label": "条件数の推定値 [-]", "type": "number", "format": sci3, "nullText": "解かない" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "methods" })
+);
+emit_chart!(serde_json::json!({
+    "kind": "line",
+    "dataZoom": true,
+    "tooltip": true,
+    "series": series,
+    "xLabel": "周波数 f [Nyquist 比]",
+    "yLabel": "振幅 |H| [-]",
+    "yType": "log",
+    "yMin": 1e-6,
+    "yMax": 2.0,
+    "annotations": [
+        { "kind": "line", "axis": "x", "value": pass_edge, "label": "通過域の端" },
+        { "kind": "line", "axis": "x", "value": stop_edge, "label": "阻止域の端" }
+    ]
+}));
+```
+
+既定の $n = 41$、$W = 10$ では、Remez 法の重み付き最大誤差は $\delta = 2.98 \times 10^{-2}$ で四つの中で最も小さく、阻止域の減衰は 50.5 dB になる。
+通過域の最大偏差 $2.98 \times 10^{-2}$ と阻止域の最大振幅の 10 倍 $2.98 \times 10^{-2}$ が一致するのは、重み付き誤差が等リプルになっているからである。
+一方、重み付き二乗誤差 $E$ は最小二乗法の $2.85 \times 10^{-5}$ が最も小さく、Remez 法の $1.59 \times 10^{-4}$ はその約 5.6 倍である。
+二つの方法は別の基準の最適解であり、どちらが良いかは仕様が最大誤差と誤差のエネルギーのどちらで書かれているかで決まる。
+窓関数法（22.2 dB）と周波数標本化（26.3 dB）は重みを使わず、阻止域の減衰が浅い。
+
+$n = 81$ にすると、阻止域の減衰は窓関数法で 53.6 dB、最小二乗法で 64.6 dB、Remez 法で 80.2 dB に深くなる。
+周波数標本化は 32.0 dB にとどまる。
+矩形ウインドウでは格子点の間のリプルが $n$ によらず残るからである。
+最小二乗の正規方程式の条件数の推定値は $n = 21$、$W = 1$ の $16.9$ から $n = 81$ の $3.0 \times 10^{5}$ まで増える。
+図の阻止域では、Remez 法の振幅の山がそろい、ほかの方法では遮断から離れるほど山が低くなる。
+
+## 交代定理による等リプルの検算
+
+次のセルは、Remez 法の結果が交代定理の条件を満たすかを、設計とは独立に確かめる。
+設計は四種類から選ぶ。
+
+- 低域通過（I 型）: 通過域 $[0, 0.2]$ で 1、阻止域 $[0.3, 1]$ で 0（重み 10）
+- 帯域通過（I 型）: $[0, 0.15]$ と $[0.65, 1]$ で 0、$[0.25, 0.55]$ で 1
+- Hilbert 変換器（III 型）: $[0.05, 0.95]$ で 1
+- 微分器（IV 型）: $[0, 0.9]$ で $D(f) = \pi f$（$H = i\omega$ の振幅 $\omega$）
+
+入力は独立な係数の個数 $m$ と反復の上限で、$n$ は型に合わせて $2m - 1$（I 型）、$2m + 1$（III 型）、$2m$（IV 型）にする。
+オプション付き形式 `design_fir_remez_with_options` を使うので、反復の上限に達しても最後の係数が返る。
+検算では、帯域を $\Delta f = 10^{-4}$ の密な格子で評価し、重み付き誤差 $E(f)$ の極値のうち大きさが最大値の 99 % 以上のものを取り出す。
+符号が交互になるように並べた極値の個数が、交代定理の要求する $m + 1$ 以上かを数える。
+表には、設計が返した格子の上のリプルと、密な格子で測った最大誤差の相対差も示す。
+図の破線は $\pm$`weighted_ripple()`、記号は最後の参照点 `extrema()` での誤差である。
+セルの最後の判定は `FirTermination` から決める（`Converged` なら satisfied、`IterationLimit` と `ExchangeStalled` は最後の係数を返すので partial）。
+
+```rust
+//| id: signal-fir-remez-alternation
+//| ref: signal-fir-remez-alternation
+//| title: Remez 法の等リプルを交代点の数で確かめる
+//| run: reactive
+//| uses: [signal-fir-amplitude]
+//| crates: [scioxide-signal]
+//| inputs:
+//|   design: {"type":"select","label":"設計","description":"帯域と型の組を選ぶ。","options":["低域通過（I 型）","帯域通過（I 型）","Hilbert 変換器（III 型）","微分器（IV 型）"],"value":"低域通過（I 型）"}
+//|   independent: {"type":"range","label":"独立な係数の個数 m","description":"交代定理は m + 1 個以上の交代点を要求する。","min":8,"max":32,"step":1,"value":16}
+//|   max_iterations: {"type":"range","label":"反復の上限","description":"小さくすると交換が収束する前に止まる。","min":1,"max":64,"step":1,"value":64}
+//| cases:
+//|   - {"id":"bandpass","label":"帯域通過（I 型）","description":"三つの帯域にまたがって交代点が並ぶ。","inputs":{"design":"帯域通過（I 型）"}}
+//|   - {"id":"hilbert","label":"Hilbert 変換器（III 型）","description":"A(0) = A(1) = 0 が強制されるので、帯域を両端から離して置く。","inputs":{"design":"Hilbert 変換器（III 型）"}}
+//|   - {"id":"differentiator","label":"微分器（IV 型）","description":"一次式の希望振幅を近似する。","inputs":{"design":"微分器（IV 型）"}}
+//|   - {"id":"one-iteration","label":"反復 1 回","description":"交換が終わらず IterationLimit で止まり、交代点が足りない。","inputs":{"max_iterations":1}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"alternation","path":"/rows/0/1","equals":17}
+//|       - {"artifact":"alternation","path":"/rows/0/2","equals":17}
+//|       - {"artifact":"alternation","path":"/rows/0/4","approx":{"value":8.4612e-2,"rtol":1e-4}}
+//|       - {"artifact":"alternation","path":"/rows/0/6","range":{"min":0,"max":3e-3}}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+//|   - case: bandpass
+//|     expect:
+//|       - {"artifact":"alternation","path":"/rows/0/2","equals":17}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+//|   - case: hilbert
+//|     expect:
+//|       - {"artifact":"alternation","path":"/rows/0/0","equals":33}
+//|       - {"artifact":"alternation","path":"/rows/0/2","equals":17}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+//|   - case: differentiator
+//|     expect:
+//|       - {"artifact":"alternation","path":"/rows/0/0","equals":32}
+//|       - {"artifact":"alternation","path":"/rows/0/2","equals":17}
+//|       - {"artifact":"alternation","path":"/rows/0/4","approx":{"value":7.0716e-5,"rtol":1e-3}}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+//|   - case: one-iteration
+//|     expect:
+//|       - {"artifact":"alternation","path":"/rows/0/2","range":{"min":0,"max":16}}
+//|       - {"path":"/outputs/2/state","equals":"partial"}
+//|       - {"path":"/outputs/2/status","equals":"IterationLimit"}
+use scioxide_signal::{
+    FirBand, FirSymmetry, FirTermination, RemezOptions, design_fir_remez_with_options,
+};
+
+let m = independent.round() as usize;
+let pi = std::f64::consts::PI;
+// 設計ごとに (n, 対称性, 帯域) を決める
+let (n, symmetry, bands) = match design.as_str() {
+    "帯域通過（I 型）" => (
+        2 * m - 1,
+        FirSymmetry::Even,
+        vec![
+            FirBand::new(0.0, 0.15, 0.0, 0.0),
+            FirBand::new(0.25, 0.55, 1.0, 1.0),
+            FirBand::new(0.65, 1.0, 0.0, 0.0),
+        ],
+    ),
+    "Hilbert 変換器（III 型）" => (
+        2 * m + 1,
+        FirSymmetry::Odd,
+        vec![FirBand::new(0.05, 0.95, 1.0, 1.0)],
+    ),
+    "微分器（IV 型）" => (
+        2 * m,
+        FirSymmetry::Odd,
+        vec![FirBand::new(0.0, 0.9, 0.0, 0.9 * pi)],
+    ),
+    _ => (
+        2 * m - 1,
+        FirSymmetry::Even,
+        vec![
+            FirBand::new(0.0, 0.2, 1.0, 1.0),
+            FirBand::new(0.3, 1.0, 0.0, 0.0).with_weight(10.0),
+        ],
+    ),
+};
+let options = RemezOptions::new().with_max_iterations(max_iterations.round() as usize);
+let result =
+    design_fir_remez_with_options(n, symmetry, &bands, options).map_err(|e| e.to_string())?;
+let h = result.coefficients();
+let odd = symmetry == FirSymmetry::Odd;
+let ripple = result
+    .weighted_ripple()
+    .ok_or("Remez 法はリプルを返す")?;
+
+// 独立な検算: 密な格子で E(f) = W (A − D) を評価し、帯域ごとに極値を集める
+let weighted_error = |b: &FirBand<f64>, f: f64| {
+    let t = (f - b.lower()) / (b.upper() - b.lower());
+    let desired = b.desired_lower() + t * (b.desired_upper() - b.desired_lower());
+    b.weight() * (zero_phase_amplitude(h, odd, f) - desired)
+};
+let mut curves = Vec::new();
+let mut extrema: Vec<f64> = Vec::new();
+let mut largest = 0.0_f64;
+for b in &bands {
+    let count = ((b.upper() - b.lower()) / 1e-4).round() as usize;
+    let e: Vec<[f64; 2]> = (0..=count)
+        .map(|j| b.lower() + (b.upper() - b.lower()) * j as f64 / count as f64)
+        .map(|f| [f, weighted_error(b, f)])
+        .collect();
+    for j in 0..e.len() {
+        let left = if j == 0 { 0.0 } else { e[j - 1][1] };
+        let right = if j + 1 == e.len() { 0.0 } else { e[j + 1][1] };
+        let v = e[j][1];
+        if (v >= left && v >= right && v > 0.0) || (v <= left && v <= right && v < 0.0) {
+            extrema.push(v);
+        }
+        largest = largest.max(v.abs());
+    }
+    // 図には 10 点ごとに間引いた曲線を渡す
+    curves.push(e.iter().step_by(10).copied().collect::<Vec<_>>());
+}
+// 99 % 以上の極値を周波数の順に並べ、同じ符号が続けば大きいほうを残す
+let mut alternation: Vec<f64> = Vec::new();
+for &v in extrema.iter().filter(|v| v.abs() >= 0.99 * largest) {
+    match alternation.last_mut() {
+        Some(last) if last.signum() == v.signum() => {
+            *last = if v.abs() > last.abs() { v } else { *last }
+        }
+        _ => alternation.push(v),
+    }
+}
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "係数の個数 n", "type": "integer" },
+    { "key": "1", "label": "必要な交代点 m + 1", "type": "integer" },
+    { "key": "2", "label": "見つけた交代点", "type": "integer" },
+    { "key": "3", "label": "反復回数", "type": "integer" },
+    { "key": "4", "label": "格子上のリプル [-]", "type": "number", "format": sci3 },
+    { "key": "5", "label": "密な格子の最大誤差 [-]", "type": "number", "format": sci3 },
+    { "key": "6", "label": "相対差 [-]", "type": "number", "format": sci3 }
+]);
+let row = (
+    n,
+    m + 1,
+    alternation.len(),
+    result.iterations(),
+    ripple,
+    largest,
+    (largest - ripple) / ripple,
+);
+emit_table_with_columns!(
+    columns,
+    vec![row],
+    metadata = serde_json::json!({ "id": "alternation" })
+);
+
+// 帯域ごとの誤差の曲線と、最後の参照点での誤差を重ねて描く
+let mut layers: Vec<serde_json::Value> = curves
+    .iter()
+    .enumerate()
+    .map(|(k, e)| {
+        serde_json::json!({
+            "id": format!("band-{k}"),
+            "kind": "line",
+            "name": format!("帯域 {}", k + 1),
+            "points": e,
+            "style": { "showSymbol": false }
+        })
+    })
+    .collect();
+let reference: Vec<[f64; 2]> = result
+    .extrema()
+    .iter()
+    .filter_map(|&f| {
+        bands
+            .iter()
+            .find(|b| b.lower() <= f && f <= b.upper())
+            .map(|b| [f, weighted_error(b, f)])
+    })
+    .collect();
+layers.push(serde_json::json!({
+    "id": "reference",
+    "kind": "scatter",
+    "name": "参照点",
+    "points": reference
+}));
+let dashed = serde_json::json!({ "lineType": "dashed" });
+emit_chart!(serde_json::json!({
+    "kind": "xy",
+    "xLabel": "周波数 f [Nyquist 比]",
+    "yLabel": "重み付き誤差 W(A − D) [-]",
+    "layers": layers,
+    "annotations": [
+        { "kind": "line", "axis": "y", "value": ripple, "label": "+δ", "style": dashed },
+        { "kind": "line", "axis": "y", "value": -ripple, "label": "−δ", "style": dashed }
+    ]
+}));
+
+let termination = result.termination();
+let outcome = if termination == FirTermination::Converged {
+    Outcome::satisfied("交互の誤差の広がりが許容誤差を満たした")
+} else {
+    Outcome::partial("交換が収束する前に止まった")
+        .explanation("係数は最後の参照点での近似であり、等リプルではない。")
+};
+emit_outcome!(
+    outcome
+        .status(format!("{termination:?}"))
+        .diagnostic("反復回数", result.iterations() as f64, None)
+        .diagnostic("格子上のリプル", ripple, None)
+        .diagnostic(
+            "交代点の不足",
+            (m + 1) as f64 - alternation.len().min(m + 1) as f64,
+            None
+        )
+);
+```
+
+既定の低域通過（$m = 16$、$n = 31$）は 4 回の反復で `Converged` になり、密な格子で 17 個の交代点が見つかる。
+これは交代定理の要求 $m + 1 = 17$ と一致する。
+格子の上のリプル $8.461 \times 10^{-2}$ は、密な格子で測った最大誤差 $8.472 \times 10^{-2}$ より 0.12 % 小さい。
+格子の点は真の極値の位置から少しずれるので、`weighted_ripple()` は連続な帯域の上の最大誤差をわずかに過小に見積もる。
+帯域通過、Hilbert 変換器（$n = 33$）、微分器（$n = 32$）でも 17 個の交代点がそろい、相対差は 0.07〜0.16 % である。
+微分器のリプル $7.07 \times 10^{-5}$ は小さいが、これは $D(f) = \pi f$ に対する絶対誤差であり、低い周波数での相対誤差は大きくなる。
+
+反復の上限を 1 にすると、終了状態は `IterationLimit` になり、判定は partial に変わる。
+このとき 99 % の基準を満たす極値は 1 個しかなく、誤差の山の高さがそろっていない。
+最後の係数は有限の近似として返るが、等リプルの性質も最良性も持たない。
+
+## 設計した係数の適用
+
+`FirDesign` の係数は畳み込みの順に並んでいる。
+一つの記録には `convolve(input, design.coefficients())` を使い、長さ $L + n - 1$ の全体の畳み込みを得る。
+同じ係数で何度も処理する場合や、チャンクに分けて逐次に処理する場合は、`design.to_polyphase()` が返す `PolyphasePlan` を使う。
+変換は $O(n)$ で、係数を標本の型（実数か複素数）に写す。
+線形位相の出力は $c = (n-1)/2$ 標本だけ遅れるので、入力と時刻をそろえるにはこの遅れを差し引く。
+畳み込みの規約と逐次処理は[畳み込みと相関](../convolution-and-correlation/)と[リサンプリング](../resampling/)で扱う。
+
+## 最小位相への変換
+
+$H(z) = \sum_k h[k] z^{-k}$ の零点がすべて単位円の内側か円周上にあるフィルタを**最小位相**という。
+同じ振幅応答 $|H|$ を持つ同じ長さの因果的な FIR の中で、最小位相のものは、どの $k$ についても先頭からの部分エネルギー $\sum_{j \le k} h[j]^2$ が最大になる。
+線形位相のフィルタより遅れが短いので、遅延を嫌う実時間の処理で使う。
+
+### ケプストラムによる方法
+
+最小位相の列 $h_{\min}$ について、複素ケプストラム $\hat h = \mathcal{F}^{-1}\{\log H_{\min}\}$ は因果的（負の添字で 0）になる。
+実ケプストラム $c = \mathcal{F}^{-1}\{\log |H|\}$ は $\hat h$ の偶部なので、$c$ を正の添字へ折り返せば $\hat h$ が戻る。
+`MinimumPhaseMethod::Homomorphic` は、長さ $L$ の FFT の格子でこの手順を実行する。
+
+1. 目標の振幅 $M$ の対数から $c = \mathrm{IDFT}(\log M)$ を求める。
+2. $\hat c[0] = c[0]$、$0 < k < L/2$ で $\hat c[k] = 2c[k]$、$\hat c[L/2] = c[L/2]$、それより後を 0 にする。
+3. $\mathrm{IDFT}(\exp(\mathrm{DFT}(\hat c)))$ の先頭の係数を返し、$h_{\min}[0]$ が正の実数になるように回転する。
+
+計算コストは長さ $L$ の FFT 数回で $O(L \log L)$ である。
+有限の $L$ ではケプストラムが折り返すので、既定の $L$ は $\max(200(N-1), N)$ 以上の最小の 2 の冪にしてあり、格子を自動で細かくしない。
+実数と複素数の係数を受け付ける。
+
+`MinimumPhaseMethod::Hilbert` は、奇数長（3 以上）の実数の I 型線形位相 FIR（等リプルの設計など）に使う。
+零位相振幅 $A$ の最小値 $A_{\min}$ が負なら $\delta = \max(0, -A_{\min})$ だけ持ち上げ、正規化 $\nu = \bigl(2/(\sqrt{A_{\max}+\delta} + \sqrt{2 - A_{\max} + \delta})\bigr)^2$ を掛けた $\sqrt{\nu (A + \delta)}$ を目標の振幅にし、対数振幅の離散 Hilbert 変換で位相を求める。
+`HalfLength` の規約に限られ、入力の対称性を許容誤差（`with_symmetry_tolerance`）で確かめる。
+
+### 規約と振幅の零点
+
+`MinimumPhaseConvention::SameLength` は $N$ 個の係数で $|H|$ を近似し、`HalfLength` は $\lceil N/2 \rceil$ 個の係数で $\sqrt{|H|}$ を近似する。
+線形位相のフィルタでは、`HalfLength` の結果は最小位相のスペクトル因子で、二回通すと元の振幅に戻る。
+
+$\log M$ は振幅の零点で発散する。
+`SpectralZeroPolicy::Regularize { relative_floor }` は、最大値に対する比が下限より小さい振幅を下限に置き換え（既定の下限は $32\varepsilon$）、`Reject { relative_threshold }` は比がしきい値以下の格子点があれば `InvalidInput` を返す。
+しきい値と下限は $(0, 1)$ に限られる。
+
+### API と診断
+
+ワンショット呼び出しの `minimum_phase(&h)` は既定の設定（`Homomorphic`、`HalfLength`、既定の格子長、$32\varepsilon$ の下限）で係数だけを返す。
+規約や格子を選ぶとき、診断を読むときは `minimum_phase_with_options(&h, options)` を使い、係数と `MinimumPhaseDiagnostics` の組を受け取る。
+同じ長さのフィルタを繰り返し変換するときは `MinimumPhasePlan::new(input_len, options)` を一度準備し、`workspace(())` で作った作業領域（複素数 $3L$ 個と FFT の作業領域）を `reconstruct_into(input, output, workspace, cx)` に渡す。
+`reconstruct_into` は失敗したとき `output` を変えない。
+
+`MinimumPhaseDiagnostics` の値は格子の上で測った推定値であり、格子点の間の誤差の上界ではない。
+
+- `fft_length()`: 格子の長さ $L$
+- `spectral_ratio()`: 下限を課す前の、目標の振幅の最小値と最大値の比（0 なら格子が零点を標本化した）
+- `regularized_bins()` と `relative_floor()`: 下限に置き換えた格子点の数と、使った下限
+- `magnitude_error()`: 結果の振幅と目標の振幅の差の最大値を、目標の最大値で割った値
+- `discarded_energy_fraction()`: 返さなかった後ろの係数のエネルギーの割合
+- `hilbert_lift()` と `hilbert_normalization()`: Hilbert の方法の $\delta$ と $\nu$（ケプストラムの方法では 0 と 1）
+
+入力が空なら `InvalidInput`、係数がすべて 0 なら `DomainError`、FFT の長さが入力より短ければ `InvalidInput`、振幅の範囲が表せなければ `NumericalInstability` になる。
+
+### 最小二乗の低域通過を最小位相にする
+
+次のセルは、最小二乗法で設計した I 型の低域通過（通過域 $[0, 0.3]$、阻止域 $[0.4, 1]$、阻止域の重み 10）を `minimum_phase_with_options` で最小位相に変換する。
+入力は係数の個数 $N$ と規約（チェックすると `HalfLength`）である。
+検算として、変換前後の係数から周波数応答を直接の和で 401 点に計算し、振幅の差の最大値を元の振幅の最大値との比で示す（`HalfLength` では結果の振幅の 2 乗と比べる）。
+図は、最小位相の列と、その時間反転（同じ振幅で零点が単位円の外にある最大位相の列）の部分エネルギーの累積を比べる。
+
+```rust
+//| id: signal-minimum-phase-fir
+//| ref: signal-minimum-phase-fir
+//| title: 線形位相のローパス FIR を最小位相に変換する
+//| run: reactive
+//| crates: [scioxide-signal]
+//| inputs:
+//|   taps: {"type":"range","label":"係数の個数 N","description":"奇数の I 型線形位相 FIR の長さ。","min":21,"max":61,"step":4,"value":41}
+//|   half_length: {"type":"checkbox","label":"半分の長さ（√|H| を近似）","description":"HalfLength 規約で ⌈N/2⌉ 個の係数を返す。","value":false}
+//| cases:
+//|   - {"id":"half-length","label":"HalfLength","description":"21 個の係数で √|H| を近似し、振幅の差が大きくなる。","inputs":{"half_length":true}}
+//|   - {"id":"short","label":"N = 21","description":"係数が少ないと最小二乗の条件数が小さい。","inputs":{"taps":21}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"conversion","path":"/rows/0/2","equals":41}
+//|       - {"artifact":"conversion","path":"/rows/0/3","equals":8192}
+//|       - {"artifact":"conversion","path":"/rows/0/5","approx":{"value":9.63e-6,"rtol":1e-2}}
+//|       - {"artifact":"conversion","path":"/rows/0/6","approx":{"value":2.11e-6,"rtol":1e-2}}
+//|       - {"artifact":"conversion","path":"/rows/0/7","approx":{"value":1.05e-7,"rtol":2e-2}}
+//|   - case: half-length
+//|     expect:
+//|       - {"artifact":"conversion","path":"/rows/0/2","equals":21}
+//|       - {"artifact":"conversion","path":"/rows/0/6","approx":{"value":2.53e-2,"rtol":1e-2}}
+//|   - case: short
+//|     expect:
+//|       - {"artifact":"conversion","path":"/rows/0/1","approx":{"value":79.49,"rtol":1e-3}}
+//|       - {"artifact":"conversion","path":"/rows/0/3","equals":4096}
+use scioxide_signal::{
+    FirBand, FirSymmetry, MinimumPhaseConvention, MinimumPhaseOptions,
+    design_fir_least_squares, minimum_phase_with_options,
+};
+
+let n = taps.round() as usize;
+// 通過域 [0, 0.3]、阻止域 [0.4, 1]（Nyquist 比）。阻止域の重みを大きくする
+let band = |lower, upper, desired, weight| {
+    FirBand::new(lower, upper, desired, desired).with_weight(weight)
+};
+let design = design_fir_least_squares(
+    n,
+    FirSymmetry::Even,
+    &[band(0.0, 0.3, 1.0, 1.0), band(0.4, 1.0, 0.0, 10.0)],
+)
+.map_err(|e| e.to_string())?;
+let h = design.coefficients();
+
+let convention = if half_length {
+    MinimumPhaseConvention::HalfLength
+} else {
+    MinimumPhaseConvention::SameLength
+};
+let options = MinimumPhaseOptions::default().with_convention(convention);
+let (h_min, report) = minimum_phase_with_options(h, options).map_err(|e| e.to_string())?;
+
+// 独立な検算: 周波数応答を直接の和で求める（f64 の固有メソッドによる参照計算）
+let response = |c: &[f64], f: f64| {
+    let (mut re, mut im) = (0.0, 0.0);
+    for (k, &b) in c.iter().enumerate() {
+        let phase = std::f64::consts::PI * f * k as f64;
+        re += b * phase.cos();
+        im -= b * phase.sin();
+    }
+    re.hypot(im)
+};
+let power = if half_length { 2 } else { 1 };
+let grid: Vec<f64> = (0..=400).map(|i| i as f64 / 400.0).collect();
+let peak = grid.iter().map(|&f| response(h, f)).fold(0.0_f64, f64::max);
+let magnitude_gap = grid
+    .iter()
+    .map(|&f| (response(&h_min, f).powi(power) - response(h, f)).abs())
+    .fold(0.0_f64, f64::max)
+    / peak;
+
+// 部分エネルギー: 最小位相の列と、その時間反転（同じ振幅の最大位相の列）
+let total: f64 = h_min.iter().map(|x| x * x).sum();
+let partial = |c: &mut dyn Iterator<Item = f64>| {
+    let mut sum = 0.0;
+    c.enumerate()
+        .map(|(k, x)| {
+            sum += x * x;
+            [k as f64, sum / total]
+        })
+        .collect::<Vec<_>>()
+};
+let forward = partial(&mut h_min.iter().copied());
+let reversed = partial(&mut h_min.iter().rev().copied());
+
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "FIR の終了状態" },
+    { "key": "1", "label": "正規方程式の条件数の推定値 [-]", "type": "number", "format": sci2 },
+    { "key": "2", "label": "出力の係数の個数", "type": "integer" },
+    { "key": "3", "label": "FFT の格子の長さ L", "type": "integer" },
+    { "key": "4", "label": "下限に置き換えた格子点", "type": "integer" },
+    { "key": "5", "label": "診断の振幅誤差 [-]", "type": "number", "format": sci2 },
+    { "key": "6", "label": "直接の和による振幅の差 [-]", "type": "number", "format": sci2 },
+    { "key": "7", "label": "捨てたエネルギーの割合 [-]", "type": "number", "format": sci2 }
+]);
+let row = (
+    format!("{:?}", design.termination()),
+    design.condition_estimate(),
+    h_min.len(),
+    report.fft_length(),
+    report.regularized_bins(),
+    report.magnitude_error(),
+    magnitude_gap,
+    report.discarded_energy_fraction(),
+);
+emit_table_with_columns!(
+    columns,
+    vec![row],
+    metadata = serde_json::json!({ "id": "conversion" })
+);
+emit_chart!(
+    serde_json::json!({
+        "kind": "line",
+        "dataZoom": true,
+        "tooltip": true,
+        "series": [
+            { "name": "最小位相", "points": forward },
+            { "name": "時間反転（最大位相）", "points": reversed, "style": { "lineType": "dashed" } }
+        ],
+        "xLabel": "係数の添字 k [-]",
+        "yLabel": "部分エネルギーの割合 [-]",
+        "yMin": 0.0,
+        "yMax": 1.0
+    }),
+    metadata = serde_json::json!({ "id": "energy" })
+);
+```
+
+既定の $N = 41$、`SameLength` では、FFT の格子は 8192 点、診断の振幅誤差は $9.6 \times 10^{-6}$、直接の和で求めた振幅の差は最大値の $2.1 \times 10^{-6}$ で、捨てたエネルギーは $1.0 \times 10^{-7}$ である。
+二つの誤差は測る格子が違う（8192 点と 401 点）ので一致しないが、どちらも同じ桁の小ささで、格子の上の診断と独立な計算が矛盾しないことを示す。
+図の実線（最小位相）は破線（時間反転）より常に上にあり、エネルギーが先頭に集まっている。
+最小二乗の正規方程式の条件数の推定値は $N = 21$ で $79$、$N = 41$ で $7.9 \times 10^{2}$、$N = 61$ で $2.0 \times 10^{4}$ と増える。
+
+`HalfLength` に切り替えると 21 個の係数で $\sqrt{|H|}$ を近似し、直接の和による振幅の差は最大値の $2.5 \times 10^{-2}$ に増える（診断の振幅誤差は $\sqrt{|H|}$ の尺度で $7.7 \times 10^{-2}$）。
+最小二乗の設計は阻止域で零位相振幅の符号が変わるので、そこで $\sqrt{|H|}$ が尖り、短い FIR では表せないからである。
+この場合は、零位相振幅を持ち上げて非負にしてから平方根を取る Hilbert の方法か、`SameLength` を選ぶ。
+
+## まとめ
+
+線形位相の FIR は型ごとに強制零があり、高域通過には I 型か IV 型、Hilbert 変換器には III 型、微分器には IV 型を選ぶ。
+最大誤差で仕様を書くなら Remez 交換法、誤差のエネルギーなら重み付き最小二乗、閉じた形で手早く作るなら窓関数法か周波数標本化を使う。
+Remez 法では `termination()` を確かめ、`weighted_ripple()` は格子の上の推定値として読み、必要なら密な格子で交代点を数えて等リプルを検算できる。
+遅れを短くしたいときは `minimum_phase_with_options` で最小位相に変換し、`MinimumPhaseDiagnostics` と独立な周波数応答で振幅の誤差を確かめる。
+フィードバックを持つ短い次数のフィルタは [IIR フィルタの設計](../iir-design/)で、ウインドウの選び方は[窓関数と DPSS](../windows-and-dpss/)で扱う。

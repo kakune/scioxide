@@ -1,0 +1,291 @@
+---
+title: "Overlapping Schwarz methods"
+description: "Subdomains and local solves, weighted additive/restricted additive/multiplicative Schwarz combinations, one-level limitations and unavailable methods, SchwarzPlan validation, plan storage and accounting, and iteration counts versus overlap and subdomain count."
+sidebar:
+  order: 345
+references:
+  sparse-schwarz-accounting: "plan-storage-and-accounting"
+  sparse-schwarz-kinds: "three-combinations"
+  sparse-schwarz-one-level: "one-level-methods-and-unavailable-capabilities"
+  sparse-schwarz-plan: "constructing-and-validating-schwarzplan"
+---
+
+Domain decomposition preconditions a large sparse system by combining solutions of smaller systems on subsets of unknowns.
+Each smaller system can use sparse direct or incomplete factorization; additive combinations solve subdomains independently and can run in parallel.
+Overlapping neighboring subdomains allows local solves to correct errors crossing their boundaries.
+This page explains the 3 overlapping-Schwarz combinations, checks and omissions in `SchwarzPlan`, and iteration accounting, then examines overlap and subdomain-count effects on a two-dimensional Poisson equation.
+[Incomplete factorizations and iterative-method preconditioning](oxref:sparse-preconditioning-role) explains what preconditioned iterations solve.
+
+## Subdomains and local solves
+
+Overlapping domain decomposition first partitions unknowns into $s$ disjoint **owned sets**, then expands each by $\delta$ graph-adjacency layers to form subdomains $\Omega_1, \dots, \Omega_s$.
+Neighboring subdomains overlap by $2\delta$ layers.
+Let $\mathbf{R}_i$ restrict to subdomain-$i$ unknowns, $\mathbf{A}_i = \mathbf{R}_i\mathbf{A}\mathbf{R}_i^{\mathsf{T}}$ be the local matrix, and $\mathbf{M}_i \approx \mathbf{A}_i^{-1}$ its inverse action (local solve).
+$\mathbf{M}_i$ may be a sparse direct solve or an approximation such as incomplete factorization.
+
+## Three combinations
+
+`SchwarzKind` combines preconditioner action $\mathbf{z}$ on residual $\mathbf{r}$ in 3 ways.
+
+- **Additive Schwarz** (`Additive`) computes local corrections simultaneously, weights them by each subdomain's diagonal $\mathbf{W}_i$, and sums them.
+
+  $$
+  \mathbf{z} = \sum_i \mathbf{R}_i^{\mathsf{T}}\mathbf{W}_i\mathbf{M}_i\mathbf{R}_i\mathbf{r}
+  $$
+
+  Choose weights summing to 1 at every unknown (a partition of unity).
+  The weighted form is generally non-Hermitian; combine it with GMRES or similar rather than CG.
+  Classical unweighted additive Schwarz ($\mathbf{W}_i = \mathbf{I}$) is Hermitian, but overlap makes weight sums differ from 1, so `SchwarzPlan` cannot represent it.
+  Only when every unknown belongs to exactly $c$ subdomains can $\mathbf{W}_i = \mathbf{I}/c$ represent it up to a constant factor.
+- **Restricted additive Schwarz** (`RestrictedAdditive`) uses weight 1 on owned sets and 0 elsewhere, writing each correction only on its owned set.
+  It requires less communication and often converges faster than classical additive Schwarz (Cai and Sarkis, 1999).
+- **Multiplicative Schwarz** (`Multiplicative`) solves subdomains sequentially in supplied order, updating the residual each time.
+
+  $$
+  \mathbf{z} \leftarrow \mathbf{0}, \qquad \mathbf{z} \leftarrow \mathbf{z} + \mathbf{R}_i^{\mathsf{T}}\mathbf{M}_i\mathbf{R}_i(\mathbf{r} - \mathbf{A}\mathbf{z}) \quad (i = 1, \dots, s)
+  $$
+
+  Writing the full preconditioner action $\mathbf{r} \mapsto \mathbf{z}$ as $\mathbf{M}^{-1}$ gives $\mathbf{I} - \mathbf{M}^{-1}\mathbf{A} = (\mathbf{I} - \mathbf{\Pi}_s)\cdots(\mathbf{I} - \mathbf{\Pi}_1)$ ($\mathbf{\Pi}_i = \mathbf{R}_i^{\mathsf{T}}\mathbf{A}_i^{-1}\mathbf{R}_i\mathbf{A}$) for $\mathbf{M}_i = \mathbf{A}_i^{-1}$, corresponding to block Gauss–Seidel.
+  It performs only one forward sweep, so this preconditioner is also non-Hermitian.
+  It requires the full operator and runs sequentially even under a parallel policy.
+
+## One-level methods and unavailable capabilities
+
+Increasing overlap $\delta$ generally reduces iterations but enlarges local systems.
+One-level Schwarz without coarse-space correction propagates information only to adjacent subdomains per application, so more subdomains require more iterations.
+Reducing global errors requires a coarse correction such as multigrid.
+
+`SchwarzPlan` provides only the 3 one-level methods above, excluding classical overlapping additive Schwarz ($\mathbf{W}_i = \mathbf{I}$) and two-level methods with coarse-space correction.
+If either is needed, implement scioxide-core `Preconditioner` and combine local solves and corrections yourself.
+For grid-independent convergence, use `AmgPreconditioner` from [Algebraic multigrid preconditioning](../algebraic-multigrid/).
+
+## Constructing and validating SchwarzPlan
+
+`SchwarzPlan::new(dimension, kind, subdomains, operator)` validates and copies subdomain indices and weights while borrowing local solves and the full operator.
+`SchwarzPlan::with_options(dimension, kind, subdomains, operator, options)` constructs the same plan using tolerances and limits in `SchwarzOptions`.
+`SchwarzSubdomainView` contains strictly increasing global indices `indices`, weights `weights` for the 2 additive methods, and local solve `solve` (`SchwarzLocalSolveView::InverseOperator(&op)` or `Preconditioner(&p)`).
+The plan checks the following, returning `InvalidInput` or `DimensionMismatch` on failure (`NonFinite` for NaN/infinite weights).
+
+- Nonempty subdomains with in-range, strictly increasing indices and local-solve dimension equal to index count.
+- For both additive methods, weights in [0, 1] whose sum at each unknown is positive and equal to 1.
+  Additive Schwarz permits tolerance `SchwarzOptions::with_partition_tolerance` (default `Tolerance::from_machine_epsilon()`); restricted additive requires exact sum 1 and weights only 0 or 1.
+  Positive sums also establish that every unknown belongs to some subdomain.
+- Multiplicative Schwarz takes no weights and requires full operator `SchwarzOperatorView::Sparse(view)` or `MatrixFree(&op)`; neither additive method takes a full operator.
+  Multiplicative Schwarz accepts uncovered unknowns, leaving their corrections 0.
+
+## Plan storage and accounting
+
+`with_max_plan_bytes` and `with_max_workspace_bytes` in `SchwarzOptions::new()` bound logical plan and workspace bytes (unlimited by default); read usage through `plan_bytes()` and `preparation_peak_bytes()`.
+Multiplicative sparse operators recompute residuals only for rows changed by local corrections; matrix-free operators apply the full operator after every correction.
+The additive methods distribute subdomains among workers according to `SparseSolveOptions`'s execution policy at application time and sum corrections in subdomain order, producing worker-count-independent results.
+One right-side application counts one iteration, each local solve one evaluation, and multiplicative residual updates each count one operator evaluation too.
+
+## Overlap and subdomain count
+
+The following cell partitions a five-point Laplacian on a $32 \times 32$ grid ($N = 1024$, row-major numbering) into $s$ owned grid-row strips, expanding each upward and downward by $\delta$ rows for overlap.
+Strip unknowns are consecutive, so build each local matrix as principal submatrix $\mathbf{A}_i = \mathbf{R}_i\mathbf{A}\mathbf{R}_i^{\mathsf{T}}$ of $\mathbf{A}$ and factor it with single-call constructor `SparseCholesky::new`.
+Additive weights are reciprocal to strip-coverage counts per point; restricted additive weights are 1 on owned sets.
+Use all 3 Schwarz preconditioners with scioxide-linalg GMRES (restart 60, iteration limit 3000) to solve uniform-source system $\mathbf{b} = \mathbf{1}$ to $\lVert \mathbf{r} \rVert_2 \le 10^{-8}\lVert \mathbf{b} \rVert_2$, comparing iterations with no preconditioning.
+Inputs are subdomain count $s$ (2–8) and overlap $\delta$ (0–4 rows).
+Besides iteration counts and termination reasons, the table reports true relative residual $\lVert \mathbf{b} - \mathbf{A}\mathbf{x} \rVert_2/\lVert \mathbf{b} \rVert_2$ recomputed from the returned solution and plan size `plan_bytes()`.
+
+```rust
+//| id: sparse-schwarz-overlap
+//| ref: sparse-schwarz-overlap
+//| title: "Schwarz-preconditioned iteration counts versus overlap and subdomain count"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-sparse, scioxide-linalg]
+//| inputs:
+//|   parts: {"type":"range","label":"Subdomains (strips) s","description":"Divide grid rows into s strips.","min":2,"max":8,"step":1,"value":4}
+//|   overlap: {"type":"range","label":"Overlap δ [grid rows]","description":"Rows added above and below each strip.","min":0,"max":4,"step":1,"value":1}
+//| cases:
+//|   - {"id":"no-overlap","label":"δ = 0","description":"Without overlap, additive and restricted additive become the same block-Jacobi preconditioner and require more iterations.","inputs":{"overlap":0}}
+//|   - {"id":"many-parts","label":"s = 8","description":"Without coarse correction, increasing subdomains increases additive iterations.","inputs":{"parts":8}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"schwarz","path":"/rows/0/1","equals":59}
+//|       - {"artifact":"schwarz","path":"/rows/1/1","equals":14}
+//|       - {"artifact":"schwarz","path":"/rows/2/1","equals":13}
+//|       - {"artifact":"schwarz","path":"/rows/3/1","equals":10}
+//|       - {"artifact":"schwarz","path":"/rows/3/2","equals":"Converged"}
+//|       - {"artifact":"schwarz","path":"/rows/0/3","range":{"max":1e-8}}
+//|       - {"artifact":"schwarz","path":"/rows/1/3","range":{"max":1e-8}}
+//|       - {"artifact":"schwarz","path":"/rows/2/3","range":{"max":1e-8}}
+//|       - {"artifact":"schwarz","path":"/rows/3/3","range":{"max":1e-8}}
+//|   - case: no-overlap
+//|     expect:
+//|       - {"artifact":"schwarz","path":"/rows/2/1","equals":21}
+//|       - {"artifact":"schwarz","path":"/rows/1/1","equals":21}
+//|       - {"artifact":"schwarz","path":"/rows/3/1","equals":15}
+//|       - {"artifact":"schwarz","path":"/rows/1/3","range":{"max":1e-8}}
+//|       - {"artifact":"schwarz","path":"/rows/3/3","range":{"max":1e-8}}
+//|   - case: many-parts
+//|     expect:
+//|       - {"artifact":"schwarz","path":"/rows/1/1","equals":17}
+//|       - {"artifact":"schwarz","path":"/rows/3/1","equals":13}
+//|       - {"artifact":"schwarz","path":"/rows/1/3","range":{"max":1e-8}}
+//|       - {"artifact":"schwarz","path":"/rows/3/3","range":{"max":1e-8}}
+use scioxide_core::{Budget, LinearOperator, RealScalar, ResidualTolerance};
+use scioxide_linalg::{GmresSolver, Preconditioning};
+use scioxide_sparse::{
+    CsrMatrix, ExplicitZeroPolicy, SchwarzKind, SchwarzLocalSolveView, SchwarzOperatorView,
+    SchwarzOptions, SchwarzPlan, SchwarzSubdomainView, SparseCholesky, sparse_diagonals,
+};
+
+let (k, s, delta) = (32, parts as usize, overlap as usize);
+let n = k * k;
+// Five-point Laplacian on an m-row × k-column grid. Grid-row-strip principal submatrices have the same form.
+let laplacian = |m: usize| -> Result<CsrMatrix<f64>, String> {
+    let size = m * k;
+    // Entry p connects indices p and p + 1; it is 0 at grid-row boundaries (dropped later).
+    let x: Vec<f64> = (1..size)
+        .map(|p| if p % k == 0 { 0.0 } else { -1.0 })
+        .collect();
+    let (y, diagonal) = (vec![-1.0_f64; size - k], vec![4.0_f64; size]);
+    let offsets = [-(k as isize), -1, 0, 1, k as isize];
+    sparse_diagonals(size, size, &offsets, &[&y, &x, &diagonal, &x, &y])
+        .map_err(|e| e.to_string())?
+        .view()
+        .to_csr(ExplicitZeroPolicy::Drop)
+        .map_err(|e| e.to_string())
+};
+let a = laplacian(k)?;
+// Owned grid rows [i k/s, (i + 1) k/s); subdomains extend them δ rows upward and downward (index ranges).
+let owned: Vec<(usize, usize)> = (0..s)
+    .map(|i| (i * k / s * k, (i + 1) * k / s * k))
+    .collect();
+let spans: Vec<(usize, usize)> = owned
+    .iter()
+    .map(|&(lo, hi)| (lo.saturating_sub(delta * k), (hi + delta * k).min(n)))
+    .collect();
+// Cholesky-factor local matrix A_i = R_i A R_iᵀ with a single-call constructor.
+let mut factors = Vec::new();
+for &(start, end) in &spans {
+    let local = laplacian((end - start) / k)?;
+    factors.push(SparseCholesky::new(&local).map_err(|e| e.to_string())?);
+}
+let indices: Vec<Vec<usize>> = spans
+    .iter()
+    .map(|&(start, end)| (start..end).collect())
+    .collect();
+// Additive weights are reciprocal strip-coverage counts; restricted additive weights are 1 on owned sets.
+let cover: Vec<f64> = (0..n)
+    .map(|j| spans.iter().filter(|r| r.0 <= j && j < r.1).count() as f64)
+    .collect();
+let additive: Vec<Vec<f64>> = indices
+    .iter()
+    .map(|ix| ix.iter().map(|&j| 1.0 / cover[j]).collect())
+    .collect();
+let restricted: Vec<Vec<f64>> = owned
+    .iter()
+    .zip(&indices)
+    .map(|(&(lo, hi), ix)| {
+        ix.iter()
+            .map(|&j| if (lo..hi).contains(&j) { 1.0 } else { 0.0 })
+            .collect()
+    })
+    .collect();
+let b = vec![1.0_f64; n];
+let tolerance = ResidualTolerance::new(0.0, 1e-8).map_err(|e| e.to_string())?;
+let limit = Budget::try_from(3000).map_err(|e| e.to_string())?;
+let restart = Budget::try_from(60).map_err(|e| e.to_string())?;
+let solver = GmresSolver::new(tolerance, limit).with_restart(restart);
+// Independent check: recompute true relative residual ‖b − Ax‖₂ / ‖b‖₂ from returned solutions (b = 1, ‖b‖₂ = √N).
+let mut scratch = vec![0.0_f64; a.apply_workspace_len().map_err(|e| e.to_string())?];
+let mut relative = |x: &[f64]| -> Result<f64, String> {
+    let mut ax = vec![0.0_f64; n];
+    a.apply_into(x, &mut ax, &mut scratch)
+        .map_err(|e| e.to_string())?;
+    let squares = ax
+        .iter()
+        .fold(0.0_f64, |sum, y| sum + (1.0 - y) * (1.0 - y));
+    Ok(RealScalar::sqrt(squares / n as f64))
+};
+let none = solver
+    .solve_with_options(&a, &b[..], Preconditioning::None, None)
+    .map_err(|e| e.to_string())?;
+let mut rows = vec![(
+    "None",
+    none.report().iterations(),
+    format!("{:?}", none.report().termination()),
+    relative(none.solution().as_slice())?,
+    None,
+)];
+for (name, kind) in [
+    ("Additive", SchwarzKind::Additive),
+    ("Restricted additive", SchwarzKind::RestrictedAdditive),
+    ("Multiplicative", SchwarzKind::Multiplicative),
+] {
+    let weights = |i: usize| match kind {
+        SchwarzKind::Additive => Some(&additive[i][..]),
+        SchwarzKind::RestrictedAdditive => Some(&restricted[i][..]),
+        SchwarzKind::Multiplicative => None,
+    };
+    let domains: Vec<SchwarzSubdomainView<'_, f64>> = (0..s)
+        .map(|i| SchwarzSubdomainView {
+            indices: &indices[i],
+            weights: weights(i),
+            solve: SchwarzLocalSolveView::InverseOperator(&factors[i]),
+        })
+        .collect();
+    // Only multiplicative Schwarz uses the full matrix for residual updates.
+    let global =
+        (kind == SchwarzKind::Multiplicative).then(|| SchwarzOperatorView::Sparse(a.view()));
+    let options = SchwarzOptions::new()
+        .with_max_plan_bytes(1 << 24)
+        .with_max_workspace_bytes(1 << 24);
+    let plan = SchwarzPlan::with_options(n, kind, &domains, global, options)
+        .map_err(|e| e.to_string())?;
+    let result = solver
+        .solve_with_options(&a, &b[..], Preconditioning::Inverse(&plan), None)
+        .map_err(|e| e.to_string())?;
+    rows.push((
+        name,
+        result.report().iterations(),
+        format!("{:?}", result.report().termination()),
+        relative(result.solution().as_slice())?,
+        Some(plan.plan_bytes()),
+    ));
+}
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Preconditioner" },
+    { "key": "1", "label": "GMRES iterations [count]", "type": "integer" },
+    { "key": "2", "label": "Termination reason" },
+    { "key": "3", "label": "True relative residual [-]", "type": "number", "format": sci2 },
+    { "key": "4", "label": "plan_bytes() [B]", "type": "integer", "nullText": "None" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "schwarz" })
+);
+```
+
+At the defaults $s = 4$, $\delta = 1$, unpreconditioned GMRES requires 59 iterations, while additive converges in 14, restricted additive in 13, and multiplicative in 10.
+All true relative residuals recomputed from solutions lie between $7.7 \times 10^{-10}$ and $7.6 \times 10^{-9}$, meeting tolerance $10^{-8}$ as termination `Converged` indicates.
+Increasing overlap as $\delta = 0, 1, 2, 3, 4$ decreases restricted-additive iterations to 21, 13, 10, 9, 8 and multiplicative iterations to 15, 10, 8, 6, 6.
+At $\delta = 0$ all weights are 1; additive and restricted additive both become block Jacobi with strip diagonal-block inverses and both require 21 iterations.
+Weighted additive iterations are 21, 14, 11, 9, 12, increasing again at $\delta = 4$ rather than decreasing monotonically with overlap.
+Keeping $\delta = 1$ and increasing subdomains as $s = 2, 4, 8$ (equal-row strips) increases additive iterations to 8, 14, 17.
+Unequal-row partitions $s = 5, 6, 7$ require 18, 20, 20 iterations, more than $s = 8$.
+From $s = 2$ through 8, multiplicative iterations increase without decrease as 6, 8, 10, 10, 11, 12, 13.
+Without coarse correction, more strips require more iterations to propagate information between distant strips.
+Here sequential residual updates let multiplicative Schwarz converge in fewer iterations than additive for the same partition, but its subdomain work cannot run in parallel.
+`plan_bytes()` sums copied indices and weights, per-subdomain records, and, for multiplicative Schwarz, lists of rows affected by each correction.
+At the default partition, additive uses 14816 B and multiplicative 9440 B (wasm values with 32-bit `usize`).
+
+## Summary
+
+Overlapping Schwarz combines subdomain local solves as a preconditioner; `SchwarzPlan` provides weighted additive, restricted additive, and multiplicative forms.
+With overlap all 3 are generally non-Hermitian, so combine them with Krylov methods such as GMRES rather than CG.
+Increasing overlap from 0 to only 1 row cuts iterations to about 2/3 but enlarges local systems; weighted additive iterations need not decrease monotonically with overlap.
+These are one-level methods without coarse correction, so iterations tend to grow with subdomains; use multigrid when grid-independent convergence is required.
+Multiplicative Schwarz uses the fewest iterations for the same partition here, but solves subdomains sequentially and cannot run them in parallel.
+
+## Further reading
+
+- [Algebraic multigrid preconditioning](../algebraic-multigrid/): examine coarse-grid correction making iteration counts nearly independent of grid resolution.
+- [Graph partitioning with the Fiedler vector](../../examples/spectral-bisection/): examine Laplacian-eigenvector bisection as one way to partition unknowns into subdomains.
+- [Preconditioners](../../api/preconditioners/): consult contracts for every Schwarz plan, subdomain, local-solve, and option item.

@@ -1,0 +1,713 @@
+---
+title: 線形系の解と分解の微分
+description: 線形方程式の解 X = A⁻¹B の JVP・VJP・Taylor 係数の導出と、base の行列を一度だけ分解して導関数のすべての成分に使う solve_into のアルゴリズムと計算コスト、アルゴリズムをそのまま微分する cholesky_into・qr_into・least_squares_into の使い分け、直列のばねの剛性感度と記録の大きさの比較、最小二乗のあてはめ係数の測定値についての感度と、列が比例する計画行列での結果。
+sidebar:
+  order: 365
+references:
+  ad-solve-into: "solve_into-のアルゴリズムと計算コスト"
+  ad-differentiated-factorizations: "アルゴリズムをそのまま微分する分解"
+  ad-series-springs-sensitivity: "直列のばねのコンプライアンスの感度"
+  ad-least-squares-sensitivity: "抵抗の較正直線と最小二乗の感度"
+---
+
+構造物の変位、回路の電圧、最小二乗のあてはめ係数のように、多くの量は線形方程式 $AX = B$ の解として間接的に定まる。
+解の導関数を求める方法は 2 つある。
+1 つは解法の演算（分解の消去と前進・後退代入）をそのまま微分する方法で、テープの記録は解法の手数に比例して伸びる。
+もう 1 つは解が満たす関係 $AX = B$ を微分する方法で、解の値と、primal 値の計算で作った係数行列の分解から導関数が求まる。
+
+このページは、関係を微分して解の導関数を作る `solve_into` と、アルゴリズムの演算をそのまま微分する `cholesky_into`、`qr_into`、`least_squares_into` を扱う。
+行列はすべて行優先の 1 次元のスライスで渡す。
+base の値（入れ子の数値型の一番内側の値）とレーン（lane、SIMD の 1 要素）は[数値型・lane・汎用コード](../number-types-and-lanes/)で定義している。
+テープの文（記録の 1 単位）とワード（文の情報を表す 64 ビットの記録の単位）は[逆モードとテープ](../reverse-mode-and-replay/)で定義している。
+非線形方程式 $F(y, p) = 0$ の解の微分は[陰関数の微分](../implicit-functions/)で扱う。
+
+## 線形系の解の微分
+
+正則な $A \in \mathbb{R}^{n \times n}$ と $B \in \mathbb{R}^{n \times k}$ について、解 $X = A^{-1} B$ を $A$ と $B$ の関数とみる。
+$AX = B$ を微分すると
+
+$$
+\dot A\,X + A\,\dot X = \dot B
+\quad\Longrightarrow\quad
+\dot X = A^{-1}\bigl(\dot B - \dot A\,X\bigr)
+$$
+
+で、接ベクトル（JVP）は同じ $A$ の線形方程式をもう 1 つ解けば得られる。
+
+余接（VJP）は Frobenius 内積 $\langle P, Q \rangle = \operatorname{tr}(P^\top Q)$ についての随伴である。
+出力の余接 $\bar X$ に対して $\langle \bar X, \dot X \rangle = \langle A^{-\top} \bar X, \dot B - \dot A X \rangle$ が成り立つので
+
+$$
+\Lambda = A^{-\top} \bar X, \qquad \bar B \mathrel{+}= \Lambda, \qquad \bar A \mathrel{-}= \Lambda X^\top
+$$
+
+となる。
+
+Taylor 係数でも同じ形になる。
+$A(t) = \sum_j A_j t^j$、$B(t) = \sum_j B_j t^j$ の解を $X(t) = \sum_k X_k t^k$ と書き、$A(t)X(t) = B(t)$ の $t^k$ の係数を比べると
+
+$$
+X_k = A_0^{-1}\Bigl(B_k - \sum_{j=1}^{k} A_j X_{k-j}\Bigr)
+$$
+
+で、どの次数も $A_0$ の線形方程式になる。
+
+どの式でも、係数行列は primal 値の $A$（$A_0$）だけである。
+primal 値の計算で $A$ を一度 LU 分解しておけば、接ベクトルの各成分も余接も因子による前進・後退代入で求まる。
+$\dot X$ は $A$ を係数とする線形方程式の解なので、後退安定な分解で計算すると、primal 値と同じく条件数 $\kappa(A) = \|A\|\,\|A^{-1}\|$ と単位丸め $u$ の積程度の相対誤差を持つ（[浮動小数点数と条件数](../../../concepts/floating-point-and-conditioning/)）。
+差分の刻みによる打ち切り誤差はない。
+
+## `solve_into` のアルゴリズムと計算コスト
+
+`solve_into(matrix, order, rhs, columns, out)` は $n \times n$（$n$ = `order`）の行列 $A$ と、$n \times k$（$k$ = `columns`）の右辺 $B$ について、$AX = B$ の解を `out` に書く。
+base の行列を lane ごとに一度、部分ピボット選択つきの LU 分解 $PA = LU$ で分解し、その因子を導関数のすべての成分に適用する。
+消去の演算そのものは微分しない。
+
+数値型ごとの規則は次のとおりである。
+
+- `f64` と `Lanes` は lane ごとの因子で前進・後退代入を行う。
+- `Dual` は $\dot x = A^{-1}(\dot b - \dot A x)$ を同じ因子で解く。
+  `MultiDual` は方向ごとに同じ式を解き、`Dual<Dual<f64>>` のような入れ子では内側の型でもう一度同じ規則を使う。
+- `Jet` は上の漸化式 $X_k = A_0^{-1}(B_k - \sum_j A_j X_{k-j})$ を次数の順に解く。
+- `Var` は値の上で解き、呼び出し文を 1 つ記録する。
+  文は $A$、$B$、$X$ の値と因子を保持し、逆走査では $\Lambda = A^{-\top}\bar X$、$\bar B \mathrel{+}= \Lambda$、$\bar A \mathrel{-}= \Lambda X^\top$、接ベクトルの走査では $\dot X = A^{-1}(\dot B - \dot A X)$ を保持した因子で計算する。
+  `Tape<Dual<f64>>` では因子を `Dual` の成分に使うので、解を通したヘッセ行列・ベクトル積も求まる。
+  逆走査は呼び出し文を通るたびに $\Lambda$ を解く作業領域を確保するので、同じ関数を記録した温まったテープでも、この走査の確保は残る。
+
+計算コストは浮動小数点演算の回数で、因子に lane ごとに約 $\tfrac{2}{3}n^3$ 回、前進・後退代入に右辺の列と導関数の成分ごとに約 $2n^2$ 回である。
+導関数の成分では、右辺 $\dot B - \dot A X$ を作る積（逆走査では $\bar A$ から $\Lambda X^\top$ を引く積）にも右辺の列ごとに約 $2n^2$ 回かかり、`Jet` の $k$ 次の係数ではその $k$ 倍になる。
+$m$ 個の成分を持つ `MultiDual` でも分解は 1 回で、毎回分解し直す $O(mn^3)$ ではなく $O(n^3 + mn^2k)$ で済む。
+呼び出しのたびに、因子（lane ごとに $n^2$ 個のスカラー）とピボットを確保し、数値型によっては値と導関数の成分を分けた作業領域も確保する。
+解は作業領域で求めてから `out` に写すので、失敗した呼び出しは `out` を変えない。
+テープの上の呼び出し文は $A$ と $B$ の成分ごとに 1 ワード、出力ごとに 1 ワード、前後に 2 ワードを使うので、$n^2 + 2nk + 2$ ワードになる。
+
+エラーは次のとおりである。
+
+- スライスの長さが `order` と `columns` に合わなければ `DimensionMismatch` を返す。
+- ある lane で、base の行列のピボット（その列の残りの成分の絶対値の最大）が 0 か非有限なら、ピボットの番号を持つ `Singular` を返す。
+  条件数は推定しないので、特異に近い行列は大きな値を返し、エラーにはならない。
+- 作業領域を確保できなければ `AllocationFailure`、大きさが `usize` に収まらなければ `SizeOverflow` を返す。
+
+## アルゴリズムをそのまま微分する分解
+
+`cholesky_into`、`qr_into`、`least_squares_into` は、教科書のアルゴリズムを `R` の算術で書いたものである。
+どの微分の方式でも、評価した演算そのものを微分するので、得られるのはアルゴリズムの出力の導関数である。
+テープの上では $O(n^3)$ 個の文を記録する。
+
+解の導関数が欲しいだけなら、分解を微分する必要はない。
+`solve_into` は $AX = B$ という関係だけを微分するので、解をどう計算したか（ピボットの順序など）に依存せず、テープには文を 1 つ残すだけである。
+分解そのものが出力であるとき（たとえば $\log\det A = 2\sum_i \ln L_{ii}$ や、正規分布の標本 $\mu + Lz$ の $L$）は、分解を微分する。
+分解が入力の滑らかな関数である点では、アルゴリズムの導関数は分解の写像の導関数に丸めの範囲で一致する。
+
+- `cholesky_into(matrix, order, out)` は対称正定値行列の、対角が正の下三角因子 $L$（$A = LL^\top$）を `out` に書き、狭義上三角は 0 にする。
+  `matrix` は下三角だけを読むので、上三角の成分についての導関数は 0 である。
+  対称な摂動 $\dot A$ について、導関数は $L^{-1}\dot L = \Phi(L^{-1}\dot A L^{-\top})$（$\Phi$ は下三角を取り、対角を半分にする）を満たす。
+  計算コストは約 $n^3/3$ 回の浮動小数点演算（$n^3/6$ 回の積和）で、$n \times n$ の作業行列を 1 つ確保する。
+  因子はこの作業行列で作ってから `out` に写すので、失敗した呼び出しは `out` を変えない。
+  長さが合わなければ `DimensionMismatch` を返す。
+  ある lane でピボット（消去後の対角）が正でなければ（NaN を含む）、`DomainError`（引数 `matrix`、`OutsideDomain`）を返す。
+- `qr_into(matrix, rows, cols, q, r)` は `rows ≥ cols` の行列の薄い QR 分解 $A = QR$（$Q$ は直交する列を持つ `rows × cols`、$R$ は対角が非負の上三角）を書く。
+  Householder 鏡映の符号は base 値の比較と `select` で選び、最後に $R$ の対角を非負にそろえる。
+  列が一次独立な点では対角が正の分解は一意なので、導関数はその分解の写像の導関数である。
+  計算コストは浮動小数点演算の回数で $R$ に $2\,\text{rows}\cdot\text{cols}^2 - \tfrac{2}{3}\text{cols}^3$ 回、$Q$ に同程度で、`rows × cols` の作業行列を 2 つ確保する。
+  長さが合わないか `rows < cols` なら `DimensionMismatch` を返す。
+  階数が落ちて鏡映の長さが 0 になる列は、その鏡映を 0 にして続け、エラーにしない。
+- `least_squares_into(matrix, rows, cols, rhs, columns, out)` は、列が一次独立な `rows × cols` の $A$ について $\min \|AX - B\|_2$ の解を、薄い QR を通して $X = R^{-1} Q^\top B$ で書く。
+  `qr_into` の 2 つの作業行列に加えて、$Q$ と $R$ を置く領域（`rows·cols + cols²` 個）と解の領域（`cols·columns` 個）を確保する。
+  `qr_into` は $R$ の対角を非負にそろえるので、`Singular` を返すのは $R$ の対角がある lane で厳密に 0 か NaN か無限大のときだけで、数値的な階数は判定しない。
+  解は作業領域で求めてから `out` に写すので、失敗した呼び出しは `out` を変えない。
+  列が比例するだけの行列では、丸めで対角が 0 にならず、エラーにならずに意味のない解を返すことがある（[抵抗の較正直線と最小二乗の感度](#抵抗の較正直線と最小二乗の感度)の最後のセル）。
+  最小二乗解の感度は、残差が大きい問題では $\kappa(A)^2$ に比例する項を含み（Golub と Van Loan、§5.3）、導関数もそれを引き継ぐ。
+
+3 つとも作業領域を確保し、確保できなければ `AllocationFailure`、行列の大きさが `usize` に収まらなければ `SizeOverflow` を返す。
+
+scioxide-ad は行列式、逆行列、固有値分解、特異値分解の規則を提供しない。
+$A^{-1}$ が必要なら `solve_into` で $B = I$ として求める。
+ほかの分解の導関数は、呼び出し側が規則を与えるか（[スカラー関数の微分規則](../custom-primitives/)、[外部の微分規則 ExternalRule](../external-rules/)）、分解が満たす方程式を[陰関数の微分](../implicit-functions/)で微分して求める。
+
+## 直列のばねのコンプライアンスの感度
+
+根元を固定した $n$ 本の直列のばね（剛性 $k_i$ [N/m]）の先端に荷重 $P = 10$ N をかけ、剛性行列の方程式 $K(k)\,u = f$ を `solve_into` と `cholesky_into` で解いて、勾配とテープの大きさを比べる。
+$K$ は三重対角の対称正定値行列で、$K_{jj} = k_j + k_{j+1}$（最後の行は $k_n$）、$K_{j,j+1} = K_{j+1,j} = -k_{j+1}$ である。
+求める量はコンプライアンス $C = f^\top u = P u_n$ [J] とその剛性についての勾配である。
+
+$C$ の余接 1 は $\bar u = f$ を与え、$K$ が対称なので $\Lambda = K^{-1} f = u$、$\bar K = -u u^\top$ となり、$\partial C / \partial k_i = -u^\top (\partial K / \partial k_i)\, u = -(u_i - u_{i-1})^2$ である（$u_0 = 0$）。
+各ばねは力 $P$ を伝えるので、独立な検算の閉形式は $u_i = P \sum_{j \le i} 1/k_j$ と $\partial C / \partial k_i = -(P / k_i)^2$ である。
+さらに、すべての剛性を $(1 + t)$ 倍すると $C$ は $1/(1 + t)$ 倍になるので、$k(t) = (1 + t)k$ の方向の導関数 $dC/dt$ は $-C$ に等しい。
+
+次の定義は剛性行列 `stiffness`、`solve_into` で解く `by_solve`、`cholesky_into` と前進・後退代入を `R` の算術で書いた `by_cholesky` を与える。
+2 つの解法は同じ $C$ を返すが、テープに残す文が違う。
+
+```rust
+//| id: ad-series-springs-model
+//| kind: definitions
+//| title: 直列のばねの剛性行列と 2 つの解法
+//| crates: [scioxide-ad, scioxide-core]
+use scioxide_ad::{Real, cholesky_into, solve_into};
+use scioxide_core::SciOxideError;
+
+pub(crate) const LOAD: f64 = 10.0; // 先端の荷重 P [N]
+
+/// 剛性行列 K(k)（行優先）。
+pub(crate) fn stiffness<R: Real>(k: &[R]) -> Vec<R> {
+    let n = k.len();
+    let mut a = vec![R::zero(); n * n];
+    for j in 0..n {
+        a[j * n + j] = if j + 1 < n { k[j] + k[j + 1] } else { k[j] };
+        if j + 1 < n {
+            a[j * n + j + 1] = -k[j + 1];
+            a[(j + 1) * n + j] = -k[j + 1];
+        }
+    }
+    a
+}
+/// K u = f を solve_into で解き、(C = P u_n, u) を返す。
+pub(crate) fn by_solve<R: Real>(k: &[R]) -> Result<(R, Vec<R>), SciOxideError> {
+    let n = k.len();
+    let mut f = vec![R::zero(); n];
+    f[n - 1] = R::constant(LOAD);
+    let mut u = vec![R::zero(); n];
+    solve_into(&stiffness(k), n, &f, 1, &mut u)?;
+    Ok((u[n - 1] * LOAD, u))
+}
+/// K = L Lᵀ と分解し、L z = f と Lᵀ u = z を R の算術で解いて C を返す。
+pub(crate) fn by_cholesky<R: Real>(k: &[R]) -> Result<R, SciOxideError> {
+    let n = k.len();
+    let mut l = vec![R::zero(); n * n];
+    cholesky_into(&stiffness(k), n, &mut l)?;
+    let mut u = vec![R::zero(); n];
+    for i in 0..n {
+        let mut s = if i + 1 == n {
+            R::constant(LOAD)
+        } else {
+            R::zero()
+        };
+        for j in 0..i {
+            s -= l[i * n + j] * u[j];
+        }
+        u[i] = s / l[i * n + i];
+    }
+    for i in (0..n).rev() {
+        let mut s = u[i];
+        for j in i + 1..n {
+            s -= l[j * n + i] * u[j];
+        }
+        u[i] = s / l[i * n + i];
+    }
+    Ok(u[n - 1] * LOAD)
+}
+```
+
+1 つ目のセルは $C$ の勾配を `by_solve` と `by_cholesky` のそれぞれでテープの上で求め、`by_solve` を `Dual` で $k(t) = (1 + t)k$ の方向に微分する。
+1 つ目の表はばねごとの変位と勾配を閉形式と並べ、2 つ目の表は方式ごとの閉形式との最大相対差、テープのワードの数（`TapeReport::words`。
+定数と入力のワードを含む）、事前確保したバイト数を示す。
+
+```rust
+//| id: ad-linear-solve-adjoint
+//| ref: ad-linear-solve-adjoint
+//| title: 直列ばねのコンプライアンスの剛性感度を solve_into と cholesky_into で求める
+//| run: reactive
+//| uses: [ad-series-springs-model]
+//| crates: [scioxide-ad, scioxide-core]
+//| inputs:
+//|   springs: {"type":"range","label":"ばねの数 n","description":"根元を固定し、先端に荷重 P = 10 N をかけた直列のばね。","min":2,"max":32,"step":1,"value":6}
+//|   ratio: {"type":"range","label":"剛性の比 k_n / k_1","description":"k_i = 1000·ρ^((i−1)/(n−1)) N/m（ρ がこの比）。","min":0.1,"max":10,"step":0.1,"value":3}
+//| cases:
+//|   - {"id":"long-soft","label":"n = 32、k_n / k_1 = 0.1","description":"先端に近いばねほど柔らかく、勾配の大きさは 100 倍の範囲に広がる。","inputs":{"springs":32,"ratio":0.1}}
+//|   - {"id":"two","label":"n = 2、k_n / k_1 = 10","description":"2 × 2 の方程式。","inputs":{"springs":2,"ratio":10}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/0/1","range":{"max":1e-13}}
+//|       - {"artifact":"methods","path":"/rows/1/1","range":{"max":1e-13}}
+//|       - {"artifact":"methods","path":"/rows/2/1","range":{"max":1e-13}}
+//|       - {"artifact":"springs","path":"/rows/0/5","approx":{"value":-0.0001,"rtol":1e-13}}
+//|   - case: long-soft
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/0/1","range":{"max":1e-12}}
+//|       - {"artifact":"methods","path":"/rows/1/1","range":{"max":1e-12}}
+//|       - {"artifact":"methods","path":"/rows/2/1","range":{"max":1e-12}}
+//|   - case: two
+//|     expect:
+//|       - {"artifact":"springs","path":"/rows/1/3","approx":{"value":0.011,"rtol":1e-14}}
+//|       - {"artifact":"springs","path":"/rows/1/5","approx":{"value":-1e-6,"rtol":1e-13}}
+use scioxide_ad::{Dual, Real, Tape, TapeOptions};
+use scioxide_core::ExecutionContext;
+
+let n = springs as usize;
+let k: Vec<f64> = (0..n)
+    .map(|i| Real::powf(ratio, i as f64 / (n - 1) as f64) * 1000.0)
+    .collect();
+let cx = ExecutionContext::sequential();
+let mut solve_tape = Tape::<f64>::new(TapeOptions::new());
+let mut factor_tape = Tape::<f64>::new(TapeOptions::new());
+let (mut by_lu, mut by_factor) = (vec![0.0; n], vec![0.0; n]);
+let compliance = solve_tape
+    .gradient_into(|k| Ok(by_solve(k)?.0), &k, &mut by_lu, cx)
+    .map_err(|e| e.to_string())?;
+factor_tape
+    .gradient_into(|k| by_cholesky(k), &k, &mut by_factor, cx)
+    .map_err(|e| e.to_string())?;
+// k(t) = (1 + t) k の方向の Dual。dC/dt = −C になる。
+let scaled: Vec<Dual<f64>> = k.iter().map(|&ki| Dual::new(ki, ki)).collect();
+let (along, u) = by_solve(&scaled).map_err(|e| e.to_string())?;
+
+// 独立検算: u_i = P Σ_{j≤i} 1/k_j と ∂C/∂k_i = −(P/k_i)²。
+let mut rows = Vec::new();
+let (mut sum, mut lu_error, mut factor_error) = (0.0, 0.0_f64, 0.0_f64);
+for i in 0..n {
+    sum += 1.0 / k[i];
+    let exact = -(LOAD / k[i]) * (LOAD / k[i]);
+    lu_error = lu_error.max(((by_lu[i] - exact) / exact).abs());
+    factor_error = factor_error.max(((by_factor[i] - exact) / exact).abs());
+    rows.push((
+        i + 1,
+        k[i],
+        u[i].value(),
+        LOAD * sum,
+        by_lu[i],
+        exact,
+        by_factor[i],
+    ));
+}
+let sci6 = serde_json::json!({ "notation": "scientific", "significantDigits": 6 });
+let fixed1 = serde_json::json!({ "fractionDigits": 1 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "ばね i", "type": "integer" },
+    { "key": "1", "label": "k_i [N/m]", "type": "number", "format": fixed1 },
+    { "key": "2", "label": "u_i（solve_into）[m]", "type": "number", "format": sci6 },
+    { "key": "3", "label": "u_i（閉形式）[m]", "type": "number", "format": sci6 },
+    { "key": "4", "label": "∂C/∂k_i（solve_into）[m²]", "type": "number", "format": sci6 },
+    { "key": "5", "label": "−(P/k_i)² [m²]", "type": "number", "format": sci6 },
+    { "key": "6", "label": "∂C/∂k_i（cholesky_into）[m²]", "type": "number", "format": sci6 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "springs" })
+);
+
+let (solve_report, factor_report) = (solve_tape.report(), factor_tape.report());
+let methods = vec![
+    (
+        "solve_into（テープ）",
+        lu_error,
+        Some(solve_report.words()),
+        Some(solve_report.reserved_bytes()),
+    ),
+    (
+        "cholesky_into と代入（テープ）",
+        factor_error,
+        Some(factor_report.words()),
+        Some(factor_report.reserved_bytes()),
+    ),
+    (
+        "solve_into（Dual、dC/dt と −C）",
+        ((along.derivative() + compliance) / compliance).abs(),
+        None,
+        None,
+    ),
+];
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let method_columns = serde_json::json!([
+    { "key": "0", "label": "方式" },
+    { "key": "1", "label": "閉形式との最大相対差 [-]", "type": "number", "format": sci2 },
+    { "key": "2", "label": "テープのワードの数 [ワード]", "type": "integer", "nullText": "テープなし" },
+    { "key": "3", "label": "事前確保したバイト数 [B]", "type": "integer", "nullText": "テープなし" }
+]);
+emit_table_with_columns!(
+    method_columns,
+    methods,
+    metadata = serde_json::json!({ "id": "methods" })
+);
+```
+
+既定の $n = 6$、$k_n/k_1 = 3$ では、`solve_into` と `cholesky_into` の勾配はどちらも閉形式 $-(P/k_i)^2$ と一致し、最大相対差は $6.3 \times 10^{-15}$ と $1.3 \times 10^{-14}$ である。
+`Dual` で求めた $dC/dt$ と $-C$ の相対差は $6.0 \times 10^{-16}$ で、接ベクトルの規則 $\dot u = K^{-1}(\dot f - \dot K u)$ が $\dot u = -u$ を与えていることも分かる。
+テープのワードの数は `solve_into` が 73 ワード、`cholesky_into` と代入が 186 ワードで、事前確保したバイト数は 3068 B と 4772 B である。
+
+$n = 32$、$k_n/k_1 = 0.1$ では、ワードの数が 1217 ワードと 13615 ワード、事前確保したバイト数が 55796 B と 331436 B になる。
+最大相対差は 3 つの方式で $4.5 \times 10^{-15}$ から $4.1 \times 10^{-14}$ にとどまる。
+柔らかいばねほど $|\partial C / \partial k_i|$ が大きく、勾配は $10^{-4}$ から $10^{-2}$ m² に広がる。
+
+2 つ目のセルは $n = 2, \dots, 48$ について 2 つの解法のテープのワードの数を数え、両対数軸に描く。
+表は選んだ $n$ について、ワードの数と、それを $n^2$ と $n^3$ で割った値を示す。
+剛性はどの $n$ でも $k_i = 1000 + 10(i - 1)$ N/m とし、大きさごとに新しいテープに記録する。
+
+```rust
+//| id: ad-solve-statement-count
+//| ref: ad-solve-statement-count
+//| title: solve_into と cholesky_into のテープのワードの数を比べる
+//| run: reactive
+//| uses: [ad-series-springs-model]
+//| crates: [scioxide-ad, scioxide-core]
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"counts","path":"/rows/3/0","equals":32}
+//|       - {"artifact":"counts","path":"/rows/3/1","equals":1217}
+//|       - {"artifact":"counts","path":"/rows/3/3","equals":13615}
+use scioxide_ad::{Tape, TapeOptions};
+use scioxide_core::ExecutionContext;
+
+let cx = ExecutionContext::sequential();
+let (mut lu_words, mut factor_words, mut rows) = (Vec::new(), Vec::new(), Vec::new());
+for size in 2..=48_usize {
+    let stiff: Vec<f64> = (0..size).map(|i| 1000.0 + 10.0 * i as f64).collect();
+    let mut gradient = vec![0.0; size];
+    let mut tape = Tape::<f64>::new(TapeOptions::new());
+    tape.gradient_into(|k| Ok(by_solve(k)?.0), &stiff, &mut gradient, cx)
+        .map_err(|e| e.to_string())?;
+    let lu = tape.report().words();
+    let mut tape = Tape::<f64>::new(TapeOptions::new());
+    tape.gradient_into(|k| by_cholesky(k), &stiff, &mut gradient, cx)
+        .map_err(|e| e.to_string())?;
+    let factor = tape.report().words();
+    lu_words.push([size as f64, lu as f64]);
+    factor_words.push([size as f64, factor as f64]);
+    if [4, 8, 16, 32, 48].contains(&size) {
+        let n = size as f64;
+        rows.push((
+            size,
+            lu,
+            lu as f64 / (n * n),
+            factor,
+            factor as f64 / (n * n * n),
+        ));
+    }
+}
+let fixed3 = serde_json::json!({ "fractionDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "ばねの数 n", "type": "integer" },
+    { "key": "1", "label": "solve_into のワードの数 [ワード]", "type": "integer" },
+    { "key": "2", "label": "solve_into のワードの数 / n²", "type": "number", "format": fixed3 },
+    { "key": "3", "label": "cholesky_into と代入のワードの数 [ワード]", "type": "integer" },
+    { "key": "4", "label": "cholesky_into と代入のワードの数 / n³", "type": "number", "format": fixed3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "counts" })
+);
+emit_line_chart!(
+    &vec![
+        serde_json::json!({
+            "name": "solve_into",
+            "points": lu_words,
+            "style": { "showSymbol": true }
+        }),
+        serde_json::json!({
+            "name": "cholesky_into と代入",
+            "points": factor_words,
+            "style": { "showSymbol": true }
+        })
+    ],
+    options = &serde_json::json!({
+        "xLabel": "ばねの数 n",
+        "yLabel": "テープのワードの数 [ワード]",
+        "xType": "log",
+        "yType": "log"
+    })
+);
+```
+
+`solve_into` のワードの数を $n^2$ で割った値は、$n = 4$ の 2.56 から $n = 48$ の 1.13 へ 1 に近づく。
+$n^2$ の項は、呼び出し文が 1 ワードずつの引数として記録する行列の成分の数である。
+`cholesky_into` と代入のワードの数を $n^3$ で割った値は 0.39 まで下がり、1/3 に近づく。
+Cholesky 分解の内側の積和（約 $n^3/6$ 回）が、積と引き算の 2 つの文を残すからである。
+グラフの両対数軸では `solve_into` が傾き 2、`cholesky_into` と代入が傾き 3 で増え、$n = 48$ では 2593 ワードと 42823 ワードで 16.5 倍の差になる。
+
+## 抵抗の較正直線と最小二乗の感度
+
+抵抗の較正を題材に、`qr_into` と `least_squares_into` の値と、あてはめ係数の測定値についての感度を確かめる。
+電流 $I_i = 0.1(i + 1)$ A（$i = 0, \dots, m - 1$）を流して電圧 $V_i$ [V] を測り、直線 $V = V_0 + R I$ を最小二乗であてはめて、抵抗 $\hat R$ [Ω] とオフセット $\hat V_0$ [V] を求める。
+測定値は $V_i = 0.05 + 4.7 I_i + \delta_i$ とし、測定誤差の代わりに決定論的な擾乱 $\delta_i = \sigma \sin(1.7 i + 0.3)$ を加える。
+計画行列 $A$ は $m \times 2$ で、行 $i$ は $[1, I_i]$ である。
+次の定義の `design` は電流の列から $A$ を行優先で作る。
+電流を `Dual` や `Var` で渡せば、$A$ の成分も同じ数値型になる。
+
+```rust
+//| id: ad-calibration-design
+//| kind: definitions
+//| title: 抵抗の較正の計画行列
+//| crates: [scioxide-ad]
+use scioxide_ad::Real;
+
+/// 計画行列 A（m × 2、行優先）。行 i は [1, I_i]。
+pub(crate) fn design<R: Real>(current: &[R]) -> Vec<R> {
+    current.iter().flat_map(|&c| [R::one(), c]).collect()
+}
+```
+
+独立な検算は正規方程式の閉形式である。
+$\bar I$ と $\bar V$ を平均、$S = \sum_i (I_i - \bar I)^2$ とすると、$\hat R = \sum_i (I_i - \bar I)(V_i - \bar V)/S$、$\hat V_0 = \bar V - \hat R \bar I$ で、薄い QR の $R$ は
+
+$$
+R = \begin{pmatrix} \sqrt m & \sqrt m\,\bar I \\ 0 & \sqrt S \end{pmatrix}
+$$
+
+になる。
+残差を $r_i = V_i - \hat V_0 - \hat R I_i$ とすると、$\hat R$ の測定値についての感度は
+
+$$
+\frac{\partial \hat R}{\partial V_i} = \frac{I_i - \bar I}{S}, \qquad
+\frac{\partial \hat R}{\partial I_i} = \frac{r_i - \hat R\,(I_i - \bar I)}{S}
+$$
+
+である。
+$\partial \hat R / \partial I_i$ の $r_i/S$ の項は行列の成分についての微分にだけ現れ、残差が大きいほど効く。
+これは最小二乗解の感度が残差に比例する項を持つことの 1 次元の例である。
+電流計の利得が $1 + t$ 倍にずれて $I_i$ が $(1 + t) I_i$ と読まれると、$\hat R$ は $1/(1 + t)$ 倍になり、$\hat V_0$ は変わらないので、$d\hat R/dt = -\hat R$、$d\hat V_0/dt = 0$ である。
+
+次のセルは `qr_into` で $A$ を分解し、`least_squares_into` で $\hat V_0$ と $\hat R$ を求める。
+さらに、測定値 $(I_0, \dots, I_{m-1}, V_0, \dots, V_{m-1})$ についての $\hat R$ の勾配をテープで、利得の誤差 $t$ についての導関数を `Dual` で求める。
+1 つ目の表は `qr_into` の $R$ の成分と $Q$ の列の直交性を閉形式と並べる。
+2 つ目の表は `least_squares_into` の係数、テープで求めた $2m$ 個の感度、`Dual` で求めた $t$ についての導関数を閉形式と並べる。
+感度の行の相対差は閉形式との差の最大を閉形式の大きさの最大で割った値である。
+
+```rust
+//| id: ad-least-squares-fit
+//| ref: ad-least-squares-fit
+//| title: 抵抗の較正直線を qr_into と least_squares_into で求め、測定値についての感度を確かめる
+//| run: reactive
+//| uses: [ad-calibration-design]
+//| crates: [scioxide-ad, scioxide-core]
+//| inputs:
+//|   points: {"type":"range","label":"測定点の数 m","description":"電流 I_i = 0.1(i + 1) A（i = 0, …, m − 1）で電圧を測る。","min":3,"max":40,"step":1,"value":10}
+//|   noise: {"type":"range","label":"擾乱の振幅 σ [V]","description":"電圧に加える決定論的な擾乱 δ_i = σ sin(1.7i + 0.3) の振幅。","min":0,"max":0.5,"step":0.05,"value":0.1}
+//| cases:
+//|   - {"id":"exact","label":"σ = 0","description":"残差が 0 になり、∂R̂/∂I_i は −R̂(I_i − Ī)/S だけになる。","inputs":{"noise":0}}
+//|   - {"id":"few","label":"m = 3、σ = 0.5","description":"点が少なく、残差の項が電流についての感度に大きく効く。","inputs":{"points":3,"noise":0.5}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"factor","path":"/rows/0/3","range":{"max":1e-14}}
+//|       - {"artifact":"factor","path":"/rows/2/3","range":{"max":1e-14}}
+//|       - {"artifact":"factor","path":"/rows/3/1","approx":{"value":0,"atol":1e-300}}
+//|       - {"artifact":"factor","path":"/rows/4/1","range":{"max":1e-14}}
+//|       - {"artifact":"fit","path":"/rows/1/1","approx":{"value":4.694801576737002,"rtol":1e-13}}
+//|       - {"artifact":"fit","path":"/rows/2/3","range":{"max":1e-13}}
+//|       - {"artifact":"fit","path":"/rows/3/3","range":{"max":1e-13}}
+//|       - {"artifact":"fit","path":"/rows/5/3","range":{"max":1e-13}}
+//|   - case: exact
+//|     expect:
+//|       - {"artifact":"fit","path":"/rows/3/2","approx":{"value":2.5636363636363653,"rtol":1e-12}}
+//|       - {"artifact":"fit","path":"/rows/4/2","range":{"max":1e-12}}
+//|       - {"artifact":"fit","path":"/rows/3/3","range":{"max":1e-13}}
+//|   - case: few
+//|     expect:
+//|       - {"artifact":"fit","path":"/rows/4/2","range":{"min":10}}
+//|       - {"artifact":"fit","path":"/rows/3/3","range":{"max":1e-13}}
+use scioxide_ad::{Dual, Real, Tape, TapeOptions, least_squares_into, qr_into};
+use scioxide_core::ExecutionContext;
+
+let m = points as usize;
+let current: Vec<f64> = (0..m).map(|i| 0.1 * (i + 1) as f64).collect();
+let voltage: Vec<f64> = (0..m)
+    .map(|i| 0.05 + 4.7 * current[i] + noise * Real::sin(1.7 * i as f64 + 0.3))
+    .collect();
+let a = design(&current);
+let (mut q, mut r) = (vec![0.0; 2 * m], [0.0; 4]);
+qr_into(&a, m, 2, &mut q, &mut r).map_err(|e| e.to_string())?;
+let mut fit = [0.0; 2]; // [V̂₀, R̂]
+least_squares_into(&a, m, 2, &voltage, 1, &mut fit).map_err(|e| e.to_string())?;
+
+// 測定値 x = [I_0, …, I_{m−1}, V_0, …, V_{m−1}] についての R̂ の勾配（テープ）。
+let cx = ExecutionContext::sequential();
+let mut tape = Tape::<f64>::new(TapeOptions::new());
+let mut gradient = vec![0.0; 2 * m];
+let measured = [current.as_slice(), voltage.as_slice()].concat();
+tape.gradient_into(
+    |x| {
+        let (i, v) = x.split_at(m);
+        let mut coefficients = [v[0]; 2]; // least_squares_into が上書きする
+        least_squares_into(&design(i), m, 2, v, 1, &mut coefficients)?;
+        Ok(coefficients[1])
+    },
+    &measured,
+    &mut gradient,
+    cx,
+)
+.map_err(|e| e.to_string())?;
+// 電流計の利得の誤差 I_i → (1 + t)I_i の方向の Dual。R̂ は 1/(1 + t) 倍、V̂₀ は変わらない。
+let gained: Vec<Dual<f64>> = current.iter().map(|&c| Dual::new(c, c)).collect();
+let fixed: Vec<Dual<f64>> = voltage.iter().map(|&v| Dual::constant(v)).collect();
+let mut along = [Dual::constant(0.0); 2];
+least_squares_into(&design(&gained), m, 2, &fixed, 1, &mut along).map_err(|e| e.to_string())?;
+
+// 独立検算: 正規方程式の閉形式。Ī、V̄、S = Σ(I_i − Ī)²、残差 r_i。参照値なので f64 の固有メソッドを使う。
+let mean_i = current.iter().sum::<f64>() / m as f64;
+let mean_v = voltage.iter().sum::<f64>() / m as f64;
+let s: f64 = current.iter().map(|c| (c - mean_i) * (c - mean_i)).sum();
+let slope = (0..m)
+    .map(|i| (current[i] - mean_i) * (voltage[i] - mean_v))
+    .sum::<f64>()
+    / s;
+let offset = mean_v - slope * mean_i;
+let (mut dv, mut di, mut gap_v, mut gap_i, mut residual) =
+    (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
+for k in 0..m {
+    let d = current[k] - mean_i;
+    let r_k = voltage[k] - offset - slope * current[k];
+    // ∂R̂/∂V_k = (I_k − Ī)/S、∂R̂/∂I_k = (r_k − R̂(I_k − Ī))/S。
+    let (exact_v, exact_i) = (d / s, (r_k - slope * d) / s);
+    gap_v = gap_v.max((gradient[m + k] - exact_v).abs());
+    gap_i = gap_i.max((gradient[k] - exact_i).abs());
+    dv = dv.max(exact_v.abs());
+    di = di.max(exact_i.abs());
+    residual = residual.max((r_k / s).abs());
+}
+let largest = |g: &[f64]| g.iter().fold(0.0_f64, |a, b| a.max(b.abs()));
+let (sens_i, sens_v) = (largest(&gradient[..m]), largest(&gradient[m..]));
+let orthogonality = [(0, 0, 1.0), (0, 1, 0.0), (1, 1, 1.0)]
+    .iter()
+    .map(|&(j, k, target)| {
+        let dot: f64 = (0..m).map(|i| q[2 * i + j] * q[2 * i + k]).sum();
+        (dot - target).abs()
+    })
+    .fold(0.0, f64::max);
+let root = (m as f64).sqrt();
+let relative = |value: f64, exact: f64| Some((value - exact).abs() / exact.abs());
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let digits = serde_json::json!({ "significantDigits": 12 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "量" },
+    { "key": "1", "label": "SciOxide の値", "type": "number", "format": digits, "nullText": "−" },
+    { "key": "2", "label": "閉形式・恒等式の値", "type": "number", "format": digits },
+    { "key": "3", "label": "相対差 [-]", "type": "number", "format": sci3, "nullText": "−" }
+]);
+let factor = vec![
+    ("R₁₁ と √m", Some(r[0]), root, relative(r[0], root)),
+    (
+        "R₁₂ と √m·Ī [A]",
+        Some(r[1]),
+        root * mean_i,
+        relative(r[1], root * mean_i),
+    ),
+    (
+        "R₂₂ と √S [A]",
+        Some(r[3]),
+        s.sqrt(),
+        relative(r[3], s.sqrt()),
+    ),
+    ("R₂₁ [A]", Some(r[2]), 0.0, None),
+    ("max|QᵀQ − I|", Some(orthogonality), 0.0, None),
+];
+emit_table_with_columns!(
+    columns.clone(),
+    factor,
+    metadata = serde_json::json!({ "id": "factor" })
+);
+let slope_rate = along[1].derivative();
+let fits = vec![
+    ("V̂₀ [V]", Some(fit[0]), offset, relative(fit[0], offset)),
+    ("R̂ [Ω]", Some(fit[1]), slope, relative(fit[1], slope)),
+    (
+        "∂R̂/∂V_i の最大の大きさ [1/A]",
+        Some(sens_v),
+        dv,
+        Some(gap_v / dv),
+    ),
+    (
+        "∂R̂/∂I_i の最大の大きさ [Ω/A]",
+        Some(sens_i),
+        di,
+        Some(gap_i / di),
+    ),
+    ("残差の項 |r_i|/S の最大 [Ω/A]", None, residual, None),
+    (
+        "dR̂/dt（Dual）と −R̂ [Ω]",
+        Some(slope_rate),
+        -slope,
+        relative(slope_rate, -slope),
+    ),
+    ("dV̂₀/dt（Dual）[V]", Some(along[0].derivative()), 0.0, None),
+];
+emit_table_with_columns!(columns, fits, metadata = serde_json::json!({ "id": "fit" }));
+```
+
+既定の $m = 10$、$\sigma = 0.1$ では $\hat R = 4.6948$ Ω、$\hat V_0 = 0.0634$ V で、$R$ の成分、$\hat R$、感度、$t$ についての導関数は閉形式と相対差 $10^{-15}$ 未満で一致する。
+$\hat V_0$ だけ相対差が $1.6 \times 10^{-14}$ と大きいのは、$\hat V_0$ が $\bar V \approx 2.65$ V と $\hat R \bar I \approx 2.58$ V の差として求まる小さな値で、相対誤差が約 40 倍に拡大されるからである。
+$Q$ の列の直交性の誤差は $5.6 \times 10^{-16}$ で、$R_{21}$ は厳密に 0 になる。
+$\partial \hat R / \partial V_i$ の大きさは端の点で最大の $0.545$ A⁻¹ で、$\partial \hat R / \partial I_i$ の最大 $2.58$ Ω/A のうち残差の項は $0.12$ Ω/A である。
+
+$\sigma = 0$ では残差の項が $1.1 \times 10^{-15}$ Ω/A まで下がり、$\partial \hat R / \partial I_i$ の最大は $\hat R \max_i |I_i - \bar I| / S = 2.5636$ Ω/A になる。
+$m = 3$、$\sigma = 0.5$ では残差の項が $17.1$ Ω/A で、$\partial \hat R / \partial I_i$ の最大 $21.7$ Ω/A の大半を占め、電流の読みの誤差が $\hat R$ に強く効く。
+
+すべての電流を同じ値にすると、$A$ の 2 列が比例して直線が決まらない。
+次のセルはこの計画行列について、`qr_into` の $R_{22}$ と `least_squares_into` の結果を示す。
+電流は 0 A の 3 点、0.3 A の 3 点、0.3 A の 4 点の 3 通りで、電圧は擾乱のない $V_i = 0.05 + 4.7 I_i$ とする。
+入力はなく、表の行が 3 通りの実験に対応する。
+
+```rust
+//| id: ad-least-squares-rank
+//| ref: ad-least-squares-rank
+//| title: 列が比例する計画行列で qr_into の R₂₂ と least_squares_into の結果を確かめる
+//| run: reactive
+//| uses: [ad-calibration-design]
+//| crates: [scioxide-ad, scioxide-core]
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"degenerate","path":"/rows/0/2","approx":{"value":0,"atol":1e-300}}
+//|       - {"artifact":"degenerate","path":"/rows/0/3","equals":"Singular（ピボット 1）"}
+//|       - {"artifact":"degenerate","path":"/rows/1/3","equals":"Singular（ピボット 1）"}
+//|       - {"artifact":"degenerate","path":"/rows/2/2","range":{"min":1e-17,"max":1e-14}}
+//|       - {"artifact":"degenerate","path":"/rows/2/3","equals":"解を返す"}
+use scioxide_ad::{least_squares_into, qr_into};
+use scioxide_core::{SciOxideErrorKind, SciOxideErrorView};
+
+// すべての電流が同じ値の実験: A の 2 列が比例し、直線が決まらない。
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let digits = serde_json::json!({ "significantDigits": 12 });
+let mut degenerate = Vec::new();
+for (level, count) in [(0.0, 3), (0.3, 3), (0.3, 4)] {
+    let same = vec![level; count];
+    let v: Vec<f64> = same.iter().map(|c| 0.05 + 4.7 * c).collect();
+    let (mut q, mut r) = (vec![0.0; 2 * count], [0.0; 4]);
+    qr_into(&design(&same), count, 2, &mut q, &mut r).map_err(|e| e.to_string())?;
+    let mut x = [0.0; 2];
+    let (outcome, slope) = match least_squares_into(&design(&same), count, 2, &v, 1, &mut x) {
+        Ok(()) => ("解を返す".to_string(), Some(x[1])),
+        Err(e) => match (e.kind(), e.view()) {
+            (SciOxideErrorKind::Singular, SciOxideErrorView::Singular { pivot: Some(k) }) => {
+                (format!("Singular（ピボット {k}）"), None)
+            }
+            _ => (e.to_string(), None),
+        },
+    };
+    degenerate.push((level, count, r[3], outcome, slope));
+}
+let degenerate_columns = serde_json::json!([
+    { "key": "0", "label": "電流 [A]", "type": "number", "format": digits },
+    { "key": "1", "label": "測定点の数", "type": "integer" },
+    { "key": "2", "label": "R₂₂（qr_into）[A]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "least_squares_into の結果" },
+    { "key": "4", "label": "R̂ [Ω]", "type": "number", "format": sci3, "nullText": "書かない" }
+]);
+emit_table_with_columns!(
+    degenerate_columns,
+    degenerate,
+    metadata = serde_json::json!({ "id": "degenerate" })
+);
+```
+
+電流がすべて 0 の実験と、すべて 0.3 A の 3 点の実験では $R_{22}$ が厳密に 0 になり、`Singular`（ピボット 1）を返す。
+ピボットの番号は 0 から数えるので、1 は $R$ の 2 つ目の対角 $R_{22}$ を指す。
+すべて 0.3 A の 4 点にすると、丸めにより $R_{22} = 1.9 \times 10^{-16}$ A になってエラーにならず、真の 4.7 Ω と関係のない $\hat R = 2.31$ Ω を返す。
+`least_squares_into` は数値的な階数を判定しないので、$R_{22}/R_{11}$ のような対角の比を呼び出し側で確かめる。
+
+## まとめ
+
+線形系の解の導関数には `solve_into` を使う。
+`solve_into` は base の行列を lane ごとに一度だけ分解して因子を導関数のすべての成分に使い、テープには $n^2 + 2nk + 2$ ワードの呼び出し文を 1 つだけ残す。
+`cholesky_into`、`qr_into`、`least_squares_into` はアルゴリズムの演算をそのまま微分し、テープに $O(n^3)$ 個の文を残すので、$\log\det A$ や $L$ のように分解そのものが出力のときに使う。
+`solve_into` はピボットが 0 か非有限のとき、`least_squares_into` は $R$ の対角が厳密に 0 か非有限のときだけ `Singular` を返すので、悪条件や階数の落ちた計画行列の判定は、`qr_into` の $R$ の対角の比などで呼び出し側が行う。
+最小二乗の係数を計画行列の成分で微分した感度は残差に比例する項を含むので、残差が大きいあてはめでは、説明変数の読みの誤差が係数に強く効く。
+
+## 次に読むページ
+
+- [陰関数の微分](../implicit-functions/)：非線形方程式の解の導関数を陰関数定理で求め、途中の線形方程式を `solve_into` で解く方法を確かめる。
+- [外部の微分規則 ExternalRule](../external-rules/)：このクレートが規則を提供しない固有値分解などを外部の解法で計算し、テープの呼び出し文として導関数を与える方法を確かめる。
+- [逆モードとテープ](../reverse-mode-and-replay/)：呼び出し文を含む記録の逆走査と接ベクトルの走査、ワードの数え方を確かめる。
+- [二階微分とヘッセ行列の作用素](../second-order-derivatives/)：`Tape<Dual<f64>>` の上で、`solve_into` の解を通したヘッセ行列・ベクトル積を求める方法を確かめる。

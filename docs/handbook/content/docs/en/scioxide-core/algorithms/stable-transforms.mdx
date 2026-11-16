@@ -1,0 +1,517 @@
+---
+title: "Elementary functions and stable transformations"
+description: "Three scalar trait levels and floating-point decomposition, dot-product accuracy levels, elementary function dispatch and ULP contracts, Payne–Hanek argument reduction, cancellation-avoiding stable transformations, complex error growth factors, and batched array transformations."
+sidebar:
+  order: 350
+references:
+  core-scalar-hierarchy: "scalar-hierarchy-and-accuracy-levels"
+  core-stable-transforms: "stable-transformations-avoiding-cancellation"
+  core-transform-into: "batched-array-transformation-with-transform_into"
+  core-argument-reduction: "argument-reduction-for-large-values"
+  core-elementary-dispatch: "elementary-dispatch-and-accuracy-contracts"
+  core-complex-growth-factors: "complex-error-growth-factors"
+---
+
+Expressions subtracting nearby values for arguments near zero, such as $\cos x - 1$ or $(e^x - 1)/x$, lose significant digits when evaluated directly.
+For trigonometric functions with very large arguments, subtracting multiples of $\pi/2$ during reduction itself introduces error.
+`scioxide-core` manages elementary implementations through a dispatch table and provides cancellation-avoiding transformations as functions returning `Result`, like `checked_*`.
+First, this page establishes their scalar type hierarchy and dot-product accuracy levels.
+
+## Scalar hierarchy and accuracy levels
+
+Functions in `scioxide-core` express required argument capabilities through three trait levels.
+
+| Trait | Implementing types | Required capabilities |
+|---|---|---|
+| `AlgebraicScalar` | Open (downstream crates can implement it) | Basic arithmetic and negation, `ZERO` and `ONE`, sum and product folds; no IEEE classification or transcendental functions required |
+| `NumericScalar` | `f32`, `f64`, `Complex32`, `Complex64` (external implementations forbidden) | Conjugation, absolute value and squared norm, real/imaginary decomposition and construction, component finiteness checks, real-component type `Real` |
+| `RealScalar` | `f32`, `f64` (external implementations forbidden) | Ordering, remainder, compound assignment (`+=`, `-=`, `*=`, `/=`), precision constants, rounding operations, elementary functions, checked conversions, `decompose` |
+
+`Complex32` and `Complex64` alias `Complex<f32>` and `Complex<f64>`.
+The default is `RealScalar`; only functions supporting complex arithmetic accept `NumericScalar`.
+Sealed traits cannot be implemented externally, allowing functions to assume the classification and conversion rules of the two supported IEEE formats.
+The basic arithmetic, compound assignment, and elementary methods of `RealScalar` follow IEEE 754 without input validation and may return NaN or infinity.
+Input and result checks belong to `checked_*` and functions returning `Result`, such as this page's stable transformations.
+[Scalar types and trait contracts](../../../concepts/scalars-and-traits/) explains the type design.
+
+`RealScalar::decompose()` classifies and decomposes values without floating-point operations, returning `FloatDecomposition`.
+Finite values use `Finite { significand, exponent, negative }` and equal $(-1)^{\text{negative}} \cdot \text{significand} \cdot 2^{\text{exponent}}$.
+The significand is an integer including the implicit leading bit of normal numbers, at most 53 bits in binary64 and 24 bits in binary32.
+Zero has significand 0 and retains its sign; subnormal and zero exponents are $-1074$ in binary64 and $-149$ in binary32.
+Infinity becomes `Infinite { negative }`; NaN becomes `Nan` without sign or payload.
+
+`Accuracy` supplies two accuracy levels for sums of products, including scioxide-linalg matrix products and norms and scioxide-sparse sparse inner products.
+The default `Standard` uses ordinary floating-point arithmetic with scaling to avoid overflow.
+For inner-product length $k$ and $\gamma_k = k\varepsilon/(1 - k\varepsilon)$ (machine epsilon $\varepsilon$, $k\varepsilon < 1$), componentwise matrix-product error is bounded by $\gamma_k (|A||B|)_{ij}$ plus terms from rounding into the subnormal range.
+With identical settings and instruction-set paths, `Standard` results are bit-identical regardless of worker count.
+`Exact` accumulates products exactly and rounds once at the end, making results independent of instruction sets as well.
+
+## Elementary dispatch and accuracy contracts
+
+Each elementary method of `RealScalar` dispatches to one of three implementation categories.
+
+| Category | Implementation | Main operations |
+|---|---|---|
+| `native` | Standard library with `std`; SciOxide kernels without `std` | `sqrt`, `exp`, `ln`, `sin`, `cos`, `powf`, `hypot`, `acosh`, and others |
+| `owned` | SciOxide kernels or compositions, regardless of `std` | `powi`, `exp10`, `asinh`, `atanh`, `next_after`, `scalbn` |
+| `intrinsic` | Language primitives | `signum`, `recip`, `max`, `min`, `clamp`, `copysign`, `to_degrees`, `to_radians` |
+
+SciOxide kernels compute in double precision, with final rounding for `f32`.
+Exceptions are `sqrt` and `mul_add`, which round directly to output precision, and bitwise `next_after` and `scalbn`.
+
+The [`RealScalar` accuracy guarantees](https://docs.rs/scioxide-core/0.1.0/scioxide_core/trait.RealScalar.html#elementary-accuracy) apply to finite results, including subnormals, in both scalar widths.
+`native` and SciOxide kernels may differ within these bounds.
+
+- 0 ULP (correct rounding): `sqrt`, `floor`, `ceil`, `round`, `trunc`, `fract`, `mul_add`, `scalbn`.
+- 4 ULP: `powi`, `powf`, `cbrt`, `hypot`, `exp`, `exp2`, `exp10`, `exp_m1`, `ln`, `log2`, `log10`, `ln_1p`, trigonometric and inverse trigonometric functions, hyperbolic and inverse hyperbolic functions, `atan2`, and `sin_cos`.
+- 16 ULP: `log` with arbitrary base.
+- `to_degrees` and `to_radians` perform only one scaling multiplication and have no ULP contract.
+  `copysign` and `next_after` manipulate bits exactly.
+
+“$N$ ULP” means $|\text{computed value} - \text{true value}| \le N \cdot \mathrm{ulp}$, with ulp the adjacent floating-point spacing at the true value (subnormal spacing in the subnormal range).
+This is a tested accuracy contract, not a per-computation error proof.
+
+In generic functions, qualify calls with the trait name, as in `RealScalar::sin(x)`, to avoid confusing them with intrinsic `f64` methods.
+The intrinsic `x.sin()` of `f64` does not use SciOxide dispatch.
+
+## Argument reduction for large values
+
+Evaluating $\sin x$ or $\cos x$ first decomposes $x = k \cdot \pi/2 + r$ ($|r| \le \pi/4$), obtaining quadrant $k \bmod 4$ and remainder $r$.
+Computing $x - k\,\widehat{\pi/2}$ with double-precision approximation $\widehat{\pi/2}$ to $\pi/2$ multiplies its error in $\widehat{\pi/2}$ (about $6 \times 10^{-17}$) by $k$, contaminating $r$.
+At $x = 10^{22}$, $k \approx 6 \times 10^{21}$, so the error in $r$ exceeds 1 and the result loses meaning.
+
+Payne–Hanek reduction retains sufficiently many binary digits of $2/\pi$ and multiplies only the necessary portion by the significand of $x$ as integers, directly obtaining the fractional part of $x \cdot 2/\pi$ and the quadrant.
+Multiples of 4 in the integer part of $x \cdot 2/\pi$ do not affect the quadrant, so high-order expansion digits can be discarded without multiplication.
+`scioxide-core` uses this method for large arguments in its own kernels (such as `sin` and `cos` without `std`, and phases beyond double-precision range in complex powers).
+The expansion is exposed as `backend::TWO_OVER_PI_LIMBS`, consisting of 66 high-to-low 24-bit integers (1584 bits).
+For concatenated integer $C$, $2/\pi$ lies between $C \cdot 2^{-1584}$ and $(C + 1) \cdot 2^{-1584}$.
+`backend::reduce_radians(x)` performs the same reduction, returning the quadrant and remainder split into two `f64` values.
+
+$$
+\frac{2}{\pi} \approx \sum_{j=0}^{65} C_j\, 2^{-24(j+1)}, \qquad 0 \le C_j < 2^{24}.
+$$
+
+For $x = 10^{p}$ (dimensionless; exactly representable in `f64` when $p = 1, \ldots, 22$), the following cell compares reduction with double-precision $\pi/2$ followed by $\sin$ against `RealScalar::sin(x)`.
+The first table shows both values at the selected $p$, their difference, and $\sin^2 x + \cos^2 x - 1$.
+At $p = 22$, differences from the known value $\sin(10^{22}) = -0.8522008497671888\ldots$ are shown in ulp.
+The chart plots differences for all $p = 1, \ldots, 22$ on a logarithmic axis and marks selected $p$ vertically.
+Browser Wasm enables `std`, so `RealScalar::sin` uses the standard library implementation.
+
+```rust
+//| id: core-large-argument-reduction
+//| ref: core-large-argument-reduction
+//| title: "Reduction error for large arguments"
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   exponent: {"type":"range","label":"Argument exponent p (x = 10^p)","description":"Larger x amplifies the π/2 approximation error during reduction.","min":1,"max":22,"step":1,"value":22}
+//| cases:
+//|   - {"id":"moderate","label":"x = 10⁵","description":"Naive reduction error is still about 10⁻¹².","inputs":{"exponent":5}}
+//|   - {"id":"lost","label":"x = 10¹⁷","description":"The naive remainder becomes zero and the result loses meaning.","inputs":{"exponent":17}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/1","approx":{"value":-0.8522008497671888,"atol":1e-15}}
+//|       - {"artifact":"summary","path":"/rows/0/4","range":{"min":-1e-15,"max":1e-15}}
+//|       - {"artifact":"summary","path":"/rows/0/5","range":{"min":0,"max":4}}
+//|       - {"artifact":"sweep","path":"/rows/0/1","equals":1584}
+//|   - case: moderate
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/1","approx":{"value":0.03574879797201651,"atol":1e-14}}
+//|       - {"artifact":"summary","path":"/rows/0/3","range":{"min":0,"max":1e-10}}
+//|       - {"artifact":"summary","path":"/rows/0/5","equals":null}
+//|   - case: lost
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/3","range":{"min":1e-3}}
+//|       - {"artifact":"summary","path":"/rows/0/4","range":{"min":-1e-15,"max":1e-15}}
+use core::f64::consts::FRAC_PI_2;
+use scioxide_core::RealScalar;
+use scioxide_core::backend::TWO_OVER_PI_LIMBS;
+
+// Construct x = 10^p by correctly rounding decimal notation (exact for p ≤ 22).
+let power = |p: i32| format!("1e{p}").parse::<f64>().map_err(|e| e.to_string());
+// Naive reduction with double-precision π/2 (comparison using f64 arithmetic and intrinsics).
+let naive_sin = |x: f64| {
+    let k = (x / FRAC_PI_2).round();
+    let reduced = x - k * FRAC_PI_2;
+    match k.rem_euclid(4.0) as u8 {
+        0 => reduced.sin(),
+        1 => reduced.cos(),
+        2 => -reduced.sin(),
+        _ => -reduced.cos(),
+    }
+};
+
+let selected = exponent as i32;
+let x = power(selected)?;
+let (sine, cosine) = (RealScalar::sin(x), RealScalar::cos(x));
+let naive = naive_sin(x);
+// Measure error against known sin(10²²) in ulp at the known value.
+let known = -0.852_200_849_767_188_8_f64;
+let ulp = RealScalar::next_after(known.abs(), 1.0) - known.abs();
+let known_gap = (selected == 22).then(|| (sine - known).abs() / ulp);
+let digits = serde_json::json!({ "significantDigits": 17 });
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed1 = serde_json::json!({ "fractionDigits": 1 });
+let only22 = "Only p = 22";
+let columns = serde_json::json!([
+    { "key": "0", "label": "Argument x [-]", "type": "number", "format": sci3 },
+    { "key": "1", "label": "RealScalar::sin(x) [-]", "type": "number", "format": digits },
+    { "key": "2", "label": "sin after reduction with double-precision π/2 [-]", "type": "number", "format": digits },
+    { "key": "3", "label": "Absolute difference between values [-]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "sin² + cos² − 1 [-]", "type": "number", "format": sci3 },
+    { "key": "5", "label": "Difference from known value [ulp]", "type": "number", "format": fixed1, "nullText": only22 }
+]);
+emit_table_with_columns!(
+    columns,
+    vec![(
+        x,
+        sine,
+        naive,
+        (sine - naive).abs(),
+        sine * sine + cosine * cosine - 1.0,
+        known_gap,
+    )],
+    metadata = serde_json::json!({ "id": "summary" })
+);
+
+// Differences for p = 1, …, 22. Count zeros because they cannot appear on a logarithmic axis.
+let (mut curve, mut zero_gaps) = (Vec::new(), 0_u32);
+for p in 1..=22 {
+    let x = power(p)?;
+    let gap = (RealScalar::sin(x) - naive_sin(x)).abs();
+    if gap > 0.0 {
+        curve.push([f64::from(p), gap]);
+    } else {
+        zero_gaps += 1;
+    }
+}
+emit_line_chart!(
+    &vec![serde_json::json!({ "name": "|Naive reduction − RealScalar::sin|", "points": curve })],
+    options = &serde_json::json!({
+        "xLabel": "Argument exponent p (x = 10^p) [-]",
+        "yLabel": "Absolute difference between values [-]",
+        "yType": "log",
+        "xMin": 1.0,
+        "xMax": 22.0,
+        "annotations": [{ "kind": "line", "axis": "x", "value": exponent, "label": "Selected p" }]
+    })
+);
+let sweep_columns = serde_json::json!([
+    { "key": "0", "label": "Zero differences excluded from the chart [count]", "type": "integer" },
+    { "key": "1", "label": "2/π expansion length (words × 24) [bits]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    sweep_columns,
+    vec![(zero_gaps, TWO_OVER_PI_LIMBS.len() * 24)],
+    metadata = serde_json::json!({ "id": "sweep" })
+);
+```
+
+At the default $p = 22$, `RealScalar::sin` agrees with the known value within its 4 ULP contract, and $\sin^2 x + \cos^2 x - 1$ is also within rounding.
+Reduction with double-precision $\pi/2$ gives zero because the remainder vanishes, with difference reaching $0.85$.
+
+In the chart, differences increase approximately tenfold with each $p$.
+The differences are $2.4 \times 10^{-12}$ at $p = 5$ and $2.5 \times 10^{-5}$ at $p = 12$; at $p \ge 16$ they are of order 1 and naive reduction loses meaning.
+These magnitudes agree with estimate $6 \times 10^{-17} \cdot 0.64\, x$, amplifying error in $\widehat{\pi/2}$ by $k \approx x \cdot 2/\pi$.
+
+## Stable transformations avoiding cancellation
+
+`scioxide-core` provides the following stable transformation functions.
+All accept real and complex numbers (`NumericScalar`), reject non-finite inputs, and return values through `Result`.
+
+| Function | Value | Main uses and domain |
+|---|---|---|
+| `cosm1(x)` | $\cos x - 1$ | Small-angle corrections |
+| `exprel(x)` | $(e^x - 1)/x$; equals 1 at $x = 0$ | Exponential integrators and thermal statistics ratios |
+| `sinc(x)` | $\sin x / x$; equals 1 at $x = 0$ | Unnormalized sinc |
+| `sincpi(x)` | $\sin(\pi x)/(\pi x)$ | Exactly zero at nonzero integers |
+| `powm1(x, y)` | $x^y - 1$ | Negative bases require integer exponents; zero bases require nonnegative exponents |
+| `xlogy(x, y)` | $x \ln y$ | Zero for any finite $y$ when $x = 0$; reject $y \le 0$ at $x \ne 0$ |
+| `xlog1py(x, y)` | $x \ln(1 + y)$ | Zero when $x = 0$; reject $y \le -1$ at $x \ne 0$ |
+| `sigmoid(x)` | $1/(1 + e^{-x})$ | Avoids overflow in both tails |
+| `log_sigmoid(x)` | $\ln \operatorname{sigmoid}(x)$ | Preserves the negative tail |
+| `softplus(x)` | $\ln(1 + e^{x})$ | Avoids exponential overflow |
+| `logit(p)` | $\ln(p / (1 - p))$, $0 < p < 1$ | $+0$ at $p = 1/2$ |
+| `sin_pi`, `cos_pi`, `tan_pi`, `sin_cos_pi` | Trigonometric functions in units of $\pi$ | Exact quadrant reduction; reject poles of `tan_pi` |
+| `sin_degrees`, `cos_degrees`, `tan_degrees`, `sin_cos_degrees` | Trigonometric functions in degrees | As above |
+
+These plus `logaddexp` ([logarithmic sums](../logarithmic-reductions/)) form 20 functions with real-valued 16 ULP contracts.
+The real version of `sincpi` has a stronger contract: it returns the correctly rounded value or an adjacent representable number.
+The table's functions evaluate arguments in `f64` and round once to the output type.
+Non-finite input produces `NonFinite`, arguments outside the listed domain produce `DomainError`, and results exceeding finite range produce `NumericalInstability`.
+$\ln(1 + x)$ and $e^x - 1$ are not stable transformations; they are provided as `RealScalar::ln_1p` and `RealScalar::exp_m1` (4 ULP).
+
+Real-only `log1mexp(x)` returns the logarithmic complement $\ln(1 - e^x)$ through $x \le 0$.
+Direct evaluation incurs cancellation in $1 - e^x$ when $x$ approaches zero; for large negative $x$, $1 - e^x$ rounds to 1 and the result becomes zero.
+Instead, use $\ln(-\operatorname{expm1}(x))$ when $x \ge -\ln 2$ and $\operatorname{ln1p}(-e^x)$ when $x < -\ln 2$.
+$x = \pm 0$ returns $-\infty$, and $x = -\infty$ returns $-0$.
+Positive $x$ produces `DomainError`; NaN and $+\infty$ produce `NonFinite`.
+This function computes at input scalar precision and is outside the 16 ULP contract.
+
+Functions such as `sin_pi` split integer and fractional argument parts exactly before evaluation, making $\sin(\pi k)$ exactly zero at integers.
+In contrast, `RealScalar::sin(k * PI)` returns a value of order $k \times 1.22 \times 10^{-16}$ because of the double-precision approximation error in $\pi$.
+
+The following cell compares direct and stable forms of $\cos x - 1$ and $(e^x - 1)/x$ at $x = 10^{p}$ (dimensionless, $-16 \le p \le -1$).
+References are the Taylor series
+
+$$
+\cos x - 1 = -\frac{x^2}{2} + \frac{x^4}{24} - \cdots, \qquad
+\frac{e^x - 1}{x} = 1 + \frac{x}{2} + \frac{x^2}{6} + \cdots
+$$
+
+summed through the $x^{10}$ and $x^{11}$ terms using Horner's method.
+At $|x| \le 0.1$, truncation error is below $\varepsilon$; neither series has cancellation, so reference error is within a few $\varepsilon$.
+The table shows each formula's value, reference, and error $|\text{computed value} - \text{reference value}| / (\varepsilon |\text{reference value}|)$.
+
+```rust
+//| id: core-cosm1-exprel-cancellation
+//| ref: core-cosm1-exprel-cancellation
+//| title: "Cancellation near zero and stable transformations"
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   log10_x: {"type":"range","label":"Input exponent p (x = 10^p)","description":"Smaller x increases cancellation in the direct formulas.","min":-16,"max":-1,"step":1,"value":-5}
+//| cases:
+//|   - {"id":"rounded-to-one","label":"x = 10⁻⁹","description":"cos x rounds to 1 and the direct formula returns zero.","inputs":{"log10_x":-9}}
+//|   - {"id":"mild","label":"x = 10⁻¹","description":"Cancellation is mild; direct-formula error remains within a few hundred ε.","inputs":{"log10_x":-1}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"errors","path":"/rows/0/3","range":{"min":1e6}}
+//|       - {"artifact":"errors","path":"/rows/1/1","approx":{"value":-4.999999999958333e-11,"rtol":1e-14}}
+//|       - {"artifact":"errors","path":"/rows/1/3","range":{"min":0,"max":16}}
+//|       - {"artifact":"errors","path":"/rows/3/1","approx":{"value":1.0000050000166667,"rtol":1e-14}}
+//|       - {"artifact":"errors","path":"/rows/3/3","range":{"min":0,"max":16}}
+//|   - case: rounded-to-one
+//|     expect:
+//|       - {"artifact":"errors","path":"/rows/0/1","equals":0}
+//|       - {"artifact":"errors","path":"/rows/1/1","approx":{"value":-5e-19,"rtol":1e-14}}
+//|       - {"artifact":"errors","path":"/rows/1/3","range":{"min":0,"max":16}}
+//|   - case: mild
+//|     expect:
+//|       - {"artifact":"errors","path":"/rows/1/1","approx":{"value":-4.995834721974235e-3,"rtol":1e-14}}
+//|       - {"artifact":"errors","path":"/rows/1/3","range":{"min":0,"max":16}}
+//|       - {"artifact":"errors","path":"/rows/3/3","range":{"min":0,"max":16}}
+use scioxide_core::{RealScalar, cosm1, exprel};
+
+// Construct x = 10^p by correctly rounding decimal notation.
+let x = format!("1e{}", log10_x as i32)
+    .parse::<f64>()
+    .map_err(|e| e.to_string())?;
+// References: sum Taylor series with Horner's method (truncation error below ε for |x| ≤ 0.1).
+// cos x − 1 = −(x²/2)(1 − (x²/12)(1 − (x²/30)(1 − (x²/56)(1 − x²/90))))
+let x2 = x * x;
+let reference_cosm1 = -0.5
+    * x2
+    * [90.0, 56.0, 30.0, 12.0]
+        .iter()
+        .fold(1.0, |tail, divisor| 1.0 - x2 / divisor * tail);
+// (e^x − 1)/x = 1 + (x/2)(1 + (x/3)(1 + … (1 + x/12)))
+let reference_exprel = (2..=12)
+    .rev()
+    .fold(1.0, |tail, divisor| 1.0 + x / f64::from(divisor) * tail);
+
+let naive_cosm1 = RealScalar::cos(x) - 1.0;
+let stable_cosm1 = cosm1(x).map_err(|e| e.to_string())?;
+let naive_exprel = (RealScalar::exp(x) - 1.0) / x;
+let stable_exprel = exprel(x).map_err(|e| e.to_string())?;
+let rows: Vec<(&str, f64, f64, f64)> = [
+    ("cos(x) − 1", naive_cosm1, reference_cosm1),
+    ("cosm1(x)", stable_cosm1, reference_cosm1),
+    ("(exp(x) − 1) / x", naive_exprel, reference_exprel),
+    ("exprel(x)", stable_exprel, reference_exprel),
+]
+.iter()
+.map(|&(name, value, reference)| {
+    let error = (value - reference).abs() / (f64::EPSILON * reference.abs());
+    (name, value, reference, error)
+})
+.collect();
+let digits = serde_json::json!({ "notation": "scientific", "significantDigits": 17 });
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Formula" },
+    { "key": "1", "label": "Value [-]", "type": "number", "format": digits },
+    { "key": "2", "label": "Reference [-]", "type": "number", "format": digits },
+    { "key": "3", "label": "Relative error / ε [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "errors" })
+);
+```
+
+At $x = 10^{-5}$, direct evaluation of $\cos x - 1 \approx -5 \times 10^{-11}$ amplifies the rounding error in double-precision $\cos x$ (up to about $5.5 \times 10^{-17}$ even with correct rounding) relative to the result, giving relative error about $4 \times 10^{8}$ times $\varepsilon$.
+For the same $x$, direct $(e^x - 1)/x$ has relative error about $4 \times 10^{4}$ times $\varepsilon$.
+At $x \le 10^{-8}$, $\cos x$ rounds to 1 and the direct formula returns zero.
+At $x = 10^{-1}$, cancellation is mild: direct $\cos x - 1$ has error about 50 times $\varepsilon$ and $(e^x - 1)/x$ about four times.
+Stable transformations remain within a few $\varepsilon$ relative difference from references for every input $p$ (at most one $\varepsilon$ in native execution).
+
+## Complex error growth factors
+
+For complex arguments $z = x + iy$, some function magnitudes grow exponentially with $|y|$, correspondingly increasing componentwise rounding errors.
+For complex stable transformations, writing exact result components as $(\mathrm{re}, \mathrm{im})$, each component's error is bounded by
+
+$$
+32\, \varepsilon\, \max(|\mathrm{re}|, |\mathrm{im}|)\, g(z) + 8\eta
+$$
+
+Here $\varepsilon$ is machine epsilon and $\eta$ is the smallest positive subnormal.
+Function-specific growth factors $g(z)$ are as follows.
+
+| Function | $g(z)$ |
+|---|---|
+| `sinc`, `cosm1` | $1 + \lvert \operatorname{Im} z \rvert$ |
+| `sincpi` and trigonometric functions in units of $\pi$ | $1 + \pi \lvert \operatorname{Im} z \rvert$ |
+| Trigonometric functions in degrees | $1 + (\pi/180) \lvert \operatorname{Im} z \rvert$ |
+| `exprel` | $1 + \lvert \operatorname{Re} z \rvert$ |
+| `powm1(z, w)` | $1 + \lvert w \rvert \lvert \ln z \rvert$ |
+| Other | 1 |
+
+Elementary functions of `Complex<T>` (including `exp`, `ln`, and `sin`) have componentwise contracts $16\,\varepsilon \max(|\mathrm{re}|, |\mathrm{im}|)\, g$ for finite arguments and representable results.
+For `exp`, `sin`, `cos`, `sinh`, and `cosh`, $g = 1 + \max(|\operatorname{Re} z|, |\operatorname{Im} z|)$; for powers $z^w$, $g = 1 + |w| |\ln z|$.
+For `sqrt`, `ln`, `tan`, `tanh`, inverse trigonometric functions, and inverse hyperbolic functions, $g = 1$.
+
+Complex division uses the ordinary formula only when intermediates remain in range; otherwise it scales both operands by powers of two before dividing.
+For finite operands and a nonzero divisor, computed quotient $\hat{q}$ and exact quotient $q$ satisfy $|\hat{q} - q| \le 8\varepsilon|q| + 4\eta$.
+No intermediate overflow, underflow, or NaN occurs while components of $q$ are representable.
+Infinity, NaN, and division by zero follow C99 Annex G.
+
+## Batched array transformation with `transform_into`
+
+Use `transform_into(input, transform, policy, output, scratch, cx)` to apply the same stable transformation at many points.
+Arguments are input, transformation, policy, output, workspace, and execution context, in that order.
+
+- Input is `NdView` and output `NdViewMut`, with matching shapes required.
+  Input may broadcast (repeatedly reading the same element); output must not reference an address twice.
+- `scratch` requires at least one scalar per element.
+  Shape mismatches and short `scratch` produce `DimensionMismatch`.
+- Results are first computed in `scratch`, then copied to output after `transform` succeeds at every point.
+  Any failure leaves output unchanged.
+- Errors from `transform` propagate unchanged.
+  A non-finite value returned by `transform` fails as `NonFinite` (`NonFiniteOrigin::Intermediate`).
+- Under policy `policy` equal to `Auto`, each element estimates one work unit, and parallelization is considered from 32 elements.
+  At most 64 partitions are used; scheduling does not change values at individual points.
+- Cancellation and deadlines are checked at least once per 256 calls in each partition.
+  A running `transform` call is not interrupted.
+
+Work is proportional to element count, without heap allocation during numerical processing.
+[Borrowed layouts and affine values](../borrowed-layouts-and-affine-values/) gives layout rules; [Execution policies, partitioning, and execution contexts](../execution-and-partitions/) covers policies and contexts.
+
+The following cell applies `sin_pi` to a dimensionless $x = 0, 0.25, 0.5, \ldots$ grid through `transform_into` and compares with `RealScalar::sin(PI * x)`.
+The input is grid point count.
+The first table shows both values and their difference per point.
+The second shows integer grid point counts and how many return exact zero for each function.
+
+```rust
+//| id: core-pi-unit-transform
+//| ref: core-pi-unit-transform
+//| title: "Applying sine in π units to a grid in a batch"
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   points: {"type":"range","label":"Grid point count","description":"Number of points x = 0, 0.25, 0.5, … .","min":4,"max":17,"step":1,"value":9}
+//| cases:
+//|   - {"id":"two-periods","label":"17 points (x ≤ 4)","description":"Integer grid points increase to five.","inputs":{"points":17}}
+//|   - {"id":"short","label":"4 points (x ≤ 0.75)","description":"Only x = 0 is an integer grid point.","inputs":{"points":4}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"grid","path":"/rows/2/1","equals":1}
+//|       - {"artifact":"grid","path":"/rows/4/1","equals":0}
+//|       - {"artifact":"grid","path":"/rows/4/2","approx":{"value":1.2246467991473532e-16,"rtol":1e-6}}
+//|       - {"artifact":"grid","path":"/rows/1/3","range":{"min":0,"max":1e-15}}
+//|       - {"artifact":"zeros","path":"/rows/0/0","equals":3}
+//|       - {"artifact":"zeros","path":"/rows/0/1","equals":3}
+//|       - {"artifact":"zeros","path":"/rows/0/2","equals":1}
+//|   - case: two-periods
+//|     expect:
+//|       - {"artifact":"grid","path":"/rows/16/1","equals":0}
+//|       - {"artifact":"zeros","path":"/rows/0/0","equals":5}
+//|       - {"artifact":"zeros","path":"/rows/0/1","equals":5}
+//|   - case: short
+//|     expect:
+//|       - {"artifact":"grid","path":"/rows/3/1","approx":{"value":0.7071067811865476,"rtol":1e-14}}
+//|       - {"artifact":"zeros","path":"/rows/0/0","equals":1}
+//|       - {"artifact":"zeros","path":"/rows/0/1","equals":1}
+use core::f64::consts::PI;
+use scioxide_core::{
+    ExecutionContext, ExecutionPolicy, NdView, NdViewMut, RealScalar, sin_pi, transform_into,
+};
+
+let n = points as usize;
+let grid: Vec<f64> = (0..n).map(|i| 0.25 * i as f64).collect();
+let shape = [n];
+let mut values = vec![0.0; n];
+let mut scratch = vec![0.0; n];
+let input = NdView::row_major(&grid, &shape).map_err(|e| e.to_string())?;
+let output = NdViewMut::row_major(&mut values, &shape).map_err(|e| e.to_string())?;
+// Arguments are input, transformation, policy, output, workspace, and execution context, in that order.
+transform_into(
+    input,
+    sin_pi::<f64>,
+    ExecutionPolicy::Sequential,
+    output,
+    &mut scratch,
+    ExecutionContext::sequential(),
+)
+.map_err(|e| e.to_string())?;
+
+let (mut integers, mut exact_pi, mut exact_radians) = (0_u32, 0_u32, 0_u32);
+let mut rows = Vec::new();
+for (&x, &value) in grid.iter().zip(&values) {
+    // Comparison: multiply by a double-precision π approximation, then take sine in radians.
+    let radians = RealScalar::sin(PI * x);
+    if RealScalar::fract(x) == 0.0 {
+        integers += 1;
+        exact_pi += u32::from(value == 0.0);
+        exact_radians += u32::from(radians == 0.0);
+    }
+    rows.push((x, value, radians, (value - radians).abs()));
+}
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let digits = serde_json::json!({ "significantDigits": 17 });
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "x [-]", "type": "number", "format": fixed2 },
+    { "key": "1", "label": "sin_pi(x) [-]", "type": "number", "format": digits },
+    { "key": "2", "label": "RealScalar::sin(PI * x) [-]", "type": "number", "format": digits },
+    { "key": "3", "label": "Absolute difference [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "grid" })
+);
+let zero_columns = serde_json::json!([
+    { "key": "0", "label": "Integer grid points [count]", "type": "integer" },
+    { "key": "1", "label": "sin_pi returns exactly zero [count]", "type": "integer" },
+    { "key": "2", "label": "RealScalar::sin(PI * x) returns exactly zero [count]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    zero_columns,
+    vec![(integers, exact_pi, exact_radians)],
+    metadata = serde_json::json!({ "id": "zeros" })
+);
+```
+
+At the default nine points ($x \le 2$), `sin_pi` returns exact zero at every integer point $x = 0, 1, 2$.
+`RealScalar::sin(PI * x)` returns zero only at $x = 0$; at $x = 1$ it returns $1.22 \times 10^{-16}$, and at $x = 2$, $-2.45 \times 10^{-16}$.
+At noninteger points, the two values differ by order $10^{-16}$ and agree within rounding.
+With 17 points ($x \le 4$), integer points increase to five, and `sin_pi` returns exact zero at all five.
+
+## Summary
+
+Elementary functions of `RealScalar` dispatch among `native`, `owned`, and `intrinsic`; most transcendentals have 4 ULP contracts, and stable transformations 16 ULP.
+Large trigonometric arguments use Payne–Hanek reduction, preventing $\pi/2$ approximation error from contaminating quadrant and remainder.
+Replace cancellation-prone formulas near zero with stable transformations such as `cosm1`, `exprel`, `powm1`, and `xlog1py`; use trigonometric functions in $\pi$ units or degrees when integer or half-integer values matter.
+Account for error bounds growing proportionally to $g(z)$ for complex arguments when interpreting results.
+Default function argument bounds to `RealScalar`, expanding to `NumericScalar` only for supported complex arithmetic; select dot-product accuracy through `Accuracy`.
+
+## Further reading
+
+- [Borrowed layouts and affine values](../borrowed-layouts-and-affine-values/): Check validation rules for `NdView` and `StridedLayout` supplied to `transform_into`.
+- [Logarithmic sums, weighted sums, and normalization](../logarithmic-reductions/): Check the accuracy contracts of `logaddexp` and log-sums.
+- [Arithmetic, stable transformation, and logarithmic sum APIs](../../api/arithmetic-and-reductions/): Look up every stable transformation and error condition.

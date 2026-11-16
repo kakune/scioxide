@@ -1,0 +1,324 @@
+---
+title: 求解のライフサイクルと計算回数の管理
+description: 求解の 6 段階と作業領域の容量の確保、SolveState と SolveContext による求解の状態とエポック、budget! と Budget による上限、求解ごとの上限と求解間で共有する上限、計算を実行する前の上限確認、取り消しの確認、信頼区分と試行の記録。
+sidebar:
+  order: 310
+references:
+  core-solve-identity: "求解の同一性とエポック"
+  core-local-and-shared-budgets: "求解ごとの上限と求解間で共有する上限"
+  core-cancellation-checks: "取り消しの確認"
+  core-workspace-capacity: "作業領域の容量の確保"
+  core-budget-construction: "上限の作り方"
+  core-admission: "計算を実行する前の上限確認"
+  core-attempt-records: "信頼区分と試行の記録"
+  core-solve-stages: "求解の-6-段階"
+---
+
+反復解法は回数の上限に達したり外から止められたりして途中で終わることがある。
+そのとき呼び出し側は残った状態をどこまで信頼できるかと、反復や関数評価を何回使ったかを知る必要がある。
+`scioxide-core` は求解の状態を所有型 `SolveState` に置き、一回の求解の間だけ借用する `SolveContext` を通して、計算を実行できるかの確認、回数の記録、受理状態の確定を行う。
+回数の上限は許容誤差とは別に `Budget` と `SolveBudgets` で与える。
+許容誤差は成功とみなす条件で、上限は成功しない場合にも計算量を有限に抑える条件である。
+このページは一つの求解の中での規則を扱い、求解の中で別の求解を呼ぶ場合の規則は[入れ子の求解・回数の集計・診断](../nested-solves-and-diagnostics/)で扱う。
+
+## 求解の 6 段階
+
+状態を持つアルゴリズムは、どれも次の 6 段階を通る。
+図による説明は[エラー仕様と部分結果](../../../concepts/errors-and-partial-results/)にある。
+
+1. 事前検証では入力、求解の同一性、形状、実行コンテキストに注入された機能（クロックなど）、計算回数の上限、作業領域の容量を検査する。
+   コールバックは呼ばず、外から見える状態も変えない。
+   この段階で拒否された試行は `AttemptOutcome::PreflightRejected` として記録され、エポックを持たない。
+2. 候補の生成では最後に受理した状態から次の候補を作る。
+3. 評価ではコールバックを呼んで結果を作業領域に書き、呼び出しを一回ずつ数える。
+4. 判定では誤差、残差、受理条件、証明用データを計算する。
+5. 受理の確定では候補とその付随情報を一度に出力に反映する。
+   `SolveContext::commit_accepted(trust)` がこれにあたり、受理した提案の数と受理状態のリビジョンを一つ進め、信頼区分 `PartialResultTrust` を記録する。
+6. 巻き戻しでは最後に受理した状態を保つ。
+   作業領域は書き換わってもよいが、再利用できる状態に保つ。
+   `record_rejected()` は受理状態の付随情報を変えずに棄却数だけを数える。
+
+候補の計算と受理の確定を分けるのは、失敗した試行の途中の値が外へ出ないようにするためである。
+解ベクトルのような数値の状態は `SolveState` に入らず、各アルゴリズムの結果型や作業領域が持つ。
+
+### 作業領域の容量の確保
+
+事前検証で作業領域の容量をそろえておけば、候補の生成より後の段階で作業領域を広げずに済む。
+作業領域を持つ API では `workspace_requirements(request)` で必要な容量を確保せずに計算し、作業領域の `check(&requirements)` で保持している領域が足りるかを `Capacity` として受け取る。
+`Capacity::Sufficient` なら既存の領域で足り、数値計算の間に広げる必要はない。
+`Capacity::NeedsGrowth` なら、計算の前に `try_reserve(&requirements)` で不足分を確保する。
+確保の失敗は `AllocationFailure`、呼び出し側が設定したバイト数の上限の超過は `ResourceLimit`、小さすぎる作業領域をそのまま渡した場合は `DimensionMismatch` になる。
+この判定は作業領域だけについてのもので、利用者のコールバックや別の出力領域の確保は含まない。
+`scioxide-core` は `Capacity` の型だけを定め、この手順を持つ作業領域は後の章のクレート（scioxide-linalg、scioxide-differentiate、scioxide-random など）にある。
+詳しい仕様は[実行形式・作業領域・再現性](../../../concepts/workspaces-and-reproducibility/)にある。
+
+## 求解の同一性とエポック
+
+`SolveState::begin_solve(execution, identity, &mut budgets)` は新しいエポックを始め、回数と受理状態の付随情報を初期化して `SolveContext` を返す。
+受理状態はリビジョン 0、信頼区分 `DiagnosticOnly` から始まる。
+`budgets` に設定した上限は求解をまたいで残り、消費量だけが 0 に戻る。
+返されたコンテキストは状態と実行コンテキストの両方を借用するので、Plan や作業領域の中に保持できない。
+エポック番号 `SolveEpoch` は `SolveState` ごとに 1 から数え、使い切ると `SizeOverflow` になる。
+
+`SolveIdentity::new(problem, algorithm, shape_token, options_token)` は求解の同一性を表す。
+
+- `ProblemToken`：呼び出し側が決める問題の識別子（`u128`）。
+- `AlgorithmId`：アルゴリズムの族、手法、意味上のバージョン。
+  `algorithm_id!("linear", "cg", 1)` のように、綴りを定数評価で検査して作る。
+- `shape_token` と `options_token`：形状と、求解の間に変えないオプションを表す呼び出し側の識別子（どちらも `u128`）。
+
+途中から続けるには `SolveContext::checkpoint(state_token)` で `SolveCheckpointMetadata` を作り、`SolveState::resume` に渡す。
+同一性、スキーマのバージョン、アルゴリズムが渡す状態トークンのどれかが一致しなければ、`resume` は状態も計算回数の上限も変えずに `InvalidInput` で拒否する。
+再開した求解は新しいエポックを始めず、回数、受理状態、各項目の上限と実行済みの回数をチェックポイントに記録された値に戻して続ける。
+
+## 求解ごとの上限と求解間で共有する上限
+
+`BudgetKind` は上限を管理する項目を表し、入れ子の求解での扱いは種類によって二通りに分かれる。
+入れ子の求解はある求解（親）の中で始める別の求解（子）で、始め方と記録の規則は[入れ子の求解・回数の集計・診断](oxref:core-nested-accounting)にある。
+
+| 種類 | 対象 | 入れ子での扱い |
+|---|---|---|
+| `Iteration` | 反復 | 局所。子の反復は親自身の反復回数には加算しない |
+| `Proposal` | 候補の提案 | 局所 |
+| `Evaluation` | コールバック・プロバイダーの呼び出し（関数、残差、ヤコビ行列などすべての `EvaluationRole`） | 共有。子の評価回数を外側のすべての求解にも加算する |
+| `Subdivision` | 適応分割 | 共有 |
+| `Sample` | 確率的な標本 | 共有 |
+| `Node` | 探索木の節点 | 共有 |
+
+評価を求解ごとの局所の上限で数えると、外側の求解に上限 $E$ を与えても内側の評価は抑えられない。
+外側が $N$ 回反復し、反復ごとに始める内側の求解がそれぞれ上限 $E_{\mathrm{in}}$ まで評価すると、評価の総数は最大で $E + N E_{\mathrm{in}}$ になる。
+評価コストはどの階層で呼んでも同じなので、呼び出し側が抑えたいのはこの総数である。
+共有にすると子の評価回数は外側のすべての求解にも同時に加算され、根の上限 $E$ が全階層の評価の和を直接抑える。
+分割、標本、節点も同じ理由で共有する。
+
+反復は事情が違う。
+外側の Newton 法の 1 反復と内側の線形反復解法の 1 反復は別のアルゴリズムの進み具合で、足しても意味のある量にならない。
+子の反復を親自身の反復回数に加算すると、親が行える Newton 反復の回数が内側の線形方程式の解きにくさで変わり、親の上限が親自身の収束の遅さを表さなくなる。
+そのため反復と提案は局所とし、各階層が自分の上限で自分の収束を判定する。
+
+### 上限の作り方
+
+`Budget` は正の整数で、0 を表せない。
+作り方は値がいつ決まるかで選ぶ。
+
+| 作り方 | 値が決まる時点 | 0 を渡した場合 |
+|---|---|---|
+| `budget!(256)`、`budget!(64 * 1024)` | コンパイル時（定数式） | コンパイルエラー |
+| `Budget::try_from(n)?` | 実行時（`usize`） | `InvalidInput`（`OutOfRange`） |
+| `Budget::from(n)` | 実行時（`NonZeroUsize`） | 型が 0 を持たない |
+| `Budget::ONE` | 定数 1 | 0 にならない |
+
+`budget!` は引数を定数として評価するので、`const MAX_TERMS: Budget = budget!(256);` のように定数の定義にも使え、エラー処理が要らない。
+定数でない式を渡すとコンパイルできないので、入力から決まる上限は `Budget::try_from` で変換する。
+`get()` は上限を `usize` で返し、`saturating_add(additional)` は `usize::MAX` で飽和する和を返す。
+
+`SolveBudgets::unbounded()` はどの種類にも上限のない状態で、`with_limit(kind, budget)` で種類ごとに上限を設定する。
+上限がなくても回数は `usize` で数えるので、表せない回数は `SizeOverflow` になる。
+
+### 計算を実行する前の上限確認
+
+各操作は実行前に回数が上限に収まることを確認し、実行が認められた時点で回数を記録する。
+拒否された操作はどの記録も変えないので、記録された回数は実際に行った作業と一致する。
+
+- `record_iteration()` は `Admission` を返す。
+  上限内なら `Admission::Granted`、超えるならどの項目の回数も変えずに `Admission::Denied(BudgetReport)` を返す。
+  部分結果を返せない API では `.require()?` で拒否を `ConvergenceFailure` に変換できる。
+  理由は計算回数の上限の種類に応じて `IterationLimit`、`EvaluationLimit`、`ResourceLimit(kind)` になる。
+- `invoke_provider(role, callback)` は許可された場合だけコールバックを呼び、`Invocation::Evaluated(value)` を返す。
+  拒否された場合はコールバックを呼ばずに `Invocation::BudgetExhausted(report)` を返す。
+  コールバックが返したエラーはそのまま伝わり、その呼び出しは評価の回数に数えられる。
+- `try_consume(kind, amount)` は節点や標本など、プロバイダー呼び出し以外の作業量を記録する。
+- `can_consume(kind, amount)`、`can_record_iterations(amount)`、`can_record_proposals(amount)` は、記録せずに許可されるかだけを確かめる。
+  途中で止められない作業の前に必要な量をまとめて確かめるために使う。
+- `record_iterations(amount)`、`record_providers(role, amount)`、`record_proposals(amount)` は複数の単位をまとめて数え、全部が許可されるか、何も数えないかのどちらかになる。
+- `record_cache_hit()` はキャッシュの参照を数える。
+  キャッシュの参照は評価ではないので、評価回数に加算しない。
+
+`Invocation` の 3 つ目の列挙子 `ExecutionStopped(reason)` は、取り消しか期限で評価が終わらなかったことを表す。
+`invoke_provider` はこれを返さず、作用素の `apply_into_scoped` のように内側で作業をする評価が返す。
+これらの許可の操作は取り消しと期限を確かめないので、アルゴリズムは反復の境界で `stop_reason()` を別に呼ぶ（[取り消しの確認](#取り消しの確認)）。
+
+次のセルは反復の上限（1〜3 回）と関数評価の上限（1〜3 回）を入力に取り、反復と関数評価をそれぞれ 3 回試みる。
+1 つ目の表は反復の判定、2 つ目の表は関数評価の判定とコールバックの戻り値（100 に試行の番号を足した値）を示す。
+「消費」と「残り」は各試行の後に `budget_report(kind)` で読んだ `BudgetReport` の `consumed()` と `remaining()` である。
+検証するのは、消費が $\min(\text{試行の番号}, \text{上限})$ に等しいことと、拒否された試行でコールバックが呼ばれないことである。
+
+```rust
+//| id: core-solve-admission
+//| ref: core-solve-admission
+//| title: 反復と関数評価を使う前に許可を得る
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   max_iterations: {"type":"range","label":"反復の上限 [回]","description":"BudgetKind::Iteration の上限。","min":1,"max":3,"step":1,"value":1}
+//|   max_evaluations: {"type":"range","label":"関数評価の上限 [回]","description":"BudgetKind::Evaluation の上限。","min":1,"max":3,"step":1,"value":1}
+//| cases:
+//|   - {"id":"larger-limits","label":"反復 3 回、評価 2 回まで","description":"反復は 3 回とも許可され、関数評価は 3 回目だけが拒否される。","inputs":{"max_iterations":3,"max_evaluations":2}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"iterations","path":"/rows/0/1","equals":"Granted"}
+//|       - {"artifact":"iterations","path":"/rows/1/1","equals":"Denied"}
+//|       - {"artifact":"iterations","path":"/rows/2/2","equals":1}
+//|       - {"artifact":"evaluations","path":"/rows/0/2","equals":101}
+//|       - {"artifact":"evaluations","path":"/rows/1/1","equals":"BudgetExhausted"}
+//|       - {"artifact":"evaluations","path":"/rows/1/2","equals":null}
+//|       - {"artifact":"evaluations","path":"/rows/2/3","equals":1}
+//|   - case: larger-limits
+//|     expect:
+//|       - {"artifact":"iterations","path":"/rows/2/1","equals":"Granted"}
+//|       - {"artifact":"iterations","path":"/rows/2/2","equals":3}
+//|       - {"artifact":"iterations","path":"/rows/2/3","equals":0}
+//|       - {"artifact":"evaluations","path":"/rows/1/2","equals":102}
+//|       - {"artifact":"evaluations","path":"/rows/2/1","equals":"BudgetExhausted"}
+//|       - {"artifact":"evaluations","path":"/rows/2/3","equals":2}
+use scioxide_core::{
+    Admission, Budget, BudgetKind, EvaluationRole, ExecutionContext, ProblemToken,
+    SolveBudgets, SolveIdentity, SolveState, algorithm_id,
+};
+
+// 入力から決まる上限は実行時に変換する。0 は InvalidInput になる。
+let limit = |count: f64| Budget::try_from(count as usize).map_err(|e| e.to_string());
+let identity = SolveIdentity::new(
+    ProblemToken::new(1),
+    algorithm_id!("handbook", "admission", 1),
+    0,
+    0,
+);
+let mut budgets = SolveBudgets::unbounded()
+    .with_limit(BudgetKind::Iteration, limit(max_iterations)?)
+    .with_limit(BudgetKind::Evaluation, limit(max_evaluations)?);
+let mut state = SolveState::new();
+let mut cx = state
+    .begin_solve(ExecutionContext::sequential(), identity, &mut budgets)
+    .map_err(|e| e.to_string())?;
+
+// 反復を 3 回試みる。拒否された試行は実行回数に数えない。
+let mut iterations = Vec::new();
+for attempt in 1..=3_u32 {
+    let decision = match cx.record_iteration().map_err(|e| e.to_string())? {
+        Admission::Granted(()) => "Granted",
+        Admission::Denied(_) => "Denied",
+    };
+    let report = cx.budget_report(BudgetKind::Iteration);
+    iterations.push((attempt, decision, report.consumed(), report.remaining()));
+}
+
+// 関数評価を 3 回試みる。許可されたときだけコールバックが呼ばれ、100 + attempt を返す。
+let mut evaluations = Vec::new();
+for attempt in 1..=3_u32 {
+    let invocation = cx
+        .invoke_provider(EvaluationRole::Function, || Ok(100 + attempt))
+        .map_err(|e| e.to_string())?;
+    let (decision, value) = if invocation.is_exhausted() {
+        ("BudgetExhausted", None)
+    } else {
+        let value = invocation.require().map_err(|e| e.to_string())?;
+        ("Evaluated", Some(value))
+    };
+    let report = cx.budget_report(BudgetKind::Evaluation);
+    evaluations.push((
+        attempt,
+        decision,
+        value,
+        report.consumed(),
+        report.remaining(),
+    ));
+}
+
+let iteration_columns = serde_json::json!([
+    { "key": "0", "label": "試行 [回目]", "type": "integer" },
+    { "key": "1", "label": "判定 Admission" },
+    { "key": "2", "label": "消費 consumed() [回]", "type": "integer" },
+    { "key": "3", "label": "残り remaining() [回]", "type": "integer", "nullText": "上限なし" }
+]);
+emit_table_with_columns!(
+    iteration_columns,
+    iterations,
+    metadata = serde_json::json!({ "id": "iterations", "title": "反復 record_iteration" })
+);
+let evaluation_columns = serde_json::json!([
+    { "key": "0", "label": "試行 [回目]", "type": "integer" },
+    { "key": "1", "label": "判定 Invocation" },
+    { "key": "2", "label": "コールバックの戻り値", "type": "integer", "nullText": "呼ばれない" },
+    { "key": "3", "label": "消費 consumed() [回]", "type": "integer" },
+    { "key": "4", "label": "残り remaining() [回]", "type": "integer", "nullText": "上限なし" }
+]);
+emit_table_with_columns!(
+    evaluation_columns,
+    evaluations,
+    metadata = serde_json::json!({ "id": "evaluations", "title": "関数評価 invoke_provider" })
+);
+```
+
+既定値（上限はどちらも 1 回）では、反復も関数評価も 1 回目だけが許可され、2 回目と 3 回目は拒否される。
+拒否された行で消費が 1 のまま増えないのは、拒否がどの記録も変えないからである。
+関数評価の 2 回目と 3 回目は `BudgetExhausted` で、コールバックは呼ばれず、戻り値の欄は空になる。
+反復の上限を 3 回、関数評価の上限を 2 回にすると、反復は 3 回とも `Granted` で残りが 0 になり、関数評価は 101 と 102 を返した後の 3 回目だけが拒否される。
+拒否を値として受け取る経路とエラーに変換する経路の違いは、[エラー仕様と部分結果](../../../concepts/errors-and-partial-results/)のセルで確かめられる。
+
+## 取り消しの確認
+
+`Cancellation` は、取り消しが要求されたかを `is_cancelled()` で答えるトレイトである。
+`scioxide-core` の実装 `CancellationToken` はスレッド間で共有できるフラグで、`cancel()` で要求し、次の求解で使う前に `reset()` で戻す。
+トークンは `ExecutionContext::with_cancellation(&token)` で実行コンテキストに入れ、そのコンテキストで始めた求解と子の求解はすべて同じ取り消しを見る。
+
+`SolveContext::stop_reason()` は取り消しを期限より先に確かめ、要求があれば `Some(ExecutionStopReason::Cancelled)` を値として返す。
+そのため反復解法は最後に受理した状態を信頼区分とともに成功条件を満たしていない結果として返してから終われる。
+部分結果を返せない API では、実行コンテキストの `check()` が同じ確認をして `ExecutionStopped` エラーを返す。
+取り消しはアルゴリズムが状態の整った境界で確認したときに効き、実行中のコールバックは打ち切られない。
+
+期限は実行コンテキストが持ち、子の求解にも引き継がれる。
+`SolveScope::with_time_limit(duration)` は親を変えずに子だけに期限を足し、`SolveContext::limit_time(duration)` は求解の途中で期限を足す。
+どちらも既にある早い期限を保ち、クロックが束ねられていないコンテキストでは `CapabilityUnavailable` を返す。
+クロックと期限は[取り消し・クロック・期限](../cancellation-clocks-and-deadlines/)で扱う。
+
+## 信頼区分と試行の記録
+
+反復が上限に達したり外から止められたりしても、最後に受理した状態が使える場合がある。
+`PartialResultTrust` はその状態をどこまで信頼できるかを表す。
+
+| 信頼区分 | 意味 |
+|---|---|
+| `DiagnosticOnly` | 有限な診断用の状態。実行可能性や残差については何も主張しない |
+| `Admissible` | アルゴリズム自身の受理条件か実行可能性の規則で受理された状態 |
+| `ResidualChecked` | 残差が設定したしきい値を独立に満たした状態 |
+| `CertificateVerified` | 独立に検証された証明用データに裏付けられた状態 |
+
+`commit_accepted` は受理と同時に信頼区分を記録し、`assess_accepted` は新しい提案を受理せずに現在の状態の信頼区分だけを更新する。
+`assess_accepted` はリビジョン 0 の初期状態にも使える。
+最後の受理状態は `AcceptedStateMetadata`（エポック、リビジョン、信頼区分）として `accepted_state()` から読める。
+
+一回の呼び出しや再開の結果は `AttemptRecord<P>` に記録できる。
+記録はエポック、種類（`AttemptKind::Call` か `Resume`）、結果 `AttemptOutcome`、`SolveCounts`、その試行の進捗 `P` を持つ。
+
+| `AttemptOutcome` | 意味 | 読み方 |
+|---|---|---|
+| `Succeeded` | 成功の条件を満たした | 結果をそのまま使う |
+| `Stopped` | 成功せずに止まったが、受理した状態がある | 信頼区分を確かめてから使う |
+| `Failed` | 実行がエラーを返した | 進捗があれば診断に使う |
+| `PreflightRejected` | 数値計算の前に検証で拒否された | 拒否の原因（入力、設定、作業領域の容量など）を直す |
+
+`PreflightRejected` の記録はエポックも進捗も持たず、回数は 0 になる。
+作業領域に前の試行の領域が残っていても、拒否された試行の進捗としては扱われない。
+`Resume` の記録の回数には、チェックポイントから引き継いだ作業が含まれる。
+
+失敗時に進捗を残したい場合は `PartialFailure::with_progress(error, capture)` を使う。
+`capture` が失敗すると進捗は `None` になり、元のエラーは置き換えられない。
+`Succeeded` と `Stopped` を分けて記録する例は[Kepler 方程式と求解の回数の集計](../../examples/kepler-solve-accounting/)にある。
+
+## まとめ
+
+求解は事前検証から受理の確定・巻き戻しまでの 6 段階で進み、外から見えるのは受理を確定した状態だけである。
+上限は定数なら `budget!`、入力から決まる値なら `Budget::try_from` で作り、種類ごとに `SolveBudgets` に設定する。
+反復と提案の上限はその求解だけのもので、評価・分割・標本・節点の上限は入れ子の求解と共有される。
+リソースは使う前に `Admission` か `Invocation` で許可を受け取り、拒否を部分結果として返せない場合だけ `.require()?` でエラーにする。
+許可の操作は取り消しと期限を確かめないので、反復の境界で `stop_reason()` を呼ぶ。
+打ち切られた結果を使うときは `PartialResultTrust` を確認し、`DiagnosticOnly` の状態を収束解として扱わない。
+
+## 次に読むページ
+
+- [入れ子の求解・回数の集計・診断](../nested-solves-and-diagnostics/)：求解の中から別の求解を呼ぶときに、上限を共有する項目の実行回数と回数がどの階層に記録されるかを確かめる。
+- [取り消し・クロック・期限](../cancellation-clocks-and-deadlines/)：求解コンテキストに注入する取り消し、クロック、期限の扱いを確かめる。
+- [Kepler 方程式と求解の回数の集計](../../examples/kepler-solve-accounting/)：`Succeeded` と `Stopped` を分けて記録する例で、試行の結果と信頼区分の読み方を確かめる。
+- [求解の回数の集計と実行の API](../../api/solve-and-execution/)：`SolveContext` の全メソッドとエラー条件を引く。

@@ -1,0 +1,671 @@
+---
+title: "RBF cross-validation with the Franke function"
+description: "For scattered-point Gaussian RBFs, examine how shape parameter and diagonal regularization affect condition estimates, compare interior leave-one-out errors with independent-grid errors using standard errors, and compare with Clough–Tocher interpolation."
+sidebar:
+  order: 450
+---
+
+When estimating fields from scattered points such as weather stations, interpolation matches sample values and even weak regularization leaves nearly zero sample residuals, so those residuals cannot select the kernel shape parameter.
+Vary Gaussian RBF width and estimate accuracy at unobserved points through errors when leaving out one sample at a time.
+Using the Franke function with known true values, examine how well cross-validation errors reflect actual approximation errors.
+
+## Test function and observation points
+
+On $[0,1]^2$,
+
+$$
+\begin{aligned}
+f(x,y)={}&\tfrac34e^{-[(9x-2)^2+(9y-2)^2]/4}
++\tfrac34e^{-(9x+1)^2/49-(9y+1)/10}\\
+&+\tfrac12e^{-[(9x-7)^2+(9y-3)^2]/4}
+-\tfrac15e^{-(9x-4)^2-(9y-7)^2}
+\end{aligned}
+$$
+
+
+It contains two peaks of different widths and heights, a gentle slope, and a narrow depression, making the whole field difficult to represent with a single basis scale.
+The original source is [Franke, Scattered Data Interpolation: Tests of Some Methods](https://doi.org/10.1090/S0025-5718-1982-0637296-4).
+Always include the square's four corners among observations, generating the remaining points with uniform random numbers.
+Including all corners makes both the bounding rectangle and convex hull of the full point set equal the square.
+The domain of `RbfInterpolator` is the points' bounding rectangle, while that of `CloughTocherInterpolator` is the Delaunay triangulation's convex hull, allowing comparison over the same square.
+
+## Gaussian RBFs and conditioning
+
+The Gaussian kernel is $\varphi(r)=\exp[-(\epsilon r)^2]$, with shape parameter $\epsilon>0$.
+Interpolation finds weights $w$ for $s(\boldsymbol x)=\sum_jw_j\varphi(\|\boldsymbol x-\boldsymbol x_j\|)$ without polynomial terms by solving $(K+\lambda I)w=y$ with kernel matrix $K_{ij}=\varphi(\|\boldsymbol x_i-\boldsymbol x_j\|)$.
+The Gaussian-kernel $K$ is positive definite for distinct points (Bochner's theorem), so `RbfInterpolator` uses Cholesky factorization.
+If factorization breaks down or numerical-rank or condition checks fail, it switches to singular value decomposition.
+Even with SVD, insufficient numerical rank under the configured threshold returns an error of `Singular`.
+Construction uses $O(n^3)$ time and $O(n^2)$ memory; evaluation costs $O(n)$ per point.
+$\lambda>0$ is diagonal regularization specified through `RbfRegularization::Diagonal(λ)`, relaxing exact sample matching to smooth the data.
+Pass kernel `RbfKernel::Gaussian(ε)` alongside the samples, set regularization and the numerical-rank threshold (relative $10^{-14}$ here, machine epsilon by default) through `RbfOptions` setters, and construct with the detailed form `RbfInterpolator::with_options(points, values, kernel, options)`.
+
+Small $\epsilon$ makes the basis flat and the columns of $K$ nearly equal, causing the condition number to grow rapidly (the flat limit).
+With regularization, however, the smallest eigenvalue of $A=K+\lambda I$ is at least $\lambda$, giving $\|A^{-1}\|_2\le1/\lambda$.
+Kernel values are at most 1, so $\|A\|_1\le n+\lambda$; together with $\|A^{-1}\|_1\le\sqrt n\,\|A^{-1}\|_2$, the 1-norm reciprocal condition number satisfies
+
+$$
+\kappa_1^{-1}\ge\frac{\lambda}{\sqrt n\,(n+\lambda)}
+$$
+
+`RbfConditioning::reciprocal_condition_number` returns a 1-norm reciprocal-condition estimate from Cholesky or LU factors, or the 2-norm singular-value ratio $\sigma_{\min}/\sigma_{\max}$ from SVD.
+The 1-norm estimate is neither an upper nor a lower bound.
+However, the Hager–Higham estimator underestimates $\|A^{-1}\|_1$ in exact arithmetic, so the estimate is usually at least the true reciprocal condition number.
+The 2-norm reciprocal condition number $\lambda_{\min}/\lambda_{\max}\ge\lambda/(n+\lambda)$ satisfies the same lower bound.
+
+The following block supplies the test function, observations, and validation helpers shared by the page's three cells.
+`franke` defines $f$; `stations` supplies corner and uniformly random observations; `test_grid` gives centers of a $20\times20$ grid; `shape_parameter` defines $\epsilon=2^{k/2}$; `rbf_options` sets regularization and rank threshold; `without` omits one sample; `mean_and_half_width` gives the mean and 1.96 SE.
+
+```rust
+//| id: interp-station-franke-model
+//| kind: definitions
+//| title: "Franke function, observations, and validation helpers"
+//| crates: [scioxide-core, scioxide-interp, scioxide-random]
+use scioxide_core::{SciOxideError, RankThreshold, RealScalar};
+use scioxide_interp::{RbfOptions, RbfRegularization};
+use scioxide_random::{Rng, SeedableRng, SplitMix64};
+
+/// Franke's test function (Franke 1982).
+pub(crate) fn franke(x: f64, y: f64) -> f64 {
+    let (u, v) = (9.0 * x, 9.0 * y);
+    0.75 * RealScalar::exp(-((u - 2.0) * (u - 2.0) + (v - 2.0) * (v - 2.0)) / 4.0)
+        + 0.75 * RealScalar::exp(-(u + 1.0) * (u + 1.0) / 49.0 - (v + 1.0) / 10.0)
+        + 0.5 * RealScalar::exp(-((u - 7.0) * (u - 7.0) + (v - 3.0) * (v - 3.0)) / 4.0)
+        - 0.2 * RealScalar::exp(-(u - 4.0) * (u - 4.0) - (v - 7.0) * (v - 7.0))
+}
+
+/// count points combining the square's four corners (indices 0–3) and uniform random points in [0, 1)².
+pub(crate) fn stations(count: usize, seed: f64) -> Result<Vec<[f64; 2]>, SciOxideError> {
+    let mut sites = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+    let mut rng = SplitMix64::from_seed(seed as u64);
+    while sites.len() < count {
+        sites.push([rng.next_float()?, rng.next_float()?]);
+    }
+    Ok(sites)
+}
+
+/// Centers of a 20 × 20 grid independent of the samples.
+pub(crate) fn test_grid() -> Vec<[f64; 2]> {
+    (0..400)
+        .map(|k| {
+            [
+                ((k / 20) as f64 + 0.5) / 20.0,
+                ((k % 20) as f64 + 0.5) / 20.0,
+            ]
+        })
+        .collect()
+}
+
+/// Shape parameter ε = 2^(k/2).
+pub(crate) fn shape_parameter(k: i32) -> f64 {
+    RealScalar::powf(2.0, f64::from(k) / 2.0)
+}
+
+/// Regularization and numerical-rank threshold (relative 10⁻¹⁴).
+pub(crate) fn rbf_options(
+    regularization: RbfRegularization<f64>,
+) -> Result<RbfOptions<f64>, SciOxideError> {
+    Ok(RbfOptions::new()
+        .with_regularization(regularization)
+        .with_rank_threshold(RankThreshold::new(0.0, 1e-14)?))
+}
+
+/// Samples with point index omitted removed.
+pub(crate) fn without(
+    sites: &[[f64; 2]],
+    values: &[f64],
+    omitted: usize,
+) -> (Vec<[f64; 2]>, Vec<f64>) {
+    sites
+        .iter()
+        .zip(values)
+        .enumerate()
+        .filter(|(i, _)| *i != omitted)
+        .map(|(_, (&p, &v))| (p, v))
+        .unzip()
+}
+
+/// Sample mean and 95% interval half-width 1.96 SE (SE = sample standard deviation / √m).
+pub(crate) fn mean_and_half_width(x: &[f64]) -> (f64, f64) {
+    let m = x.len() as f64;
+    let mean = x.iter().sum::<f64>() / m;
+    let variance = x.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / (m - 1.0);
+    (mean, 1.96 * RealScalar::sqrt(variance / m))
+}
+```
+
+## Conditioning versus shape parameter and regularization
+
+The next cell constructs full-point RBFs for $\epsilon=2^{k/2}$ ($k=-4,\dots,8$, 13 values from 0.25 to 16) and four regularizations, comparing reciprocal-condition estimates.
+Inputs are point count and random seed.
+Since conditioning is independent of values, set all values to 1.
+The plot shows reciprocal-condition estimates on logarithmic axes, with a reference line for each $\lambda$ lower bound $\lambda/(\sqrt n(n+\lambda))$.
+The first table shows each candidate's estimate, labeling failed constructions “Cannot construct” rather than replacing them with zero.
+The second table shows counts of candidates switching to SVD, failed constructions, and error kinds for each regularization.
+This cell also passes point count and seed to the next two cells.
+
+```rust
+//| id: interp-station-rbf-conditioning
+//| ref: interp-station-rbf-conditioning
+//| title: "Condition-estimate changes with shape parameter and regularization"
+//| run: reactive
+//| uses: [interp-station-franke-model]
+//| crates: [scioxide-core, scioxide-interp, scioxide-random]
+//| exports: [count, seed]
+//| inputs:
+//|   count: {"type":"range","label":"Point count n [-]","min":12.0,"max":40.0,"step":4.0,"value":24.0}
+//|   seed: {"type":"range","label":"Random seed","min":1.0,"max":100.0,"step":1.0,"value":7.0}
+//| cases:
+//|   - {"id":"many-points","label":"n = 40","description":"Closer point spacing worsens conditioning at the same ε.","inputs":{"count":40}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"rcond","path":"/rows/0/1","equals":null}
+//|       - {"artifact":"rcond","path":"/rows/12/1","approx":{"value":0.16227,"rtol":1e-3}}
+//|       - {"artifact":"rcond","path":"/rows/0/3","range":{"min":8.5e-11}}
+//|       - {"artifact":"rcond","path":"/rows/0/4","approx":{"value":1.984e-6,"rtol":1e-2}}
+//|       - {"artifact":"failures","path":"/rows/0/2","equals":2}
+//|       - {"artifact":"failures","path":"/rows/0/3","equals":"Singular"}
+//|       - {"artifact":"failures","path":"/rows/1/2","equals":0}
+//|   - case: many-points
+//|     expect:
+//|       - {"artifact":"failures","path":"/rows/0/1","equals":1}
+//|       - {"artifact":"failures","path":"/rows/0/2","equals":4}
+//|       - {"artifact":"rcond","path":"/rows/12/1","approx":{"value":0.022538,"rtol":1e-3}}
+use scioxide_core::RealScalar;
+use scioxide_interp::{RbfInterpolator, RbfKernel, RbfRegularization};
+
+let count = count as usize;
+let sites = stations(count, seed).map_err(|e| e.to_string())?;
+let values = vec![1.0; count];
+let lambdas = [None, Some(1e-12), Some(1e-8), Some(1e-4)];
+let names = ["No regularization", "λ = 10⁻¹²", "λ = 10⁻⁸", "λ = 10⁻⁴"];
+let mut curves = vec![Vec::new(); lambdas.len()];
+let mut rows = Vec::new();
+// [SVD switch count, construction failure count] and last error kind per regularization
+let mut tally = [[0_usize; 2]; 4];
+let mut kinds = [None, None, None, None];
+for k in -4..=8 {
+    let epsilon = shape_parameter(k);
+    let mut rcond = [None; 4];
+    for (j, lambda) in lambdas.into_iter().enumerate() {
+        let regularization =
+            lambda.map_or(RbfRegularization::None, RbfRegularization::Diagonal);
+        let options = rbf_options(regularization).map_err(|e| e.to_string())?;
+        let kernel = RbfKernel::Gaussian(epsilon);
+        match RbfInterpolator::with_options(sites.clone(), values.clone(), kernel, options) {
+            Ok(model) => {
+                let conditioning = model.conditioning();
+                let value = conditioning.reciprocal_condition_number();
+                rcond[j] = Some(value);
+                curves[j].push([epsilon, value]);
+                if conditioning.used_fallback() {
+                    tally[j][0] += 1;
+                }
+            }
+            Err(e) => {
+                tally[j][1] += 1;
+                kinds[j] = Some(format!("{:?}", e.kind()));
+            }
+        }
+    }
+    rows.push((epsilon, rcond[0], rcond[1], rcond[2], rcond[3]));
+}
+let n = count as f64;
+let bound = |lambda: f64| lambda / (RealScalar::sqrt(n) * (n + lambda));
+let series: Vec<_> = curves
+    .iter()
+    .zip(names)
+    .map(|(points, name)| serde_json::json!({ "name": name, "points": points }))
+    .collect();
+let mut annotations = Vec::new();
+for (lambda, label) in [(1e-12, "λ = 10⁻¹²"), (1e-8, "λ = 10⁻⁸"), (1e-4, "λ = 10⁻⁴")]
+{
+    annotations.push(serde_json::json!({
+        "kind": "line",
+        "axis": "y",
+        "value": bound(lambda),
+        "label": format!("Lower bound for {label}")
+    }));
+}
+emit_line_chart!(
+    &series,
+    options = &serde_json::json!({
+        "xLabel": "Shape parameter ε [-]",
+        "yLabel": "Reciprocal-condition estimate [-]",
+        "xType": "log",
+        "yType": "log",
+        "annotations": annotations
+    })
+);
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Shape parameter ε [-]", "type": "number", "format": { "significantDigits": 3 } },
+    { "key": "1", "label": "No regularization [-]", "type": "number", "format": sci2, "nullText": "Cannot construct" },
+    { "key": "2", "label": "λ = 10⁻¹² [-]", "type": "number", "format": sci2, "nullText": "Cannot construct" },
+    { "key": "3", "label": "λ = 10⁻⁸ [-]", "type": "number", "format": sci2, "nullText": "Cannot construct" },
+    { "key": "4", "label": "λ = 10⁻⁴ [-]", "type": "number", "format": sci2, "nullText": "Cannot construct" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "rcond" })
+);
+let failure_rows: Vec<_> = (0..4)
+    .map(|j| (names[j], tally[j][0], tally[j][1], kinds[j].clone()))
+    .collect();
+let failure_columns = serde_json::json!([
+    { "key": "0", "label": "Regularization" },
+    { "key": "1", "label": "Candidates switching to SVD [-]", "type": "integer" },
+    { "key": "2", "label": "Failed constructions [-]", "type": "integer" },
+    { "key": "3", "label": "Error kind", "nullText": "None" }
+]);
+emit_table_with_columns!(
+    failure_columns,
+    failure_rows,
+    metadata = serde_json::json!({ "id": "failures" })
+);
+export!(count, count);
+export!(seed, seed);
+```
+
+With default $n=24$, reducing $\epsilon$ from 16 lowers the unregularized reciprocal-condition estimate from 0.16 to $5.8\times10^{-14}$ at $\epsilon=0.5$; the two candidates at $\epsilon\le0.35$ fail construction with an error of `Singular`.
+None of the successfully constructed candidates switches to SVD; their values are 1-norm estimates from Cholesky factors.
+Adding regularization places a floor under reciprocal condition numbers: $2.1\times10^{-10}$–$3.5\times10^{-8}$ at $\lambda=10^{-8}$ and at least $2.0\times10^{-6}$ at $\lambda=10^{-4}$.
+Floors on the flat side are two to four times the lower bound $\lambda/(\sqrt n(n+\lambda))$ ($8.5\times10^{-11}$ at $\lambda=10^{-8}$ and $8.5\times10^{-7}$ at $10^{-4}$); no candidate falls below its bound.
+At $\epsilon\ge4$, the kernel matrix is well conditioned, and regularization $\lambda\le10^{-4}$ barely changes the estimate.
+Setting $n=40$ reduces point spacing and makes bases relatively flatter at the same $\epsilon$; the estimate at $\epsilon=16$ falls to 0.023, while without regularization four candidates fail construction and one switches to SVD.
+A large reciprocal condition number indicates only that the system can be solved stably, not that interpolation is accurate.
+
+## Leave-one-out cross-validation
+
+Let $s_{-i}$ be the model constructed without sample $i$, and use held-out errors $e_i=s_{-i}(\boldsymbol x_i)-y_i$ to define
+
+$$
+E_{\mathrm{CV}}=\sqrt{\frac1{|I|}\sum_{i\in I}e_i^2}
+$$
+
+
+Removing a corner shrinks the bounding rectangle and puts the omitted point outside the RBF domain, so always retain the corners and omit only interior points $I$ in turn.
+This validates interior points with known boundary values, rather than leaving out every point.
+`RbfInterpolator` provides no closed-form leave-one-out error calculation, so reconstruct it for every omitted point.
+Each reconstruction costs $O(n^3)$, for total cost $O(n^4)$.
+For closed-form leave-one-out predictions, use Gaussian-process `GaussianProcessModel::leave_one_out_into` ([Local models and kriging prediction variance](../../algorithms/local-models-and-kriging/)).
+
+$E_{\mathrm{CV}}$ itself is an estimate from a limited number of points.
+Convert the standard error of mean squared error $\mathrm{SE}=s_{e^2}/\sqrt{|I|}$ to $\mathrm{SE}/(2E_{\mathrm{CV}})$ with the delta method to obtain the 95% interval half-width of $E_{\mathrm{CV}}$.
+For comparison, measure the full model's RMS difference $E_{\mathrm{test}}$ from the true function at centers of a $20\times20$ grid independent of samples.
+Express agreement between the rankings of $E_{\mathrm{CV}}$ and $E_{\mathrm{test}}$ across shape parameters through Spearman's rank correlation $r_s=1-6\sum d_i^2/[m(m^2-1)]$ ($d_i$ is the difference between candidate $i$'s two ranks, and $m$ is the candidate count).
+Also compare $E_{\mathrm{test}}$ at the $\epsilon$ minimizing $E_{\mathrm{CV}}$ with the minimum of $E_{\mathrm{test}}$.
+
+The next cell receives point count and seed from above and takes diagonal-regularization exponent $\log_{10}\lambda$ as input.
+It uses the same 13 shape parameters as the previous cell.
+The first table shows each candidate's $E_{\mathrm{CV}}$ and interval, $E_{\mathrm{test}}$, and status; the second shows rank correlation and the selected $\epsilon$.
+For construction failures, show the error kind as status rather than substituting zero error.
+The plot shows a $E_{\mathrm{CV}}\pm1.96$ SE band and a $E_{\mathrm{test}}$ line on logarithmic axes.
+This cell also passes $\lambda$ to the next cell.
+
+```rust
+//| id: interp-station-rbf-shape-scan
+//| ref: interp-station-rbf-shape-scan
+//| title: "Compare shape parameters using leave-one-out and independent-grid errors"
+//| run: button
+//| cache: inputs
+//| uses: [interp-station-franke-model]
+//| crates: [scioxide-core, scioxide-interp, scioxide-random]
+//| dependsOn:
+//|   layout: interp-station-rbf-conditioning
+//| exports: [count, seed, exponent]
+//| inputs:
+//|   exponent: {"type":"range","label":"Diagonal-regularization exponent log₁₀λ [-]","min":-14.0,"max":-2.0,"step":1.0,"value":-8.0}
+//| cases:
+//|   - {"id":"weak-regularization","label":"λ = 10⁻¹⁴","description":"Flat candidates become Singular; even successful constructions are ill conditioned and have larger errors.","inputs":{"exponent":-14}}
+//|   - {"id":"strong-regularization","label":"λ = 10⁻²","description":"Strong regularization relaxes sample matching and raises the error floor for every ε.","inputs":{"exponent":-2}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"selection","path":"/rows/0/0","approx":{"value":0.92857,"atol":1e-4}}
+//|       - {"artifact":"selection","path":"/rows/0/2","approx":{"value":2.8284,"rtol":1e-4}}
+//|       - {"artifact":"selection","path":"/rows/0/4","approx":{"value":2.8284,"rtol":1e-4}}
+//|       - {"artifact":"scan","path":"/rows/7/1","approx":{"value":0.050317,"rtol":1e-3}}
+//|       - {"artifact":"scan","path":"/rows/7/3","approx":{"value":0.055988,"rtol":1e-3}}
+//|   - case: weak-regularization
+//|     expect:
+//|       - {"artifact":"scan","path":"/rows/0/4","equals":"Singular"}
+//|       - {"artifact":"scan","path":"/rows/0/1","equals":null}
+//|       - {"artifact":"scan","path":"/rows/2/3","approx":{"value":0.4898,"rtol":1e-3}}
+//|       - {"artifact":"selection","path":"/rows/0/1","equals":11}
+//|   - case: strong-regularization
+//|     expect:
+//|       - {"artifact":"scan","path":"/rows/0/3","approx":{"value":0.1555,"rtol":1e-3}}
+//|       - {"artifact":"selection","path":"/rows/0/5","approx":{"value":0.050511,"rtol":1e-3}}
+use scioxide_core::{SciOxideError, RealScalar};
+use scioxide_interp::{
+    ExtrapolationPolicy, Interpolant, RbfInterpolator, RbfKernel, RbfRegularization,
+};
+
+let count = layout["count"].as_u64().ok_or("Missing point count")? as usize;
+let seed = layout["seed"].as_f64().ok_or("Missing seed")?;
+let sites = stations(count, seed).map_err(|e| e.to_string())?;
+let values: Vec<_> = sites.iter().map(|p| franke(p[0], p[1])).collect();
+let grid = test_grid();
+let lambda = RealScalar::powi(10.0, exponent as i32);
+let options = rbf_options(RbfRegularization::Diagonal(lambda)).map_err(|e| e.to_string())?;
+let policy = ExtrapolationPolicy::Reject;
+let mut rows = Vec::new();
+let mut scores = Vec::new();
+for k in -4..=8 {
+    let epsilon = shape_parameter(k);
+    let kernel = RbfKernel::Gaussian(epsilon);
+    // Interior leave-one-out squared errors and independent-grid mean squared error of the full model
+    let trial = (|| -> Result<(Vec<f64>, f64), SciOxideError> {
+        let mut squares = Vec::new();
+        for omitted in 4..count {
+            let (x, y) = without(&sites, &values, omitted);
+            let model = RbfInterpolator::with_options(x, y, kernel, options)?;
+            let e = model.evaluate(sites[omitted], policy)? - values[omitted];
+            squares.push(e * e);
+        }
+        let model =
+            RbfInterpolator::with_options(sites.clone(), values.clone(), kernel, options)?;
+        let mut test = 0.0;
+        for &p in &grid {
+            let e = model.evaluate(p, policy)? - franke(p[0], p[1]);
+            test += e * e / 400.0;
+        }
+        Ok((squares, test))
+    })();
+    match trial {
+        Ok((squares, test)) => {
+            let (mse, half) = mean_and_half_width(&squares);
+            let cv = RealScalar::sqrt(mse);
+            let (half, test) = (half / (2.0 * cv), RealScalar::sqrt(test));
+            rows.push((
+                epsilon,
+                Some(cv),
+                Some(half),
+                Some(test),
+                "Success".to_string(),
+            ));
+            scores.push((k, epsilon, cv, half, test));
+        }
+        Err(e) => rows.push((epsilon, None, None, None, format!("{:?}", e.kind()))),
+    }
+}
+// Spearman rank correlation (assuming no ties)
+let rank = |key: fn(&(i32, f64, f64, f64, f64)) -> f64| {
+    let mut order: Vec<_> = (0..scores.len()).collect();
+    order.sort_by(|&a, &b| key(&scores[a]).total_cmp(&key(&scores[b])));
+    let mut ranks = vec![0.0; scores.len()];
+    for (r, &i) in order.iter().enumerate() {
+        ranks[i] = r as f64;
+    }
+    ranks
+};
+let (cv_rank, test_rank) = (rank(|s| s.2), rank(|s| s.4));
+let m = scores.len() as f64;
+let d2: f64 = cv_rank
+    .iter()
+    .zip(&test_rank)
+    .map(|(a, b)| (a - b) * (a - b))
+    .sum();
+let spearman = 1.0 - 6.0 * d2 / (m * (m * m - 1.0));
+let by_cv = scores
+    .iter()
+    .min_by(|a, b| a.2.total_cmp(&b.2))
+    .ok_or("No candidates")?;
+let by_test = scores
+    .iter()
+    .min_by(|a, b| a.4.total_cmp(&b.4))
+    .ok_or("No candidates")?;
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let sig3 = serde_json::json!({ "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Shape parameter ε [-]", "type": "number", "format": sig3 },
+    { "key": "1", "label": "E_CV [-]", "type": "number", "format": sci3, "nullText": "—" },
+    {
+        "key": "2",
+        "label": "1.96 SE of E_CV [-]",
+        "type": "number",
+        "format": sci3,
+        "nullText": "—"
+    },
+    { "key": "3", "label": "E_test [-]", "type": "number", "format": sci3, "nullText": "—" },
+    { "key": "4", "label": "Status" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "scan" })
+);
+let selection_columns = serde_json::json!([
+    { "key": "0", "label": "Rank correlation r_s [-]", "type": "number", "format": sig3 },
+    { "key": "1", "label": "Candidate count [-]", "type": "integer" },
+    { "key": "2", "label": "ε minimizing E_CV [-]", "type": "number", "format": sig3 },
+    { "key": "3", "label": "Its E_test [-]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "ε minimizing E_test [-]", "type": "number", "format": sig3 },
+    { "key": "5", "label": "Minimum E_test [-]", "type": "number", "format": sci3 }
+]);
+let selection = vec![(
+    spearman,
+    scores.len(),
+    by_cv.1,
+    by_cv.4,
+    by_test.1,
+    by_test.4,
+)];
+emit_table_with_columns!(
+    selection_columns,
+    selection,
+    metadata = serde_json::json!({ "id": "selection" })
+);
+let band: Vec<_> = scores
+    .iter()
+    .map(|s| [s.1, s.2, s.2 - s.3, s.2 + s.3])
+    .collect();
+// Plot E_test on the same figure as a zero-width band
+let test_line: Vec<_> = scores.iter().map(|s| [s.1, s.4, s.4, s.4]).collect();
+emit_chart!(serde_json::json!({
+    "kind": "band",
+    "xLabel": "Shape parameter ε [-]",
+    "yLabel": "RMS error [-]",
+    "xType": "log",
+    "yType": "log",
+    "series": [
+        { "name": "Interior leave-one-out E_CV ±1.96 SE", "points": band },
+        { "name": "Independent-grid E_test", "points": test_line }
+    ]
+}));
+export!(count, count);
+export!(seed, seed);
+export!(exponent, exponent);
+```
+
+With defaults, rank correlation is 0.93, and $\epsilon\approx2.83$ minimizing $E_{\mathrm{CV}}$ also minimizes $E_{\mathrm{test}}$ ($E_{\mathrm{CV}}=0.050$, $E_{\mathrm{test}}=0.056$).
+The 95% interval half-width for $E_{\mathrm{CV}}$ reaches 30–70% of $E_{\mathrm{CV}}$, and intervals of neighboring candidates often overlap.
+Setting seed 1 in the first cell lowers rank correlation to 0.85; $E_{\mathrm{CV}}$ selects $\epsilon=0.5$, but its $E_{\mathrm{test}}=0.17$ exceeds the best value 0.10 ($\epsilon\approx0.35$).
+Setting $n=40$ in the first cell lowers rank correlation to 0.68; $E_{\mathrm{test}}=0.053$ at $\epsilon=4$ selected by $E_{\mathrm{CV}}$ is 25% above the best value 0.042 ($\epsilon\approx2.83$).
+Weakening regularization to $10^{-14}$ makes the $\epsilon\le0.35$ candidates `Singular`; even the successfully constructed $\epsilon=0.5$ has $E_{\mathrm{test}}$ increase to 0.49 due to poor conditioning.
+At $\lambda=10^{-2}$, relaxed sample matching keeps $E_{\mathrm{test}}$ on the flat side at most 0.16 and slightly lowers $E_{\mathrm{test}}$ at $\epsilon\approx2.83$ to 0.051.
+Do not select $\epsilon$ solely by the minimum $E_{\mathrm{CV}}$; also inspect interval overlap and reciprocal condition number.
+
+## Comparison with Clough–Tocher
+
+Clough–Tocher interpolation splits each Delaunay triangle into three at its centroid and places a cubic Bézier patch on each, producing globally $C^1$ interpolation.
+Vertex gradients are estimated globally using Nielson's minimum-norm network method, and the termination status in `CloughTocherReport` reports whether Gauss–Seidel iteration converged.
+Even if gradient estimation fails to converge, interpolation remains a $C^1$ surface matching sample-point values; only vertex-gradient accuracy is reduced.
+The ordinary form `CloughTocherInterpolator::new` returns an error on nonconvergence, so this comparison, which counts nonconverged cases, uses the detailed form `with_options` returning an interpolator with a report.
+It has no scale input like a shape parameter, making it a baseline for measuring the effect of RBF shape-parameter selection.
+
+The next cell receives point count, seed, and regularization from above and computes interior leave-one-out and independent-grid errors for the specified-shape RBF and Clough–Tocher.
+Clough–Tocher is also reconstructed from its Delaunay triangulation for every omitted point.
+Errors for the same omitted point are paired, so also compare the mean and 1.96 SE of squared-error differences $d_i=e_{\mathrm{RBF},i}^2-e_{\mathrm{CT},i}^2$.
+The input is shape-parameter exponent $k$ ($\epsilon=2^{k/2}$).
+Default $k=3$ ($\epsilon\approx2.83$) is the candidate minimizing $E_{\mathrm{CV}}$ with the previous cell's defaults.
+The first table shows both methods' $E_{\mathrm{CV}}$, intervals, $E_{\mathrm{test}}$, and counts of gradient-estimation nonconvergence; the second shows paired differences.
+
+```rust
+//| id: interp-station-cross-validation
+//| ref: interp-station-cross-validation
+//| title: "Compare RBF and Clough–Tocher with leave-one-out and independent-grid errors"
+//| run: button
+//| uses: [interp-station-franke-model]
+//| crates: [scioxide-core, scioxide-interp, scioxide-spatial, scioxide-random]
+//| dependsOn:
+//|   scan: interp-station-rbf-shape-scan
+//| inputs:
+//|   shape_index: {"type":"range","label":"Shape-parameter exponent k (ε = 2^(k/2)) [-]","min":-4.0,"max":8.0,"step":1.0,"value":3.0}
+//| cases:
+//|   - {"id":"flat-kernel","label":"k = −4（ε = 0.25）","description":"With flat kernels, RBF performs worse than Clough–Tocher.","inputs":{"shape_index":-4}}
+//|   - {"id":"narrow-kernel","label":"k = 8（ε = 16）","description":"Narrow-kernel bases cannot fill gaps between samples.","inputs":{"shape_index":8}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"comparison","path":"/rows/0/1","approx":{"value":0.050317,"rtol":1e-3}}
+//|       - {"artifact":"comparison","path":"/rows/1/1","approx":{"value":0.081026,"rtol":1e-3}}
+//|       - {"artifact":"comparison","path":"/rows/1/3","approx":{"value":0.051769,"rtol":1e-3}}
+//|       - {"artifact":"comparison","path":"/rows/1/4","equals":0}
+//|       - {"artifact":"paired","path":"/rows/0/1","approx":{"value":-4.0334e-3,"rtol":1e-3}}
+//|       - {"artifact":"paired","path":"/rows/0/2","approx":{"value":7.1338e-3,"rtol":1e-3}}
+//|   - case: flat-kernel
+//|     expect:
+//|       - {"artifact":"paired","path":"/rows/0/1","approx":{"value":7.1492e-3,"rtol":1e-3}}
+//|       - {"artifact":"paired","path":"/rows/0/2","approx":{"value":4.0201e-3,"rtol":1e-3}}
+//|   - case: narrow-kernel
+//|     expect:
+//|       - {"artifact":"comparison","path":"/rows/0/3","approx":{"value":0.41068,"rtol":1e-3}}
+use scioxide_core::{SciOxideError, RealScalar};
+use scioxide_interp::{
+    CloughTocherInterpolator, CloughTocherOptions, ExtrapolationPolicy, Interpolant,
+    RbfInterpolator, RbfKernel, RbfRegularization, ScatteredValues,
+};
+use scioxide_spatial::{Delaunay, PointSet};
+
+let count = scan["count"].as_u64().ok_or("Missing point count")? as usize;
+let seed = scan["seed"].as_f64().ok_or("Missing seed")?;
+let exponent = scan["exponent"].as_f64().ok_or("Missing regularization exponent")?;
+let sites = stations(count, seed).map_err(|e| e.to_string())?;
+let values: Vec<_> = sites.iter().map(|p| franke(p[0], p[1])).collect();
+let grid = test_grid();
+let kernel = RbfKernel::Gaussian(shape_parameter(shape_index as i32));
+let lambda = RealScalar::powi(10.0, exponent as i32);
+let options = rbf_options(RbfRegularization::Diagonal(lambda)).map_err(|e| e.to_string())?;
+let policy = ExtrapolationPolicy::Reject;
+// Construct an RBF from the supplied points and return values at query points
+let rbf = |points: &[[f64; 2]], data: &[f64], queries: &[[f64; 2]]| {
+    let model = RbfInterpolator::with_options(points.to_vec(), data.to_vec(), kernel, options)?;
+    queries
+        .iter()
+        .map(|&q| model.evaluate(q, policy))
+        .collect::<Result<Vec<_>, SciOxideError>>()
+};
+// Construct Clough–Tocher from the supplied points' Delaunay triangulation and return values and gradient-estimation convergence
+let clough_tocher = |points: &[[f64; 2]], data: &[f64], queries: &[[f64; 2]]| {
+    let mesh = Delaunay::new(&PointSet::from_points(points)?)?;
+    let samples = ScatteredValues::from_input_values(&mesh, data.to_vec())?;
+    let model =
+        CloughTocherInterpolator::with_options(&mesh, &samples, CloughTocherOptions::new())?;
+    let predicted = queries
+        .iter()
+        .map(|&q| model.evaluate(q, policy))
+        .collect::<Result<Vec<_>, SciOxideError>>()?;
+    Ok::<_, SciOxideError>((
+        predicted,
+        model.gradient_report().termination().is_success(),
+    ))
+};
+// Omit interior points one at a time and measure both methods' errors at each omitted point
+let mut squares = [Vec::new(), Vec::new()];
+let mut unconverged = 0;
+for omitted in 4..count {
+    let (x, y) = without(&sites, &values, omitted);
+    let query = [sites[omitted]];
+    let e_rbf = rbf(&x, &y, &query).map_err(|e| e.to_string())?[0] - values[omitted];
+    let (predicted, converged) = clough_tocher(&x, &y, &query).map_err(|e| e.to_string())?;
+    let e_ct = predicted[0] - values[omitted];
+    if !converged {
+        unconverged += 1;
+    }
+    squares[0].push(e_rbf * e_rbf);
+    squares[1].push(e_ct * e_ct);
+}
+let (full_ct, full_converged) =
+    clough_tocher(&sites, &values, &grid).map_err(|e| e.to_string())?;
+let tests = [
+    rbf(&sites, &values, &grid).map_err(|e| e.to_string())?,
+    full_ct,
+];
+let mut rows = Vec::new();
+for (j, name) in ["Gaussian RBF", "Clough–Tocher"].into_iter().enumerate() {
+    let (mse, half) = mean_and_half_width(&squares[j]);
+    let cv = RealScalar::sqrt(mse);
+    let test: f64 = grid
+        .iter()
+        .zip(&tests[j])
+        .map(|(p, v)| (v - franke(p[0], p[1])) * (v - franke(p[0], p[1])) / 400.0)
+        .sum();
+    let failures = (j == 1).then_some(unconverged + usize::from(!full_converged));
+    rows.push((
+        name,
+        cv,
+        half / (2.0 * cv),
+        RealScalar::sqrt(test),
+        failures,
+    ));
+}
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Method" },
+    { "key": "1", "label": "E_CV [-]", "type": "number", "format": sci3 },
+    { "key": "2", "label": "1.96 SE of E_CV [-]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "E_test [-]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "Gradient-estimation nonconvergence [times]", "type": "integer", "nullText": "—" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "comparison" })
+);
+let differences: Vec<_> = squares[0]
+    .iter()
+    .zip(&squares[1])
+    .map(|(a, b)| a - b)
+    .collect();
+let (difference, difference_half) = mean_and_half_width(&differences);
+let paired_columns = serde_json::json!([
+    { "key": "0", "label": "Shape parameter ε [-]", "type": "number", "format": { "significantDigits": 3 } },
+    { "key": "1", "label": "Mean squared-error difference RBF − CT [-]", "type": "number", "format": sci3 },
+    { "key": "2", "label": "1.96 SE [-]", "type": "number", "format": sci3 }
+]);
+let paired = vec![(
+    shape_parameter(shape_index as i32),
+    difference,
+    difference_half,
+)];
+emit_table_with_columns!(
+    paired_columns,
+    paired,
+    metadata = serde_json::json!({ "id": "paired" })
+);
+```
+
+With defaults, RBF $E_{\mathrm{CV}}$ is $0.050\pm0.027$ and Clough–Tocher's is $0.081\pm0.040$; independent-grid errors are nearly equal at 0.056 and 0.052.
+Clough–Tocher gradient estimation converges in all 20 omitted-point fits and the full-point fit.
+The paired squared-error difference is $-0.0040\pm0.0071$ with an interval containing zero, so leave-one-out errors do not distinguish the methods for this point configuration.
+Setting $\epsilon$ to 0.25 gives difference $0.0071\pm0.0040$, and setting it to 16 gives $0.18\pm0.14$; neither interval contains zero, and RBF's $E_{\mathrm{CV}}$ and $E_{\mathrm{test}}$ exceed Clough–Tocher's.
+Setting $n=12$ in the first cell gives RBF independent-grid error 0.086, below Clough–Tocher's 0.148, but RBF leave-one-out error 0.160 exceeds Clough–Tocher's 0.074, reversing the rankings.
+At $n=40$, independent-grid errors are 0.042 for RBF and 0.032 for Clough–Tocher, while leave-one-out errors are 0.018 for RBF and 0.045 for Clough–Tocher, again reversing the rankings.
+Clough–Tocher, without a shape parameter, provides a baseline when the RBF parameter is poorly chosen, but which method is better depends on point count and configuration.
+
+## Summary
+
+Interpolation through samples leaves nearly zero sample residuals, so choose shape parameters using errors outside the sample set, such as leave-one-out errors.
+Leave-one-out error is an estimate depending on point configuration and count; compare candidates with 95% intervals and avoid conclusions about differences between overlapping intervals.
+Gaussian RBF conditioning worsens rapidly as $\epsilon$ decreases; diagonal regularization $\lambda$ keeps reciprocal condition numbers at least $\lambda/(\sqrt n(n+\lambda))$ but relaxes sample matching.
+A reciprocal-condition estimate indicates only whether the system can be solved stably, not approximation accuracy.
+Comparison with a method lacking a scale input, such as Clough–Tocher, reveals how strongly shape-parameter selection affects accuracy.
+
+## Further reading
+
+- [Regular-grid interpolation and RBF](../../algorithms/grids-and-rbf/): inspect RBF kernel types, shape parameters and the flat limit, and interpretation of condition estimates.
+- [Scattered-point interpolation sharing a triangulation](../../algorithms/scattered-tessellations/): inspect Clough–Tocher patches and gradient estimation, and handling outside the convex hull.

@@ -1,0 +1,340 @@
+---
+title: 曲率更新の安全策と SR1
+description: BFGS 更新が曲率条件を満たさない差分の対を減衰・省略する判定、更新のレポートと飛ばす理由、行列を直接更新する HessianUpdateWorkspace、不定な曲率を表す SR1 更新、L-BFGS での曲率の方針の影響を説明する。
+sidebar:
+  order: 312
+references:
+  optimize-curvature-policy: "曲率の判定と処置"
+  optimize-direct-hessian-update: "行列を直接更新する"
+  optimize-update-skip-reasons: "更新のレポートと飛ばす理由"
+  optimize-sr1-update: "sr1-更新"
+---
+
+準 Newton 法は反復で観測した差分の対 $(\mathbf{s}, \mathbf{y})$（$\mathbf{s} = \mathbf{x}_{k+1} - \mathbf{x}_k$、$\mathbf{y} = \nabla f(\mathbf{x}_{k+1}) - \nabla f(\mathbf{x}_k)$）からヘッセ行列の近似を作り直す。
+[BFGS 更新](oxref:optimize-bfgs-update)は $\mathbf{s}^\mathsf{T}\mathbf{y} > 0$ のときに正定値性を保つが、非凸な関数や不正確な直線探索ではこの条件が崩れることがあり、条件を満たしていても丸めで更新後の行列が壊れることがある。
+このページでは、SciOxide の更新がどの対を使い、どの対を修正し、どの対を捨てるかを説明し、正定値性を保たない SR1 更新と比べる。
+記号は[一階法・非線形共役勾配・準 Newton 法](../first-order-and-quasi-newton/)と同じで、$\mathbf{B}$ はヘッセ行列の近似、$\mathbf{H}$ は逆ヘッセ行列の近似である。
+
+## 曲率の判定と処置
+
+`CurvaturePolicy::new(action, threshold)` は、しきい値 $\eta \in (0, 1)$ と処置 `CurvatureAction` を持つ（rustdoc ではしきい値を $\theta$ と書く）。
+ヘッセ行列の形（`HessianForm::Hessian`）では、対 $(\mathbf{s}, \mathbf{y})$ を
+
+$$
+\mathbf{s}^\mathsf{T}\mathbf{y} \ge \eta\,\mathbf{s}^\mathsf{T}\mathbf{B}\mathbf{s}
+$$
+
+のときにそのまま使う。
+右辺は現在の近似が予測する $\mathbf{s}$ 方向の曲率で、左辺は観測した曲率である。
+逆行列の形（`HessianForm::Inverse`）では $\mathbf{s}$ と $\mathbf{y}$ の役割を入れ替え、$\mathbf{y}^\mathsf{T}\mathbf{s} \ge \eta\,\mathbf{y}^\mathsf{T}\mathbf{H}\mathbf{y}$ で判定する。
+両辺は目的関数を定数倍しても同じ比で変わるので、判定は目的関数の単位に依存しない。
+
+判定を満たさない対への処置は二つある。
+
+- `CurvatureAction::Damp`（既定、$\eta = 0.2$）は、Powell の[減衰](oxref:optimize-damped-bfgs)で $\mathbf{y}$ を $\theta\mathbf{y} + (1-\theta)\mathbf{B}\mathbf{s}$ に置き換え、$\mathbf{s}^\mathsf{T}\bar{\mathbf{y}} = \eta\,\mathbf{s}^\mathsf{T}\mathbf{B}\mathbf{s}$ にしてから更新する。
+- `CurvatureAction::Skip` は対を捨て、近似を前のまま保つ。
+
+どちらの処置でも、近似の予測する曲率 $\mathbf{s}^\mathsf{T}\mathbf{B}\mathbf{s}$ が正でなければ対を捨てる。
+そのまま使う対と修正した対のどちらも、$\mathbf{s}^\mathsf{T}\mathbf{y}$ が $\varepsilon_{\mathrm{mach}}\lVert\mathbf{s}\rVert_2\lVert\mathbf{y}\rVert_2$ 以下なら、角度がほぼ直角で更新が丸めに支配されるので捨てる。
+
+## 更新のレポートと飛ばす理由
+
+一回の更新の結果は `HessianUpdateReport` で、`Updated`（観測した対をそのまま使った）、`Damped`（修正した対を使った）、`Skipped(UpdateSkipReason)` のどれかである。
+飛ばした更新は行列を変えない。
+`UpdateSkipReason` は次の理由を区別する。
+
+- `Curvature`：曲率の判定を満たさず `Skip` が選ばれたか、予測する曲率が正でないか、修正後の対がほぼ直交する。
+- `SmallDenominator`：SR1 の分母の絶対値が、分母を作る二つのベクトルのノルムの積の $\sqrt{\varepsilon_{\mathrm{mach}}}$ 倍以下である。
+- `Unrepresentable`：更新した行列の成分が浮動小数点数で表せない。
+- `NotPositiveDefinite`：BFGS の更新後の行列が丸めの後に正定値でない。
+  呼び出し側が渡した行列がもともと正定値でない場合も、更新の前にこの理由で飛ばす。
+
+`Bfgs` と `Lbfgs` は各反復のレポートを数え、`GlobalizationDiagnostics` の `updates()`、`damped_updates()`、`skipped_updates()`、`last_update()` で返す。
+`Bfgs` は自分が保つ近似について、更新後の対角成分が正であることだけを確かめ、Cholesky 分解はしない。
+
+## 行列を直接更新する
+
+`HessianUpdateWorkspace` は、呼び出し側が持つ密な $n \times n$ の行列を BFGS か SR1 で更新する作業領域である。
+`new()` は確保せず、`try_reserve(n)` が $O(n^2)$ の候補行列と Cholesky 分解の領域を準備する。
+`update(&mut matrix, &s, &y, form, rule)` はその場で更新し、`update_into(source, output, &s, &y, form, rule, execution)` は元の行列を残して結果を別の行列に書く。
+`form` は `HessianForm`、`rule` は `HessianUpdate::Bfgs(policy)` か `HessianUpdate::Sr1` である。
+渡す行列は有限で厳密に対称でなければならず、形が合わないか対称でなければ `InvalidInput`、有限でない成分は `NonFinite` のエラーになる。
+SR1 の更新は $O(n^2)$ である。
+BFGS の更新は、渡された行列と更新後の行列が正定値であることを確かめ、対角優位なら対角で判定し、そうでなければ Cholesky 分解（$O(n^3)$）で判定する。
+
+## SR1 更新
+
+対称階数 1（SR1）更新は、$\mathbf{r} = \mathbf{y} - \mathbf{B}\mathbf{s}$ を使って
+
+$$
+\mathbf{B}_{+} = \mathbf{B} + \frac{\mathbf{r}\mathbf{r}^\mathsf{T}}{\mathbf{r}^\mathsf{T}\mathbf{s}}
+$$
+
+とする。
+割線条件 $\mathbf{B}_+\mathbf{s} = \mathbf{y}$ を満たす対称な階数 1 の修正はこれ一つである。
+二次関数 $f(\mathbf{x}) = \tfrac12\mathbf{x}^\mathsf{T}\mathbf{A}\mathbf{x} - \mathbf{b}^\mathsf{T}\mathbf{x}$ では、一次独立な $n$ 個のステップで分母が 0 にならなければ、直線探索によらず $\mathbf{B}_n = \mathbf{A}$ になる（Nocedal–Wright 定理 6.1）。
+分母 $\mathbf{r}^\mathsf{T}\mathbf{s}$ の符号を問わないので、BFGS と違って正定値性を保たず、負の曲率も表せる。
+分母が小さいと更新が大きくなりすぎるので、SciOxide は $|\mathbf{r}^\mathsf{T}\mathbf{s}| \le \sqrt{\varepsilon_{\mathrm{mach}}}\lVert\mathbf{s}\rVert_2\lVert\mathbf{r}\rVert_2$ のとき `SmallDenominator` で飛ばす。
+逆行列の形では $\mathbf{r} = \mathbf{s} - \mathbf{H}\mathbf{y}$、分母 $\mathbf{r}^\mathsf{T}\mathbf{y}$ の双対な式を使う。
+SR1 の近似から作った方向は降下方向とは限らないので、方向の降下性を別に保つ信頼領域法と組み合わせる。
+
+次のセルは単位行列のヘッセ近似 $\mathbf{B}_0=\mathbf{I}$ を、$\mathbf{s}=(1,0)$、$\mathbf{y}=(-2,0)$（$\mathbf{s}^\mathsf{T}\mathbf{y}=-2<0$）で SR1、既定の BFGS（Powell の減衰）、`CurvatureAction::Skip` の BFGS の三通りに更新する。
+表は更新のレポート、更新後の対角成分、手計算の行列との差、割線条件の残差 $|\mathbf{B}\mathbf{s}-\mathbf{y}|$ の最大、最小固有値である。
+手計算では、SR1 は $\mathbf{r}=(-3,0)$、$\mathbf{r}^\mathsf{T}\mathbf{s}=-3$ から $\operatorname{diag}(-2,1)$ になる。
+減衰 BFGS は $\mathbf{s}^\mathsf{T}\mathbf{B}\mathbf{s}=1$ から $\theta=0.8/3$、$\bar{\mathbf{y}}=(0.2,0)$ となり、更新後は $\operatorname{diag}(0.2,1)$ になる。
+`Skip` は更新を捨てて単位行列を保つ。
+
+```rust
+//| id: optimize-sr1-indefinite-secant
+//| ref: optimize-sr1-indefinite-secant
+//| title: 負の曲率を持つ差分の対で SR1 と BFGS の更新を比べる
+//| run: reactive
+//| crates: [scioxide-core, scioxide-optimize, scioxide-linalg]
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"updates","path":"/rows/0/1","equals":"Updated"}
+//|       - {"artifact":"updates","path":"/rows/0/4","range":{"min":0,"max":1e-15}}
+//|       - {"artifact":"updates","path":"/rows/0/5","range":{"min":0,"max":1e-15}}
+//|       - {"artifact":"updates","path":"/rows/0/6","approx":{"value":-2.0,"atol":1e-15}}
+//|       - {"artifact":"updates","path":"/rows/1/1","equals":"Damped"}
+//|       - {"artifact":"updates","path":"/rows/1/4","range":{"min":0,"max":1e-14}}
+//|       - {"artifact":"updates","path":"/rows/1/5","approx":{"value":2.2,"atol":1e-14}}
+//|       - {"artifact":"updates","path":"/rows/1/6","approx":{"value":0.2,"atol":1e-14}}
+//|       - {"artifact":"updates","path":"/rows/2/1","equals":"Skipped(Curvature)"}
+//|       - {"artifact":"updates","path":"/rows/2/4","equals":0}
+//|       - {"artifact":"updates","path":"/rows/2/6","approx":{"value":1.0,"atol":1e-15}}
+use scioxide_core::RealScalar;
+use scioxide_linalg::Matrix;
+use scioxide_optimize::{
+    CurvatureAction, CurvaturePolicy, HessianForm, HessianUpdate, HessianUpdateWorkspace,
+};
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let sig4 = serde_json::json!({ "significantDigits": 4 });
+// 同じ差分の対 s = (1, 0)、y = (−2, 0)（sᵀy = −2 < 0）で B₀ = I を三つの規則で更新する。
+let (s, y) = ([1.0_f64, 0.0], [-2.0_f64, 0.0]);
+let skip = CurvaturePolicy::new(CurvatureAction::Skip, 0.2).map_err(|e| e.to_string())?;
+let rules = [
+    ("SR1", HessianUpdate::Sr1, [-2.0, 0.0, 0.0, 1.0]),
+    (
+        "BFGS（既定: Powell の減衰 η = 0.2）",
+        HessianUpdate::Bfgs(CurvaturePolicy::default()),
+        [0.2, 0.0, 0.0, 1.0],
+    ),
+    (
+        "BFGS（Skip）",
+        HessianUpdate::Bfgs(skip),
+        [1.0, 0.0, 0.0, 1.0],
+    ),
+];
+let mut work = HessianUpdateWorkspace::new();
+work.try_reserve(2).map_err(|e| e.to_string())?;
+let mut rows = Vec::new();
+for (name, rule, expected) in rules {
+    let mut model =
+        Matrix::from_vec(2, 2, vec![1.0_f64, 0.0, 0.0, 1.0]).map_err(|e| e.to_string())?;
+    let report = work
+        .update(&mut model, &s, &y, HessianForm::Hessian, rule)
+        .map_err(|e| e.to_string())?;
+    let m = model.as_slice();
+    // 独立検算: 手計算した行列との差、B s − y の最大成分、2×2 対称行列の最小固有値。
+    let matrix_error = m
+        .iter()
+        .zip(expected)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f64, f64::max);
+    let secant = (m[0] * s[0] + m[1] * s[1] - y[0])
+        .abs()
+        .max((m[2] * s[0] + m[3] * s[1] - y[1]).abs());
+    let (mean, half) = (0.5 * (m[0] + m[3]), 0.5 * (m[0] - m[3]));
+    let smallest = mean - RealScalar::sqrt(half * half + m[1] * m[2]);
+    rows.push((
+        name,
+        format!("{report:?}"),
+        m[0],
+        m[3],
+        matrix_error,
+        secant,
+        smallest,
+    ));
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "更新規則" },
+    { "key": "1", "label": "更新のレポート" },
+    { "key": "2", "label": "B₁₁ [-]", "type": "number", "format": sig4 },
+    { "key": "3", "label": "B₂₂ [-]", "type": "number", "format": sig4 },
+    { "key": "4", "label": "手計算の行列との差 [-]", "type": "number", "format": sci3 },
+    { "key": "5", "label": "割線条件 |B s − y| の最大 [-]", "type": "number", "format": sig4 },
+    { "key": "6", "label": "最小固有値 [-]", "type": "number", "format": sig4 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "updates" })
+);
+```
+
+SR1 の更新後の行列は $\operatorname{diag}(-2,1)$ と一致し、割線条件の残差は 0、最小固有値は $-2$、レポートは `Updated` である。
+減衰 BFGS は `Damped` を返し、行列は $\operatorname{diag}(0.2,1)$ と $1.7\times10^{-16}$ の差で一致する。
+その最小固有値は 0.2 で正定値性を保つが、満たすのは修正した $\bar{\mathbf{y}}$ に対する割線条件なので、元の $\mathbf{y}$ との残差は 2.2 になる。
+`Skip` は `Skipped(Curvature)` を返し、単位行列のまま残差 3 を残す。
+
+## L-BFGS と曲率の方針
+
+L-BFGS は直近 $m$ 組の対だけをメモリするので、対を捨てるとメモリが新しくならない。
+`Lbfgs` は新しい対を、その対で更新する行列 $\tilde{\mathbf{H}}$ に対する逆行列の形の判定 $\mathbf{y}^\mathsf{T}\mathbf{s} \ge \eta\,\mathbf{y}^\mathsf{T}\tilde{\mathbf{H}}\mathbf{y}$ で調べる（Nocedal–Wright 式 7.19、7.20）。
+$\tilde{\mathbf{H}}$ は、新しい対から作った初期行列 $\gamma\mathbf{I}$（$\gamma = \mathbf{s}^\mathsf{T}\mathbf{y}/\mathbf{y}^\mathsf{T}\mathbf{y}$）に、新しい対を加えた後もメモリに残る対（メモリが満杯なら最も古い対を除いた $m-1$ 組）の BFGS 更新を施した行列である。
+二重ループ再帰は方向を作るたびに初期行列を直近の対で作り直すので、判定もその行列に合わせる。
+メモリが空なら $\mathbf{y}^\mathsf{T}\tilde{\mathbf{H}}\mathbf{y} = \gamma\,\mathbf{y}^\mathsf{T}\mathbf{y} = \mathbf{s}^\mathsf{T}\mathbf{y}$ なので、$\mathbf{s}^\mathsf{T}\mathbf{y} > 0$ の対は $\eta < 1$ のどのしきい値でも判定を満たす。
+判定を満たさない対は、`Damp` なら $\bar{\mathbf{s}} = \theta\mathbf{s} + (1-\theta)\tilde{\mathbf{H}}\mathbf{y}$ に修正してメモリし、`Skip` ならメモリしない。
+$\mathbf{s}^\mathsf{T}\mathbf{y} \le 0$ の対は判定を満たさず、減衰の基準には $\tilde{\mathbf{H}}$ の代わりにメモリしている現在の近似を使う。
+
+次のセルは[比較の実験](oxref:optimize-bfgs-condition)と同じ $n = 20$ の二次関数（条件数 $\kappa$）を、`Bfgs` と `Lbfgs`（$m = 10$）で `Damp` と `Skip` の二つの処置について解く。
+入力は条件数 $\kappa$ と判定のしきい値 $\eta$ である。
+凸な二次関数ではどの対も $\mathbf{s}^\mathsf{T}\mathbf{y} = \mathbf{s}^\mathsf{T}\mathbf{A}\mathbf{s} > 0$ を満たすので、BFGS の正定値性のためには対を捨てる必要がない。
+さらに $\mathbf{y} = \mathbf{A}\mathbf{s}$ から $\mathbf{y}^\mathsf{T}\mathbf{A}^{-1}\mathbf{y} = \mathbf{s}^\mathsf{T}\mathbf{y}$ なので、比 $\mathbf{s}^\mathsf{T}\mathbf{y}/\mathbf{y}^\mathsf{T}\tilde{\mathbf{H}}\mathbf{y}$ は $\tilde{\mathbf{H}}$ が $\mathbf{y}$ の向きで $\mathbf{A}^{-1}$ をどれだけよく近似しているかを表し、近似が正確なら 1 になる。
+表は各組の終了理由、反復回数、そのまま使った更新、減衰した更新、捨てた更新の回数である。
+セルの結論は既定の処置 `Damp` の `Lbfgs` の終了理由から出す。
+
+```rust
+//| id: optimize-lbfgs-curvature-policy
+//| ref: optimize-lbfgs-curvature-policy
+//| title: 曲率の処置を変えて BFGS と L-BFGS の更新の内訳を比べる
+//| run: reactive
+//| crates: [scioxide-core, scioxide-optimize]
+//| inputs:
+//|   condition_number: {"type":"range","label":"ヘッセ行列の条件数 κ [-]","description":"二次関数の固有値の広がりを変える。","min":2,"max":10000,"step":2,"value":400}
+//|   threshold: {"type":"range","label":"判定のしきい値 η [-]","description":"観測した曲率が、対が更新する行列の予測の η 倍に届かない対を減衰または省略する。","min":0.05,"max":0.95,"step":0.05,"value":0.2}
+//| cases:
+//|   - {"id":"kappa-10000","label":"κ = 10⁴","description":"既定の η = 0.2 では四つの組とも対を一つも減衰・省略せず、Lbfgs は Damp と Skip で同じ反復数になる。","inputs":{"condition_number":10000}}
+//|   - {"id":"strict-threshold","label":"κ = 10⁴、η = 0.8","description":"判定に掛かる対が増え、Skip の L-BFGS は対を捨て続けて 1000 反復の上限で止まる。","inputs":{"condition_number":10000,"threshold":0.8}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"policies","path":"/rows/0/2","equals":"GradientSmall"}
+//|       - {"artifact":"policies","path":"/rows/1/2","equals":"GradientSmall"}
+//|       - {"artifact":"policies","path":"/rows/2/2","equals":"GradientSmall"}
+//|       - {"artifact":"policies","path":"/rows/3/2","equals":"GradientSmall"}
+//|       - {"artifact":"policies","path":"/rows/2/5","equals":0}
+//|       - {"artifact":"policies","path":"/rows/3/6","equals":0}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+//|   - case: kappa-10000
+//|     expect:
+//|       - {"artifact":"policies","path":"/rows/1/6","equals":0}
+//|       - {"artifact":"policies","path":"/rows/2/2","equals":"GradientSmall"}
+//|       - {"artifact":"policies","path":"/rows/3/2","equals":"GradientSmall"}
+//|       - {"artifact":"policies","path":"/rows/3/6","equals":0}
+//|   - case: strict-threshold
+//|     expect:
+//|       - {"artifact":"policies","path":"/rows/1/6","equals":0}
+//|       - {"artifact":"policies","path":"/rows/2/2","equals":"GradientSmall"}
+//|       - {"artifact":"policies","path":"/rows/2/5","range":{"min":100,"max":1000}}
+//|       - {"artifact":"policies","path":"/rows/3/2","equals":"IterationLimit"}
+//|       - {"artifact":"policies","path":"/rows/3/6","range":{"min":500,"max":1000}}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+use scioxide_core::{Budget, RealScalar};
+use scioxide_optimize::{
+    Bfgs, BfgsOptions, CurvatureAction, CurvaturePolicy, Lbfgs, LbfgsOptions, ObjectiveFn,
+    OptimizeDiagnostics, OptimizeResult,
+};
+
+// f(x) = ½ Σ λᵢ xᵢ²、λᵢ = κ^{i/(n−1)}（比較の実験と同じ問題）。
+let n = 20_usize;
+let lambda: Vec<f64> = (0..n)
+    .map(|i| RealScalar::powf(condition_number, i as f64 / (n - 1) as f64))
+    .collect();
+let (lv, lg) = (lambda.clone(), lambda.clone());
+let objective = ObjectiveFn::new(n, move |x: &[f64]| {
+    Ok(0.5 * x.iter().zip(&lv).map(|(v, l)| l * v * v).sum::<f64>())
+})
+.with_gradient(move |x: &[f64], g: &mut [f64]| {
+    for ((gi, v), l) in g.iter_mut().zip(x).zip(&lg) {
+        *gi = l * v;
+    }
+    Ok(())
+});
+let start = vec![1.0_f64; n];
+let memory = Budget::try_from(10).map_err(|e| e.to_string())?;
+let mut rows = Vec::new();
+let mut default_lbfgs = None;
+for (method, name) in ["Bfgs", "Lbfgs"].into_iter().enumerate() {
+    for (action, label) in [
+        (CurvatureAction::Damp, "Damp"),
+        (CurvatureAction::Skip, "Skip"),
+    ] {
+        let policy = CurvaturePolicy::new(action, threshold).map_err(|e| e.to_string())?;
+        let result: OptimizeResult<f64> = if method == 0 {
+            Bfgs::new(BfgsOptions::default().with_curvature_policy(policy))
+                .minimize(&objective, &start)
+        } else {
+            let options = LbfgsOptions::default().with_memory(memory);
+            Lbfgs::new(options.with_curvature_policy(policy)).minimize(&objective, &start)
+        }
+        .map_err(|e| e.to_string())?;
+        let OptimizeDiagnostics::FirstOrder(d) = result.method_diagnostics() else {
+            return Err("一階法の診断がない".into());
+        };
+        rows.push((
+            name,
+            label,
+            result.termination().to_string(),
+            result.iterations(),
+            d.updates(),
+            d.damped_updates(),
+            d.skipped_updates(),
+        ));
+        if method == 1 && action == CurvatureAction::Damp {
+            default_lbfgs = Some(result);
+        }
+    }
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "方法" },
+    { "key": "1", "label": "処置" },
+    { "key": "2", "label": "終了理由" },
+    { "key": "3", "label": "反復 [回]", "type": "integer" },
+    { "key": "4", "label": "そのまま使った更新 [回]", "type": "integer" },
+    { "key": "5", "label": "減衰した更新 [回]", "type": "integer" },
+    { "key": "6", "label": "捨てた更新 [回]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "policies" })
+);
+// 既定の処置（Damp）の L-BFGS の終了理由をセルの結論にする。
+let result = default_lbfgs.ok_or("L-BFGS の結果がない")?;
+let outcome = if result.is_success() {
+    Outcome::satisfied("Damp の L-BFGS の勾配ノルムが許容誤差を下回った")
+} else {
+    Outcome::partial("Damp の L-BFGS が上限で止まり、最後に受理した点を返した")
+};
+emit_outcome!(outcome.status(result.termination().to_string()).diagnostic(
+    "反復",
+    result.iterations() as f64,
+    None
+));
+```
+
+既定の $\kappa = 400$、$\eta = 0.2$ では、四つの組とも対を一度も減衰も省略もせず、`Bfgs` は 94 回、`Lbfgs` は 157 回の更新をすべてそのまま使って `GradientSmall` になる。
+処置は判定を満たさない対にだけ働くので、`Damp` と `Skip` の反復は同じである。
+$\kappa = 10^4$ でも同じで、`Lbfgs` はどちらの処置でも 758 反復、`Bfgs` は 139 反復で止まる。
+しきい値を $\eta = 0.8$ に上げると、$\kappa = 10^4$ の `Lbfgs` では判定を満たさない対が多くなる。
+`Damp` は 785 反復のうち 360 回の対を減衰して `GradientSmall` になるが、`Skip` は 904 回の対を捨ててメモリがほとんど新しくならず、1000 反復の上限で `IterationLimit` に止まる。
+`Bfgs` はこの $\eta$ でも対を一度も修正しない。
+L-BFGS に `Skip` や大きな $\eta$ を使うときは、`skipped_updates()` と `damped_updates()` の割合と終了理由を確かめる。
+
+## まとめ
+
+BFGS 更新は、観測した曲率が近似の予測の $\eta$ 倍（既定 0.2）に届かない対を、既定では Powell の減衰で修正し、`CurvatureAction::Skip` では捨てる。
+どの対をどう扱ったかは `HessianUpdateReport` と `UpdateSkipReason`、反復全体では `GlobalizationDiagnostics` の回数で読める。
+呼び出し側の行列を更新するときは `HessianUpdateWorkspace` を使い、BFGS では正定値性の確認に最大 $O(n^3)$ の計算コストがかかることを見込む。
+SR1 は不定な曲率を表せる代わりに降下方向を保証しないので、信頼領域法と組み合わせる。
+L-BFGS は新しい対をその対で更新する行列で判定し、対を捨てるとメモリが新しくならないので、捨てた更新の割合が高いときは処置としきい値を見直す。
+
+## 次に読むページ
+
+- [一階法・非線形共役勾配・準 Newton 法](../first-order-and-quasi-newton/)：BFGS の正定値性の定理と L-BFGS の二重ループ再帰を確かめる。
+- [Newton 法と信頼領域法](../newton-and-trust-region/)：不定な曲率を持つ近似から、信頼領域の部分問題で降下するステップを作る方法を確かめる。
+- [直線探索・曲率更新・一変数最小化の API](../../api/line-search-curvature-scalar/)：`CurvaturePolicy`、`HessianUpdate`、`HessianUpdateWorkspace` の一覧を確かめる。

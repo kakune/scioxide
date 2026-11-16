@@ -1,0 +1,732 @@
+---
+title: "Steady reaction front with counter-diffusion"
+description: "Solve the steady second-order reaction A + B → P between two species diffusing from opposite sides of a membrane using NonlinearPdeProblem and Newton–Krylov; compare Jacobian representations and fieldwise preconditioning, checking invariants and the fast-reaction limit."
+sidebar:
+  order: 428
+references:
+  pde-reaction-front: "counter-diffusing-species-and-their-reaction-front"
+  pde-reaction-front-limit: "concentration-distribution-and-fast-reaction-limit"
+  pde-reaction-front-damkohler-scaling: "reaction-speed-and-reaction-band-width"
+---
+
+This page applies `NonlinearPdeProblem`, `PdeJacobianMode`, `PdeFieldPreconditioner`, and `PdeTangent` from [Nonlinear steady problems](../../algorithms/nonlinear-steady-problems/) to a steady problem with two fields coupled by reaction.
+Solve with Newton–Krylov and compare iteration counts across Jacobian representations and with or without preconditioning.
+Check solution correctness using an invariant unaffected by reaction and a closed-form fast-reaction limit, rather than residual magnitude.
+
+## Counter-diffusing species and their reaction front
+
+A solution of species A contacts the left face ($x=0$) of a membrane of thickness $L=1$ mm, and species B contacts the right face ($x=L$).
+A and B diffuse into the membrane and disappear where they meet through second-order reaction $\mathrm{A}+\mathrm{B}\to\mathrm{P}$ (rate constant $k$ [m³/(mol·s)]).
+Steady concentrations $a(x),b(x)$ [mol/m³] satisfy
+
+$$
+D_A\,a''=k\,a\,b,\qquad D_B\,b''=k\,a\,b,\qquad 0<x<L
+$$
+
+$$
+a(0)=a_0,\quad a(L)=0,\qquad b(0)=0,\quad b(L)=b_0
+$$
+
+
+Set parameters $D_A=1.0\times10^{-9}$ m²/s, $D_B=0.5\times10^{-9}$ m²/s, and $a_0=b_0=1$ mol/m³.
+Express reaction speed by Damköhler number $\mathrm{Da}=k\,a_0L^2/D_A$ (the ratio of reaction to diffusion rates).
+
+Subtracting the equations removes reaction, giving $w''=0$ for $w=D_A a-D_B b$.
+Thus $w$ is the linear function determined by boundary values:
+
+$$
+w(x)=D_A a_0\left(1-\frac{x}{L}\right)-D_B b_0\,\frac{x}{L}
+$$
+
+
+In the fast-reaction limit ($\mathrm{Da}\to\infty$), A and B cannot coexist: only A remains where $w>0$ and only B where $w<0$.
+Limiting concentrations are $a=\max(w,0)/D_A$ and $b=\max(-w,0)/D_B$, with the reaction front concentrated at the position where $w=0$:
+
+$$
+x_f=\frac{D_A a_0}{D_A a_0+D_B b_0}\,L=\frac{2}{3}\,L
+$$
+
+
+At finite Da, reaction occurs in a band of width $\delta$ around $x_f$.
+Balancing diffusion and reaction in the band, $D c/\delta^2\sim k c^2$, with incoming flux $D c/\delta\sim D_A a_0/L$ estimates width $\delta/L\sim\mathrm{Da}^{-1/3}$ and band concentration $c/a_0\sim\mathrm{Da}^{-1/3}$.
+Thus the difference from limiting concentrations is expected to shrink proportionally to $\mathrm{Da}^{-1/3}$.
+
+Divide the interval into $n+1$ equal parts and use three-point differences at interior nodes $x_i=ih$ ($h=L/(n+1)$, $i=1,\dots,n$), multiplying each nodal equation by $h$ to obtain residuals
+
+$$
+F^{a}_i=\frac{D_A}{h}\left(a_{i-1}-2a_i+a_{i+1}\right)-h\,k\,a_ib_i,\qquad
+F^{b}_i=\frac{D_B}{h}\left(b_{i-1}-2b_i+b_{i+1}\right)-h\,k\,a_ib_i
+$$
+
+with units mol/(m²·s).
+The form multiplied by $h$ matches the right-hand side of semidiscrete system $h\,\dot{\mathbf{u}}=\mathbf{F}$ with lumped mass $h$.
+$a_0,a_{n+1},b_0,b_{n+1}$ are boundary values; order unknowns as $\mathbf{u}=(a_1,\dots,a_n,b_1,\dots,b_n)$.
+Discrete $w_i=D_Aa_i-D_Bb_i$ also satisfies $w_{i-1}-2w_i+w_{i+1}=0$ in three-point differences, so $w_i$ of the discrete solution matches the linear function to rounding and residual levels.
+This checks whether the two fields were coupled and solved correctly.
+
+The Jacobian is tridiagonal within each field, with only diagonal coupling between fields.
+
+$$
+\frac{\partial F^a_i}{\partial a_i}=-\frac{2D_A}{h}-hk\,b_i,\qquad
+\frac{\partial F^a_i}{\partial a_{i\pm1}}=\frac{D_A}{h},\qquad
+\frac{\partial F^a_i}{\partial b_i}=-hk\,a_i
+$$
+
+$F^b$ has the same form with $a$ and $b$ exchanged.
+Each preconditioning block uses the inverse of the diffusion part $-(D/h)\,\mathrm{tridiag}(-1,2,-1)$ without reaction, applied in $O(n)$ work by the Thomas algorithm (tridiagonal LU factorization).
+
+The following block defines the model shared by two cells.
+In `ReactionFront`, `rhs` implements residual $\mathbf{F}$; `jacobian`, `sparse_jacobian`, and `jacobian_product` give three Jacobian representations; `diffusion_inverse` gives preconditioning blocks.
+`linear_profiles` gives linear concentration profiles without reaction ($k=0$), used as Newton's initial guess.
+
+```rust
+//| id: pde-reaction-front-model
+//| kind: definitions
+//| title: "Residuals and Jacobian for a counter-diffusing two-species reaction front"
+//| crates: [scioxide-core, scioxide-linalg, scioxide-ode]
+use scioxide_core::{
+    ClosurePreconditioner, SciOxideError, SolveContext, StructuralPattern, StructuralPatternView,
+};
+use scioxide_linalg::MatrixViewMut;
+use scioxide_ode::OdeSystem;
+
+/// Residuals at interior nodes of membrane 0 < x < L. Component order is [a_1..a_n, b_1..b_n].
+pub(crate) struct ReactionFront {
+    pub(crate) nodes: usize,
+    pub(crate) spacing: f64,
+    pub(crate) diffusivity: [f64; 2],
+    pub(crate) rate: f64,
+    pub(crate) left: [f64; 2],
+    pub(crate) right: [f64; 2],
+}
+
+impl ReactionFront {
+    /// L = 1 mm, D_A = 1e-9 m²/s, D_B = 0.5e-9 m²/s, a0 = b0 = 1 mol/m³.
+    pub(crate) fn new(nodes: usize, rate: f64) -> Self {
+        Self {
+            nodes,
+            spacing: 1.0e-3 / (nodes + 1) as f64,
+            diffusivity: [1.0e-9, 0.5e-9],
+            rate,
+            left: [1.0, 0.0],
+            right: [0.0, 1.0],
+        }
+    }
+
+    /// Position of zero-based node i: x = (i + 1) h [m].
+    pub(crate) fn position(&self, i: usize) -> f64 {
+        (i + 1) as f64 * self.spacing
+    }
+
+    /// Value at node i of field. i = −1 and i = n are Dirichlet boundary values.
+    fn value(&self, x: &[f64], field: usize, i: isize) -> f64 {
+        match usize::try_from(i) {
+            Err(_) => self.left[field],
+            Ok(i) if i == self.nodes => self.right[field],
+            Ok(i) => x[field * self.nodes + i],
+        }
+    }
+
+    /// Jacobian entry (row, col).
+    pub(crate) fn entry(&self, x: &[f64], row: usize, col: usize) -> f64 {
+        let n = self.nodes;
+        let (field, i, other, j) = (row / n, row % n, col / n, col % n);
+        let mut value = 0.0;
+        if field == other && i.abs_diff(j) <= 1 {
+            let d = self.diffusivity[field] / self.spacing;
+            value += if i == j { -2.0 * d } else { d };
+        }
+        if i == j {
+            // ∂(h k a b)/∂a = h k b, ∂(h k a b)/∂b = h k a.
+            let partner = if other == 0 { x[n + i] } else { x[i] };
+            value -= self.spacing * self.rate * partner;
+        }
+        value
+    }
+
+    /// Structure consists of tridiagonal blocks per field and coupling between fields at the same node.
+    pub(crate) fn pattern(&self) -> Result<StructuralPattern, SciOxideError> {
+        let n = self.nodes;
+        let (mut rows, mut columns) = (vec![0], Vec::new());
+        for row in 0..2 * n {
+            let (field, i) = (row / n, row % n);
+            let mut entries: Vec<usize> = (i.saturating_sub(1)..=(i + 1).min(n - 1))
+                .map(|j| field * n + j)
+                .collect();
+            entries.push((1 - field) * n + i);
+            entries.sort_unstable();
+            columns.extend(entries);
+            rows.push(columns.len());
+        }
+        StructuralPattern::new(2 * n, 2 * n, rows, columns)
+    }
+
+    /// Linear concentration profiles without reaction (k = 0).
+    pub(crate) fn linear_profiles(&self) -> Vec<f64> {
+        (0..2 * self.nodes)
+            .map(|row| {
+                let s = self.position(row % self.nodes) / 1.0e-3;
+                let field = row / self.nodes;
+                self.left[field] * (1.0 - s) + self.right[field] * s
+            })
+            .collect()
+    }
+
+    /// Exact linear invariant w = D_A a − D_B b and fast-reaction limiting concentrations (a, b) at node i.
+    pub(crate) fn limit(&self, i: usize) -> (f64, f64, f64) {
+        let s = self.position(i) / 1.0e-3;
+        let [da, db] = self.diffusivity;
+        let w = da * self.left[0] * (1.0 - s) - db * self.right[1] * s;
+        (w, w.max(0.0) / da, (-w).max(0.0) / db)
+    }
+
+    /// Check: (invariant defect / (D_A a0), maximum limiting-concentration difference [mol/m³], reaction-band centroid x_c [m]).
+    pub(crate) fn checks(&self, u: &[f64]) -> (f64, f64, f64) {
+        let n = self.nodes;
+        let [da, db] = self.diffusivity;
+        let (mut invariant, mut limit, mut weighted, mut total) = (0.0_f64, 0.0_f64, 0.0, 0.0);
+        for i in 0..n {
+            let (w, a, b) = self.limit(i);
+            invariant = invariant.max((da * u[i] - db * u[n + i] - w).abs() / (da * self.left[0]));
+            limit = limit.max((u[i] - a).abs()).max((u[n + i] - b).abs());
+            weighted += self.position(i) * u[i] * u[n + i];
+            total += u[i] * u[n + i];
+        }
+        (invariant, limit, weighted / total)
+    }
+
+    /// Preconditioner applying inverse diffusion part −(D/h) tridiag(−1, 2, −1) with the Thomas algorithm.
+    pub(crate) fn diffusion_inverse(
+        &self,
+        field: usize,
+    ) -> ClosurePreconditioner<f64, impl Fn(&[f64], &mut [f64]) -> Result<(), SciOxideError>> {
+        let (n, scale) = (self.nodes, self.spacing / self.diffusivity[field]);
+        // Precompute LU diagonal m_i and upper coefficient c_i = −1/m_i.
+        let mut pivots = vec![2.0; n];
+        let mut upper = vec![-0.5; n];
+        for i in 1..n {
+            pivots[i] = 2.0 + upper[i - 1];
+            upper[i] = -1.0 / pivots[i];
+        }
+        ClosurePreconditioner::new(n, move |input: &[f64], output: &mut [f64]| {
+            for i in 0..n {
+                let previous = if i > 0 { output[i - 1] } else { 0.0 };
+                output[i] = (-scale * input[i] + previous) / pivots[i];
+            }
+            for i in (0..n.saturating_sub(1)).rev() {
+                output[i] -= upper[i] * output[i + 1];
+            }
+            Ok(())
+        })
+    }
+}
+
+impl OdeSystem<f64> for ReactionFront {
+    fn dimension(&self) -> usize {
+        2 * self.nodes
+    }
+
+    fn rhs(
+        &self,
+        _: f64,
+        x: &[f64],
+        out: &mut [f64],
+        _: &mut SolveContext<'_, '_>,
+    ) -> Result<(), SciOxideError> {
+        let n = self.nodes;
+        for row in 0..2 * n {
+            let (field, i) = (row / n, (row % n) as isize);
+            let laplacian =
+                self.value(x, field, i - 1) - 2.0 * x[row] + self.value(x, field, i + 1);
+            let reaction = self.spacing * self.rate * x[row % n] * x[n + row % n];
+            out[row] = self.diffusivity[field] / self.spacing * laplacian - reaction;
+        }
+        Ok(())
+    }
+
+    fn jacobian(
+        &self,
+        _: f64,
+        x: &[f64],
+        out: &mut MatrixViewMut<'_, f64>,
+        _: &mut SolveContext<'_, '_>,
+    ) -> Result<Option<()>, SciOxideError> {
+        for row in 0..2 * self.nodes {
+            for col in 0..2 * self.nodes {
+                out.set(row, col, self.entry(x, row, col))?;
+            }
+        }
+        Ok(Some(()))
+    }
+
+    fn sparse_jacobian(
+        &self,
+        _: f64,
+        x: &[f64],
+        p: StructuralPatternView<'_>,
+        out: &mut [f64],
+        _: &mut SolveContext<'_, '_>,
+    ) -> Result<Option<()>, SciOxideError> {
+        for row in 0..2 * self.nodes {
+            for k in p.row_ptr()[row]..p.row_ptr()[row + 1] {
+                out[k] = self.entry(x, row, p.col_indices()[k]);
+            }
+        }
+        Ok(Some(()))
+    }
+
+    fn jacobian_product(
+        &self,
+        _: f64,
+        x: &[f64],
+        v: &[f64],
+        out: &mut [f64],
+        _: &mut [f64],
+        _: &mut SolveContext<'_, '_>,
+    ) -> Result<Option<()>, SciOxideError> {
+        let n = self.nodes;
+        for row in 0..2 * n {
+            let i = row % n;
+            // Boundary values are fixed, so out-of-range direction components are 0.
+            let below = if i > 0 { v[row - 1] } else { 0.0 };
+            let above = if i + 1 < n { v[row + 1] } else { 0.0 };
+            let diffusion =
+                self.diffusivity[row / n] / self.spacing * (below - 2.0 * v[row] + above);
+            let reaction = self.spacing * self.rate * (x[n + i] * v[i] + x[i] * v[n + i]);
+            out[row] = diffusion - reaction;
+        }
+        Ok(Some(()))
+    }
+}
+```
+
+## Newton–Krylov solve
+
+The next cell selects rate constant $k$, interior-node count $n$, Jacobian representation, and fieldwise preconditioning, then computes the steady solution with `NewtonKrylovSolver`.
+Use relative residual tolerance $10^{-10}$ (relative to the initial residual norm) and initial linear concentration profiles without reaction.
+The table shows termination reason, Newton and GMRES iteration counts, Jacobian assembly count, and final residual norm.
+The last column gives the relative difference between $J(\mathbf{u})\mathbf{v}$ returned by `PdeTangent` at the solution and central residual difference $[\mathbf{F}(\mathbf{u}+\sigma\mathbf{v})-\mathbf{F}(\mathbf{u}-\sigma\mathbf{v})]/(2\sigma)$.
+The residual is quadratic in $\mathbf{u}$, so central differences are exact apart from rounding; this column checks consistency of the selected derivative representation with the residual.
+Pass computed concentrations to the next cell.
+
+```rust
+//| id: pde-coupled-steady-newton
+//| ref: pde-coupled-steady-newton
+//| title: "Solve a counter-diffusing two-species reaction front with Newton–Krylov"
+//| run: reactive
+//| uses: [pde-reaction-front-model]
+//| crates: [scioxide-core, scioxide-linalg, scioxide-ode, scioxide-pde, scioxide-rootfind]
+//| exports: [nodes, rate, state]
+//| inputs:
+//|   rate_exponent: {"type":"range","label":"Rate constant log₁₀ k (k [m³/(mol·s)])","description":"Da = 1000 k. Changes reaction-band width and departure from the limit.","min":-3,"max":1,"step":0.5,"value":0}
+//|   front_nodes: {"type":"range","label":"Interior-node count n [points]","description":"Unknowns per field. Total dimension is 2n.","min":49,"max":399,"step":50,"value":99}
+//|   jacobian_mode: {"type":"select","label":"Jacobian representation","options":["Operator","Sparse","Dense"],"value":"Operator"}
+//|   field_preconditioner: {"type":"checkbox","label":"Use fieldwise preconditioning (inverse diffusion)","value":true}
+//| cases:
+//|   - {"id":"slow-reaction","label":"k = 10⁻³ (Da = 1)","description":"Slow reaction needs fewer Newton iterations.","inputs":{"rate_exponent":-3}}
+//|   - {"id":"sparse-mode","label":"Sparse representation","description":"Iteration counts match operator representation; assemble the Jacobian once per Newton iteration.","inputs":{"jacobian_mode":"Sparse"}}
+//|   - {"id":"dense-mode","label":"Dense representation","description":"Iteration counts are the same; assemble the Jacobian as a (2n)² dense matrix.","inputs":{"jacobian_mode":"Dense"}}
+//|   - {"id":"no-preconditioner","label":"No preconditioning","description":"GMRES iterations increase greatly.","inputs":{"field_preconditioner":false}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"solve","path":"/rows/0/1","equals":"ResidualTolerance"}
+//|       - {"artifact":"solve","path":"/rows/0/2","range":{"min":5,"max":9}}
+//|       - {"artifact":"solve","path":"/rows/0/3","range":{"min":20,"max":80}}
+//|       - {"artifact":"solve","path":"/rows/0/4","equals":0}
+//|       - {"artifact":"solve","path":"/rows/0/6","range":{"max":1e-10}}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+//|   - case: sparse-mode
+//|     expect:
+//|       - {"artifact":"solve","path":"/rows/0/4","range":{"min":5,"max":9}}
+//|       - {"artifact":"solve","path":"/rows/0/6","range":{"max":1e-10}}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+//|   - case: dense-mode
+//|     expect:
+//|       - {"artifact":"solve","path":"/rows/0/4","range":{"min":5,"max":9}}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+//|   - case: no-preconditioner
+//|     expect:
+//|       - {"artifact":"solve","path":"/rows/0/3","range":{"min":500}}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+//|   - case: slow-reaction
+//|     expect:
+//|       - {"artifact":"solve","path":"/rows/0/2","range":{"max":5}}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+use scioxide_core::{
+    EvaluationRole, LinearOperator, Preconditioner, ResidualOperator, ResidualTolerance,
+};
+use scioxide_pde::{
+    NonlinearPdeProblem, PdeFieldLayout, PdeFieldPreconditioner, PdeJacobianMode, PdeTangent,
+};
+use scioxide_rootfind::{
+    NewtonKrylovOptions, NewtonKrylovProblem, NewtonKrylovSolver, RootTermination,
+};
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let n = front_nodes as usize;
+let model = ReactionFront::new(n, 10.0_f64.powf(rate_exponent));
+let layout = PdeFieldLayout::new(&[n, n]).map_err(|e| e.to_string())?;
+let mode = match jacobian_mode.as_str() {
+    "Sparse" => PdeJacobianMode::Sparse(model.pattern().map_err(|e| e.to_string())?),
+    "Dense" => PdeJacobianMode::Dense,
+    _ => PdeJacobianMode::Operator {
+        operator_scratch: 0,
+    },
+};
+let (inverse_a, inverse_b) = (model.diffusion_inverse(0), model.diffusion_inverse(1));
+let blocks: [&dyn Preconditioner<f64>; 2] = [&inverse_a, &inverse_b];
+let field_inverse = PdeFieldPreconditioner::new(&layout, &blocks).map_err(|e| e.to_string())?;
+
+// Pass residual F(u) = f(0, u), fixed at time 0, to Newton–Krylov.
+let problem = NonlinearPdeProblem::new(&model, 0.0, &layout, &mode);
+let mut workspace = problem.workspace().map_err(|e| e.to_string())?;
+let residual = problem.bind(&mut workspace).map_err(|e| e.to_string())?;
+let mut newton = NewtonKrylovProblem::with_jacobian(&residual);
+if field_preconditioner {
+    newton = newton.with_preconditioner(&field_inverse);
+}
+let tolerance = ResidualTolerance::new(0.0, 1.0e-10).map_err(|e| e.to_string())?;
+let options = NewtonKrylovOptions::default().with_residual_tolerance(tolerance);
+let result = NewtonKrylovSolver::new(options)
+    .and_then(|solver| solver.solve(&newton, &model.linear_profiles()))
+    .map_err(|e| e.to_string())?;
+let termination = result.termination();
+let u = result.point();
+
+// J v (PdeTangent) at the solution and central residual differences (independent check).
+let v: Vec<f64> = (0..2 * n).map(|r| ((r % 7) as f64 - 3.0) / 3.0).collect();
+let tangent = PdeTangent::new(&residual, u).map_err(|e| e.to_string())?;
+let mut scratch = vec![0.0; tangent.apply_workspace_len().map_err(|e| e.to_string())?];
+let mut product = vec![0.0; 2 * n];
+tangent
+    .apply_into(&v, &mut product, &mut scratch)
+    .map_err(|e| e.to_string())?;
+let sigma = 1.0e-4;
+let mut difference = vec![0.0; 2 * n];
+for sign in [1.0, -1.0] {
+    let point: Vec<f64> = u
+        .iter()
+        .zip(&v)
+        .map(|(x, d)| x + sign * sigma * d)
+        .collect();
+    let mut value = vec![0.0; 2 * n];
+    residual
+        .residual_into(&point, &mut value, &mut scratch)
+        .map_err(|e| e.to_string())?;
+    for (d, f) in difference.iter_mut().zip(&value) {
+        *d += sign * f / (2.0 * sigma);
+    }
+}
+let largest = product.iter().fold(0.0_f64, |m, p| m.max(p.abs()));
+let gaps = product.iter().zip(&difference).map(|(p, d)| (p - d).abs());
+let jvp_gap = gaps.fold(0.0_f64, f64::max) / largest;
+
+let nested = result.accounting().nested();
+let columns = serde_json::json!([
+    { "key": "0", "label": "Representation" },
+    { "key": "1", "label": "Termination reason" },
+    { "key": "2", "label": "Newton iterations [count]", "type": "integer" },
+    { "key": "3", "label": "GMRES iterations [count]", "type": "integer" },
+    { "key": "4", "label": "Jacobian assemblies [count]", "type": "integer" },
+    { "key": "5", "label": "‖F‖₂ [mol/(m²·s)]", "type": "number", "format": sci3, "nullText": "None" },
+    { "key": "6", "label": "Relative JVP/central-difference discrepancy [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    vec![(
+        jacobian_mode.clone(),
+        termination.to_string(),
+        result.iterations(),
+        nested.iterations(),
+        nested.provider(EvaluationRole::Jacobian),
+        result.residual_norm(),
+        jvp_gap,
+    )],
+    metadata = serde_json::json!({ "id": "solve" })
+);
+export!(nodes, n);
+export!(rate, model.rate);
+export!(state, u.to_vec());
+
+let broken = matches!(
+    termination,
+    RootTermination::GlobalizationFailure | RootTermination::LinearFailure(_)
+);
+let outcome = if termination.is_success() {
+    Outcome::satisfied("Newton–Krylov met the residual tolerance")
+} else if broken {
+    Outcome::failed("Line search or inner linear solve broke down; no steady solution was obtained")
+} else {
+    Outcome::partial("Stopped before meeting tolerance")
+        .explanation("Passed concentrations are the last accepted point, not a steady solution.")
+};
+emit_outcome!(
+    outcome
+        .status(termination.to_string())
+        .diagnostic("Newton iterations", result.iterations() as f64, None)
+        .diagnostic("GMRES iterations", nested.iterations() as f64, None)
+);
+```
+
+With default $k=1$ m³/(mol·s) ($\mathrm{Da}=1000$) and $n=99$, Newton reaches `ResidualTolerance` in 7 iterations, reducing residual norm to $5.5\times10^{-20}$ mol/(m²·s).
+GMRES takes 43 iterations across all 7 Newton iterations.
+Removing fieldwise preconditioning increases Newton iterations to 15 and GMRES iterations to 1107.
+Inverse diffusion directly cancels the part responsible for condition number $O(h^{-2})$, greatly reducing GMRES iterations even while ignoring reaction terms.
+
+Switching to sparse or dense representations leaves Newton and GMRES iteration counts unchanged.
+Assembled-matrix products and provider JVPs return the same $J(\mathbf{u})\mathbf{v}$ to rounding error.
+Sparse and dense representations assemble the Jacobian 7 times, matching Newton iterations; all 43 GMRES products reuse those matrices.
+Relative JVP/central-difference discrepancies are around $8\times10^{-14}$ for all three representations, showing derivative consistency with residuals.
+At $k=10^{-3}$ (Da = 1), reaction terms are small and initial linear profiles are close to the solution; Newton stops in 4 iterations and GMRES in 7.
+
+## Concentration distribution and fast-reaction limit
+
+The next cell receives concentrations from the preceding cell and compares them with the fast-reaction limit.
+The upper plot shows both concentrations (solid) and their limits (dashed); the lower plot shows reaction rate $k\,a\,b$, with linked horizontal axes.
+The vertical line marks limiting reaction front $x_f=2L/3$.
+The table shows Da, reaction-rate-weighted band centroid $x_c=\sum_i x_i a_ib_i/\sum_i a_ib_i$, maximum limiting-concentration difference, and maximum difference between invariant $w_i$ and its linear profile (relative to $D_Aa_0$).
+
+```rust
+//| id: pde-reaction-front-profiles
+//| ref: pde-reaction-front-profiles
+//| title: "Compare reaction-front concentrations with the fast-reaction limit"
+//| run: reactive
+//| uses: [pde-reaction-front-model]
+//| crates: [scioxide-core, scioxide-linalg, scioxide-ode]
+//| dependsOn:
+//|   steady: pde-coupled-steady-newton
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"checks","path":"/rows/0/0","approx":{"value":1000,"rtol":1e-12}}
+//|       - {"artifact":"checks","path":"/rows/0/1","approx":{"value":0.6663,"atol":2e-4}}
+//|       - {"artifact":"checks","path":"/rows/0/3","approx":{"value":0.1085,"rtol":1e-2}}
+//|       - {"artifact":"checks","path":"/rows/0/4","range":{"max":1e-12}}
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed4 = serde_json::json!({ "fractionDigits": 4 });
+let n = steady["nodes"].as_u64().ok_or("Missing node count")? as usize;
+let rate = steady["rate"].as_f64().ok_or("Missing rate constant")?;
+let u: Vec<f64> = serde_json::from_value(steady["state"].clone()).map_err(|e| e.to_string())?;
+let model = ReactionFront::new(n, rate);
+
+// Concentrations and limiting concentrations (x in mm), reaction rate k a b [mol/(m³·s)].
+let mut series = [(); 5].map(|_| Vec::new());
+for i in 0..n {
+    let (_, a_limit, b_limit) = model.limit(i);
+    let x = model.position(i) * 1.0e3;
+    series[0].push([x, u[i]]);
+    series[1].push([x, u[n + i]]);
+    series[2].push([x, a_limit]);
+    series[3].push([x, b_limit]);
+    series[4].push([x, rate * u[i] * u[n + i]]);
+}
+let [a_line, b_line, a_limit, b_limit, rate_line] = series;
+let front = serde_json::json!([
+    { "kind": "line", "axis": "x", "value": 2.0 / 3.0, "label": "x_f = 2L/3" }
+]);
+let dashed = serde_json::json!({ "lineType": "dashed" });
+emit_line_chart!(
+    &vec![
+        serde_json::json!({ "name": "a(x)", "points": a_line }),
+        serde_json::json!({ "name": "b(x)", "points": b_line }),
+        serde_json::json!({ "name": "a (limit)", "points": a_limit, "style": dashed }),
+        serde_json::json!({ "name": "b (limit)", "points": b_limit, "style": dashed }),
+    ],
+    options = &serde_json::json!({
+        "link": { "group": "front-x" },
+        "xLabel": "Position x [mm]",
+        "yLabel": "Concentration [mol/m³]",
+        "xMin": 0.0,
+        "xMax": 1.0,
+        "annotations": front
+    })
+);
+emit_line_chart!(
+    &vec![serde_json::json!({ "name": "k a b", "points": rate_line })],
+    options = &serde_json::json!({
+        "link": { "group": "front-x" },
+        "xLabel": "Position x [mm]",
+        "yLabel": "Reaction rate k a b [mol/(m³·s)]",
+        "xMin": 0.0,
+        "xMax": 1.0,
+        "annotations": front
+    })
+);
+
+let (invariant_gap, limit_gap, centroid) = model.checks(&u);
+let columns = serde_json::json!([
+    { "key": "0", "label": "Da [-]", "type": "number", "format": sci3 },
+    { "key": "1", "label": "Centroid x_c [mm]", "type": "number", "format": fixed4 },
+    { "key": "2", "label": "Limit x_f [mm]", "type": "number", "format": fixed4 },
+    { "key": "3", "label": "Maximum difference from limit [mol/m³]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "Invariant defect [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    vec![(
+        rate * 1.0e-6 / model.diffusivity[0],
+        centroid * 1.0e3,
+        2.0 / 3.0,
+        limit_gap,
+        invariant_gap,
+    )],
+    metadata = serde_json::json!({ "id": "checks" })
+);
+```
+
+For default concentrations, band centroid $x_c=0.6663$ mm lies $3.4\times10^{-4}$ mm from the limiting position $x_f=0.6667$ mm.
+Maximum limiting-concentration difference is 0.108 mol/m³, representing coexistence of A and B in the reaction band.
+Invariant defect is $5\times10^{-16}$, showing correct coupling of both fields at the rounding level.
+Selecting $k=10^{-3}$ (Da = 1) above makes both species coexist throughout the membrane, moving the centroid near its middle, 0.5 mm.
+
+## Reaction speed and reaction-band width
+
+The next cell varies rate constant from $k=10^{-2}$ to $10^{1.5}$ m³/(mol·s) in half-decade increments ($\mathrm{Da}=10$ to $3.2\times10^4$), solving steady states with operator representation and fieldwise preconditioning.
+Plot maximum limiting-concentration difference against Da on log-log axes; the dashed reference line has slope $-1/3$ and passes through the point at $\mathrm{Da}=10^3$.
+The final table column is slope $\Delta\log(\text{difference})/\Delta\log\mathrm{Da}$ between adjacent points.
+Increasing node count gives more points resolving the reaction band at large Da.
+
+```rust
+//| id: pde-reaction-front-damkohler
+//| ref: pde-reaction-front-damkohler
+//| title: "Damköhler number and shrinking departure from the limit"
+//| run: button
+//| uses: [pde-reaction-front-model]
+//| crates: [scioxide-core, scioxide-linalg, scioxide-ode, scioxide-pde, scioxide-rootfind]
+//| inputs:
+//|   scan_nodes: {"type":"range","label":"Interior-node count n [points]","description":"Changes points resolving the reaction band.","min":99,"max":399,"step":100,"value":199}
+//| cases:
+//|   - {"id":"coarse","label":"n = 99","description":"At large Da the band spans only a few points, shifting slope away from −1/3.","inputs":{"scan_nodes":99}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"scan","path":"/rows/0/6","equals":null}
+//|       - {"artifact":"scan","path":"/rows/4/4","approx":{"value":0.1109,"rtol":1e-2}}
+//|       - {"artifact":"scan","path":"/rows/5/6","range":{"min":-0.36,"max":-0.32}}
+//|       - {"artifact":"scan","path":"/rows/7/6","range":{"min":-0.37,"max":-0.33}}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+//|   - case: coarse
+//|     expect:
+//|       - {"artifact":"scan","path":"/rows/7/6","range":{"min":-0.40,"max":-0.36}}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+use scioxide_core::{Preconditioner, ResidualTolerance};
+use scioxide_pde::{
+    NonlinearPdeProblem, PdeFieldLayout, PdeFieldPreconditioner, PdeJacobianMode,
+};
+use scioxide_rootfind::{NewtonKrylovOptions, NewtonKrylovProblem, NewtonKrylovSolver};
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed3 = serde_json::json!({ "fractionDigits": 3 });
+let n = scan_nodes as usize;
+let layout = PdeFieldLayout::new(&[n, n]).map_err(|e| e.to_string())?;
+let mode = PdeJacobianMode::Operator {
+    operator_scratch: 0,
+};
+let tolerance = ResidualTolerance::new(0.0, 1.0e-10).map_err(|e| e.to_string())?;
+let solver =
+    NewtonKrylovSolver::new(NewtonKrylovOptions::default().with_residual_tolerance(tolerance))
+        .map_err(|e| e.to_string())?;
+let mut rows = Vec::new();
+let mut points = Vec::new();
+let mut first_failure = None;
+for step in 0..8 {
+    let model = ReactionFront::new(n, 10.0_f64.powf(-2.0 + 0.5 * step as f64));
+    let (inverse_a, inverse_b) = (model.diffusion_inverse(0), model.diffusion_inverse(1));
+    let blocks: [&dyn Preconditioner<f64>; 2] = [&inverse_a, &inverse_b];
+    let field_inverse =
+        PdeFieldPreconditioner::new(&layout, &blocks).map_err(|e| e.to_string())?;
+    let problem = NonlinearPdeProblem::new(&model, 0.0, &layout, &mode);
+    let mut workspace = problem.workspace().map_err(|e| e.to_string())?;
+    let residual = problem.bind(&mut workspace).map_err(|e| e.to_string())?;
+    let newton =
+        NewtonKrylovProblem::with_jacobian(&residual).with_preconditioner(&field_inverse);
+    let result = solver
+        .solve(&newton, &model.linear_profiles())
+        .map_err(|e| e.to_string())?;
+    if !result.is_success() && first_failure.is_none() {
+        first_failure = Some(result.termination().to_string());
+    }
+    let (_, limit_gap, centroid) = model.checks(result.point());
+    let damkohler = model.rate * 1.0e-6 / model.diffusivity[0];
+    // Slope to the adjacent point (undefined for the first point).
+    let slope = points
+        .last()
+        .map(|&[d0, g0]: &[f64; 2]| (limit_gap / g0).ln() / (damkohler / d0).ln());
+    points.push([damkohler, limit_gap]);
+    rows.push((
+        damkohler,
+        result.termination().to_string(),
+        result.iterations(),
+        result.accounting().nested().iterations(),
+        limit_gap,
+        centroid * 1.0e3,
+        slope,
+    ));
+}
+// Slope −1/3 reference line (through Da = 10³).
+let anchor = points[4][1];
+let reference: Vec<[f64; 2]> = points
+    .iter()
+    .map(|&[d, _]| [d, anchor * (d / 1.0e3).powf(-1.0 / 3.0)])
+    .collect();
+emit_line_chart!(
+    &vec![
+        serde_json::json!({ "name": "Maximum difference from limit", "points": points, "style": { "symbol": "circle" } }),
+        serde_json::json!({ "name": "Slope −1/3", "points": reference, "style": { "lineType": "dashed" } }),
+    ],
+    options = &serde_json::json!({
+        "xLabel": "Damköhler number Da [-]",
+        "yLabel": "Maximum limiting-concentration difference [mol/m³]",
+        "xType": "log",
+        "yType": "log"
+    })
+);
+let columns = serde_json::json!([
+    { "key": "0", "label": "Da [-]", "type": "number", "format": sci3 },
+    { "key": "1", "label": "Termination reason" },
+    { "key": "2", "label": "Newton iterations [count]", "type": "integer" },
+    { "key": "3", "label": "GMRES iterations [count]", "type": "integer" },
+    { "key": "4", "label": "Maximum difference from limit [mol/m³]", "type": "number", "format": sci3 },
+    { "key": "5", "label": "Centroid x_c [mm]", "type": "number", "format": fixed3 },
+    { "key": "6", "label": "Slope [-]", "type": "number", "format": fixed3, "nullText": "—" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "scan" })
+);
+let outcome = if first_failure.is_none() {
+    Outcome::satisfied("Met residual tolerance at all eight Da values")
+} else {
+    Outcome::partial("Some Da values stopped without meeting tolerance")
+        .explanation("Differences and slopes in those rows are not steady-solution values.")
+};
+emit_outcome!(
+    outcome
+        .status(first_failure.unwrap_or_else(|| "ResidualTolerance".to_string()))
+        .diagnostic("Solve count", rows.len() as f64, None)
+);
+```
+
+With default $n=199$, all eight Da values reach `ResidualTolerance` with 5–8 Newton iterations.
+Each $10^{0.5}$-fold increase in Da reduces the difference by about factor $10^{-1/6}\approx0.68$; slopes beyond Da = 100 range from −0.33 to −0.35, near estimated −1/3.
+Slopes −0.26 to −0.31 over Da = 10–100 are shallower than −1/3.
+Estimated band width $L\,\mathrm{Da}^{-1/3}$ is 0.2–0.46 mm here, violating the estimate's assumption of a band thin relative to membrane thickness.
+At the largest Da, slope is −0.375 with $n=99$ and −0.343 with $n=399$.
+At maximum Da = $3.2\times10^4$, estimated band width is about 31 µm; grid spacing 10 µm for $n=99$ gives only about three band points, mixing finite-difference error into the slope.
+For Da = $10^4$ and above, reaction-band centroid agrees with $x_f$ to about nine digits.
+
+## Summary
+
+Write two-field reaction-front residuals as the right-hand side of `OdeSystem`, then solve with Newton–Krylov through `NonlinearPdeProblem`.
+All three Jacobian representations give the same iteration history, changing only storage and provider-call counts; choose from available storage and derivatives the provider can supply.
+Fieldwise inverse-diffusion preconditioning reduces GMRES iterations from 1107 to 43 despite ignoring reaction coupling.
+Check solutions to rounding accuracy with the invariant making $w=D_Aa-D_Bb$ linear; departure from limiting concentrations shrinks nearly proportionally to Da raised to $-1/3$ for large Da.
+At large Da, choose enough nodes to resolve reaction-band width $L\,\mathrm{Da}^{-1/3}$ with at least several points.
+
+## Further reading
+
+- [Nonlinear steady problems](../../algorithms/nonlinear-steady-problems/): examine contracts of the types used here and interpretation of termination reasons and counts.
+- [Method of lines and semidiscrete systems](../../algorithms/method-of-lines-and-nonlinear/): learn how to pass residuals of the same form to time integration and follow approach to steady state.
+- [Matrix-free Newton–Krylov](../../../scioxide-rootfind/algorithms/matrix-free-newton-krylov/): examine how forcing terms and line search determine iteration counts.

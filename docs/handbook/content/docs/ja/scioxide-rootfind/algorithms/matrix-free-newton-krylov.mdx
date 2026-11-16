@@ -1,0 +1,524 @@
+---
+title: 行列を形成しない Newton–Krylov 法
+description: ヤコビ行列の作用だけで連立方程式を解く不正確 Newton 法。強制項の理論と Eisenstat–Walker の規則、内側の GMRES と検査、非単調な直線探索、差分による作用、尺度と前処理、終了理由と評価回数。
+sidebar:
+  order: 335
+references:
+  rootfind-inexact-newton-forcing: "不正確-newton-法と強制項"
+  rootfind-krylov-inner-gmres: "内側の-gmres-と補正の検査"
+  rootfind-krylov-nonmonotone-search: "非単調な直線探索"
+  rootfind-krylov-difference-products: "差分による作用"
+  rootfind-krylov-scaling: "成分の尺度"
+  rootfind-krylov-termination: "終了理由"
+  rootfind-krylov-products: "作用の渡し方と評価回数"
+  rootfind-krylov-bratu-history: "bratu-問題の反復履歴"
+  rootfind-krylov-workspaces: "入力出力と作業領域"
+---
+
+連立方程式 $\mathbf{F}(\mathbf{x}) = \mathbf{0}$ の Newton 法は、各反復で線形方程式 $J(\mathbf{x}_k)\mathbf{s}_k = -\mathbf{F}(\mathbf{x}_k)$ を解く。
+未知数 $n$ が大きいと、ヤコビ行列 $J$ の $n^2$ 個の成分を作って分解する計算コストとメモリ使用量が支配的になる。
+Krylov 部分空間法（GMRES など）は $J$ の成分を使わず、ヤコビ行列とベクトルの積（JVP）$J\mathbf{v}$ だけで線形方程式を解く。
+`NewtonKrylovSolver` はこの二つを組み合わせ、残差の作用 `ResidualOperator` と JVP の作用 `JacobianOperator`（scioxide-core）だけで方程式を解く。
+密なヤコビ行列を使う方法は[非線形連立方程式と大域化](../nonlinear-systems/)にある。
+
+## 不正確 Newton 法と強制項
+
+非線形の残差がまだ大きい段階で、線形方程式だけを丸め誤差の程度まで解いても、外側の収束は速くならない。
+不正確 Newton 法（inexact Newton method）は、線形方程式を
+
+$$
+\lVert \mathbf{F}(\mathbf{x}_k) + J(\mathbf{x}_k)\,\mathbf{s}_k \rVert \le \eta_k \lVert \mathbf{F}(\mathbf{x}_k) \rVert, \qquad 0 \le \eta_k < 1
+$$
+
+を満たす程度まで解いて止める。
+$\eta_k$ を強制項（forcing term）という。
+Dembo–Eisenstat–Steihaug の定理によれば、根でヤコビ行列が正則で $\mathbf{x}_0$ が根に十分近いとき、次が成り立つ。
+
+- $\eta_k \le \eta_{\max} < 1$ なら局所的に 1 次収束する。
+- $\eta_k \to 0$ なら超 1 次収束する。
+- $\eta_k = O(\lVert \mathbf{F}(\mathbf{x}_k) \rVert)$ なら 2 次収束する。
+
+$\eta_k$ を小さくしすぎると、外側の収束が速くならないまま内側の反復だけが増える（過剰な求解、oversolving）。
+Eisenstat–Walker の規則は線形モデルが実際の残差をどれだけよく予測したかから $\eta_k$ を決めて、この無駄を避ける。
+
+`NewtonKrylovForcing` は強制項の規則で、`with_forcing` で選ぶ。
+
+- `Constant(η)` は $0 < \eta < 1$ の一定値である。
+- `EisenstatWalker { initial, minimum, maximum }`（既定）は Eisenstat–Walker の第 1 の規則（choice 1）である。
+  既定は `initial` 0.5、`minimum` $\varepsilon$、`maximum` 0.9 である。
+
+第 1 の規則はステップ幅 $\alpha_k$ で実際に受理した補正について、新しい残差と線形モデルの予測との差を使う。
+
+$$
+\eta_{k+1} = \frac{\bigl|\,\lVert \mathbf{F}(\mathbf{x}_{k+1}) \rVert - \lVert \mathbf{F}(\mathbf{x}_k) + \alpha_k J(\mathbf{x}_k)\mathbf{s}_k \rVert\,\bigr|}{\lVert \mathbf{F}(\mathbf{x}_k) \rVert}
+$$
+
+前の値 $\eta_k$ から作る安全化の下限 $\eta_k^{(1+\sqrt5)/2}$ が 0.1 を超える場合に限り、$\eta_{k+1}$ をその値以上にする。
+その後 `[minimum, maximum]` に収め、差分の JVP を使う場合はさらに $\sqrt\varepsilon$ 以上にする。
+差分の JVP は $O(\sqrt\varepsilon)$ の相対誤差を持つので、それより厳しい要求は満たせず、検査もできないからである。
+Eisenstat–Walker（1996）は、この規則が仮定のもとで局所的に超 1 次収束を与えることを示している。
+
+## 内側の GMRES と補正の検査
+
+内側の線形方程式は scioxide-linalg の再始動付き `GmresSolver` で解く。
+右前処理は呼び出しごとに変わってよく、前処理を掛けた方向をすべて保持する柔軟型 GMRES（FGMRES）として解く。
+1 回の Newton 反復あたりの内側の反復は既定で最大 200、再始動長 $m$ は 30 で、`with_krylov` で変えられる。
+Krylov 基底のメモリ使用量は $O(nm)$ で、密なヤコビ行列は作らない。
+再始動長を小さくするとメモリ使用量は減るが、収束に必要な情報を捨てて内側の反復が増えることがある。
+
+内側の解法が返した補正 $\mathbf{d}$ について、`NewtonKrylovSolver` は JVP をもう 1 回評価して $\mathbf{F} + J\mathbf{d}$ を計算し直す。
+この検査した線形残差を、補正の採否、直線探索の傾き $\mathbf{F}^{\mathsf T} J\mathbf{d}$、次の強制項の計算に使う。
+検査した線形残差が要求 $\eta_k \lVert \mathbf{F} \rVert$ を満たさなくても、$\bar\eta\,\lVert \mathbf{F} \rVert$ 以下なら補正をそのまま使う。
+ここで $\bar\eta = \max(\eta_{\max}, \eta_{\mathrm{floor}})$ で、$\eta_{\max}$ は強制項の規則の上限（`Constant(η)` では $\eta$）、$\eta_{\mathrm{floor}}$ は差分の JVP では $\sqrt\varepsilon$、それ以外では 0 である。
+このとき傾きは $\mathbf{F}^{\mathsf T}J\mathbf{d} = \mathbf{F}^{\mathsf T}(\mathbf{F} + J\mathbf{d}) - \lVert \mathbf{F} \rVert^2 \le -(1 - \bar\eta)\lVert \mathbf{F} \rVert^2$ なので、補正はメリット関数の降下方向である。
+これも超えると `LinearFailure` で止まる。
+
+前処理は `NewtonKrylovProblem::with_preconditioner` で、近似逆行列 $M^{-1}$ を掛ける `Preconditioner`（scioxide-core）として渡し、GMRES の右前処理に使う。
+前処理は線形反復を速くするが、非線形方程式の解は変えない。
+内側の解法そのものを替えるときは、`NonlinearLinearSolver` を実装して `NewtonKrylovProblem::with_linear_solver` で渡す（直接法や独自の前処理付き反復法など）。
+差し替えた解法は Newton 方程式を `NonlinearLinearization` として受け取り、`operator()` で尺度付きのヤコビ行列 $R^{-1} J V$（$R$ は残差の成分の除数、$V$ は変数の成分の除数を並べた対角行列で、後述の成分の尺度を与えなければ単位行列）の作用を、`point()`・`residual()`・`row_divisors()`・`variable_divisors()` で現在の点、残差、除数を読む。
+差し替えた解法は要求された精度を守り、未収束を返しなければならず、返した補正は上の検査を受ける。
+`with_linear_solver` と `with_preconditioner` を同時に指定すると、作業領域の準備か求解の開始のときに `InvalidInput` のエラーになる。
+
+## 非単調な直線探索
+
+外側の補正はメリット関数 $\phi(\mathbf{x}) = \tfrac12 \lVert \mathbf{F}(\mathbf{x}) \rVert^2$ に対する後退直線探索で受理する。
+Armijo 条件の比較の相手は現在の $\phi(\mathbf{x}_k)$ ではなく Zhang–Hager の重み付き平均 $C_k$ である。
+
+$$
+\phi(\mathbf{x}_k + \alpha\mathbf{d}) \le C_k + c\,\alpha\,\mathbf{F}^{\mathsf T} J \mathbf{d}, \qquad
+Q_{k+1} = wQ_k + 1, \quad C_{k+1} = \frac{wQ_k C_k + \phi(\mathbf{x}_{k+1})}{Q_{k+1}}
+$$
+
+初期値は $Q_0 = 1$、$C_0 = \phi(\mathbf{x}_0)$ で、既定の重みは $w = 0.85$（`with_nonmonotone`）、$c = 10^{-4}$ である。
+$C_k \ge \phi(\mathbf{x}_k)$ なので、受理した補正で $\lVert \mathbf{F} \rVert$ が一時的に増えることがある。
+$w = 0$ にすると通常の単調な Armijo 条件になる。
+平均を使うと、正確な Newton 補正が曲がった谷を横切るときに、単調な条件のようにステップ幅を縮め続けずに済む。
+
+ステップ幅は 1 から始め、退けたステップ幅は 2 次補間、2 回目からは 3 次補間の最小点に替え、直前のステップ幅の 0.1〜0.5 倍に制限する。
+試行点の残差が非有限か、残差の関数が `DomainError`（`OutsideDomain`）を返した場合は、補間を使わずにステップ幅を半分にする。
+相対的な移動量 $\alpha \max_i |d_i| / \max(1, |x_i|)$ が最小値（既定 $\varepsilon^{2/3}$）を下回ると探索を打ち切る。
+$c$ と最小値は `with_backtracking(c, minimum)` で変えられる。
+
+## 差分による作用
+
+解析的な JVP がなければ、`NewtonKrylovProblem::numerical` で前進差分を使う。
+既知の $\mathbf{F}(\mathbf{x})$ を再利用し、非零の方向 $\mathbf{v}$ に対して
+
+$$
+J(\mathbf{x})\mathbf{v} \approx \frac{\mathbf{F}(\mathbf{x} + \sigma\mathbf{v}) - \mathbf{F}(\mathbf{x})}{\sigma}, \qquad
+\sigma = \frac{\sqrt\varepsilon}{\max_i \bigl(|v_i| / \max(1, |x_i|)\bigr)}
+$$
+
+とする。
+最も大きく動く成分の変位が $\sqrt\varepsilon\max(1, |x_i|)$ になり、積 1 回につき残差の評価が 1 回増える。
+`NonlinearScaling` を与えた場合は、$\max(1, |x_i|)$ の代わりに変数の除数を使う。
+差分の打切り誤差と丸め誤差の和は $\sqrt\varepsilon$ の程度なので、強制項を $\sqrt\varepsilon$ より小さくしても補正は良くならない。
+残差にノイズや不連続があると、この精度は仮定できない。
+解析的な JVP や自動微分の JVP を渡すときは、`NewtonKrylovProblem::with_jacobian` を使う。
+
+## 成分の尺度
+
+`NonlinearScaling` を実装すると、`NewtonKrylovProblem::with_scaling` で残差と変数の成分ごとの除数を与えられる。
+`scales_into` はすべての成分に正の有限な除数を書き、必要な一時領域は `scaling_workspace_len` で提示する。
+除数は受理した点で更新し、その点からの線形の補正と試行点の探索の間は固定する。
+除数が変わると、非単調な比較の基準 $C_k$ は新しい単位の $\phi$ で始め直す。
+残差ノルム、停止判定、直線探索は除数で割った値を使い、結果の残差ベクトルはプロバイダーの単位のまま返す。
+
+## 終了理由
+
+既定の残差の許容誤差は絶対 0、相対 $\sqrt\varepsilon$ で、相対の基準は初期点の残差ノルム（除数で割った 2 ノルム）である。
+`with_residual_scale` は基準を固定値に替え、`with_residual_tolerance` は許容誤差を替える。
+
+| 終了理由 | 起こる条件 |
+|---|---|
+| `ResidualTolerance`（唯一の成功） | 受理した点の残差が許容誤差を満たした |
+| `Stagnation` | 更新幅が `StepTolerance` の閾値（既定は絶対・相対とも $\sqrt\varepsilon$。成分の尺度があれば変数の除数で割った更新幅を相対の基準 1 で比べる）以下で、残差が減らなかった。または試行点が丸めで元の点と同じになった |
+| `GlobalizationFailure` | 傾き $\mathbf{F}^{\mathsf T} J\mathbf{d}$ が負でない、ステップ幅が最小値を下回った、定義域の外の試行が続いて点が動かなくなった |
+| `LinearFailure(t)` | 内側の GMRES が破綻（`Breakdown`）か条件の上限（`ConditionLimit`）で止まった。または検査した線形残差が許される最大値を超えた（内側が成功と返していれば `t` は `Stagnation`、そうでなければ内側の終了理由）。内側が評価の上限で止まった場合は `WorkLimit` になる |
+| `IterationLimit` | 外側の反復が上限（既定 100、`with_max_iterations`）に達した |
+| `WorkLimit`、`Cancelled`、`TimeLimit` | `SolveBudgets` や実行コンテキストが処理を止めた |
+
+内側が収束しても外側が未収束のことがあり、外側の `termination()` と内側の `NewtonKrylovObservation::linear_termination()` は別の判定である。
+スカラーの型は `NumericScalar` で、実数のほか複素数も受け付け、複素数ではメリット関数を実部と虚部の二乗和で測る。
+
+## 作用の渡し方と評価回数
+
+$F_i(\mathbf{x}) = x_i^2 - 1$（$i = 1, \dots, 8$）をヤコビ行列を作らずに解く。
+解析的な作用は $J(\mathbf{x})\mathbf{v} = 2\mathbf{x} \odot \mathbf{v}$（成分ごとの積）で、`JacobianOperator::jvp_into` に書く。
+入力は全成分に共通の初期値 $x_0$ と作用の出所（解析的、前進差分）で、正の初期値からは全成分 1 の根に向かう。
+出力は終了理由、反復回数、残差ノルム、厳密な根との最大誤差（独立な検算）と、処理の種類ごとの回数である。
+回数は `counts()`（Newton の範囲）と `accounting().nested()`（内側の GMRES の範囲）に分けて出す。
+
+```rust
+//| id: rootfind-matrix-free-products
+//| ref: rootfind-matrix-free-products
+//| title: ヤコビ行列の作用だけを渡して非線形系を解く
+//| run: reactive
+//| crates: [scioxide-core, scioxide-rootfind]
+//| inputs:
+//|   initial: {"type":"range","label":"初期値 x₀ の全成分 [-]","description":"正なら根 1 へ向かう。","min":0.1,"max":4,"step":0.1,"value":0.4}
+//|   product: {"type":"select","label":"作用 Jv の出所","options":["解析的","前進差分"],"value":"解析的"}
+//| cases:
+//|   - {"id":"forward-difference","label":"前進差分の作用","description":"作用 1 回ごとに残差の評価が加わり、残差の評価は Newton の範囲で 12 回、内側で 10 回になる。","inputs":{"product":"前進差分"}}
+//|   - {"id":"far-start","label":"x₀ = 4（根から遠い初期値）","description":"根に達するまでに 6 反復かかる。","inputs":{"initial":4}}
+//|   - {"id":"small-start","label":"x₀ = 0.1（0 に近い初期値）","description":"5 反復で閾値を下回って止まり、残差ノルムは 3.4 × 10⁻⁹ にとどまる。","inputs":{"initial":0.1}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":"ResidualTolerance"}
+//|       - {"artifact":"summary","path":"/rows/0/1","equals":5}
+//|       - {"artifact":"summary","path":"/rows/0/2","approx":{"value":2.1e-14,"atol":5e-16}}
+//|       - {"artifact":"summary","path":"/rows/0/3","approx":{"value":3.8e-15,"atol":5e-17}}
+//|       - {"artifact":"work","path":"/rows/0/1","equals":7}
+//|       - {"artifact":"work","path":"/rows/1/1","equals":5}
+//|       - {"artifact":"work","path":"/rows/1/2","equals":15}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+//|   - case: forward-difference
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":"ResidualTolerance"}
+//|       - {"artifact":"work","path":"/rows/0/1","equals":12}
+//|       - {"artifact":"work","path":"/rows/0/2","equals":10}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+//|   - case: far-start
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":"ResidualTolerance"}
+//|       - {"artifact":"summary","path":"/rows/0/1","equals":6}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+//|   - case: small-start
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":"ResidualTolerance"}
+//|       - {"artifact":"summary","path":"/rows/0/1","equals":5}
+//|       - {"artifact":"summary","path":"/rows/0/2","approx":{"value":3.4e-9,"atol":5e-11}}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+use scioxide_core::{EvaluationRole, SciOxideError, JacobianOperator, ResidualOperator};
+use scioxide_rootfind::{
+    NewtonKrylovOptions, NewtonKrylovProblem, NewtonKrylovSolver, RootTermination,
+};
+// F_i(x) = x_i² − 1（i = 1, …, 8）。根は全成分 1（正の初期値から）。
+struct Squares(usize);
+impl ResidualOperator<f64> for Squares {
+    fn input_dimension(&self) -> usize {
+        self.0
+    }
+    fn output_dimension(&self) -> usize {
+        self.0
+    }
+    fn residual_workspace_len(&self) -> Result<usize, SciOxideError> {
+        Ok(0)
+    }
+    fn residual_into(
+        &self,
+        x: &[f64],
+        y: &mut [f64],
+        _: &mut [f64],
+    ) -> Result<(), SciOxideError> {
+        y.iter_mut().zip(x).for_each(|(y, x)| *y = x * x - 1.0);
+        Ok(())
+    }
+}
+// J(x)v = 2x ⊙ v。ヤコビ行列の成分は作らない。
+impl JacobianOperator<f64> for Squares {
+    fn jvp_workspace_len(&self) -> Result<usize, SciOxideError> {
+        Ok(0)
+    }
+    fn jvp_into(
+        &self,
+        x: &[f64],
+        v: &[f64],
+        y: &mut [f64],
+        _: &mut [f64],
+    ) -> Result<(), SciOxideError> {
+        y.iter_mut()
+            .zip(x)
+            .zip(v)
+            .for_each(|((y, x), v)| *y = 2.0 * x * v);
+        Ok(())
+    }
+}
+let residual = Squares(8);
+let problem = if product == "前進差分" {
+    NewtonKrylovProblem::numerical(&residual)
+} else {
+    NewtonKrylovProblem::with_jacobian(&residual)
+};
+let result = NewtonKrylovSolver::new(NewtonKrylovOptions::default())
+    .map_err(|e| e.to_string())?
+    .solve(&problem, &[initial; 8])
+    .map_err(|e| e.to_string())?;
+// 独立な検算: 厳密な根（全成分 1）との最大誤差。
+let error = result
+    .point()
+    .iter()
+    .fold(0.0_f64, |m, x| m.max((x - 1.0).abs()));
+let termination = result.termination();
+let residual_norm = result.residual_norm().ok_or("残差が未評価")?;
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "終了理由" },
+    { "key": "1", "label": "Newton 反復 [回]", "type": "integer" },
+    { "key": "2", "label": "残差ノルム ‖F‖₂ [-]", "type": "number", "format": sci2 },
+    { "key": "3", "label": "max |x_i − 1| [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    columns,
+    vec![(termination.to_string(), result.iterations(), residual_norm, error)],
+    metadata = serde_json::json!({ "id": "summary" })
+);
+// 計算量: counts() は Newton の範囲だけ、accounting().nested() は内側の GMRES の範囲。
+let (own, nested) = (result.counts(), result.accounting().nested());
+let roles = [
+    ("残差の評価", EvaluationRole::Residual),
+    ("作用 Jv の評価", EvaluationRole::LinearOperator),
+    ("線形方程式の求解", EvaluationRole::LinearSolve),
+];
+let rows: Vec<_> = roles
+    .iter()
+    .map(|&(name, role)| (name, own.provider(role), nested.provider(role)))
+    .chain([("反復", own.iterations(), nested.iterations())])
+    .collect();
+let columns = serde_json::json!([
+    { "key": "0", "label": "処理の種類" },
+    { "key": "1", "label": "Newton の範囲 [回]", "type": "integer" },
+    { "key": "2", "label": "内側の範囲 [回]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "work" })
+);
+let outcome = if termination.is_success() {
+    Outcome::satisfied("残差が既定の許容誤差を満たした")
+} else if matches!(
+    termination,
+    RootTermination::GlobalizationFailure | RootTermination::LinearFailure(_)
+) {
+    Outcome::failed("直線探索か内側の線形求解が使える補正を返さなかった")
+} else {
+    Outcome::partial("残差の許容誤差を満たす前に止まった")
+};
+emit_outcome!(
+    outcome
+        .status(termination.to_string())
+        .diagnostic("残差ノルム", residual_norm, None)
+        .diagnostic("根との最大誤差", error, None)
+        .diagnostic("Newton 反復", result.iterations() as f64, None)
+);
+```
+
+既定の $x_0 = 0.4$ と解析的な作用では、5 反復で `ResidualTolerance` に達し、残差ノルムは $2.1 \times 10^{-14}$、根との最大誤差は $3.8 \times 10^{-15}$ である。
+Newton の範囲の残差の評価 7 回には、初期点と、退けた試行点を含む直線探索の試行点が入る。
+作用 $J\mathbf{v}$ の 5 回は補正の検査に使った積で、内側の GMRES の 15 回（1 回の求解あたり 3 回）とは別に数えられる。
+前進差分にすると、作用 1 回ごとに残差の評価が加わり、Newton の範囲の残差の評価は 12 回、内側は 10 回になる。
+方向が零の積は残差を評価せずに 0 を返すので、内側の残差の評価は作用の回数より少ない。
+差分の作用の評価は `EvaluationRole::Residual` として数えられ、GMRES の再始動はどの範囲でも別の項目として数えない。
+$x_0 = 4$ では 6 反復かかる。
+$x_0 = 0.1$ では解析的な作用でも前進差分でも 5 反復で止まり、残差ノルムは $3.4 \times 10^{-9}$ である。
+既定の閾値 $\sqrt\varepsilon\,\lVert \mathbf{F}(\mathbf{x}_0) \rVert$ は $x_0 = 0.1$ で $4.2 \times 10^{-8}$、$x_0 = 0.4$ で $3.5 \times 10^{-8}$ とほぼ同じなので、残差の違いは閾値の違いでも作用の出所の違いでもない。
+どちらも閾値を下回った最初の受理点で止まり、その点の残差は反復の経路で決まる。
+根の近くでは 2 次収束するので、もう 1 反復すれば丸め誤差の水準まで下がるが、許容誤差を満たした時点で止まる。
+
+## Bratu 問題の反復履歴
+
+$u'' + \lambda e^u = 0$、$u(0) = u(1) = 0$ を $N$ 個の内部格子点（$h = 1/(N+1)$）の中心差分で離散化する。
+残差の成分は $F_i = (u_{i-1} - 2u_i + u_{i+1})/h^2 + \lambda e^{u_i}$ である。
+次のセルは格子点数 $N$、$\lambda$、強制項の規則を変え、前進差分の作用だけで $u = 0$ から下側の解の枝を求める。
+許容誤差は絶対 $10^{-7}$ とする。
+`NewtonKrylovOptions::with_history(true)` で履歴を有効にし、`NewtonKrylovObservation` から線形化した点の残差、強制項、内側の反復回数、検査した相対線形残差 $\lVert \mathbf{F} + J\mathbf{d} \rVert / \lVert \mathbf{F} \rVert$、内側の終了理由、受理したステップ幅を表に出す。
+独立な検算として、左右対称な問題の解が満たすべき $u_i = u_{N+1-i}$ からのずれを出す。
+
+```rust
+//| id: rootfind-bratu-krylov-history
+//| ref: rootfind-bratu-krylov-history
+//| title: Bratu 問題で外側と内側の反復を観察する
+//| run: button
+//| crates: [scioxide-core, scioxide-rootfind]
+//| inputs:
+//|   points: {"type":"range","label":"内部格子点数 N [-]","min":8,"max":32,"step":8,"value":16}
+//|   lambda: {"type":"range","label":"Bratu パラメータ λ [-]","description":"連続問題の折り返し点 λc ≈ 3.5138 より小さい範囲。","min":0.5,"max":3,"step":0.5,"value":2}
+//|   forcing: {"type":"select","label":"強制項","options":["Eisenstat–Walker（既定）","一定 0.1"],"value":"Eisenstat–Walker（既定）"}
+//| cases:
+//|   - {"id":"constant-forcing","label":"強制項を一定 0.1 にする","description":"外側は 6 反復、内側は計 39 回で、最終の残差ノルムは 4.6 × 10⁻⁸ にとどまる。","inputs":{"forcing":"一定 0.1"}}
+//|   - {"id":"fine-grid","label":"N = 32、λ = 3（細かい格子）","description":"線形方程式の条件数が増え、外側は 5 反復、内側は計 121 回になり、最後の内側の求解は 60 回かかって再始動長 30 を超える。","inputs":{"points":32,"lambda":3}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"history","path":"/rows/3/0","equals":3}
+//|       - {"artifact":"history","path":"/rowCount","equals":4}
+//|       - {"artifact":"history","path":"/rows/0/2","approx":{"value":0.5,"atol":1e-12}}
+//|       - {"artifact":"history","path":"/rows/1/2","approx":{"value":0.326,"atol":5e-4}}
+//|       - {"artifact":"history","path":"/rows/2/2","approx":{"value":0.163,"atol":5e-4}}
+//|       - {"artifact":"history","path":"/rows/3/2","approx":{"value":2.8e-5,"atol":5e-7}}
+//|       - {"artifact":"history","path":"/rows/0/3","equals":7}
+//|       - {"artifact":"history","path":"/rows/1/3","equals":8}
+//|       - {"artifact":"history","path":"/rows/2/3","equals":7}
+//|       - {"artifact":"history","path":"/rows/3/3","equals":10}
+//|       - {"artifact":"final","path":"/rows/0/0","equals":"ResidualTolerance"}
+//|       - {"artifact":"final","path":"/rows/0/1","approx":{"value":8.8e-8,"atol":5e-10}}
+//|       - {"artifact":"final","path":"/rows/0/2","range":{"min":0,"max":5e-10}}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+//|   - case: constant-forcing
+//|     expect:
+//|       - {"artifact":"history","path":"/rows/5/0","equals":5}
+//|       - {"artifact":"history","path":"/rows/0/3","equals":8}
+//|       - {"artifact":"history","path":"/rows/1/3","equals":7}
+//|       - {"artifact":"history","path":"/rows/2/3","equals":5}
+//|       - {"artifact":"history","path":"/rows/3/3","equals":7}
+//|       - {"artifact":"history","path":"/rows/4/3","equals":4}
+//|       - {"artifact":"history","path":"/rows/5/3","equals":8}
+//|       - {"artifact":"final","path":"/rows/0/0","equals":"ResidualTolerance"}
+//|       - {"artifact":"final","path":"/rows/0/1","approx":{"value":4.6e-8,"atol":5e-10}}
+//|       - {"artifact":"final","path":"/rows/0/2","range":{"min":0,"max":5e-10}}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+//|   - case: fine-grid
+//|     expect:
+//|       - {"artifact":"history","path":"/rowCount","equals":5}
+//|       - {"artifact":"history","path":"/rows/4/3","equals":60}
+//|       - {"artifact":"final","path":"/rows/0/0","equals":"ResidualTolerance"}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+use scioxide_core::{RealScalar, ResidualTolerance};
+use scioxide_rootfind::{
+    NewtonKrylovForcing, NewtonKrylovOptions, NewtonKrylovProblem, NewtonKrylovSolver,
+    ResidualFn, RootTermination,
+};
+let n = points as usize;
+let h = 1.0 / (n + 1) as f64;
+// F_i = (u_{i−1} − 2u_i + u_{i+1})/h² + λ e^{u_i}、境界 u_0 = u_{N+1} = 0。
+let residual = ResidualFn::new(n, |x: &[f64], out: &mut [f64]| {
+    for i in 0..n {
+        let left = if i == 0 { 0.0 } else { x[i - 1] };
+        let right = if i + 1 == n { 0.0 } else { x[i + 1] };
+        out[i] = (left - 2.0 * x[i] + right) / (h * h) + lambda * RealScalar::exp(x[i]);
+    }
+    Ok(())
+});
+let inner = if forcing == "一定 0.1" {
+    NewtonKrylovForcing::Constant(0.1)
+} else {
+    NewtonKrylovForcing::default()
+};
+let options = NewtonKrylovOptions::default()
+    .with_history(true)
+    .with_forcing(inner)
+    .with_residual_tolerance(ResidualTolerance::new(1e-7, 0.0).map_err(|e| e.to_string())?);
+let solver = NewtonKrylovSolver::new(options).map_err(|e| e.to_string())?;
+// 作用 Jv は前進差分で近似する（ヤコビ行列は作らない）。
+let problem = NewtonKrylovProblem::numerical(&residual);
+let result = solver
+    .solve(&problem, &vec![0.0; n])
+    .map_err(|e| e.to_string())?;
+let rows: Vec<_> = result
+    .history()
+    .iter()
+    .enumerate()
+    .map(|(k, item)| {
+        // 線形残差が得られない反復（内側がリソースの上限で止まった場合など）は None とする。
+        let ratio = item.linear_residual().map(|r| r / item.residual_norm());
+        (
+            k,
+            item.residual_norm(),
+            item.forcing(),
+            item.linear_iterations(),
+            ratio,
+            format!("{:?}", item.linear_termination()),
+            item.step_length(),
+        )
+    })
+    .collect();
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let sig3 = serde_json::json!({ "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "反復 k [-]", "type": "integer" },
+    { "key": "1", "label": "線形化した点の残差 ‖F‖ [-]", "type": "number", "format": sci2 },
+    { "key": "2", "label": "強制項 η [-]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "内側の反復 [回]", "type": "integer" },
+    { "key": "4", "label": "‖F + Jd‖/‖F‖ [-]", "type": "number", "format": sci3, "nullText": "なし" },
+    { "key": "5", "label": "内側の終了理由" },
+    { "key": "6", "label": "受理したステップ幅 α [-]", "type": "number", "format": sig3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "history" })
+);
+// 独立な検算: 左右対称な境界値問題なので、解は u_i = u_{N+1−i} を満たすはずである。
+let symmetry = result
+    .point()
+    .iter()
+    .zip(result.point().iter().rev())
+    .map(|(a, b)| (a - b).abs())
+    .fold(0.0_f64, f64::max);
+let termination = result.termination();
+let residual_norm = result.residual_norm().ok_or("残差が未評価")?;
+let columns = serde_json::json!([
+    { "key": "0", "label": "外側の終了理由" },
+    { "key": "1", "label": "残差ノルム ‖F‖ [-]", "type": "number", "format": sci2 },
+    { "key": "2", "label": "左右対称性の誤差 [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    columns,
+    vec![(termination.to_string(), residual_norm, symmetry)],
+    metadata = serde_json::json!({ "id": "final" })
+);
+let outcome = if termination.is_success() {
+    Outcome::satisfied("残差が絶対許容誤差 10⁻⁷ を満たした")
+} else if matches!(
+    termination,
+    RootTermination::GlobalizationFailure | RootTermination::LinearFailure(_)
+) {
+    Outcome::failed("直線探索か内側の線形求解が使える補正を返さなかった")
+} else {
+    Outcome::partial("残差の許容誤差を満たす前に止まった")
+};
+emit_outcome!(
+    outcome
+        .status(termination.to_string())
+        .diagnostic("残差ノルム", residual_norm, None)
+        .diagnostic("外側の反復", result.iterations() as f64, None)
+        .diagnostic("左右対称性の誤差", symmetry, None)
+);
+```
+
+既定の $N = 16$、$\lambda = 2$ と Eisenstat–Walker の規則では、4 回の外側の反復で `ResidualTolerance` に達し、残差ノルムは $8.8 \times 10^{-8}$ である。
+強制項は 0.5、0.326、0.163、$2.8 \times 10^{-5}$ と変わる。
+2 番目と 3 番目は前の値の $(1+\sqrt5)/2$ 乗の安全化の下限（$0.5^{1.618} = 0.326$、$0.326^{1.618} = 0.163$）で、その次は下限が 0.1 を下回るので第 1 の規則の値がそのまま使われる。
+検査した相対線形残差はどの反復でも強制項以下で、内側の反復は 7、8、7、10 回（計 32 回）である。
+一定 0.1 にすると外側は 6 反復、内側は計 39 回で、2 回目以降の反復では残差が 1 反復ごとにおよそ 1/10〜1/20 に減り、最終の残差ノルムは $4.6 \times 10^{-8}$ になる。
+強制項が一定なら 1 次収束し、0 に近づけると超 1 次収束するという前の定理のとおりである。
+左右対称性の誤差は Eisenstat–Walker で $3.0 \times 10^{-10}$、一定 0.1 で $1.4 \times 10^{-10}$ で、最終の残差ノルムより小さい。
+
+$N = 32$、$\lambda = 3$ では外側は 5 反復と 1 回増えるだけだが、内側は計 121 回に増え、最後の内側の求解は 60 回かかって再始動長 30 を超えて再始動している。
+格子を細かくすると線形方程式の条件数が $O(h^{-2})$ で増え、外側の反復回数がほとんど変わらなくても内側の処理が増える。
+対称性の一致だけでは正しい解の証明にならないので、残差と終了理由も確かめる。
+上側の解の枝と解析解との比較は[継続法による解の枝の追跡](oxref:rootfind-bratu-branch)、二つ目の解を求めるデフレーションは[デフレーションによる別の解の探索](../deflation/)にある。
+
+## 入力・出力と作業領域
+
+`NewtonKrylovInput` は初期値として連続したスライスか、正しいストライドを持つ 1 次元のビューを借用する。
+`NewtonKrylovSolver::workspace_requirements` は `NewtonKrylovWorkspaceRequirements`（非線形のベクトル、残差と作用の一時領域、差分用の領域、Krylov 基底の必要量）を返し、`workspace` は `NewtonKrylovWorkspace` を確保する。
+`NewtonKrylovResult` は最後に受理した点、その点の残差、唯一の終了理由、履歴を持ち、`solve_into` で作業領域とともに再利用できる。
+`solve_into` はエラーのとき出力を変更しない。
+受理した点がある後に上限や取り消しで止まった場合は、その点と未完了の終了理由を出力に書く。
+`last_linear()` は最後の内側の求解の診断で、`history()` は `with_history(true)` のときだけ記録される列である。
+履歴は診断に役立つが、メモリ使用量を使う。
+
+`backend::solve_newton_partitioned` は、別の解法が管理する求解の中で 1 回の Newton–Krylov 法を子の求解として実行する下位の関数で、ふつうの利用では使わない。
+親の `SolveContext` の評価回数の上限、取り消し、期限を共有し、反復上限と処理の上限は解法の設定のものを使い、失敗した処理も含めて評価回数を親に加える。
+準備した作業領域と結果を渡せば確保をしないが、`solve_into` と違ってエラーのときに出力を保たない。
+
+行列を作らない方法がいつも速いわけではなく、作用 1 回の計算コストと前処理の質が全体の計算コストを決める。
+密な小さい問題では[非線形連立方程式と大域化](../nonlinear-systems/)の `NewtonSystem`、`Broyden`、`TrustRegionSystem` も比べる。
+
+## まとめ
+
+`NewtonKrylovSolver` は作用 $J\mathbf{v}$ だけで連立方程式を解き、内側の GMRES を強制項 $\eta_k$ で決まる精度で止める。
+既定の Eisenstat–Walker の規則は線形モデルの予測の誤差から $\eta_k$ を決めて過剰な求解を避け、一定の $\eta$ では 1 次収束にとどまる。
+内側の補正は JVP で検査し直され、許される最大の線形残差を超えると `LinearFailure` で止まる。
+直線探索は非単調なので途中で $\lVert \mathbf{F} \rVert$ が増えることがあり、成否は唯一の成功 `ResidualTolerance` で判定する。
+差分の作用では強制項の下限が $\sqrt\varepsilon$ になるので、精度が必要なら解析的な JVP か自動微分の JVP を渡す。
+
+## 次に読むページ
+
+- [継続法による解の枝の追跡](../continuation-and-deflation/)：この解法を補正に使い、折り返し点を越えて Bratu 問題の上側の解の枝をたどれることを確かめる。
+- [デフレーションによる別の解の探索](../deflation/)：同じ Bratu 問題の二つ目の解を、初期点を変えずに求める方法を確かめる。

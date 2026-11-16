@@ -1,0 +1,247 @@
+---
+title: "Sampling from user densities"
+description: "UserDensity and concavity and boundedness guarantees, adaptive-rejection and transformed-density envelopes and squeezes, ratio-of-uniforms and numerical-inversion samplers, closure wrappers, UniversalSamplingOptions limits and SamplingDiagnostics, and inspection of log-concave density samples."
+sidebar:
+  order: 317
+references:
+  random-laws-user-density: "samplers-and-user-guarantees"
+  random-user-density-envelopes: "envelope-rejection"
+---
+
+Even laws not built in can be sampled with general-purpose samplers in `scioxide-random` if their density or tails can be expressed.
+Samplers accept mathematical density-shape properties (concavity, boundedness, normalization) as user guarantees and use them to produce samples with the correct law.
+Finitely many point checks cannot establish these properties; false guarantees produce samples from the wrong law.
+This page explains the guarantees required by four samplers, derives envelope rejection, describes work limits and diagnostics, and compares log-concave samples with closed-form moments.
+Built-in capabilities and inversion are in [Distribution capabilities, tail probabilities, and numerical inversion](../laws-tails-and-multivariate-models/); continuous built-in generation is in [Transformations, rejection, and tail control for continuous distributions](../continuous-distributions/).
+
+## Samplers and user guarantees
+
+Users implement `UserDensity` to provide log-density `log_pdf`, support, and `validate_density`.
+`validate_density` asserts positive finite total density mass and interval support.
+Density need not be normalized; `log_pdf` must be finite inside support, may be $-\infty$ at zero-density endpoints, and returns identical values for identical arguments.
+The four samplers accept the following guarantees.
+
+| Sampler | User guarantee | Method |
+|---|---|---|
+| `AdaptiveRejectionSampler::new(density, &knots)` | `ConcaveDensity`: $\ln f$ is concave across support and $(\ln f)'$ can be returned | Adaptive rejection with upper tangent bounds on $\ln f$ (Gilks–Wild 1992) |
+| `TransformedDensitySampler::new(density, &knots)` | $-1/\sqrt{f}$ is concave (log-concavity implies this too) | Transformed-density rejection applying the same method to transform $T(f) = -1/\sqrt{f}$ (Hörmann 1995) |
+| `RatioUniformsSampler::new(density)` | `BoundedDensity`: rectangle `RatioUniformsBounds` enclosing the ratio-of-uniforms region | Ratio of uniforms (Kinderman–Monahan 1977) |
+| `InversionSampler::new(provider)` | `LogCdf` and `LogSurvival` represent the same normalized law, with interval support | Bounded numerical inversion |
+
+`DensityTransform` is an enum specifying the transform guaranteed concave, with values `Log` (concave $\ln f$) and `NegativeInverseSqrt` (concave $-1/\sqrt{f}$).
+At preparation, `AdaptiveRejectionSampler::new` calls `validate_concavity(DensityTransform::Log)` and `TransformedDensitySampler::new` calls `validate_concavity(DensityTransform::NegativeInverseSqrt)`; an error aborts preparation.
+Users return `Ok(())` only for transforms they can guarantee and errors for transforms with unknown or false concavity.
+A log-concave density also has concave $-1/\sqrt{f}$, so both can return `Ok(())`, but the converse fails.
+For example, Cauchy-type $f(x) \propto 1/(1 + x^2)$ has concave $-1/\sqrt{f} = -\sqrt{1 + x^2}$ but $\ln f$ is convex for $\lvert x \rvert > 1$, allowing only `TransformedDensitySampler`.
+
+Closed-form densities or tails can use closure wrappers instead of trait implementations.
+
+| Type | Inputs | Implemented traits | Accepted by |
+|---|---|---|---|
+| `ConcaveDensityFn::new(log_pdf, derivative, transform, support)` | Closures for $\ln f$ and $(\ln f)'$, guaranteed-concave transform, support | `Support`, `LogDensity`, `UserDensity`, `ConcaveDensity` | Both adaptive samplers if `transform` is `Log`; only `TransformedDensitySampler` for `NegativeInverseSqrt` |
+| `BoundedDensityFn::new(log_pdf, bounds, support)` | Closure for $\ln f$, enclosing acceptance rectangle `RatioUniformsBounds`, support | `Support`, `LogDensity`, `UserDensity`, `BoundedDensity` | `RatioUniformsSampler` |
+| `LogTailsFn::new(log_cdf, log_sf, support)` | Closures for $\ln F$ and $\ln S$, support | `LogCdf`, `LogSurvival`, `Support` | `InversionSampler`, `invert_log_probability`, `log_interval_probability` |
+
+Wrappers forward each query to one closure call without allocation.
+Users supply concavity, boundedness, and normalization guarantees; samplers check them only at evaluated points.
+A density exceeding its envelope or becoming NaN or $+\infty$ at an evaluated point disproves the guarantee and returns `InvalidInput`.
+
+## Envelope rejection
+
+Rejection sampling proposes $X$ from a function $g \ge f$ bounding density $f$ (possibly unnormalized) and accepts if $W\,g(X) \le f(X)$ for uniform $W$.
+Accepted $X$ has density proportional to $f$, and expected proposals per sample are $\int g / \int f$.
+
+Adaptive rejection constructs $g$ using concavity of $h = \ln f$.
+Tangents $\ell_i(x) = h(x_i) + h'(x_i)(x - x_i)$ at nodes $x_1 < \dots < x_m$ lie above a concave function, giving $u(x) = \min_i \ell_i(x) \ge h(x)$.
+$e^{u}$ is piecewise exponential with intervals bounded by adjacent tangent intersections; closed-form interval masses select intervals, and inverse transforms sample exactly within them.
+The chord $s(x)$ between adjacent nodes lies below the concave function, so $\ln W + u(X) \le s(X)$ permits acceptance without evaluating $f$ (a squeeze).
+Only candidates unresolved by the squeeze evaluate $h(X)$, with acceptance decided by $\ln W + u(X) \le h(X)$.
+Each proposal costs $O(\log m)$ for interval search and at most one density and one derivative evaluation.
+
+`sample_adaptive` with workspace `AdaptiveSamplingWorkspace` refines the envelope by adding tangents at density-evaluated candidates.
+Tangents are added regardless of acceptance, except when the table reaches `table_nodes` nodes, the candidate is too close to an existing node, or insertion would invalidate the envelope.
+Transformed-density rejection also skips insertion when the new $\ln f$ differs from every existing node value by more than $\ln(1/\varepsilon) \approx 36$, because intersection computation becomes ill-conditioned.
+As nodes increase, $\int e^{u} / \int f$ approaches 1 and squeeze acceptance increases, so later samples need fewer density evaluations.
+A refinement costs $O(m)$.
+`sample_report` samples with the originally prepared envelope, without refinement.
+
+Transformed-density rejection uses tangents of $T(f) = -1/\sqrt{f}$ instead of $h = \ln f$.
+Inverting tangent $a + bx$ gives a piecewise envelope proportional to $1/(a + bx)^2$, also sampled exactly by inverse transform.
+Concavity of $-1/\sqrt{f}$ is weaker than log-concavity, including power tails such as Student t with $\nu \ge 1$ degrees of freedom and Cauchy.
+
+Ratio-of-uniforms uses the fact that uniform $(u, v)$ over region $\{0 < u \le \sqrt{f(c + v/u)}\}$ makes $x = c + v/u$ have density proportional to $f$.
+`RatioUniformsBounds` supplies enclosing rectangle $(0, u_{\max}] \times [v_{\min}, v_{\max}]$.
+The conditions are $u_{\max} \ge \sup \sqrt{f(x)}$, $v_{\min} \le \inf (x - c)\sqrt{f(x)}$, and $v_{\max} \ge \sup (x - c)\sqrt{f(x)}$ (suprema and infima over full support); placing shift $c$ near the mode shrinks the rectangle.
+Choose $(u, v)$ uniformly in the rectangle and accept if $2\ln u \le \ln f(x)$.
+Each proposal costs two uniforms and at most one density evaluation; expected proposals equal rectangle area $u_{\max}(v_{\max} - v_{\min})$ divided by half the total mass of $f$.
+
+`InversionSampler` evaluates no density.
+For open-interval uniform $u$, solve $\ln F(x) = \ln u$ if $u \le 1/2$ or $\ln S(x) = \ln(1 - u)$ if $u > 1/2$ using `invert_log_probability_with_options`.
+Solving the smaller tail preserves relative accuracy in both tails.
+`transport(u)` maps a supplied $u$, so it can also transport quasi-random coordinates to a law.
+
+## Work and diagnostics
+
+For every sampler, `new` uses default `UniversalSamplingOptions` and `with_options` takes limits as the final argument.
+
+| Limit | Default |
+|---|---|
+| Preparation density and derivative evaluations | 65,536 |
+| Per-sample density, derivative, and tail evaluations (including refinement) | 4,096 |
+| Per-sample uniform calls (including redrawn zeros) | 65,536 |
+| Adaptive envelope nodes `table_nodes` | 128 (at least 2) |
+| Storage per operation (sampler and temporary buffers) | 64 MiB |
+
+Evaluation or random-call exhaustion returns `ConvergenceFailure`; exceeding storage returns `ResourceLimit`.
+Independently of these limits, rejection stops after 1,024 proposals per sample.
+Per-sample work is returned as `SamplingDiagnostics` (proposals, rejections, evaluations, random-call counts) in `diagnostics` of `UniversalSample`.
+Adaptive rejection retains nodes in caller-owned workspace, never exceeding its prepared capacity (`table_nodes` nodes).
+A workspace is usable only with its creating sampler; refinements made before an error remain in it.
+
+## Sampling a log-concave density
+
+The following cell samples log-concave density $f(x) \propto \exp(-\lvert x \rvert^\beta)$ ($\beta \ge 1$) through `AdaptiveRejectionSampler`.
+Density `ConcaveDensityFn` is constructed from closures for $\ln f$ and its derivative, transform `DensityTransform::Log`, and whole-real-line support.
+The three initial nodes are $-1, 0, 1$.
+The first table gives proposals, rejections, and evaluations to generate $n$ samples, acceptance rate (samples divided by total proposals), and final envelope node count.
+The second compares sample $\mathrm{E}[\lvert X \rvert]$ and $\mathrm{E}[X^2]$ with closed form $\mathrm{E}[\lvert X \rvert^r] = \Gamma((r + 1)/\beta)/\Gamma(1/\beta)$ (independent check), reporting $z$ scaled by standard error from sample moments of order $2r$.
+
+```rust
+//| id: random-adaptive-rejection
+//| ref: random-adaptive-rejection
+//| title: "Sample a user log-concave density through adaptive rejection"
+//| run: reactive
+//| crates: [scioxide-random, scioxide-core, scioxide-special]
+//| inputs:
+//|   beta: {"type":"range","label":"Exponent β (density ∝ exp(−|x|^β))","description":"β = 1 is Laplace; β = 2 is normal with variance 1/2.","min":1.25,"max":4,"step":0.25,"value":2}
+//|   sample_count: {"type":"range","label":"Sample size n [count]","min":1000,"max":20000,"step":1000,"value":5000}
+//|   seed: {"type":"range","label":"Random seed","min":1,"max":1000,"step":1,"value":9}
+//| cases:
+//|   - {"id":"flat-top","label":"β = 4","description":"Flat-topped, short-tailed density. E[X²] = Γ(3/4)/Γ(1/4) = 0.338.","inputs":{"beta":4}}
+//|   - {"id":"near-laplace","label":"β = 1.25, n = 20000","description":"Sharp density near Laplace. More envelope nodes are added.","inputs":{"beta":1.25,"sample_count":20000}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"work","path":"/rows/0/3","range":{"min":0.9,"max":1}}
+//|       - {"artifact":"work","path":"/rows/0/4","range":{"min":4,"max":128}}
+//|       - {"artifact":"moments","path":"/rows/0/3","range":{"min":-4,"max":4}}
+//|       - {"artifact":"moments","path":"/rows/1/3","range":{"min":-4,"max":4}}
+//|   - case: flat-top
+//|     expect:
+//|       - {"artifact":"moments","path":"/rows/1/1","approx":{"value":0.337989,"atol":1e-5}}
+//|       - {"artifact":"moments","path":"/rows/1/3","range":{"min":-4,"max":4}}
+//|   - case: near-laplace
+//|     expect:
+//|       - {"artifact":"work","path":"/rows/0/4","range":{"min":4,"max":128}}
+//|       - {"artifact":"moments","path":"/rows/0/3","range":{"min":-4,"max":4}}
+use scioxide_core::{ExtendedInterval, NumericScalar, RealScalar};
+use scioxide_random::{
+    AdaptiveRejectionSampler, ConcaveDensityFn, DensityTransform, SeedableRng, SplitMix64,
+};
+
+let fixed4 = serde_json::json!({ "fractionDigits": 4 });
+let sig5 = serde_json::json!({ "significantDigits": 5 });
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+// ln f and (ln f)′ for unnormalized density exp(−|x|^β). Since β ≥ 1, ln f is concave.
+// Mass 2Γ(1 + 1/β) is positive and finite; support is the connected real line (UserDensity guarantee).
+let density = ConcaveDensityFn::new(
+    |x: f64| {
+        let magnitude: f64 = NumericScalar::abs(x);
+        Ok(-RealScalar::powf(magnitude, beta))
+    },
+    |x: f64| {
+        let magnitude: f64 = NumericScalar::abs(x);
+        Ok(-beta * RealScalar::signum(x) * RealScalar::powf(magnitude, beta - 1.0))
+    },
+    DensityTransform::Log,
+    ExtendedInterval::new(None, None).map_err(|e| e.to_string())?,
+);
+let n = sample_count as usize;
+let sampler =
+    AdaptiveRejectionSampler::new(density, &[-1.0, 0.0, 1.0]).map_err(|e| e.to_string())?;
+let mut adaptive = sampler.workspace().map_err(|e| e.to_string())?;
+let mut rng = SplitMix64::from_seed(seed as u64);
+let mut samples = Vec::with_capacity(n);
+let (mut proposals, mut rejections, mut evaluations) = (0_usize, 0_usize, 0_usize);
+for _ in 0..n {
+    let draw = sampler
+        .sample_adaptive(&mut rng, &mut adaptive)
+        .map_err(|e| e.to_string())?;
+    proposals += draw.diagnostics.proposals;
+    rejections += draw.diagnostics.rejections;
+    evaluations += draw.diagnostics.evaluations;
+    samples.push(draw.value);
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "Proposal count", "type": "integer" },
+    { "key": "1", "label": "Rejection count", "type": "integer" },
+    { "key": "2", "label": "Density and derivative evaluations", "type": "integer" },
+    { "key": "3", "label": "Acceptance rate n/proposals [-]", "type": "number", "format": fixed4 },
+    { "key": "4", "label": "Envelope node count", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    vec![(
+        proposals,
+        rejections,
+        evaluations,
+        n as f64 / proposals as f64,
+        adaptive.nodes()
+    )],
+    metadata = serde_json::json!({ "id": "work" })
+);
+// Independent check: E[|X|^r] = Γ((r + 1)/β)/Γ(1/β). Standard errors use sample moments of order 2r.
+let gamma = |x: f64| scioxide_special::gamma(x).map_err(|e| e.to_string());
+let nf = n as f64;
+let moment = |r: i32| {
+    samples
+        .iter()
+        .map(|&x| RealScalar::powi(NumericScalar::abs(x), r))
+        .sum::<f64>()
+        / nf
+};
+let (m1, m2, m4) = (moment(1), moment(2), moment(4));
+let row = |name: &'static str, r: f64, est: f64, se: f64| -> Result<_, String> {
+    let exact = gamma((r + 1.0) / beta)? / gamma(1.0 / beta)?;
+    Ok((name, exact, est, (est - exact) / se))
+};
+let columns = serde_json::json!([
+    { "key": "0", "label": "Quantity" },
+    { "key": "1", "label": "Closed form", "type": "number", "format": sig5 },
+    { "key": "2", "label": "Sample estimate", "type": "number", "format": sig5 },
+    { "key": "3", "label": "z [-]", "type": "number", "format": fixed2 }
+]);
+emit_table_with_columns!(
+    columns,
+    vec![
+        row("E[|X|]", 1.0, m1, RealScalar::sqrt((m2 - m1 * m1) / nf))?,
+        row("E[X²]", 2.0, m2, RealScalar::sqrt((m4 - m2 * m2) / nf))?,
+    ],
+    metadata = serde_json::json!({ "id": "moments" })
+);
+```
+
+With the defaults ($\beta = 2$, $n = 5\,000$, seed 9), 12 of 5,012 proposals are rejected, giving acceptance rate $0.9976$.
+Nodes increase from 3 to 44; 82 evaluations comprise 41 density calls and 41 derivative calls for adding tangents.
+Of 41 density-evaluated candidates, 29 were accepted, showing tangents were added for evaluated candidates, including accepted ones.
+The remaining 4,971 proposals are accepted by the squeeze without density evaluations.
+
+For $\mathrm{E}[\lvert X \rvert]$, the sample is $0.57542$ ($z = 1.85$) versus closed form $1/\sqrt{\pi} = 0.56419$; for $\mathrm{E}[X^2]$, $0.51596$ ($z = 1.58$) compares with $0.5$.
+The two $z$ values use the same sample and are positively correlated, tending to deviate in the same direction.
+Even a correct sampler gives a $z$ outside $\pm 1.96$ with probability about 5%; vary seed or $n$ to check that $z$ scatters around 0.
+For $\beta = 4$, sample $0.34693$ ($z = 1.70$) compares with closed-form $0.33799$ of $\mathrm{E}[X^2]$.
+For $\beta = 1.25$ and $n = 20\,000$, nodes increase to 68, giving $z = -0.97$ for $\mathrm{E}[X^2]$.
+
+## Summary
+
+Laws not built in can use general-purpose sampling by adding concavity (`ConcaveDensity`) or boundedness (`BoundedDensity`) guarantees to `UserDensity`, or supplying log-tails `LogCdf` and `LogSurvival`.
+Use `AdaptiveRejectionSampler` for log-concave densities and `TransformedDensitySampler` for $-1/\sqrt{f}$-concave power-tailed densities; supply closed-form densities through wrappers such as `ConcaveDensityFn`.
+Guarantees are checked only at evaluated points, so return errors from `validate_concavity` for transforms you cannot guarantee.
+Reuse workspaces for adaptive sampling, inspecting proposal and evaluation counts in `SamplingDiagnostics` to assess envelope effectiveness.
+Check sample correctness against closed-form moments or quantiles using standard errors, rather than one seed's $z$ alone.
+
+## Further reading
+
+- [Transformations, rejection, and tail control for continuous distributions](../continuous-distributions/): compare with built-in inverse transforms, Ziggurat sampling, and variate combinations.
+- [Distribution capabilities, tail probabilities, and numerical inversion](../laws-tails-and-multivariate-models/): examine termination and work of `invert_log_probability_with_options` used by `InversionSampler`.
+- [Law capabilities and composition](../../api/law-protocols-and-combinators/): look up contracts for general-purpose samplers, wrappers, and `UniversalSamplingOptions` in the API tables.

@@ -1,0 +1,323 @@
+---
+title: "Execution forms, workspaces, and reproducibility"
+description: "Allocation-free hot loops, execution forms, Capacity and ResourceLimit, floating-point non-associativity, and three levels of reproducibility."
+sidebar:
+  order: 60
+---
+
+When repeating computations of the same shape, reusing plans, factorization factors, and workspaces reduces preparation and memory allocation overhead.
+In parallel computations, the order of addition also affects reproducibility.
+This page organizes what to prepare before execution and which conditions to check when assessing reproducibility.
+
+---
+
+## Unified execution forms
+
+SciOxide's basic design separates configuration, preparation, and execution.
+The following table outlines execution categories; it does not give common signatures that can be called verbatim.
+Consult each type's contract for concrete arguments and failure behavior.
+
+| Execution category | Execution form signature | Failure contract |
+|---|---|---|
+| **Atomic output** | `verb(..)`, `verb_into(inputs, out, ws, cx)`, `verb_in_place(data, ws, cx)` | On error, values in the output region `out` or input buffer `data` are **completely unchanged** (atomicity is preserved). |
+| **Progressive solve** | `advance(problem, state, sink, ws, scope) -> Result<Report, SciOxideError>` | Preflight rejection leaves `state` as supplied. After any accepted step, the **last accepted state** is retained. Samples already emitted are not retracted. |
+| **Session** | A view borrowing a workspace for multiple products at one point, such as `Linearization` returned by `Tape::linearize` | The next session completely reinitializes the workspace. |
+| **Plan-less function** | `f(x)`, `f_with_options(x, opts)`, `f_scoped(x, opts, scope)` | Special functions and similar operations return results by value. Only functions performing iterative or nested work have `f_scoped`; fixed-cost functions do not. |
+
+Plan-less scalar functions have no batch form.
+Call them elementwise to evaluate multiple points.
+The only exceptions are sequence forms that reuse recurrences in the order (such as sequences of special functions).
+
+- **Owned form (`verb`)**: A convenience function provided only when the output type is unambiguous and can be owned.
+  It temporarily allocates a workspace and returns an owned result.
+  It executes sequentially with `ExecutionContext::sequential_native()`, using validated native instruction paths with `std` and portable scalar paths with `no_std`.
+  Clocks, cancellation, and entropy are not passed through, so setting a time limit fails with `CapabilityUnavailable`.
+- **Borrowed form (`verb_into`)**: The standard execution form for allocation-free hot loops.
+  It mutably borrows caller-provided output slices and a workspace (`Workspace`), writing results directly into them.
+
+LU factorization can be reused when only the right-hand side $b_k$ changes for the same coefficient matrix $A$.
+Factorization requires approximately $2n^3/3$ operations, and substitution for each right-hand side requires $2n^2$.
+On the borrowed-output path of `LuDecomposition`, preparing the output and `LinalgWorkspace` in advance avoids additional allocations during execution.
+
+---
+
+## Workspace capacity protocol and `ResourceLimit`
+
+When reusing a workspace (`Workspace`), separate obtaining capacity requirements, reserving storage, and checking compatibility.
+
+| Step | Operation |
+|---|---|
+| Determine capacity requirements | `plan.workspace_requirements(request)` |
+| Reserve storage | `ws.try_reserve(&requirements)` |
+| Check capacity | `ws.check(&requirements)` |
+
+`plan.workspace(request)` is another entry point for constructing a workspace that meets the requirements.
+An already reserved workspace need not be recreated on every reuse.
+
+### Capacity compatibility checks (`Capacity`)
+
+`ws.check(&requirements)` returns the enum `Capacity`.
+
+- **`Capacity::Sufficient`**: Existing storage held by the workspace meets the requirements, so no growth is needed for those requirements.
+  This does not guarantee allocation behavior of user callbacks or separate output storage.
+- **`Capacity::NeedsGrowth`**: The retained storage is insufficient and must grow before the numerical computation runs.
+
+Requirements account for retained capacity, including storage kept from earlier calls.
+A failed reservation may keep storage already grown; output atomicity does not imply capacity rollback.
+
+### Resource limits and error contracts
+
+- A borrowed slice shorter than the required minimum returns **`DimensionMismatch`** as a shape mismatch.
+- Failure to allocate memory while growing an owned workspace returns **`AllocationFailure`**.
+- Integer overflow while calculating required capacity returns **`SizeOverflow`**.
+- Exceeding a caller-configured memory limit or capacity resource allowance returns the structured error **`SciOxideErrorKind::ResourceLimit`**.
+
+---
+
+## Interactive model of amortizing preparation costs
+
+The following cell shows a **computational work model** for reusing preparation.
+Taking one application as unit cost and preparation as $P$, the total work for $N$ applications is $N(P+1)$ when preparing each time and $P+N$ when reusing preparation.
+The inputs are $P$ and $N$; these are not measured execution times.
+As a concrete borrowed-form example, also normalize a 20-row, 10-column array row by row using `softmax_axis_into`.
+The caller prepares output and workspace before execution and reuses the same storage across three executions.
+The table shows the prepared output and workspace lengths, the maximum deviation of row probability sums from 1, and the error category when the workspace is shortened by one element.
+If the workspace is shorter than required (the number of input elements), the result is `DimensionMismatch` and the output is unchanged.
+
+```rust
+//| id: concept-plan-amortization
+//| title: "Varying preparation cost and iteration count to observe amortization of plan reuse (cost model and requirements example)"
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   preparation_cost_ratio: {"type":"range","label":"Preparation cost / single application cost P [-]","description":"Vary how many applications equal the cost of factorization or plan construction.","min":1,"max":500,"step":1,"value":80}
+//|   selected_repetitions: {"type":"range","label":"Observed iteration count N [executions]","description":"Vary the number of computations sharing the same preparation.","min":1,"max":200,"step":1,"value":24}
+use scioxide_core::{
+    ExecutionContext, ExecutionPolicy, SciOxideErrorKind, NdView, NdViewMut, checked_sum,
+    softmax_axis_into,
+};
+
+// Normalize 20 rows and 10 columns rowwise (axis 1). The borrowed form takes output and a workspace at least as long as the element count.
+let shape = [20, 10];
+let logits: Vec<f64> = (0..200).map(|i| 0.01 * f64::from(i)).collect();
+let input = NdView::row_major(&logits, &shape).map_err(|e| e.to_string())?;
+let mut output = vec![0.0; 200];
+let mut scratch = vec![0.0; 200];
+// Reuse the same output and workspace across three executions.
+for _ in 0..3 {
+    let target = NdViewMut::row_major(&mut output, &shape).map_err(|e| e.to_string())?;
+    softmax_axis_into(
+        input,
+        1,
+        ExecutionPolicy::Sequential,
+        target,
+        &mut scratch,
+        ExecutionContext::sequential(),
+    )
+    .map_err(|e| e.to_string())?;
+}
+let mut worst_total = 0.0_f64;
+for row in output.chunks(10) {
+    let total = checked_sum(row).map_err(|e| e.to_string())?;
+    worst_total = worst_total.max((total - 1.0).abs());
+}
+// A workspace shorter by one element is rejected as DimensionMismatch before computation.
+let target = NdViewMut::row_major(&mut output, &shape).map_err(|e| e.to_string())?;
+let short = softmax_axis_into(
+    input,
+    1,
+    ExecutionPolicy::Sequential,
+    target,
+    &mut scratch[..199],
+    ExecutionContext::sequential(),
+);
+let short_result = match short {
+    Ok(()) => "Ok",
+    Err(error) if error.kind() == SciOxideErrorKind::DimensionMismatch => "DimensionMismatch",
+    Err(error) => return Err(error.to_string()),
+};
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let workspace_columns = serde_json::json!([
+    { "key": "0", "label": "Input shape" },
+    { "key": "1", "label": "Output length [scalars]", "type": "integer" },
+    { "key": "2", "label": "Workspace length [scalars]", "type": "integer" },
+    { "key": "3", "label": "Maximum difference between a row's probability sum and 1 [-]", "type": "number", "format": sci2 },
+    { "key": "4", "label": "Result with workspace length 199" }
+]);
+emit_table_with_columns!(
+    workspace_columns,
+    vec![(
+        "20 × 10",
+        output.len(),
+        scratch.len(),
+        worst_total,
+        short_result
+    )],
+    metadata = serde_json::json!({ "id": "workspace" })
+);
+
+// The following is a computational work model, not measured execution time.
+let p = preparation_cost_ratio;
+let n = selected_repetitions.round();
+let repeated: Vec<_> = (1..=200).map(|k| [k as f64, p + 1.0]).collect();
+let reused: Vec<_> = (1..=200).map(|k| [k as f64, p / k as f64 + 1.0]).collect();
+let series = vec![
+    serde_json::json!({"name":"Prepare each time", "points":repeated}),
+    serde_json::json!({"name":"Reuse preparation", "points":reused}),
+];
+// The reuse cost p/N + 1 approaches 1 on logarithmic axes. The vertical line marks the N compared in the table.
+emit_line_chart!(
+    &series,
+    options = &serde_json::json!({"xLabel": "Repetition count N [executions]", "yLabel": "Work per execution [single application units]",
+"xType": "log", "yType": "log", "annotations": [{"kind": "line", "axis": "x", "value": n, "label": "Selected N"}]})
+);
+emit_table_with_columns!(
+    serde_json::json!([
+    {"key":"0","label":"Path","type":"string","nullText":"Undefined"},
+    {"key":"1","label":"Total work [single application units]","type":"number","format":{"significantDigits":6},"nullText":"Undefined"},
+    {"key":"2","label":"Work per execution","type":"number","format":{"significantDigits":6},"nullText":"Undefined"}
+    ]),
+    vec![
+        ("Prepare each time", n * (p + 1.0), p + 1.0),
+        ("Reuse preparation", p + n, p / n + 1.0),
+    ]
+);
+```
+
+As the iteration count $N$ increases, the effective cost per execution decreases to $1 + P/N$ and approaches the theoretical limit of 1.
+
+---
+
+## Separating `ExecutionPolicy` from `ExecutionContext`
+
+SciOxide explicitly separates the user's intention to parallelize from the platform's actual ability to execute parallel threads.
+
+- **`ExecutionPolicy`**: An enum expressing the intended resource allocation.
+  - `Sequential`: Enforces fully sequential execution.
+  - `Auto`: Decides from operation-specific size thresholds, work estimates, and the executor's minimum work per worker (the default).
+    For `ThreadExecutor`, the minimum is 32,768 work units; smaller computations run without threads.
+  - `Parallel(NonZeroUsize)`: Executes in parallel with the specified upper limit on workers (a positive integer).
+- **`ExecutionContext`**: An execution context bundling borrowed access to an executor (`Executor`), cancellation notifications, an optional monotonic clock (`ClockBinding`), an optional entropy source, and a processor capability policy (`ProcessorCapabilities`).
+
+Explicitly injecting the required capabilities through an execution context, without global environment or static variables, facilitates deterministic testing in `no_std` environments, embedded systems, and test environments.
+
+---
+
+## Floating-point non-associativity and three levels of reproducibility
+
+Real-number addition satisfies associativity, $(a + b) + c = a + (b + c)$, but intermediate rounding generally invalidates this equality in floating-point arithmetic.
+
+### Interactive experiment on rounding differences caused by reduction order
+
+Consider the expression $L + s - L$ containing a large term $L = 10^{16}$ and a small term $s = 1$.
+In the real field, every addition order gives exactly $s = 1$, but in floating-point arithmetic different intermediate addition orders can produce completely different results.
+
+```rust
+//| id: concept-reduction-order
+//| title: "Varying large and small term scales to observe summation order differences (naive floating-point sums and checked_sum exact sums)"
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   large_exponent: {"type":"range","label":"Large term exponent a (L=10ᵃ)","description":"A large scale that absorbs the small term.","min":10,"max":18,"step":1,"value":16}
+//|   small_exponent: {"type":"range","label":"Small term exponent b (s=10ᵇ)","description":"The small true value to preserve.","min":-2,"max":4,"step":1,"value":0}
+use scioxide_core::checked_sum;
+
+let large = 10.0_f64.powf(large_exponent);
+let small = 10.0_f64.powf(small_exponent);
+// Compare orders of the same three terms, using naive addition as a control.
+#[allow(clippy::eq_op)]
+let values = vec![
+    (large + small) - large,
+    (large - large) + small,
+    (small + large) - large,
+    (small - large) + large,
+    (-large + large) + small,
+    (-large + small) + large,
+];
+let labels = vec![
+    "(L+s)−L",
+    "(L−L)+s",
+    "(s+L)−L",
+    "(s−L)+L",
+    "(−L+L)+s",
+    "(−L+s)+L",
+];
+let exact = checked_sum(&[large, small, -large]).map_err(|e| e.to_string())?;
+emit_bar_chart!(
+    &labels,
+    &values,
+    options = &serde_json::json!({"xLabel": "Addition order", "yLabel": "Sum [-]", "style": {"animation": false},
+"annotations": [{"kind": "line", "axis": "y", "value": exact, "label": "Exact sum s"}]})
+);
+let rows: Vec<_> = labels
+    .iter()
+    .zip(&values)
+    .map(|(&label, &value)| (label, value, exact, (value - exact).abs()))
+    .collect();
+emit_table_with_columns!(
+    serde_json::json!([
+    {"key":"0","label":"Addition order","type":"string","nullText":"Undefined"},
+    {"key":"1","label":"Naive sum","type":"number","format":{"significantDigits":6},"nullText":"Undefined"},
+    {"key":"2","label":"Rounded value after exact accumulation","type":"number","format":{"significantDigits":6},"nullText":"Undefined"},
+    {"key":"3","label":"Absolute difference","type":"number","format":{"significantDigits":6},"nullText":"Undefined"}
+    ]),
+    rows
+);
+
+// Do not execute in parallel; reproduce only the addition order caused by chunking.
+let terms = [large, small, -large, small, large, -large, small, small];
+let reference = checked_sum(&terms).map_err(|e| e.to_string())?;
+let mut rows = Vec::new();
+for count in [1, 2, 4, 8] {
+    let parts: Vec<_> = terms
+        .chunks(8 / count)
+        .map(|part| part.iter().fold(0.0, |s, &v| s + v))
+        .collect();
+    let value = parts.iter().fold(0.0, |s, &v| s + v);
+    rows.push((count, value, reference, (value - reference).abs()));
+}
+emit_table_with_columns!(
+    serde_json::json!([
+    {"key":"0","label":"Partition count","type":"number","format":{"significantDigits":6},"nullText":"Undefined"},
+    {"key":"1","label":"Naive partitioned sum","type":"number","format":{"significantDigits":6},"nullText":"Undefined"},
+    {"key":"2","label":"Rounded value after exact accumulation","type":"number","format":{"significantDigits":6},"nullText":"Undefined"},
+    {"key":"3","label":"Absolute difference","type":"number","format":{"significantDigits":6},"nullText":"Undefined"}
+    ]),
+    rows
+);
+```
+
+At the defaults $L=10^{16}$ and $s=1$, computing $L-L$ first gives 1, whereas computing $L+s$ first loses the small term and gives 0.
+Changing the scales may partly round the small term or make all orders agree.
+Inspect both the absolute differences in the table and the bar chart.
+The partitioned sum table does not report browser thread execution; it sequentially reproduces the different addition orders caused by partitioning.
+
+### Three levels of reproducibility and their basis in SciOxide
+
+Specify which of the following levels of reproducibility is required for the scientific computation's purpose.
+
+1. **Bit-level reproducibility**: Output bit patterns agree for identical inputs.
+   When checking bit-level reproducibility, align the arithmetic environment and the scope of each API's guarantees.
+   - **Linear merging in partition order**: The `ExecutionPlan::reduce` of `scioxide-core` combines results deterministically in the partition order specified by the plan, rather than nondeterministic thread completion order.
+     With identical inputs, partitions, processing, and arithmetic environment, differing completion orders do not cause result variation.
+   - **Bit-level reproducibility independent of worker count**: `scioxide_core::Accuracy` is a shared policy for dense and sparse matrices.
+     Standard-precision (`Accuracy::Standard`) results agree bit for bit regardless of parallel worker count when options and the instruction-set backend (native SIMD or portable scalar) are fixed.
+     A different backend may change rounding within the contract's error bounds.
+   - **Bit-level reproducibility across hardware architectures**: Exact accumulation through `RangeAccumulator` and dot products through `Accuracy::Exact` perform only a single final rounding, producing the same rounded result for the same input values in supported arithmetic environments.
+     This does not claim reproducibility of upstream computations that generated those inputs.
+2. **Numerical reproducibility**: Solutions agree within a specified tolerance ($\gamma_k$ bounds or `Tolerance`).
+   Check that different thread counts or hardware also stay within that range.
+3. **Scientific reproducibility**: Physical conclusions and statistical uncertainty assessments agree even with different discretizations (such as finite differences and finite elements) or independent algorithms.
+
+---
+
+## Summary and next steps
+
+Before reusing preparation, check that the input shapes and required capacity still match.
+Sufficient capacity and reproducible results are separate contracts.
+When comparing reproducibility, specify which inputs, worker counts, precision settings, or arithmetic environments changed.
+Next, consider errors and computation count limits when connecting multiple computations.
+
+- Next core concept: [Connecting crates and propagating combined errors](../composition/)
+- Execution plan and partitioning contracts: [`scioxide-core` execution policies, partitioning, and execution contexts](../../scioxide-core/algorithms/execution-and-partitions/)
+- Workspaces and accuracy contracts in linear algebra: [`scioxide-linalg` dense matrices and execution settings](../../scioxide-linalg/api/dense-and-execution/)

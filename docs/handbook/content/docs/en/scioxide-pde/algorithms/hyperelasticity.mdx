@@ -1,0 +1,513 @@
+---
+title: "Hyperelasticity and consistent tangents"
+description: "Strain energy and stress for compressible neo-Hookean materials, local plane-stress solves, discrete dead-load residuals and load increments, Newton–Krylov solves, and one-time evaluation and reuse of consistent tangents."
+sidebar:
+  order: 356
+references:
+  pde-hyperelastic-neo-hooke: "neo-hookean-material"
+  pde-hyperelastic-residual: "discrete-residuals-and-load-increments"
+  pde-hyperelastic-linearization: "consistent-tangents-and-linearization-reuse"
+---
+
+Rubber, biological tissue, and foams can recover elastically even after extension or compression exceeding tens of percent.
+At such large deformations, the small-strain linear Hooke law in [Finite elements for elastic solids](../elasticity/) is inapplicable.
+This page explains how to discretize a neo-Hookean hyperelastic material (elasticity whose stress derives from strain energy density) with `HyperelasticityPlan` and solve by passing its residual and consistent tangent to Newton–Krylov.
+Mesh, boundary conditions, reduction (`ElasticityKinematics`), element (`ElasticityFormulation`), and material (`IsotropicElasticMaterial`) are selected as in linear elasticity.
+
+## Neo-Hookean material
+
+Suppose a material point $X$ before deformation moves to $x=X+u(X)$ after deformation.
+Large deformation is represented by the deformation gradient, differentiated in reference-configuration coordinates:
+
+```text
+F = I + ∇u,   J = det F,   I₁ = tr(Fᵀ F)
+```
+
+
+$J$ is the volume ratio; unless $J>0$, the element is inverted.
+$I_1$ is a measure of stretch invariant under rigid rotation.
+
+`HyperelasticityPlan` uses a compressible neo-Hookean material with strain energy density
+
+```text
+W(F) = μ/2 · (J^(−2/3) I₁ − 3) + K/2 · (J − 1)²
+```
+
+
+The first term represents volume-preserving deformation and the second volume change; $\mu$ and $K$ are the small-deformation shear and bulk moduli.
+At zero displacement, the tangent equals the linear Hooke stiffness.
+Stress is expressed as first Piola–Kirchhoff stress $P=\partial W/\partial F$, force per reference area, and Cauchy stress $\sigma=PF^{\mathsf T}/J$, force per deformed area.
+`MixedP2P1` replaces the second term with $p(J-1)-p^2/(2K)$ and imposes the volume constraint weakly through P1 pressure $p$.
+For deformations with $J\le0$, material evaluation returns a domain error (`DomainError`).
+
+Plane strain sets $F_{zz}=1$.
+Plane stress solves for stretch $F_{zz}$ making thickness-direction Piola stress $P_{zz}(F_{zz})$ equal to 0 at each quadrature point.
+With fixed in-plane deformation and a positive in-plane determinant, $P_{zz}$ increases monotonically with $F_{zz}$.
+A bracket search in `scioxide-rootfind` (expanding geometrically from $F_{zz}=1$) therefore brackets the root, which safeguarded Newton then computes.
+`PlaneStressOptions` configures this local solve.
+`new()` and `Default` allow at most 64 bracket expansions and 64 Newton iterations, with relative tolerance $64\varepsilon$.
+Change these through `with_max_iterations` and `with_tolerance`; if tolerance is outside $(0,1)$, plan preparation returns `InvalidInput`.
+Preparation of `LinearElasticityPlan` performs the same check.
+Failure to bracket a root or reach the Newton tolerance returns an evaluation error (`ConvergenceFailure` in the latter case).
+
+## Discrete residuals and load increments
+
+Loads are dead loads with direction and magnitude determined in the reference configuration; body forces and tractions use the same `body` and `TaggedBoundaries` as linear elasticity.
+With displacement basis functions $\phi_i$, body-force and traction load vector $\ell_i=\ell(\phi_i)$, and Dirichlet values $g_i$, the discrete residual is
+
+```text
+R_i(x) = ∫_Ω P(F(x)) : ∇φ_i dX − ℓ_i   (free degrees of freedom)
+R_i(x) = x_i − g_i                     (Dirichlet degrees of freedom)
+```
+
+
+In free-degree residuals, deformation is evaluated with $g_i$ substituted for Dirichlet degrees of freedom rather than $x_i$.
+The plan is immutable; the caller's solver owns nonlinear iteration and accepted states.
+It implements `ResidualOperator` (`residual_into`) and `JacobianOperator` (`jvp_into`), so it can be passed directly to `NewtonKrylovProblem::with_jacobian(&plan)` in `scioxide-rootfind`.
+
+Because the residual substitutes $g_i$, starting from 0 deforms only elements adjacent to Dirichlet nodes strongly.
+If boundary displacement is large relative to element size, those elements have $J\le0$, causing initial residual evaluation to fail.
+Newton–Krylov reduces its step and continues after a domain error at an intermediate trial point, but propagates an initial-point error directly.
+In this case, use load increments: change boundary values gradually, using each stage's solution as the next stage's initial guess.
+
+`energy` returns an `ElasticityEnergy` containing integrated $W$ (`internal`), the dead-load contribution (`external_work`), and their difference (`potential`); `stress` returns an `ElasticityStress` with deformation gradient, Piola stress, and Cauchy stress.
+Both use the supplied state values directly without substituting Dirichlet values.
+Because plane stress includes local solves, `energy_scoped`, `stress_scoped`, and `assemble_tangent_csr_scoped` allow computation to be charged to the caller's scope.
+
+The next block defines the rectangular-plate mesh and edge tags shared by this page's cells.
+It repeats the block from [Finite elements for elastic solids](../elasticity/), because definitions can be shared only within a page.
+
+```rust
+//| id: pde-hyperelastic-plate
+//| kind: definitions
+//| title: "Triangular mesh and edge tags for a rectangular plate"
+//| crates: [scioxide-core, scioxide-pde, scioxide-spatial]
+use scioxide_core::SciOxideError;
+use scioxide_pde::{BoundaryCondition, TaggedBoundaries};
+use scioxide_spatial::{Point, SimplexBoundaryTags, TriangleMesh};
+
+/// Divide rectangle [0, a] × [0, b] into nx × ny rectangles, each split into two triangles.
+/// Vertex index: j (nx + 1) + i.
+pub(crate) fn plate_mesh(
+    a: f64,
+    b: f64,
+    nx: usize,
+    ny: usize,
+) -> Result<TriangleMesh<f64>, SciOxideError> {
+    let mut points = Vec::new();
+    for j in 0..=ny {
+        for i in 0..=nx {
+            points.push(Point::new([
+                a * i as f64 / nx as f64,
+                b * j as f64 / ny as f64,
+            ])?);
+        }
+    }
+    let mut cells = Vec::new();
+    for j in 0..ny {
+        for i in 0..nx {
+            let v = j * (nx + 1) + i;
+            cells.push([v, v + 1, v + nx + 2]);
+            cells.push([v, v + nx + 2, v + nx + 1]);
+        }
+    }
+    TriangleMesh::new(points, cells)
+}
+
+/// Exterior-face tags: 1 for the left edge x = 0, 2 for the right edge x = a, 3 for the bottom edge y = 0, and 4 for the top edge y = b.
+pub(crate) fn plate_boundaries(
+    mesh: &TriangleMesh<f64>,
+    a: f64,
+    b: f64,
+    conditions: Vec<BoundaryCondition<f64, f64, 2, u32>>,
+) -> Result<TaggedBoundaries<f64, f64, 2>, SciOxideError> {
+    let mut faces = Vec::new();
+    for face in mesh.boundary_faces() {
+        let v = mesh.face_vertices(face)?;
+        let [x0, y0] = *mesh.points()[v[0]].as_array();
+        let [x1, y1] = *mesh.points()[v[1]].as_array();
+        let (x, y) = (0.5 * (x0 + x1), 0.5 * (y0 + y1));
+        let tag = if x < 1e-9 * a {
+            1
+        } else if x > (1.0 - 1e-9) * a {
+            2
+        } else if y < 1e-9 * b {
+            3
+        } else {
+            4
+        };
+        faces.push((face, tag));
+    }
+    let tags = SimplexBoundaryTags::new(mesh, faces)?;
+    TaggedBoundaries::new(mesh, &tags, 2, conditions)
+}
+```
+
+The next cell divides a plane-strain plate (20 mm × 10 mm rubber with $\mu=1$ MPa) into four triangles by splitting a 2×1 grid of rectangles, and stretches or compresses it by a factor $\lambda$ in the $x$ direction.
+Prescribing $u_x$ on the left and right edges and $u_y=0$ on the top and bottom gives the exact uniform deformation $F=\mathrm{diag}(\lambda,1,1)$, $J=\lambda$.
+The $xx$ cofactor of $F$ is 1, so Cauchy stress is
+
+```text
+σ_xx = μ λ^(−2/3) (λ − (λ² + 2) / (3λ)) + K (λ − 1)
+```
+
+whereas the small-strain Hooke law gives $(K+4\mu/3)(\lambda-1)$.
+Vary $\lambda$ from 1 in increments of 0.1 down to 0.7 and up to 1.5, solving each stage with Newton–Krylov from the preceding solution.
+Every stage's termination reason is retained in the table; whether all stages succeed determines the cell's conclusion.
+
+```rust
+//| id: pde-hyperelastic-confined-stretch
+//| ref: pde-hyperelastic-confined-stretch
+//| title: "Solve constrained uniaxial extension and compression with neo-Hookean hyperelasticity and compare analytical stress"
+//| run: button
+//| uses: [pde-hyperelastic-plate]
+//| crates: [scioxide-core, scioxide-pde, scioxide-rootfind, scioxide-spatial]
+//| inputs:
+//|   neo_bulk_ratio: {"type":"range","label":"Bulk-to-shear modulus ratio K/μ [-]","description":"Change stiffness against volume changes.","min":1,"max":50,"step":1,"value":5}
+//|   neo_formulation: {"type":"select","label":"Entry","description":"Choose displacement-only P2 or mixed P2/P1.","options":[{"label":"P2 displacement","value":"p2"},{"label":"Mixed P2/P1","value":"mixed"}],"value":"p2"}
+//| cases:
+//|   - {"id":"stiff-bulk","label":"K/μ = 50","description":"Volume change dominates; stress at λ = 1.5 is 25.42 MPa, differing from Hooke's law by 1%.","inputs":{"neo_bulk_ratio":50}}
+//|   - {"id":"mixed","label":"Mixed P2/P1","description":"Adding pressure as an unknown reproduces the same analytical solution.","inputs":{"neo_formulation":"mixed"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"stretch","path":"/rows/0/3","approx":{"value":-2.1160967,"rtol":1e-7}}
+//|       - {"artifact":"stretch","path":"/rows/7/3","approx":{"value":2.9239682,"rtol":1e-7}}
+//|       - {"artifact":"stretch","path":"/rows/7/5","approx":{"value":3.1666667,"rtol":1e-7}}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+//|       - {"path":"/outputs/2/diagnostics/0/value","range":{"min":5,"max":8}}
+//|   - case: stiff-bulk
+//|     expect:
+//|       - {"artifact":"stretch","path":"/rows/7/3","approx":{"value":25.423968,"rtol":1e-7}}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+//|   - case: mixed
+//|     expect:
+//|       - {"artifact":"stretch","path":"/rows/0/3","approx":{"value":-2.1160967,"rtol":1e-7}}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+use scioxide_core::{ResidualTolerance, StepTolerance};
+use scioxide_pde::{
+    BoundaryCondition, BoundaryData, ElasticityFormulation, ElasticityKinematics,
+    ElasticityOptions, HyperelasticityPlan, IsotropicElasticMaterial, SimplexFemGeometry,
+    SimplexFemOrder,
+};
+use scioxide_rootfind::{NewtonKrylovOptions, NewtonKrylovProblem, NewtonKrylovSolver};
+
+// Rubber with μ = 1 MPa. Stretch or compress a 20 mm × 10 mm plate by λ in x under plane strain.
+let (a, b, mu) = (20.0, 10.0, 1.0);
+let bulk = neo_bulk_ratio * mu;
+let material = IsotropicElasticMaterial::new(mu, bulk).map_err(|e| e.to_string())?;
+let formulation = if neo_formulation == "mixed" {
+    ElasticityFormulation::MixedP2P1
+} else {
+    ElasticityFormulation::Displacement(SimplexFemOrder::P2)
+};
+let options = NewtonKrylovOptions::default()
+    .with_residual_tolerance(ResidualTolerance::new(1e-12, 1e-10).map_err(|e| e.to_string())?)
+    .with_step_tolerance(StepTolerance::new(1e-13, 1e-13).map_err(|e| e.to_string())?);
+let solver = NewtonKrylovSolver::new(options).map_err(|e| e.to_string())?;
+let (mut rows, mut fe, mut exact, mut hooke) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+let (mut failures, mut most) = (0, 0);
+let (mut worst, mut last) = (None, None);
+// Load increments: solve progressively farther from λ = 1 in increments of 0.1, using the previous solution as the next initial guess.
+for (steps, sign) in [(3, -1.0), (5, 1.0)] {
+    let mut previous: Option<Vec<f64>> = None;
+    for step in 1..=steps {
+        let stretch = 1.0 + sign * 0.1 * f64::from(step);
+        // Prescribe u_x on left and right edges and u_y on top and bottom. F = diag(λ, 1, 1) is the exact solution.
+        let conditions = vec![
+            BoundaryCondition::dirichlet(1, BoundaryData::zero()).for_component(0),
+            BoundaryCondition::natural(1, BoundaryData::zero()).for_component(1),
+            BoundaryCondition::dirichlet(2, BoundaryData::constant((stretch - 1.0) * a))
+                .for_component(0),
+            BoundaryCondition::natural(2, BoundaryData::zero()).for_component(1),
+            BoundaryCondition::natural(3, BoundaryData::zero()).for_component(0),
+            BoundaryCondition::dirichlet(3, BoundaryData::zero()).for_component(1),
+            BoundaryCondition::natural(4, BoundaryData::zero()).for_component(0),
+            BoundaryCondition::dirichlet(4, BoundaryData::zero()).for_component(1),
+        ];
+        let mesh = plate_mesh(a, b, 2, 1).map_err(|e| e.to_string())?;
+        let boundaries =
+            plate_boundaries(&mesh, a, b, conditions).map_err(|e| e.to_string())?;
+        let plan = HyperelasticityPlan::new(
+            mesh,
+            SimplexFemGeometry::Affine,
+            material,
+            &boundaries,
+            &|_| Ok([0.0; 2]),
+            ElasticityOptions::new(ElasticityKinematics::PlaneStrain, formulation),
+        )
+        .map_err(|e| e.to_string())?;
+        let initial = previous.take().unwrap_or(vec![0.0; plan.unknowns()]);
+        let result = solver
+            .solve(&NewtonKrylovProblem::with_jacobian(&plan), &initial)
+            .map_err(|e| e.to_string())?;
+        previous = Some(result.point().to_vec());
+        if !result.is_success() {
+            failures += 1;
+            worst = Some(result.termination());
+        }
+        last = Some(result.termination());
+        most = most.max(result.iterations());
+        let sigma = plan
+            .stress(0, [1.0 / 3.0; 2], result.point())
+            .map_err(|e| e.to_string())?
+            .cauchy()[0][0];
+        // Analytical solution: σ_xx = μ λ^(−2/3) (λ − (λ² + 2)/(3λ)) + K (λ − 1). Small-strain Hooke law: (K + 4μ/3)(λ − 1).
+        let neo = mu
+            * stretch.powf(-2.0 / 3.0)
+            * (stretch - (stretch * stretch + 2.0) / (3.0 * stretch))
+            + bulk * (stretch - 1.0);
+        let linear = (bulk + 4.0 * mu / 3.0) * (stretch - 1.0);
+        rows.push((
+            stretch,
+            result.iterations(),
+            result.termination().to_string(),
+            sigma,
+            neo,
+            linear,
+        ));
+        fe.push([stretch, sigma]);
+        exact.push([stretch, neo]);
+        hooke.push([stretch, linear]);
+    }
+}
+rows.sort_by(|p, q| p.0.total_cmp(&q.0));
+fe.sort_by(|p, q| p[0].total_cmp(&q[0]));
+let sig6 = serde_json::json!({ "significantDigits": 6 });
+emit_table_with_columns!(
+    serde_json::json!([
+        { "key": "0", "label": "Stretch λ [-]", "type": "number" },
+        { "key": "1", "label": "Newton iterations [count]", "type": "integer" },
+        { "key": "2", "label": "Termination reason" },
+        { "key": "3", "label": "Finite-element σ_xx [MPa]", "type": "number", "format": sig6 },
+        { "key": "4", "label": "Neo-Hookean analytical solution [MPa]", "type": "number", "format": sig6 },
+        { "key": "5", "label": "Hooke law [MPa]", "type": "number", "format": sig6 }
+    ]),
+    rows,
+    metadata = serde_json::json!({ "id": "stretch" })
+);
+let dashed = serde_json::json!({ "lineType": "dashed", "showSymbol": false });
+emit_chart!(
+    serde_json::json!({
+        "kind": "xy",
+        "dataZoom": true,
+        "tooltip": true,
+        "xLabel": "Stretch λ [-]",
+        "yLabel": "Cauchy stress σ_xx [MPa]",
+        "layers": [
+            { "id": "fe", "kind": "scatter", "name": "Finite element", "points": fe },
+            {
+                "id": "neo",
+                "kind": "line",
+                "name": "Neo-Hookean analytical solution",
+                "points": exact,
+                "style": dashed
+            },
+            { "id": "hooke", "kind": "line", "name": "Hooke law", "points": hooke, "style": dashed }
+        ]
+    }),
+    metadata = serde_json::json!({ "id": "curve" })
+);
+// Keep every stage's termination reason in the table; determine the conclusion from the unsuccessful-stage count.
+// status is the last unsuccessful stage's termination, or the final stage's termination when all succeed.
+let status = worst.or(last).map(|t| t.to_string()).unwrap_or_default();
+let label = if failures == 0 {
+    Outcome::satisfied("Newton–Krylov converged at every stretch")
+} else {
+    Outcome::partial(format!("Did not converge at {failures} stretches"))
+};
+emit_outcome!(
+    label
+        .status(status)
+        .diagnostic("Maximum Newton iterations", most as f64, None)
+        .diagnostic("Unconverged stages", failures as f64, None)
+);
+```
+
+At the default $K/\mu=5$, Newton–Krylov reaches `ResidualTolerance` in six iterations at every stage; finite-element stresses agree with the analytical solution to relative differences of order $10^{-12}$.
+P2 displacement represents uniform deformation exactly, so the difference comes from the nonlinear tolerance.
+Stress at $\lambda=1.5$ is 2.924 MPa, 8% below Hooke's 3.167 MPa; at $\lambda=0.7$ it is $-2.116$ MPa, 11% larger in magnitude than Hooke's $-1.900$ MPa.
+The plotted points lie on the dashed neo-Hookean curve and depart farther from the dashed Hooke curve as $\lambda=1$ is left behind.
+At $K/\mu=50$, volume change dominates: stress at $\lambda=1.5$ is 25.42 MPa, differing from Hooke's law by 1%.
+Iterations then increase to 7–9.
+
+## Consistent tangents and linearization reuse
+
+Quadratic Newton convergence requires the exact derivative of the discrete residual (a consistent tangent).
+The neo-Hookean tangent analytically evaluates $\partial^2W/\partial F\,\partial F$; plane stress eliminates the locally solved $F_{zz}$ by static condensation.
+Dirichlet rows are identity rows, and free rows exclude directions corresponding to Dirichlet degrees of freedom.
+The tangent is symmetric, so adjoint products (`vjp_into` in `PdeAdjointJacobian`) equal Jacobian products.
+
+`jvp_into` recomputes material responses at every quadrature point on each call.
+For repeated products at the same state (inner Krylov iterations or preconditioner construction), allocate an `HyperelasticityLinearizationWorkspace` once through `linearization_workspace`, evaluate the tangent once with `linearize(point, &mut workspace, scope)`, and retain it as a CSR matrix.
+Workspace storage is $O(\text{cells}\times\text{local unknowns}^2+\text{CSR entries})$; calling `linearize` again at a changed state allocates nothing.
+Evaluation costs $O(\text{cells}\times\text{quadrature points}\times\text{local unknowns}^2)$.
+
+The `SimplexLinearization` returned by `linearize` borrows the linearization point (`point`) and evaluated CSR (`matrix`) without copying.
+It implements `LinearOperator` and `AdjointOperator`; products cost time proportional to stored entries and allocate nothing beyond the workspace.
+`assemble_csr_into(output)` copies values to a CSR with the same structure; a different structure returns an error without changing output.
+While the view is alive, the state and workspace are borrowed, preventing workspace updates followed by reads of an old tangent.
+`SimplexLinearization` is shared by simplex finite elements; `NavierStokesPlan::linearize` also returns it ([Incompressible flow](../incompressible-flow/)).
+For a one-time explicit matrix, use `assemble_tangent_csr`, which allocates on every call.
+
+The next cell evaluates the tangent at a nonequilibrium state with a small perturbation added to uniform stretch $\lambda$, comparing stored tangent product $Lv$ with $Jv$ from `jvp_into` and the centered residual difference $(R(x+hv)-R(x-hv))/(2h)$.
+Centered differences have truncation error $O(h^2)$ and roundoff error $O(\varepsilon/h)$, so error is smallest for $h$ of order $\varepsilon^{1/3}\approx6\times10^{-6}$ times a coefficient determined by the magnitude ratio of the residual and its third derivative.
+
+```rust
+//| id: pde-hyperelastic-tangent-check
+//| ref: pde-hyperelastic-tangent-check
+//| title: "Check a stored tangent against Jacobian products and centered residual differences"
+//| run: reactive
+//| uses: [pde-hyperelastic-plate]
+//| crates: [scioxide-core, scioxide-pde, scioxide-spatial]
+//| inputs:
+//|   tangent_stretch: {"type":"range","label":"Stretch λ [-]","description":"Change the uniform stretch of the linearization state.","min":0.7,"max":1.5,"step":0.05,"value":1.25}
+//|   tangent_kinematics: {"type":"select","label":"Two-dimensional reduction","description":"Plane stress solves thickness stretch at each quadrature point.","options":[{"label":"Plane strain","value":"strain"},{"label":"Plane stress","value":"stress"}],"value":"strain"}
+//| cases:
+//|   - {"id":"plane-stress","label":"Plane stress","description":"Even with local solves and static condensation, the centered-difference discrepancy decreases proportionally to h².","inputs":{"tangent_kinematics":"stress"}}
+//|   - {"id":"compressed","label":"λ = 0.7","description":"Stored tangents and Jacobian products agree within roundoff in compression as well.","inputs":{"tangent_stretch":0.7}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"products","path":"/rows/0/2","range":{"max":1e-13}}
+//|       - {"artifact":"difference","path":"/rows/2/1","range":{"max":1e-6}}
+//|   - case: plane-stress
+//|     expect:
+//|       - {"artifact":"products","path":"/rows/0/2","range":{"max":1e-12}}
+//|       - {"artifact":"difference","path":"/rows/2/1","range":{"max":1e-5}}
+//|   - case: compressed
+//|     expect:
+//|       - {"artifact":"products","path":"/rows/0/2","range":{"max":1e-13}}
+use scioxide_core::{ExecutionContext, JacobianOperator, LinearOperator, ResidualOperator};
+use scioxide_pde::{
+    BoundaryCondition, BoundaryData, ElasticityFormulation, ElasticityKinematics,
+    ElasticityOptions, HyperelasticityPlan, IsotropicElasticMaterial, SimplexFemGeometry,
+    SimplexFemOrder,
+};
+
+let (a, b) = (20.0, 10.0);
+let material = IsotropicElasticMaterial::new(1.0, 5.0).map_err(|e| e.to_string())?;
+let kinematics = if tangent_kinematics == "stress" {
+    ElasticityKinematics::PlaneStress
+} else {
+    ElasticityKinematics::PlaneStrain
+};
+// Rollers: u_x = 0 on the left and u_y = 0 on the bottom. Zero traction elsewhere.
+let conditions = vec![
+    BoundaryCondition::dirichlet(1, BoundaryData::zero()).for_component(0),
+    BoundaryCondition::natural(1, BoundaryData::zero()).for_component(1),
+    BoundaryCondition::natural(2, BoundaryData::zero()),
+    BoundaryCondition::natural(3, BoundaryData::zero()).for_component(0),
+    BoundaryCondition::dirichlet(3, BoundaryData::zero()).for_component(1),
+    BoundaryCondition::natural(4, BoundaryData::zero()),
+];
+let mesh = plate_mesh(a, b, 4, 2).map_err(|e| e.to_string())?;
+let boundaries = plate_boundaries(&mesh, a, b, conditions).map_err(|e| e.to_string())?;
+let options = ElasticityOptions::new(
+    kinematics,
+    ElasticityFormulation::Displacement(SimplexFemOrder::P2),
+);
+let plan = HyperelasticityPlan::new(
+    mesh,
+    SimplexFemGeometry::Affine,
+    material,
+    &boundaries,
+    &|_| Ok([0.0; 2]),
+    options,
+)
+.map_err(|e| e.to_string())?;
+// Nonequilibrium state: add a small perturbation to uniform stretch u_x = (λ − 1) x.
+let (n, nodes) = (plan.unknowns(), plan.displacement_nodes());
+let mut point = vec![0.0; n];
+for node in 0..nodes {
+    let p = plan.node_point(node).map_err(|e| e.to_string())?;
+    point[node] = (tangent_stretch - 1.0) * p[0] + 0.01 * (0.3 * p[1]).sin();
+    point[nodes + node] = 0.01 * (0.2 * p[0]).cos();
+}
+let direction: Vec<f64> = (0..n).map(|i| ((i % 7) as f64 - 3.0) / 100.0).collect();
+let mut workspace = plan.linearization_workspace().map_err(|e| e.to_string())?;
+let tangent = plan
+    .linearize(&point, &mut workspace, ExecutionContext::sequential())
+    .map_err(|e| e.to_string())?;
+let mut stored = vec![0.0; n];
+let mut scratch = vec![0.0; tangent.apply_workspace_len().map_err(|e| e.to_string())?];
+tangent
+    .apply_into(&direction, &mut stored, &mut scratch)
+    .map_err(|e| e.to_string())?;
+let mut product = vec![0.0; n];
+let mut work = vec![0.0; plan.jvp_workspace_len().map_err(|e| e.to_string())?];
+plan.jvp_into(&point, &direction, &mut product, &mut work)
+    .map_err(|e| e.to_string())?;
+let size = stored.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+let gap = |other: &[f64]| {
+    stored
+        .iter()
+        .zip(other)
+        .fold(0.0_f64, |m, (s, o)| m.max((s - o).abs()))
+        / size
+};
+let products = vec![(tangent.matrix().nnz(), size, gap(&product))];
+// Difference between the centered difference (R(x + h v) − R(x − h v)) / (2h) and the stored tangent product.
+let mut rows = Vec::new();
+let mut residual_work = vec![0.0; plan.residual_workspace_len().map_err(|e| e.to_string())?];
+for h in [1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8] {
+    let mut sides = [vec![0.0; n], vec![0.0; n]];
+    for (side, sign) in sides.iter_mut().zip([1.0, -1.0]) {
+        let moved: Vec<f64> = point
+            .iter()
+            .zip(&direction)
+            .map(|(p, v)| p + sign * h * v)
+            .collect();
+        plan.residual_into(&moved, side, &mut residual_work)
+            .map_err(|e| e.to_string())?;
+    }
+    let difference: Vec<f64> = (0..n)
+        .map(|i| (sides[0][i] - sides[1][i]) / (2.0 * h))
+        .collect();
+    rows.push((h, gap(&difference)));
+}
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+emit_table_with_columns!(
+    serde_json::json!([
+        { "key": "0", "label": "Stored CSR entries [-]", "type": "integer" },
+        { "key": "1", "label": "‖Lv‖∞ [N/mm]", "type": "number", "format": sci3 },
+        { "key": "2", "label": "‖Lv − Jv‖∞ / ‖Lv‖∞ [-]", "type": "number", "format": sci3 }
+    ]),
+    products,
+    metadata = serde_json::json!({ "id": "products" })
+);
+emit_table_with_columns!(
+    serde_json::json!([
+        { "key": "0", "label": "Difference step h [mm]", "type": "number", "format": sci3 },
+        { "key": "1", "label": "Relative difference from central differences [-]", "type": "number", "format": sci3 }
+    ]),
+    rows,
+    metadata = serde_json::json!({ "id": "difference" })
+);
+```
+
+At the default $\lambda=1.25$ under plane strain, the relative difference between $Lv$ and $Jv$ is $3\times10^{-16}$, showing that the stored tangent represents the same operation as `jvp_into`.
+The centered-difference discrepancy falls from $3.0\times10^{-8}$ at $h=10^{-2}$ to $3.0\times10^{-10}$ at $h=10^{-3}$, becoming 1/100 as large each time $h$ is reduced to 1/10 of its previous value; this reveals difference truncation error rather than tangent error.
+It reaches its minimum $4.9\times10^{-11}$ at $h=10^{-4}$, then grows from roundoff at smaller $h$.
+Plane stress shows the same trend, confirming consistency of the tangent including locally solved $F_{zz}$.
+An error in the tangent formula would make the discrepancy plateau rather than decrease proportionally to $h^2$ as $h$ shrinks.
+
+## Summary
+
+`HyperelasticityPlan` provides residuals and consistent tangents for compressible neo-Hookean materials; the caller's nonlinear solver, such as `NewtonKrylovProblem::with_jacobian`, performs the solve.
+Because residual evaluation directly substitutes Dirichlet values, use load increments to keep initial points inside the domain when boundary displacement is large.
+Plane stress solves thickness stretch at every quadrature point; `PlaneStressOptions` sets its tolerance and iteration limit.
+For repeated use of a tangent at one state, evaluate it once with `linearize` and pass `SimplexLinearization` to Krylov methods or preconditioners.
+Tangent correctness can be checked by centered-difference error decreasing proportionally to $h^2$.
+
+## Further reading
+
+- [Finite elements for elastic solids](../elasticity/): examine small-strain weak forms, plane-strain and plane-stress reductions, volumetric locking, and mixed formulations.
+- [Cantilever deflection and locking](../../examples/cantilever-beam/): compare accuracy of linear-elasticity elements with an exact bending solution.
+- [Newton–Krylov methods](../../../scioxide-rootfind/algorithms/matrix-free-newton-krylov/): inspect globalization and stopping conditions of the nonlinear solver used for hyperelasticity.
+- [Elasticity and incompressible-flow API](../../api/elasticity-and-incompressible-flow/): consult specifications of plans, workspaces, and output types.
+
+## References
+
+- J. Bonet, R. D. Wood, *Nonlinear Continuum Mechanics for Finite Element Analysis*, 2nd ed., Cambridge University Press (2008).
+- P. Wriggers, *Nonlinear Finite Element Methods*, Springer (2008).

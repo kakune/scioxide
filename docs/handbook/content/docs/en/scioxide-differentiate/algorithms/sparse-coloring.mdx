@@ -1,0 +1,515 @@
+---
+title: "Sparse-Jacobian compression by coloring"
+description: "Curtis–Powell–Reid simultaneous perturbation of structurally orthogonal columns, recovery with column-specific steps and errors, color-count bounds, StructuralPattern, derivative_coloring, ColoringSchedule, ColoredJacobianPlan and sparse_jacobian counts, order and termination, and contamination from omitted nonzeros and its detection."
+sidebar:
+  order: 340
+references:
+  differentiate-colored-plan: "coloredjacobianplan"
+  differentiate-orthogonal-columns: "structurally-orthogonal-columns"
+  differentiate-sparse-one-shot: "one-shot-functions-and-workspaces"
+---
+
+Jacobians of PDE discretizations and reaction networks are sparse, with mostly zero entries, because each equation depends on few variables.
+Dense differences use evaluations proportional to variable count $n$; exploiting sparsity reduces them to a count proportional to colors.
+This page explains Curtis, Powell, and Reid's (1974) principle and `scioxide-differentiate` coloring Plan counts, output order, and cautions.
+Coloring algorithms and color counts are covered in scioxide-sparse [Orderings and coloring](../../../scioxide-sparse/algorithms/orderings-and-coloring/#derivative-column-coloring); here we recover differences from supplied coloring.
+
+## Structurally orthogonal columns
+
+Let sparse structure (pattern) $\mathcal{S}$ be the positions of entries in Jacobian $\mathbf{J} \in \mathbb{R}^{m \times n}$ that may be zero.
+$(i, j) \notin \mathcal{S}$ means $F_i$ does not depend on $x_j$.
+Columns $j$ and $k$ are structurally orthogonal if no row places both in $\mathcal{S}$.
+
+Group mutually orthogonal columns $C$ into one color, perturbing them simultaneously by their own steps $h_j$.
+
+$$
+\mathbf{x}_C^{\pm} = \mathbf{x} \pm \sum_{j \in C} h_j \mathbf{e}_j .
+$$
+
+For row $i$, at most one column $j$ of $C$ belongs to $\mathcal{S}$, giving $F_i(\mathbf{x}_C^{\pm}) = F_i(\mathbf{x} \pm h_j \mathbf{e}_j)$.
+Each row $i$ of the colored central difference therefore equals a difference perturbing only column $j$.
+
+$$
+\frac{F_i(\mathbf{x}_C^{+}) - F_i(\mathbf{x}_C^{-})}{2 h_j} = \frac{F_i(\mathbf{x} + h_j \mathbf{e}_j) - F_i(\mathbf{x} - h_j \mathbf{e}_j)}{2 h_j} = J_{ij} + \frac{h_j^2}{6} \frac{\partial^3 F_i}{\partial x_j^3} + O(h_j^4) \qquad ((i, j) \in \mathcal{S},\ j \in C).
+$$
+
+Truncation and rounding match dense column $j$, while counts scale with colors $c$ rather than columns $n$.
+This assumes $F_i$ truly ignores variables outside $\mathcal{S}$.
+
+Columns in a row's $\mathcal{S}$ must all differ in color, so color count $c$ is at least maximum row entries.
+
+$$
+c \ge \max_i \bigl\lvert \{ j : (i, j) \in \mathcal{S} \} \bigr\rvert .
+$$
+
+For lower bandwidth $p_l$ and upper $p_u$ (only $-p_l \le j - i \le p_u$ nonzero), each row has at most $p_l + p_u + 1$ entries; coloring by column index modulo $p_l + p_u + 1$ uses exactly that many, independently of $n$.
+Finding minimum colors is generally NP-hard; practical methods use greedy coloring.
+A greedy method visits columns in index order and assigns the smallest color unused by preceding columns sharing rows; its count is at most one plus the largest count of other columns sharing rows with a column.
+See [Derivative-column coloring](../../../scioxide-sparse/algorithms/orderings-and-coloring/#derivative-column-coloring) for bounds and banded measurements.
+
+## Specifying and coloring structures
+
+Supply nonzero positions through scioxide-core [`StructuralPattern`](https://docs.rs/scioxide-core/0.1.0/scioxide_core/struct.StructuralPattern.html)`::new(rows, cols, row_ptr, col_indices)` in CSR format, with strictly increasing column indices per row.
+`row_ptr` gives starts of $m + 1$ rows and `col_indices` stored column indices; malformed structures give `InvalidInput` (`Malformed`).
+The pattern must include every position of an entry that may be zero.
+Accidentally zero entries may be included, but omitting actual nonzeros silently mixes their values into same-color columns and returns wrong Jacobians ([Omitted nonzeros](#omitted-nonzeros) below).
+
+scioxide-sparse [`derivative_coloring`](https://docs.rs/scioxide-sparse/0.1.0/scioxide_sparse/fn.derivative_coloring.html)`(pattern.view())` constructs coloring with that greedy method.
+The result is scioxide-core [`ColoringSchedule`](https://docs.rs/scioxide-core/0.1.0/scioxide_core/struct.ColoringSchedule.html) of kind `ColoringKind::DerivativeColumns`, owning a pattern copy; `color_count()`, `colors()`, and `groups()` expose color counts, per-column colors, and ascending columns per color.
+Pass custom colors to `ColoringSchedule::new(pattern, ColoringKind::DerivativeColumns, colors)` to check that shared-row columns differ; collisions give `InvalidInput` (`Malformed`, argument `colors`).
+Coloring guarantees conflict freedom only on the declared pattern, not agreement with actual function dependencies.
+scioxide-differentiate has no scioxide-sparse dependency; callers use it to construct coloring.
+
+## ColoredJacobianPlan
+
+[`ColoredJacobianPlan`](https://docs.rs/scioxide-differentiate/0.1.0/scioxide_differentiate/struct.ColoredJacobianPlan.html)`::new(&schedule, method)` borrows coloring and constructs a sparse-Jacobian Plan using adaptive settings `AdaptiveDifference`.
+Construction precomputes each column's entry rows, output positions, and absolute tolerances, taking $O(n + \mathrm{nnz})$ time and storage for $n$ columns and $\mathrm{nnz}$ entries.
+Coloring kind other than `DerivativeColumns` gives `InvalidInput` (argument `schedule`, `UnsupportedConfiguration`); levels outside 3–64 or a nonmaximum norm give `InvalidInput` (argument `method`, `OutOfRange`); nondefault `ZeroDirectionPolicy` gives `InvalidInput` (argument `method`, `Inconsistent`).
+Evaluate with owned `evaluate(f, x, bounds)` or borrowed `evaluate_into` accepting output, estimates, workspace, and context.
+Functions write every one of $m$ rows, with real or complex values.
+
+### Per-column extrapolation
+
+Each column is a univariate adaptive problem outputting only its stored rows, with its own step, table, and termination ([Richardson extrapolation and Ridders' method](../richardson-and-ridders/)).
+Initial steps are $h_j = 0.5 \max(1, \lvert x_j \rvert)$, or supplied `with_step`, divided by the reduction ratio per level.
+Same-color columns share perturbed points per level; at sample $s$ each uses its own displacement number $s$.
+Converged columns stay at the base, leaving only unfinished columns perturbed.
+Stored entry $k$ tests $\tau_{\mathrm{abs},k} + \tau_{\mathrm{rel}} \lvert J_k \rvert$ (absolute $\tau_{\mathrm{abs},k}$, relative $\tau_{\mathrm{rel}}$, entry $J_k$ at storage index $k$); vector absolute tolerances follow stored-entry order and count.
+
+Values and estimates follow pattern storage order (CSR, by row), with length `output_len()`.
+Without external or limit stops, report termination is the first nonconverged column's reason in index order.
+If every column has estimates, values and estimated errors are written to the output even without `Converged` ([Report and publication rules](oxref:differentiate-report-rules)).
+
+### Evaluation counts
+
+Without boundaries, each level samples two points $\mathbf{x}_C^{\pm}$.
+With bounds, each column chooses symmetric $\{-h, 0, h\}$ or inward one-sided $\{0, h, 2h\}$ using adaptive rules at its step ([Boundaries for adaptive, directional, and node differences](oxref:differentiate-bounded-other-methods)).
+Both have two nonbase points; the first sample combines first displacements $-h$ or $h$, and the second combines second displacements $h$ or $2h$.
+Same-color columns share no rows, so mixing node shapes leaves two samples per level.
+Levels $L_C$ for color $C$ equal its slowest column's levels; calls add one base evaluation to their sum.
+
+$$
+N_{\mathrm{eval}} = 1 + 2 \sum_{C} L_C .
+$$
+
+Sum over every color $C$; equal levels $L$ give $1 + 2cL$.
+Counts are at most $1 + 2cL_{\max}$ with or without bounds, where $L_{\max}$ is the level limit.
+Dense adaptive Jacobians take $1 + 2\sum_j L_j$ calls, giving approximate ratio $c / n$.
+Reported iterations `iterations()` sum per-column levels $\sum_j L_j$.
+Each evaluation is one full function call; each color level also requires $O(n + m)$ work to assemble perturbed points, plus extrapolation-table updates for every stored entry.
+Ridders updates every table column per level, giving quadratic work in levels per entry; Richardson work is linear in levels.
+
+### One-shot functions and workspaces
+
+For default values alone, one-shot [`sparse_jacobian`](https://docs.rs/scioxide-differentiate/0.1.0/scioxide_differentiate/fn.sparse_jacobian.html)`(f, x, &schedule)` performs the same computation with `AdaptiveDifference::default()` and no bounds.
+Default tolerance is $\sqrt{\varepsilon}(1 + \lvert J_{ij} \rvert)$ per stored entry, at most 16 levels, and no more than $1 + 32c$ calls.
+Termination other than `Converged` returns no values, applying `into_values()` error rules (`ConvergenceFailure` for `RoundoffLimit`, `RefinementLimit`, or `StepSizeLimit`).
+
+Workspace is [`ColoredJacobianWorkspace`](https://docs.rs/scioxide-differentiate/0.1.0/scioxide_differentiate/struct.ColoredJacobianWorkspace.html), with Plan-borrowing requirements [`ColoredJacobianRequirements`](https://docs.rs/scioxide-differentiate/0.1.0/scioxide_differentiate/struct.ColoredJacobianRequirements.html) ([Reusing Plans, requirements, and workspaces](../plans-workspaces-and-reports/)).
+For $m$ rows and $L$ levels, size is $O(n + m + \mathrm{nnz} \cdot L)$ entries; constructing with Plan `workspace(())` lets `evaluate_into` avoid allocation.
+Only two sets of points and function values coexist, independently of color count.
+
+## Measuring banded evaluation counts
+
+The next cell compares dense adaptive `AdaptiveDifference::jacobian` and coloring on Broyden's banded function from the Moré–Garbow–Hillstrom test set.
+
+$$
+F_i(\mathbf{x}) = x_i (2 + 5 x_i^2) + 1 - \sum_{j \in J_i} x_j (1 + x_j), \qquad J_i = \{ j \ne i : i - p_l \le j \le i + 1,\ 0 \le j < n \}.
+$$
+
+The original has lower bandwidth $p_l = 5$ and upper 1; the cell varies $p_l$ from 1 to 5.
+Rows have at most $p_l + 2$ entries, giving color-count lower bound $p_l + 2$.
+The analytic Jacobian is $\partial F_i / \partial x_i = 2 + 15 x_i^2$ and $\partial F_i / \partial x_j = -(1 + 2 x_j)$ ($j \in J_i$).
+At point $x_i = -1 + 0.5\, i / n$, vary $n$ from 8 to 64 and record counts and maximum errors.
+
+The following block supplies helpers shared by two cells.
+`csr_pattern` constructs CSR `StructuralPattern` from rowwise columns; `stored_max_error` returns maximum absolute difference between stored-order values and reference $J_{ij}$.
+
+```rust
+//| id: differentiate-coloring-helpers
+//| kind: definitions
+//| title: "CSR structures from rowwise columns and stored-entry errors"
+//| crates: [scioxide-core]
+use scioxide_core::{SciOxideError, StructuralPattern};
+
+/// Construct n × n CSR from row i's strictly increasing columns(i).
+pub(crate) fn csr_pattern<I: IntoIterator<Item = usize>>(
+    n: usize,
+    columns: impl Fn(usize) -> I,
+) -> Result<StructuralPattern, SciOxideError> {
+    let (mut row_ptr, mut col_indices) = (vec![0], Vec::new());
+    for i in 0..n {
+        col_indices.extend(columns(i));
+        row_ptr.push(col_indices.len());
+    }
+    StructuralPattern::new(n, n, row_ptr, col_indices)
+}
+
+/// Maximum absolute difference between CSR-order values and reference(i, j).
+pub(crate) fn stored_max_error(
+    pattern: &StructuralPattern,
+    values: &[f64],
+    reference: impl Fn(usize, usize) -> f64,
+) -> f64 {
+    let view = pattern.view();
+    let mut largest = 0.0_f64;
+    for (i, span) in view.row_ptr().windows(2).enumerate() {
+        for k in span[0]..span[1] {
+            largest = largest.max((values[k] - reference(i, view.col_indices()[k])).abs());
+        }
+    }
+    largest
+}
+```
+
+Table $\bar{L}$ is per-column levels from colored iterations divided by $n$; prediction is $1 + 2c\bar{L}$.
+Colored maximum error compares stored entries with analytic values; dense–colored difference is maximum difference on stored entries; termination is the colored report's.
+The chart plots both evaluation counts logarithmically.
+
+```rust
+//| id: differentiate-banded-coloring
+//| ref: differentiate-banded-coloring
+//| title: "Broyden banded Jacobians with dense differences and coloring"
+//| run: reactive
+//| uses: [differentiate-coloring-helpers]
+//| crates: [scioxide-core, scioxide-differentiate, scioxide-sparse]
+//| inputs:
+//|   lower: {"type":"range","label":"Lower bandwidth p_l","description":"Number of left-side variables per row; the test problem uses 5.","min":1,"max":5,"step":1,"value":5}
+//|   method: {"type":"select","label":"Extrapolation method","options":["Ridders","Richardson"],"value":"Ridders"}
+//| cases:
+//|   - {"id":"narrow-band","label":"p_l = 1","description":"Narrow bands reduce colors to 3 and reduce colored calls.","inputs":{"lower":1}}
+//|   - {"id":"richardson","label":"Richardson","description":"Calls match Ridders; this function has exactly zero error.","inputs":{"method":"Richardson"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"comparison","path":"/rows/0/1","equals":7}
+//|       - {"artifact":"comparison","path":"/rows/0/2","equals":65}
+//|       - {"artifact":"comparison","path":"/rows/3/1","equals":7}
+//|       - {"artifact":"comparison","path":"/rows/3/2","equals":513}
+//|       - {"artifact":"comparison","path":"/rows/3/3","equals":57}
+//|       - {"artifact":"comparison","path":"/rows/3/4","approx":{"value":4,"atol":1e-12}}
+//|       - {"artifact":"comparison","path":"/rows/3/5","approx":{"value":57,"atol":1e-9}}
+//|       - {"artifact":"comparison","path":"/rows/3/6","range":{"max":1e-12}}
+//|       - {"artifact":"comparison","path":"/rows/3/7","equals":0}
+//|       - {"artifact":"comparison","path":"/rows/3/8","equals":"Converged"}
+//|   - case: narrow-band
+//|     expect:
+//|       - {"artifact":"comparison","path":"/rows/3/1","equals":3}
+//|       - {"artifact":"comparison","path":"/rows/3/3","equals":25}
+//|       - {"artifact":"comparison","path":"/rows/3/6","range":{"max":1e-12}}
+//|       - {"artifact":"comparison","path":"/rows/3/7","equals":0}
+//|   - case: richardson
+//|     expect:
+//|       - {"artifact":"comparison","path":"/rows/3/1","equals":7}
+//|       - {"artifact":"comparison","path":"/rows/3/3","equals":57}
+//|       - {"artifact":"comparison","path":"/rows/3/6","range":{"max":1e-10}}
+//|       - {"artifact":"comparison","path":"/rows/3/7","equals":0}
+use scioxide_core::SciOxideError;
+use scioxide_differentiate::{AdaptiveDifference, AdaptiveDifferenceMethod, ColoredJacobianPlan};
+use scioxide_sparse::derivative_coloring;
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed1 = serde_json::json!({ "fractionDigits": 1 });
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let lower = lower as usize;
+let method = match method.as_str() {
+    "Richardson" => AdaptiveDifferenceMethod::Richardson,
+    _ => AdaptiveDifferenceMethod::Ridders,
+};
+let adaptive = AdaptiveDifference::default().with_method(method);
+// Columns j used by row i: i − p_l ≤ j ≤ i + 1 (0 ≤ j < n).
+let band = |i: usize, n: usize| i.saturating_sub(lower)..(i + 2).min(n);
+let broyden = |x: &[f64], y: &mut [f64]| {
+    let n = x.len();
+    for i in 0..n {
+        let coupling: f64 = band(i, n)
+            .filter(|&j| j != i)
+            .map(|j| x[j] * (1.0 + x[j]))
+            .sum();
+        y[i] = x[i] * (2.0 + 5.0 * x[i] * x[i]) + 1.0 - coupling;
+    }
+    Ok::<(), SciOxideError>(())
+};
+let (mut dense_points, mut colored_points, mut rows) = (Vec::new(), Vec::new(), Vec::new());
+for n in [8_usize, 16, 32, 64] {
+    let x: Vec<f64> = (0..n).map(|i| -1.0 + 0.5 * (i as f64 / n as f64)).collect();
+    let pattern = csr_pattern(n, |i| band(i, n)).map_err(|e| e.to_string())?;
+    let schedule = derivative_coloring(pattern.view()).map_err(|e| e.to_string())?;
+    let plan =
+        ColoredJacobianPlan::new(&schedule, adaptive.clone()).map_err(|e| e.to_string())?;
+    let sparse = plan
+        .evaluate(broyden, &x, None)
+        .map_err(|e| e.to_string())?;
+    let dense = adaptive
+        .jacobian(broyden, &x, n, None)
+        .map_err(|e| e.to_string())?;
+    let values = sparse.values().ok_or("Sparse Jacobian not published")?;
+    let full = dense.values().ok_or("Dense Jacobian not published")?;
+    // Reference: analytic stored Jacobian entry (i, j).
+    let exact = |i: usize, j: usize| {
+        if i == j {
+            2.0 + 15.0 * x[i] * x[i]
+        } else {
+            -(1.0 + 2.0 * x[j])
+        }
+    };
+    // Dense output is row-major with (i, j) at i n + j.
+    let difference = stored_max_error(&pattern, values, |i, j| full[i * n + j]);
+    let (d, s) = (dense.report().evaluations(), sparse.report().evaluations());
+    // Levels per column; if all stop at L, colored calls are 1 + 2cL.
+    let levels = sparse.report().iterations() as f64 / n as f64;
+    let colors = schedule.color_count();
+    dense_points.push([n as f64, d as f64]);
+    colored_points.push([n as f64, s as f64]);
+    rows.push((
+        n,
+        colors,
+        d,
+        s,
+        levels,
+        1.0 + 2.0 * colors as f64 * levels,
+        stored_max_error(&pattern, values, exact),
+        difference,
+        sparse.report().termination().to_string(),
+    ));
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "n", "type": "integer" },
+    { "key": "1", "label": "Color count c", "type": "integer" },
+    { "key": "2", "label": "Dense evaluations [count]", "type": "integer" },
+    { "key": "3", "label": "Colored evaluations [count]", "type": "integer" },
+    { "key": "4", "label": "Levels per column L̄", "type": "number", "format": fixed2 },
+    { "key": "5", "label": "Prediction 1 + 2cL̄ [count]", "type": "number", "format": fixed1 },
+    { "key": "6", "label": "Maximum colored error [-]", "type": "number", "format": sci3 },
+    { "key": "7", "label": "Dense–colored difference [-]", "type": "number", "format": sci3 },
+    { "key": "8", "label": "Termination reason" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "comparison" })
+);
+let series = vec![
+    serde_json::json!({
+        "name": "Dense adaptive differences",
+        "points": dense_points,
+        "style": { "showSymbol": true }
+    }),
+    serde_json::json!({
+        "name": "Colored Jacobian",
+        "points": colored_points,
+        "style": { "showSymbol": true }
+    }),
+];
+emit_line_chart!(
+    &series,
+    options = &serde_json::json!({
+        "xLabel": "Variable count n [-]",
+        "yLabel": "Evaluations [count]",
+        "xType": "log",
+        "yType": "log"
+    })
+);
+```
+
+At $p_l = 5$, colors equal lower bound 7 for every $n$; colored calls stay at $1 + 2 \cdot 7 \cdot 4 = 57$ independently of $n$.
+Dense calls $1 + 8n$ scale with $n$; at $n = 64$, 513 calls are 9 times the colored count.
+At $n = 8$, 7 colors are near $n$, making 65 versus 57 calls similar.
+
+Every column converges in 4 levels.
+$F_i$ is cubic per variable, so central errors have only $h^2$ and extrapolation column 1 removes truncation.
+Still, convergence does not occur at level 2.
+Ridders estimates use the larger difference from two parent entries; level-2 parents are unextrapolated, retaining $h^2$ in the estimate.
+Only level 3 has both parents extrapolated, lowering estimates to rounding; two consecutive successes give level-4 convergence ([Step and stopping rules](oxref:differentiate-stopping-rules)).
+
+Colored maximum error is at most $1.3 \times 10^{-14}$; stored dense–colored differences are exactly zero.
+$F_i$ ignores other same-color variables, and dense adaptation uses identical initial steps and ratios.
+Colored perturbations therefore produce bitwise-identical row values to single-column perturbations, followed by identical extrapolation.
+
+At $p_l = 1$ (case narrow-band), colors drop to 3 and colored calls to $1 + 2 \cdot 3 \cdot 4 = 25$.
+Richardson (case richardson) also converges in 4 levels for the same reason, with unchanged counts and exactly zero error at this point.
+
+## Omitted nonzeros
+
+Omitting actual nonzero $(i, k)$ can give column $k$ the same color as column $j$ with an entry in row $i$.
+Colored perturbation $\mathbf{x}_C^{\pm}$ then moves both $x_j$ and $x_k$; row $i$ differences include column $k$'s change.
+
+$$
+\frac{F_i(\mathbf{x}_C^{+}) - F_i(\mathbf{x}_C^{-})}{2 h_j} = J_{ij} + \frac{h_k}{h_j} J_{ik} + O(h^2).
+$$
+
+Column steps shrink by identical ratios, keeping $h_k / h_j$ constant across levels, so extrapolation converges to this wrong value.
+Estimates measure interlevel changes, missing contamination and still giving `Converged`.
+`ColoredJacobianPlan` does not compare functions with patterns and reports no error.
+
+Detection requires an independent computation.
+For example, compute one dense `FiniteDifference::jacobian` Jacobian and check zero entries outside the pattern.
+If $F_i$ ignores $x_k$, both difference points give bitwise-identical $F_i$, making outside-pattern differences exactly zero.
+For mechanically generated patterns, derive them from scioxide-ad recordings with `jacobian_pattern()` ([Structural patterns from recordings](../../../scioxide-ad/algorithms/sparse-derivatives/#structural-patterns-from-a-recording)).
+
+The next cell computes a four-variable Jacobian with the correct pattern and one omitting $(0, 2)$.
+
+$$
+\mathbf{F} = \bigl( x_0^2 + \gamma x_2, \; x_0 + x_1^2, \; x_1 + x_2^2, \; x_2 + x_3^2 \bigr), \qquad \mathbf{x} = (1, 0.5, x_2, 2).
+$$
+
+Correct columns 0 and 2 conflict in row 0 and differ in color; omitting $(0, 2)$ merges their colors.
+Row-0 differences become $2 x_0 + \gamma h_2 / h_0$ instead of $J_{00} = 2 x_0 = 2$, predictable from initial steps $h_j = 0.5 \max(1, \lvert x_j \rvert)$.
+Setting coupling $\gamma$ to 0 makes $(0, 2)$ truly zero, so omission is harmless.
+“Maximum outside pattern” independently checks maximum absolute outside-pattern entries from a dense fixed-step Jacobian.
+
+```rust
+//| id: differentiate-missing-pattern
+//| ref: differentiate-missing-pattern
+//| title: "Color merging and value contamination when nonzeros are omitted"
+//| run: reactive
+//| uses: [differentiate-coloring-helpers]
+//| crates: [scioxide-core, scioxide-differentiate, scioxide-sparse]
+//| inputs:
+//|   coupling: {"type":"select","label":"Coupling γ","description":"Strength of F₀'s x₂ dependence; 0 makes (0, 2) truly zero.","options":["0.5","0.01","0"],"value":"0.5"}
+//|   x2: {"type":"select","label":"Evaluation-point x₂","description":"Change column 2's initial h₂ = 0.5 max(1, |x₂|).","options":["-0.5","-4"],"value":"-0.5"}
+//| cases:
+//|   - {"id":"weak-coupling","label":"γ = 0.01","description":"Contamination decreases but remains invisible to estimates.","inputs":{"coupling":"0.01"}}
+//|   - {"id":"no-coupling","label":"γ = 0","description":"The omitted entry is truly zero, so two colors remain correct.","inputs":{"coupling":"0"}}
+//|   - {"id":"large-step","label":"x₂ = −4","description":"Step ratio h₂/h₀ becomes 4, quadrupling contamination.","inputs":{"x2":"-4"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"patterns","path":"/rows/0/1","equals":3}
+//|       - {"artifact":"patterns","path":"/rows/0/5","range":{"max":1e-9}}
+//|       - {"artifact":"patterns","path":"/rows/0/7","equals":0}
+//|       - {"artifact":"patterns","path":"/rows/1/1","equals":2}
+//|       - {"artifact":"patterns","path":"/rows/1/3","approx":{"value":2.5,"rtol":1e-9}}
+//|       - {"artifact":"patterns","path":"/rows/1/4","approx":{"value":2.5,"rtol":1e-12}}
+//|       - {"artifact":"patterns","path":"/rows/1/6","range":{"max":1e-8}}
+//|       - {"artifact":"patterns","path":"/rows/1/7","approx":{"value":0.5,"rtol":1e-8}}
+//|       - {"artifact":"patterns","path":"/rows/1/8","equals":"Converged"}
+//|   - case: weak-coupling
+//|     expect:
+//|       - {"artifact":"patterns","path":"/rows/1/3","approx":{"value":2.01,"rtol":1e-9}}
+//|       - {"artifact":"patterns","path":"/rows/1/6","range":{"max":1e-8}}
+//|       - {"artifact":"patterns","path":"/rows/1/7","approx":{"value":0.01,"rtol":1e-6}}
+//|   - case: no-coupling
+//|     expect:
+//|       - {"artifact":"patterns","path":"/rows/1/1","equals":2}
+//|       - {"artifact":"patterns","path":"/rows/1/5","range":{"max":1e-9}}
+//|       - {"artifact":"patterns","path":"/rows/1/7","equals":0}
+//|   - case: large-step
+//|     expect:
+//|       - {"artifact":"patterns","path":"/rows/0/5","range":{"max":1e-9}}
+//|       - {"artifact":"patterns","path":"/rows/1/3","approx":{"value":4,"rtol":1e-9}}
+//|       - {"artifact":"patterns","path":"/rows/1/4","approx":{"value":4,"rtol":1e-12}}
+use scioxide_core::SciOxideError;
+use scioxide_differentiate::{AdaptiveDifference, ColoredJacobianPlan, FiniteDifference};
+use scioxide_sparse::derivative_coloring;
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let digits10 = serde_json::json!({ "significantDigits": 10 });
+let gamma: f64 = coupling.parse().map_err(|_| "Cannot read γ")?;
+let x2: f64 = x2.parse().map_err(|_| "Cannot read x₂")?;
+let x = [1.0_f64, 0.5, x2, 2.0];
+let f = |p: &[f64], y: &mut [f64]| {
+    y[0] = p[0] * p[0] + gamma * p[2];
+    y[1] = p[0] + p[1] * p[1];
+    y[2] = p[1] + p[2] * p[2];
+    y[3] = p[2] + p[3] * p[3];
+    Ok::<(), SciOxideError>(())
+};
+// Reference: analytic J(i, j).
+let exact = |i: usize, j: usize| match (i, j) {
+    (0, 2) => gamma,
+    (i, j) if j == i => 2.0 * x[i],
+    (i, j) if j + 1 == i => 1.0,
+    _ => 0.0,
+};
+// Independent check: dense fixed-step Jacobian, row-major; outside-pattern entries should be zero.
+let dense = FiniteDifference::default()
+    .jacobian(f, &x, 4, None, None)
+    .map_err(|e| e.to_string())?
+    .into_values()
+    .map_err(|e| e.to_string())?;
+// Initial column step h_j = 0.5 max(1, |x_j|); ratio h₂/h₀ is level-independent.
+let step = |v: f64| 0.5 * v.abs().max(1.0);
+let mut rows = Vec::new();
+for (name, row0) in [
+    ("Correct pattern", vec![0, 2]),
+    ("Pattern omitting (0, 2)", vec![0]),
+] {
+    let dropped = row0.len() == 1;
+    // Row 0 uses row0; rows i ≥ 1 use columns i − 1 and i.
+    let pattern = csr_pattern(4, |i| if i == 0 { row0.clone() } else { vec![i - 1, i] })
+        .map_err(|e| e.to_string())?;
+    let schedule = derivative_coloring(pattern.view()).map_err(|e| e.to_string())?;
+    let plan = ColoredJacobianPlan::new(&schedule, AdaptiveDifference::default())
+        .map_err(|e| e.to_string())?;
+    let result = plan.evaluate(f, &x, None).map_err(|e| e.to_string())?;
+    let values = result.values().ok_or("Jacobian not published")?;
+    let estimates = result.errors().ok_or("Error estimate not published")?;
+    let mixed = if dropped {
+        gamma * step(x[2]) / step(x[0])
+    } else {
+        0.0
+    };
+    let view = pattern.view();
+    let in_pattern = |i: usize, j: usize| {
+        view.col_indices()[view.row_ptr()[i]..view.row_ptr()[i + 1]].contains(&j)
+    };
+    let largest_estimate = estimates.iter().copied().fold(0.0, f64::max);
+    let outside = (0..16)
+        .filter(|&k| !in_pattern(k / 4, k % 4))
+        .map(|k| dense[k].abs())
+        .fold(0.0, f64::max);
+    let colors: Vec<String> = schedule.colors().iter().map(|c| c.to_string()).collect();
+    rows.push((
+        name,
+        schedule.color_count(),
+        colors.join(", "),
+        values[0],
+        2.0 * x[0] + mixed,
+        stored_max_error(&pattern, values, exact),
+        largest_estimate,
+        outside,
+        result.report().termination().to_string(),
+    ));
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "Pattern" },
+    { "key": "1", "label": "Colors", "type": "integer" },
+    { "key": "2", "label": "Colors of columns 0–3" },
+    { "key": "3", "label": "J₀₀ (true 2) [-]", "type": "number", "format": digits10 },
+    { "key": "4", "label": "Prediction 2x₀ + γh₂/h₀ [-]", "type": "number", "format": digits10 },
+    { "key": "5", "label": "Maximum stored-entry error [-]", "type": "number", "format": sci3 },
+    { "key": "6", "label": "Maximum estimated error [-]", "type": "number", "format": sci3 },
+    { "key": "7", "label": "Maximum outside pattern [-]", "type": "number", "format": sci3 },
+    { "key": "8", "label": "Termination reason" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "patterns" })
+);
+```
+
+At defaults $\gamma = 0.5$ and $x_2 = -0.5$, correct coloring uses 3 colors and every stored entry matches analytic values.
+Omitting $(0, 2)$ gives 2 colors (0, 1, 0, 1) and $J_{00}$ equals predicted $2 + 0.5 \cdot h_2 / h_0 = 2.5$ instead of true 2.
+Estimates remain $2.4 \times 10^{-14}$ and termination `Converged`, without errors.
+Outside maxima are exactly 0 for correct patterns and $\lvert J_{02} \rvert = 0.5$ for omitted ones; only this independent check detects the omission.
+
+At $\gamma = 0.01$, $J_{00} = 2.01$ reduces contamination without changing estimates.
+At $\gamma = 0$, the omitted entry is truly zero; two colors give correct values and zero outside maxima.
+At $x_2 = -4$, $h_2 / h_0 = 2 / 0.5 = 4$, and $J_{00}$ becomes $2 + 0.5 \cdot 4 = 4$ with fourfold contamination.
+Contamination depends on step ratios as well as $J_{02}$, so mismatched variable scales can worsen errors.
+
+## Summary
+
+Sparse Jacobians group structurally orthogonal columns into colors for simultaneous perturbation, making calls proportional to colors rather than columns.
+Colors are at least maximum row entries; banded counts depend only on bandwidth, and `derivative_coloring` constructs greedy coloring in column order.
+`ColoredJacobianPlan` stores adaptive tables per column, shares same-color points, and returns values and estimates in CSR order.
+Calls are $1 + 2\sum_C L_C$ with or without bounds, determined by each color's slowest column; if functions ignore other same-color variables, results match dense adaptive columns.
+If `StructuralPattern` omits actual nonzeros, values contaminate same-color columns and silently return incorrect `Converged` without larger estimates; verify patterns once with dense differences or automatic differentiation.
+
+## Further reading
+
+- [Reusing Plans, requirements, and workspaces](../plans-workspaces-and-reports/): allocate Plan workspace, including coloring, once and reuse it in iterations.
+- [Sparse reaction–diffusion Jacobians with coloring](../../examples/reaction-diffusion-coloring/): check color counts, calls, and analytic agreement for a Brusselator discretization.
+- [Orderings and coloring](../../../scioxide-sparse/algorithms/orderings-and-coloring/#derivative-column-coloring): examine column-intersection graph coloring and banded color counts in scioxide-sparse.

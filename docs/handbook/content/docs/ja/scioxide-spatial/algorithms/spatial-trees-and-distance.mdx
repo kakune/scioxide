@@ -1,0 +1,432 @@
+---
+title: KD 木による近傍探索
+description: KD 木の構築、軸ごとのはみ出しによる距離の下界と枝刈り、丸めに対する安全係数、最近傍と半径で意味の違う (1+ε) 近似、周期箱の minimum image、総当たりとの照合。
+sidebar:
+  order: 325
+references:
+  spatial-kdtree-construction: "kd-木の構築"
+  spatial-kdtree-pruning: "距離の下界と枝刈り"
+  spatial-kdtree-approximate: "近似探索の意味"
+  spatial-kdtree-periodic: "周期箱と-minimum-image"
+---
+
+$n$ 点の集合から、照会点に最も近い $k$ 点や、半径 $r$ 以内の全点を探す問題は、クラスタ分析、粒子の相互作用、最近傍による補間や分類に現れる。
+全点との距離を調べる総当たりは、$d$ 次元で照会 1 回あたり $O(nd)$ の計算コストがかかる。
+KD 木は空間を軸に平行な超平面で再帰的に二分し、照会点から遠い部分をまとめて調べずに済ませる。
+このページは木の構築、枝刈りの根拠となる距離の下界、近似探索の意味、周期境界を説明し、結果を総当たりと照合する。
+照会の呼び出し方と作業領域は[KD 木の照会と作業領域](../kdtree-queries-and-workspaces/)で、距離の定義は[距離と非類似度](../distances/)で扱う。
+
+## KD 木の構築
+
+`KdTree::with_options(&points, metric, options)` は、借用した `PointSet` の上に二分木を作る。
+`KdTree::new(&points)` は、Euclid 距離、葉の大きさ 16、周期箱なしの既定の木を同じ方法で作る。
+各節点では、含まれる点の座標の広がり（最大値と最小値の差）が最も大きい軸を選び、その軸の座標の中央値で点を 2 つに分ける。
+中央値は（座標の値、元の行番号）の順序で選ぶので、同じ座標の点があっても木の形は入力だけで決まる。
+葉の点の数が `KdTreeOptions::with_leaf_size` の値（既定 16）以下になると分割をやめる。
+すべての点が同じ座標にある部分は分けようがないので、葉の大きさを超えても 1 つの葉に残る。
+
+中央値で分けるので木の深さは $\lceil \log_2 n \rceil$ 以下で、構築の計算コストは $O(d\,n \log n)$、メモリ領域は $O(n + d)$ である。
+木は点の番号だけを持ち、座標は複製せずに借用するので、木がある間は座標を書き換えられない（書き換えるコードはコンパイルされない）。
+`node_count()` は節点の数、`storage_bytes()` は借用した座標を除く木のメモリ領域のバイト数を返す。
+葉の大きさが 0 か、`Minkowski` の指数が 1 未満か非有限なら `InvalidInput` になる。
+
+## 距離の下界と枝刈り
+
+各節点はその部分木の点を含む軸に平行な箱 $B = \prod_i [a_i, b_i]$ を持つ（根の箱を保持し、子の箱は分割の座標から求める）。
+照会点 $q$ の各軸のはみ出し量を
+
+$$
+\delta_i = \max(a_i - q_i,\; 0,\; q_i - b_i)
+$$
+
+とすると、箱の中の任意の点 $x$ について軸ごとに $\lvert q_i - x_i\rvert \ge \delta_i$ が成り立つ。
+$p$ ノルムは各成分の絶対値について単調に増えるので、
+
+$$
+\lVert q - x\rVert_p \ge \lVert \delta\rVert_p \qquad (x \in B)
+$$
+
+が得られる。
+これが箱の中の全点に共通する距離の下界で、下界が現在の第 $k$ 近傍の距離 $r_k$ を超えれば、部分木全体を調べずに捨ててよい。
+$k$ 個の候補がそろうまでは $r_k = \infty$ とみなし、半径の照会では $r_k$ の代わりに $r$ と比べる。
+この議論に必要なのは成分ごとの単調性で、三角不等式ではない。
+`TreeMetric` は、この下界が成り立つ `Euclidean`、`CityBlock`、`Chebyshev`（$p = \infty$）と、$p \ge 1$ の `Minkowski(p)` の 4 種類を受け付ける。
+Mahalanobis 距離や余弦のように箱との距離で下界を作れない距離は木では扱わず、`PreparedDistance::pairwise` で全点対を計算する。
+
+浮動小数点で $\lVert \delta\rVert_p$ を計算すると、丸めで真の下界をわずかに上回り、真の近傍を含む部分木を誤って捨てるおそれがある。
+`KdTree` は深さ $\ell$ の節点の下界に安全係数
+
+$$
+1 - 64\,(d + \ell + 1)\,\varepsilon_{\mathrm{mach}}
+$$
+
+を掛け、さらにスカラー型の最小の非正規化数の 2 倍を引いてから比べる。
+$\varepsilon_{\mathrm{mach}}$ はスカラー型の機械イプシロンである。
+これで下界を小さめに見積もり、丸めによる誤った枝刈りを防ぐ。
+候補の比較では丸めた後に等しくなる距離も同順位として残す。
+
+結果は `Neighbor`（点の番号 `index` と距離 `distance`）の列で、距離の昇順、同じ距離なら番号の昇順に並ぶ。
+同順位は丸めた距離で決まり、第 $k$ 近傍と同じ距離の点が複数あれば、訪れた順序によらず番号の小さい点が残る。
+表せない距離（桁あふれ）の点は無視されるが、最近傍の照会で $k$ 個に足りなくなる場合だけ `NumericalInstability` になる。
+半径の照会は表せない距離の点を含めない。
+低い次元で点がほぼ一様なら、照会は少数の葉を調べて終わる。
+次元が高くなると多くの箱の下界が $r_k$ を下回り、全点を訪れることもあるが、その場合も結果は総当たりと同じで、計算コストが総当たりに近づくだけである。
+
+## 近似探索の意味
+
+`SearchOptions::with_epsilon(ε)` は $\varepsilon \ge 0$ の近似を許す。
+既定の $\varepsilon = 0$ が厳密な探索で、負か非有限の $\varepsilon$ は `InvalidInput` になる。
+近似の保証は最近傍の照会と半径の照会で異なる。
+
+- 最近傍の照会では枝刈りの基準を $r_k$ から $r_k/(1 + \varepsilon)$ に下げる。
+  返された第 $i$ 近傍の距離は、真の第 $i$ 近傍の距離の $1 + \varepsilon$ 倍以下である。
+  返る点の数は $\min(k, n)$ のままで、点の選び方だけが変わる。
+- 半径の照会では枝刈りの基準を $r/(1 + \varepsilon)$ に下げ、候補は距離 $r$ 以下で受け入れる。
+  距離 $r/(1 + \varepsilon)$ 以内の点はすべて返り、距離 $r$ を超える点は返らない。
+  その間の帯にある点は返ることも省かれることもある。
+
+どちらも調べる部分木を減らす代わりに、保証の範囲で答えが変わることを許す。
+
+## 周期箱と minimum image
+
+`KdTreeOptions::with_periodic_box(Some(&lengths))` は軸ごとの周期 $L_i$ を与え、木の距離を周期箱の上で測る。
+索引に入れる点の座標はすべて $[0, L_i)$ になければならない。
+外れた点、長さの合わない配列、有限で正でない周期は、構築時に `InvalidInput` になる。
+照会点は各軸で $[0, L_i)$ に折り返してから探す（丸めで $L_i$ ちょうどになる場合は継ぎ目の 0 に移す）。
+座標の差は minimum image
+
+$$
+\Delta_i = \min\bigl(\lvert q_i - x_i\rvert,\; L_i - \lvert q_i - x_i\rvert\bigr)
+$$
+
+で測るので、各点は照会点に最も近い像だけで数えられる。
+実装は $L_i - \lvert q_i - x_i\rvert$ を $(L_i - \max(q_i, x_i)) + \min(q_i, x_i)$ の順に計算し、継ぎ目の側の像が近いときの桁落ちを避ける。
+この周期は木の距離にだけ作用し、構造格子の周期軸（[点・範囲・格子・メッシュの基礎](../geometry-grids-and-meshes/)）とは関係しない。
+
+## 総当たりとの照合
+
+次のセルはシード $s$ の乱数で単位立方体 $[0, 1)^3$ に $n$ 点と 32 個の照会点を置き、KD 木の $k$ 近傍を `nearest_batch_into` で一括に求める。
+独立な検算として、照会点と全点の距離行列を `pairwise` で作り、行ごとに（距離、番号）の順に並べた第 $j$ 近傍と比べる。
+1 つ目の表は最初の 4 つの照会について、木と総当たりの第 $k$ 近傍の距離、その比、近傍の番号を並べる。
+2 つ目の表は全照会について、番号が一致した数、距離の比の最大値と保証 $1 + \varepsilon$、木の節点の数とメモリ領域を示す。
+$\varepsilon = 0$ では番号がすべて一致し、$\varepsilon > 0$ では比が $1 + \varepsilon$ 以下に収まることを確かめる。
+
+```rust
+//| id: spatial-kdtree-brute-force-check
+//| ref: spatial-kdtree-brute-force-check
+//| title: KD 木の k 近傍を全点対の距離行列と照合する
+//| run: reactive
+//| crates: [scioxide-core, scioxide-random, scioxide-spatial]
+//| inputs:
+//|   point_count: {"type":"range","label":"点の数 n","min":50,"max":2000,"step":50,"value":400}
+//|   neighbor_count: {"type":"range","label":"近傍の数 k","min":1,"max":8,"step":1,"value":4}
+//|   epsilon: {"type":"range","label":"近似の許容 ε [-]","min":0,"max":1,"step":0.25,"value":0}
+//|   seed: {"type":"range","label":"乱数のシード s","min":1,"max":50,"step":1,"value":3}
+//| cases:
+//|   - {"id":"approximate","label":"ε = 1","description":"番号が総当たりと違う近傍が出るが、距離の比は 2 以下に収まる。","inputs":{"epsilon":1}}
+//|   - {"id":"many-points","label":"n = 2000、k = 8","description":"点と近傍を増やしても、厳密な探索は総当たりと一致する。","inputs":{"point_count":2000,"neighbor_count":8}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":128}
+//|       - {"artifact":"summary","path":"/rows/0/1","equals":128}
+//|       - {"artifact":"summary","path":"/rows/0/2","equals":1}
+//|       - {"artifact":"queries","path":"/rows/0/3","equals":1}
+//|   - case: approximate
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":128}
+//|       - {"artifact":"summary","path":"/rows/0/2","range":{"min":1,"max":2}}
+//|   - case: many-points
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":256}
+//|       - {"artifact":"summary","path":"/rows/0/1","equals":256}
+//|       - {"artifact":"summary","path":"/rows/0/2","equals":1}
+use core::num::NonZeroUsize;
+use scioxide_core::{ExecutionContext, NdView, StridedLayout};
+use scioxide_random::{SeedableRng, SplitMix64, fill_uniforms};
+use scioxide_spatial::{
+    KdTree, Neighbor, PointSet, SearchOptions, SearchWorkspaceRequest, pairwise,
+};
+
+// 単位立方体の一様な点 n 個と照会点 32 個（1 行 1 点）。
+let (n, k, q, d) = (
+    point_count as usize,
+    neighbor_count as usize,
+    32_usize,
+    3_usize,
+);
+let mut rng = SplitMix64::from_seed(seed as u64);
+let (mut coordinates, mut query_coordinates) = (vec![0.0_f64; n * d], vec![0.0_f64; q * d]);
+let mut draws = 0;
+fill_uniforms(&mut rng, &mut coordinates, &mut draws).map_err(|e| e.to_string())?;
+fill_uniforms(&mut rng, &mut query_coordinates, &mut draws).map_err(|e| e.to_string())?;
+let (shape_points, shape_queries, strides) = ([n, d], [q, d], [d, 1]);
+let layout = StridedLayout::new(&shape_points, &strides).map_err(|e| e.to_string())?;
+let points = PointSet::new(NdView::new(&coordinates, layout).map_err(|e| e.to_string())?)
+    .map_err(|e| e.to_string())?;
+let layout = StridedLayout::new(&shape_queries, &strides).map_err(|e| e.to_string())?;
+let queries =
+    PointSet::new(NdView::new(&query_coordinates, layout).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+
+// 木を作り、一括照会の作業領域を事前確保して k 近傍を求める。
+let tree = KdTree::new(&points).map_err(|e| e.to_string())?;
+let options = SearchOptions::new().with_epsilon(epsilon);
+let request = SearchWorkspaceRequest::new(k, options).with_batch(q, q * k, NonZeroUsize::MIN);
+let mut workspace = tree.workspace(request).map_err(|e| e.to_string())?;
+let mut found = vec![Neighbor::default(); q * k];
+let context = ExecutionContext::sequential();
+let total = tree
+    .nearest_batch_into(&queries, k, options, &mut found, &mut workspace, context)
+    .map_err(|e| e.to_string())?;
+
+// 独立な検算: 照会点 × 全点の距離行列を、行ごとに（距離, 番号）の順に並べる。
+let table = pairwise(&queries, &points).map_err(|e| e.to_string())?;
+let (mut same_index, mut worst_ratio) = (0_usize, 1.0_f64);
+let mut rows = Vec::new();
+for (row, distances) in table.as_slice().chunks(n).enumerate() {
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| distances[a].total_cmp(&distances[b]).then(a.cmp(&b)));
+    // n ≥ 50 > k なので、各照会の行はちょうど k 個の近傍を持つ。
+    let tree_row = &found[row * k..(row + 1) * k];
+    for (rank, neighbor) in tree_row.iter().enumerate() {
+        same_index += usize::from(neighbor.index == order[rank]);
+        worst_ratio = worst_ratio.max(neighbor.distance / distances[order[rank]]);
+    }
+    if row < 4 {
+        let (tree_kth, brute_kth) = (tree_row[k - 1].distance, distances[order[k - 1]]);
+        let tree_indices: Vec<usize> = tree_row.iter().map(|v| v.index).collect();
+        let brute_indices = format!("{:?}", &order[..k]);
+        let tree_indices = format!("{tree_indices:?}");
+        rows.push((
+            row,
+            tree_kth,
+            brute_kth,
+            tree_kth / brute_kth,
+            tree_indices,
+            brute_indices,
+        ));
+    }
+}
+let fixed6 = serde_json::json!({ "fractionDigits": 6 });
+let query_columns = serde_json::json!([
+    { "key": "0", "label": "照会", "type": "integer" },
+    { "key": "1", "label": "木の第 k 近傍の距離 [-]", "type": "number", "format": fixed6 },
+    { "key": "2", "label": "総当たりの第 k 近傍の距離 [-]", "type": "number", "format": fixed6 },
+    { "key": "3", "label": "比 [-]", "type": "number", "format": fixed6 },
+    { "key": "4", "label": "木の近傍の番号" },
+    { "key": "5", "label": "総当たりの近傍の番号" }
+]);
+emit_table_with_columns!(
+    query_columns,
+    rows,
+    metadata = serde_json::json!({ "id": "queries" })
+);
+let summary_columns = serde_json::json!([
+    { "key": "0", "label": "返した近傍の数", "type": "integer" },
+    { "key": "1", "label": "番号の一致", "type": "integer" },
+    { "key": "2", "label": "距離の比の最大 [-]", "type": "number", "format": fixed6 },
+    { "key": "3", "label": "保証 1 + ε [-]", "type": "number", "format": fixed6 },
+    { "key": "4", "label": "節点の数", "type": "integer" },
+    { "key": "5", "label": "木のメモリ領域 [B]", "type": "integer" }
+]);
+let summary = (total, same_index, worst_ratio, 1.0 + epsilon);
+let (nodes, bytes) = (tree.node_count(), tree.storage_bytes());
+emit_table_with_columns!(
+    summary_columns,
+    vec![(summary.0, summary.1, summary.2, summary.3, nodes, bytes)],
+    metadata = serde_json::json!({ "id": "summary" })
+);
+```
+
+既定値（$n = 400$、$k = 4$、$\varepsilon = 0$、$s = 3$）では、32 個の照会の 128 個の近傍がすべて総当たりと同じ番号で、距離の比は 1 である。
+木は 63 個の節点を持つ。
+400 点を中央値で 5 回二分すると 12〜13 点の葉が $2^5 = 32$ 個でき（4 回では 25 点で葉の大きさ 16 を超える）、節点の数は $2 \cdot 32 - 1 = 63$ になる。
+$\varepsilon = 1$ では 128 個のうち 110 個だけが総当たりと一致し、距離の比の最大は 1.357 で、保証の 2 を下回る。
+近似は近傍の番号を変えるが、距離の比の保証は守り、この例の実際の比は保証より小さい。
+$n = 2000$、$k = 8$ でも、厳密な探索の 256 個の近傍はすべて総当たりと一致する。
+
+## 半径の照会での帯の点と周期箱の効果
+
+次のセルはシード $s$ の乱数で単位正方形 $[0, 1)^2$ に 500 点を置き、角・辺・中央の 5 つの照会点から半径 $r$ の照会を一括で行う。
+入力で周期箱（周期 1）を使うかを選び、$\varepsilon$ で近似を許す。
+独立な検算として、全点の距離を `f64` の標準関数で直接求め（周期箱では minimum image）、距離 $r/(1 + \varepsilon)$ 以内の内側、$r/(1 + \varepsilon)$ と $r$ の間の帯、$r$ の外側に分ける。
+表は照会ごとに、返った点の数、内側と帯の点の数、返らなかった内側の点、返った帯の点、$r$ を超えて返った点、距離の差の最大を示す。
+返らなかった内側の点と $r$ を超えて返った点は、保証により 0 でなければならない。
+
+```rust
+//| id: spatial-kdtree-radius-periodic
+//| ref: spatial-kdtree-radius-periodic
+//| title: 半径の照会の近似の帯と周期箱の minimum image を総当たりで確かめる
+//| run: reactive
+//| crates: [scioxide-core, scioxide-random, scioxide-spatial]
+//| inputs:
+//|   radius: {"type":"range","label":"半径 r [-]","min":0.02,"max":0.3,"step":0.02,"value":0.1}
+//|   epsilon: {"type":"range","label":"近似の許容 ε [-]","min":0,"max":1,"step":0.25,"value":0.5}
+//|   periodic: {"type":"checkbox","label":"周期箱（周期 1）を使う","value":true}
+//|   seed: {"type":"range","label":"乱数のシード s","min":1,"max":50,"step":1,"value":5}
+//| cases:
+//|   - {"id":"exact","label":"ε = 0","description":"帯が空になり、返る点の数は内側の点の数に等しい。","inputs":{"epsilon":0}}
+//|   - {"id":"bounded","label":"周期箱なし","description":"角と辺の照会点では、箱の外に出る部分の点が数えられず、返る点が減る。","inputs":{"periodic":false}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"radius","path":"/rows/0/1","equals":16}
+//|       - {"artifact":"radius","path":"/rows/0/4","equals":0}
+//|       - {"artifact":"radius","path":"/rows/0/6","equals":0}
+//|       - {"artifact":"radius","path":"/rows/3/4","equals":0}
+//|       - {"artifact":"radius","path":"/rows/3/5","equals":11}
+//|       - {"artifact":"radius","path":"/rows/3/7","range":{"max":1e-15}}
+//|   - case: exact
+//|     expect:
+//|       - {"artifact":"radius","path":"/rows/3/1","equals":18}
+//|       - {"artifact":"radius","path":"/rows/3/3","equals":0}
+//|       - {"artifact":"radius","path":"/rows/3/4","equals":0}
+//|   - case: bounded
+//|     expect:
+//|       - {"artifact":"radius","path":"/rows/0/1","equals":3}
+//|       - {"artifact":"radius","path":"/rows/0/4","equals":0}
+//|       - {"artifact":"radius","path":"/rows/4/6","equals":0}
+use core::num::NonZeroUsize;
+use scioxide_core::{ExecutionContext, NdView, StridedLayout};
+use scioxide_random::{SeedableRng, SplitMix64, fill_uniforms};
+use scioxide_spatial::{
+    KdTree, KdTreeOptions, Neighbor, PointSet, SearchOptions, SearchWorkspaceRequest,
+    TreeMetric,
+};
+
+let n = 500;
+let mut coordinates = vec![0.0_f64; 2 * n];
+let mut rng = SplitMix64::from_seed(seed as u64);
+fill_uniforms(&mut rng, &mut coordinates, &mut 0).map_err(|e| e.to_string())?;
+let probes = [
+    [0.01, 0.01],
+    [0.99, 0.5],
+    [0.5, 0.995],
+    [0.5, 0.5],
+    [0.995, 0.995],
+];
+let query_coordinates: Vec<f64> = probes.iter().flatten().copied().collect();
+let (shape_points, shape_queries, strides) = ([n, 2], [probes.len(), 2], [2, 1]);
+let layout = StridedLayout::new(&shape_points, &strides).map_err(|e| e.to_string())?;
+let points = PointSet::new(NdView::new(&coordinates, layout).map_err(|e| e.to_string())?)
+    .map_err(|e| e.to_string())?;
+let layout = StridedLayout::new(&shape_queries, &strides).map_err(|e| e.to_string())?;
+let queries =
+    PointSet::new(NdView::new(&query_coordinates, layout).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+let period = [1.0, 1.0];
+let tree_options = KdTreeOptions::default().with_periodic_box(periodic.then_some(&period[..]));
+let tree = KdTree::with_options(&points, TreeMetric::Euclidean, tree_options)
+    .map_err(|e| e.to_string())?;
+
+// 半径の一括照会。出力は全点 × 照会の数で、どの結果も収まる。
+let options = SearchOptions::new().with_epsilon(epsilon);
+let capacity = n * probes.len();
+let request = SearchWorkspaceRequest::new(0, options).with_batch(
+    probes.len(),
+    capacity,
+    NonZeroUsize::MIN,
+);
+let mut workspace = tree.workspace(request).map_err(|e| e.to_string())?;
+let (mut found, mut counts) = (vec![Neighbor::default(); capacity], vec![0; probes.len()]);
+let context = ExecutionContext::sequential();
+tree.radius_batch_into(
+    &queries,
+    radius,
+    options,
+    &mut found,
+    &mut counts,
+    &mut workspace,
+    context,
+)
+.map_err(|e| e.to_string())?;
+
+// 参照値: f64 の標準関数で全点の距離を求める（周期箱では成分ごとに minimum image）。
+let reference = |q: [f64; 2], i: usize| {
+    let image = |delta: f64| {
+        if periodic {
+            delta.min(1.0 - delta)
+        } else {
+            delta
+        }
+    };
+    let dx = image((q[0] - coordinates[2 * i]).abs());
+    let dy = image((q[1] - coordinates[2 * i + 1]).abs());
+    dx.hypot(dy)
+};
+let inner_radius = radius / (1.0 + epsilon);
+let mut rows = Vec::new();
+let mut start = 0;
+for (row, &q) in probes.iter().enumerate() {
+    let returned = &found[start..start + counts[row]];
+    start += counts[row];
+    let distances: Vec<f64> = (0..n).map(|i| reference(q, i)).collect();
+    let inner = distances.iter().filter(|&&d| d <= inner_radius).count();
+    let band = distances
+        .iter()
+        .filter(|&&d| d > inner_radius && d <= radius)
+        .count();
+    let band_returned = returned
+        .iter()
+        .filter(|v| distances[v.index] > inner_radius)
+        .count();
+    let inner_returned = returned.len() - band_returned;
+    let beyond = returned
+        .iter()
+        .filter(|v| distances[v.index] > radius)
+        .count();
+    let gap = returned
+        .iter()
+        .map(|v| (v.distance - distances[v.index]).abs())
+        .fold(0.0, f64::max);
+    let label = format!("{q:?}");
+    rows.push((
+        label,
+        returned.len(),
+        inner,
+        band,
+        inner - inner_returned,
+        band_returned,
+        beyond,
+        gap,
+    ));
+}
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "照会点" },
+    { "key": "1", "label": "返った点", "type": "integer" },
+    { "key": "2", "label": "内側の点", "type": "integer" },
+    { "key": "3", "label": "帯の点", "type": "integer" },
+    { "key": "4", "label": "返らなかった内側の点", "type": "integer" },
+    { "key": "5", "label": "返った帯の点", "type": "integer" },
+    { "key": "6", "label": "r を超えて返った点", "type": "integer" },
+    { "key": "7", "label": "距離の差の最大 [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "radius" })
+);
+```
+
+既定値（$r = 0.1$、$\varepsilon = 0.5$、周期箱あり）では、どの照会点でも返らなかった内側の点と $r$ を超えて返った点は 0 で、近似の保証どおりである。
+中央の照会点 $(0.5, 0.5)$ では、帯にある 12 点のうち 11 点だけが返り、1 点が省かれた。
+$\varepsilon = 0$ では帯が空になり、中央の照会点は内側の 18 点をすべて返す。
+周期箱を外すと、角の照会点 $(0.01, 0.01)$ の結果は 16 点から 3 点に減り、反対側の辺の近くにある点が近傍に数えられなくなる。
+返った距離は minimum image の参照値と $3 \times 10^{-17}$ 以内で一致する。
+
+## まとめ
+
+KD 木で探せるのは成分ごとに単調な `Euclidean`・`CityBlock`・`Chebyshev`・`Minkowski(p ≥ 1)` の距離で、Mahalanobis 距離や余弦には `PreparedDistance::pairwise` の総当たりを使う。
+木は最も広がった軸の中央値で点を分けるので、構築は $O(d\,n\log n)$ で座標を複製せず、同じ点集合への多数の照会で使い回せる。
+枝刈りは丸めを見込んで下界を小さめに見積もるので、厳密な探索の結果は総当たりと番号まで一致する。
+$\varepsilon > 0$ を選ぶときは、最近傍では距離の比 $1 + \varepsilon$ 以内、半径では $r/(1 + \varepsilon)$ 以内の点を必ず返して $r$ を超える点を返さないという、保証の違いを踏まえる。
+周期的な系では点の座標を $[0, L_i)$ に入れてから `with_periodic_box` で木を作り、minimum image の距離を使う。
+
+## 次に読むページ
+
+- [KD 木の照会と作業領域](../kdtree-queries-and-workspaces/)：多数の照会を割り当てなしに行うための作業領域の事前確保と、出力が足りないときのエラーを確かめる。
+- [厳密な幾何述語](../exact-predicates/)：近傍の距離と違い、向きや円の内外の判定を丸め誤差なしに決める方法を確かめる。
+- [最近傍距離の統計（Clark–Evans）](../../examples/nearest-neighbor-statistics/)：周期箱の KD 木で最近傍距離の分布を求め、理論の分布と比べる例題に進む。
+- [有向 Hausdorff 距離](../directed-hausdorff/)：2 つの点集合のずれを、1 近傍の照会の最大として求める使い方を確かめる。

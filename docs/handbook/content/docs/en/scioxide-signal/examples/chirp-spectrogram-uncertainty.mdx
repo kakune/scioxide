@@ -1,0 +1,327 @@
+---
+title: "Chirp spectrograms and time–frequency uncertainty"
+description: "Analyze a linear chirp sweeping from 50 Hz to 450 Hz with a Gaussian-window STFT, and compare the tradeoff between time and frequency resolution as window length changes with the closed-form ridge width, theoretical instantaneous frequency, and inverse-transform reconstruction error."
+sidebar:
+  order: 425
+references:
+  signal-chirp-ridge-width: "closed-form-ridge-width"
+---
+
+A sinusoid whose frequency changes linearly with time (a linear chirp) appears in radar and sonar pulse compression, measurements of acoustic transfer characteristics, and bat echolocation calls.
+In a spectrogram (the squared magnitude of the STFT), a chirp appears as a diagonal line, or ridge, in the time–frequency plane.
+This example derives a closed-form expression for how ridge width changes with window length and compares it with widths measured using `StftPlan`.
+A shorter window improves time precision at the expense of frequency blurring, while a longer window allows the frequency to change within it.
+This tradeoff is time–frequency uncertainty.
+
+## Linear chirp and instantaneous frequency
+
+At sampling rate $f_s = 1000$ Hz, define the following signal over a record of length $T = 2$ s:
+
+$$
+x(t) = \cos\!\left( 2\pi \left( f_0 t + \frac{k}{2} t^2 \right) \right), \qquad k = \frac{f_1 - f_0}{T}
+$$
+
+
+With $f_0 = 50$ Hz and $f_1 = 450$ Hz, the sweep rate is $k = 200$ Hz/s.
+Dividing the phase by $2\pi$ and differentiating with respect to time gives the instantaneous frequency $f(t) = f_0 + kt$, which is 250 Hz at $t = 1$ s.
+Create the samples by passing `Waveform::Chirp` (`ChirpLaw::Linear`) to `waveform`.
+$x$ is a real signal with unit amplitude and also has a negative-frequency image $-f(t)$, sufficiently far from the 150–350 Hz analysis band.
+
+## Closed-form ridge width
+
+Use a Gaussian STFT window $g(u) = e^{-u^2/(2\sigma^2)}$ with standard deviation $\sigma$ [s].
+Substituting $t = \tau + u$ gives the following STFT of the complex chirp $e^{i\pi k t^2}$ at time $\tau$:
+
+$$
+X(\tau, f) \propto \int_{-\infty}^{\infty} \exp\!\left( -\left( \frac{1}{2\sigma^2} - i\pi k \right) u^2 + 2\pi i (k\tau - f)\, u \right) du
+$$
+
+
+Using the Gaussian integral $\int e^{-a u^2 + ibu} du = \sqrt{\pi/a}\, e^{-b^2/(4a)}$, $|X|^2$ becomes a Gaussian function of $f$ with mean $k\tau$ and standard deviation
+
+$$
+s_f(\sigma) = \sqrt{ \frac{1}{8\pi^2 \sigma^2} + \frac{k^2 \sigma^2}{2} }
+$$
+
+
+The first term is the frequency resolution set by the window length (the width remaining even for a stationary sinusoid); the second is broadening due to frequency changes of order $k\sigma$ within the window.
+Differentiating with respect to $\sigma$ and setting the derivative to zero gives the window that minimizes the width:
+
+$$
+\sigma_\ast = \frac{1}{\sqrt{2\pi k}}, \qquad s_f(\sigma_\ast) = \sqrt{\frac{k}{2\pi}}
+$$
+
+For $k = 200$ Hz/s, this gives $\sigma_\ast = 28.2$ ms and $s_f = 5.64$ Hz.
+The product of the time standard deviation $\sigma/\sqrt2$ of the window power $|g|^2$ and the frequency standard deviation $1/(2\sqrt2\,\pi\sigma)$ of its spectrum is $1/(4\pi)$; the Gaussian window attains equality in this bound (Gabor's uncertainty lower bound).
+
+## Analysis settings
+
+Create the Gaussian window with `WindowKind::Gaussian { sigma }`, where `sigma` is measured in samples.
+Set the window length to $m = 2\lceil 5\sigma f_s \rceil$ samples, making its value at both ends at most $e^{-12.5} \approx 4 \times 10^{-6}$.
+Use a hop of 20 samples (20 ms), FFT length 1024 (bin spacing 0.977 Hz), one-sided packing, and `StftScaling::Psd` scaling.
+$|X|^2$ is then a power spectral density [1/Hz] (the signal is dimensionless).
+
+Measure the ridge in frames from 0.5 to 1.5 s (instantaneous frequencies 150–350 Hz), finding the centroid and standard deviation from the density within 100 Hz on either side of the maximum bin.
+Compare the centroid with the instantaneous frequency $f(\tau)$ and the standard deviation with $s_f(\sigma)$.
+Use `frame_time(p)` ($ph/f_s$) for the frame time, which differs from the center of an even-length window by half a sample (0.5 ms, or 0.1 Hz in frequency).
+
+The following block defines functions shared by the two cells.
+`chirp` produces samples of $x$, `plan` prepares the window and STFT plan, `theory_width` evaluates $s_f(\sigma)$, and `ridge` measures ridge centroid and width.
+
+```rust
+//| id: signal-chirp-model
+//| kind: definitions
+//| title: "Linear chirp and ridge measurement"
+//| crates: [scioxide-core, scioxide-signal]
+use scioxide_core::SciOxideError;
+use scioxide_signal::{
+    ChirpLaw, StftOptions, StftPacking, StftPlan, StftScaling, Waveform, WindowKind,
+    WindowNormalization, WindowSymmetry, waveform, window,
+};
+
+/// Sampling rate f_s [Hz], record length T [s], and sweep endpoints f₀ and f₁ [Hz].
+pub(crate) const SAMPLE_RATE: f64 = 1000.0;
+pub(crate) const DURATION: f64 = 2.0;
+pub(crate) const START: f64 = 50.0;
+pub(crate) const END: f64 = 450.0;
+/// Hop [samples] and FFT length [samples].
+pub(crate) const HOP: usize = 20;
+pub(crate) const FFT_LEN: usize = 1024;
+
+/// Sweep rate k = (f₁ − f₀)/T [Hz/s].
+pub(crate) fn sweep_rate() -> f64 {
+    (END - START) / DURATION
+}
+
+/// Samples of the linear chirp cos(2π(f₀t + kt²/2)).
+pub(crate) fn chirp() -> Result<Vec<f64>, SciOxideError> {
+    let count = (DURATION * SAMPLE_RATE) as usize;
+    let times: Vec<f64> = (0..count).map(|i| i as f64 / SAMPLE_RATE).collect();
+    let law = Waveform::Chirp {
+        initial: START,
+        final_frequency: END,
+        duration: DURATION,
+        phase: 0.0,
+        law: ChirpLaw::Linear,
+    };
+    waveform(law, &times)
+}
+
+/// Gaussian window with standard deviation σ [s] (length 2⌈5σf_s⌉) and a one-sided, PSD-scaled STFT plan.
+pub(crate) fn plan(sigma: f64) -> Result<StftPlan<f64>, SciOxideError> {
+    let samples = sigma * SAMPLE_RATE;
+    let length = 2 * (5.0 * samples).ceil() as usize;
+    let kind = WindowKind::Gaussian { sigma: samples };
+    let w = window::<f64>(kind, length, WindowSymmetry::Symmetric, WindowNormalization::Native)?;
+    let options = StftOptions::new()
+        .with_sample_rate(SAMPLE_RATE)
+        .with_fft_len(Some(FFT_LEN))
+        .with_packing(StftPacking::OneSided)
+        .with_scaling(StftScaling::Psd);
+    StftPlan::new(&w, HOP, options)
+}
+
+/// Closed-form ridge width s_f(σ) = √(1/(8π²σ²) + k²σ²/2) [Hz] (reference values using f64 inherent methods).
+pub(crate) fn theory_width(sigma: f64) -> f64 {
+    let pi = core::f64::consts::PI;
+    let k = sweep_rate();
+    (1.0 / (8.0 * pi * pi * sigma * sigma) + k * k * sigma * sigma / 2.0).sqrt()
+}
+
+/// Ridge measurement: rows of time [s], centroid [Hz], and standard deviation [Hz]. Use only frames from 0.5 to 1.5 s.
+pub(crate) fn ridge(
+    plan: &StftPlan<f64>,
+    power: &[f64],
+    len: usize,
+) -> Result<Vec<(f64, f64, f64)>, SciOxideError> {
+    let frames = plan.frames(len)?;
+    let bins = plan.bins();
+    let df = SAMPLE_RATE / FFT_LEN as f64;
+    let reach = (100.0 / df).round() as usize;
+    let mut rows = Vec::new();
+    for i in 0..frames.count() {
+        let time = plan.frame_time(frames.first() + i as i64)?;
+        if !(0.5..=1.5).contains(&time) {
+            continue;
+        }
+        let frame = &power[i * bins..(i + 1) * bins];
+        let peak = (0..bins).max_by(|&a, &b| frame[a].total_cmp(&frame[b])).unwrap_or(0);
+        let range = peak.saturating_sub(reach)..(peak + reach + 1).min(bins);
+        let total: f64 = frame[range.clone()].iter().sum();
+        let mean = range.clone().map(|j| j as f64 * df * frame[j]).sum::<f64>() / total;
+        let spread = range.map(|j| (j as f64 * df - mean).powi(2) * frame[j]).sum::<f64>() / total;
+        rows.push((time, mean, spread.sqrt()));
+    }
+    Ok(rows)
+}
+```
+
+## Spectrogram and ridge
+
+The next cell selects the Gaussian window standard deviation $\sigma$, plots a spectrogram, and tabulates the RMS difference between ridge centroid and instantaneous frequency, the mean ridge width and its closed-form value, and the inverse-transform reconstruction error.
+Reconstruct the record from the coefficients using the plan's prepared canonical dual, and measure the maximum difference from the original samples.
+Chart colors show power spectral density on a linear scale.
+
+```rust
+//| id: signal-chirp-spectrogram
+//| ref: signal-chirp-spectrogram
+//| title: "Measure a chirp ridge with a Gaussian-window STFT"
+//| run: reactive
+//| uses: [signal-chirp-model]
+//| inputs:
+//|   sigma_ms: {"type":"range","label":"Window standard deviation σ [ms]","description":"Short windows blur frequency; long windows blur time.","min":5,"max":60,"step":1,"value":28}
+//| cases:
+//|   - {"id":"short-window","label":"σ = 5 ms","description":"The frequency-resolution term dominates, widening the ridge.","inputs":{"sigma_ms":5}}
+//|   - {"id":"long-window","label":"σ = 60 ms","description":"Frequency changes within the window dominate, widening the ridge.","inputs":{"sigma_ms":60}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"ridge","path":"/rows/0/1","range":{"max":0.2}}
+//|       - {"artifact":"ridge","path":"/rows/0/2","approx":{"value":5.64,"atol":0.1}}
+//|       - {"artifact":"ridge","path":"/rows/0/3","approx":{"value":5.64,"atol":0.01}}
+//|       - {"artifact":"ridge","path":"/rows/0/4","range":{"max":1e-12}}
+//|   - case: short-window
+//|     expect:
+//|       - {"artifact":"ridge","path":"/rows/0/3","approx":{"value":22.52,"atol":0.01}}
+//|       - {"artifact":"ridge","path":"/rows/0/2","approx":{"value":22.5,"atol":0.5}}
+//|   - case: long-window
+//|     expect:
+//|       - {"artifact":"ridge","path":"/rows/0/3","approx":{"value":8.69,"atol":0.01}}
+//|       - {"artifact":"ridge","path":"/rows/0/2","approx":{"value":8.69,"atol":0.2}}
+let sigma = sigma_ms / 1000.0;
+let x = chirp().map_err(|e| e.to_string())?;
+let plan = plan(sigma).map_err(|e| e.to_string())?;
+let coefficients = plan.analyze(&x).map_err(|e| e.to_string())?;
+let power: Vec<f64> = coefficients.iter().map(|c| c.norm_sqr()).collect();
+let rows = ridge(&plan, &power, x.len()).map_err(|e| e.to_string())?;
+
+// RMS difference between ridge centroid and instantaneous frequency f₀ + kτ, and mean width
+let k = sweep_rate();
+let squared: f64 = rows.iter().map(|r| (r.1 - (START + k * r.0)).powi(2)).sum();
+let rms = (squared / rows.len() as f64).sqrt();
+let width = rows.iter().map(|r| r.2).sum::<f64>() / rows.len() as f64;
+// Inverse transform: reconstruct with the plan's canonical dual and measure the maximum difference from the original samples
+let restored = plan.synthesize(&coefficients, x.len()).map_err(|e| e.to_string())?;
+let error = x.iter().zip(&restored).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Window length m [samples]", "type": "integer" },
+    { "key": "1", "label": "Ridge centroid RMS error [Hz]", "type": "number", "format": fixed2 },
+    { "key": "2", "label": "Ridge width (measured) [Hz]", "type": "number", "format": fixed2 },
+    { "key": "3", "label": "Ridge width (closed form) [Hz]", "type": "number", "format": fixed2 },
+    { "key": "4", "label": "Maximum reconstruction error [-]", "type": "number", "format": sci2 }
+]);
+let table = vec![(plan.window().len(), rms, width, theory_width(sigma), error)];
+emit_table_with_columns!(columns, table, metadata = serde_json::json!({ "id": "ridge" }));
+
+// Spectrogram: density over time [s] × frequency [Hz]
+let frames = plan.frames(x.len()).map_err(|e| e.to_string())?;
+let bins = plan.bins();
+let mut heat = Vec::with_capacity(power.len());
+for i in 0..frames.count() {
+    let time = plan.frame_time(frames.first() + i as i64).map_err(|e| e.to_string())?;
+    // Plot every other bin (1.95 Hz spacing) to reduce rendering load
+    for j in (0..bins).step_by(2) {
+        let frequency = plan.frequency(j).map_err(|e| e.to_string())?;
+        heat.push(serde_json::json!([time, frequency, power[i * bins + j]]));
+    }
+}
+emit_chart!(serde_json::json!({
+    "kind": "heatmap",
+    "data": heat,
+    "xLabel": "Time τ [s]",
+    "yLabel": "Frequency f [Hz]",
+    "tooltip": true
+}));
+```
+
+At the default $\sigma = 28$ ms (window length 280 samples), the measured ridge width of 5.642 Hz agrees with the closed-form 5.642 Hz to 9 digits.
+The RMS difference between ridge centroid and instantaneous frequency is 0.100 Hz.
+This matches $0.5\ \mathrm{ms} \times 200\ \mathrm{Hz/s} = 0.1$ Hz from the half-sample offset between the frame time $ph/f_s$ and the center of an even-length window, a systematic error with an identified cause.
+The inverse-transform reconstruction error is $4.4 \times 10^{-16}$, at the level of rounding error.
+
+At $\sigma = 5$ ms (window length 50 samples), the ridge widens to 22.52 Hz, matching the closed-form 22.52 Hz.
+At $\sigma = 60$ ms (window length 600 samples), the width is 8.69 Hz, now broadened by the sweep within the window.
+In both cases the centroid error remains 0.1 Hz; window length changes the ridge width rather than its position.
+The chart shows the ridge widening in the frequency direction for both short and long windows.
+
+## Window length and ridge width
+
+The next cell repeats the measurement at seven values of $\sigma$ from 5 to 60 ms, comparing ridge widths with the closed-form curve.
+The chart shows the closed form as a dashed line and measurements as markers, with a vertical line at the minimizing $\sigma_\ast$.
+
+```rust
+//| id: signal-chirp-window-sweep
+//| ref: signal-chirp-window-sweep
+//| title: "Vary window standard deviation to check the minimum ridge width"
+//| run: reactive
+//| uses: [signal-chirp-model]
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"sweep","path":"/rows/0/2","approx":{"value":22.52,"atol":0.01}}
+//|       - {"artifact":"sweep","path":"/rows/4/1","approx":{"value":5.64,"atol":0.1}}
+//|       - {"artifact":"sweep","path":"/rows/6/1","approx":{"value":8.69,"atol":0.2}}
+let x = chirp().map_err(|e| e.to_string())?;
+let mut rows = Vec::new();
+for sigma_ms in [5.0_f64, 10.0, 15.0, 20.0, 28.2, 40.0, 60.0] {
+    let sigma = sigma_ms / 1000.0;
+    let plan = plan(sigma).map_err(|e| e.to_string())?;
+    let power = plan.spectrogram(&x).map_err(|e| e.to_string())?;
+    let ridge = ridge(&plan, &power, x.len()).map_err(|e| e.to_string())?;
+    let width = ridge.iter().map(|r| r.2).sum::<f64>() / ridge.len() as f64;
+    rows.push((sigma_ms, width, theory_width(sigma)));
+}
+let fixed1 = serde_json::json!({ "fractionDigits": 1 });
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Window standard deviation σ [ms]", "type": "number", "format": fixed1 },
+    { "key": "1", "label": "Ridge width (measured) [Hz]", "type": "number", "format": fixed2 },
+    { "key": "2", "label": "Ridge width (closed form) [Hz]", "type": "number", "format": fixed2 }
+]);
+emit_table_with_columns!(columns, rows.clone(), metadata = serde_json::json!({ "id": "sweep" }));
+
+// Closed-form curve (reference) and its minimizer σ* = 1/√(2πk)
+let optimum = 1000.0 / (2.0 * core::f64::consts::PI * sweep_rate()).sqrt();
+let curve: Vec<[f64; 2]> = (0..=60)
+    .map(|i| {
+        let ms = 5.0 * 12.0_f64.powf(i as f64 / 60.0);
+        [ms, theory_width(ms / 1000.0)]
+    })
+    .collect();
+let measured: Vec<[f64; 2]> = rows.iter().map(|r| [r.0, r.1]).collect();
+emit_chart!(serde_json::json!({
+    "kind": "xy",
+    "xLabel": "Window standard deviation σ [ms]",
+    "yLabel": "Ridge width s_f [Hz]",
+    "yMin": 0.0,
+    "layers": [
+        {
+            "id": "theory",
+            "kind": "line",
+            "name": "Closed form s_f(σ)",
+            "points": curve,
+            "style": { "lineType": "dashed", "showSymbol": false }
+        },
+        { "id": "measured", "kind": "scatter", "name": "STFT measurement", "points": measured }
+    ],
+    "annotations": [{ "kind": "line", "axis": "x", "value": optimum, "label": "σ* = 1/√(2πk)" }],
+    "dataZoom": true,
+    "tooltip": true
+}));
+```
+
+Measured widths agree with the closed form within 0.01 Hz at all seven points; the minimum is 5.64 Hz at $\sigma = 28.2$ ms.
+Reducing $\sigma$ to 15 ms or increasing it to 40 ms gives widths of 7.80 Hz and 6.32 Hz, so the width is insensitive to $\sigma$ near the minimum.
+For $\sigma < \sigma_\ast$, the first term (window frequency resolution) dominates; for $\sigma > \sigma_\ast$, the second term (sweep within the window) dominates.
+The 0.002 Hz difference at $\sigma = 5$ ms results from truncating the ridge centroid and width calculation to 100 Hz on either side.
+
+## Summary
+
+The ridge width in a linear-chirp spectrogram is the root sum of squares of the window frequency resolution $1/(2\sqrt2\,\pi\sigma)$ and the frequency change within the window $k\sigma/\sqrt2$.
+Knowing the sweep rate $k$ lets you choose the width-minimizing window standard deviation $\sigma_\ast = 1/\sqrt{2\pi k}$ in advance.
+The ridge centroid tracks instantaneous frequency well regardless of window length, so use the centroid to estimate frequency and the width to assess resolution.
+The canonical dual reconstructs the original record from STFT coefficients to rounding error, allowing processing that modifies coefficients in the time–frequency domain before synthesis.
+See [STFT and reconstruction](../../algorithms/stft/) for window and frame conventions, and [Window functions and DPSS](../../algorithms/windows-and-dpss/) for window metrics.

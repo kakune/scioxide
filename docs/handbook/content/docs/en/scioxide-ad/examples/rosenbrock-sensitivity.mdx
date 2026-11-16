@@ -1,0 +1,586 @@
+---
+title: "Gradient and curvature of the Rosenbrock function"
+description: "Compute the gradient of the multidimensional Rosenbrock function in three ways—forward evaluation with Dual, value_and_grad, and a caller-owned tape—and compare with closed forms. Obtain the valley-floor Hessian with hessian and compare eigenvalues, condition numbers, and curvature along the valley with closed forms."
+sidebar:
+  order: 405
+references:
+  ad-rosenbrock-gradient-methods: "three-ways-to-obtain-a-gradient"
+  ad-rosenbrock-valley-hessian: "valley-floor-hessian-and-curvature"
+---
+
+The Rosenbrock function, used by H. H. Rosenbrock in 1960 to test optimization methods, has its minimum at the bottom of a narrow curved valley.
+Curvature across the valley is orders of magnitude greater than along it, so methods using only gradients bounce between valley walls and make slow progress along the valley.
+
+This example obtains gradients in three ways—forward-mode dual numbers `Dual`, the reverse-mode one-shot call `value_and_grad`, and `Tape::gradient_into` on a caller-owned tape—and compares them with closed forms.
+It then obtains the Hessian at a valley-floor point with `hessian` and uses scioxide-linalg's symmetric eigensolver for eigenvalues and condition numbers, comparing curvature along and across the valley with closed forms.
+
+## The generalized Rosenbrock function
+
+For dimension $n \ge 2$ and coefficients $a > 0$ and $b > 0$, consider
+
+$$
+f(\mathbf{x}) = \sum_{i=0}^{n-2} \left[ (a - x_i)^2 + b\,(x_{i+1} - x_i^2)^2 \right]
+$$
+
+
+Component indices start at zero; $\mathbf{x}$, $a$, $b$, and $f$ are dimensionless.
+The first term draws each component toward $a$, and the second draws neighboring component pairs toward the parabola $x_{i+1} = x_i^2$ (the valley floor).
+$b$ determines the steepness of the valley walls; standard values are $a = 1$ and $b = 100$.
+
+For $n = 2$, the minimizer is $(a, a^2)$ and the minimum value is zero.
+For $a = 1$, $(1, \dots, 1)$ is a minimizer for every $n$.
+For $n \ge 3$ and $a \ne 1$, all conditions $x_i = a$ and $x_{i+1} = x_i^2$ cannot hold simultaneously, so the minimum value is positive.
+
+The two terms containing $x_j$ give gradient component $j$ as
+
+$$
+\frac{\partial f}{\partial x_j}
+= \underbrace{-2(a - x_j) - 4b\,x_j\,(x_{j+1} - x_j^2)}_{j \le n-2 \text{ holds}}
++ \underbrace{2b\,(x_j - x_{j-1}^2)}_{j \ge 1 \text{ holds}}
+$$
+
+
+Each component depends only on its neighbors, so the Hessian $\mathbf{H}$ is tridiagonal:
+
+$$
+H_{jj} = \underbrace{2 + 12b\,x_j^2 - 4b\,x_{j+1}}_{j \le n-2 \text{ holds}} + \underbrace{2b}_{j \ge 1 \text{ holds}}, \qquad
+H_{j,j+1} = H_{j+1,j} = -4b\,x_j
+$$
+
+
+$a$ does not appear in the Hessian.
+This is because the second derivative of $(a - x_j)^2$ is 2 independently of $a$.
+
+The following block contains definitions shared by both cells; `rosenbrock` corresponds to $f$.
+Write the function once for `R: Real`; the caller chooses a numeric type such as `f64`, `Dual<f64>`, or `Var` on a tape.
+In generic code, place scalars on the right of operators (`-w[0] + a`, `… * b`).
+
+```rust
+//| id: ad-rosenbrock-model
+//| kind: definitions
+//| title: "Generalized Rosenbrock function"
+//| crates: [scioxide-ad]
+use scioxide_ad::Real;
+
+/// f(x) = Σᵢ [(a − xᵢ)² + b (xᵢ₊₁ − xᵢ²)²]（i = 0, …, n − 2）.
+pub(crate) fn rosenbrock<R: Real>(x: &[R], a: f64, b: f64) -> R {
+    x.windows(2)
+        .map(|w| (-w[0] + a).powi(2) + (w[1] - w[0] * w[0]).powi(2) * b)
+        .sum()
+}
+```
+
+## Three ways to obtain a gradient
+
+Forward mode carries a derivative in one direction alongside each value.
+Evaluating with input $x_k + \delta_{kj}\varepsilon$ in `Dual<f64>`, representing the dual number $x + \dot x\,\varepsilon$ ($\varepsilon^2 = 0$), gives $\partial f/\partial x_j$ as the coefficient of $\varepsilon$ in the result.
+$\delta_{kj}$ is 1 when $k = j$ and zero otherwise.
+This unit vector $\mathbf{e}_j$ is called a seed.
+All gradient components require $n$ evaluations; one evaluation of this $f$ costs $O(n)$ operations, giving $O(n^2)$ overall.
+
+Reverse mode records operations on a tape and accumulates adjoints $\bar v = \partial f/\partial v$ in reverse recording order, returning all gradient components in one reverse sweep.
+Its cost is a small constant multiple of one function evaluation, and this multiplier is independent of the input count $n$.
+`value_and_grad(function, point)` creates a new tape, records the function, performs one reverse sweep, and returns the value and a gradient in `scioxide_linalg::Vector`.
+Each call allocates a tape and results; the execution context is fixed to `ExecutionContext::sequential_native()`.
+
+To differentiate the same function at many points, construct a tape with `Tape::<f64>::new(TapeOptions::new())` and repeatedly call `gradient_into(function, point, gradient, cx)`.
+It returns the value and writes the gradient to the caller's array `gradient`.
+`gradient.len() != point.len()` gives `DimensionMismatch`; failure leaves `gradient` unchanged.
+The first recording on an empty tape exceeds capacity but still counts statements.
+The tape grows to the counted size and executes the function again, so one call executes the function at most twice.
+The one-shot `value_and_grad` uses a new tape each time and executes the function twice on every call.
+The function must produce the same recording at the same point (be deterministic).
+If the second execution exceeds the size counted by the first, it returns `InvalidInput` (`Inconsistent`).
+Once a tape has recorded the same function, subsequent calls perform one recording and one reverse sweep without allocating memory.
+`words()` of the `TapeReport` returned by `report()` is the previous recording's statement-word count, including constant and input words.
+For this function, every operation statement occupies one word.
+`recorded_twice()` indicates whether the previous call grew the tape and recorded again.
+
+Pass the tape a closure satisfying `for<'t> Fn(&[Var<'t, f64>]) -> Result<Var<'t, f64>, SciOxideError>`, written directly in the call's argument position.
+Binding it with `let` before passing it prevents inference of this higher-ranked lifetime bound and fails compilation.
+
+Every wrapper takes its value from its inner type (`Primal`), so values of $f$ are bitwise equal when evaluated with `f64`, `Dual`, or a tape.
+For a single operation, reverse-mode derivatives are bitwise equal to derivatives from `Dual`.
+Exceptions are exact zeros becoming $+0$ and rules using IEEE multiplication where an infinite partial derivative multiplies a zero tangent (`Dual` gives NaN while the tape gives a finite value).
+In long recordings, accumulation order for adjoint contributions differs from forward evaluation, so the two agree within rounding error.
+None of these modes has truncation error; differences from closed forms result from a few roundings per component.
+[Forward mode and dual numbers](../../algorithms/forward-mode/) and [Reverse mode and tapes](../../algorithms/reverse-mode-and-replay/) cover mode rules; [Tape lifecycle and reuse](../../algorithms/tape-lifecycle/) covers tape capacity and reuse.
+
+The next cell obtains the gradient at $\mathbf{x} = (p, q, p, q, \dots)$ in three ways and compares it with the closed-form gradient.
+Inputs are dimension $n$ (2–64), coefficients $a$ and $b$, and evaluation-point components $p$ and $q$.
+The defaults $n = 2$ and $(p, q) = (-1.2, 1)$ are the standard initial point for the Rosenbrock function.
+`counted` counts function executions, shown for each method in the table's second column.
+The chart reuses the tape from the second call onward and plots $\lVert\nabla f\rVert_\infty$ on a logarithmic axis along a section moving the even-indexed components through 161 points in $p \in [-2, 2]$.
+The first table shows each method's execution count, value $f$, and difference $\lVert\Delta\nabla f\rVert_\infty$ from the closed form.
+The second shows gradient magnitude, tape word count, whether the first call recorded again, growth in preallocated bytes over the section's 161 points, and the number of zero-gradient points excluded from the chart.
+The checks are that differences from closed forms are at the rounding-error level, values of $f$ are mode-independent, and calls after the first execute the function once without growing preallocation.
+
+```rust
+//| id: ad-rosenbrock-gradient
+//| ref: ad-rosenbrock-gradient
+//| title: "Three gradient methods and closed forms"
+//| run: reactive
+//| uses: [ad-rosenbrock-model]
+//| crates: [scioxide-ad, scioxide-core]
+//| inputs:
+//|   dimension: {"type":"range","label":"Dimension n","description":"Input count. Dual evaluation count is proportional to n.","min":2,"max":64,"step":1,"value":2}
+//|   shift: {"type":"range","label":"Coefficient a [-]","description":"Center of the first term (a − xᵢ)².","min":0.5,"max":2,"step":0.1,"value":1}
+//|   valley: {"type":"range","label":"Valley coefficient b [-]","description":"Steepness of the valley walls.","min":1,"max":1000,"step":1,"value":100}
+//|   even_component: {"type":"range","label":"Even-indexed component p of the evaluation point [-]","description":"p in x = (p, q, p, q, …).","min":-2,"max":2,"step":0.05,"value":-1.2}
+//|   odd_component: {"type":"range","label":"Odd-indexed component q of the evaluation point [-]","description":"q in x = (p, q, p, q, …).","min":-1,"max":4,"step":0.05,"value":1}
+//| cases:
+//|   - {"id":"fifty-inputs","label":"n = 50","description":"Dual requires 50 evaluations; reverse mode still needs one recording and one reverse sweep.","inputs":{"dimension":50}}
+//|   - {"id":"shifted-minimum","label":"a = 2, (p, q) = (2, 4)","description":"At the n = 2 minimizer (a, a²), the gradient is exactly zero.","inputs":{"shift":2,"even_component":2,"odd_component":4}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/0/2","approx":{"value":24.2,"rtol":1e-15}}
+//|       - {"artifact":"methods","path":"/rows/1/1","equals":2}
+//|       - {"artifact":"methods","path":"/rows/1/3","range":{"max":1e-13}}
+//|       - {"artifact":"methods","path":"/rows/2/3","range":{"max":1e-13}}
+//|       - {"artifact":"methods","path":"/rows/3/1","equals":2}
+//|       - {"artifact":"methods","path":"/rows/4/1","equals":1}
+//|       - {"artifact":"methods","path":"/rows/4/2","approx":{"value":24.2,"rtol":1e-15}}
+//|       - {"artifact":"methods","path":"/rows/4/3","range":{"max":1e-13}}
+//|       - {"artifact":"summary","path":"/rows/0/0","approx":{"value":215.6,"rtol":1e-14}}
+//|       - {"artifact":"summary","path":"/rows/0/3","equals":0}
+//|   - case: fifty-inputs
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/1/1","equals":50}
+//|       - {"artifact":"methods","path":"/rows/1/3","range":{"max":1e-12}}
+//|       - {"artifact":"methods","path":"/rows/4/1","equals":1}
+//|       - {"artifact":"methods","path":"/rows/4/3","range":{"max":1e-12}}
+//|       - {"artifact":"summary","path":"/rows/0/3","equals":0}
+//|   - case: shifted-minimum
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/2/2","equals":0}
+//|       - {"artifact":"methods","path":"/rows/2/3","equals":0}
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":0}
+use std::cell::Cell;
+
+use scioxide_ad::{Dual, Real, Tape, TapeOptions, value_and_grad};
+use scioxide_core::ExecutionContext;
+
+// Count function executions in runs.
+fn counted<R: Real>(runs: &Cell<usize>, x: &[R], a: f64, b: f64) -> R {
+    runs.set(runs.get() + 1);
+    rosenbrock(x, a, b)
+}
+
+let n = dimension as usize;
+let (a, b) = (shift, valley);
+let point: Vec<f64> = (0..n)
+    .map(|i| {
+        if i % 2 == 0 {
+            even_component
+        } else {
+            odd_component
+        }
+    })
+    .collect();
+
+// Independent check: manually derived closed-form gradient (f64 arithmetic).
+let closed: Vec<f64> = (0..n)
+    .map(|j| {
+        let x = &point;
+        let mut g = 0.0;
+        if j + 1 < n {
+            g += -2.0 * (a - x[j]) - 4.0 * b * x[j] * (x[j + 1] - x[j] * x[j]);
+        }
+        if j > 0 {
+            g += 2.0 * b * (x[j] - x[j - 1] * x[j - 1]);
+        }
+        g
+    })
+    .collect();
+let max_abs = |v: &[f64]| v.iter().fold(0.0_f64, |m, g| m.max(g.abs()));
+let error = |v: &[f64]| {
+    let d: Vec<f64> = v.iter().zip(&closed).map(|(g, c)| g - c).collect();
+    Some(max_abs(&d))
+};
+let runs = Cell::new(0_usize);
+let plain = counted(&runs, &point, a, b);
+let plain_runs = runs.replace(0);
+
+// Forward mode: one Dual evaluation with seed e_j gives ∂f/∂x_j. Evaluate n times.
+let mut forward = vec![0.0; n];
+let mut forward_value = 0.0;
+for j in 0..n {
+    let seeded: Vec<Dual<f64>> = point
+        .iter()
+        .enumerate()
+        .map(|(k, &x)| Dual::new(x, if k == j { 1.0 } else { 0.0 }))
+        .collect();
+    let result = counted(&runs, &seeded, a, b);
+    forward[j] = result.derivative();
+    forward_value = result.value();
+}
+let forward_runs = runs.replace(0);
+
+// Reverse-mode one-shot call: record on a new tape and perform one reverse sweep.
+let (one_shot_value, reverse) =
+    value_and_grad(|x| Ok(counted(&runs, x, a, b)), &point).map_err(|e| e.to_string())?;
+let one_shot_runs = runs.replace(0);
+
+// Caller-owned tape: determine capacity on the first call, then perform one recording and one reverse sweep per call.
+let cx = ExecutionContext::sequential();
+let mut tape = Tape::<f64>::new(TapeOptions::new());
+let mut first = vec![0.0; n];
+let first_value = tape
+    .gradient_into(|x| Ok(counted(&runs, x, a, b)), &point, &mut first, cx)
+    .map_err(|e| e.to_string())?;
+let first_runs = runs.replace(0);
+let first_twice = tape.report().recorded_twice();
+let mut warm = vec![0.0; n];
+let warm_value = tape
+    .gradient_into(|x| Ok(counted(&runs, x, a, b)), &point, &mut warm, cx)
+    .map_err(|e| e.to_string())?;
+let warm_runs = runs.replace(0);
+let words = tape.report().words();
+
+// Obtain gradients at 161 points on the section x = (s, q, s, q, …) with the same tape.
+let reserved = tape.reserved_bytes();
+let mut section = Vec::new();
+let mut omitted = 0_usize;
+let mut gradient = vec![0.0; n];
+let mut moving = point.clone();
+for i in 0..=160 {
+    let s = -2.0 + 4.0 * f64::from(i) / 160.0;
+    for k in (0..n).step_by(2) {
+        moving[k] = s;
+    }
+    tape.gradient_into(|x| Ok(rosenbrock(x, a, b)), &moving, &mut gradient, cx)
+        .map_err(|e| e.to_string())?;
+    let size = max_abs(&gradient);
+    // Exclude zero-gradient points that cannot be plotted logarithmically and tabulate their count.
+    if size > 0.0 {
+        section.push([s, size]);
+    } else {
+        omitted += 1;
+    }
+}
+let growth = tape.reserved_bytes() - reserved;
+emit_line_chart!(
+    &vec![serde_json::json!({ "name": "‖∇f‖∞（gradient_into）", "points": section })],
+    options = &serde_json::json!({
+        "xLabel": "Section coordinate p [-] (q is the input value)",
+        "yLabel": "Gradient magnitude ‖∇f‖∞ [-]",
+        "yType": "log",
+        "xMin": -2.0,
+        "xMax": 2.0,
+        "annotations": [
+            { "kind": "line", "axis": "x", "value": even_component, "label": "Selected p" }
+        ]
+    })
+);
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let digits = serde_json::json!({ "significantDigits": 12 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Method" },
+    { "key": "1", "label": "Function executions [count]", "type": "integer" },
+    { "key": "2", "label": "Value f [-]", "type": "number", "format": digits },
+    {
+        "key": "3",
+        "label": "Difference from closed form ‖Δ∇f‖∞ [-]",
+        "type": "number",
+        "format": sci3,
+        "nullText": "No gradient"
+    }
+]);
+emit_table_with_columns!(
+    columns,
+    vec![
+        ("f64 (no differentiation)", plain_runs, plain, None),
+        (
+            "Dual (n evaluations with seeds e_j)",
+            forward_runs,
+            forward_value,
+            error(&forward)
+        ),
+        (
+            "value_and_grad",
+            one_shot_runs,
+            one_shot_value,
+            error(reverse.as_slice())
+        ),
+        (
+            "Tape::gradient_into (first call)",
+            first_runs,
+            first_value,
+            error(&first)
+        ),
+        (
+            "Tape::gradient_into (second call)",
+            warm_runs,
+            warm_value,
+            error(&warm)
+        ),
+    ],
+    metadata = serde_json::json!({ "id": "methods" })
+);
+let summary_columns = serde_json::json!([
+    { "key": "0", "label": "‖∇f‖∞ (closed form) [-]", "type": "number", "format": digits },
+    { "key": "1", "label": "Tape word count [words]", "type": "integer" },
+    { "key": "2", "label": "Recorded again on first call" },
+    { "key": "3", "label": "Preallocation growth over 161 section points [B]", "type": "integer" },
+    { "key": "4", "label": "Zero-gradient points excluded from chart [count]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    summary_columns,
+    vec![(
+        max_abs(&closed),
+        words,
+        if first_twice { "Yes" } else { "No" },
+        growth,
+        omitted,
+    )],
+    metadata = serde_json::json!({ "id": "summary" })
+);
+```
+
+At the defaults, $f = 24.2$ and the closed-form gradient is $(-215.6, -88)$.
+All five rows have the same value `24.199999999999996` for $f$, independent of differentiation mode.
+Gradients from the four modes agree with the closed form to a difference of $2.8 \times 10^{-14}$, one ulp ($2^{-45}$) of the largest component, 215.6.
+Execution counts are $n = 2$ for `Dual`, two for `value_and_grad` and the first `gradient_into` on an empty tape, and one for the second `gradient_into`.
+An empty tape needs two executions because the first counts statements and grows the tape, and the second records them (“Recorded again on first call” is “Yes” in the second table).
+The tape has 10 words (including three for the constant and two inputs), and its preallocated byte count did not grow while computing all 161 section points with the same tape.
+
+In the chart, $\lVert\nabla f\rVert_\infty$ is about 2400 on the walls at $p = \pm 2$ and 215.6 at the selected $p = -1.2$.
+It falls to 4 at $p = -1$ where the section crosses the valley floor $q = p^2$; at $p = 1$, the minimizer $(1, 1)$, the gradient is exactly zero, so that one point is excluded from the logarithmic chart.
+Moving $p$ just 0.025 from the minimum to $p = 0.975$ gives a value around 19, revealing the narrow valley through the rapid change in gradient magnitude.
+
+At $n = 50$, `Dual` executions increase to 50, while reverse mode still needs one recording (two on an empty tape) and one reverse sweep.
+The tape has 442 words, nearly proportional to $n$ (about nine words per term).
+The difference from the closed form remains $2.8 \times 10^{-14}$, at the rounding-error level relative to $\lVert\nabla f\rVert_\infty = 792$.
+$a = 2$ and $(p, q) = (2, 4)$ give the minimizer $(a, a^2)$ for $n = 2$; every mode returns an exactly zero gradient and $f = 0$.
+
+## Valley-floor Hessian and curvature
+
+Now restrict attention to $f(x, y) = (a - x)^2 + b\,(y - x^2)^2$ with $n = 2$ and examine curvature at the point $(t, t^2)$ on the valley floor $y = x^2$.
+Setting $n = 2$ and $y = x^2$ in the tridiagonal formulas above gives
+
+$$
+\mathbf{H}(t, t^2) = \begin{bmatrix} 2 + 8b\,t^2 & -4b\,t \\ -4b\,t & 2b \end{bmatrix}, \qquad
+\det\mathbf{H} = 4b, \qquad
+\tau = \operatorname{tr}\mathbf{H} = 2 + 2b + 8b\,t^2
+$$
+
+with determinant $4b$ everywhere on the valley floor.
+The eigenvalues are
+
+$$
+\lambda_\pm = \frac{\tau \pm \sqrt{\tau^2 - 16b}}{2}, \qquad \lambda_- = \frac{4b}{\lambda_+}
+$$
+
+where the smaller one is computed in the right-hand form to avoid cancellation.
+For large $b$, $\lambda_+ \approx \tau$ and $\lambda_- \approx 4b/\tau$ give the condition-number approximation $\kappa \approx \tau^2/(4b) \approx b\,(1 + 4t^2)^2$ for $\kappa = \lambda_+/\lambda_-$.
+
+From $\mathbf{H}$ above, curvatures (second directional derivatives) in the unit tangent direction $\mathbf{d} = (1, 2t)/\sqrt{1 + 4t^2}$ and unit normal direction $\mathbf{m} = (-2t, 1)/\sqrt{1 + 4t^2}$ of the valley floor are
+
+$$
+\mathbf{d}^\mathsf{T}\mathbf{H}\,\mathbf{d} = \frac{2}{1 + 4t^2}, \qquad
+\mathbf{m}^\mathsf{T}\mathbf{H}\,\mathbf{m} = \frac{8t^2}{1 + 4t^2} + 2b\,(1 + 4t^2)
+$$
+
+
+Curvature along the valley is independent of $b$, while curvature across it grows proportionally to $b$.
+The Rayleigh quotient $\mathbf{u}^\mathsf{T}\mathbf{H}\mathbf{u}$ of a unit vector $\mathbf{u}$ lies between a symmetric matrix's minimum and maximum eigenvalues, so $\lambda_- \le \mathbf{d}^\mathsf{T}\mathbf{H}\mathbf{d}$ and $\mathbf{m}^\mathsf{T}\mathbf{H}\mathbf{m} \le \lambda_+$.
+Since $\mathbf{d}$ and $\mathbf{m}$ are orthonormal, the sum of the two curvatures equals $\operatorname{tr}\mathbf{H} = \lambda_+ + \lambda_-$.
+Their product is $4b + 16t^2/(1 + 4t^2)^2$, close to $\lambda_+\lambda_- = \det\mathbf{H} = 4b$ when $b$ is large.
+Equal sums and similar products give $\lambda_- \approx \mathbf{d}^\mathsf{T}\mathbf{H}\mathbf{d}$ and $\lambda_+ \approx \mathbf{m}^\mathsf{T}\mathbf{H}\mathbf{m}$ for large $b$, with eigenvectors nearly aligned with the valley's tangent and normal.
+
+The condition number expresses the slow progress of gradient methods.
+Approximating $f$ quadratically near the minimizer and applying steepest descent with exact line search gives a worst-case per-iteration contraction factor $\bigl((\kappa - 1)/(\kappa + 1)\bigr)^2$ for $f - f^*$.
+At the minimizer $t = 1$ with $b = 100$ and $\kappa \approx 2508$, this factor is about $0.9984$, requiring about 1440 iterations to reduce $f - f^*$ by one order of magnitude.
+
+`hessian(function, point)` returns the dense Hessian as a row-major `scioxide_linalg::Matrix`.
+It records the function once per unit direction $\mathbf{e}_j$ on the dual-number tape `Tape<Dual<f64>>` and obtains column $j$, $\mathbf{H}\mathbf{e}_j$, by a reverse sweep (forward-over-reverse).
+The cost is $n$ times a small constant multiple of a gradient computation.
+A new tape is used on every call, adding one initial execution to count statements for $n + 1$ function executions in total.
+The function type is `for<'t> Fn(&[Var<'t, Dual<f64>>]) -> Result<Var<'t, Dual<f64>>, SciOxideError>`, so generic `rosenbrock` can be used directly.
+[Hessians and Hessian–vector products](../hessian-vector-product/) and [Second derivatives and Hessian operators](../../algorithms/second-order-derivatives/) cover Hessians and vector products in detail.
+
+$H_{01}$ and $H_{10}$ come from separate recordings and can generally differ by rounding.
+Eigenvalues use scioxide-linalg's `HermitianEigenvaluesResult::compute` with input interpreted as `HermitianInput::Projected(HermitianProjectionPolicy::Always)` to use $(\mathbf{H} + \mathbf{H}^\mathsf{T})/2$.
+Eigenvalues are sorted in ascending order.
+A backward-stable symmetric eigensolver has error on the order of $\varepsilon\lVert\mathbf{H}\rVert_2 = \varepsilon\lambda_+$, so relative error of $\lambda_-$ can grow to the order of $\varepsilon\kappa$.
+This reflects poor conditioning of the small eigenvalue, rather than AD error ([Floating-point numbers and conditioning](../../../concepts/floating-point-and-conditioning/)).
+
+The next cell selects valley coefficient $b$ and valley-floor position $t$, obtains the Hessian at $(t, t^2)$ with `hessian`, and compares eigenvalues, condition numbers, and curvatures along and across the valley with closed forms.
+The chart plots $\lambda_+$ and $\lambda_-$ from AD Hessians (symbols) and the two closed-form directional curvatures (dashed) on a logarithmic axis at 61 points in $t \in [-1.5, 1.5]$.
+The table shows quantities and relative differences at the selected $t$.
+AD directional curvatures are computed from AD entries and tangent $(1, 2t)$ and normal $(-2t, 1)$.
+The checks are that entries and directional curvatures agree with closed forms and the relative difference in $\lambda_-$ lies within $\varepsilon\kappa$.
+
+```rust
+//| id: ad-rosenbrock-valley-curvature
+//| ref: ad-rosenbrock-valley-curvature
+//| title: "Valley-floor Hessian, eigenvalues, and directional curvatures"
+//| run: reactive
+//| uses: [ad-rosenbrock-model]
+//| crates: [scioxide-ad, scioxide-linalg]
+//| inputs:
+//|   valley: {"type":"range","label":"Valley coefficient b [-]","description":"Steepness of the valley walls.","min":1,"max":1000,"step":1,"value":100}
+//|   position: {"type":"range","label":"Valley-floor position t [-]","description":"Evaluation point (t, t²). t = 1 is the minimizer for a = 1.","min":-1.5,"max":1.5,"step":0.05,"value":1}
+//| cases:
+//|   - {"id":"valley-origin","label":"t = 0","description":"H = diag(2, 2b); its condition number equals b.","inputs":{"position":0}}
+//|   - {"id":"narrow-valley","label":"b = 1000, t = 1.5","description":"The condition number is about 10⁵, increasing the relative difference in λ₋.","inputs":{"valley":1000,"position":1.5}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"curvature","path":"/rows/0/1","approx":{"value":802,"rtol":1e-15}}
+//|       - {"artifact":"curvature","path":"/rows/1/1","approx":{"value":-400,"rtol":1e-15}}
+//|       - {"artifact":"curvature","path":"/rows/3/1","approx":{"value":200,"rtol":1e-15}}
+//|       - {"artifact":"curvature","path":"/rows/6/1","approx":{"value":2508.0096,"rtol":1e-8}}
+//|       - {"artifact":"curvature","path":"/rows/5/3","range":{"max":6e-13}}
+//|       - {"artifact":"curvature","path":"/rows/7/1","approx":{"value":0.4,"rtol":1e-14}}
+//|       - {"artifact":"curvature","path":"/rows/8/1","approx":{"value":1001.6,"rtol":1e-14}}
+//|   - case: valley-origin
+//|     expect:
+//|       - {"artifact":"curvature","path":"/rows/6/1","approx":{"value":100,"rtol":1e-13}}
+//|       - {"artifact":"curvature","path":"/rows/1/3","equals":null}
+//|   - case: narrow-valley
+//|     expect:
+//|       - {"artifact":"curvature","path":"/rows/6/1","approx":{"value":100018.001,"rtol":1e-8}}
+//|       - {"artifact":"curvature","path":"/rows/5/3","range":{"max":2.2e-11}}
+//|       - {"artifact":"curvature","path":"/rows/7/3","range":{"max":1e-14}}
+use scioxide_ad::hessian;
+use scioxide_linalg::{HermitianEigenvaluesResult, HermitianInput, HermitianProjectionPolicy};
+
+let b = valley;
+// AD Hessian (row-major) and scioxide-linalg eigenvalues λ₋ ≤ λ₊. Use a = 1 because a does not appear in the Hessian.
+let curvature = |t: f64| -> Result<([f64; 4], f64, f64), String> {
+    let h = hessian(|x| Ok(rosenbrock(x, 1.0, b)), &[t, t * t]).map_err(|e| e.to_string())?;
+    let values = HermitianEigenvaluesResult::compute(
+        &h,
+        HermitianInput::Projected(HermitianProjectionPolicy::Always),
+    )
+    .map_err(|e| e.to_string())?;
+    let entries = <[f64; 4]>::try_from(h.as_slice()).map_err(|_| "Not 2×2".to_string())?;
+    Ok((entries, values.eigenvalues()[0], values.eigenvalues()[1]))
+};
+// Independent check: valley-floor closed forms (f64 arithmetic and inherent sqrt). τ = 2 + 2b + 8bt², det H = 4b.
+let along = |t: f64| 2.0 / (1.0 + 4.0 * t * t);
+let across = |t: f64| 8.0 * t * t / (1.0 + 4.0 * t * t) + 2.0 * b * (1.0 + 4.0 * t * t);
+let eigen = |t: f64| {
+    let trace = 2.0 + 2.0 * b + 8.0 * b * t * t;
+    let large = 0.5 * (trace + (trace * trace - 16.0 * b).sqrt());
+    (4.0 * b / large, large)
+};
+
+let mut large_points = Vec::new();
+let mut small_points = Vec::new();
+let mut along_curve = Vec::new();
+let mut across_curve = Vec::new();
+for i in 0..=60 {
+    let t = -1.5 + 3.0 * f64::from(i) / 60.0;
+    let (_, small, large) = curvature(t)?;
+    large_points.push([t, large]);
+    small_points.push([t, small]);
+    along_curve.push([t, along(t)]);
+    across_curve.push([t, across(t)]);
+}
+let scatter = |id: &str, name: &str, points: &Vec<[f64; 2]>, symbol: &str| {
+    serde_json::json!({
+        "id": id,
+        "kind": "scatter",
+        "name": name,
+        "points": points,
+        "style": { "symbol": symbol }
+    })
+};
+let dashed = |id: &str, name: &str, points: &Vec<[f64; 2]>| {
+    serde_json::json!({
+        "id": id,
+        "kind": "line",
+        "name": name,
+        "points": points,
+        "style": { "lineType": "dashed", "showSymbol": false }
+    })
+};
+emit_chart!(serde_json::json!({
+    "kind": "xy",
+    "dataZoom": true,
+    "tooltip": true,
+    "xLabel": "Valley-floor position t [-]",
+    "yLabel": "Curvature [-]",
+    "yType": "log",
+    "xMin": -1.5,
+    "xMax": 1.5,
+    "layers": [
+        scatter("large", "λ₊ (hessian and eigensolver)", &large_points, "circle"),
+        scatter("small", "λ₋ (hessian and eigensolver)", &small_points, "diamond"),
+        dashed("across", "Curvature across valley mᵀHm (closed form)", &across_curve),
+        dashed("along", "Curvature along valley dᵀHd (closed form)", &along_curve)
+    ],
+    "annotations": [{ "kind": "line", "axis": "x", "value": position, "label": "Selected t" }]
+}));
+
+let t = position;
+let (h, small, large) = curvature(t)?;
+let (exact_small, exact_large) = eigen(t);
+let exact_h = [2.0 + 8.0 * b * t * t, -4.0 * b * t, -4.0 * b * t, 2.0 * b];
+// Compute tangent (1, 2t) and normal (−2t, 1) curvatures from AD entries and divide by squared length 1 + 4t².
+let stretch = 1.0 + 4.0 * t * t;
+let off = 0.5 * (h[1] + h[2]);
+let along_ad = (h[0] + 4.0 * t * off + 4.0 * t * t * h[3]) / stretch;
+let across_ad = (4.0 * t * t * h[0] - 4.0 * t * off + h[3]) / stretch;
+let relative = |ad: f64, exact: f64| (exact != 0.0).then(|| (ad - exact).abs() / exact.abs());
+let rows: Vec<(&str, f64, f64, Option<f64>)> = [
+    ("H₀₀", h[0], exact_h[0]),
+    ("H₀₁", h[1], exact_h[1]),
+    ("H₁₀", h[2], exact_h[2]),
+    ("H₁₁", h[3], exact_h[3]),
+    ("λ₊", large, exact_large),
+    ("λ₋", small, exact_small),
+    ("κ = λ₊/λ₋", large / small, exact_large / exact_small),
+    ("Curvature along valley dᵀHd", along_ad, along(t)),
+    ("Curvature across valley mᵀHm", across_ad, across(t)),
+]
+.into_iter()
+.map(|(name, ad, exact)| (name, ad, exact, relative(ad, exact)))
+.collect();
+let digits = serde_json::json!({ "significantDigits": 10 });
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Quantity" },
+    { "key": "1", "label": "AD and scioxide-linalg [-]", "type": "number", "format": digits },
+    { "key": "2", "label": "Closed form [-]", "type": "number", "format": digits },
+    { "key": "3", "label": "Relative difference [-]", "type": "number", "format": sci3, "nullText": "Closed form is zero" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "curvature" })
+);
+```
+
+At the defaults $b = 100$ and $t = 1$, entries from `hessian` agree with closed forms $H_{00} = 802$, $H_{01} = H_{10} = -400$, and $H_{11} = 200$, and both off-diagonal entries are bitwise equal.
+Eigenvalues are $\lambda_+ = 1001.6006$ and $\lambda_- = 0.39936$, and the condition number is $\kappa = 2508.0$.
+The relative difference in $\lambda_-$ is $4.0 \times 10^{-14}$, within $\varepsilon\kappa = 5.6 \times 10^{-13}$.
+Curvature along the valley is $0.4$ and across it $1001.6$, close to $\lambda_-$ and $\lambda_+$ respectively, and satisfying the Rayleigh-quotient inequalities $\lambda_- \le 0.4$ and $1001.6 \le \lambda_+$.
+
+In the chart, $\lambda_+$ symbols nearly overlap the dashed cross-valley curvature, while $\lambda_-$ symbols nearly overlap the dashed along-valley curvature.
+At $t = \pm 1.5$, $\lambda_+ = 2001.8$ and $\lambda_- = 0.1998$; the condition number varies with valley-floor position from 100 at $t = 0$ to about $10^4$.
+At $t = 0$, $\mathbf{H} = \operatorname{diag}(2, 2b)$, so eigenvalues equal the two directional curvatures and $\kappa = b = 100$.
+Off-diagonal entries are zero at this point, so the table leaves their relative difference undefined.
+
+At $b = 1000$ and $t = 1.5$, $\kappa = 1.0002 \times 10^5$, close to the approximation $b(1 + 4t^2)^2 = 10^5$.
+Entries and directional curvatures still agree with closed forms, but the relative difference in $\lambda_-$ grows to $6.3 \times 10^{-13}$, within $\varepsilon\kappa = 2.2 \times 10^{-11}$.
+Since entries agree with closed forms, this difference arises from computing the small eigenvalue on the scale of $\lVert\mathbf{H}\rVert_2$.
+
+## Summary
+
+`Dual` returns one partial derivative per forward evaluation with seed $\mathbf{e}_j$, so a gradient requires $n$ evaluations.
+Reverse mode returns the gradient with one recording and one reverse sweep independently of $n$; at the defaults, all three methods agree with closed forms to one ulp of the largest component.
+For differentiating the same function at many points, create one tape and repeat `gradient_into`; from the second call onward, the function executes once and no memory is allocated.
+The valley-floor Hessian from `hessian` matches the closed form; the ratio between along-valley curvature $2/(1 + 4t^2)$ and cross-valley curvature $\approx 2b(1 + 4t^2)$ determines the condition number $\kappa \approx b(1 + 4t^2)^2$.
+Relative error in small eigenvalues can grow to the order of $\varepsilon\kappa$; interpret it separately from AD accuracy.
+
+## Further reading
+
+- [Duality of JVPs and VJPs](../jvp-vjp-duality/): examine how forward- and reverse-mode products give columns and rows of the same Jacobian, and the sweep counts for assembling it.
+- [Hessians and Hessian–vector products](../hessian-vector-product/): examine Newton–CG, which uses curvature without forming a dense Hessian.
+- [Sparse Hessian recovery by coloring](../sparse-hessian-chain/): examine recovery of sparse Hessians such as tridiagonal matrices with fewer than $n$ recordings.
+- [Tape lifecycle and reuse](../../algorithms/tape-lifecycle/): examine tape capacity, rerecording, and allocation-free reuse.

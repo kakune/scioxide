@@ -1,0 +1,812 @@
+---
+title: 構造パターンと疎な微分の復元
+description: 記録から求めるヤコビ行列とヘッセ行列の構造パターン（jacobian_pattern、hessian_pattern）と有効な点の範囲、scioxide_sparse::derivative_coloring の列彩色による直接復元の原理、sparse_jacobian_into と sparse_hessian_into の仕様と関数の実行回数、ワンショット呼び出しの sparse_jacobian と sparse_hessian、密な結果とビット単位で一致する範囲、色の数が変数の並べ方で変わることを確かめる。
+sidebar:
+  order: 340
+references:
+  ad-structural-patterns: "記録から求める構造パターン"
+  ad-sparse-recovery: "列彩色による疎な復元"
+  ad-sparse-recovery-methods: "sparse_jacobian_into-と-sparse_hessian_into"
+  ad-sparse-hessian-executions: "疎なヘッセ行列の復元と関数の実行回数"
+  ad-sparse-one-shot-methods: "ワンショット呼び出しの-sparse_jacobian-と-sparse_hessian"
+  ad-sparse-one-shot-check: "ワンショット呼び出しと-_into-の経路の一致"
+---
+
+離散化した微分方程式、粒子の鎖、部分的に分離できる和のように、各成分が少数の変数にしか依存しない関数では、ヤコビ行列 $J$ やヘッセ行列 $H$ の成分のほとんどが構造的に 0 である。
+密な $m \times n$ の $J$ は前進走査を $n$ 回か逆走査を $m$ 回、密な $n \times n$ の $H$ はヘッセ行列・ベクトル積を $n$ 回行って求める。
+非零になりうる位置が分かっていれば、どの行でも重ならない列をまとめてシードにし、まとめた組の数 $p$ だけの走査ですべての非零を復元できる。
+このページは記録から非零になりうる位置（構造パターン）を求める方法、列彩色による復元の原理と `scioxide-ad` の関数、色の数が変数の並べ方で変わることを説明する。
+`linearize` と前進走査は[逆モードとテープ](../reverse-mode-and-replay/)、ヘッセ行列・ベクトル積と `hvp_into` は[二階微分とヘッセ行列の作用素](../second-order-derivatives/)で説明する。
+
+## 記録から求める構造パターン
+
+疎な行列を少ない回数の方向微分で求めるには、まず非零になりうる位置の集合（構造パターン）が要る。
+`Linearization` は記録をたどって、評価点の値を使わずにこの集合を求める。
+結果は `scioxide_core::StructuralPattern`（行ごとに列番号を昇順に並べた CSR の構造）で、呼び出しごとに確保して返す（[疎構造と列彩色](../../../scioxide-core/algorithms/sparse-structure-and-coloring/)）。
+
+`jacobian_pattern()` は $m \times n$ のパターンを返し、出力 $i$ が記録された文を通して入力 $j$ に依存するとき位置 $(i, j)$ を含める。
+記録を前から 1 回たどり、各値が依存する入力の集合（index domain）を、引数の集合の和として伝える。
+呼び出し文（`solve_into` などが記録する 1 文）の出力は、その呼び出しのすべての入力に依存するとみなす。
+これは構造上の依存なので、評価点でたまたま 0 になる偏導関数（$x_0 x_1$ の $x_1 = 0$ での $\partial/\partial x_0$ など）の位置も含む。
+微分対象外の値（入力に依存しない値）だけの演算は記録されないので、依存を作らない。
+
+`hessian_pattern()` は、出力がちょうど 1 つの記録について $n \times n$ のパターンを返し、そうでなければ `DimensionMismatch` を返す。
+出力が依存する文だけを対象に、非線形な相互作用の領域（nonlinear interaction domains、Walther 2008）を集める。
+引数の入力集合を $D(\cdot)$ と書くと、各文は次の位置を加える。
+
+- 非線形な 1 引数の文 $\phi(a)$（`exp`、`powi` など）は $D(a) \times D(a)$ を加える。
+- 積 $a \cdot b$ は $D(a) \times D(b)$ と $D(b) \times D(a)$ を加える。
+  `dot` の 1 文は掛け合わせる成分の組ごとに同じ位置を加える。
+- 非線形な 2 引数の文 $\phi(a, b)$、`combine` の 1 文、呼び出し文は、すべての引数の集合の和 $U$ について $U \times U$ を加える。
+- 和、差、定数倍、`select` のような線形の文は何も加えない。
+
+パターンは真のヘッセ行列の非零を必ず含むが、打ち消しで 0 になる位置も含む。
+たとえば $f = (x_0 + x_1)^2 - x_0^2 - 2x_0x_1$ の真のヘッセ行列は $\operatorname{diag}(0, 2)$ だが、$(x_0 + x_1)^2$ の文が $\{0, 1\}^2$ を加えるので、パターンは $2 \times 2$ のすべての位置を含む。
+
+テープは実際に通った分岐だけを記録するので、どちらのパターンも記録した点と同じ分岐をとる点でだけ有効である（[分岐・マスク・表引き](../control-flow/)）。
+パターンを格納できなければ `AllocationFailure` を返す。
+
+## 列彩色による疎な復元
+
+$m \times n$ の $J$ の列 $j$ と列 $k$ がどの行でも同時に非零にならないとき、2 つの列は構造的に直交するという。
+列を色 $C_0, \dots, C_{p-1}$ に分け、同じ色の列がすべて互いに構造的に直交するようにすると、色 $c$ の圧縮したシード $d_c = \sum_{j \in C_c} e_j$ による積 $J d_c$ の第 $i$ 成分は、行 $i$ で非零になりうる $C_c$ のただ 1 つの列 $j$ の成分 $J_{ij}$ に等しい。
+$p$ 回の方向微分ですべての非零成分が読み出せ、引き算や連立方程式の解は要らない（直接復元、Curtis–Powell–Reid の列圧縮）。
+1 つの行の非零の列はすべて異なる色を要するので、色の数 $p$ は行あたりの非零の最大数 $\rho_{\max}$ 以上になる。
+最小の色の数を求める問題は NP 困難である（Coleman–Moré, 1983）。
+
+`scioxide_sparse::derivative_coloring(pattern.view())` は、列を番号の昇順に見て、同じ行に位置を持つ色付きの列が使っていない最小の色を割り当てる貪欲法で、列交差グラフ（同じ行に位置を持つ列どうしを結ぶグラフ）の距離 1 彩色を求める（[並べ替えと彩色](../../../scioxide-sparse/algorithms/orderings-and-coloring/)）。
+結果は `ColoringKind::DerivativeColumns` の `ColoringSchedule` で、最小の色の数は保証しない。
+得られる色の数は列の並べ方で変わる。
+
+### sparse_jacobian_into と sparse_hessian_into
+
+- `Linearization::sparse_jacobian_into(coloring, values, context)` は、色ごとに 1 回の前進走査を記録の上で行い、$J$ の成分を `coloring` のパターンの CSR の順に `values` に書く。
+  関数は実行し直さないので、関数の実行は `linearize` の記録の分だけである。
+  パターンは $J$ のパターンを含めばよく、余分な位置には 0 が入る。
+  値は列ごとの前進走査で求めた密なヤコビ行列（`JacobianMode::Forward` の `jacobian_into`）とビット単位で一致する。
+  行ごとの逆走査で求めた密な行列（`JacobianMode::Reverse`）とは、足し込みの順序が違うので丸めの範囲で一致する。
+- `Tape<Dual<S>>` の `sparse_hessian_into(function, point, coloring, values, context)` は、色ごとに $d_c$ をシードにして関数を 1 回記録し、$H_{ij}$ を $(H d_{c(j)})_i$ から直接読む（$c(j)$ は列 $j$ の色）。
+  新しいテープでは文の数を数えるための実行が 1 回加わるので、関数の実行は色の数より 1 回多い。
+  `coloring` は、ヘッセ行列のパターンを含むパターン（たとえば `hessian_pattern()`）の列彩色でなければならない。
+  対称性を使って色を減らす星彩色（star coloring）や置換による復元は提供しないので、$H_{ij}$ と $H_{ji}$ は別の記録から読まれる。
+- `Tape<Dual<S>>` の `hessian_pattern(function, point, context)` は、`sparse_hessian_into` と同じクロージャを方向 0 で 1 回記録して、ヘッセ行列のパターンを返す。
+  パターンは同じ関数を `Tape<S>` に記録した `Linearization::hessian_pattern` と等しく、テープは `linearize` の後と同じ状態に残る。
+  パターン、彩色、`sparse_hessian_into` を 1 本のテープと 1 つのクロージャで済ませられる。
+
+どちらの積も、`coloring` が `ColoringKind::DerivativeColumns` の彩色（`derivative_coloring` の結果）でなければ `InvalidInput`（引数 `coloring`、`UnsupportedConfiguration`）を返す。
+`scioxide_sparse::distance_one_coloring` の距離 1 彩色は隣り合う頂点だけを別の色にするので、同じ行に非零を持つ 2 列が同じ色になりえて、直接復元では成分が足し合わされる。
+パターンが $m \times n$（ヘッセ行列では $n \times n$）でないか、`values` の長さが非零の数と違えば `DimensionMismatch` を返す。
+ほかの失敗はそれぞれ `jvp_into` と `hvp_into` と同じで、失敗したとき `values` は書き換えない。
+値を並べる段階の配列は初回にテープの中に確保され、2 回目以降は確保しない。
+パターンが実際の非零を欠くと、欠けた成分は失われるか、同じ色の別の成分に混ざり、エラーにはならない。
+
+### ワンショット呼び出しの sparse_jacobian と sparse_hessian
+
+`sparse_jacobian(function, point)` は関数を新しい `Tape<S>` に記録し、`jacobian_pattern`、`derivative_coloring`、`sparse_jacobian_into` を順に行って、$J$ を scioxide-sparse の `CsrMatrix` で返す。
+`sparse_hessian(function, point)` は新しい `Tape<Dual<S>>` で `hessian_pattern`、`derivative_coloring`、`sparse_hessian_into` を行い、$H$ を `CsrMatrix` で返す。
+格納する位置はパターンのとおりで、打ち消しで 0 になる位置には 0 が入る。
+値は `_into` の経路の値と同じで、`sparse_jacobian` は列ごとの前進走査の密なヤコビ行列と、`sparse_hessian` は `hessian` とビット単位で一致する。
+`CsrMatrix` は有限の値しか持たないので、復元した値に NaN か無限大があると、`NonFinitePolicy` によらず `NonFinite` を返す（`_into` の形はその値を書く）。
+出力のない関数の `sparse_jacobian` は $0 \times n$ の行列を返す。
+呼び出しのたびにテープ、パターン、彩色、行列を確保するので、同じ構造で何度も求めるときはパターンと彩色を残して `_into` の形を呼ぶ。
+
+## ばねの鎖の帯構造
+
+このページのセルは[二階微分とヘッセ行列の作用素](../second-order-derivatives/)と同じ非線形のばねの鎖を使う。
+直線上の $n$ 個の変数 $x_0, \dots, x_{n-1}$ のうち、到達距離 $b$ までの組 $(i, i + d)$（$1 \le d \le b$）を、伸び $u = x_{i+d} - x_i$ のエネルギーが $\varphi(u) = u^2 + u^4$ のばねでつなぐ。
+全エネルギーを $E$、ばねの張力 $\varphi'(u_k) = 2u_k + 4u_k^3$ を並べた写像を $F: \mathbb{R}^n \to \mathbb{R}^m$ とする。
+ばねの番号 $k$ は $d$ の昇順、同じ $d$ の中で $i$ の昇順に付け、ばねの数は $m = \sum_{d=1}^{b}(n - d)$ である。
+ばね $k = (i, i + d)$ の行の第 $i$ 列が $-1$、第 $i + d$ 列が $+1$ の $m \times n$ の差分行列を $D$ とすると、$\nabla E = D^{\mathsf T} F$ であり、
+
+$$
+J_F = \operatorname{diag}(\varphi''(u))\,D, \qquad
+J_{\nabla E} = H_E = D^{\mathsf T} \operatorname{diag}(\varphi''(u))\,D
+$$
+
+が成り立つ（$\varphi''(u) = 2 + 12u^2$）。
+
+$J_F$ の行 $k$ はばねの両端の 2 列だけに非零を持ち、非零の数は $2m$ である。
+$H_E$ は半帯幅 $b$ の帯行列で、$1 \le |i - j| \le b$ の成分は $-\varphi''(x_j - x_i)$、対角成分は $x_i$ を含むばねの $\varphi''$ の和であり、非零の数は $n + 2\sum_{d=1}^{b}(n - d) = n(2b + 1) - b(b + 1)$ である。
+列交差グラフでは、$J_F$ の列 $j$ と $k$ は $1 \le |j - k| \le b$ のとき、$H_E$ の列は $1 \le |j - k| \le 2b$ のときに結ばれる。
+隣り合う $b + 1$ 本（$H_E$ では $2b + 1$ 本）の列はどの 2 本も結ばれるので、色の数は $J_F$ で $b + 1$ 以上、$H_E$ で $2b + 1$ 以上である。
+$J_F$ の行あたりの非零は 2 つなので、$J_F$ ではこの下限が $\rho_{\max}$ による下限より強い。
+評価点は $x_i = 0.3 \sin(1.7\,i)$ とする。
+
+次の定義のブロックは $E$ を `chain_energy`、$F$ を `bond_tensions`、評価点を `chain_point` として、どの数値型でも動く汎用関数で書く。
+`energy_gradient` は $\nabla E = D^{\mathsf T} F$ を手で書いた写像で、そのヤコビ行列が $H_E$ になる。
+`chain_energy` の引数 `place` は鎖の $i$ 番目の変数を入力ベクトルの何番目に置くかを表し、変数の並べ方を変える実験に使う。
+`chain_placement` はその並べ方（自然な順と、偶数番を先に置く順）を作る。
+`spring_curvature` と `chain_hessian_entry` は $\varphi''$ と $H_E$ の成分を閉形式から `f64` で計算する独立な検算である。
+
+```rust
+//| id: ad-sparse-spring-chain-model
+//| kind: definitions
+//| title: 非線形ばねの鎖のエネルギー・張力・勾配と閉形式の 2 階微分
+//| crates: [scioxide-ad, scioxide-core]
+use scioxide_ad::Real;
+use scioxide_core::RealScalar;
+
+/// 評価点 xᵢ = 0.3 sin(1.7 i)（入力データ）。
+pub(crate) fn chain_point(n: usize) -> Vec<f64> {
+    (0..n)
+        .map(|i| 0.3 * RealScalar::sin(1.7 * i as f64))
+        .collect()
+}
+
+/// E(x) = Σ_{d=1}^{b} Σ_i φ(x_{i+d} − x_i)、φ(u) = u² + u⁴。
+/// 鎖の i 番目の変数は入力ベクトルの place[i] 番目にある。
+pub(crate) fn chain_energy<R: Real>(x: &[R], reach: usize, place: &[usize]) -> R {
+    let n = place.len();
+    let mut total = R::zero();
+    for d in 1..=reach {
+        for i in 0..n.saturating_sub(d) {
+            let u = x[place[i + d]] - x[place[i]];
+            let u2 = u * u;
+            total = total + u2 + u2 * u2;
+        }
+    }
+    total
+}
+
+/// 鎖の i 番目の変数を置く入力ベクトルの位置。偶数番を先に: x₀, x₂, …, x₁, x₃, …。
+pub(crate) fn chain_placement(n: usize, even_first: bool) -> Vec<usize> {
+    (0..n)
+        .map(|i| match (even_first, i % 2) {
+            (false, _) => i,
+            (true, 0) => i / 2,
+            (true, _) => (n + 1) / 2 + i / 2,
+        })
+        .collect()
+}
+
+/// 張力 φ′(u) = 2u + 4u³。
+fn tension<R: Real>(u: R) -> R {
+    u * 2.0 + u * u * u * 4.0
+}
+
+/// 張力 F_k = φ′(u_k) を、d の昇順、同じ d の中で i の昇順に積む。
+pub(crate) fn bond_tensions<R: Real>(x: &[R], reach: usize, out: &mut Vec<R>) {
+    let n = x.len();
+    for d in 1..=reach {
+        for i in 0..n.saturating_sub(d) {
+            out.push(tension(x[i + d] - x[i]));
+        }
+    }
+}
+
+/// ∇E = Dᵀ F: ばね (i, i + d) の張力を成分 i + d に足し、成分 i から引く。
+pub(crate) fn energy_gradient<R: Real>(x: &[R], reach: usize, out: &mut Vec<R>) {
+    let (n, start) = (x.len(), out.len());
+    out.extend((0..n).map(|_| R::zero()));
+    for d in 1..=reach {
+        for i in 0..n.saturating_sub(d) {
+            let t = tension(x[i + d] - x[i]);
+            out[start + i + d] = out[start + i + d] + t;
+            out[start + i] = out[start + i] - t;
+        }
+    }
+}
+
+/// 閉形式（独立検算）: ばね (i, j) の φ″(x_j − x_i) = 2 + 12(x_j − x_i)²。
+pub(crate) fn spring_curvature(x: &[f64], i: usize, j: usize) -> f64 {
+    let u = x[j] - x[i];
+    2.0 + 12.0 * u * u
+}
+
+/// 閉形式（独立検算）: 鎖の番号で H_ij = −φ″(x_j − x_i)（1 ≤ |i − j| ≤ b）、対角は φ″ の和。
+pub(crate) fn chain_hessian_entry(x: &[f64], reach: usize, i: usize, j: usize) -> f64 {
+    let n = x.len();
+    match i.abs_diff(j) {
+        0 => (1..=reach)
+            .map(|d| {
+                let right = if i + d < n {
+                    spring_curvature(x, i, i + d)
+                } else {
+                    0.0
+                };
+                let left = if i >= d {
+                    spring_curvature(x, i - d, i)
+                } else {
+                    0.0
+                };
+                right + left
+            })
+            .sum::<f64>(),
+        gap if gap <= reach => -spring_curvature(x, i.min(j), i.max(j)),
+        _ => 0.0,
+    }
+}
+```
+
+## 変数の並べ方と色の数
+
+次のセルはばねの鎖の $E$ のヘッセ行列のパターンを `hessian_pattern` で求め、`derivative_coloring` の色の数を半帯幅 $b = 1, \dots, 8$ について調べる。
+変数の並べ方は 2 通りで、「偶数番を先に」は同じ鎖を入力ベクトルの中で $x_0, x_2, \dots, x_1, x_3, \dots$ の順に並べる。
+数学的な構造は同じで、行と列の番号だけが入れ替わる。
+変数の数は $n = 40$ に固定する（$n$ を変えた結果は 3 つ目のセルで確かめられる）。
+入力はない。
+グラフと表は 2 つの並べ方の色の数と、行あたりの非零の最大数から来る下限 $2b + 1$ を示す。
+
+```rust
+//| id: ad-coloring-order
+//| ref: ad-coloring-order
+//| title: 帯状のヘッセ行列の色の数と変数の並べ方
+//| run: reactive
+//| uses: [ad-sparse-spring-chain-model]
+//| crates: [scioxide-ad, scioxide-core, scioxide-sparse]
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"colors","path":"/rows/0/2","equals":3}
+//|       - {"artifact":"colors","path":"/rows/0/3","equals":4}
+//|       - {"artifact":"colors","path":"/rows/1/2","equals":5}
+//|       - {"artifact":"colors","path":"/rows/1/3","equals":6}
+//|       - {"artifact":"colors","path":"/rows/7/1","equals":17}
+//|       - {"artifact":"colors","path":"/rows/7/2","equals":17}
+//|       - {"artifact":"colors","path":"/rows/7/3","equals":18}
+use scioxide_ad::{Tape, TapeOptions};
+use scioxide_core::ExecutionContext;
+use scioxide_sparse::derivative_coloring;
+
+let n = 40;
+let cx = ExecutionContext::sequential();
+let point = chain_point(n);
+let mut rows = Vec::new();
+for reach in 1..=8_usize {
+    let mut counts = [0_usize; 2];
+    for (slot, even_first) in [false, true].into_iter().enumerate() {
+        // f64 の記録からヘッセ行列のパターンを求め、列を彩色する。
+        let place = chain_placement(n, even_first);
+        let mut tape = Tape::<f64>::new(TapeOptions::new());
+        let linear = tape
+            .linearize(
+                |x, y| {
+                    y.push(chain_energy(x, reach, &place));
+                    Ok(())
+                },
+                &point,
+                cx,
+            )
+            .map_err(|e| e.to_string())?;
+        let pattern = linear.hessian_pattern().map_err(|e| e.to_string())?;
+        counts[slot] = derivative_coloring(pattern.view())
+            .map_err(|e| e.to_string())?
+            .color_count();
+    }
+    rows.push((reach, 2 * reach + 1, counts[0], counts[1]));
+}
+let line = |name: &str, column: usize| {
+    let points: Vec<[f64; 2]> = rows
+        .iter()
+        .map(|row| [row.0 as f64, [row.1, row.2, row.3][column] as f64])
+        .collect();
+    serde_json::json!({ "name": name, "points": points })
+};
+let mut bound = line("下限 2b + 1", 0);
+bound["style"] = serde_json::json!({ "lineType": "dashed" });
+emit_line_chart!(
+    &vec![line("自然な順", 1), line("偶数番を先に", 2), bound],
+    options = &serde_json::json!({
+        "xLabel": "半帯幅 b [-]",
+        "yLabel": "色の数 [-]",
+        "yIncludeZero": true
+    })
+);
+let columns = serde_json::json!([
+    { "key": "0", "label": "半帯幅 b", "type": "integer" },
+    { "key": "1", "label": "下限 2b + 1", "type": "integer" },
+    { "key": "2", "label": "色の数（自然な順）", "type": "integer" },
+    { "key": "3", "label": "色の数（偶数番を先に）", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "colors" })
+);
+```
+
+自然な順では、色の数は $b = 1, \dots, 8$ のすべてで下限 $2b + 1$ に一致し、この構造では貪欲法が最小の色の数を与える。
+自然な順の貪欲法は列 $j$ に色 $j \bmod (2b + 1)$ を割り当て、同じ色の列は $2b + 1$ 以上離れるので、どの行でも衝突しない。
+「偶数番を先に」に切り替えると、構造も下限 $2b + 1$ も変わらないが、$n = 40$ では貪欲法の色の数がどの $b$ でも下限より 1 多い。
+同じ構造でも変数の並べ方で色の数が変わることは、貪欲法が最小の色の数を保証しないことの具体例である。
+
+## 疎なヤコビ行列と密な結果の一致
+
+次のセルは張力の写像 $F$ と勾配の写像 $\nabla E$ のヤコビ行列を、`jacobian_pattern`、`derivative_coloring`、`sparse_jacobian_into` で疎に求める。
+同じ写像を `JacobianMode::Forward`（列ごとの前進走査）と `JacobianMode::Reverse`（行ごとの逆走査）のテープに記録し、それぞれのテープで疎な値と `jacobian_into` の密な値をビット単位で比べる。
+入力は変数の数 $n$（10 から 120）とばねの到達距離 $b$（1 から 8）で、変数は自然な順に並べる。
+表は写像と密な行列の組み方ごとに、行の数、非零の数、色の数、密な値とビットが違う成分の数、差の最大値、閉形式 $J_F = \operatorname{diag}(\varphi'')\,D$ と $H_E$ との相対差を示す。
+閉形式は定義のブロックの `spring_curvature` と `chain_hessian_entry` で計算する。
+
+```rust
+//| id: ad-sparse-jacobian-recovery
+//| ref: ad-sparse-jacobian-recovery
+//| title: 疎なヤコビ行列の復元と密な結果とのビット単位の比較
+//| run: reactive
+//| uses: [ad-sparse-spring-chain-model]
+//| crates: [scioxide-ad, scioxide-core, scioxide-sparse]
+//| inputs:
+//|   masses: {"type":"range","label":"変数の数 n","min":10,"max":120,"step":10,"value":40}
+//|   reach: {"type":"range","label":"ばねの到達距離 b","description":"x_i と x_{i+d}（1 ≤ d ≤ b）をばねでつなぐ。","min":1,"max":8,"step":1,"value":2}
+//| cases:
+//|   - {"id":"nearest","label":"b = 1","description":"対角成分の寄与が 2 つで、逆走査の密な値ともビット単位で一致する。","inputs":{"reach":1}}
+//|   - {"id":"wide-band","label":"n = 120、b = 8","description":"張力は 9 色、勾配は 17 色で復元する。","inputs":{"masses":120,"reach":8}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"recovery","path":"/rows/0/2","equals":77}
+//|       - {"artifact":"recovery","path":"/rows/0/3","equals":154}
+//|       - {"artifact":"recovery","path":"/rows/0/4","equals":3}
+//|       - {"artifact":"recovery","path":"/rows/0/5","equals":0}
+//|       - {"artifact":"recovery","path":"/rows/1/5","equals":0}
+//|       - {"artifact":"recovery","path":"/rows/2/3","equals":194}
+//|       - {"artifact":"recovery","path":"/rows/2/4","equals":5}
+//|       - {"artifact":"recovery","path":"/rows/2/5","equals":0}
+//|       - {"artifact":"recovery","path":"/rows/3/5","range":{"min":1}}
+//|       - {"artifact":"recovery","path":"/rows/3/6","approx":{"value":0,"atol":1e-13}}
+//|       - {"artifact":"recovery","path":"/rows/0/7","approx":{"value":0,"atol":1e-15}}
+//|       - {"artifact":"recovery","path":"/rows/2/7","approx":{"value":0,"atol":1e-15}}
+//|   - case: nearest
+//|     expect:
+//|       - {"artifact":"recovery","path":"/rows/0/4","equals":2}
+//|       - {"artifact":"recovery","path":"/rows/2/4","equals":3}
+//|       - {"artifact":"recovery","path":"/rows/2/5","equals":0}
+//|       - {"artifact":"recovery","path":"/rows/3/5","equals":0}
+//|       - {"artifact":"recovery","path":"/rows/2/7","approx":{"value":0,"atol":1e-15}}
+//|   - case: wide-band
+//|     expect:
+//|       - {"artifact":"recovery","path":"/rows/0/4","equals":9}
+//|       - {"artifact":"recovery","path":"/rows/2/4","equals":17}
+//|       - {"artifact":"recovery","path":"/rows/2/5","equals":0}
+//|       - {"artifact":"recovery","path":"/rows/3/5","range":{"min":1}}
+//|       - {"artifact":"recovery","path":"/rows/2/7","approx":{"value":0,"atol":1e-15}}
+use scioxide_ad::{JacobianMode, Tape, TapeOptions};
+use scioxide_core::ExecutionContext;
+use scioxide_sparse::derivative_coloring;
+
+let (n, b) = (masses as usize, reach as usize);
+let cx = ExecutionContext::sequential();
+let point = chain_point(n);
+// ばね k = (i, i + d) の両端を bond_tensions と同じ順に並べる（閉形式の検算に使う）。
+let bonds: Vec<(usize, usize)> = (1..=b)
+    .flat_map(|d| (0..n - d).map(move |i| (i, i + d)))
+    .collect();
+let (forward, reverse) = (JacobianMode::Forward, JacobianMode::Reverse);
+let mut rows = Vec::new();
+for (tensions, mode) in [
+    (true, forward),
+    (true, reverse),
+    (false, forward),
+    (false, reverse),
+] {
+    let mut tape = Tape::<f64>::new(TapeOptions::new().with_jacobian_mode(mode));
+    let mut linear = tape
+        .linearize(
+            |x, y| {
+                if tensions {
+                    bond_tensions(x, b, y);
+                } else {
+                    energy_gradient(x, b, y);
+                }
+                Ok(())
+            },
+            &point,
+            cx,
+        )
+        .map_err(|e| e.to_string())?;
+    // 密な J: Forward は列ごとの前進走査、Reverse は行ごとの逆走査で組む。
+    let m = linear.outputs();
+    let mut dense = vec![0.0; m * n];
+    linear
+        .jacobian_into(&mut dense, cx)
+        .map_err(|e| e.to_string())?;
+    // 疎な J: 構造パターンの列を彩色し、色ごとに 1 回の前進走査で非零を読む。
+    let pattern = linear.jacobian_pattern().map_err(|e| e.to_string())?;
+    let view = pattern.view();
+    let schedule = derivative_coloring(view).map_err(|e| e.to_string())?;
+    let mut values = vec![0.0; view.col_indices().len()];
+    linear
+        .sparse_jacobian_into(&schedule, &mut values, cx)
+        .map_err(|e| e.to_string())?;
+    // 閉形式（独立検算）: J_F の行 k = (i, j) は第 i 列が −φ″、第 j 列が φ″。J_∇E は H_E。
+    let exact = |r: usize, c: usize| {
+        if !tensions {
+            return chain_hessian_entry(&point, b, r, c);
+        }
+        let (i, j) = bonds[r];
+        match c {
+            c if c == j => spring_curvature(&point, i, j),
+            c if c == i => -spring_curvature(&point, i, j),
+            _ => 0.0,
+        }
+    };
+    let (mut differ, mut gap, mut closed, mut scale) = (0_usize, 0.0_f64, 0.0_f64, 0.0_f64);
+    for r in 0..m {
+        for e in view.row_ptr()[r]..view.row_ptr()[r + 1] {
+            let (c, value) = (view.col_indices()[e], values[e]);
+            differ += usize::from(value.to_bits() != dense[r * n + c].to_bits());
+            gap = gap.max((value - dense[r * n + c]).abs());
+            closed = closed.max((value - exact(r, c)).abs());
+            scale = scale.max(exact(r, c).abs());
+        }
+    }
+    let map = if tensions { "張力 F" } else { "勾配 ∇E" };
+    let sweep = match mode {
+        JacobianMode::Forward => "列ごとの前進走査",
+        _ => "行ごとの逆走査",
+    };
+    let entries = view.col_indices().len();
+    let colors = schedule.color_count();
+    rows.push((map, sweep, m, entries, colors, differ, gap, closed / scale));
+}
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "写像" },
+    { "key": "1", "label": "密な J の組み方" },
+    { "key": "2", "label": "行の数 m", "type": "integer" },
+    { "key": "3", "label": "非零の数", "type": "integer" },
+    { "key": "4", "label": "色の数", "type": "integer" },
+    { "key": "5", "label": "密な値とビットが違う成分 [個]", "type": "integer" },
+    { "key": "6", "label": "max |疎 − 密| [-]", "type": "number", "format": sci3 },
+    { "key": "7", "label": "閉形式との相対差 [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "recovery" })
+);
+```
+
+既定の $n = 40$、$b = 2$ では、張力 $F$ のヤコビ行列は $77 \times 40$ で非零が 154 個あり、下限 $b + 1$ と同じ 3 色で復元できる。
+密な $J_F$ を列ごとに組むと前進走査が 40 回、行ごとに組むと逆走査が 77 回要るが、疎な復元は前進走査 3 回で済む。
+勾配 $\nabla E$ のヤコビ行列 $H_E$ は非零が 194 個で、下限 $2b + 1$ と同じ 5 色で復元できる。
+疎な値はどちらの写像でも列ごとの前進走査で組んだ密な値とビット単位で一致し、閉形式との相対差は $1.9 \times 10^{-16}$ 以下である。
+行ごとの逆走査で組んだ密な値とは、張力ではビット単位で一致するが、勾配では 194 個のうち 11 個の成分で最後の桁が違い、差の最大値は $3.6 \times 10^{-15}$ である。
+違う成分はすべて対角にある。
+$H_E$ の対角成分は $x_i$ を含む最大 $2b$ 本のばねの寄与の和で、前進走査はこの和を記録の順に、逆走査は逆の順に足す。
+そのため、項が 3 つ以上ある成分では丸めが変わりうる。
+非対角成分と張力の成分は 1 本のばねの寄与だけからなり、どちらの走査でも同じビットになる。
+
+$b = 1$ では対角成分の項が高々 2 つで、2 項の和は足す順序によらないので、逆走査で組んだ密な値ともビット単位で一致する。
+$n = 120$、$b = 8$ では張力が 9 色、勾配が 17 色で、勾配の 1,968 個の成分のうち 80 個が逆走査で組んだ密な値と違う。
+差の最大値 $2.1 \times 10^{-14}$ は、大きさ 56 程度の対角成分に対して丸めの水準である。
+既定値、2 つのケース、入力の両端のどれでも、閉形式との相対差は $4 \times 10^{-16}$ 以下で、疎な値は列ごとの前進走査の密な値と同じビットである。
+
+## 疎なヘッセ行列の復元と関数の実行回数
+
+次のセルは選んだ $n$、$b$、並べ方で、ヘッセ行列を彩色による疎な復元と `hessian` の密な計算の両方で求めて比べる。
+入力は変数の数 $n$（20 から 120）、半帯幅 $b$（1 から 8）、変数の並べ方である。
+表は非零の数とその閉形式 $n(2b + 1) - b(b + 1)$、行あたりの非零の最大数、色の数、関数の実行回数、密な結果との差、閉形式のヘッセ行列との相対差、密な結果の非対称性 $\max|H_{ij} - H_{ji}|$ を示す。
+関数の実行回数は関数の中で数えた値である。
+閉形式のヘッセ行列は定義のブロックの `chain_hessian_entry` で計算する。
+
+```rust
+//| id: ad-sparse-coloring-cost
+//| ref: ad-sparse-coloring-cost
+//| title: 彩色による疎なヘッセ行列の復元と記録の回数
+//| run: reactive
+//| uses: [ad-sparse-spring-chain-model]
+//| crates: [scioxide-ad, scioxide-core, scioxide-sparse]
+//| inputs:
+//|   masses: {"type":"range","label":"変数の数 n","min":20,"max":120,"step":10,"value":60}
+//|   reach: {"type":"range","label":"半帯幅 b","description":"x_i と x_{i+d}（1 ≤ d ≤ b）が相互作用する。","min":1,"max":8,"step":1,"value":2}
+//|   ordering: {"type":"select","label":"変数の並べ方","options":["自然な順","偶数番を先に"],"value":"自然な順"}
+//| cases:
+//|   - {"id":"even-first","label":"偶数番を先に","description":"同じ構造で色が 1 つ増える。","inputs":{"ordering":"偶数番を先に"}}
+//|   - {"id":"wide-band","label":"n = 120、b = 8","description":"色の数は 17 で、密な 120 回に対して 7 分の 1 程度。","inputs":{"masses":120,"reach":8}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":294}
+//|       - {"artifact":"summary","path":"/rows/0/1","equals":294}
+//|       - {"artifact":"summary","path":"/rows/0/3","equals":5}
+//|       - {"artifact":"summary","path":"/rows/0/4","equals":6}
+//|       - {"artifact":"summary","path":"/rows/0/5","equals":61}
+//|       - {"artifact":"summary","path":"/rows/0/6","equals":0}
+//|       - {"artifact":"summary","path":"/rows/0/7","approx":{"value":0,"atol":1e-14}}
+//|   - case: even-first
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":294}
+//|       - {"artifact":"summary","path":"/rows/0/3","equals":6}
+//|       - {"artifact":"summary","path":"/rows/0/6","equals":0}
+//|       - {"artifact":"summary","path":"/rows/0/7","approx":{"value":0,"atol":1e-14}}
+//|   - case: wide-band
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":1968}
+//|       - {"artifact":"summary","path":"/rows/0/3","equals":17}
+//|       - {"artifact":"summary","path":"/rows/0/5","equals":121}
+//|       - {"artifact":"summary","path":"/rows/0/7","approx":{"value":0,"atol":1e-14}}
+use scioxide_ad::{Dual, Tape, TapeOptions, Var, hessian};
+use scioxide_core::ExecutionContext;
+use scioxide_sparse::derivative_coloring;
+use std::cell::Cell;
+
+let (n, b) = (masses as usize, reach as usize);
+let cx = ExecutionContext::sequential();
+let point = chain_point(n);
+// 選んだ並べ方で、同じ鎖の値を入力ベクトルの位置 place[i] に置く。
+let place = chain_placement(n, ordering == "偶数番を先に");
+let mut input = vec![0.0; n];
+for (i, &p) in place.iter().enumerate() {
+    input[p] = point[i];
+}
+let mut tape = Tape::<f64>::new(TapeOptions::new());
+let linear = tape
+    .linearize(
+        |x, y| {
+            y.push(chain_energy(x, b, &place));
+            Ok(())
+        },
+        &input,
+        cx,
+    )
+    .map_err(|e| e.to_string())?;
+let pattern = linear.hessian_pattern().map_err(|e| e.to_string())?;
+let view = pattern.view();
+let schedule = derivative_coloring(view).map_err(|e| e.to_string())?;
+// 色ごとに 1 回の記録で疎な値を、単位方向ごとに 1 回の記録で密な H を求め、関数の実行を数える。
+let calls = Cell::new(0_usize);
+let mut second = Tape::<Dual<f64>>::new(TapeOptions::new());
+let mut values = vec![0.0; view.col_indices().len()];
+second
+    .sparse_hessian_into(
+        |x: &[Var<'_, Dual<f64>>]| {
+            calls.set(calls.get() + 1);
+            Ok(chain_energy(x, b, &place))
+        },
+        &input,
+        &schedule,
+        &mut values,
+        cx,
+    )
+    .map_err(|e| e.to_string())?;
+let sparse_calls = calls.replace(0);
+let dense = hessian(
+    |x| {
+        calls.set(calls.get() + 1);
+        Ok(chain_energy(x, b, &place))
+    },
+    &input,
+)
+.map_err(|e| e.to_string())?;
+let dense = dense.as_slice();
+let (mut sparse_gap, mut closed_gap, mut scale, mut asymmetry) =
+    (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
+for r in 0..n {
+    for e in view.row_ptr()[r]..view.row_ptr()[r + 1] {
+        sparse_gap = sparse_gap.max((values[e] - dense[r * n + view.col_indices()[e]]).abs());
+    }
+}
+// 閉形式は鎖の番号 (i, j) で与えるので、入力ベクトルの位置 (place[i], place[j]) と比べる。
+for i in 0..n {
+    for j in 0..n {
+        let (r, c) = (place[i], place[j]);
+        let exact = chain_hessian_entry(&point, b, i, j);
+        closed_gap = closed_gap.max((dense[r * n + c] - exact).abs());
+        scale = scale.max(exact.abs());
+        asymmetry = asymmetry.max((dense[r * n + c] - dense[c * n + r]).abs());
+    }
+}
+let max_row = view
+    .row_ptr()
+    .windows(2)
+    .map(|w| w[1] - w[0])
+    .max()
+    .unwrap_or(0);
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "パターンの非零の数", "type": "integer" },
+    { "key": "1", "label": "閉形式 n(2b + 1) − b(b + 1)", "type": "integer" },
+    { "key": "2", "label": "行あたりの非零の最大数", "type": "integer" },
+    { "key": "3", "label": "色の数", "type": "integer" },
+    { "key": "4", "label": "疎な復元での関数の実行 [回]", "type": "integer" },
+    { "key": "5", "label": "hessian での関数の実行 [回]", "type": "integer" },
+    { "key": "6", "label": "max |疎 − 密| [-]", "type": "number", "format": sci3 },
+    { "key": "7", "label": "閉形式との相対差 [-]", "type": "number", "format": sci3 },
+    { "key": "8", "label": "max |H_ij − H_ji| [-]", "type": "number", "format": sci3 }
+]);
+let row = (
+    view.col_indices().len(),
+    n * (2 * b + 1) - b * (b + 1),
+    max_row,
+    schedule.color_count(),
+    sparse_calls,
+    calls.get(),
+    sparse_gap,
+    closed_gap / scale,
+    asymmetry,
+);
+emit_table_with_columns!(
+    columns,
+    vec![row],
+    metadata = serde_json::json!({ "id": "summary" })
+);
+```
+
+既定の $n = 60$、$b = 2$ では非零が 294 個で閉形式と一致し、色は 5 つである。
+疎な復元は関数を 6 回、`hessian` は 61 回実行する。
+どちらも 1 回は新しいテープで文の数を数えるための実行で、値に使われる記録はそれぞれ 5 回と 60 回である。
+疎な値は `hessian` の対応する成分とビット単位で一致し、閉形式との相対差は $1.9 \times 10^{-16}$ である。
+この鎖では、$x_i$ を含むばねの両端はどちらも $i$ から $b$ 以内にあり、正しい彩色ではその範囲（行 $i$ のパターン）に色 $c$ の列が高々 1 つ（$j$ とする）しかない。
+そのため、色 $c$ のシードで記録したとき $x_i$ を含むばねが受け取る接ベクトルは単位方向 $e_j$ で記録したときと同じで、$(H d_c)_i$ は $(H e_j)_i$ と同じ演算で求まる。
+密な結果の非対称性も 0 である。
+`hessian` は対称化しないので、一般の関数では $H_{ij}$ と $H_{ji}$ に丸めの差が残りうる。
+
+「偶数番を先に」では色が 6 つになり、関数の実行は 7 回に増えるが、復元した値は自然な順と同じく密な結果とビット単位で一致する。
+$n = 120$、$b = 8$ では非零が 1,968 個、色が 17 で、記録の回数は密な 120 回の約 7 分の 1 になる。
+自然な順の色の数は $n$ によらず $2b + 1$ なので、$n$ が大きいほど彩色で減らせる記録の回数が多い。
+
+## ワンショット呼び出しと _into の経路の一致
+
+次のセルは自然な順のばねの鎖で、ワンショット呼び出しの `sparse_jacobian`（張力 $F$）と `sparse_hessian`（エネルギー $E$）を、パターン・彩色・`_into` を手で組んだ経路と比べる。
+ヘッセ行列の経路は 1 本の `Tape<Dual<f64>>` で `hessian_pattern`、`derivative_coloring`、`sparse_hessian_into` を行い、そのパターンを `Tape<f64>` の記録の `Linearization::hessian_pattern` とも比べる。
+入力は変数の数 $n$ とばねの到達距離 $b$ である。
+表は比較ごとに、非零の数、色の数、パターン（行の開始位置と列番号）が等しいか、値のビットが違う成分の数を示す。
+最後の行は、同じテープの `sparse_hessian_into` に `distance_one_coloring` の距離 1 彩色を渡した結果である。
+
+```rust
+//| id: ad-sparse-one-shot
+//| ref: ad-sparse-one-shot
+//| title: ワンショット呼び出しの sparse_jacobian と sparse_hessian を _into の経路と比べる
+//| run: reactive
+//| uses: [ad-sparse-spring-chain-model]
+//| crates: [scioxide-ad, scioxide-core, scioxide-sparse]
+//| inputs:
+//|   masses: {"type":"range","label":"変数の数 n","min":10,"max":120,"step":10,"value":40}
+//|   reach: {"type":"range","label":"ばねの到達距離 b","description":"x_i と x_{i+d}（1 ≤ d ≤ b）をばねでつなぐ。","min":1,"max":8,"step":1,"value":2}
+//| cases:
+//|   - {"id":"wide-band","label":"n = 120、b = 8","description":"ヘッセ行列は 17 色、距離 1 彩色は 9 色になる。","inputs":{"masses":120,"reach":8}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"one-shot","path":"/rows/0/1","equals":154}
+//|       - {"artifact":"one-shot","path":"/rows/0/3","equals":"等しい"}
+//|       - {"artifact":"one-shot","path":"/rows/0/4","equals":0}
+//|       - {"artifact":"one-shot","path":"/rows/1/1","equals":194}
+//|       - {"artifact":"one-shot","path":"/rows/1/3","equals":"等しい"}
+//|       - {"artifact":"one-shot","path":"/rows/1/4","equals":0}
+//|       - {"artifact":"one-shot","path":"/rows/2/3","equals":"等しい"}
+//|       - {"artifact":"one-shot","path":"/rows/3/3","equals":"InvalidInput"}
+//|   - case: wide-band
+//|     expect:
+//|       - {"artifact":"one-shot","path":"/rows/1/2","equals":17}
+//|       - {"artifact":"one-shot","path":"/rows/1/4","equals":0}
+//|       - {"artifact":"one-shot","path":"/rows/3/3","equals":"InvalidInput"}
+use scioxide_ad::{Dual, Tape, sparse_hessian, sparse_jacobian};
+use scioxide_core::{ColoringSchedule, ExecutionContext, StructuralPattern};
+use scioxide_sparse::{CsrMatrix, derivative_coloring, distance_one_coloring};
+
+/// ワンショット呼び出しの CSR とパターン・値の組について、パターンが等しいかと、ビットが違う値の数。
+fn compare(one: &CsrMatrix<f64>, pattern: &StructuralPattern, values: &[f64]) -> (bool, usize) {
+    let view = pattern.view();
+    let same = one.row_ptr() == view.row_ptr() && one.col_indices() == view.col_indices();
+    let differ =
+        core::iter::zip(one.values(), values).filter(|(a, b)| a.to_bits() != b.to_bits());
+    (same, differ.count())
+}
+
+let (n, b) = (masses as usize, reach as usize);
+let cx = ExecutionContext::sequential();
+let (point, place) = (chain_point(n), chain_placement(n, false));
+let label = |same: bool| if same { "等しい" } else { "違う" };
+
+// 張力 F: ワンショット呼び出しと、linearize → jacobian_pattern → 彩色 → sparse_jacobian_into。
+let one = sparse_jacobian(
+    |x, y| {
+        bond_tensions(x, b, y);
+        Ok(())
+    },
+    &point,
+)
+.map_err(|e| e.to_string())?;
+let mut tape = Tape::<f64>::default();
+let mut linear = tape
+    .linearize(
+        |x, y| {
+            bond_tensions(x, b, y);
+            Ok(())
+        },
+        &point,
+        cx,
+    )
+    .map_err(|e| e.to_string())?;
+let pattern = linear.jacobian_pattern().map_err(|e| e.to_string())?;
+let colors = derivative_coloring(pattern.view()).map_err(|e| e.to_string())?;
+let mut values = vec![0.0; pattern.view().col_indices().len()];
+linear
+    .sparse_jacobian_into(&colors, &mut values, cx)
+    .map_err(|e| e.to_string())?;
+let (same, differ) = compare(&one, &pattern, &values);
+let (name, k) = ("sparse_jacobian（張力 F）", Some(colors.color_count()));
+let mut rows = vec![(name, one.nnz(), k, label(same), Some(differ))];
+
+// エネルギー E: ワンショット呼び出しと、1 本の Tape<Dual<f64>> での hessian_pattern → 彩色 → sparse_hessian_into。
+let one =
+    sparse_hessian(|x| Ok(chain_energy(x, b, &place)), &point).map_err(|e| e.to_string())?;
+let mut second = Tape::<Dual<f64>>::default();
+let pattern = second
+    .hessian_pattern(|x| Ok(chain_energy(x, b, &place)), &point, cx)
+    .map_err(|e| e.to_string())?;
+let colors = derivative_coloring(pattern.view()).map_err(|e| e.to_string())?;
+let distance_one = distance_one_coloring(pattern.view()).map_err(|e| e.to_string())?;
+let mut values = vec![0.0; pattern.view().col_indices().len()];
+let mut recover = |coloring: &ColoringSchedule| {
+    second.sparse_hessian_into(
+        |x| Ok(chain_energy(x, b, &place)),
+        &point,
+        coloring,
+        &mut values,
+        cx,
+    )
+};
+// 距離 1 彩色は拒まれ、values は書き換わらない。
+let rejected = match recover(&distance_one) {
+    Ok(()) => "成功".to_string(),
+    Err(e) => format!("{:?}", e.kind()),
+};
+recover(&colors).map_err(|e| e.to_string())?;
+let (same, differ) = compare(&one, &pattern, &values);
+let (name, k) = ("sparse_hessian（エネルギー E）", Some(colors.color_count()));
+rows.push((name, one.nnz(), k, label(same), Some(differ)));
+
+// 同じ E を Tape<f64> に記録した Linearization::hessian_pattern。
+let mut plain = Tape::<f64>::default();
+let recorded = plain
+    .linearize(
+        |x, y| {
+            y.push(chain_energy(x, b, &place));
+            Ok(())
+        },
+        &point,
+        cx,
+    )
+    .and_then(|linear| linear.hessian_pattern())
+    .map_err(|e| e.to_string())?;
+let name = "Tape<Dual<f64>>::hessian_pattern と Linearization::hessian_pattern";
+rows.push((
+    name,
+    recorded.view().col_indices().len(),
+    None,
+    label(recorded == pattern),
+    None,
+));
+let (name, k) = (
+    "distance_one_coloring を渡した sparse_hessian_into",
+    Some(distance_one.color_count()),
+);
+rows.push((name, one.nnz(), k, &rejected, None));
+let columns = serde_json::json!([
+    { "key": "0", "label": "比較" },
+    { "key": "1", "label": "非零の数", "type": "integer" },
+    { "key": "2", "label": "色の数", "type": "integer", "nullText": "−" },
+    { "key": "3", "label": "パターン（最後の行は結果の分類）" },
+    { "key": "4", "label": "値のビットが違う成分 [個]", "type": "integer", "nullText": "−" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "one-shot" })
+);
+```
+
+既定の $n = 40$、$b = 2$ では、`sparse_jacobian` は非零 154 個を 3 色で、`sparse_hessian` は非零 194 個を 5 色で復元し、どちらもパターンが `_into` の経路と等しく、値もすべて同じビットである。
+`Tape<Dual<f64>>::hessian_pattern` のパターンは、`Tape<f64>` の記録の `Linearization::hessian_pattern` と等しい。
+距離 1 彩色は $H_E$ のグラフ（$1 \le |i - j| \le b$ の頂点を結ぶ）を $b + 1 = 3$ 色で塗る。
+この彩色では同じ色の列 $i$ と $i + b + 1$ が行 $i + 1$ に共通の非零を持ち、直接復元すると成分が足し合わされるので、`sparse_hessian_into` は彩色の種類を確かめて `InvalidInput` を返す。
+$n = 120$、$b = 8$ でも結果は同じで、色の数は張力が 9、ヘッセ行列が 17、距離 1 彩色が 9 である。
+
+## まとめ
+
+疎なヤコビ行列は `jacobian_pattern`、疎なヘッセ行列は `hessian_pattern` から `derivative_coloring` で色を求め、色の数が $n$ より十分小さいことを確かめてから `sparse_jacobian_into` か `sparse_hessian_into` で復元する。
+パターンは記録した点と同じ分岐をとる点でだけ有効で、打ち消しで 0 になる位置も含む。
+貪欲法の色の数は変数の並べ方で変わるので、帯構造の問題では相互作用する変数を近い番号に並べ、色の数を下限（$\rho_{\max}$ や、互いに結ばれる列の数）と比べる。
+`sparse_jacobian_into` は関数を実行し直さずに色ごとに前進走査を 1 回行い、値は `JacobianMode::Forward` の密な行列とビット単位で一致するが、`JacobianMode::Reverse` の密な行列とは丸めの範囲で一致する。
+`sparse_hessian_into` は色ごとに関数を 1 回記録するので、新しいテープでの関数の実行は色の数より 1 回多い。
+一度だけ求めるなら `sparse_jacobian` と `sparse_hessian` が同じ手順を 1 回の呼び出しで行って `CsrMatrix` を返し、彩色は `derivative_coloring` のものだけが受け付けられる。
+
+## 次に読むページ
+
+- [Taylor ジェットと高階の係数](../taylor-jets/)：方向に沿った 2 階より高い微分と、2 変数の混合係数を Taylor 算術で求める方法を確かめる。
+- [分岐・マスク・表引き](../control-flow/)：記録したパターンを使い回せる点の範囲を、分岐とマスクの規則から確かめる。
+- [疎なヘッセ行列の彩色による復元](../../examples/sparse-hessian-chain/)：`hessian_pattern` と彩色による復元を物理の題材で確かめる。
+- [並べ替えと彩色](../../../scioxide-sparse/algorithms/orderings-and-coloring/)：`derivative_coloring` と距離 1 彩色の定義と計算コストを確かめる。

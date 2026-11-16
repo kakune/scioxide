@@ -1,0 +1,270 @@
+---
+title: "Branches, masks, and table lookup"
+description: "Derivative conventions for value-dependent branches written with if and select; masks and their operations using Real<Mask = bool> and LaneMask; handling NaN in unselected branches; derivatives and recording of table lookup with gather; and why recordings and structural patterns apply only at points taking the same branches."
+sidebar:
+  order: 350
+references:
+  ad-branch-select: "value-dependent-branching-and-select"
+  ad-table-gather: "table-lookup-with-gather"
+  ad-branch-recording: "branching-and-reuse-of-recordings"
+---
+
+Numerical programs contain branches that switch expressions based on values and table lookups that select a position from an argument and retrieve a value.
+Automatic differentiation applies the chain rule to operations on the executed path, raising the questions of which branch's derivative is returned and what is returned at a branch boundary.
+
+This page covers branching with comparisons and `select`, mask types and operations, table lookup with `gather`, and the relationship between branches, recordings, and structural patterns.
+[Reverse mode and tapes](../reverse-mode-and-replay/) defines tape, statement, and sweep; [Numeric types, lanes, and generic code](../number-types-and-lanes/) defines `Mask` and lanes for numeric types.
+[Loops and checkpointing](../checkpointing/) covers memory and recomputation when traversing loops in reverse.
+
+## Differentiating the executed path
+
+Consider a function that switches between two expressions: $f(x) = f_1(x)$ if the predicate $p(x)$ is true, and $f(x) = f_2(x)$ otherwise.
+If $p$ is a comparison such as $g(x) > h(x)$ and $g$ and $h$ are continuous, its truth value changes only where $g - h$ changes sign (a boundary).
+
+Away from a boundary, every point in a neighborhood selects the same branch, so $f = f_i$ holds in that neighborhood and $f'(x) = f_i'(x)$.
+Differentiating operations in the executed branch gives this classical derivative directly.
+The predicate's truth value is locally constant, so the comparison itself contributes nothing to the derivative.
+
+At a boundary $x_0$ ($g(x_0) = h(x_0)$), $f$ need not be continuous; even when continuous, its one-sided derivatives $f_1'(x_0)$ and $f_2'(x_0)$ need not agree.
+The derivative $f_i'(x_0)$ of the selected branch can be computed, but whether the branches share a value and slope at the boundary depends on their expressions and cannot be determined from program structure.
+The derivative obtained at a boundary is therefore the one-sided derivative of the side containing the boundary, and need not be a classical derivative of $f$.
+
+## Value-dependent branching and `select`
+
+The `Real` comparisons `lt`, `le`, `gt`, and `ge` compare two base values (the innermost `f64` or `Lanes` values) lane by lane and return `R::Mask`.
+Derivative components are not used in comparisons.
+Comparisons involving NaN are false.
+`is_finite` returns a mask identifying lanes whose value and every derivative component are finite.
+
+The numeric type determines the mask type.
+For single-lane types such as `f64`, `Dual<f64>`, `MultiDual<f64, N>`, `Jet<f64, N>`, and `Var<'_, f64>` it is `bool`; for `Lanes<S, W>` and types wrapping it, it is `LaneMask<W>`.
+A generic function branching with Rust's `if` specifies `R: Real<Mask = bool>` as its type bound.
+A generic function that also supports types with lanes selects branches with `R::select(mask, if_true, if_false)`.
+
+Combine masks with `&` (and), `|` (or), and `!` (not).
+For example, lanes satisfying $0 < x < 1$ can be selected with `x.gt(R::zero()) & x.lt(R::one())`.
+`splat(b)` on the `Mask` trait returns a mask with every lane equal to `b`; `any()` and `all()` return whether any lane and all lanes are true respectively.
+`LaneMask<W>` converts to and from arrays of per-lane `bool` values with `from_array` and `to_array`.
+
+`if` executes only the selected branch's operations, so the tape retains only statements from that branch.
+`select` assumes both values have already been computed and takes the selected side's value and every derivative component lane by lane.
+Both branches are computed, so the computational cost is their sum.
+
+Even if the unselected branch's value is NaN, it does not enter the selected lane's value or derivatives.
+The tape's reverse sweep makes the product of a zero adjoint with an infinite or NaN partial derivative zero (`Real::azmul`), so partial derivatives of unselected branches also do not enter the gradient.
+For example, differentiating `select(x.gt(0), x.sqrt(), x * 2.0)` with `Tape<Lanes<f64, 4>>` at $x = (-1, 0, 0.5, 2)$ gives slope 2 in lanes with $x \le 0$, unaffected by NaN or infinite partial derivatives of $\sqrt{x}$.
+
+On a scalar tape (such as `Tape<f64>`), `select` returns the selected value directly and records no statement.
+On a tape with a lane type (such as `Tape<Lanes<f64, 4>>`), it records one `select` statement only if different lanes select different sides; no statement is recorded if all lanes select the same side.
+
+The derivative of `select` is the derivative of the selected side.
+`select` and comparisons are not kinks, so they do not count toward the tape's kink count (`TapeReport::kinks`) and are not rejected even with `KinkPolicy::Error`.
+In contrast, `abs`, `min`, and `max` have kink rules: at a kink they return the midpoint of one-sided derivatives, and the tape counts these occurrences ([Kinks and nonfinite-value policies](../nonsmooth-and-nonfinite-policies/)).
+Even for the same piecewise function, the boundary derivative differs depending on whether it is written with `select` or `max`.
+
+The next cell writes $f(x) = x^2$ ($x \le 1$), $x^3$ ($x > 1$) in four ways and compares values and derivatives at the evaluation point $x$.
+Since $x^3 - x^2 = x^2(x - 1)$, this function equals $\max(x^2, x^3)$ for every real number.
+At the boundary $x = 1$, the left derivative is $2x = 2$ and the right derivative is $3x^2 = 3$.
+For each expression, the table shows the value, derivatives from the tape (`Tape<f64>`) and `Dual`, kink count, and tape word count (`TapeReport::words`, including constant and input words).
+As an independent check, the second table shows the closed-form derivatives of both branches and a central difference (step $h = 10^{-6}$) formed from `f64` values of $\max(x^2, x^3)$.
+The chart computes derivatives of the expression selecting with `x > 1` at 41 points with $x$ from 0.5 to 1.5, eight points at a time using `Dual<Lanes<f64, 8>>`, and overlays the derivatives of both branches (dashed).
+
+```rust
+//| id: ad-select-branch-derivative
+//| ref: ad-select-branch-derivative
+//| title: "Derivatives of a piecewise function written with select, if, and max"
+//| run: reactive
+//| crates: [scioxide-ad, scioxide-core]
+//| inputs:
+//|   point: {"type":"range","label":"Evaluation point x [-]","description":"x = 1 is the boundary between the two branches.","min":0.5,"max":1.5,"step":0.05,"value":1}
+//| cases:
+//|   - {"id":"left","label":"x = 0.8 (left of the boundary)","description":"Every expression returns the x² branch derivative 2x = 1.6.","inputs":{"point":0.8}}
+//|   - {"id":"right","label":"x = 1.25 (right of the boundary)","description":"Every expression returns the x³ branch derivative 3x² = 4.6875.","inputs":{"point":1.25}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"forms","path":"/rows/0/2","approx":{"value":2,"atol":1e-15}}
+//|       - {"artifact":"forms","path":"/rows/1/2","approx":{"value":3,"atol":1e-15}}
+//|       - {"artifact":"forms","path":"/rows/2/3","approx":{"value":2,"atol":1e-15}}
+//|       - {"artifact":"forms","path":"/rows/3/2","approx":{"value":2.5,"atol":1e-15}}
+//|       - {"artifact":"forms","path":"/rows/0/4","equals":0}
+//|       - {"artifact":"forms","path":"/rows/3/4","equals":1}
+//|       - {"artifact":"reference","path":"/rows/0/2","approx":{"value":2.5,"atol":1e-5}}
+//|   - case: left
+//|     expect:
+//|       - {"artifact":"forms","path":"/rows/0/2","approx":{"value":1.6,"rtol":1e-15}}
+//|       - {"artifact":"forms","path":"/rows/3/2","approx":{"value":1.6,"rtol":1e-15}}
+//|       - {"artifact":"reference","path":"/rows/0/2","approx":{"value":1.6,"atol":1e-8}}
+//|   - case: right
+//|     expect:
+//|       - {"artifact":"forms","path":"/rows/1/3","approx":{"value":4.6875,"rtol":1e-15}}
+//|       - {"artifact":"forms","path":"/rows/3/2","approx":{"value":4.6875,"rtol":1e-15}}
+//|       - {"artifact":"forms","path":"/rows/3/4","equals":0}
+use scioxide_ad::{Dual, Lanes, Real, Tape, TapeOptions};
+use scioxide_core::ExecutionContext;
+
+// Four expressions for f(x) = x² (x ≤ 1), x³ (x > 1).
+fn which<R: Real<Mask = bool>>(form: usize, x: R) -> R {
+    match form {
+        0 => R::select(x.gt(R::one()), x.powi(3), x.powi(2)),
+        1 => R::select(x.ge(R::one()), x.powi(3), x.powi(2)),
+        2 => {
+            if x.gt(R::one()) {
+                x.powi(3)
+            } else {
+                x.powi(2)
+            }
+        }
+        _ => x.powi(2).max(x.powi(3)),
+    }
+}
+// An expression supporting types with lanes (without requiring Real<Mask = bool>).
+fn strict<R: Real>(x: R) -> R {
+    R::select(x.gt(R::one()), x.powi(3), x.powi(2))
+}
+
+let cx = ExecutionContext::sequential();
+let names = [
+    "select (x³ for x > 1)",
+    "select (x³ for x ≥ 1)",
+    "if（R: Real<Mask = bool>）",
+    "max(x², x³)",
+];
+let mut rows = Vec::new();
+for (form, name) in names.into_iter().enumerate() {
+    let mut tape = Tape::<f64>::new(TapeOptions::new());
+    let mut slope = [0.0];
+    let value = tape
+        .gradient_into(|x| Ok(which(form, x[0])), &[point], &mut slope, cx)
+        .map_err(|e| e.to_string())?;
+    let report = tape.report();
+    let forward = which(form, Dual::variable(point)).derivative();
+    rows.push((
+        name,
+        value,
+        slope[0],
+        forward,
+        report.kinks(),
+        report.words(),
+    ));
+}
+let fixed6 = serde_json::json!({ "fractionDigits": 6 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Expression" },
+    { "key": "1", "label": "f(x) [-]", "type": "number", "format": fixed6 },
+    { "key": "2", "label": "f′(x) (tape) [-]", "type": "number", "format": fixed6 },
+    { "key": "3", "label": "f′(x)（Dual）[-]", "type": "number", "format": fixed6 },
+    { "key": "4", "label": "Kink count [count]", "type": "integer" },
+    { "key": "5", "label": "Tape word count [words]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "forms" })
+);
+
+// Independent check: closed-form branch derivatives and central differences from f64 values.
+let h = 1e-6;
+let central = (which(3, point + h) - which(3, point - h)) / (2.0 * h);
+let reference_columns = serde_json::json!([
+    { "key": "0", "label": "Left branch derivative 2x [-]", "type": "number", "format": fixed6 },
+    { "key": "1", "label": "Right branch derivative 3x² [-]", "type": "number", "format": fixed6 },
+    { "key": "2", "label": "Central difference (h = 10⁻⁶) [-]", "type": "number", "format": fixed6 }
+]);
+emit_table_with_columns!(
+    reference_columns,
+    vec![(2.0 * point, 3.0 * point * point, central)],
+    metadata = serde_json::json!({ "id": "reference" })
+);
+
+// Evaluate eight points at a time with Dual<Lanes<f64, 8>>. select chooses a branch per lane.
+let (mut slopes, mut left, mut right) = (Vec::new(), Vec::new(), Vec::new());
+for pack in 0..6 {
+    let x = Lanes::<f64, 8>::from_fn(|k| 0.5 + 0.025 * (8 * pack + k) as f64);
+    let y = strict(Dual::new(x, Lanes::splat(1.0)));
+    for k in (0..8).filter(|k| 8 * pack + k <= 40) {
+        if let (Some(a), Some(d)) = (x.lane(k), y.derivative().lane(k)) {
+            slopes.push([a, d]);
+            left.push([a, 2.0 * a]);
+            right.push([a, 3.0 * a * a]);
+        }
+    }
+}
+let dashed = serde_json::json!({ "lineType": "dashed" });
+emit_line_chart!(
+    &vec![
+        serde_json::json!({
+            "name": "f′ from select (x > 1)",
+            "points": slopes,
+            "style": { "showSymbol": true }
+        }),
+        serde_json::json!({ "name": "x² branch derivative 2x", "points": left, "style": dashed }),
+        serde_json::json!({ "name": "x³ branch derivative 3x²", "points": right, "style": dashed })
+    ],
+    options = &serde_json::json!({
+        "xLabel": "Evaluation point x [-]",
+        "yLabel": "Derivative f′(x) [-]",
+        "annotations": [{ "kind": "line", "axis": "x", "value": point, "label": "Selected x" }]
+    })
+);
+```
+
+At the default $x = 1$, `select` and `if` selecting with `x > 1` return the left branch derivative 2, while `select` selecting with `x ≥ 1` returns the right branch derivative 3.
+All three have kink count zero.
+`max(x², x³)` is at a kink with equal arguments, so it returns the midpoint 2.5 and counts one kink.
+The central difference is $2.5 + h + h^2/2 \approx 2.500001$; a difference straddling the boundary approaches the average of the two one-sided derivatives.
+Every expression's value is the same on the tape and with `Dual`.
+
+The tape word count is 4 for `select`, which computes both branches, and 3 for `if`, which computes only the selected branch.
+Because `select` records no statement on a scalar tape, the four words are the constant, input, and two `powi` words; the one-word difference from `if` is the `powi` statement of the unselected branch.
+`max(x², x³)` adds a `max` statement to the two `powi` statements, giving five words.
+
+At $x = 0.8$ and $x = 1.25$, every expression returns the selected branch's classical derivative, 1.6 and 4.6875 respectively, and `max` is also away from a kink.
+In the chart, the derivative switches from the dashed $2x$ line to the dashed $3x^2$ line across $x = 1$.
+The `Lanes` containing eight points from $x = 0.9$ to $1.075$ selects different branches in different lanes.
+
+## Table lookup with `gather`
+
+Some computations, such as piecewise linear interpolation and tables of material properties, derive a table position from an argument and retrieve a value.
+For each lane, `R::gather(table, key, locate)` passes the base value of key to `locate` to obtain an index and returns that element of `table`.
+Types with lanes can select a different element in each lane.
+
+The returned value's derivative is the derivative of the selected element.
+The key is not differentiated.
+Since the index is piecewise constant in key, its derivative is zero away from boundaries and undefined on boundaries.
+If table elements are active values (for example, parameters being optimized), derivatives with respect to those elements can be obtained.
+
+For piecewise linear interpolation $y(x) = t_i + (x - x_i)(t_{i+1} - t_i)/h$ (uniform grid $x_i = x_0 + ih$), compute $i = \lfloor (x - x_0)/h \rfloor$ with `locate` and retrieve $t_i$ and $t_{i+1}$ with `gather`.
+Computing $x_i$ with `floor` makes it passive, so the derivative with respect to $x$ passes only through the weight $(x - x_i)/h$ and becomes $(t_{i+1} - t_i)/h$.
+At a grid point, it returns the slope of the interval selected by `locate`.
+
+`locate` is called several times per lane and must be deterministic, returning the same index for the same argument.
+If `locate` returns an index at least as large as the table length, it returns `OutOfBounds` (quantity `table`).
+
+On a scalar tape, `gather` also returns the selected element directly without recording a statement.
+On a tape with a lane type, if selected elements include active values, it records one statement assembling the value from per-lane elements.
+
+## Branching and reuse of recordings
+
+A tape records only executed operations, so its contents depend on the branches selected at each point.
+`Tape::gradient_into` and `Tape::linearize` execute the function and record it anew on every call; when the point changes, the branches at the new point are recorded.
+In contrast, a `Linearization` constructed at a point and its products use only that point's recording.
+
+The structural patterns returned by `Linearization::jacobian_pattern` and `hessian_pattern` are also constructed from statements recorded at that point ([Structural patterns and recovery of sparse derivatives](../sparse-derivatives/)).
+Because `select` and `gather` on a scalar tape record no statements, the pattern contains only dependencies of selected branches and selected elements.
+At points where branch selection changes, dependencies and thus patterns can change.
+Reuse a coloring constructed from a pattern at another point only if it takes the same branches.
+
+## Summary
+
+A function used only with types without lanes can branch with `if` under the bound `R: Real<Mask = bool>`; only statements of the selected branch remain on the tape.
+Functions also supporting types with lanes branch using `select` and mask operations; both branches must be computed, but NaN in an unselected branch does not enter the selected lane's value or derivatives.
+At a boundary, the derivative is the one-sided derivative of the branch containing the boundary; it differs from the midpoint obtained with `max` or `abs` and is not counted as a kink.
+Write table lookups with `gather`; key is not differentiated and only the derivative of the selected element passes through.
+Recordings, `Linearization`, and structural patterns apply only to the branches taken at the recording point; record anew at points where branches may change.
+
+## Further reading
+
+- [Loops and checkpointing](../checkpointing/): examine how memory and recomputation are apportioned when traversing long loops in reverse.
+- [Kinks and nonfinite-value policies](../nonsmooth-and-nonfinite-policies/): examine the midpoint convention for `abs` and `max` and kink detection with `KinkPolicy`.
+- [Structural patterns and recovery of sparse derivatives](../sparse-derivatives/): examine reuse of structural patterns from recordings and their colorings at points taking the same branches.

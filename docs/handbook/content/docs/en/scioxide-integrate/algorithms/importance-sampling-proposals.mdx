@@ -1,0 +1,279 @@
+---
+title: "Importance-sampling proposals and effective sample size"
+description: "Unbiasedness and variance of importance-sampling estimators, the MonteCarloProposal contract with UniformProposal and ProposalUniforms, the meaning of Kish effective sample size, and scale versus standard error for a custom truncated Laplace proposal."
+sidebar:
+  order: 390
+references:
+  integrate-effective-sample-size: "effective-sample-size"
+  integrate-proposal-contract: "proposal-contract"
+  integrate-importance-sampling-estimator: "importance-sampling-estimator-and-variance"
+---
+
+Uniform Monte Carlo integration places samples at the same density where integrand values are small and where they are large.
+Importance sampling draws points from a density (proposal) that places more samples where values are large, dividing by the density to remove bias.
+This page covers importance-sampling estimators and variance, the proposal contract for `MonteCarloIntegrator::importance`, and effective sample size as a measure of weight imbalance, then uses a custom proposal to examine scale versus standard error.
+[Adaptive Monte Carlo (VEGAS and MISER)](../adaptive-monte-carlo/) covers VEGAS proposal learning; [Monte Carlo integration estimators and statistics](../monte-carlo-integration/) covers uniform Monte Carlo standard errors and intervals.
+
+## Importance-sampling estimator and variance
+
+Let $\boldsymbol X_i$ be the affine image in box $B$ of volume $V$ of a point $\boldsymbol Y_i$ drawn from probability density $q > 0$ on the unit cube $[0,1)^d$, and define the observation as
+
+$$
+Y_i = \frac{V f(\boldsymbol X_i)}{q(\boldsymbol Y_i)}
+$$
+
+
+Since $\mathbb E_q[V f/q] = \int V f\,d\boldsymbol y = I$, the sample mean is unbiased regardless of $q$.
+Its variance is $\operatorname{Var}_q(Y) = \int (Vf)^2/q\,d\boldsymbol y - I^2$, minimized when $q \propto |f|$ (zero if $f$ has constant sign).
+If $q$ gives little density where $f$ is large, $f/q$ takes large values and variance can instead increase.
+
+## Proposal contract
+
+`MonteCarloIntegrator::importance(&bounds, proposal, options)` performs importance sampling with `proposal` implementing the `MonteCarloProposal` trait.
+The trait has `dimension()` (point dimension $d$), `uniform_count()` (uniform random numbers per point $m$), and `sample(uniforms, point)`.
+`sample` receives $m$ uniform random numbers in $[0,1)$, writes a unit-cube point, and returns its density $q$.
+Uniforms are passed as `ProposalUniforms`, checked at construction to be finite and in $[0,1)$ (you can also construct them with `ProposalUniforms::new`).
+Unbiasedness requires $q$ to integrate to 1 on the cube and be positive wherever $f \ne 0$, but a plan cannot verify this from samples.
+The plan only checks that the returned density is finite and positive and that the point lies in $[0,1)$.
+Density or coordinate violations return `InvalidInput`; NaN or infinite coordinates return `NonFinite`.
+Weights $1/q$ are not self-normalized.
+`sample` must be a deterministic function of the supplied uniforms; rejection sampling, adaptive sampling, and Markov chain sampling are not supported.
+`MonteCarloIntegrator::new` uses the uniform proposal `UniformProposal::new(d)` ($q = 1$, passing uniforms directly through as point coordinates).
+
+## Effective sample size
+
+Use Kish effective sample size $n_{\mathrm{eff}} = (\sum_i w_i)^2/\sum_i w_i^2$ ($w_i = 1/q(\boldsymbol Y_i)$) to diagnose weight imbalance.
+`MonteCarloStatistics::effective_sample_size()` and `MonteCarloChild::effective_sample_size()` return it; for a uniform proposal it equals $n$.
+The more weights $1/q$ concentrate on a few samples, the smaller $n_{\mathrm{eff}}$ becomes.
+$n_{\mathrm{eff}}$ depends only on weights, excluding the integrand, so it measures how far the proposal differs from uniform.
+When reusing samples for another integrand, it warns that a few samples may dominate the estimate; for the integrand matched by the proposal, assess accuracy through standard error.
+This is a proposal diagnostic, not the degrees of freedom for an interval.
+
+## A custom proposal and effective sample size
+
+Consider the same Gaussian heat source $\exp(-|\boldsymbol x-\boldsymbol c|^2/(2s^2))$ W/m³ centered at $\boldsymbol c=(0.37,0.52,0.61)$ m in a cube of side 1 m as in [Adaptive Monte Carlo (VEGAS and MISER)](../adaptive-monte-carlo/), and its total output [W].
+The exact value is the product of $\sqrt{\pi/2}\,s\,[\operatorname{erf}((1-c_j)/(\sqrt2 s))+\operatorname{erf}(c_j/(\sqrt2 s))]$ over axes, computed with `scioxide_special::erf`.
+Implementing `MonteCarloProposal` yourself lets the proposal incorporate knowledge of the integrand's shape.
+For this heat source, use a product over axes of Laplace densities centered at $c_k$ with scale $b$, truncated to $[0,1)$:
+
+$$
+q_k(y) = \frac{e^{-|y - c_k|/b}}{Z_k}, \qquad Z_k = b\bigl(2 - e^{-c_k/b} - e^{-(1-c_k)/b}\bigr)
+$$
+
+
+The cumulative distribution function has a closed-form inverse, so each coordinate uses one uniform random number (`uniform_count()` is 3).
+The following definitions block implements this proposal as `MonteCarloProposal`.
+Map the uniform $u$ on each axis to $t = u(A + B)$ ($A = 1 - e^{-c_k/b}$, $B = 1 - e^{-(1-c_k)/b}$, $Z_k = b(A + B)$).
+For $t < A$ use the left inverse $y = c_k + b\ln(t + e^{-c_k/b})$, otherwise the right inverse $y = c_k - b\ln(1 - (t - A))$ to construct the coordinate, returning the product of $q_k(y)$ across three axes as the density.
+
+```rust
+//| id: integrate-laplace-proposal
+//| kind: definitions
+//| title: "Proposal from a product of truncated Laplace distributions"
+//| crates: [scioxide-core, scioxide-integrate]
+use scioxide_core::{SciOxideError, RealScalar};
+use scioxide_integrate::{MonteCarloProposal, ProposalUniforms};
+
+// Product of Laplace densities, each centered at c_k with scale b and truncated to [0, 1).
+pub(crate) struct LaplaceProposal {
+    pub(crate) center: [f64; 3],
+    pub(crate) scale: f64,
+}
+impl MonteCarloProposal<f64> for LaplaceProposal {
+    fn dimension(&self) -> usize {
+        3
+    }
+    fn uniform_count(&self) -> usize {
+        3
+    }
+    fn sample(
+        &self,
+        uniforms: ProposalUniforms<'_, f64>,
+        point: &mut [f64],
+    ) -> Result<f64, SciOxideError> {
+        let b = self.scale;
+        let mut density = 1.0;
+        for (k, &u) in uniforms.as_slice().iter().enumerate() {
+            let c = self.center[k];
+            // Masses left and right of the center (excluding b), and normalization constant Z = b (A + B).
+            let left = 1.0 - RealScalar::exp(-c / b);
+            let right = 1.0 - RealScalar::exp(-(1.0 - c) / b);
+            let t = u * (left + right);
+            // Inverse CDF: left side c + b ln(t + e^{−c/b}), right side c − b ln(1 − (t − A)).
+            let y = if t < left {
+                c + b * RealScalar::ln(t + RealScalar::exp(-c / b))
+            } else {
+                c - b * RealScalar::ln(1.0 - (t - left))
+            };
+            point[k] = y;
+            density *= RealScalar::exp(-(y - c).abs() / b) / (b * (left + right));
+        }
+        Ok(density)
+    }
+}
+```
+
+Vary scale $b$ from $0.02$ to $2$ m and plot standard error and effective-sample-size fraction $n_{\mathrm{eff}}/n$ for $2^{14}$ samples.
+Both plots share horizontal axis $b$ and are linked, so zooming one gives the same range in the other.
+The dashed horizontal line is uniform Monte Carlo's standard error; the vertical line is source width $s$.
+
+```rust
+//| id: integrate-custom-laplace-proposal
+//| ref: integrate-custom-laplace-proposal
+//| title: "Vary proposal scale to examine standard error and effective sample size"
+//| run: button
+//| uses: [integrate-laplace-proposal]
+//| crates: [scioxide-core, scioxide-integrate, scioxide-random, scioxide-special]
+//| timeoutMs: 120000
+//| inputs:
+//|   source_width: {"type":"range","label":"Heat-source width s [m]","description":"Spread of the Gaussian heat source inside the cube.","min":0.02,"max":0.3,"step":0.02,"value":0.06}
+//|   seed: {"type":"range","label":"Random seed [-]","description":"Seed from which evaluation random streams are derived.","min":1,"max":50,"step":1,"value":11}
+//| cases:
+//|   - {"id":"wide-source","label":"s = 0.2 m","description":"A wider source requires a larger scale to minimize standard error; with an overly narrow proposal, standard errors become unreliable.","inputs":{"source_width":0.2}}
+//|   - {"id":"other-seed","label":"Seed 29","description":"Different random numbers give the same trends in standard error and effective sample size.","inputs":{"seed":29}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"scales","path":"/rows/0/1","range":{"min":0,"max":0.2}}
+//|       - {"artifact":"scales","path":"/rows/9/1","range":{"min":0.8,"max":1}}
+//|       - {"artifact":"scales","path":"/rows/4/4","range":{"min":-4,"max":4}}
+//|   - case: wide-source
+//|     expect:
+//|       - {"artifact":"scales","path":"/rows/7/4","range":{"min":-4,"max":4}}
+//|       - {"artifact":"scales","path":"/rows/0/4","range":{"max":-5}}
+//|   - case: other-seed
+//|     expect:
+//|       - {"artifact":"scales","path":"/rows/4/4","range":{"min":-4,"max":4}}
+use scioxide_core::{Budget, ExecutionContext, Interval, RealScalar};
+use scioxide_integrate::{MonteCarloIntegrator, MonteCarloOptions, RandomStreams};
+use scioxide_random::{Philox4x64, SeedableRng};
+use scioxide_special::erf;
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let (s, c) = (source_width, [0.37_f64, 0.52, 0.61]);
+let f = |x: &[f64]| {
+    let r2: f64 = (0..3).map(|j| (x[j] - c[j]) * (x[j] - c[j])).sum();
+    Ok(RealScalar::exp(-r2 / (2.0 * s * s)))
+};
+// Reference: product over axes of √(π/2) s [erf((1 − c)/(√2 s)) + erf(c/(√2 s))] (SciOxide erf).
+let width = std::f64::consts::SQRT_2 * s;
+let mut exact = 1.0_f64;
+for &cj in &c {
+    let sum = erf((1.0 - cj) / width).map_err(|e| e.to_string())?
+        + erf(cj / width).map_err(|e| e.to_string())?;
+    exact *= RealScalar::sqrt(std::f64::consts::PI / 2.0) * s * sum;
+}
+let bounds = [Interval::new(0.0_f64, 1.0).map_err(|e| e.to_string())?; 3];
+let (root, context) = (
+    Philox4x64::from_seed(seed as u64),
+    ExecutionContext::sequential(),
+);
+let n = 1_usize << 14;
+let options =
+    MonteCarloOptions::default().with_samples(Budget::try_from(n).map_err(|e| e.to_string())?);
+// Uniform Monte Carlo standard error for comparison.
+let uniform = MonteCarloIntegrator::new(&bounds, options).map_err(|e| e.to_string())?;
+let mut workspace = uniform.workspace(1, context).map_err(|e| e.to_string())?;
+let mut value = 0.0_f64;
+let streams = RandomStreams::new(&root, 0);
+// A fixed-sample run terminates with SampleBudgetCompleted, so read statistics rather than the report.
+let _ = uniform
+    .integrate_into(&f, streams, &mut value, &mut workspace, context)
+    .map_err(|e| e.to_string())?;
+let uniform_se = workspace.statistics()[0]
+    .as_ref()
+    .ok_or("Missing statistics")?
+    .standard_error();
+let (mut se_curve, mut ess_curve, mut rows) = (Vec::new(), Vec::new(), Vec::new());
+for b in [0.02_f64, 0.03, 0.05, 0.08, 0.12, 0.2, 0.3, 0.5, 1.0, 2.0] {
+    let proposal = LaplaceProposal {
+        center: c,
+        scale: b,
+    };
+    let plan = MonteCarloIntegrator::importance(&bounds, proposal, options)
+        .map_err(|e| e.to_string())?;
+    let (streams, mut estimate) = (RandomStreams::new(&root, 1), 0.0_f64);
+    let _ = plan
+        .integrate_into(&f, streams, &mut estimate, &mut workspace, context)
+        .map_err(|e| e.to_string())?;
+    let statistics = workspace.statistics()[0].as_ref().ok_or("Missing statistics")?;
+    let se = statistics.standard_error();
+    let ess = statistics
+        .effective_sample_size()
+        .ok_or("Missing effective sample size")?;
+    se_curve.push([b, se]);
+    ess_curve.push([b, ess / n as f64]);
+    rows.push((b, ess / n as f64, estimate, se, (estimate - exact) / se));
+}
+let marker =
+    serde_json::json!({ "kind": "line", "axis": "x", "value": s, "label": "Source width s" });
+emit_line_chart!(
+    &vec![serde_json::json!({
+        "name": "Laplace-proposal standard error",
+        "points": se_curve,
+        "style": { "showSymbol": true }
+    })],
+    options = &serde_json::json!({
+        "link": { "group": "proposal-scale" },
+        "xLabel": "Proposal scale b [m]",
+        "yLabel": "Standard error [W]",
+        "xType": "log",
+        "yType": "log",
+        "annotations": [
+            marker.clone(),
+            { "kind": "line", "axis": "y", "value": uniform_se, "label": "Uniform MC standard error" }
+        ]
+    })
+);
+emit_line_chart!(
+    &vec![serde_json::json!({
+        "name": "Effective-sample-size fraction",
+        "points": ess_curve,
+        "style": { "showSymbol": true }
+    })],
+    options = &serde_json::json!({
+        "link": { "group": "proposal-scale" },
+        "xLabel": "Proposal scale b [m]",
+        "yLabel": "Effective-sample-size fraction n_eff/n [-]",
+        "xType": "log",
+        "yMin": 0.0,
+        "yMax": 1.0,
+        "annotations": [marker]
+    })
+);
+let columns = serde_json::json!([
+    { "key": "0", "label": "Scale b [m]", "type": "number", "format": { "significantDigits": 2 } },
+    { "key": "1", "label": "n_eff/n [-]", "type": "number", "format": { "fractionDigits": 3 } },
+    { "key": "2", "label": "Estimate [W]", "type": "number", "format": { "significantDigits": 6 } },
+    { "key": "3", "label": "Standard error [W]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "Difference/standard error [-]", "type": "number", "format": { "fractionDigits": 2 } }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "scales" })
+);
+```
+
+With the default $s = 0.06$ m, standard error reaches its minimum $1.4\times10^{-5}$ W at $b = 0.05$ m, about one twentieth of uniform MC's $2.8\times10^{-4}$ W; without training it is comparable to the standard error obtained with the learned VEGAS map ($1.7\times10^{-5}$ W for the same sample count).
+Setting $b$ to 0.02 m, narrower than the source width, increases standard error to about 10 times its minimum.
+If proposal tails decay faster than integrand tails, rare tail samples have very large $f/q$.
+Increasing $b$ brings the proposal closer to uniform, and standard error returns to the uniform MC value.
+
+The effective-sample-size fraction is below 0.002 at $b \le 0.05$ m, increases once $b$ exceeds 0.1 m, and reaches 0.98 at $b = 2$ m.
+At $b$, where standard error is minimized, the effective-sample-size fraction is nearly minimal, showing it is not an integrand-specific accuracy measure.
+With source width 0.2 m, the estimate at $b = 0.02$ m differs from the exact value by about 20 standard errors.
+An overly narrow proposal gives $f/q$ a heavy-tailed distribution, making the sample standard error itself unreliable.
+
+## Summary
+
+The mean of importance-sampling observations $V f/q$ is unbiased if $q$ integrates to 1 on the cube and is positive wherever $f \ne 0$; variance decreases as the density approaches $q \propto |f|$.
+`MonteCarloProposal` deterministically constructs a point and density from uniforms; a plan checks only positivity of density and coordinate bounds, and cannot verify normalization.
+A proposal too narrow relative to the integrand gives $f/q$ heavy tails, increasing standard error and making the sample standard error itself unreliable.
+Effective sample size depends only on weights $1/q$ and diagnoses separation of the proposal from uniform; judge accuracy for a specific integrand through standard error and comparisons with exact values.
+
+## Further reading
+
+- [Adaptive Monte Carlo (VEGAS and MISER)](../adaptive-monte-carlo/): examine benefits and failures of VEGAS proposal learning and MISER stratification learning.
+- [Monte Carlo integration estimators and statistics](../monte-carlo-integration/): examine standard errors, degrees of freedom, interval definitions, and reading statistics from `MonteCarloWorkspace`.
+- [Monte Carlo API guide](../../api/monte-carlo/): review specifications for `MonteCarloProposal`, `ProposalUniforms`, and `UniformProposal`.

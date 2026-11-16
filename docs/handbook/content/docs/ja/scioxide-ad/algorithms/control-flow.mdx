@@ -1,0 +1,271 @@
+---
+title: 分岐・マスク・表引き
+description: 値による分岐を if と select で書いたときの導関数の規約、Real<Mask = bool> と LaneMask によるマスクとその演算、選ばれなかった枝の NaN の扱い、表引き gather の導関数と記録、記録と構造パターンが同じ枝を通る点でだけ有効であること。
+sidebar:
+  order: 350
+references:
+  ad-branch-select: "値による分岐と-select"
+  ad-table-gather: "表引き-gather"
+  ad-branch-recording: "分岐と記録の再利用"
+---
+
+数値計算のプログラムには値によって式を切り替える分岐と、引数から位置を決めて表の値を取り出す表引きがある。
+自動微分は実行した経路の演算に連鎖律を当てるので、どちらの枝の導関数を返すかと、枝の境目で何を返すかが問題になる。
+
+このページは比較と `select` による分岐、マスクの型と演算、表引きの `gather`、分岐と記録・構造パターンの関係を扱う。
+テープ、文、走査の用語は[逆モードとテープ](../reverse-mode-and-replay/)、数値型の `Mask` と lane は[数値型・lane・汎用コード](../number-types-and-lanes/)で定義している。
+ループを逆にたどるときのメモリと再計算は[ループとチェックポイント](../checkpointing/)で扱う。
+
+## 実行した経路の微分
+
+述語 $p(x)$ が真なら $f(x) = f_1(x)$、偽なら $f(x) = f_2(x)$ と 2 つの式を切り替える関数を考える。
+$p$ は $g(x) > h(x)$ のような比較で、$g$ と $h$ が連続なら、真偽は $g - h$ の符号が変わる点（境界）でだけ変わる。
+
+境界から離れた点では、近傍のどの点でも同じ枝が選ばれるので、近傍で $f = f_i$ が成り立ち、$f'(x) = f_i'(x)$ である。
+実行した枝の演算を微分すれば、この古典的な導関数がそのまま得られる。
+述語の真偽は近傍で一定なので、比較そのものは導関数に寄与しない。
+
+境界 $x_0$（$g(x_0) = h(x_0)$）では、$f$ が連続とは限らず、連続でも片側導関数 $f_1'(x_0)$ と $f_2'(x_0)$ が一致するとは限らない。
+選ばれた枝の導関数 $f_i'(x_0)$ は計算できるが、2 つの枝が境界で同じ値と傾きを持つかは枝の式の内容で決まり、プログラムの構造からは分からない。
+そのため境界で得た導関数は、境界を含む側の片側導関数であり、$f$ の古典的な導関数とは限らない。
+
+## 値による分岐と `select`
+
+`Real` の比較 `lt`、`le`、`gt`、`ge` は、2 つの値の base 値（一番内側の `f64` や `Lanes` の値）を lane ごとに比べ、`R::Mask` を返す。
+導関数の成分は比較に使わない。
+NaN を含む比較は偽になる。
+`is_finite` は、値とすべての導関数の成分が有限である lane を示すマスクを返す。
+
+マスクの型は数値型で決まる。
+`f64`、`Dual<f64>`、`MultiDual<f64, N>`、`Jet<f64, N>`、`Var<'_, f64>` のように lane が 1 つの型では `bool` で、`Lanes<S, W>` とそれをラップする型では `LaneMask<W>` である。
+Rust の `if` で分岐する汎用関数は、型の境界に `R: Real<Mask = bool>` を書く。
+lane のある型でも動かす汎用関数は、`R::select(mask, if_true, if_false)` で枝を選ぶ。
+
+マスクは `&`（かつ）、`|`（または）、`!`（否定）で組み合わせる。
+たとえば $0 < x < 1$ の lane は `x.gt(R::zero()) & x.lt(R::one())` で選べる。
+`Mask` トレイトの `splat(b)` はすべての lane が `b` のマスクを返し、`any()` と `all()` はいずれかの lane とすべての lane が真かを返す。
+`LaneMask<W>` は `from_array` と `to_array` で、lane ごとの `bool` の配列と相互に変換できる。
+
+`if` は選んだ枝の演算だけを実行するので、テープにも選んだ枝の文だけが残る。
+`select` は 2 つの値がすでに計算されていることを前提に、lane ごとに選んだ側の値とすべての導関数の成分を取り出す。
+両方の枝を計算するので、計算コストは 2 つの枝の和になる。
+
+選ばれなかった枝の値が NaN でも、選んだ lane の値と導関数には入らない。
+テープの逆走査は 0 の随伴と無限大や NaN の偏導関数の積を 0 にする（`Real::azmul`）ので、選ばれなかった枝の偏導関数も勾配に入らない。
+たとえば `select(x.gt(0), x.sqrt(), x * 2.0)` を `Tape<Lanes<f64, 4>>` で $x = (-1, 0, 0.5, 2)$ について微分すると、$x \le 0$ の lane は $\sqrt{x}$ の NaN や無限大の偏導関数の影響を受けずに傾き 2 を返す。
+
+スカラーのテープ（`Tape<f64>` など）の `select` は、選んだ値をそのまま返し、文を記録しない。
+lane の型のテープ（`Tape<Lanes<f64, 4>>` など）では、lane ごとに選ぶ側が分かれるときだけ `select` の文を 1 つ記録し、すべての lane が同じ側を選べば文を記録しない。
+
+`select` の導関数は選んだ側の導関数である。
+`select` と比較は折れ点ではないので、テープの折れ点の回数（`TapeReport::kinks`）に数えず、`KinkPolicy::Error` でも拒否されない。
+これに対して `abs`、`min`、`max` は折れ点の規則を持つ関数で、引数が折れ点にあると片側導関数の中点を返し、テープはその回数を数える（[折れ点と非有限値の扱い](../nonsmooth-and-nonfinite-policies/)）。
+同じ区分関数でも、`select` で書くか `max` で書くかで境界の導関数が変わる。
+
+次のセルは $f(x) = x^2$（$x \le 1$）、$x^3$（$x > 1$）を 4 通りに書き、評価点 $x$ での値と導関数を比べる。
+$x^3 - x^2 = x^2(x - 1)$ なので、この関数はすべての実数で $\max(x^2, x^3)$ に等しい。
+境界 $x = 1$ の左側の導関数は $2x = 2$、右側の導関数は $3x^2 = 3$ である。
+表は書き方ごとに値、テープ（`Tape<f64>`）と `Dual` の導関数、折れ点の回数、テープのワードの数（`TapeReport::words`。
+定数と入力のワードを含む）を示す。
+2 つ目の表は独立な検算として、2 つの枝の導関数の閉形式と、$\max(x^2, x^3)$ の `f64` の値から作った中心差分（刻み $h = 10^{-6}$）を示す。
+グラフは $x$ が 0.5 から 1.5 までの 41 点で、`x > 1` で選ぶ書き方の導関数を `Dual<Lanes<f64, 8>>` で 8 点ずつ求め、2 つの枝の導関数（破線）と重ねる。
+
+```rust
+//| id: ad-select-branch-derivative
+//| ref: ad-select-branch-derivative
+//| title: 区分関数を select、if、max で書いたときの導関数
+//| run: reactive
+//| crates: [scioxide-ad, scioxide-core]
+//| inputs:
+//|   point: {"type":"range","label":"評価点 x [-]","description":"x = 1 が 2 つの枝の境界。","min":0.5,"max":1.5,"step":0.05,"value":1}
+//| cases:
+//|   - {"id":"left","label":"x = 0.8（境界の左）","description":"どの書き方も x² の枝の導関数 2x = 1.6 を返す。","inputs":{"point":0.8}}
+//|   - {"id":"right","label":"x = 1.25（境界の右）","description":"どの書き方も x³ の枝の導関数 3x² = 4.6875 を返す。","inputs":{"point":1.25}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"forms","path":"/rows/0/2","approx":{"value":2,"atol":1e-15}}
+//|       - {"artifact":"forms","path":"/rows/1/2","approx":{"value":3,"atol":1e-15}}
+//|       - {"artifact":"forms","path":"/rows/2/3","approx":{"value":2,"atol":1e-15}}
+//|       - {"artifact":"forms","path":"/rows/3/2","approx":{"value":2.5,"atol":1e-15}}
+//|       - {"artifact":"forms","path":"/rows/0/4","equals":0}
+//|       - {"artifact":"forms","path":"/rows/3/4","equals":1}
+//|       - {"artifact":"reference","path":"/rows/0/2","approx":{"value":2.5,"atol":1e-5}}
+//|   - case: left
+//|     expect:
+//|       - {"artifact":"forms","path":"/rows/0/2","approx":{"value":1.6,"rtol":1e-15}}
+//|       - {"artifact":"forms","path":"/rows/3/2","approx":{"value":1.6,"rtol":1e-15}}
+//|       - {"artifact":"reference","path":"/rows/0/2","approx":{"value":1.6,"atol":1e-8}}
+//|   - case: right
+//|     expect:
+//|       - {"artifact":"forms","path":"/rows/1/3","approx":{"value":4.6875,"rtol":1e-15}}
+//|       - {"artifact":"forms","path":"/rows/3/2","approx":{"value":4.6875,"rtol":1e-15}}
+//|       - {"artifact":"forms","path":"/rows/3/4","equals":0}
+use scioxide_ad::{Dual, Lanes, Real, Tape, TapeOptions};
+use scioxide_core::ExecutionContext;
+
+// f(x) = x²（x ≤ 1）、x³（x > 1）の 4 つの書き方。
+fn which<R: Real<Mask = bool>>(form: usize, x: R) -> R {
+    match form {
+        0 => R::select(x.gt(R::one()), x.powi(3), x.powi(2)),
+        1 => R::select(x.ge(R::one()), x.powi(3), x.powi(2)),
+        2 => {
+            if x.gt(R::one()) {
+                x.powi(3)
+            } else {
+                x.powi(2)
+            }
+        }
+        _ => x.powi(2).max(x.powi(3)),
+    }
+}
+// lane のある型でも動く書き方（Real<Mask = bool> を要求しない）。
+fn strict<R: Real>(x: R) -> R {
+    R::select(x.gt(R::one()), x.powi(3), x.powi(2))
+}
+
+let cx = ExecutionContext::sequential();
+let names = [
+    "select（x > 1 で x³）",
+    "select（x ≥ 1 で x³）",
+    "if（R: Real<Mask = bool>）",
+    "max(x², x³)",
+];
+let mut rows = Vec::new();
+for (form, name) in names.into_iter().enumerate() {
+    let mut tape = Tape::<f64>::new(TapeOptions::new());
+    let mut slope = [0.0];
+    let value = tape
+        .gradient_into(|x| Ok(which(form, x[0])), &[point], &mut slope, cx)
+        .map_err(|e| e.to_string())?;
+    let report = tape.report();
+    let forward = which(form, Dual::variable(point)).derivative();
+    rows.push((
+        name,
+        value,
+        slope[0],
+        forward,
+        report.kinks(),
+        report.words(),
+    ));
+}
+let fixed6 = serde_json::json!({ "fractionDigits": 6 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "書き方" },
+    { "key": "1", "label": "f(x) [-]", "type": "number", "format": fixed6 },
+    { "key": "2", "label": "f′(x)（テープ）[-]", "type": "number", "format": fixed6 },
+    { "key": "3", "label": "f′(x)（Dual）[-]", "type": "number", "format": fixed6 },
+    { "key": "4", "label": "折れ点の回数 [回]", "type": "integer" },
+    { "key": "5", "label": "テープのワードの数 [ワード]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "forms" })
+);
+
+// 独立検算: 枝ごとの導関数の閉形式と、f64 の値から作る中心差分。
+let h = 1e-6;
+let central = (which(3, point + h) - which(3, point - h)) / (2.0 * h);
+let reference_columns = serde_json::json!([
+    { "key": "0", "label": "左の枝の導関数 2x [-]", "type": "number", "format": fixed6 },
+    { "key": "1", "label": "右の枝の導関数 3x² [-]", "type": "number", "format": fixed6 },
+    { "key": "2", "label": "中心差分（h = 10⁻⁶）[-]", "type": "number", "format": fixed6 }
+]);
+emit_table_with_columns!(
+    reference_columns,
+    vec![(2.0 * point, 3.0 * point * point, central)],
+    metadata = serde_json::json!({ "id": "reference" })
+);
+
+// Dual<Lanes<f64, 8>> で 8 点ずつ評価する。select は lane ごとに枝を選ぶ。
+let (mut slopes, mut left, mut right) = (Vec::new(), Vec::new(), Vec::new());
+for pack in 0..6 {
+    let x = Lanes::<f64, 8>::from_fn(|k| 0.5 + 0.025 * (8 * pack + k) as f64);
+    let y = strict(Dual::new(x, Lanes::splat(1.0)));
+    for k in (0..8).filter(|k| 8 * pack + k <= 40) {
+        if let (Some(a), Some(d)) = (x.lane(k), y.derivative().lane(k)) {
+            slopes.push([a, d]);
+            left.push([a, 2.0 * a]);
+            right.push([a, 3.0 * a * a]);
+        }
+    }
+}
+let dashed = serde_json::json!({ "lineType": "dashed" });
+emit_line_chart!(
+    &vec![
+        serde_json::json!({
+            "name": "select（x > 1）の f′",
+            "points": slopes,
+            "style": { "showSymbol": true }
+        }),
+        serde_json::json!({ "name": "x² の枝の導関数 2x", "points": left, "style": dashed }),
+        serde_json::json!({ "name": "x³ の枝の導関数 3x²", "points": right, "style": dashed })
+    ],
+    options = &serde_json::json!({
+        "xLabel": "評価点 x [-]",
+        "yLabel": "導関数 f′(x) [-]",
+        "annotations": [{ "kind": "line", "axis": "x", "value": point, "label": "選んだ x" }]
+    })
+);
+```
+
+既定の $x = 1$ では、`x > 1` で選ぶ `select` と `if` は左の枝の導関数 2 を返し、`x ≥ 1` で選ぶ `select` は右の枝の導関数 3 を返す。
+3 つとも折れ点の回数は 0 である。
+`max(x², x³)` は 2 つの引数が等しい折れ点にあたるので、中点 2.5 を返して折れ点を 1 回数える。
+中心差分は $2.5 + h + h^2/2 \approx 2.500001$ で、境界をまたぐ差分は 2 つの片側導関数の平均に近づく。
+どの書き方の値もテープと `Dual` で同じである。
+
+テープのワードの数は、両方の枝を計算する `select` が 4 ワード、選んだ枝だけを計算する `if` が 3 ワードである。
+スカラーのテープの `select` は文を記録しないので、4 ワードは定数、入力、2 つの `powi` のワードで、`if` との差の 1 ワードは選ばれなかった枝の `powi` の文である。
+`max(x², x³)` は 2 つの `powi` に `max` の文が加わって 5 ワードになる。
+
+$x = 0.8$ と $x = 1.25$ では、どの書き方も選ばれた枝の古典的な導関数 1.6 と 4.6875 を返し、`max` も折れ点に当たらない。
+グラフでは、導関数が $x = 1$ を境に $2x$ の破線から $3x^2$ の破線へ移る。
+$x = 0.9$ から $1.075$ までの 8 点を詰めた `Lanes` では、lane ごとに別の枝が選ばれている。
+
+## 表引き `gather`
+
+区分線形補間や物性値の表のように、引数から表の位置を決めて値を取り出す計算がある。
+`R::gather(table, key, locate)` は lane ごとに、key の base 値を `locate` に渡して添字を求め、`table` のその要素を返す。
+lane のある型では、lane ごとに別の要素を選べる。
+
+返す値の導関数は選んだ要素の導関数である。
+key は微分しない。
+添字は key について区分的に一定なので、境界の外では添字の導関数は 0 であり、境界の上では定義されない。
+表の要素が微分対象の値（たとえば最適化するパラメータ）なら、その要素についての導関数は得られる。
+
+区分線形補間 $y(x) = t_i + (x - x_i)(t_{i+1} - t_i)/h$（等間隔の格子 $x_i = x_0 + ih$）では、$i = \lfloor (x - x_0)/h \rfloor$ を `locate` で求め、$t_i$ と $t_{i+1}$ を `gather` で取り出す。
+$x_i$ を `floor` で求めると微分対象外の値になるので、$x$ についての導関数は重み $(x - x_i)/h$ だけを通って $(t_{i+1} - t_i)/h$ になる。
+格子点の上では、`locate` が選んだ区間の傾きを返す。
+
+`locate` は lane ごとに数回呼ばれるので、同じ引数に同じ添字を返す決定論的な関数でなければならない。
+`locate` が表の長さ以上の添字を返すと、`OutOfBounds`（数量 `table`）を返す。
+
+スカラーのテープでは、`gather` も選んだ要素をそのまま返し、文を記録しない。
+lane の型のテープでは、選んだ要素に微分対象の値があれば、lane ごとの要素から値を組み立てる文を 1 つ記録する。
+
+## 分岐と記録の再利用
+
+テープは実行した演算だけを記録するので、記録の内容は点ごとに選んだ枝で決まる。
+`Tape::gradient_into` や `Tape::linearize` は呼び出しのたびに関数を実行して記録し直すので、点が変われば新しい点の枝が記録される。
+一方、ある点で作った `Linearization` とその積は、その点の記録だけを使う。
+
+`Linearization::jacobian_pattern` と `hessian_pattern` が返す構造パターンも、その点で記録した文から作る（[構造パターンと疎な微分の復元](../sparse-derivatives/)）。
+スカラーのテープの `select` と `gather` は文を記録しないので、パターンは選んだ枝と選んだ要素の依存関係だけを含む。
+分岐の選び方が変わる点では、依存関係が変わり、パターンも変わりうる。
+パターンから作った彩色を別の点で使い回すのは、同じ枝を通る点に限る。
+
+## まとめ
+
+lane のない型だけで使う関数は `R: Real<Mask = bool>` を境界にして `if` で分岐でき、テープには選んだ枝の文だけが残る。
+lane のある型でも使う関数は `select` とマスクの演算で分岐し、両方の分岐を計算する必要があるが、選ばれなかった枝の NaN は選んだ lane の値と導関数に入らない。
+境界の点で得られるのは境界を含む枝の片側導関数で、`max` や `abs` で書いたときの中点とは違い、折れ点にも数えられない。
+表引きは `gather` で書き、key は微分されず、選んだ要素の導関数だけが通る。
+記録、`Linearization`、構造パターンは記録した点の枝に限って有効なので、枝が変わりうる点では記録し直す。
+
+## 次に読むページ
+
+- [ループとチェックポイント](../checkpointing/)：長いループを逆にたどるときのメモリと再計算の配分を確かめる。
+- [折れ点と非有限値の扱い](../nonsmooth-and-nonfinite-policies/)：`abs`・`max` の中点の規約と、`KinkPolicy` による折れ点の検出を確かめる。
+- [構造パターンと疎な微分の復元](../sparse-derivatives/)：記録から作る構造パターンと彩色を、同じ枝を通る点で使い回す方法を確かめる。

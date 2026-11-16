@@ -1,0 +1,291 @@
+---
+title: "Approximate the efficient frontier with NSGA-II"
+description: "Solve the mean–variance pair of objectives with NSGA-II and compare archive points with the closed-form efficient frontier to assess proximity and spread."
+sidebar:
+  order: 472
+---
+
+[Efficient frontiers of mean–variance models](../efficient-frontier/) fixed target returns and solved QPs to obtain the efficient frontier point by point.
+This page treats the same tradeoff as multiobjective optimization, simultaneously minimizing objectives for variance and expected return.
+Assets, expected returns $\mu=(0.03,0.07,0.11)$, standard deviations $\sigma=(0.08,0.14,0.20)$ and common correlation $\rho$ use the same hypothetical values as the previous page; returns and standard deviations are annual rates.
+The frontier reference is the closed form after eliminating equalities, which agreed with QP to around $10^{-17}$ on the previous page.
+
+## Two objectives and nondominated solutions
+
+Define the two objectives of allocation $w$ as $(w^\mathsf T\Sigma w,-\mu^\mathsf Tw)$ and minimize both.
+A candidate dominates another if it is no worse in either objective and better in at least one.
+A candidate dominated by no other is nondominated (Pareto optimal); the objective values of nondominated allocations form the Pareto front.
+For mean–variance optimization without short selling, the Pareto front coincides with the efficient frontier.
+
+NSGA-II (non-dominated sorting genetic algorithm II) updates a population by crossover and mutation, ranks combined parents and offspring by nondominance, then selects the next population.
+Within a rank, it favors larger crowding distances measuring spacing to neighboring candidates in objective space, spreading candidates over the front.
+SciOxide `Nsga2` defaults to simulated binary crossover (SBX, probability 0.9, distribution index 15) and polynomial mutation (probability $1/n_v$, distribution index 20).
+Here $n_v$ is the variable count.
+
+`Nsga2Result::archive` is a capacity-bounded archive of feasible, mutually nondominated points found during search.
+On overflow, it removes the point with smallest crowding distance, retaining points spread across the front.
+The archive is a finite approximation and is not guaranteed to contain Pareto-optimal points.
+Completing the scheduled generations gives termination reason `SearchBudgetCompleted`; NSGA-II never returns success.
+Here we use population 60, archive capacity 100 and 80 generations, evaluating the archive points.
+Each generation evaluates objectives 60 times, equal to population size; nondominated sorting requires work and memory proportional to population size squared.
+
+## Parameterizing the simplex
+
+NSGA-II searches box $[0,1]^{n-1}$, so express allocations as box points.
+For two assets use $w=(1-u,u)$, and for three use $w=(1-u,u(1-v),uv)$, with variables $u,v\in[0,1]$.
+This parameterization ensures all candidates have nonnegative weights summing to 1, so constraints need not be passed to NSGA-II.
+Multiple parameters may represent the same boundary allocation (at $u=0$, $v$ does not affect allocation), but no feasible allocation is excluded.
+
+The following definitions collect the covariance matrix, parameterization, mean and variance, closed form without short selling, and two objectives passed to `Nsga2` as Rust items.
+Write the two objectives with `sample_into` of `SampledObjective`; because they are deterministic, return `NoiseModel::Deterministic` and ignore the sample seed.
+
+```rust
+//| id: optimize-efficient-frontier-nsga2-model
+//| kind: definitions
+//| title: "Two-objective mean–variance model and closed-form frontier"
+//| crates: [scioxide-core, scioxide-optimize]
+use scioxide_core::SciOxideError;
+use scioxide_optimize::{NoiseModel, SampledObjective};
+pub(crate) struct Portfolio {
+    pub(crate) n: usize,
+    pub(crate) covariance: Vec<f64>,
+}
+impl Portfolio {
+    // Build Σᵢⱼ = σᵢσⱼ(ρ + (1 − ρ)δᵢⱼ) from standard deviations (0.08, 0.14, 0.20) and common correlation ρ.
+    pub(crate) fn new(n: usize, correlation: f64) -> Self {
+        let sd = [0.08, 0.14, 0.20];
+        let covariance = (0..n)
+            .flat_map(|i| {
+                (0..n).map(move |j| sd[i] * sd[j] * if i == j { 1.0 } else { correlation })
+            })
+            .collect();
+        Self { n, covariance }
+    }
+    // Simplex parameterization: (1 − u, u) for two assets; (1 − u, u(1 − v), uv) for three.
+    pub(crate) fn weights(&self, x: &[f64]) -> Vec<f64> {
+        if self.n == 2 {
+            vec![1.0 - x[0], x[0]]
+        } else {
+            vec![1.0 - x[0], x[0] * (1.0 - x[1]), x[0] * x[1]]
+        }
+    }
+    pub(crate) fn variance(&self, w: &[f64]) -> f64 {
+        (0..self.n)
+            .map(|i| {
+                (0..self.n)
+                    .map(|j| w[i] * self.covariance[i * self.n + j] * w[j])
+                    .sum::<f64>()
+            })
+            .sum()
+    }
+    // Expected returns μ = (0.03, 0.07, 0.11).
+    pub(crate) fn mean(&self, w: &[f64]) -> f64 {
+        w.iter()
+            .enumerate()
+            .map(|(i, v)| (0.03 + 0.04 * i as f64) * v)
+            .sum()
+    }
+    // Independent check: minimum of the one-variable quadratic after eliminating equalities (no short selling).
+    // For three assets, w = b + t d, b = (1 − β, β, 0), d = (1, −2, 1); project the vertex onto the interval.
+    pub(crate) fn minimum_variance(&self, r: f64) -> f64 {
+        let b = (r - 0.03) / 0.04;
+        if self.n == 2 {
+            return self.variance(&[1.0 - b, b]);
+        }
+        let base = [1.0 - b, b, 0.0];
+        let direction = [1.0, -2.0, 1.0];
+        let linear: f64 = (0..3)
+            .map(|i| {
+                (0..3)
+                    .map(|j| direction[i] * self.covariance[i * 3 + j] * base[j])
+                    .sum::<f64>()
+            })
+            .sum();
+        let t = (-linear / self.variance(&direction)).clamp((b - 1.0).max(0.0), b / 2.0);
+        let w: Vec<_> = (0..3).map(|i| base[i] + t * direction[i]).collect();
+        self.variance(&w)
+    }
+}
+// Two objectives passed to NSGA-II: (variance, −expected return).
+impl SampledObjective<f64> for Portfolio {
+    fn dimension(&self) -> usize {
+        self.n - 1
+    }
+    fn objectives(&self) -> usize {
+        2
+    }
+    fn noise_model(&self) -> NoiseModel {
+        NoiseModel::Deterministic
+    }
+    fn sample_into(&self, x: &[f64], _: u64, out: &mut [f64]) -> Result<(), SciOxideError> {
+        let w = self.weights(x);
+        out[0] = self.variance(&w);
+        out[1] = -self.mean(&w);
+        Ok(())
+    }
+}
+```
+
+## Comparing the archive and frontier
+
+The following cell runs NSGA-II and compares archive points with the closed-form efficient frontier.
+Inputs are asset count, common correlation and random seed.
+Proximity to the front is each point's variance minus the minimum variance at the same expected return (closed form without short selling); return range measures spread along the front.
+This is a variance difference at fixed expected return, not Euclidean distance in objective space.
+Outputs are a plot of archive points and frontier, a proximity-and-spread table, and a search outcome.
+The plotted frontier uses 31 points from the closed-form minimum-variance point to maximum return.
+
+```rust
+//| id: optimize-efficient-frontier-nsga2
+//| ref: optimize-efficient-frontier-nsga2
+//| title: "Compare the NSGA-II archive with the closed-form front"
+//| run: button
+//| timeoutMs: 120000
+//| uses: [optimize-efficient-frontier-nsga2-model]
+//| crates: [scioxide-core, scioxide-optimize]
+//| inputs:
+//|   assets: {"type":"range","label":"Asset count n [assets]","min":2,"max":3,"step":1,"value":3}
+//|   correlation: {"type":"range","label":"Common correlation ρ [-]","min":-0.4,"max":0.8,"step":0.1,"value":0.2}
+//|   seed: {"type":"range","label":"Random seed [-]","min":1,"max":100,"step":1,"value":7}
+//| cases:
+//|   - {"id":"two-assets","label":"Two assets","description":"The variable directly determines return, so all points lie on the front and minimum-variance differences are rounding errors around 10⁻¹⁸.","inputs":{"assets":2}}
+//|   - {"id":"negative-correlation","label":"Common correlation −0.4","description":"The front bends left and the minimum-variance point moves to return 0.0562. Minimum archive return is also 0.0562.","inputs":{"correlation":-0.4}}
+//|   - {"id":"seed-42","label":"Seed 42","description":"Changing the seed keeps maximum differences and return ranges at similar levels.","inputs":{"seed":42}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"archive","path":"/rows/0/0","range":{"min":10,"max":100}}
+//|       - {"artifact":"archive","path":"/rows/0/3","range":{"min":0,"max":1e-4}}
+//|       - {"artifact":"archive","path":"/rows/0/4","range":{"min":0,"max":2e-3}}
+//|       - {"artifact":"archive","path":"/rows/0/6","equals":"SearchBudgetCompleted"}
+//|       - {"path":"/outputs/2/state","equals":"partial"}
+//|   - case: two-assets
+//|     expect:
+//|       - {"artifact":"archive","path":"/rows/0/4","range":{"min":-1e-12,"max":1e-12}}
+//|   - case: negative-correlation
+//|     expect:
+//|       - {"artifact":"archive","path":"/rows/0/1","range":{"min":0.0555,"max":0.06}}
+//|       - {"artifact":"archive","path":"/rows/0/4","range":{"min":0,"max":3e-3}}
+//|   - case: seed-42
+//|     expect:
+//|       - {"artifact":"archive","path":"/rows/0/4","range":{"min":0,"max":2e-3}}
+use scioxide_core::{Budget, RealScalar};
+use scioxide_optimize::{FiniteBounds, Nsga2, Nsga2Options, Nsga2Problem};
+let n = assets as usize;
+let model = Portfolio::new(n, correlation);
+// Compute the closed-form minimum-variance set at 31 points and plot its branch above the minimum-variance point as the front.
+let curve: Vec<_> = (0..=30)
+    .map(|k| {
+        let r = 0.03 + 0.04 * (n - 1) as f64 * k as f64 / 30.0;
+        [RealScalar::sqrt(model.minimum_variance(r)), r]
+    })
+    .collect();
+let lowest = curve
+    .iter()
+    .copied()
+    .min_by(|a, b| a[0].total_cmp(&b[0]))
+    .ok_or("Empty frontier")?;
+let frontier: Vec<_> = curve.iter().filter(|p| p[1] >= lowest[1]).copied().collect();
+let bounds = FiniteBounds::new(vec![(0.0, 1.0); n - 1]).map_err(|e| e.to_string())?;
+let problem = Nsga2Problem::new(&model, &bounds).map_err(|e| e.to_string())?;
+let options = Nsga2Options::new(60, 100, Budget::try_from(80_usize).map_err(|e| e.to_string())?)
+    .with_seed(seed as u64);
+let result = Nsga2::new(options)
+    .map_err(|e| e.to_string())?
+    .solve(&problem)
+    .map_err(|e| e.to_string())?;
+// Convert archive objectives (variance, −expected return) to (variance, expected return).
+let entries: Vec<_> = result
+    .archive()
+    .entries()
+    .map(|p| (p.objectives()[0], -p.objectives()[1]))
+    .collect();
+let points: Vec<_> = entries
+    .iter()
+    .map(|&(v, r)| [RealScalar::sqrt(v), r])
+    .collect();
+emit_chart!(serde_json::json!({
+    "kind": "xy",
+    "xLabel": "Return standard deviation [annual rate]",
+    "yLabel": "Expected return [annual rate]",
+    "xMin": 0,
+    "xMax": 0.22,
+    "yMin": 0.02,
+    "yMax": 0.12,
+    "dataZoom": true,
+    "tooltip": true,
+    "layers": [
+        {
+            "id": "frontier",
+            "kind": "line",
+            "name": "Efficient frontier (closed form)",
+            "points": frontier,
+            "style": { "lineType": "dashed" }
+        },
+        { "id": "archive", "kind": "scatter", "name": "NSGA-II archive", "points": points }
+    ]
+}));
+// Independent check: compare each variance with the minimum at the same return (closed form without short selling).
+let mut gaps: Vec<_> = entries
+    .iter()
+    .map(|&(v, r)| v - model.minimum_variance(r))
+    .collect();
+gaps.sort_by(f64::total_cmp);
+let returns: Vec<_> = entries.iter().map(|e| e.1).collect();
+let fixed4 = serde_json::json!({ "fractionDigits": 4 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Archive points [count]", "type": "integer" },
+    { "key": "1", "label": "Minimum return [annual rate]", "type": "number", "format": fixed4 },
+    { "key": "2", "label": "Maximum return [annual rate]", "type": "number", "format": fixed4 },
+    { "key": "3", "label": "Median difference from minimum variance [annual rate²]", "type": "number", "format": sci2 },
+    { "key": "4", "label": "Maximum difference from minimum variance [annual rate²]", "type": "number", "format": sci2 },
+    { "key": "5", "label": "Generations [count]", "type": "integer" },
+    { "key": "6", "label": "Termination reason" }
+]);
+let summary = (
+    gaps.len(),
+    returns.iter().copied().fold(f64::INFINITY, f64::min),
+    returns.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+    gaps[gaps.len() / 2],
+    gaps[gaps.len() - 1],
+    result.generations(),
+    result.termination().to_string(),
+);
+emit_table_with_columns!(
+    columns,
+    vec![summary.clone()],
+    metadata = serde_json::json!({ "id": "archive" })
+);
+emit_outcome!(
+    Outcome::partial("NSGA-II completed scheduled generations without claiming convergence to the front")
+        .explanation("The archive is a finite front approximation; assess proximity and spread against the closed-form front.")
+        .status(summary.6)
+        .diagnostic("Maximum difference from minimum variance", summary.4, None)
+        .diagnostic("Return range", summary.2 - summary.1, None)
+);
+```
+
+For the default three assets, $\rho=0.2$ and seed 7, the archive fills its capacity of 100 points, spanning returns 0.0412–0.110.
+The closed-form minimum-variance return is 0.0412 (0.0407 on the plot's 31-point grid), so the archive covers nearly the entire efficient frontier.
+Differences from minimum variance at the same return have median $8.7\times10^{-6}$ and maximum $2.0\times10^{-4}$.
+With seed 42, maximum difference is $2.9\times10^{-4}$ and return range 0.0412–0.110, remaining at similar levels.
+Each QP point solves a convex problem, whereas NSGA-II points result from population search over finitely many generations, leaving this difference.
+
+For two assets, the single parameter directly determines return, so each point automatically lies on a frontier allocation, reducing differences to rounding error around $10^{-18}$.
+Only spread along the frontier determines NSGA-II quality in this case.
+At correlation $-0.4$, the closed-form minimum-variance point moves to return 0.0562, as does the minimum archive return.
+Maximum differences vary with seed and correlation; read proximity through both median and maximum, and spread through return range.
+
+## Summary
+
+The mean–variance tradeoff passes to NSGA-II as variance and negative expected return; the simplex without short selling maps to box $[0,1]^{n-1}$ by parameterization.
+Read NSGA-II results through archive points, assessing proximity by minimum-variance differences at the same return and spread by return range.
+Termination reason `SearchBudgetCompleted` means only that scheduled generations finished, so use outcome `partial` and draw conclusions from numerical proximity and spread.
+At scales without a closed form, make the same comparison using fixed-target-return QP frontiers as the reference.
+
+## Further reading
+
+- [Multiobjective optimization and NSGA-II](../../algorithms/multiobjective-and-stochastic/): examine dominance, crowding distance and archives.
+- [Stochastic gradient descent and stochastic trust-region methods](../../algorithms/stochastic-gradient-and-trust-region/): examine sampled-objective contracts in `SampledObjective`.
+- [Efficient frontiers of mean–variance models](../efficient-frontier/): compute the same frontier with QP and compare the Markowitz closed form allowing short selling.

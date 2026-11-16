@@ -1,0 +1,429 @@
+---
+title: "Sample matrices and weighted least squares"
+description: "Vandermonde matrices and conditioning, reasons to avoid normal equations, column scaling and truncated SVD, weight conventions, rank-deficient solutions, and reuse of prepared Plans."
+sidebar:
+  order: 320
+references:
+  poly-fit-column-scaling-svd: "column-scaling-and-truncated-svd"
+  poly-fit-plan-report-workspace: "preparation-results-and-workspaces"
+  poly-fit-sample-matrix-objective: "sample-matrix-and-objective"
+---
+
+Noisy measurements do not necessarily call for high-degree interpolation through every sample.
+Approximate $m$ samples $(x_i,y_i)$ with degree-$n$ polynomial $p(x)=\sum_{k=0}^n c_k\phi_k(x)$.
+Choose basis and degree and inspect residuals and rank to avoid coefficients overly sensitive to observation changes.
+This page explains the objective and weights, sample-matrix conditioning, SciOxide solvers and APIs, and two experiments.
+
+## Sample matrix and objective
+
+The $m\times(n+1)$ matrix $V_{ik}=\phi_k(x_i)$ evaluating basis functions $\phi_0,\dots,\phi_n$ at nodes is the sample matrix (design matrix).
+For monomials $\phi_k(x)=x^k$, $V$ is a Vandermonde matrix.
+The objective minimized is
+
+$$
+\sum_{i=0}^{m-1}w_i|p(x_i)-y_i|^2
+=\|W^{1/2}(Vc-y)\|_2^2,\qquad W=\operatorname{diag}(w_i)
+$$
+
+where $c=(c_0,\dots,c_n)^{\mathsf T}$ are coefficients and $w_i\ge0$ weights.
+For $m=n+1$ with distinct nodes and positive weights, residuals vanish and the result equals interpolation.
+
+Weights multiply squared residuals of individual samples.
+If observation errors are independent, mean zero, and have known standard deviations $\sigma_i$, $w_i=1/\sigma_i^2$ is a candidate.
+Scaling each row by $1/\sigma_i$ then makes errors homoscedastic; Gauss–Markov gives the best linear unbiased estimator (Aitken's theorem).
+Square weights from conventions multiplying residuals themselves before passing them.
+Passing them unchanged solves a different problem.
+Zero weights exclude samples, but all-zero or negative weights are rejected with `InvalidInput` (`OutOfRange`).
+
+`Vandermonde::monomial(n)` specifies columns $1,x,\ldots,x^n$, while `Vandermonde::orthogonal(plan)` specifies every column of a prepared orthogonal basis.
+For a single monomial matrix, `vandermonde(points, n)` returns the same matrix.
+Rows follow input point order and columns ascending degree; points may be real or complex.
+Each row is filled by the basis recurrence in $O(n)$, giving cost proportional to point count times column count without monomial expansion of orthogonal bases.
+`matrix` returns an owned matrix; empty points give zero rows.
+`matrix_into` borrows output (including strided views) and caller scratch, taking `ExecutionContext` last.
+`workspace_requirements(point_count)` gives scratch length; the whole matrix is built there before copying to output, preserving output on failure without allocation.
+Least-squares Plans, however, reject empty observations as invalid input.
+
+## Conditioning of sample matrices
+
+### Normal equations and squared conditioning
+
+Setting the derivative of the objective with respect to $c$ to 0 gives normal equations $V^*WVc=V^*Wy$.
+Writing $A=W^{1/2}V$ gives $\kappa_2(A^*A)=\kappa_2(A)^2$, so forming normal equations already squares the condition number.
+Let $\varepsilon$ denote relative perturbations in $A$ and the right-hand side, including rounding error, with least-squares residual $r$ and $\sin\theta=\|r\|_2/\|W^{1/2}y\|_2$; through first order, relative solution error is bounded by
+
+$$
+\frac{\|\hat c-c\|_2}{\|c\|_2}\lesssim\varepsilon\Bigl(\frac{2\kappa_2(A)}{\cos\theta}+\kappa_2(A)^2\tan\theta\Bigr)
+$$
+
+(Golub and Van Loan, §5.3).
+Orthogonal-transform solvers such as QR and SVD attain accuracy matching this bound; for small residuals, error is proportional to $\kappa_2(A)$.
+Normal-equation solvers can incur errors around $\kappa_2(A)^2u$ regardless of residual size ($u$ is unit roundoff).
+
+### Ill-conditioning of Vandermonde matrices
+
+For monomial samples, weighted normal-equation matrix $V^*WV$ has entries $\sum_iw_ix_i^{j+k}$ and is positive-definite Hankel.
+Beckermann (2000) showed that order-$n+1$ positive-definite Hankel matrices have 2-norm condition numbers at least $\gamma^{n}/(16(n+1))$ ($\gamma=e^{4G/\pi}\approx3.21$; $G$ is Catalan's constant).
+Since $\kappa_2(A)^2=\kappa_2(V^*WV)$, every choice of real nodes and weights makes the condition number of $A$ grow at least exponentially with column count at ratio $\sqrt{3.21}\approx1.79$.
+This lower bound concerns $A$ before column scaling.
+Column scaling by diagonal matrix $D$ gives $AD$ satisfying $\kappa_2(AD)\ge\kappa_2(A)/\kappa_2(D)$.
+For nodes spread over $[-1,1]$, the norm ratio $\kappa_2(D)$ of columns $x^k$ grows only polynomially with degree, so the condition number after scaling still grows exponentially at the same ratio.
+Column scaling removes magnitude differences, but cannot remove near-parallel columns.
+
+Orthogonal polynomial bases change the situation.
+At $m$ first-kind Chebyshev nodes $x_i=\cos((2i+1)\pi/(2m))$, for $j\ne k$ and $j,k<m$, $\sum_iT_j(x_i)T_k(x_i)=0$ holds (discrete orthogonality).
+Thus the sample matrix of $T_0,\dots,T_n$ ($n<m$) has orthogonal columns; unit-norm scaling gives $\kappa_2=1$.
+Even at equally spaced points, the Chebyshev-basis condition number stays small if degree $n$ is below the order of $\sqrt m$ (Rakhmanov, 2007).
+The condition number grows as degree approaches $m$; $n=m-1$ gives equally spaced interpolation itself.
+Continuous orthogonality need not make $V$ columns orthogonal on arbitrary discrete samples; inspect reported conditioning.
+
+## Column scaling and truncated SVD
+
+SciOxide's `PolynomialFitPlan` prepares without normal equations as follows (Björck, 1996).
+
+1. Construct sample matrix $V$ with `Vandermonde` and multiply row $i$ by $\sqrt{w_i}$ to form $A=W^{1/2}V$.
+2. Divide each column by its 2-norm $s_k$ to form $\widetilde A_{ik}=A_{ik}/s_k$.
+   Zero columns use unit scale; row weighting and column norms use scaling to avoid overflow or underflow.
+3. Compute thin SVD $\widetilde A=U\Sigma Z^*$ of $\widetilde A$ through `scioxide-linalg`.
+
+Setting $z_k=s_kc_k$ turns the problem into least squares for $\widetilde A z$, with solution
+
+$$
+z=\sum_{\sigma_j>\tau}Z_j\frac{U_j^*W^{1/2}y}{\sigma_j}
+$$
+
+where $U_j$ and $Z_j$ are singular vectors and $\tau$ the rank threshold.
+The rank policy (`RankPolicy`) in `PolynomialApproximationPolicy` sets the threshold.
+Default `RankPolicy::DimensionScaledEpsilon` retains only singular values exceeding $\tau=\min(\max(m,n+1)\,\varepsilon,1/2)\,\sigma_{\max}$ ($\varepsilon$ is machine epsilon).
+`RankPolicy::Exact` excludes only exactly zero singular values; `RankPolicy::Threshold` uses absolute and relative threshold $\tau=\mathrm{atol}+\mathrm{rtol}\,\sigma_{\max}$.
+No policy applies regularization.
+
+Rank deficiency or more coefficients than observations still returns the minimum-norm solution in the retained subspace.
+The minimized norm is that of scaled-column coordinates $z$, not necessarily original $c$.
+Reported rank and conditioning concern $\widetilde A$.
+Unit-norm column scaling gives a condition number within a factor $\sqrt{n+1}$ of the optimum among all diagonal column scalings (van der Sluis, 1969).
+
+Preparation costs $O(m(n+1)\min(m,n+1))$, or $O(m(n+1)^2)$ for ordinary overdetermined systems $m\ge n+1$.
+The Plan retains sample matrices and decomposition; changing only values with the same nodes, degree, and weights costs $O((m+n)(n+1))$ per fit.
+More samples do not always help; clustered nodes, excessive degrees, and extrapolation can remain ill-conditioned.
+
+## Preparation, results, and workspaces
+
+| Item | Role and interpretation |
+|---|---|
+| `PolynomialFitPlan` | Retains nodes, weights, decomposition, and basis preparation. `monomial` and `orthogonal` determine result basis |
+| `PolynomialFit` | Owns fitted polynomial and report. `polynomial()` borrows without conversion; `into_polynomial()` extracts the polynomial |
+| `PolynomialFitReport` | Returns column-scaled rank (`rank()`), reciprocal conditioning from all singular values (`condition()`), weighted residual norm in original units (`residual_norm()`), and policy (`policy()`) |
+| `PolynomialFitRequirements` | Workspace requirements returned by `workspace_requirements(())` |
+| `PolynomialFitWorkspace` | Create with `workspace(())` or reserve with `try_reserve`, check capacity through `check`, and pass to `fit_into` |
+
+`PolynomialFitPlan::monomial(points, degree, weights, policy)` creates a monomial Plan; `PolynomialFitPlan::orthogonal(points, basis, weights, policy)` uses every column of prepared orthogonal basis `basis`.
+Passing `None` to `weights` gives unit weights.
+Empty points, negative weights, or all-zero weights give `InvalidInput`; weight/point length mismatch gives `DimensionMismatch`; non-finite points or weights give `NonFinite`.
+Basis-value overflow gives `NumericalInstability`; SVD nonconvergence propagates errors from `scioxide-linalg` (such as `ConvergenceFailure`).
+
+Use `ApproxPolynomial::fit_monomial(points, values, degree)` and `ApproxPolynomial::fit_orthogonal(points, values, degree, spec)` for a single fit without weights or reports.
+Both prepare Plans with unit weights and default policies, returning only fitted polynomials.
+
+`fit` allocates workspace and calls `fit_into`.
+`fit_into` borrows exact-length (degree + 1) coefficient output and workspace, taking `ExecutionContext` last.
+Sufficiently reserved workspace gives allocation-free execution.
+Failure preserves coefficient output, but workspace contents may change.
+Orthogonal results retain preparation including normalization, coordinate mapping, maximum degree, and execution settings.
+
+Small residuals do not guarantee accurate coefficients; inspect sample count, rank, and extrapolation-point sensitivity as well.
+No coefficient covariance or confidence intervals are returned, so reports alone do not supply statistical uncertainty.
+
+## Quadratic fitting on symmetric samples
+
+Fit a weighted quadratic to dimensionless nodes $-1,-1/2,0,1/2,1$ with quadratic function $1+2x+x^2$ plus systematic quartic deviation $\eta x^4$.
+Control $\eta$ sets deviation magnitude; $w$ weights the two endpoint samples (the middle three have weight 1).
+Outputs are coefficient and Plan-size/rank/residual tables and a plot of individual sample residuals.
+
+The independent check obtains constant and quadratic coefficients from symmetry-reduced two-variable normal equations.
+Symmetric nodes and weights make odd column $x$ weighted-orthogonal to even columns $1,x^2$, leaving the linear coefficient independently 2.
+Setting $s_k=\sum_iw_ix_i^k$ gives even-part normal equations
+
+$$
+\begin{pmatrix}s_0&s_2\\s_2&s_4\end{pmatrix}
+\begin{pmatrix}c_0\\c_2\end{pmatrix}
+=\begin{pmatrix}s_0+s_2+\eta s_4\\s_2+s_4+\eta s_6\end{pmatrix}
+$$
+
+This checking formula is a closed form for this example, not a recommendation to use normal equations generally.
+Moments $s_k$ are references constructed with f64 `powi`.
+
+```rust
+//| id: poly-weighted-fit
+//| ref: poly-weighted-fit
+//| title: "Weights and quadratic-fit residuals"
+//| run: reactive
+//| crates: [scioxide-poly]
+//| inputs:
+//|   deviation: {"type":"range","label":"Quartic deviation η [-]","min":0,"max":1,"step":0.1,"value":0.3}
+//|   endpoint_weight: {"type":"range","label":"Endpoint squared-residual weight w [-]","min":0,"max":4,"step":0.5,"value":1}
+//| cases:
+//|   - {"id":"exact-quadratic","label":"η = 0","description":"Samples exactly follow a quadratic, recovering coefficients to rounding accuracy.","inputs":{"deviation":0}}
+//|   - {"id":"middle-only","label":"η = 0.5, w = 0","description":"Removing endpoints gives interpolation of the middle three points and quadratic coefficient 1 + η/4.","inputs":{"deviation":0.5,"endpoint_weight":0}}
+//|   - {"id":"heavy-ends","label":"w = 4","description":"Emphasizing endpoints reduces their residuals and increases central residuals.","inputs":{"endpoint_weight":4}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"coefficients","path":"/rows/0/1","approx":{"value":0.9614285714285714,"rtol":1e-12}}
+//|       - {"artifact":"coefficients","path":"/rows/2/1","approx":{"value":1.3321428571428573,"rtol":1e-12}}
+//|       - {"artifact":"coefficients","path":"/rows/1/3","range":{"max":1e-13}}
+//|       - {"artifact":"coefficients","path":"/rows/2/3","range":{"max":1e-13}}
+//|       - {"artifact":"summary","path":"/rows/0/2","equals":3}
+//|       - {"artifact":"summary","path":"/rows/0/3","approx":{"value":0.05378,"rtol":1e-3}}
+//|   - case: exact-quadratic
+//|     expect:
+//|       - {"artifact":"coefficients","path":"/rows/2/1","approx":{"value":1,"atol":1e-13}}
+//|       - {"artifact":"summary","path":"/rows/0/3","range":{"max":1e-13}}
+//|   - case: middle-only
+//|     expect:
+//|       - {"artifact":"coefficients","path":"/rows/2/1","approx":{"value":1.125,"atol":1e-13}}
+//|       - {"artifact":"coefficients","path":"/rows/2/3","range":{"max":1e-13}}
+//|   - case: heavy-ends
+//|     expect:
+//|       - {"artifact":"coefficients","path":"/rows/0/3","range":{"max":1e-13}}
+//|       - {"artifact":"coefficients","path":"/rows/2/3","range":{"max":1e-13}}
+use scioxide_poly::{PolynomialBasis, PolynomialFitPlan};
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed6 = serde_json::json!({ "fractionDigits": 6 });
+let points = [-1.0_f64, -0.5, 0.0, 0.5, 1.0];
+let values: Vec<f64> = points
+    .iter()
+    .map(|&x| 1.0 + 2.0 * x + x * x + deviation * (x * x) * (x * x))
+    .collect();
+let weights = [endpoint_weight, 1.0, 1.0, 1.0, endpoint_weight];
+let plan = PolynomialFitPlan::monomial(&points, 2, Some(&weights), Default::default())
+    .map_err(|e| e.to_string())?;
+let fit = plan.fit(&values).map_err(|e| e.to_string())?;
+let coefficients = fit.polynomial().basis().coefficients();
+// Independent check: even-part 2×2 normal equations (reference moments use f64 powi).
+let moment = |k: i32| {
+    points
+        .iter()
+        .zip(&weights)
+        .map(|(&x, &w)| w * x.powi(k))
+        .sum::<f64>()
+};
+let (s0, s2, s4, s6) = (moment(0), moment(2), moment(4), moment(6));
+let determinant = s0 * s4 - s2 * s2;
+let expected = [
+    1.0 + deviation * (s4 * s4 - s2 * s6) / determinant,
+    2.0,
+    1.0 + deviation * (s0 * s6 - s2 * s4) / determinant,
+];
+let rows: Vec<_> = coefficients
+    .iter()
+    .zip(expected)
+    .enumerate()
+    .map(|(k, (&actual, reference))| (k, actual, reference, (actual - reference).abs()))
+    .collect();
+let columns = serde_json::json!([
+    { "key": "0", "label": "Degree k [-]", "type": "integer" },
+    { "key": "1", "label": "Coefficient c_k [-]", "type": "number", "format": fixed6 },
+    { "key": "2", "label": "Symmetry-based check [-]", "type": "number", "format": fixed6 },
+    { "key": "3", "label": "Absolute discrepancy [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "coefficients" })
+);
+let report = fit.report();
+let summary = serde_json::json!([
+    { "key": "0", "label": "Samples m [points]", "type": "integer" },
+    { "key": "1", "label": "Coefficients n + 1 [-]", "type": "integer" },
+    { "key": "2", "label": "Retained rank [-]", "type": "integer" },
+    { "key": "3", "label": "Weighted residual norm [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    summary,
+    vec![(
+        points.len(),
+        coefficients.len(),
+        report.rank().rank(),
+        report.residual_norm()
+    )],
+    metadata = serde_json::json!({ "id": "summary" })
+);
+let mut residuals = Vec::new();
+for (&x, &y) in points.iter().zip(&values) {
+    let value = fit.polynomial().evaluate(x).map_err(|e| e.to_string())?;
+    residuals.push([x, value - y]);
+}
+emit_scatter_chart!(
+    &vec![serde_json::json!({ "name": "Sample residuals", "points": residuals })],
+    options = &serde_json::json!({
+        "xLabel": "Position x [-]",
+        "yLabel": "Fitted value − sample value [-]"
+    })
+);
+```
+
+With default $\eta=0.3$ and $w=1$, constant coefficient $0.961429$ and quadratic coefficient $1.332143$ match symmetry checks to about $10^{-15}$, with weighted residual norm $0.0538$.
+For $\eta=0$, the quadratic is recovered to rounding accuracy.
+Zero endpoint weights leave the middle three points to determine the quadratic; endpoint residuals do not enter the objective.
+For example, $\eta=0.5$ and $w=0$ give quadratic coefficient $1+\eta/4=1.125$, matching middle-three-point interpolation.
+At $w=4$, smaller endpoint residuals accompany larger central residuals, changing the residual distribution.
+Residual norms measure different objectives when weights change; magnitude alone does not rank fit quality.
+
+## Conditioning of monomial and Chebyshev bases
+
+The next cell prepares degree-$d=3,\dots,\min(30,m-1)$ monomial and Chebyshev-basis (`OrthogonalFamily::ChebyshevT`) Plans on $m$ samples over $[-1,1]$, comparing reported condition numbers $\kappa_2$.
+Choose equally spaced samples or `chebyshev_points` first-kind Chebyshev nodes.
+Observations are $y_i=T_3(x_i)=4x_i^3-3x_i$, evaluated with SciOxide's `OrthogonalFamily::evaluate`.
+For $d\ge3$, this polynomial is exactly representable, giving independent exact coefficients ($(0,-3,0,4,0,\dots)$ for monomials, $(0,0,0,1,0,\dots)$ for Chebyshev).
+The table shows maximum coefficient error and weighted residual norm; the plot draws $\kappa_2$ logarithmically across degrees.
+Chebyshev-basis $\kappa_2=1$ at first-kind nodes checks discrete orthogonality.
+
+```rust
+//| id: poly-vandermonde-condition
+//| ref: poly-vandermonde-condition
+//| title: "Condition numbers of monomial and Chebyshev sample matrices"
+//| run: reactive
+//| crates: [scioxide-poly]
+//| inputs:
+//|   samples: {"type":"range","label":"Samples m [points]","description":"Sample count on [−1, 1].","min":10,"max":200,"step":10,"value":50}
+//|   layout: {"type":"select","label":"Sample placement","options":["Equally spaced","Chebyshev first-kind nodes"],"value":"Equally spaced"}
+//| cases:
+//|   - {"id":"chebyshev-points","label":"Chebyshev first-kind nodes","description":"Chebyshev columns are orthogonal, giving condition number exactly 1.","inputs":{"layout":"Chebyshev first-kind nodes"}}
+//|   - {"id":"few-samples","label":"m = 20","description":"Few equally spaced samples make Chebyshev conditioning grow with degree as well.","inputs":{"samples":20}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"condition","path":"/rows/6/0","equals":30}
+//|       - {"artifact":"condition","path":"/rows/6/1","range":{"min":1e10}}
+//|       - {"artifact":"condition","path":"/rows/6/2","approx":{"value":344.10,"rtol":1e-4}}
+//|       - {"artifact":"condition","path":"/rows/6/3","range":{"min":1e-9,"max":1e-3}}
+//|       - {"artifact":"condition","path":"/rows/6/4","range":{"max":1e-13}}
+//|       - {"artifact":"condition","path":"/rows/6/5","range":{"max":1e-13}}
+//|       - {"artifact":"condition","path":"/rows/6/6","range":{"max":1e-13}}
+//|   - case: chebyshev-points
+//|     expect:
+//|       - {"artifact":"condition","path":"/rows/0/2","approx":{"value":1,"atol":1e-12}}
+//|       - {"artifact":"condition","path":"/rows/6/2","approx":{"value":1,"atol":1e-12}}
+//|       - {"artifact":"condition","path":"/rows/6/1","range":{"min":1e10}}
+//|       - {"artifact":"condition","path":"/rows/6/4","range":{"max":1e-13}}
+//|   - case: few-samples
+//|     expect:
+//|       - {"artifact":"condition","path":"/rows/4/0","equals":19}
+//|       - {"artifact":"condition","path":"/rows/4/2","approx":{"value":4281.2,"rtol":1e-4}}
+//|       - {"artifact":"condition","path":"/rows/4/4","range":{"max":1e-12}}
+use scioxide_poly::backend::barycentric::{ChebyshevPoints, chebyshev_points};
+use scioxide_poly::{
+    OrthogonalBasisSpec, OrthogonalFamily, PolynomialBasis, PolynomialFit, PolynomialFitPlan,
+};
+
+// κ₂ = 1/rcond (unit-norm-column sample matrix), maximum exact-coefficient discrepancy, and residual norm
+fn diagnose<B: PolynomialBasis<f64>>(fit: &PolynomialFit<f64, B>, exact: [f64; 4]) -> [f64; 3] {
+    let report = fit.report();
+    let mut error = 0.0_f64;
+    for (k, &c) in fit.polynomial().basis().coefficients().iter().enumerate() {
+        error = error.max((c - exact.get(k).copied().unwrap_or(0.0)).abs());
+    }
+    let kappa = 1.0 / report.condition().reciprocal().value();
+    [kappa, error, report.residual_norm()]
+}
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let m = samples.round() as usize;
+let points: Vec<f64> = if layout == "Equally spaced" {
+    (0..m)
+        .map(|i| -1.0 + 2.0 * i as f64 / (m - 1) as f64)
+        .collect()
+} else {
+    chebyshev_points::<f64>(m, ChebyshevPoints::Roots)
+        .map_err(|e| e.to_string())?
+        .0
+};
+// Observations y = T₃(x) = 4x³ − 3x (SciOxide recurrence). Exact coefficients are known.
+let family = OrthogonalFamily::ChebyshevT;
+let mut values = Vec::with_capacity(m);
+for &x in &points {
+    values.push(family.evaluate(3, x).map_err(|e| e.to_string())?);
+}
+let spec = OrthogonalBasisSpec::classical(family).map_err(|e| e.to_string())?;
+let (mut rows, mut monomial_curve, mut chebyshev_curve) = (Vec::new(), Vec::new(), Vec::new());
+for degree in 3..=30.min(m - 1) {
+    let monomial = PolynomialFitPlan::monomial(&points, degree, None, Default::default())
+        .and_then(|plan| plan.fit(&values))
+        .map_err(|e| e.to_string())?;
+    let basis = spec
+        .prepare(degree, Default::default())
+        .map_err(|e| e.to_string())?;
+    let chebyshev = PolynomialFitPlan::orthogonal(&points, basis, None, Default::default())
+        .and_then(|plan| plan.fit(&values))
+        .map_err(|e| e.to_string())?;
+    // Independent reference: monomial coefficients (0, −3, 0, 4, 0, …), Chebyshev coefficients (0, 0, 0, 1, 0, …)
+    let [kappa_m, error_m, residual_m] = diagnose(&monomial, [0.0, -3.0, 0.0, 4.0]);
+    let [kappa_c, error_c, residual_c] = diagnose(&chebyshev, [0.0, 0.0, 0.0, 1.0]);
+    monomial_curve.push([degree as f64, kappa_m]);
+    chebyshev_curve.push([degree as f64, kappa_c]);
+    if degree % 5 == 0 || degree == 3 || degree == 30.min(m - 1) {
+        rows.push((
+            degree, kappa_m, kappa_c, error_m, error_c, residual_m, residual_c,
+        ));
+    }
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "Degree d [-]", "type": "integer" },
+    { "key": "1", "label": "Monomial κ₂ [-]", "type": "number", "format": sci3 },
+    { "key": "2", "label": "Chebyshev κ₂ [-]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "Monomial coefficient error [-]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "Chebyshev coefficient error [-]", "type": "number", "format": sci3 },
+    { "key": "5", "label": "Monomial residual norm [-]", "type": "number", "format": sci3 },
+    { "key": "6", "label": "Chebyshev residual norm [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "condition" })
+);
+emit_line_chart!(
+    &vec![
+        serde_json::json!({ "name": "Monomial", "points": monomial_curve }),
+        serde_json::json!({ "name": "Chebyshev basis", "points": chebyshev_curve }),
+    ],
+    options = &serde_json::json!({
+        "xLabel": "Degree d [-]",
+        "yLabel": "Sample-matrix condition number κ₂ [-]",
+        "yType": "log"
+    })
+);
+```
+
+With the default 50 equally spaced points, monomial $\kappa_2$ reaches $1.7\times10^{3}$ at $d=10$, $1.4\times10^{7}$ at $d=20$, and $2.5\times10^{11}$ at $d=30$, growing about 2.5-fold per degree.
+This exponential growth exceeds ratio 1.79 from Beckermann's lower bound.
+Chebyshev $\kappa_2$ on the same points is 4.5 at $d=20$ and only $3.4\times10^{2}$ even at $d=30$.
+With first-kind Chebyshev nodes, Chebyshev $\kappa_2$ matches $1$ to rounding accuracy at every degree, while monomials worsen as with equal spacing ($1.2\times10^{11}$ at $d=30$).
+
+Coefficient errors reflect conditioning differences directly.
+For $d=30$ with 50 equally spaced points, monomial coefficient error reaches $3.7\times10^{-5}$, versus Chebyshev error $6.2\times10^{-15}$.
+Monomial error is of the same order as $u\kappa_2\approx2.8\times10^{-5}$, consistent with perturbation bound $2\varepsilon\kappa_2$ above for zero-residual problems.
+This value is sensitive to rounding details and can vary by over an order of magnitude between environments.
+Weighted residual norms remain about $10^{-14}$ for both bases; residuals alone conceal monomial ill-conditioning.
+Orthogonal-transform solvers return small-residual solutions, but conditioning determines coefficient accuracy.
+
+With 20 equally spaced points (`few-samples`) and $d=19$, the Plan equals 20-point interpolation; even Chebyshev $\kappa_2$ grows to $4.3\times10^{3}$.
+This is the same phenomenon as exponential Lebesgue growth for equally spaced [interpolation](../interpolation-and-chebyshev/); changing bases leaves node-placement ill-conditioning.
+Rank threshold is $\max(m,d+1)\,\varepsilon\,\sigma_{\max}$, about $1.1\times10^{-14}$ times $\sigma_{\max}$ at $m=50$.
+The experiment's $\kappa_2$ is at most $2.5\times10^{11}$, so the least singular value exceeds threshold and every retained rank is $d+1$.
+Monomial singular values reach the threshold only at still higher degrees.
+
+## Summary
+
+Sample-matrix rows follow nodes and columns degrees; weights multiply squared residuals (square residual-multiplying weights before passing).
+Real-node monomial matrices worsen exponentially with degree for any node choice; above degree 10, use orthogonal bases such as `Vandermonde::orthogonal` or `PolynomialFitPlan::orthogonal`.
+SciOxide avoids normal equations and solves a column-scaled thin SVD, so for small residuals error scales with $\kappa_2$ rather than $\kappa_2^2$.
+Reported rank below column count means a minimum-norm solution; reduce degree or change basis.
+Reuse prepared Plans when only observations change, calling `fit_into` with preallocated workspace for allocation-free repetition.
+
+## Further reading
+
+- [Chebyshev coefficient decay](../../examples/chebyshev-approximation/): examine how fitted coefficient decay reveals smoothness and required degree.
+- [Theory and numerical computation of orthogonal polynomial families](../orthogonal-families/): examine weights, normalizations, and recurrences of families used as columns.
+- [Orthogonal bases and least-squares APIs](../../api/orthogonal/): look up Plan, result, and workspace contracts.

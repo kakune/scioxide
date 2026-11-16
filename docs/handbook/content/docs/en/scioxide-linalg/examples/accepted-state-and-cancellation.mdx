@@ -1,0 +1,606 @@
+---
+title: "Cancellation, count limits, and interpreting accepted iterates"
+description: "Stop conjugate gradients by iteration and operator-evaluation limits, cancellation, violated assumptions, operator errors, and invalid input; inspect what the caller-output API solve_into writes on Ok and Err, its attempt records and accepted state, and the error of solutions committed after early termination."
+sidebar:
+  order: 450
+references:
+  linalg-example-attempt-records: "attempt-records-and-accepted-state"
+---
+
+An iterative solve of a large system can stop before convergence.
+A user may interrupt it, iteration or operator-evaluation limits may be reached, or violated assumptions may prevent the algorithm from continuing.
+The caller then needs to know what the output contains and how much confidence to place in it.
+This example stops conjugate gradients (CG) for a one-dimensional Poisson equation in several ways and reads the report, output, and workspace records from the API `solve_into` accepting caller-provided output.
+In this call form the caller supplies the output vector, workspace, and execution context ([Workspaces, execution contexts, and attempt records](oxref:linalg-execution-forms)).
+
+---
+
+## Verified solutions and committing output
+
+CG updates the residual $r_k$ by recurrence, but rounding makes this value drift from the true residual $b - Ax_k$.
+`CgSolver` checks at initialization, every 50 iterations, on a convergence candidate, when an update leaves the iterate unchanged, and at the iteration limit, recomputing the true residual by an operator evaluation.
+Here an iterate whose true residual has been checked at a checkpoint is called a verified solution.
+The solver retains the verified solution with the smallest true residual, choosing the later one in a tie.
+Replacement every 50 iterations restores the recurrence residual to its true value while preserving search directions and conjugacy.
+When a checkpoint's true residual does not improve the previous minimum, the solver checks whether that minimum has reached the rounding-error residual floor; if so, it stops with `Stagnation`.
+This test uses one product of $A$ with a sign-modified iterate, counted as an operator evaluation ([Rounding-error residual floor](../preconditioned-cg/#residual-floor-from-rounding-errors) gives the formula).
+
+`CgSolver::solve_into` uses the current output-vector $x$ as the initial value and writes a result to $x$ only when returning `Ok`.
+On convergence it writes the solution whose convergence was verified; on stopping, it writes the verified solution with smallest true residual, including the initial value.
+Returning `Err` leaves $x$ unchanged.
+`Ok` does not mean convergence alone.
+It also returns report and solution in `Ok` on iteration limits (`IterationLimit`), evaluation limits (`EvaluationLimit`), stagnation (`Stagnation`), cancellation or deadlines (`ExecutionStopped(reason)`), or violated assumptions such as curvature $p^{\mathsf T}Ap \le 0$ (`Breakdown(NonPositiveCurvature)`).
+Determine success from the report's `termination()`; `is_success()` is true for `Converged` and `LeastSquaresConverged`.
+The standard-form `solve` uses `IterativeSolveResult::into_converged_solution` to convert `ExecutionStopped(reason)` to an `ExecutionStopped` error and other non-convergence to `ConvergenceFailure` errors.
+
+`Err` covers shape mismatch (`DimensionMismatch`) or non-finite input (`NonFinite`) rejected before computation, non-finite values or errors from operators or preconditioners, and workspace allocation failures (`ResourceLimit`, `AllocationFailure`).
+If even the first residual evaluation is rejected by the count limit, no usable iterate exists and the result is `ConvergenceFailure`.
+The owned-value API `solve_with_options` allocates output and workspace and follows the same procedure, returning the solution in `IterativeSolveResult`.
+
+## Attempt records and accepted state
+
+The workspace `IterativeWorkspace` leaves two records on each call.
+
+- `last_attempt()` returns an `AttemptRecord` recording the last call.
+  `outcome()` classifies it as `Succeeded` (success), `Stopped` (stopped with a usable solution), `Failed` (error after computation began), or `PreflightRejected` (rejected by checks before computation).
+  `counts()` counts iterations and operator or preconditioner evaluations; these are 0 for `PreflightRejected`.
+- `last_accepted()` returns accepted state `IterativeAccepted` for successful or stopped attempts and becomes `None` after `Failed` or `PreflightRejected`.
+  `solution()` returns the committed solution, `history()` its residual history, and `progress()` its termination reason, iteration count, true residual, and trust class.
+
+The trust class `PartialResultTrust` describes how far accepted state has been checked, in increasing order: `DiagnosticOnly` (diagnostic state without a residual claim), `Admissible` (meets only the algorithm's own acceptance conditions), `ResidualChecked` (an independent computation confirms the residual meets the configured tolerance), and `CertificateVerified` (an independently verified certificate).
+`Display` displays lowercase names such as `diagnostic-only` and `residual-checked`.
+CG assigns `ResidualChecked` only to converged solutions whose true residual meets tolerance.
+A non-converged stop gives `Admissible` even when returning a verified solution with checked true residual; stopping before the first true residual is computed gives `DiagnosticOnly`.
+
+## Setting limits and cancellation
+
+Set the iteration limit at solver construction with the `Budget` in `CgSolver::new(tolerance, max_iterations)`.
+If `with_execution_options` composes `LinalgExecutionOptions::with_iteration_budget` or `LinalgExecutionContext::with_iteration_budget` adds a context limit, the smaller limit applies.
+
+Set the operator and preconditioner evaluation limit by configuring `BudgetKind::Evaluation` in scioxide-core's `SolveBudgets` and passing the caller-owned `SolveContext` created by `SolveState::begin_solve` to `solve_into` ([Solve lifecycle and computational accounting](../../../scioxide-core/algorithms/solve-lifecycle-and-accounting/)).
+CG then runs as a nested solve in that context; evaluations count against the caller's limit, while iterations count only against CG's own limit.
+The `SolveIdentity` accepted by `begin_solve` is matched when resuming intermediate state; any value is sufficient here.
+
+Request cancellation through the `CancellationToken` passed to `ExecutionContext::with_cancellation`.
+The solver checks at solve entry and the start of each iteration, detecting a request made inside an operator evaluation at the next iteration's start.
+Browser cells run on one thread without a clock.
+This cell can therefore demonstrate only cancellation before the call or requested on the same thread inside an operator evaluation.
+It cannot demonstrate cancellation from another thread or deadline stops.
+Set a deadline with `with_time_limit` on a context with a clock (`with_clock`); without a clock, it gives a `CapabilityUnavailable` error ([Cancellation, clocks, and deadlines](../../../scioxide-core/algorithms/cancellation-clocks-and-deadlines/)).
+A deadline stop has termination reason `ExecutionStopped(DeadlineReached)` and follows the same output and record rules as cancellation.
+
+## Results for each stopping condition
+
+The following block defines helpers shared by two cells.
+`Probe` implements scioxide-core's `LinearOperator`, applying $A = \operatorname{tridiag}(-1, 2, -1)$ ($-A$ for `sign = -1`) without forming a matrix.
+It counts applications and either requests cancellation or inserts NaN during a specified application.
+`poisson` returns the right-hand side $b_i = h^2 x_i$ from second-difference discretization of $-u'' = x$ ($u(0) = u(1) = 0$) at $N$ interior points, and the exact discrete solution $u_i = x_i(1 - x_i^2)/6$ (second differences are exact for cubics).
+`relative_residual` recomputes $\lVert b - Ax \rVert_2/\lVert b \rVert_2$ for verification without counting evaluations; `termination_name` returns termination variant names.
+
+```rust
+//| id: linalg-context-contracts-model
+//| kind: definitions
+//| title: "One-dimensional Poisson operator counting evaluations"
+//| crates: [scioxide-core, scioxide-linalg]
+use core::cell::Cell;
+use scioxide_core::{CancellationToken, Dimensions, SciOxideError, LinearOperator};
+use scioxide_linalg::LinearSolveTermination;
+
+/// Apply A = tridiag(−1, 2, −1) without a matrix (−A for sign = −1).
+/// Count applications and request cancellation or return NaN during a specified application.
+pub(crate) struct Probe<'a> {
+    pub(crate) n: usize,
+    pub(crate) sign: f64,
+    pub(crate) calls: Cell<usize>,
+    pub(crate) cancel_at: Option<(usize, &'a CancellationToken)>,
+    pub(crate) nan_at: Option<usize>,
+}
+
+impl Probe<'_> {
+    pub(crate) fn new(n: usize) -> Self {
+        Probe {
+            n,
+            sign: 1.0,
+            calls: Cell::new(0),
+            cancel_at: None,
+            nan_at: None,
+        }
+    }
+}
+
+impl LinearOperator<f64> for Probe<'_> {
+    fn rows(&self) -> usize {
+        self.n
+    }
+
+    fn cols(&self) -> usize {
+        self.n
+    }
+
+    fn apply_workspace_len(&self) -> Result<usize, SciOxideError> {
+        Ok(0)
+    }
+
+    fn apply_into(&self, x: &[f64], y: &mut [f64], _: &mut [f64]) -> Result<(), SciOxideError> {
+        if x.len() != self.n || y.len() != self.n {
+            return Err(SciOxideError::dimension_mismatch(
+                Dimensions::two(self.n, self.n),
+                Dimensions::two(x.len(), y.len()),
+            ));
+        }
+        let call = self.calls.get() + 1;
+        self.calls.set(call);
+        for i in 0..self.n {
+            let left = if i > 0 { x[i - 1] } else { 0.0 };
+            let right = if i + 1 < self.n { x[i + 1] } else { 0.0 };
+            y[i] = self.sign * (2.0 * x[i] - left - right);
+        }
+        if let Some((at, token)) = self.cancel_at
+            && at == call
+        {
+            token.cancel();
+        }
+        if self.nan_at == Some(call) {
+            y[0] = f64::NAN;
+        }
+        Ok(())
+    }
+}
+
+/// Right-hand side b_i = h² x_i for −u'' = x, u(0) = u(1) = 0 discretized at n interior points, and
+/// exact discrete solution u_i = x_i(1 − x_i²)/6 (second differences are exact for cubics).
+pub(crate) fn poisson(n: usize) -> (Vec<f64>, Vec<f64>) {
+    let h = 1.0 / (n + 1) as f64;
+    let x = |i: usize| (i + 1) as f64 * h;
+    let b = (0..n).map(|i| h * h * x(i)).collect();
+    let exact = (0..n).map(|i| x(i) * (1.0 - x(i) * x(i)) / 6.0).collect();
+    (b, exact)
+}
+
+/// Termination variant name.
+pub(crate) fn termination_name(t: LinearSolveTermination) -> String {
+    match t {
+        LinearSolveTermination::Converged => "Converged".to_string(),
+        LinearSolveTermination::LeastSquaresConverged => "LeastSquaresConverged".to_string(),
+        LinearSolveTermination::ConditionLimit => "ConditionLimit".to_string(),
+        LinearSolveTermination::IterationLimit => "IterationLimit".to_string(),
+        LinearSolveTermination::EvaluationLimit => "EvaluationLimit".to_string(),
+        LinearSolveTermination::Stagnation => "Stagnation".to_string(),
+        LinearSolveTermination::Breakdown(cause) => format!("Breakdown({cause:?})"),
+        LinearSolveTermination::ExecutionStopped(reason) => format!("ExecutionStopped({reason:?})"),
+    }
+}
+
+/// Residual ‖b − sign·A x‖₂ / ‖b‖₂ (verification without counting operator evaluations).
+pub(crate) fn relative_residual(sign: f64, b: &[f64], x: &[f64]) -> f64 {
+    let n = x.len();
+    let mut squared = 0.0;
+    for i in 0..n {
+        let left = if i > 0 { x[i - 1] } else { 0.0 };
+        let right = if i + 1 < n { x[i + 1] } else { 0.0 };
+        let r = b[i] - sign * (2.0 * x[i] - left - right);
+        squared += r * r;
+    }
+    (squared / b.iter().map(|v| v * v).sum::<f64>()).sqrt()
+}
+```
+
+The following cell passes the $N = 100$ system to `solve_into` under seven conditions.
+The output vector also supplies initial value 0; check when it is overwritten and when it is unchanged.
+
+1. Unlimited: iteration limit 1000.
+2. Iteration limit: the input limit (1–100 iterations).
+3. Evaluation limit: the input limit (1–200 evaluations) on the caller's context.
+4. Cancellation: request it during the selected application (0 means before the call).
+5. Negative-definite matrix: solve with $-A$.
+6. Operator returning NaN: insert NaN into the result of application 30.
+7. Right-hand-side length mismatch: supply length $N - 1$.
+
+The table shows `Ok` or `Err` and error kind, report termination and iterations, attempt evaluation count and outcome, accepted-state trust class, and the report's true residual relative to $\lVert b \rVert$.
+The last three columns independently check output: relative residual $\lVert b - Ax \rVert_2/\lVert b \rVert_2$, relative error given by maximum difference from the exact solution ($-u$ for the negative-definite matrix) divided by $\max_i \lvert u_i \rvert$, and whether output remains at initial value 0.
+
+```rust
+//| id: linalg-context-contracts
+//| ref: linalg-context-contracts
+//| title: "CG results and records after limits, cancellation, violated assumptions, and errors"
+//| run: reactive
+//| uses: [linalg-context-contracts-model]
+//| crates: [scioxide-core, scioxide-linalg]
+//| inputs:
+//|   iteration_limit: {"type":"range","label":"Iteration limit","description":"Budget passed to the solver.","min":1,"max":100,"step":1,"value":70}
+//|   evaluation_limit: {"type":"range","label":"Evaluation limit","description":"Operator evaluations passed to SolveBudgets in the solve context.","min":1,"max":200,"step":1,"value":90}
+//|   cancel_after: {"type":"range","label":"Application requesting cancellation","description":"0 cancels before the call.","min":0,"max":120,"step":1,"value":0}
+//| cases:
+//|   - {"id":"late-limits","label":"100 iterations, 102 evaluations","description":"The iteration limit allows convergence; the evaluation limit lacks the verification evaluation and returns the initial value.","inputs":{"iteration_limit":100,"evaluation_limit":102}}
+//|   - {"id":"cancel-midway","label":"Cancel at application 75","description":"Even cancellation during iteration commits the checkpoint-verified solution with smallest residual.","inputs":{"cancel_after":75}}
+//|   - {"id":"boundaries","label":"59 iterations, cancel at application 102","description":"Limit 59 returns the initial value because checkpoint residuals still exceed its residual; cancellation requested at application 102 is checked only after convergence is established.","inputs":{"iteration_limit":59,"cancel_after":102}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"contracts","path":"/rows/0/2","equals":"Converged"}
+//|       - {"artifact":"contracts","path":"/rows/0/4","equals":103}
+//|       - {"artifact":"contracts","path":"/rows/0/9","range":{"max":1e-13}}
+//|       - {"artifact":"contracts","path":"/rows/1/2","equals":"IterationLimit"}
+//|       - {"artifact":"contracts","path":"/rows/1/6","equals":"admissible"}
+//|       - {"artifact":"contracts","path":"/rows/1/10","equals":"No"}
+//|       - {"artifact":"contracts","path":"/rows/2/2","equals":"EvaluationLimit"}
+//|       - {"artifact":"contracts","path":"/rows/2/9","approx":{"value":1.0,"atol":1e-12}}
+//|       - {"artifact":"contracts","path":"/rows/3/2","equals":"ExecutionStopped(Cancelled)"}
+//|       - {"artifact":"contracts","path":"/rows/3/4","equals":0}
+//|       - {"artifact":"contracts","path":"/rows/3/6","equals":"diagnostic-only"}
+//|       - {"artifact":"contracts","path":"/rows/4/2","equals":"Breakdown(NonPositiveCurvature)"}
+//|       - {"artifact":"contracts","path":"/rows/5/1","equals":"Err(NonFinite)"}
+//|       - {"artifact":"contracts","path":"/rows/5/4","equals":30}
+//|       - {"artifact":"contracts","path":"/rows/5/5","equals":"Failed"}
+//|       - {"artifact":"contracts","path":"/rows/5/6","equals":null}
+//|       - {"artifact":"contracts","path":"/rows/6/1","equals":"Err(DimensionMismatch)"}
+//|       - {"artifact":"contracts","path":"/rows/6/5","equals":"PreflightRejected"}
+//|       - {"artifact":"contracts","path":"/rows/6/9","approx":{"value":1.0,"atol":1e-12}}
+//|   - case: late-limits
+//|     expect:
+//|       - {"artifact":"contracts","path":"/rows/1/2","equals":"Converged"}
+//|       - {"artifact":"contracts","path":"/rows/1/9","range":{"max":1e-13}}
+//|       - {"artifact":"contracts","path":"/rows/2/2","equals":"EvaluationLimit"}
+//|       - {"artifact":"contracts","path":"/rows/2/3","equals":100}
+//|       - {"artifact":"contracts","path":"/rows/2/4","equals":102}
+//|       - {"artifact":"contracts","path":"/rows/2/9","approx":{"value":1.0,"atol":1e-12}}
+//|   - case: cancel-midway
+//|     expect:
+//|       - {"artifact":"contracts","path":"/rows/3/3","equals":73}
+//|       - {"artifact":"contracts","path":"/rows/3/6","equals":"admissible"}
+//|       - {"artifact":"contracts","path":"/rows/3/9","approx":{"value":1.0,"atol":1e-12}}
+//|   - case: boundaries
+//|     expect:
+//|       - {"artifact":"contracts","path":"/rows/1/2","equals":"IterationLimit"}
+//|       - {"artifact":"contracts","path":"/rows/1/8","approx":{"value":1.0,"atol":1e-12}}
+//|       - {"artifact":"contracts","path":"/rows/1/10","equals":"Yes"}
+//|       - {"artifact":"contracts","path":"/rows/3/2","equals":"Converged"}
+//|       - {"artifact":"contracts","path":"/rows/3/9","range":{"max":1e-13}}
+use scioxide_core::{
+    AttemptOutcome, Budget, BudgetKind, CancellationToken, ExecutionContext, ProblemToken,
+    ResidualTolerance, SolveBudgets, SolveIdentity, SolveState, algorithm_id,
+};
+use scioxide_linalg::{CgSolver, IterativeWorkspaceRequest, Preconditioning, Vector};
+
+let n = 100_usize;
+let (b, exact) = poisson(n);
+let peak = exact.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+let tolerance = ResidualTolerance::new(0.0, 1e-12).map_err(|e| e.to_string())?;
+let scenarios = [
+    "Unlimited",
+    "Iteration limit",
+    "Evaluation limit",
+    "Cancellation",
+    "Negative-definite matrix",
+    "Operator returning NaN",
+    "Right-hand-side length mismatch",
+];
+// Display attempt outcomes as variant names (termination uses the defined termination_name).
+let outcome_name = |o: AttemptOutcome| match o {
+    AttemptOutcome::Succeeded => "Succeeded",
+    AttemptOutcome::Stopped => "Stopped",
+    AttemptOutcome::Failed => "Failed",
+    AttemptOutcome::PreflightRejected => "PreflightRejected",
+    _ => "Other",
+};
+let mut rows = Vec::new();
+for (index, scenario) in scenarios.iter().enumerate() {
+    let token = CancellationToken::new();
+    let mut operator = Probe::new(n);
+    let limit = if index == 1 {
+        iteration_limit.round() as usize
+    } else {
+        1000
+    };
+    match index {
+        3 if cancel_after < 0.5 => token.cancel(),
+        3 => operator.cancel_at = Some((cancel_after.round() as usize, &token)),
+        4 => operator.sign = -1.0,
+        5 => operator.nan_at = Some(30),
+        _ => {}
+    }
+    let solver = CgSolver::new(
+        tolerance,
+        Budget::try_from(limit).map_err(|e| e.to_string())?,
+    );
+    let request = IterativeWorkspaceRequest::operator(&operator).map_err(|e| e.to_string())?;
+    let mut ws = solver.workspace(&request).map_err(|e| e.to_string())?;
+    // The output vector also supplies initial value 0.
+    let mut x = Vector::zeros(n).map_err(|e| e.to_string())?;
+    let rhs = if index == 6 { &b[..n - 1] } else { &b[..] };
+    let context = ExecutionContext::sequential().with_cancellation(&token);
+    let result = if index == 2 {
+        // Set the evaluation limit as a count limit on the caller's solve context.
+        let mut state = SolveState::new();
+        let limit =
+            Budget::try_from(evaluation_limit.round() as usize).map_err(|e| e.to_string())?;
+        let mut budgets = SolveBudgets::unbounded().with_limit(BudgetKind::Evaluation, limit);
+        let identity = SolveIdentity::new(
+            ProblemToken::new(1),
+            algorithm_id!("handbook", "poisson", 1),
+            0,
+            0,
+        );
+        let mut parent = state
+            .begin_solve(context, identity, &mut budgets)
+            .map_err(|e| e.to_string())?;
+        solver.solve_into(
+            &operator,
+            rhs,
+            Preconditioning::None,
+            x.view_mut(),
+            &mut ws,
+            &mut parent,
+        )
+    } else {
+        solver.solve_into(
+            &operator,
+            rhs,
+            Preconditioning::None,
+            x.view_mut(),
+            &mut ws,
+            context,
+        )
+    };
+    // Attempt record: outcome classification and operator/preconditioner evaluations.
+    let record = ws.last_attempt().ok_or("No attempt record")?;
+    let evaluations = record
+        .counts()
+        .total()
+        .and_then(|c| c.total_providers())
+        .map_err(|e| e.to_string())?;
+    // Accepted state: only successful or stopped attempts have one.
+    let trust = ws.last_accepted().map(|a| a.progress().trust().to_string());
+    let (status, termination, iterations, reported) = match &result {
+        Ok(report) => (
+            "Ok".to_string(),
+            Some(termination_name(report.termination())),
+            Some(report.iterations()),
+            report.true_residual().map(|r| r.scaled_norm()),
+        ),
+        Err(e) => (format!("Err({:?})", e.kind()), None, None, None),
+    };
+    // Verify output: residual and difference from the exact solution (−u for the negative-definite matrix).
+    let output = x.as_slice();
+    let residual = relative_residual(operator.sign, &b, output);
+    let error = output
+        .iter()
+        .zip(&exact)
+        .fold(0.0_f64, |m, (p, q)| m.max((p - operator.sign * q).abs()))
+        / peak;
+    let unchanged = if output.iter().all(|&v| v == 0.0) {
+        "Yes"
+    } else {
+        "No"
+    };
+    rows.push((
+        *scenario,
+        status,
+        termination,
+        iterations,
+        evaluations,
+        outcome_name(record.outcome()),
+        trust,
+        reported,
+        residual,
+        error,
+        unchanged,
+    ));
+}
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Conditions" },
+    { "key": "1", "label": "Result" },
+    { "key": "2", "label": "Termination reason", "nullText": "None" },
+    { "key": "3", "label": "Iterations [count]", "type": "integer", "nullText": "None" },
+    { "key": "4", "label": "Evaluations [count]", "type": "integer" },
+    { "key": "5", "label": "Attempt outcome" },
+    { "key": "6", "label": "Accepted-state trust class", "nullText": "None" },
+    { "key": "7", "label": "Reported residual [-]", "type": "number", "format": sci2, "nullText": "None" },
+    { "key": "8", "label": "Output residual [-]", "type": "number", "format": sci2 },
+    { "key": "9", "label": "Output relative error [-]", "type": "number", "format": sci2 },
+    { "key": "10", "label": "Output remains initial value" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "contracts" })
+);
+```
+
+“Unlimited” reaches `Converged` in 100 iterations.
+The 103 evaluations comprise one initial residual, 100 iterations, and two checkpoint evaluations at iterations 50 and 100.
+At iteration 50 the true residual exceeds the initial residual, triggering the residual-floor check.
+The minimum-residual iterate is still the initial $x = 0$, however, so the floor formula's product $A(s \circ x)$ is zero and no operator evaluation is needed.
+The attempt outcome is `Succeeded` and trust class `residual-checked`, with relative error only $3.5 \times 10^{-15}$.
+Without rounding, CG finishes within $N = 100$ iterations; here it converges in exactly that many.
+
+At the default iteration limit 70, it returns `Ok` and `IterationLimit`, with attempt outcome `Stopped` and trust class `admissible`.
+There are 73 evaluations; iteration 70 at the limit is also a checkpoint.
+Its true residual $0.55\lVert b \rVert$ is smaller than initial residual $\lVert b \rVert$, so output is the iteration-70 solution (relative error $2.9 \times 10^{-2}$).
+This problem's residual grows to 5.7 times $\lVert b \rVert$ at iteration 1 and stays above $\lVert b \rVert$ through iteration 59 (next section).
+A limit at most 59 therefore leaves every checkpoint residual above the initial residual and returns the initial value (relative residual 1), as in case “59 iterations, cancel at application 102.”
+
+With evaluation limit 90, an operator evaluation is refused at iteration 89, giving `EvaluationLimit` and leaving initial output unchanged.
+An evaluation limit prevents computation of the current true residual; among earlier checkpoints (initialization and iteration 50), the initial value has the smaller residual and is returned.
+In case “100 iterations, 102 evaluations,” the iteration-limited solve converges at iteration 100 with `Converged`.
+The evaluation-limited solve reaches a convergence candidate at iteration 100 but lacks the confirming evaluation and again returns the initial value.
+In both evaluation-limited cases, the returned solution is not the iterate at the report's iteration count.
+
+Default cancellation before the call returns `Ok` and `ExecutionStopped(Cancelled)`.
+No operator evaluation occurs, so trust is `diagnostic-only`, reported residual is absent, and output remains at its initial value.
+In case “Cancel at application 75,” cancellation requested inside the operator evaluation at iteration 73 is detected at the start of iteration 74.
+Trust is `admissible`; the initial value still has the smallest checkpoint residual and is again returned.
+Application 102 is the product at iteration 100.
+Cancellation at application 102 or later therefore allows iteration 100 to finish and its true residual to establish convergence; there is no iteration 101 to check cancellation, giving the same `Converged` as the unlimited run (case “59 iterations, cancel at application 102”).
+At application 101, the request occurs during iteration 99, stopping at the start of iteration 100 and returning the initial value.
+
+For the sign-reversed negative-definite matrix, curvature $p^{\mathsf T}Ap$ is negative in the first iteration, returning `Breakdown(NonPositiveCurvature)` and leaving the verified initial value in output.
+The NaN-producing operator gives `Err(NonFinite)` when application 30's result is checked.
+The attempt records `Failed` and 30 evaluations but no accepted state (`last_accepted()` is `None`); output is unchanged.
+A right-hand side of length $N - 1$ gives `Err(DimensionMismatch)`, rejected before computation with attempt outcome `PreflightRejected`, zero evaluations, and unchanged output.
+
+## Quality of early-terminated solutions
+
+The CG iterate at step $k$ minimizes the error's $A$-norm $\lVert x - x^\ast \rVert_A$ in the Krylov subspace $x_0 + \mathcal K_k(A, r_0)$; in exact arithmetic, this $A$-norm error decreases monotonically with iterations.
+Residual $\lVert b - Ax_k \rVert_2$ need not be monotonic, however, and the $A$-norm error cannot be measured without the exact solution.
+Only true residuals are comparable at termination, so the committed solution is selected by residual and may discard a newer iterate with smaller $A$-norm error.
+
+The next cell varies iteration limit $k$ in steps of 5 from 5 to $k_{\max}$ (50–300), measuring relative $A$-norm error and true relative residual of solutions committed by the owned-value API `solve_with_options`.
+The chart overlays residual history from one unlimited run (recurrence values between checkpoints, true values at checkpoints).
+The table shows the final limit's termination reason, iteration count, committed relative $A$-norm error, count of limits returning the initial value, count of increases in committed $A$-norm error from the previous limit, and the last unlimited-run iteration whose residual history exceeds $\lVert b \rVert$.
+
+```rust
+//| id: linalg-truncated-cg-quality
+//| ref: linalg-truncated-cg-quality
+//| title: "Error and residual of solutions committed by CG stopped at a limit"
+//| run: button
+//| uses: [linalg-context-contracts-model]
+//| crates: [scioxide-core, scioxide-linalg]
+//| inputs:
+//|   max_limit: {"type":"range","label":"Maximum limit k_max","description":"Stop at limits 5, 10, …, k_max.","min":50,"max":300,"step":50,"value":200}
+//| cases:
+//|   - {"id":"short","label":"k_max = 50","description":"Every limit returns the initial value because no checkpoint residual falls below the initial residual.","inputs":{"max_limit":50}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"truncated","path":"/rows/0/0","equals":"Converged"}
+//|       - {"artifact":"truncated","path":"/rows/0/2","range":{"max":1e-12}}
+//|       - {"artifact":"truncated","path":"/rows/0/3","equals":11}
+//|       - {"artifact":"truncated","path":"/rows/0/4","equals":0}
+//|       - {"artifact":"truncated","path":"/rows/0/5","equals":59}
+//|   - case: short
+//|     expect:
+//|       - {"artifact":"truncated","path":"/rows/0/0","equals":"IterationLimit"}
+//|       - {"artifact":"truncated","path":"/rows/0/2","approx":{"value":1.0,"atol":1e-12}}
+//|       - {"artifact":"truncated","path":"/rows/0/3","equals":10}
+use scioxide_core::{Budget, LinearOperator, ResidualTolerance};
+use scioxide_linalg::{CgSolver, Preconditioning};
+
+let n = 100_usize;
+let (b, exact) = poisson(n);
+let b_norm = b.iter().map(|v| v * v).sum::<f64>().sqrt();
+let operator = Probe::new(n);
+let tolerance = ResidualTolerance::new(0.0, 1e-12).map_err(|e| e.to_string())?;
+// A-norm √(eᵀ A e) of error e = x − u (verification by calling the operator directly).
+let energy = |x: &[f64]| -> Result<f64, String> {
+    let e: Vec<f64> = x.iter().zip(&exact).map(|(p, q)| p - q).collect();
+    let mut ae = vec![0.0; n];
+    operator
+        .apply_into(&e, &mut ae, &mut [])
+        .map_err(|e| e.to_string())?;
+    Ok(e.iter().zip(&ae).map(|(p, q)| p * q).sum::<f64>().sqrt())
+};
+let initial = energy(&vec![0.0; n])?;
+// One unlimited run gives the residual history: recurrence values and true checkpoint residuals.
+let unlimited = Budget::try_from(1000_usize).map_err(|e| e.to_string())?;
+let full = CgSolver::new(tolerance, unlimited)
+    .with_history(true)
+    .solve_with_options(&operator, &b[..], Preconditioning::None, None)
+    .map_err(|e| e.to_string())?;
+let history: Vec<[f64; 2]> = full
+    .history()
+    .unwrap_or(&[])
+    .iter()
+    .enumerate()
+    .map(|(k, r)| [k as f64, r / b_norm])
+    .collect();
+let last_above = history
+    .iter()
+    .filter(|p| p[1] > 1.0)
+    .map(|p| p[0] as usize)
+    .max();
+let (mut a_norm, mut residual) = (Vec::new(), Vec::new());
+let (mut increases, mut kept_initial) = (0_usize, 0_usize);
+// Report and relative A-norm error at the last limit (overwritten in the loop).
+let (mut last, mut last_error) = (full.report(), 1.0);
+for k in (5..=max_limit.round() as usize).step_by(5) {
+    // Solution committed at limit k (verified iterate with smallest true residual).
+    let budget = Budget::try_from(k).map_err(|e| e.to_string())?;
+    let result = CgSolver::new(tolerance, budget)
+        .solve_with_options(&operator, &b[..], Preconditioning::None, None)
+        .map_err(|e| e.to_string())?;
+    let x = result.solution().as_slice();
+    if x.iter().all(|&v| v == 0.0) {
+        kept_initial += 1;
+    }
+    let ratio = energy(x)? / initial;
+    last_error = ratio;
+    if a_norm
+        .last()
+        .is_some_and(|p: &[f64; 2]| ratio > p[1] * (1.0 + 1e-12))
+    {
+        increases += 1;
+    }
+    // Omit zero errors and residuals from the logarithmic axis.
+    if ratio > 0.0 {
+        a_norm.push([k as f64, ratio]);
+    }
+    if let Some(r) = result.report().true_residual().map(|t| t.scaled_norm()) {
+        if r > 0.0 {
+            residual.push([k as f64, r]);
+        }
+    }
+    last = result.report();
+}
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Termination at last limit" },
+    { "key": "1", "label": "Iterations at last limit [count]", "type": "integer" },
+    { "key": "2", "label": "Relative A-norm error of that solution [-]", "type": "number", "format": sci2 },
+    { "key": "3", "label": "Limits returning initial value", "type": "integer" },
+    { "key": "4", "label": "Increases in A-norm error", "type": "integer" },
+    { "key": "5", "label": "Last iteration with history above ‖b‖", "type": "integer", "nullText": "None" }
+]);
+emit_table_with_columns!(
+    columns,
+    vec![(
+        termination_name(last.termination()),
+        last.iterations(),
+        last_error,
+        kept_initial,
+        increases,
+        last_above
+    )],
+    metadata = serde_json::json!({ "id": "truncated" })
+);
+emit_line_chart!(
+    &vec![
+        serde_json::json!({ "name": "Committed solution ‖x − x*‖_A / ‖x*‖_A", "points": a_norm }),
+        serde_json::json!({ "name": "Committed solution ‖b − Ax‖ / ‖b‖", "points": residual }),
+        serde_json::json!({ "name": "Unlimited-run residual history / ‖b‖", "points": history })
+    ],
+    options = &serde_json::json!({
+        "xLabel": "Iteration limit k / iterations [count]",
+        "yLabel": "Relative error / relative residual [-]",
+        "yType": "log",
+        "annotations": [
+            { "kind": "line", "axis": "y", "value": 1e-12, "label": "Residual tolerance 10⁻¹²" }
+        ]
+    })
+);
+```
+
+Unlimited-run residual history rises to 5.7 times $\lVert b \rVert$ in iteration 1, stays above $\lVert b \rVert$ through iteration 59, then decreases below tolerance $10^{-12}$ at iteration 100.
+At default $k_{\max} = 200$, the 11 limits from 5 through 55 therefore commit the initial value (relative $A$-norm error 1).
+At limit 60, a solution with relative $A$-norm error 0.105 and residual $0.96\lVert b \rVert$ is committed for the first time.
+Thereafter both error and residual decrease as the limit increases.
+Residual selection moves to later iterates whenever a checkpoint improves the residual; for this problem, committed $A$-norm error never increases.
+All limits at least 100 give the same converged solution; the table's last termination is `Converged` with 100 iterations.
+At $k_{\max} = 50$, every limit returns the initial value; final termination is `IterationLimit` (50 iterations).
+
+---
+
+## Summary
+
+Iterative `solve_into` and `solve_with_options` return `Ok` even at limits, cancellation, or curvature breakdown, so assess success through report `termination().is_success()` rather than `Ok`.
+Stopped solutions retain trust class `admissible`; before using them, check whether the reported true residual improves the initial residual, and extend iteration or add preconditioning if output remains initial.
+On `Err`, output is unchanged and its original value remains usable; distinguish causes by the `last_attempt()` outcome (`Failed` or `PreflightRejected`) and evaluation count.
+Set evaluation limits through `SolveBudgets` of the caller's `SolveContext` to stop before an excessive application; request cancellation through the context's `CancellationToken` to stop at the next iteration's start.
+Committed solutions are selected by residual and can discard later iterates with smaller $A$-norm error, so compare with known solutions or other estimates when error magnitude matters.
+
+## Further reading
+
+- [Workspaces, execution contexts, and attempt records](../../algorithms/workspaces-and-execution/): examine cancellation and attempt records for dense computations and workspace reservation.
+- [Solve lifecycle and computational accounting](../../../scioxide-core/algorithms/solve-lifecycle-and-accounting/): examine which limits count evaluations and iterations in nested solves.
+- [Example index](../): return to other examples and what each verifies.

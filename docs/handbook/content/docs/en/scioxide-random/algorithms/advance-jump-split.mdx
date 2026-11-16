@@ -1,0 +1,276 @@
+---
+title: "Stream advancement, jumps, and splits"
+description: "Advancement through closed-form recurrences, jump polynomials for F₂-linear generators, stream spacing and overlap for split and substream, Philox and Threefry counters, and parallel streams with BoundedSubstream and StreamPartitioner."
+sidebar:
+  order: 308
+references:
+  random-prng-advance-jump-split: "advancement-jumps-and-splits"
+  random-prng-stream-spacing: "stream-spacing-and-overlap"
+  random-prng-counter-based: "counter-based-generators"
+---
+
+Parallel computation requires separate random streams for each worker.
+Shifting seeds alone cannot guarantee nonoverlap, so `scioxide-random` provides tools extracting streams from one root through advancement, jumps, and splits.
+This page explains their mathematical mechanisms, costs, and guarantees derived from stream spacing.
+Assignment to execution-Plan partitions is covered in [Bounded streams and execution-Plan partitioning](../bounded-streams-and-partitions/).
+Generator recurrences and periods appear in [Generator families](oxref:random-prng-families).
+
+## Advancement, jumps, and splits
+
+`SkipAhead::skip_ahead(k)` advances by $k$ native words ($k$ transitions); `skip_to(i)` advances to position $i$.
+`skip_to` cannot move backward and rejects earlier positions with `OutOfBounds`.
+Advancement uses the recurrence's closed form without generating words.
+
+One LCG transition is the affine map $f(x) = a x + c$.
+Composing $k$ times gives $f^{k}(x) = a^{k} x + c\,(a^{k-1} + \dots + a + 1)$; representing a map by the pair $(a, c)$ makes its square $(a, c) \mapsto (a^2, (a + 1) c)$.
+Binary expansion of $k$ and repeated squaring and composition compute $f^{k}$ with $O(\log k)$ multiplications (Brown 1994).
+All arithmetic is modulo $2^{128}$ ($2^{64}$ for `Lcg64`), requiring no division by $a - 1$.
+`skip_ahead` for `Pcg64` and `Lcg64` uses this method; `SplitMix64` has an arithmetic-progression state and computes $s + k\gamma$ once ($O(1)$).
+`Mrg32k3a` exponentiates its two $3 \times 3$ companion matrices $A_1$ and $A_2$ by squaring, obtaining $A^{k} s \bmod m$ with $O(\log k)$ matrix products.
+Counter-based generators only rewrite counters, costing $O(1)$.
+
+Transitions of $\mathbb{F}_2$-linear generators (xoshiro) are represented by matrix $M$.
+If $M$ has characteristic polynomial $\chi$, Cayley–Hamilton gives $\chi(M) = 0$; precomputing $\lambda^{J} \bmod \chi(\lambda) = \sum_i c_i \lambda^i$ therefore gives $M^{J} s = \sum_i c_i M^i s$.
+`JumpableRng::jump` and `long_jump` use this jump polynomial, advancing 256 times (128 for `Xoshiro128StarStar`) and XOR-summing states where coefficient $c_i$ is 1.
+Jump distances are $2^{128}$ and $2^{192}$ transitions for `Xoshiro256StarStar`, and $2^{64}$ and $2^{96}$ for `Xoshiro128StarStar`.
+Positions use `u128`, so after a `Xoshiro256StarStar` jump the position is untrackable and becomes `None`; `Xoshiro128StarStar` continues tracking.
+Blocks constructed by repeated jumps do not overlap only if no worker reads more than one jump distance.
+
+`split(i)` and `substream(i, j)` of `SplittableRng` select streams by index.
+Selectors are absolute selections from the immutable root (initial state), even when called on derived or advanced generators.
+Selection does not consume the parent; derived streams start at position zero.
+`split(i)` returns the same stream as `substream(i, 0)`.
+Different selectors identify different streams but do not alone guarantee statistical independence.
+
+## Stream spacing and overlap
+
+Assess stream nonoverlap from each generator's spacing and maximum words consumed per stream.
+
+| Generator | `split(i)` | `substream(i, j)` | Nonoverlap condition |
+|---|---|---|---|
+| `Pcg64` | Stream with increment replaced by $2i + 1$ (`i` is `u64`, giving $2^{64}$ streams) | From transition $j \cdot 2^{64}$ of stream $i$ | Substreams under the same $i$ do not overlap if each reads at most $2^{64}$ transitions. Different $i$ values give separate congruential sequences with different increments |
+| `Mrg32k3a` | From transition $i \cdot 2^{127}$ of the root | A further $j \cdot 2^{76}$ transitions ahead | Substreams $j < 2^{51}$ under the same $i$ do not overlap if each reads at most $2^{76}$ transitions (L'Ecuyer et al. 2002) |
+| `Philox4x64`, `Threefry4x64` | Set counter stream word to $i$ | Set substream word to $j$ | Under the same key, distinct-selector streams never evaluate the same counter. Each stream allows up to $2^{66}$ words |
+| `Xoshiro256StarStar`, `Xoshiro128StarStar` | None (divide intervals with `jump`) | None | Nonoverlap if each worker reads at most the jump distance |
+
+`Pcg64` increments can take $2^{127}$ odd values, but `split` selects only a subset of $2^{64}$ streams.
+Placing $2^{51}$ substream intervals $2^{76}$ of `Mrg32k3a` consecutively exactly fills stream interval $2^{127}$, so substreams with $j \ge 2^{51}$ lie within another stream's interval.
+
+## Counter-based generators
+
+`Philox4x64` and `Threefry4x64` use block functions computing $w = F_K(c)$ from key $K$ and counter $c$.
+Philox repeats high halves of 64-bit products and XOR for 10 rounds, adding Weyl constants to its 128-bit key between rounds.
+Threefry repeats addition, rotation, and XOR from the Threefish cipher for 20 rounds, adding a key schedule every four rounds (256-bit key).
+Both have constant input-independent round counts and accept every key and counter.
+
+The counter has four words `[block, path, stream, subsequence]`.
+Stream word $n$ is word $n \bmod 4$ among four outputs for counter $[\lfloor n/4 \rfloor, \text{path}, \text{stream}, \text{subsequence}]$, giving $2^{64}$ blocks and $2^{66}$ words (`WORD_CAPACITY`) per stream.
+`path` encodes a tree path by appending at most seven one-byte child indices to leading `0x01`.
+`fork(child)` returns a child of the current path; `derive(path)` returns the absolute path from the root at position zero.
+An eighth child gives `InvalidInput`.
+`seek(position)` seeks to absolute positions within a stream in $O(1)$ and, unlike `skip_to`, allows backward movement.
+`jump` and `long_jump` advance $2^{32}$ and $2^{48}$ words.
+Single-word reads such as `next_u64` or advancement past the stream end give `OutOfBounds` without changing the generator.
+Bulk reads such as `fill_uniforms` write through the end before returning `OutOfBounds`.
+
+Under the same key, a difference in stream, substream, or path makes counter inputs disjoint.
+Individual 64-bit output values can nevertheless repeat in different streams.
+Distinct inputs and distinct outputs are separate properties; block-function outputs can coincide by chance as uniform 64-bit values.
+`philox4x64_block` and `threefry4x64_block` evaluate the same functions without state and match known output vectors from Salmon et al. (2011).
+
+The next cell checks whether five pairs of paths return identical words for the selected generator.
+Inputs are generator, seed, and advance count $k$ (0–4,000 transitions).
+The first table shows the low 32 bits of words from paths A and B, their positions after reading, and the differing-bit count between the two 64-bit words.
+The fifth pair compares bounded stream `BoundedSubstream::for_chunk(&root, 2, 4)` permitting only root transitions 8–11 ([Bounded streams](oxref:random-prng-bounded-partitions)) with a generator advanced eight transitions from the root.
+The second table shows state-byte length and the result of reading the bounded stream's fifth word.
+
+```rust
+//| id: random-stream-movement
+//| ref: random-stream-movement
+//| title: "Check advancement, splits, storage, and bounded streams against sequential words"
+//| run: reactive
+//| crates: [scioxide-random]
+//| inputs:
+//|   engine: {"type":"select","label":"Generator","description":"Choose among four generators supporting stream advancement and partitioning.","options":["Pcg64","Mrg32k3a","Philox4x64","Threefry4x64"],"value":"Pcg64"}
+//|   seed: {"type":"range","label":"Random seed [-]","min":1,"max":1000,"step":1,"value":42}
+//|   steps: {"type":"range","label":"Advance count k [transitions]","description":"Transitions advanced through skip_ahead or k next_u32 calls.","min":0,"max":4000,"step":250,"value":1000}
+//| cases:
+//|   - {"id":"mrg32k3a-long","label":"Mrg32k3a, k = 4000","description":"next_u64 consumes two transitions, giving position k + 2 after reading.","inputs":{"engine":"Mrg32k3a","steps":4000}}
+//|   - {"id":"threefry-zero","label":"Threefry4x64, k = 0","description":"Even with no advancement, the five path pairs return identical words.","inputs":{"engine":"Threefry4x64","seed":7,"steps":0}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"paths","path":"/rows/0/3","equals":1001}
+//|       - {"artifact":"paths","path":"/rows/0/5","equals":0}
+//|       - {"artifact":"paths","path":"/rows/1/5","equals":0}
+//|       - {"artifact":"paths","path":"/rows/2/5","equals":0}
+//|       - {"artifact":"paths","path":"/rows/3/5","equals":0}
+//|       - {"artifact":"paths","path":"/rows/4/5","equals":0}
+//|       - {"artifact":"envelope","path":"/rows/0/0","equals":100}
+//|       - {"artifact":"envelope","path":"/rows/0/1","equals":100}
+//|       - {"artifact":"envelope","path":"/rows/0/2","equals":"OutOfBounds"}
+//|   - case: mrg32k3a-long
+//|     expect:
+//|       - {"artifact":"paths","path":"/rows/0/3","equals":4002}
+//|       - {"artifact":"paths","path":"/rows/0/5","equals":0}
+//|       - {"artifact":"paths","path":"/rows/4/5","equals":0}
+//|       - {"artifact":"envelope","path":"/rows/0/0","equals":148}
+//|   - case: threefry-zero
+//|     expect:
+//|       - {"artifact":"paths","path":"/rows/0/3","equals":1}
+//|       - {"artifact":"paths","path":"/rows/3/5","equals":0}
+//|       - {"artifact":"envelope","path":"/rows/0/0","equals":92}
+use scioxide_random::{
+    BitGenerator, BoundedSubstream, Mrg32k3a, Pcg64, Philox4x64, SeedableRng, SerializableState,
+    SkipAhead, SplittableRng, Threefry4x64,
+};
+
+// (check, low 32 bits of path A word, low 32 bits of path B word, A position, B position, differing bits)
+type Row = (String, u32, u32, u64, u64, u32);
+// (STATE_BYTES, bytes written, fifth-word result for block, transitions remaining in block)
+type Envelope = (usize, usize, Option<String>, u64);
+
+fn position<R: BitGenerator>(rng: &R) -> Result<u64, String> {
+    let tracked = rng.position().ok_or("Position is untracked")?;
+    u64::try_from(tracked).map_err(|e| e.to_string())
+}
+
+fn row(item: &str, a: u64, b: u64, positions: (u64, u64), differing: u32) -> Row {
+    let (pa, pb) = positions;
+    let low = |word: u64| (word & 0xffff_ffff) as u32;
+    (item.to_string(), low(a), low(b), pa, pb, differing)
+}
+
+// Perform the same five comparisons for every generator type.
+fn check<R>(seed: u64, k: u128) -> Result<(Vec<Row>, Envelope), String>
+where
+    R: SeedableRng + BitGenerator + SkipAhead + SplittableRng + SerializableState + Clone,
+{
+    let root = R::from_seed(seed);
+    let mut rows = Vec::new();
+    // 1. skip_ahead(k) versus sequential advancement by k next_u32 calls (both k transitions).
+    let mut skipped = root.clone();
+    skipped.skip_ahead(k).map_err(|e| e.to_string())?;
+    let mut stepped = root.clone();
+    for _ in 0..k {
+        stepped.next_u32().map_err(|e| e.to_string())?;
+    }
+    let a = skipped.next_u64().map_err(|e| e.to_string())?;
+    let b = stepped.next_u64().map_err(|e| e.to_string())?;
+    let at = (position(&skipped)?, position(&stepped)?);
+    rows.push(row(
+        "skip_ahead(k) versus k next_u32 calls",
+        a,
+        b,
+        at,
+        (a ^ b).count_ones(),
+    ));
+    // 2. Selectors are absolute from the root, so split(1) on an advanced generator gives the same stream as root split(1).
+    let mut from_root = root.split(1).map_err(|e| e.to_string())?;
+    let mut from_advanced = stepped.split(1).map_err(|e| e.to_string())?;
+    let mut from_substream = root.substream(1, 0).map_err(|e| e.to_string())?;
+    let a = from_root.next_u64().map_err(|e| e.to_string())?;
+    let b = from_advanced.next_u64().map_err(|e| e.to_string())?;
+    let c = from_substream.next_u64().map_err(|e| e.to_string())?;
+    let at = (position(&from_root)?, position(&from_advanced)?);
+    rows.push(row(
+        "Root split(1) versus split(1) after advancement",
+        a,
+        b,
+        at,
+        (a ^ b).count_ones(),
+    ));
+    let at = (position(&from_root)?, position(&from_substream)?);
+    rows.push(row(
+        "Root split(1) versus substream(1, 0)",
+        a,
+        c,
+        at,
+        (a ^ c).count_ones(),
+    ));
+    // 3. Save state, read the next word, then reread from the saved state.
+    let checkpoint = skipped.export_state().map_err(|e| e.to_string())?;
+    let expected = skipped.next_u64().map_err(|e| e.to_string())?;
+    let mut replay = R::import_state(&checkpoint).map_err(|e| e.to_string())?;
+    let again = replay.next_u64().map_err(|e| e.to_string())?;
+    let at = (position(&skipped)?, position(&replay)?);
+    let differing = (expected ^ again).count_ones();
+    rows.push(row(
+        "Word after saved state versus word after restoration",
+        expected,
+        again,
+        at,
+        differing,
+    ));
+    // 4. Block 2 (length four transitions) reads only root transitions 8..12. A's position is relative to the block.
+    let mut chunk = BoundedSubstream::for_chunk(&root, 2, 4).map_err(|e| e.to_string())?;
+    let mut reference = root.clone();
+    reference.skip_ahead(8).map_err(|e| e.to_string())?;
+    let (mut a, mut b, mut differing) = (0, 0, 0);
+    for _ in 0..4 {
+        a = u64::from(chunk.next_u32().map_err(|e| e.to_string())?);
+        b = u64::from(reference.next_u32().map_err(|e| e.to_string())?);
+        differing += (a ^ b).count_ones();
+    }
+    let at = (position(&chunk)?, position(&reference)?);
+    rows.push(row("Four words from block 2 versus root transitions 8..12", a, b, at, differing));
+    let fifth = chunk.next_u32().err().map(|e| format!("{:?}", e.kind()));
+    let remaining = u64::try_from(chunk.remaining()).map_err(|e| e.to_string())?;
+    Ok((rows, (R::STATE_BYTES, checkpoint.len(), fifth, remaining)))
+}
+
+let k = steps.round() as u128;
+let seed = seed.round() as u64;
+let (rows, envelope) = match engine.as_str() {
+    "Pcg64" => check::<Pcg64>(seed, k)?,
+    "Mrg32k3a" => check::<Mrg32k3a>(seed, k)?,
+    "Philox4x64" => check::<Philox4x64>(seed, k)?,
+    _ => check::<Threefry4x64>(seed, k)?,
+};
+let path_columns = serde_json::json!([
+    { "key": "0", "label": "Check" },
+    { "key": "1", "label": "Low 32 bits of path A word", "type": "integer" },
+    { "key": "2", "label": "Low 32 bits of path B word", "type": "integer" },
+    { "key": "3", "label": "A position [transitions]", "type": "integer" },
+    { "key": "4", "label": "B position [transitions]", "type": "integer" },
+    { "key": "5", "label": "Differing bits [bits]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    path_columns,
+    rows,
+    metadata = serde_json::json!({ "id": "paths" })
+);
+let envelope_columns = serde_json::json!([
+    { "key": "0", "label": "STATE_BYTES [bytes]", "type": "integer" },
+    { "key": "1", "label": "Bytes written [bytes]", "type": "integer" },
+    { "key": "2", "label": "Block's fifth word", "nullText": "Read succeeded" },
+    { "key": "3", "label": "Transitions remaining in block [transitions]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    envelope_columns,
+    vec![envelope],
+    metadata = serde_json::json!({ "id": "envelope" })
+);
+```
+
+With defaults (`Pcg64`, seed 42, $k = 1\,000$), all five rows have zero differing bits.
+Both positions in the first row are 1001: `skip_ahead` and sequential advancement each count $k$ transitions, followed by one transition for `next_u64`.
+Selecting `Mrg32k3a` gives position $k + 2$ because `next_u64` consumes two 32-bit native words.
+The second and third rows have position 1 for `Pcg64`, showing that derived streams start at position zero.
+In the block row, A's block-relative position is 4 and B's root position is 12; the fifth read is rejected with `OutOfBounds`, leaving zero transitions.
+State-byte lengths are fixed per generator by `STATE_BYTES`: `Pcg64` is 100 bytes, `Mrg32k3a` 148, `Philox4x64` 76, and `Threefry4x64` 92.
+
+## Summary
+
+Select parallel streams from one root with `split`, `substream`, and `jump` rather than shifting seeds.
+Assess nonoverlap from each generator's stream spacing and maximum word consumption rather than from distinct selectors alone.
+Substreams of `Pcg64` are spaced by $2^{64}$ transitions and those of `Mrg32k3a` by $2^{76}$; counter-based streams have disjoint inputs for distinct selectors.
+Advancement costs $O(\log k)$ for `Pcg64`, `Lcg64`, and `Mrg32k3a`, and $O(1)$ for `SplitMix64` and counter-based generators, so even distant positions need no generated words.
+After a jump in `Xoshiro256StarStar`, position becomes `None`; use `Xoshiro128StarStar` or another generator when counting work by position.
+
+## Further reading
+
+- [Bounded streams and execution-Plan partitioning](../bounded-streams-and-partitions/): inspect stream assignment to execution-Plan partitions and preventing overreads.
+- [Seeds, saved state, and state after failure](../seeding-and-state/): inspect saving partitioned-stream state and restoring after failed batches.
+- [Seed collisions and stream partitioning](../../examples/seed-collisions-and-streams/): estimate collisions among randomly assigned seeds and inspect overlap guarantees from `seed_sequence`, `split`, jumps, and `StreamPartitioner`.
+- [Generators and streams API](../../api/engines-and-streams/): find contracts and errors for `SkipAhead`, `JumpableRng`, and `SplittableRng`.

@@ -1,0 +1,657 @@
+---
+title: "Adjoint gradients and checkpoints"
+description: "Compute gradients of objectives depending on time-integration results by integrating adjoint equations backward. Continuous versus discrete adjoints, checkpoint memory/recomputation tradeoffs, ODE and index-1 DAE Plans, problems and workspaces, and interpreting termination statuses and diagnostics."
+sidebar:
+  order: 365
+references:
+  ode-continuous-adjoint: "continuous-adjoint-equations"
+  ode-discrete-and-continuous-adjoint: "discrete-and-continuous-adjoints"
+  ode-adjoint-checkpointing: "checkpoints-and-recomputation"
+  ode-adjoint-plans-and-workspaces: "plans-problems-and-workspaces"
+  ode-adjoint-termination: "termination-statuses-and-diagnostics"
+  ode-adjoint-implicit: "implicit-forward-methods-and-dae-adjoints"
+---
+
+Parameter identification and optimal control require gradients $\partial J/\partial y_0$ and $\partial J/\partial p$ of scalar objective $J(y_0, p)$ depending on ODE solution $y(t; y_0, p)$.
+[Forward sensitivity](../forward-sensitivities-and-ensembles/) integrates $\partial y/\partial p$ alongside state, adding state-sized equations for each extra parameter.
+Adjoints add one backward integration after the forward integration, computing the full gradient at cost independent of parameter count.
+The backward integration instead needs the forward trajectory in reverse order.
+
+The crate `scioxide-ode` provides ODE `OdeAdjointSolver` (forward Dormand–Prince 5(4)) and residual-form index-1 DAE `DaeAdjointSolver` (forward BDF, backward Euler, or implicit trapezoidal).
+Both record forward accepted steps and traverse them backward, recomputing portions to fit memory limits.
+
+## Continuous adjoint equations
+
+Let the objective over $[t_0, T]$ be
+
+$$
+J(y_0, p) = \Phi\bigl(T, y(T), p\bigr) + \int_{t_0}^{T} L\bigl(t, y(t), p\bigr)\,dt + \sum_k G_k\bigl(y(t_k), p\bigr)
+$$
+
+
+Here $\Phi$ is the terminal term, $L$ the integral term, and $G_k$ the term at observation time $t_k$.
+Integrating a Lagrangian constrained by $y' = f(t, y, p)$ by parts in time gives the adjoint variable (costate) $\lambda(t)$ equations
+
+$$
+\lambda' = -\Bigl(\frac{\partial f}{\partial y}\Bigr)^{\mathsf T}\lambda - \Bigl(\frac{\partial L}{\partial y}\Bigr)^{\mathsf T}, \qquad \lambda(T) = \Bigl(\frac{\partial \Phi}{\partial y}\Bigr)^{\mathsf T}
+$$
+
+to solve backward from $T$ to $t_0$.
+Observation terms add jumps to $\lambda$ at times $t_k$.
+The gradients are
+
+$$
+\frac{\partial J}{\partial y_0} = \lambda(t_0), \qquad \frac{\partial J}{\partial p} = \frac{\partial \Phi}{\partial p} + \int_{t_0}^{T} \Bigl(\frac{\partial L}{\partial p} + \lambda^{\mathsf T}\frac{\partial f}{\partial p}\Bigr)\,dt
+$$
+
+
+Only Jacobian–adjoint products $(\partial f/\partial y)^{\mathsf T}w$ and $(\partial f/\partial p)^{\mathsf T}w$ (pullbacks) are needed, without forming full Jacobians.
+
+The system implements `OdeAdjointSystem` (extending `OdeSystem` with `parameters`, `is_replayable`, and `pullback`); `pullback(t, y, w, …)` writes both products.
+Products may use dense or sparse matrices, matrix-free actions, or scioxide-ad reverse-mode automatic differentiation.
+Objectives implement `AdjointObjective`; `evaluate(part, t, y, p, …)` returns value `AdjointObjectiveValue { value, time_derivative }` for terminal (`AdjointObjectivePart::Terminal`) or integral (`Running`) terms and writes state and parameter gradients.
+Observation terms use `observation_times` and `observation`, available only under `AdjointMode::Discrete` without terminal events.
+States may be complex; state gradients are then cotangents $\bar y$ satisfying $dJ = \operatorname{Re}(\bar{y}^{\mathsf T}\,dy)$.
+Time and parameters are real.
+
+## Discrete and continuous adjoints
+
+The setting `AdjointMode` selects what is differentiated.
+
+| `AdjointMode` | Quantity computed | Error properties |
+|---|---|---|
+| `Discrete` | Fix the forward accepted-step sequence and apply transposed step-map derivatives in reverse order | Exact derivative of computed $J$ at fixed steps, apart from rounding. Excludes changes in step selection with $p$ |
+| `Continuous` | Integrate the adjoint equations backward along forward dense output | Estimate depending on adjoint and integral-term local tolerances (`with_adjoint_error`, `with_quadrature_error`) and forward tolerances |
+
+Both differ from true $J$ gradients by forward discretization error.
+Discrete adjoints give gradients consistent with the computed objective, suiting optimization that combines objective values and gradients.
+Continuous adjoints independently select backward steps, integrating within each recorded forward step using Dormand–Prince 5(4).
+Gradient differences are roughly of tolerance magnitude and do not prove either is correct.
+
+## Checkpoints and recomputation
+
+Backward integration needs forward states in reverse order.
+Storing all accepted states uses memory proportional to step count.
+Storing only some states (checkpoints) and recomputing between them reduces memory at the cost of extra forward steps.
+Choose storage through `CheckpointPolicy`.
+
+| `CheckpointPolicy` | Behavior |
+|---|---|
+| `StoreAll` (default) | Store restart states at all accepted steps, without recomputation |
+| `MemoryBudget` | Store all steps if total workspace fits `with_max_workspace_bytes`; otherwise choose a binomial schedule (Griewank 1992) with the most snapshots (up to 64) fitting both workspace and `with_max_replay_steps` recomputation limits |
+| `Explicit(schedule)` | Use scioxide-ad's `CheckpointSchedule`; it must cover recorded-step capacity `with_tape_capacity` and fit recomputation within `with_max_replay_steps` |
+
+[scioxide-ad checkpoints](../../../scioxide-ad/algorithms/checkpointing/) covers binomial-schedule theory.
+Recomputation must reproduce stored states correctly; systems declare identical outputs for identical inputs through `is_replayable`.
+Systems returning `false` give `InvalidInput` during workspace preparation.
+Recomputed-state differences are checked against `with_replay_error` tolerances (default: no difference allowed); exceeding them fails with `ReplayMismatch`.
+Changing system parameters during computation also gives `ReplayMismatch`.
+The recomputation limit `with_max_replay_steps` is validated at Plan construction against recomputation for full recorded capacity, so it never stops execution at runtime.
+
+## Plans, problems, and workspaces
+
+Settings have two levels: shared ODE/DAE `AdjointOptions` and family-specific settings.
+The constructor `AdjointOptions::new(mode, initial_step)` accepts adjoint method and initial-step magnitude.
+Defaults are adaptive steps, forward/adjoint/integral local tolerances $\sqrt{\varepsilon}$ (absolute and relative, maximum norm), exact recomputation agreement, `StoreAll`, recorded-step capacity 1024, and no other limits.
+The setting `with_fixed_step(true)` disables error control, fixing all forward steps to the initial size.
+Resource limits are:
+
+| Setting | Quantity limited | Termination on reaching the limit |
+|---|---|---|
+| `with_tape_capacity` | Recorded accepted forward steps (default 1024); workspace is estimated for this count | `BudgetLimit(Iteration)` |
+| `with_max_steps` | Attempted integration steps (forward plus continuous-adjoint backward steps) | `BudgetLimit(Proposal)` |
+| `with_max_replay_steps` | Recomputed forward steps | Validated at Plan construction; never stops runtime execution |
+| `with_max_reverse_steps` | Backward steps (one per recorded step for discrete adjoints; one per attempted substep for continuous adjoints) | `BudgetLimit(Iteration)` |
+| `with_max_workspace_bytes` | Numerical workspace bytes (including linear-solver memory, excluding callback-owned memory) | `InvalidInput` or `DimensionMismatch` at Plan or workspace preparation |
+| `with_max_evaluations` | Callback evaluations (right-hand side or residual, pullback, objective, events, linear solvers) | `BudgetLimit(Evaluation)` |
+
+ODE settings `OdeAdjointOptions::new(common)` add forward Dormand–Prince 5(4) tolerances (`with_primal_error`), terminal-event search and localization (`with_event_options`), and continuous-adjoint interpolation-defect measurements (`with_interpolation_defect_sampling`).
+DAE settings `DaeAdjointOptions::new(common, numerics)` add numerical settings shared with `DaeBdf` (`DaeNumericalOptions`) and the relative residual for backward transposed linear systems (`with_linear_residual`, default $64\varepsilon$).
+Adjoint tolerances and interpolation-defect measurements apply only to continuous adjoints; supplying them for discrete adjoints gives `InvalidInput` at Plan construction.
+
+The Plan `OdeAdjointSolver::new(dimension, parameter_dimension, options)` validates only dimensions and settings, without borrowing callbacks.
+The problem `OdeAdjointProblem::new(&system, &objective, &initial, (t0, t1))` borrows the system, objective, initial values, interval, and optional terminal event.
+The condition `t1 < t0` requests backward time integration.
+The method `workspace_requirements(&problem)` validates system reproducibility, mass-matrix presence (`OdeAdjointSolver` rejects them), dimensions, and observation times, estimating workspace including callback memory, observation times, and checkpoints.
+The returned `OdeAdjointRequirements` holds gradient lengths (`initial_gradient_len`, `parameter_gradient_len`) and memory bound `required_bytes()`.
+The method `workspace(&problem)` allocates matching `OdeAdjointWorkspace`, returning an error before system or objective evaluation if limits are exceeded.
+Existing workspace can also be checked or grown through `OdeAdjointWorkspace::check` and `try_reserve`.
+
+There are two computation APIs.
+
+- `solve_into(&problem, &mut initial_gradient, &mut parameter_gradient, &mut workspace, scope)` writes both gradients only on success, returning `AdjointReport`.
+  Failed-attempt reports remain in workspace `last_attempt()`.
+  With prepared workspace and nonallocating callbacks, no allocation occurs even with terminal events.
+- `solve(&problem)` allocates new workspace and gradient storage, returning `AdjointResult` (`initial_gradient()`, `parameter_gradient()`, `report()`, `into_parts()`).
+  Failure returns `PartialFailure` carrying the failed attempt's `AdjointReport`.
+
+Neither returns partial gradients on failure.
+
+### Oral-dosing model AUC gradients
+
+In a one-compartment pharmacokinetic model, let gastrointestinal amount $A_g$ and body amount $A_c$ [mg] satisfy
+
+$$
+A_g' = -k_a A_g, \qquad A_c' = k_a A_g - k_e A_c, \qquad A_g(0) = D,\ A_c(0) = 0
+$$
+
+
+With absorption constant $k_a = 1\ \mathrm{h^{-1}}$, elimination constant $k_e = 0.2\ \mathrm{h^{-1}}$, and dose $D = 100$ mg, compute gradients of 24-hour body-amount integral (AUC) $J = \int_0^{24} A_c\,dt$ [mg·h].
+Analytical solution $A_c = D k_a (e^{-k_e t} - e^{-k_a t})/(k_a - k_e)$ gives closed forms for $J$ and four partial derivatives.
+Use them for independent verification.
+
+The following block defines helpers shared by two cells.
+The type `OralDose` supplies the system and pullback, `Auc` the integral term $L = A_c$, `auc_closed_form` closed-form $J$ and gradients, and `worst_relative` the maximum relative error against the closed forms across four partial derivatives.
+
+```rust
+//| id: ode-adjoint-oral-dose-model
+//| kind: definitions
+//| title: "Oral-dosing system, pullback, AUC, and closed forms"
+//| crates: [scioxide-core, scioxide-ode]
+use scioxide_core::{SciOxideError, SolveContext};
+use scioxide_ode::{
+    AdjointObjective, AdjointObjectivePart, AdjointObjectiveValue, OdeAdjointSystem, OdeSystem,
+};
+
+/// One-compartment model with state y = (A_g, A_c) [mg], parameters p = (k_a, k_e) [1/h].
+pub(crate) struct OralDose(pub(crate) [f64; 2]);
+impl OdeSystem<f64> for OralDose {
+    fn dimension(&self) -> usize {
+        2
+    }
+    fn rhs(
+        &self,
+        _: f64,
+        y: &[f64],
+        out: &mut [f64],
+        _: &mut SolveContext<'_, '_>,
+    ) -> Result<(), SciOxideError> {
+        let [ka, ke] = self.0;
+        out[0] = -ka * y[0];
+        out[1] = ka * y[0] - ke * y[1];
+        Ok(())
+    }
+}
+impl OdeAdjointSystem<f64> for OralDose {
+    fn parameters(&self) -> &[f64] {
+        &self.0
+    }
+    fn is_replayable(&self) -> bool {
+        true
+    }
+    /// Write (∂f/∂y)ᵀw and (∂f/∂p)ᵀw for seed w.
+    fn pullback(
+        &self,
+        _: f64,
+        y: &[f64],
+        w: &[f64],
+        dy: &mut [f64],
+        dp: &mut [f64],
+        _: &mut [f64],
+        _: &mut SolveContext<'_, '_>,
+    ) -> Result<(), SciOxideError> {
+        let [ka, ke] = self.0;
+        dy.copy_from_slice(&[ka * (w[1] - w[0]), -ke * w[1]]);
+        dp.copy_from_slice(&[y[0] * (w[1] - w[0]), -y[1] * w[1]]);
+        Ok(())
+    }
+}
+/// J = ∫ A_c dt. Integral term L = A_c has state gradient (0, 1); terminal term is zero.
+pub(crate) struct Auc;
+impl AdjointObjective<f64> for Auc {
+    fn evaluate(
+        &self,
+        part: AdjointObjectivePart,
+        _: f64,
+        y: &[f64],
+        _: &[f64],
+        dy: &mut [f64],
+        dp: &mut [f64],
+        _: &mut [f64],
+        _: &mut SolveContext<'_, '_>,
+    ) -> Result<AdjointObjectiveValue<f64>, SciOxideError> {
+        let running = if part == AdjointObjectivePart::Running {
+            1.0
+        } else {
+            0.0
+        };
+        dy.copy_from_slice(&[0.0, running]);
+        dp.fill(0.0);
+        Ok(AdjointObjectiveValue {
+            value: running * y[1],
+            time_derivative: 0.0,
+        })
+    }
+}
+/// Closed forms (J, ∂J/∂A_g(0), ∂J/∂A_c(0), ∂J/∂k_a, ∂J/∂k_e). Exponentials use f64 references.
+pub(crate) fn auc_closed_form(dose: f64, ka: f64, ke: f64, horizon: f64) -> [f64; 5] {
+    let (ea, ee) = ((-ka * horizon).exp(), (-ke * horizon).exp());
+    let (c, q) = (dose * ka / (ka - ke), (1.0 - ee) / ke - (1.0 - ea) / ka);
+    let dq_dka = ((1.0 - ea) - ka * horizon * ea) / (ka * ka);
+    let dq_dke = (ke * horizon * ee - (1.0 - ee)) / (ke * ke);
+    let scale = dose / (ka - ke).powi(2);
+    [
+        c * q,
+        q * ka / (ka - ke),
+        (1.0 - ee) / ke,
+        -scale * ke * q + c * dq_dka,
+        scale * ka * q + c * dq_dke,
+    ]
+}
+/// Maximum relative error across four closed-form partial derivatives.
+pub(crate) fn worst_relative(gradient: [f64; 4], exact: [f64; 5]) -> f64 {
+    let pairs = gradient.iter().zip(&exact[1..]);
+    pairs.fold(0.0_f64, |m, (a, b)| m.max(((a - b) / b).abs()))
+}
+```
+
+The next cell solves this model with discrete and continuous `OdeAdjointSolver::solve` adjoints, comparing with closed forms.
+Forward, adjoint, and integral tolerances share value $10^q$; checkpoints use `MemoryBudget` with an input memory bound.
+“Maximum relative error” is the maximum of the relative errors in $\partial J/\partial A_g(0)$, $\partial J/\partial A_c(0)$, $\partial J/\partial k_a$, and $\partial J/\partial k_e$; “Workspace bound” is `OdeAdjointRequirements::required_bytes()`.
+
+```rust
+//| id: ode-adjoint-auc-gradient
+//| ref: ode-adjoint-auc-gradient
+//| title: "Compute oral-dosing AUC gradients by adjoints and compare with closed form"
+//| run: button
+//| uses: [ode-adjoint-oral-dose-model]
+//| crates: [scioxide-core, scioxide-ode]
+//| inputs:
+//|   tolerance_exponent: {"type":"range","label":"Exponent q of local tolerance 10^q","description":"Absolute and relative tolerances for forward, adjoint, and integral errors.","min":-12,"max":-4,"step":1,"value":-8}
+//|   checkpoint_kib: {"type":"range","label":"Workspace bound [KiB]","description":"MemoryBudget memory bound. Smaller values require more recomputation.","min":80,"max":1024,"step":16,"value":96}
+//| cases:
+//|   - {"id":"loose","label":"q = −4","description":"Fewer steps increase relative error to around 10⁻⁵.","inputs":{"tolerance_exponent":-4}}
+//|   - {"id":"store-all","label":"q = −11, 1024 KiB","description":"Sufficient memory stores every step without recomputation.","inputs":{"tolerance_exponent":-11,"checkpoint_kib":1024}}
+//|   - {"id":"tape-full","label":"q = −12","description":"Accepted steps reach recorded capacity 1024; no gradients are returned.","inputs":{"tolerance_exponent":-12}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"gradients","path":"/rows/1/5","range":{"max":1e-8}}
+//|       - {"artifact":"gradients","path":"/rows/2/5","range":{"max":1e-8}}
+//|       - {"artifact":"gradients","path":"/rows/1/4","approx":{"value":-2357.26532461266,"rtol":1e-8}}
+//|       - {"artifact":"gradients","path":"/rows/1/7","range":{"min":1}}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+//|   - case: store-all
+//|     expect:
+//|       - {"artifact":"gradients","path":"/rows/1/7","equals":0}
+//|       - {"artifact":"gradients","path":"/rows/2/5","range":{"max":1e-11}}
+//|   - case: tape-full
+//|     expect:
+//|       - {"artifact":"gradients","path":"/rows/1/10","equals":"BudgetLimit(Iteration)"}
+//|       - {"artifact":"gradients","path":"/rows/1/2","equals":null}
+//|       - {"path":"/outputs/1/state","equals":"failed"}
+use scioxide_core::{ErrorTolerance, NormSelection};
+use scioxide_ode::{
+    AdjointMode, AdjointOptions, CheckpointPolicy, OdeAdjointOptions, OdeAdjointProblem,
+    OdeAdjointSolver, OdeAdjointSystem, OdeSystem,
+};
+
+let (dose, ka, ke, horizon) = (100.0, 1.0, 0.2, 24.0);
+let exact = auc_closed_form(dose, ka, ke, horizon);
+let epsilon = 10.0_f64.powf(tolerance_exponent);
+let tol = ErrorTolerance::scalar(epsilon, epsilon, NormSelection::Infinity)
+    .map_err(|e| e.to_string())?;
+let model = OralDose([ka, ke]);
+let initial = [dose, 0.0];
+let problem = OdeAdjointProblem::new(&model, &Auc, &initial, (0.0, horizon));
+let mut rows = vec![(
+    "Closed form",
+    Some(exact[0]),
+    Some(exact[1]),
+    Some(exact[3]),
+    Some(exact[4]),
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+)];
+let mut failure = None;
+for mode in [AdjointMode::Discrete, AdjointMode::Continuous] {
+    let common = AdjointOptions::new(mode, 0.1)
+        .map_err(|e| e.to_string())?
+        .with_quadrature_error(tol.clone())
+        .with_max_workspace_bytes(checkpoint_kib as usize * 1024)
+        .with_checkpoint_policy(CheckpointPolicy::MemoryBudget);
+    // Adjoint-equation error control applies only to continuous adjoints; discrete adjoints reject it at Plan construction.
+    let common = match mode {
+        AdjointMode::Continuous => common.with_adjoint_error(tol.clone()),
+        AdjointMode::Discrete => common,
+    };
+    let options = OdeAdjointOptions::new(common).with_primal_error(tol.clone());
+    let plan = OdeAdjointSolver::new(model.dimension(), model.parameter_dimension(), options)
+        .map_err(|e| e.to_string())?;
+    let bytes = plan
+        .workspace_requirements(&problem)
+        .map_err(|e| e.to_string())?
+        .required_bytes();
+    let name = if mode == AdjointMode::Discrete {
+        "Discrete adjoint"
+    } else {
+        "Continuous adjoint"
+    };
+    // Failure returns no gradient; PartialFailure progress carries the report.
+    let (gradient, report) = match plan.solve(&problem) {
+        Ok(result) => {
+            let (initial, parameter) = (result.initial_gradient(), result.parameter_gradient());
+            let gradient = [initial[0], initial[1], parameter[0], parameter[1]];
+            (Some(gradient), *result.report())
+        }
+        Err(failure) => (
+            None,
+            *failure
+                .progress()
+                .ok_or_else(|| failure.error().to_string())?,
+        ),
+    };
+    if !report.is_success() {
+        failure = report.termination().map(|t| format!("{t:?}"));
+    }
+    let status = report.termination().map(|t| format!("{t:?}"));
+    rows.push((
+        name,
+        report.objective(),
+        gradient.map(|g| g[0]),
+        gradient.map(|g| g[2]),
+        gradient.map(|g| g[3]),
+        gradient.map(|g| worst_relative(g, exact)),
+        Some(report.accepted_steps()),
+        Some(report.replayed_steps()),
+        Some(report.reverse_steps()),
+        Some(bytes),
+        status,
+    ));
+}
+let sig10 = serde_json::json!({ "significantDigits": 10 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Method" },
+    { "key": "1", "label": "J [mg·h]", "type": "number", "format": sig10, "nullText": "None" },
+    { "key": "2", "label": "∂J/∂A_g(0) [h]", "type": "number", "format": sig10, "nullText": "None" },
+    { "key": "3", "label": "∂J/∂k_a [mg·h²]", "type": "number", "format": sig10, "nullText": "None" },
+    { "key": "4", "label": "∂J/∂k_e [mg·h²]", "type": "number", "format": sig10, "nullText": "None" },
+    { "key": "5", "label": "Maximum relative error [-]", "type": "number", "format": sci2, "nullText": "None" },
+    { "key": "6", "label": "Accepted steps [count]", "type": "integer", "nullText": "-" },
+    { "key": "7", "label": "Recomputed steps [count]", "type": "integer", "nullText": "-" },
+    { "key": "8", "label": "Backward steps [count]", "type": "integer", "nullText": "-" },
+    { "key": "9", "label": "Workspace bound [B]", "type": "integer", "nullText": "-" },
+    { "key": "10", "label": "Termination status", "nullText": "-" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "gradients" })
+);
+let outcome = if failure.is_none() {
+    Outcome::satisfied("Both discrete and continuous adjoints produced gradients")
+} else {
+    Outcome::failed("Some methods did not produce gradients")
+        .explanation("Adjoints return no gradients on failure. Inspect termination statuses for the cause.")
+};
+let status = failure.unwrap_or_else(|| "ReachedEnd".to_string());
+emit_outcome!(outcome.status(status).diagnostic("Tolerance", epsilon, None));
+```
+
+With defaults (tolerance $10^{-8}$, workspace bound 96 KiB), forward integration takes 150 steps, with AUC $J = 494.8564081$ mg·h agreeing with the closed form to all 10 displayed digits.
+Maximum relative errors across the four derivatives are $7.0 \times 10^{-10}$ for discrete and $1.1 \times 10^{-9}$ for continuous adjoints.
+The value $\partial J/\partial k_e \approx -2357$ mg·h² means 1% faster elimination ($\Delta k_e = 0.002\ \mathrm{h^{-1}}$) reduces AUC by about 4.7 mg·h.
+Since 96 KiB cannot store all steps, `MemoryBudget` selects a binomial schedule; both methods recompute 383 steps.
+Workspace estimates are 76 624 B for discrete and 76 144 B for continuous adjoints (wasm values with 32-bit `usize`).
+At 1024 KiB, every step is stored with zero recomputation; estimates increase to 498 448 B and 268 592 B, respectively.
+Discrete adjoints also store per-stage integral gradients, requiring more memory than continuous adjoints.
+Both storage policies give identical gradients; only memory and recomputed-step counts change.
+
+Tolerance $10^{-4}$ reduces steps to 25, increasing maximum relative errors to $2.8 \times 10^{-5}$ for discrete and $2.3 \times 10^{-5}$ for continuous adjoints.
+At $10^{-11}$, 653 steps give maximum relative errors $5.9 \times 10^{-13}$ and $6.2 \times 10^{-13}$, respectively.
+At $10^{-12}$, accepted steps reach recorded capacity 1024; both methods fail with `BudgetLimit(Iteration)` and return no gradients.
+The table's 1024 accepted steps come from the failed-attempt report.
+
+## Termination statuses and diagnostics
+
+The enum `AdjointTermination` is the authoritative termination status.
+Gradients are written only on success, so successful `AdjointReport` always has status `ReachedEnd` or `TerminalEvent`.
+Other variants classify failed-attempt reports (workspace `last_attempt()`, `PartialFailure` of `solve`).
+
+| Termination status | Meaning | Error returned |
+|---|---|---|
+| `ReachedEnd`, `TerminalEvent` | Reached interval end or terminal event and computed both gradients | None |
+| `BudgetLimit(kind)` | Reached a limit in the table above. Outer-solve evaluation limits also give `Evaluation` | `ConvergenceFailure` |
+| `StepSizeLimit` | No representable step advances time | `ConvergenceFailure` |
+| `ExecutionStopped(reason)` | Stopped by cancellation or deadline | `ExecutionStopped` |
+| `ReplayMismatch` | Recomputation failed to reproduce stored states | `ConvergenceFailure` |
+| `EventDerivativeUnavailable` | Terminal-event gradient unavailable | `InvalidInput` |
+
+The method `AdjointReport::termination()` returns `Option`, or `None` for failures outside these classifications, such as callback errors.
+The method `is_success()` is true only when gradients were computed.
+The value `objective()` is the objective after forward integration; `final_time()` is the last accepted forward time.
+The fields `accepted_steps()` and `rejected_steps()` count only initial forward steps; recomputed and backward steps use `replayed_steps()` and `reverse_steps()` separately.
+The field `reverse_steps()` counts recorded steps fully processed backward, counting one even when continuous adjoints use multiple substeps within a recorded step.
+The field `workspace_bytes()` gives the numerical-memory bound; `counts()` and `accounting()` count evaluations.
+
+The `AdjointErrorReport` returned by `errors()` records the following quantities separately.
+
+- `primal()`: maximum normalized local error estimate over accepted forward steps, for methods providing estimates
+- `adjoint()`: maximum normalized local error estimate over accepted continuous-adjoint steps
+- `quadrature()`: maximum normalized local error estimate for integral-term and parameter-gradient quadrature
+- `replay()`: maximum difference between recomputed and stored states
+- `interpolation_defect()`: maximum sampled defect $|u'(t) - f(t, u(t))|$ of forward dense output $u$ (only under `with_interpolation_defect_sampling(true)`; one extra right-hand-side evaluation per sample)
+- `linear_residual()`: maximum relative residual of backward transposed linear systems (DAE adjoints)
+
+None bounds global gradient error.
+
+For objectives stopping at terminal events, supply `AdjointTerminalEvent` through `OdeAdjointProblem::with_terminal_event(Some(&event))`.
+The first root of event function $g(t, y, p)$ becomes terminal time $T$; gradients include dependence of $T$ on $y_0$ and $p$.
+The caller declares a unique root in the interval (true `unique_branch`) and a lower bound (`transversality_threshold`) for total-derivative magnitude $|dg/dt| = |\partial g/\partial t + (\partial g/\partial y) f|$.
+Finite-point root finding cannot prove uniqueness, so this declaration is the caller's responsibility.
+An initial-time root, false `unique_branch`, or derivative magnitude at most the bound leaves gradients nonexistent, giving `EventDerivativeUnavailable`.
+Event search and localization default to initial value problem settings, configurable through `OdeAdjointOptions::with_event_options`.
+Events have no state updates (reset maps).
+
+## Implicit forward methods and DAE adjoints
+
+`DaeAdjointSolver` computes gradients for residual-form index-1 DAE $F(t, y, y', p) = 0$ ([Index-1 DAEs](../dae-index-one/)).
+Initial-value gradients contain only differential coordinates; initial algebraic values follow from constraints and are not independent variables.
+Systems implement `DaeAdjointSystem`, with `pullback` writing $(\partial F/\partial y)^{\mathsf H}w$, $(\partial F/\partial y')^{\mathsf H}w$, and $(\partial F/\partial p)^{\mathsf T}w$.
+DAE adjoints have no terminal events.
+One solve is represented by `DaeAdjointProblem::new(system, objective, initial, derivative, interval)`, borrowing the initial state/derivative pair and interval.
+Select the forward method through constructors.
+
+| Constructor | Forward method | Conditions |
+|---|---|---|
+| `DaeAdjointSolver::new(partition, parameter_dimension, backend, options)` | Variable-order BDF, orders 1–5 (same as `DaeBdf`) | Specify differential and algebraic variables through `DaePartition` |
+| `DaeAdjointSolver::backward_euler(dimension, parameter_dimension, backend, options)` | Order-1 BDF (backward Euler) | All coordinates differential |
+| `DaeAdjointSolver::trapezoid(dimension, parameter_dimension, backend, options)` | Fixed-step implicit trapezoidal | All coordinates differential. Requires `AdjointMode::Discrete` and `with_fixed_step(true)`, without `with_quadrature_error` |
+
+Backward integration solves transposed systems combining $\partial F/\partial y$ and $\partial F/\partial y'$ with the Plan's linear solver (dense, sparse, or Krylov in `OdeStageBackend`).
+Discrete adjoints fix accepted steps and orders, differentiating all multistep-history dependencies.
+Continuous adjoints integrate the adjoint DAE backward, estimating local error from one step $h$ versus two steps $h/2$ (step doubling), then correcting with the difference (local extrapolation).
+
+The adapter `OdeAdjointResidual::new(&system)` supplies `OdeAdjointSystem` to `DaeAdjointSolver` as residual $F = y' - f(t, y, p)$.
+Use this with backward Euler or BDF adjoints for stiff ODE gradients.
+Use analytical ODE Jacobians when available; otherwise difference the residual according to DAE derivative settings.
+ODEs with mass matrices cannot use the adapter; implement `DaeAdjointSystem` directly.
+One implicit trapezoidal step solves $F(t_0 + h, y_1, y'_1) = 0$ by Newton, using $(t_0, y_0, y'_0)$ to give $y'_1 = 2(y_1 - y_0)/h - y'_0$.
+For $F = y' - f$, this equals $y_1 - y_0 = \tfrac{h}{2}(f_0 + f_1)$, with integral terms also integrated by trapezoidal rule $\tfrac{h}{2}(L_0 + L_1)$.
+Without error estimates, report `primal()` and `quadrature()` are `None`.
+The types `DaeAdjointRequirements` and `DaeAdjointWorkspace` have the same roles as for ODEs; initial-value gradient length is the differential-variable count.
+
+The next cell converts the same oral-dosing model to a residual through `OdeAdjointResidual`, computing fixed-step discrete adjoints with implicit trapezoidal (second-order) and backward Euler (first-order), halving step $h = 24/2^k$ successively.
+Rebuild Plans per method and step size, reusing one `DaeAdjointWorkspace` workspace through `solve_into`.
+Gradients include forward discretization error, so closed-form differences should decrease at the order of $h$.
+Table “Observed order” is $\log_2$ of the error ratio after halving steps.
+For steps exceeding recorded capacity, no gradients are returned; read status from workspace `last_attempt()` reports.
+
+```rust
+//| id: ode-adjoint-implicit-convergence
+//| ref: ode-adjoint-implicit-convergence
+//| title: "Convergence orders of discrete adjoints for implicit trapezoidal and backward Euler methods"
+//| run: button
+//| uses: [ode-adjoint-oral-dose-model]
+//| crates: [scioxide-core, scioxide-ode]
+//| inputs:
+//|   finest_level: {"type":"range","label":"Exponent k of finest step 24/2^k h","description":"Halve step size with each increment from k = 4.","min":6,"max":10,"step":1,"value":9}
+//|   tape_capacity: {"type":"range","label":"Recorded-step capacity [steps]","description":"with_tape_capacity. Computations exceeding this step count fail.","min":128,"max":1024,"step":128,"value":1024}
+//| cases:
+//|   - {"id":"small-tape","label":"k = 8, capacity 128 steps","description":"The step size requiring 256 steps fails at recorded capacity.","inputs":{"finest_level":8,"tape_capacity":128}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"convergence","path":"/rows/5/4","approx":{"value":2,"atol":0.05}}
+//|       - {"artifact":"convergence","path":"/rows/11/4","approx":{"value":1,"atol":0.05}}
+//|       - {"artifact":"convergence","path":"/rows/5/3","range":{"max":1e-4}}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+//|   - case: small-tape
+//|     expect:
+//|       - {"artifact":"convergence","path":"/rows/4/6","equals":"BudgetLimit(Iteration)"}
+//|       - {"artifact":"convergence","path":"/rows/4/3","equals":null}
+//|       - {"path":"/outputs/2/state","equals":"failed"}
+use scioxide_core::ExecutionContext;
+use scioxide_ode::{
+    AdjointMode, AdjointOptions, DaeAdjointOptions, DaeAdjointProblem, DaeAdjointSolver,
+    DaeAdjointWorkspace, DaeNumericalOptions, OdeAdjointResidual, OdeStageBackend,
+};
+
+let (dose, ka, ke, horizon) = (100.0, 1.0, 0.2, 24.0);
+let exact = auc_closed_form(dose, ka, ke, horizon);
+let model = OralDose([ka, ke]);
+// Supply the ODE to DAE adjoints as residual F = y' − f(t, y, p). Initial derivative is f(0, y₀).
+let residual = OdeAdjointResidual::new(&model).map_err(|e| e.to_string())?;
+let (initial, derivative) = ([dose, 0.0], [-ka * dose, ka * dose]);
+let problem = DaeAdjointProblem::new(&residual, &Auc, &initial, &derivative, (0.0, horizon));
+// Reuse one workspace across all Plans with different methods and steps.
+let mut workspace = DaeAdjointWorkspace::new();
+let (mut rows, mut series) = (Vec::new(), Vec::new());
+let (mut failures, mut failure) = (0, None);
+for name in ["trapezoid", "backward_euler"] {
+    let mut points = Vec::new();
+    let mut previous: Option<f64> = None;
+    for level in 4..=(finest_level as i32) {
+        // h = 24/2^k is exactly representable in binary, so 2^k steps reach the endpoint exactly.
+        let step = horizon / 2.0_f64.powi(level);
+        let common = AdjointOptions::new(AdjointMode::Discrete, step)
+            .map_err(|e| e.to_string())?
+            .with_fixed_step(true)
+            .with_tape_capacity(tape_capacity as usize);
+        let options = DaeAdjointOptions::new(common, DaeNumericalOptions::new())
+            .map_err(|e| e.to_string())?;
+        let backend = OdeStageBackend::Dense;
+        let plan = match name {
+            "trapezoid" => DaeAdjointSolver::trapezoid(2, 2, backend, options),
+            _ => DaeAdjointSolver::backward_euler(2, 2, backend, options),
+        }
+        .map_err(|e| e.to_string())?;
+        let requirements = plan
+            .workspace_requirements(&problem)
+            .map_err(|e| e.to_string())?;
+        let (mut initial_gradient, mut parameter_gradient) = ([0.0; 2], [0.0; 2]);
+        let solved = plan.solve_into(
+            &problem,
+            &mut initial_gradient,
+            &mut parameter_gradient,
+            &mut workspace,
+            ExecutionContext::sequential(),
+        );
+        let gradient = [
+            initial_gradient[0],
+            initial_gradient[1],
+            parameter_gradient[0],
+            parameter_gradient[1],
+        ];
+        let (error, status, steps) = match solved {
+            Ok(report) => (
+                Some(worst_relative(gradient, exact)),
+                report.termination(),
+                report.accepted_steps(),
+            ),
+            // Failed-attempt reports remain in workspace last_attempt.
+            Err(_) => {
+                failures += 1;
+                let record = workspace.last_attempt().and_then(|a| a.progress());
+                let report = record.ok_or("No failed-attempt report")?;
+                (None, report.termination(), report.accepted_steps())
+            }
+        };
+        // Observed order: log₂ of the error ratio after halving steps.
+        let order = match (previous, error) {
+            (Some(coarse), Some(fine)) => Some((coarse / fine).log2()),
+            _ => None,
+        };
+        previous = error;
+        if let Some(e) = error {
+            points.push([step, e]);
+        }
+        let status = status.map(|t| format!("{t:?}"));
+        if error.is_none() {
+            failure = status.clone();
+        }
+        rows.push((
+            name,
+            step,
+            steps,
+            error,
+            order,
+            requirements.required_bytes(),
+            status,
+        ));
+    }
+    series.push(serde_json::json!({ "name": name, "points": points, "kind": "scatter" }));
+}
+emit_line_chart!(
+    &series,
+    options = &serde_json::json!({
+        "xLabel": "Step size h [h]",
+        "yLabel": "Maximum relative gradient error [-]",
+        "xType": "log",
+        "yType": "log"
+    })
+);
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Forward method" },
+    { "key": "1", "label": "Step size h [h]", "type": "number", "format": { "significantDigits": 4 } },
+    { "key": "2", "label": "Accepted steps [count]", "type": "integer" },
+    { "key": "3", "label": "Maximum relative gradient error [-]", "type": "number", "format": sci2, "nullText": "None" },
+    { "key": "4", "label": "Observed order [-]", "type": "number", "format": fixed2, "nullText": "-" },
+    { "key": "5", "label": "Workspace bound [B]", "type": "integer" },
+    { "key": "6", "label": "Termination status", "nullText": "-" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "convergence" })
+);
+let outcome = if failures == 0 {
+    Outcome::satisfied("Gradients obtained at every step size")
+} else {
+    Outcome::failed("No gradients for step sizes exceeding recorded capacity").explanation(
+        "Reaching recorded capacity fails with BudgetLimit(Iteration), returning no gradients.",
+    )
+};
+let status = failure.unwrap_or_else(|| "ReachedEnd".to_string());
+emit_outcome!(
+    outcome
+        .status(status)
+        .diagnostic("Failed computations", failures as f64, None)
+);
+```
+
+With defaults ($k = 4$–$9$, capacity 1024), implicit-trapezoidal maximum relative gradient error falls from $3.6 \times 10^{-2}$ at $h = 1.5$ h to $3.5 \times 10^{-5}$ at $h = 0.046875$ h; observed orders 1.99–2.00 match second-order convergence.
+Backward Euler decreases only from 0.83 to $2.3 \times 10^{-2}$ over the same range, with observed order approaching 1 from 1.09 to 1.01.
+Workspace estimates depend on recorded capacity, not step size: 289 008 B for trapezoidal and 404 128 B for backward Euler.
+Capacity 128 makes the $h = 0.09375$ h computation needing 256 steps fail with `BudgetLimit(Iteration)`, leaving error columns blank.
+The accepted-step column then shows 128 from the failed-attempt report.
+Table errors reflect forward discretization, distinct from the discrete adjoint returning derivatives of the computed objective to within rounding error.
+
+## Summary
+
+Adjoints compute objective gradients with one forward and one backward integration at cost independent of parameter count.
+The method `AdjointMode::Discrete` returns derivatives consistent with the computed objective; `Continuous` returns estimates from independently error-controlled adjoint equations.
+Verify both against closed forms or forward sensitivities.
+Memory depends on `CheckpointPolicy` and `AdjointOptions` limits; workspace preparation compares estimates with them.
+Insufficient memory appears as recomputed steps in reports; exceeding recorded capacity `with_tape_capacity` fails.
+Gradients are available only on success; inspect failure causes through termination statuses in workspace `last_attempt()` or `PartialFailure` reports.
+Convert stiff ODEs to residuals through `OdeAdjointResidual` and solve with implicit-method adjoints in `DaeAdjointSolver`.
+
+[Forward sensitivities and ensembles](../forward-sensitivities-and-ensembles/) covers forward sensitivity and ensemble execution, [Index-1 DAEs](../dae-index-one/) DAE integration and consistent initialization, [scioxide-ad](../../../scioxide-ad/) general pullbacks and checkpoint theory, and the [API guide](../../api/) type tables.

@@ -1,0 +1,732 @@
+---
+title: テープのライフサイクルと再利用
+description: Tape::default() と TapeOptions の既定値、保持するバイト数を抑えるバイト上限、容量の不足を数えてテープを広げ関数をもう一度記録する手順と決定性、ワンショット関数の実行回数、requirements・TapeRequirements・try_reserve・check・reserved_bytes による事前確保、大きさの違う記録で広げ直したときの領域、確保しない再利用、TapeReport、エラーの分類と失敗時の出力、スレッドと Linearization の借用を確かめる。
+sidebar:
+  order: 320
+references:
+  ad-tape-options: "テープの設定"
+  ad-tape-capacity: "容量の不足と二度目の記録"
+  ad-tape-requirements: "要件の確認と事前確保"
+  ad-tape-report: "変換のレポート"
+  ad-tape-errors: "失敗の分類と出力"
+  ad-tape-threads: "スレッドと借用"
+---
+
+`Tape` は呼び出し側が所有する記録の置き場で、一度に 1 つの記録を持つ。
+同じ関数を多くの点で微分するとき、1 つのテープを使い回すと、2 回目以降の変換は確保をせず、関数を 1 回だけ実行する。
+このページは、テープの設定、容量が足りないときの手順、要件を確かめて先に事前確保する方法、変換のレポート、エラーの分類と失敗時の出力、スレッドと借用の規則を説明する。
+文を記録する規則と逆走査は[逆モードとテープ](../reverse-mode-and-replay/)で扱った。
+作業領域の容量を確かめて広げる手順の一般論は[作業領域と再現性](../../../concepts/workspaces-and-reproducibility/)にある。
+
+## テープの設定
+
+`TapeOptions` はテープの変換の振る舞いを決める値で、`Tape::new(options)` でテープに固定する。
+`Tape::default()` は `Tape::new(TapeOptions::new())` と同じで、下の表の既定値を持つテープを作る。
+`TapeOptions::new()` と `TapeOptions::default()` は次の既定値を返し、`with_*` のメソッドで 1 つずつ変える。
+
+| 設定 | 既定値 | 変えるメソッド | 決めること |
+|---|---|---|---|
+| 非有限値の方針 | `NonFinitePolicy::Propagate` | `with_non_finite_policy` | 非有限な点と結果をそのまま扱うか、`NonFinite` で拒むか |
+| 折れ点の方針 | `KinkPolicy::Midpoint` | `with_kink_policy` | 折れ点で片側導関数の中点を使うか、`DomainError` にするか |
+| ヤコビ行列の向き | `JacobianMode::Auto` | `with_jacobian_mode` | `jacobian_into` の走査の向き |
+| バイト上限 | `None`（上限なし） | `with_byte_limit` | テープが保持するバイト数 `reserved_bytes()` の上限 |
+
+`with_byte_limit` は `Option<usize>` を取り、`None` で上限を外す。
+同じ名前の取得メソッド（`non_finite_policy()`、`kink_policy()`、`jacobian_mode()`、`byte_limit()`）が値を返し、`Tape::options()` はテープの設定を返す。
+テープの設定は作った後に変えられないので、別の設定が要るときは別のテープを作る。
+方針の数学的な意味は[折れ点と非有限値の扱い](../nonsmooth-and-nonfinite-policies/)、ヤコビ行列の向きは[逆モードとテープ](../reverse-mode-and-replay/)で扱う。
+
+## 容量の不足と二度目の記録
+
+テープは、ワード、偏導関数の列、ワードごとの随伴、呼び出しの表と作業域、変数の領域を、普通のベクトルとして持つ。
+記録はこれらの領域にすでにある容量へ書き込み、記録の途中でテープの領域を広げることはしない。
+容量に収まらない文は保存しないが、ワードや偏導関数の数は数え続ける。
+変換は記録の前に、入力と出力の変数の領域を、入力の数と直前の記録の出力の数（最初の記録では 1）の和まで広げておく。
+記録が容量を超えたとき、変換は次の手順をとる。
+
+1. 関数を 1 回実行し、必要なワード、偏導関数、呼び出し、作業域の数を数える。
+2. 各領域を数えた大きさまで広げた後のバイト数がバイト上限に、ワードの数がワード数の上限に収まるかを確かめ、各領域をちょうどその大きさまで広げる。
+3. 関数をもう一度実行し、広げた領域に記録する。
+
+そのため 1 回の変換で関数は最大 2 回実行され、`TapeReport::recorded_twice` が 2 回記録したかを示す。
+事前確保をしていない新しいテープは容量を持たないので、最初の変換は必ず 2 回記録する。
+ワンショット呼び出しの `grad`、`value_and_grad`、`vjp`、`jacobian`、`hvp` は呼ぶたびに新しいテープを作るので、毎回関数を 2 回実行し、方向ごとに同じテープで記録する `hessian` は入力の数 $n$ に対して $n + 1$ 回実行する。
+2 回目の実行は 1 回目と同じ文を記録する前提なので、関数は決定論的でなければならない。
+2 回目の実行が広げた容量にも収まらないと、変換は `InvalidInput`（引数 `function`、理由 `Inconsistent`）を返す。
+容量に収まらなかった 1 回目の実行で関数が `Err` を返したときは、関数をもう一度実行せず、そのエラーをそのまま返す。
+2 回目の記録が 1 回目より小さい場合は検出されないので、呼ぶたびに変わる状態（実行の回数、時刻、呼び出しごとに進む乱数列など）によって記録が変わる関数を渡してはならない。
+
+テープは縮まない。
+どの領域も、それまでの記録が必要とした最大の大きさまでちょうど広がり、それより小さい記録はそのまま収まる。
+そのため、大きさの違う記録で何度か広げたテープは、それまでで最も大きな記録だけをした新しいテープと同じバイト数を保持する（次のセルで確かめる）。
+同じ関数を記録したことのあるテープでの変換は確保をしない。
+例外は、作業域を確保する構造化演算（`solve_into`、`cholesky_into`、`qr_into`、`least_squares_into`、`implicit_solution_into`、`checkpointed_loop`）、評価用の作業域を確保する `Var::external`（微分対象の入力では最初の記録で、受動的な入力では呼び出しごとに確保する）、最初の呼び出しで行列 1 枚分の作業域を確保する `Linearization::jacobian_into` である。
+
+テープの大きさには 2 つの上限がある。
+`with_byte_limit` の上限は、`reserved_bytes()` が返す保持中のバイト数に対する上限である。
+テープは領域を広げるたび（記録の領域、変数の領域、二階微分のシードや `jacobian_into` の途中結果の領域）に、広げた後のバイト数を上限と比べ、上限を超えるなら広げずに量 `tape_bytes` の `ResourceLimit` を返す。
+広げることを拒まれたテープはそれまでの領域をそのまま保つので、変換の後の `reserved_bytes()` は上限を超えない。
+例外は、関数が出力のベクトルにテープの事前確保より多くの出力を push し、ベクトルが自分で広がる場合である。
+上限を与えなくても、ワードの数は $2^{28} = 268{,}435{,}456$ ワードまでで、超えると量 `tape_words` の `ResourceLimit` になる。
+バイト数の計算が `usize` で桁あふれすると `SizeOverflow`、領域を広げる確保が失敗すると `AllocationFailure` を返す。
+どの場合もテープは壊れず、次の変換に使える。
+
+## 要件の確認と事前確保
+
+`Tape::requirements()` は、最後に完了した記録の要件 `TapeRequirements` を返す。
+要件は 6 つの数からなり、同じ名前のアクセサで読める。
+
+| アクセサ | 数えるもの |
+|---|---|
+| `words()` | ワードの数。定数と入力のワードを含む |
+| `partials()` | 値の型 `V` で保存した偏導関数の数 |
+| `scalars()` | スカラー `S` で保存した定数の偏導関数の数 |
+| `calls()` | 呼び出しの表の項目の数 |
+| `scratch()` | 呼び出しの作業域の値の数。`Var::external`、`solve_into`、`checkpointed_loop` の呼び出しのうち、入力と出力の数の和が最大のものの値の数で、テープは走査用にさらにその 2 倍の領域を持つ |
+| `variables()` | 変数の数。入力の数と出力の数の和 |
+
+`TapeRequirements::new(words, partials, scalars, calls, scratch, variables)` は、この 6 つの数から要件を作る。
+`Tape::try_reserve(&requirements)` は、テープの各領域を要件を満たす大きさまでちょうど広げる。
+広げた後のバイト数がバイト上限を超えるか、ワードの数が $2^{28}$ を超えれば `ResourceLimit`、確保が失敗すれば `AllocationFailure` を返し、失敗した後もテープは使える。
+`Tape::check(&requirements)` は確保をせず、保持している容量で足りれば `Capacity::Sufficient`、広げる必要があれば `Capacity::NeedsGrowth` を返す。
+記録を終えたテープでは、`check(&tape.requirements())` は `Sufficient` を返す。
+要件まで広げた後のバイト数が上限を超えるときは、`check` も `ResourceLimit` を返す。
+`Tape::reserved_bytes()` は、テープがいま保持しているバイト数を返す。
+
+要件は一度記録したテープから写すか、記録の規則から数えて作る。
+確保を避けたい繰り返しに入る前に `try_reserve` でテープを広げておけば、最初の変換から関数は 1 回だけ実行される。
+要件は呼び出しの作業域 `scratch()` も含むので、`Var::external` や `solve_into` を含む関数でも、記録したテープの `requirements()` で事前確保した別のテープは、最初の変換から関数を 1 回だけ実行する。
+
+このページのセルは[逆モードとテープ](../reverse-mode-and-replay/)と同じ拡張 Rosenbrock 関数
+
+$$
+f(\mathbf{x}) = \sum_{i=1}^{n-1} \Bigl[100\,(x_{i+1} - x_i^2)^2 + (1 - x_i)^2\Bigr]
+$$
+
+をテープで微分する。
+次のブロックの `rosenbrock` がこの $f$ を `R: Real` に対して書いたもので、3 つのセルが共有する。
+
+```rust
+//| id: ad-tape-rosenbrock-model
+//| kind: definitions
+//| title: 拡張 Rosenbrock 関数
+//| crates: [scioxide-ad]
+use scioxide_ad::Real;
+
+/// 拡張 Rosenbrock 関数 f(x) = Σᵢ [100 (xᵢ₊₁ − xᵢ²)² + (1 − xᵢ)²]。
+pub(crate) fn rosenbrock<R: Real>(x: &[R]) -> R {
+    x.windows(2)
+        .map(|w| {
+            let a = w[1] - w[0] * w[0];
+            let b = -w[0] + 1.0;
+            a * a * 100.0 + b * b
+        })
+        .sum()
+}
+```
+
+次のセルはこの関数の勾配を 1 つのテープで 6 回求める。
+入力は入力次元 $n$（2〜128）で、5 回目だけ $2n$ 次元の点を使い、呼び出しごとに点を変える。
+記録の規則から数えた要件は、ワード $9n - 8$、値の偏導関数 $6(n - 1)$（項ごとに 3 つの積の 2 つずつ）、定数の偏導関数 $n - 1$（項ごとの 100 倍）、呼び出し 0、呼び出しの作業域 0、変数 $n + 1$ である。
+1 つ目の表は呼び出しごとに、この予測の要件に対する実行前の `check` の結果、関数の実行回数、`recorded_twice()`、`words()`、`reserved_bytes()` を示す。
+最後の 2 行は予測の要件で `try_reserve` した別のテープと、5 回目と同じ $2n$ 次元の点だけを記録した新しいテープの結果である。
+2 つ目の表は 6 回目の記録の `requirements()` を予測と並べる。
+検証するのは、関数の実行回数と `check` の結果が容量の手順どおりであることと、要件が予測に等しいことである。
+
+```rust
+//| id: ad-tape-reuse-requirements
+//| ref: ad-tape-reuse-requirements
+//| title: 同じテープで多くの点の勾配を求め、要件と容量を読む
+//| run: reactive
+//| crates: [scioxide-ad, scioxide-core]
+//| uses: [ad-tape-rosenbrock-model]
+//| inputs:
+//|   dimension: {"type":"range","label":"入力次元 n","description":"拡張 Rosenbrock 関数の変数の数。5 回目の呼び出しだけ 2n 次元にする。","min":2,"max":128,"step":1,"value":16}
+//| cases:
+//|   - {"id":"two","label":"n = 2","description":"項が 1 つで、ワードは 10、5 回目は 28 ワードになる。","inputs":{"dimension":2}}
+//|   - {"id":"large","label":"n = 100","description":"ワードは 892、5 回目は 1,792 ワードになる。","inputs":{"dimension":100}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"calls","path":"/rows/0/2","equals":"NeedsGrowth"}
+//|       - {"artifact":"calls","path":"/rows/0/3","equals":2}
+//|       - {"artifact":"calls","path":"/rows/0/4","equals":"true"}
+//|       - {"artifact":"calls","path":"/rows/1/2","equals":"Sufficient"}
+//|       - {"artifact":"calls","path":"/rows/1/3","equals":1}
+//|       - {"artifact":"calls","path":"/rows/1/4","equals":"false"}
+//|       - {"artifact":"calls","path":"/rows/4/2","equals":"NeedsGrowth"}
+//|       - {"artifact":"calls","path":"/rows/4/3","equals":2}
+//|       - {"artifact":"calls","path":"/rows/4/5","equals":280}
+//|       - {"artifact":"calls","path":"/rows/5/2","equals":"Sufficient"}
+//|       - {"artifact":"calls","path":"/rows/5/3","equals":1}
+//|       - {"artifact":"calls","path":"/rows/5/5","equals":136}
+//|       - {"artifact":"calls","path":"/rows/6/2","equals":"Sufficient"}
+//|       - {"artifact":"calls","path":"/rows/6/3","equals":1}
+//|       - {"artifact":"calls","path":"/rows/7/2","equals":"NeedsGrowth"}
+//|       - {"artifact":"calls","path":"/rows/7/3","equals":2}
+//|       - {"artifact":"calls","path":"/rows/7/5","equals":280}
+//|       - {"artifact":"requirements","path":"/rows/0/1","equals":136}
+//|       - {"artifact":"requirements","path":"/rows/1/1","equals":90}
+//|       - {"artifact":"requirements","path":"/rows/2/1","equals":15}
+//|       - {"artifact":"requirements","path":"/rows/4/1","equals":0}
+//|       - {"artifact":"requirements","path":"/rows/5/1","equals":17}
+//|   - case: two
+//|     expect:
+//|       - {"artifact":"calls","path":"/rows/0/5","equals":10}
+//|       - {"artifact":"calls","path":"/rows/4/5","equals":28}
+//|       - {"artifact":"requirements","path":"/rows/1/1","equals":6}
+//|       - {"artifact":"requirements","path":"/rows/1/2","equals":6}
+//|   - case: large
+//|     expect:
+//|       - {"artifact":"calls","path":"/rows/4/5","equals":1792}
+//|       - {"artifact":"calls","path":"/rows/5/3","equals":1}
+//|       - {"artifact":"requirements","path":"/rows/0/1","equals":892}
+use core::cell::Cell;
+
+use scioxide_ad::{Tape, TapeRequirements};
+use scioxide_core::{Capacity, ExecutionContext, SciOxideError};
+
+/// 記録の規則から数えた要件（ワード、値の偏導関数、定数の偏導関数、呼び出し、呼び出しの作業域、変数）。
+fn predicted(n: usize) -> TapeRequirements {
+    TapeRequirements::new(9 * n - 8, 6 * (n - 1), n - 1, 0, 0, n + 1)
+}
+
+type Row = (
+    &'static str,
+    usize,
+    &'static str,
+    usize,
+    &'static str,
+    usize,
+    usize,
+);
+
+/// n 次元の点で勾配を 1 回求め、実行前の check と変換のレポートを 1 行にする。
+fn differentiate(
+    tape: &mut Tape<f64>,
+    label: &'static str,
+    n: usize,
+    shift: usize,
+) -> Result<Row, SciOxideError> {
+    let point: Vec<f64> = (0..n)
+        .map(|i| 0.5 + 0.1 * ((i + shift) % 7) as f64)
+        .collect();
+    let before = match tape.check(&predicted(n))? {
+        Capacity::Sufficient => "Sufficient",
+        Capacity::NeedsGrowth => "NeedsGrowth",
+    };
+    let runs = Cell::new(0_usize);
+    let mut gradient = vec![0.0; n];
+    tape.gradient_into(
+        |x| {
+            runs.set(runs.get() + 1);
+            Ok(rosenbrock(x))
+        },
+        &point,
+        &mut gradient,
+        ExecutionContext::sequential(),
+    )?;
+    let report = tape.report();
+    let twice = if report.recorded_twice() {
+        "true"
+    } else {
+        "false"
+    };
+    Ok((
+        label,
+        n,
+        before,
+        runs.get(),
+        twice,
+        report.words(),
+        report.reserved_bytes(),
+    ))
+}
+
+let n = dimension as usize;
+let mut tape = Tape::<f64>::default();
+let mut rows = Vec::new();
+// 同じ次元の点を 4 つ、2n 次元の点を 1 つ、元の次元の点を 1 つ。
+let calls = [
+    ("1 回目", n),
+    ("2 回目", n),
+    ("3 回目", n),
+    ("4 回目", n),
+    ("5 回目（2n）", 2 * n),
+    ("6 回目", n),
+];
+for (shift, &(label, dim)) in calls.iter().enumerate() {
+    let row = differentiate(&mut tape, label, dim, shift).map_err(|e| e.to_string())?;
+    rows.push(row);
+}
+let last = tape.requirements();
+// 予測の要件で先に事前確保した別のテープ。
+let mut reserved = Tape::<f64>::default();
+reserved
+    .try_reserve(&predicted(n))
+    .map_err(|e| e.to_string())?;
+let row =
+    differentiate(&mut reserved, "事前確保した別のテープ", n, 0).map_err(|e| e.to_string())?;
+rows.push(row);
+// 比較: 5 回目と同じ 2n 次元の点だけを記録する新しいテープ。
+let mut fresh = Tape::<f64>::default();
+let row =
+    differentiate(&mut fresh, "2n 次元の新しいテープ", 2 * n, 4).map_err(|e| e.to_string())?;
+rows.push(row);
+
+let columns = serde_json::json!([
+    { "key": "0", "label": "呼び出し" },
+    { "key": "1", "label": "次元", "type": "integer" },
+    { "key": "2", "label": "実行前の check" },
+    { "key": "3", "label": "関数の実行回数", "type": "integer" },
+    { "key": "4", "label": "recorded_twice()" },
+    { "key": "5", "label": "words() [ワード]", "type": "integer" },
+    { "key": "6", "label": "reserved_bytes() [B]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "calls", "title": "呼び出しごとの容量とレポート" })
+);
+let expected = predicted(n);
+let breakdown = vec![
+    ("words()", last.words(), expected.words()),
+    ("partials()", last.partials(), expected.partials()),
+    ("scalars()", last.scalars(), expected.scalars()),
+    ("calls()", last.calls(), expected.calls()),
+    ("scratch()", last.scratch(), expected.scratch()),
+    ("variables()", last.variables(), expected.variables()),
+];
+let columns = serde_json::json!([
+    { "key": "0", "label": "アクセサ" },
+    { "key": "1", "label": "6 回目の記録", "type": "integer" },
+    { "key": "2", "label": "記録の規則からの予測", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    breakdown,
+    metadata = serde_json::json!({ "id": "requirements", "title": "最後の記録の要件" })
+);
+```
+
+既定の $n = 16$ では、1 回目の呼び出しの前の `check` が `NeedsGrowth` を返し、変換は関数を 2 回実行して `recorded_twice()` が `true` になる。
+2〜4 回目は `check` が `Sufficient` を返し、関数は 1 回だけ実行され、ワードの数は 136、保持するバイト数は 3,764 B のまま変わらない。
+5 回目の 32 次元の点は 280 ワードを要するので、テープはもう一度 2 回記録し、7,668 B まで広がる。
+6 回目に 16 次元へ戻るとワードの数は 136 に戻るが、保持するバイト数は 7,668 B のままで、テープは縮まない。
+予測の要件で事前確保した別のテープは、最初の変換から関数を 1 回だけ実行し、保持するバイト数は 1 つ目のテープの 1 回目と同じ 3,764 B である。
+2 つ目の表では、`requirements()` の 6 つの数が記録の規則から数えた予測と一致する。
+
+5 回目の 7,668 B は、同じ 32 次元の点だけを記録した新しいテープ（最後の行）と同じである。
+テープは広げるたびに各領域を、それまでの容量と記録が数えた大きさの大きいほうにちょうど合わせるので、広げ直しても余分な領域は残らない。
+拡張 Rosenbrock 関数の次元を 2 から 16 まで 1 ずつ増やしながら同じテープで記録すると、テープは毎回広がって関数を 2 回実行し、最後に保持するのは 16 次元の新しいテープと同じ 3,764 B である。
+大きさが記録ごとに大きくなる使い方でも 1 つのテープを使い回せるが、記録が大きくなるたびに確保と 2 回目の実行が起きる。
+これを避けるには、最も大きな記録の要件で先に `try_reserve` する。
+16 次元の要件で先に事前確保したテープは、2 から 16 次元までの記録で一度も広がらず、3,764 B のまま変わらない。
+
+$n = 2$ では 1 項だけの 10 ワードの記録で、5 回目は 28 ワードになる。
+$n = 100$ では 892 ワード、5 回目は 1,792 ワードで、どちらの次元でも関数の実行回数と `check` の結果は既定と同じ並びになる。
+保持するバイト数は `usize` の幅と `Var` の大きさに依存し、上の値は wasm のものである。
+64 ビットのネイティブでは既定の値が 4,036 B と 8,196 B になる。
+
+## 変換のレポート
+
+`Tape::report()` は最後の変換のレポート `TapeReport` を返す。
+
+- `words()` は最後の記録のワードの数で、メモリ使用量と走査 1 回の計算コストの目安になる。
+- `reserved_bytes()` は、変換が記録を終えた時点でテープが保持していたバイト数である。
+- `kinks()` は最後の記録で能動的な引数が折れ点にあった回数で、演算と lane ごとに 1 回数える（[折れ点と非有限値の扱い](../nonsmooth-and-nonfinite-policies/)）。
+- `recorded_twice()` は、テープを広げるために関数を 2 回記録したかを返す。
+
+使い回しているテープで `recorded_twice()` が真になったら、その点の記録がテープの容量に収まらず、テープが確保をしたことを意味する。
+分岐や反復の回数が点によって変わる関数では、記録の大きさも点によって変わる。
+繰り返しの中で確保を避けたいときは、最も大きな記録の要件で先に `try_reserve` しておく。
+
+## 失敗の分類と出力
+
+`gradient_into` と `linearize` の記録は次のエラーを返す。
+`Linearization` の積が返すエラーは[逆モードとテープ](../reverse-mode-and-replay/)にある。
+
+| 分類 `kind()` | 条件 | `view()` で読める詳細 |
+|---|---|---|
+| `DimensionMismatch` | `gradient` の長さが `point` と違う | 期待した長さと実際の長さ |
+| 関数のエラー | 関数が `Err` を返した | 関数が返したまま |
+| `NonFinite` | `NonFinitePolicy::Error` のもとで、点が非有限（記録の前）か、値か導関数が非有限（書き込みの前） | 発生源 `Input` か `Output` |
+| `DomainError` | `KinkPolicy::Error` のもとで、能動的な引数が折れ点にある | 引数 `point`、理由 `Undefined` |
+| `InvalidInput` | 2 回目の実行が広げた容量に収まらない、または 2 つの記録の値を 1 つの演算で混ぜた | 引数 `function`、理由 `Inconsistent` |
+| `ResourceLimit` | 広げた後のバイト数がバイト上限を超える、またはワードの数が $2^{28}$ を超える | 量 `tape_bytes` か `tape_words`、必要量（広げた後のバイト数かワードの数）、上限 |
+| `SizeOverflow`、`AllocationFailure` | バイト数が桁あふれする、領域を広げられない | 量 |
+| `ExecutionStopped` | コンテキストが取り消しか期限で停止した | 停止の理由 |
+
+2 つの記録の値を混ぜるコードは、`Var` のライフタイムの境界により通常はコンパイルできない。
+変換はこれを実行時にも検査し、混ぜた演算は NaN の微分対象外の値を返して、変換は `InvalidInput` で失敗する。
+
+失敗した変換は `gradient` などの出力を変えない。
+テープは失敗の後もそのまま使え、次の変換は通常どおり記録する。
+停止の要求は、変換（`gradient_into`、`linearize` など）が API で 1 回、逆走査と前進走査が走査の前と後、および 1,024 ワードをたどるごとに `context.check()` で確かめる（多引数の文と呼び出し文は引数のワードも数える。
+[逆モードとテープ](../reverse-mode-and-replay/)）。
+API で停止した変換は関数を実行しない。
+`Linearization` の積（`vjp_into`、`jvp_into`、`jacobian_into`、`sparse_jacobian_into`）も API と走査の前ごとに確かめるので、1,024 ワードに満たない記録の積でも、行や列ごとの走査を重ねる `jacobian_into` でも、停止の要求は次の走査の前に観測される。
+`kind()` と `view()` の読み方の一般論は[エラーの分類と詳細ビュー](../../../scioxide-core/algorithms/errors-and-diagnostic-views/)にある。
+
+エラーの分類を、設定によるものと、記録と停止の手順によるものの 2 つのセルで確かめる。
+次のブロックの `describe` は変換か積の結果を表の 1 行（状況、`kind()`、引数か量、理由か発生源、必要量、上限、変換の後にテープが保持するバイト数、勾配の出力）にする。
+勾配の出力は変換の前に 7 で埋めておき、変換の後もすべて 7 なら「変わらない」とする。
+理由と発生源は、`view()` が返す列挙子の名前で示す。
+
+```rust
+//| id: ad-tape-error-row
+//| kind: definitions
+//| title: 変換の結果を表の 1 行にする
+//| crates: [scioxide-core]
+use scioxide_core::{
+    DomainReason, ExecutionStopReason, SciOxideError, SciOxideErrorKind, SciOxideErrorView,
+    InvalidInputReason, NonFiniteOrigin,
+};
+
+/// (状況, kind(), 引数か量, 理由か発生源, 必要量 [B], 上限 [B], 保持 [B], 勾配の出力)。
+pub(crate) type Row = (
+    &'static str,
+    &'static str,
+    Option<&'static str>,
+    Option<&'static str>,
+    Option<usize>,
+    Option<usize>,
+    Option<usize>,
+    &'static str,
+);
+
+/// 変換か積の結果を 1 行にする。gradient は変換の前に 7 で埋めておく。
+/// held は変換の後にテープが保持するバイト数で、示さないときは None。
+pub(crate) fn describe<T>(
+    situation: &'static str,
+    result: Result<T, SciOxideError>,
+    gradient: &[f64],
+    held: Option<usize>,
+) -> Row {
+    let output = if gradient.iter().all(|&g| g == 7.0) {
+        "変わらない"
+    } else {
+        "書き込んだ"
+    };
+    let Err(error) = result else {
+        return (situation, "Ok", None, None, None, None, held, output);
+    };
+    let kind = match error.kind() {
+        SciOxideErrorKind::ResourceLimit => "ResourceLimit",
+        SciOxideErrorKind::NonFinite => "NonFinite",
+        SciOxideErrorKind::DomainError => "DomainError",
+        SciOxideErrorKind::InvalidInput => "InvalidInput",
+        SciOxideErrorKind::ExecutionStopped => "ExecutionStopped",
+        _ => "その他",
+    };
+    let (name, reason, required, limit) = match error.view() {
+        SciOxideErrorView::ResourceLimit {
+            resource,
+            required,
+            limit,
+        } => (Some(resource.as_str()), None, Some(required), Some(limit)),
+        SciOxideErrorView::NonFinite { origin, .. } => {
+            let origin = match origin {
+                NonFiniteOrigin::Input => "Input",
+                NonFiniteOrigin::Output => "Output",
+                _ => "その他",
+            };
+            (None, Some(origin), None, None)
+        }
+        SciOxideErrorView::DomainError {
+            argument, reason, ..
+        } => {
+            let reason = match reason {
+                DomainReason::Undefined => "Undefined",
+                _ => "その他",
+            };
+            (Some(argument.as_str()), Some(reason), None, None)
+        }
+        SciOxideErrorView::InvalidInput {
+            argument, reason, ..
+        } => {
+            let reason = match reason {
+                InvalidInputReason::Inconsistent => "Inconsistent",
+                _ => "その他",
+            };
+            (Some(argument.as_str()), Some(reason), None, None)
+        }
+        SciOxideErrorView::ExecutionStopped { reason } => {
+            let reason = match reason {
+                ExecutionStopReason::Cancelled => "Cancelled",
+                _ => "その他",
+            };
+            (None, Some(reason), None, None)
+        }
+        _ => (None, None, None, None),
+    };
+    (situation, kind, name, reason, required, limit, held, output)
+}
+```
+
+次のセルは `TapeOptions` の設定によって起こる 4 つのエラーを分類する。
+入力はバイト上限 $L$（0〜8,192 B）で、1 行目は上限 $L$ のテープに 16 次元の拡張 Rosenbrock 関数（136 ワード）を記録し、変換の後にテープが保持するバイト数も示す。
+2〜4 行目は、`NonFinitePolicy::Error` のもとでの NaN の点と $\sqrt{x}$ の $x = 0$、`KinkPolicy::Error` のもとでの $|x|$ の $x = 0$ である。
+必要量と保持するバイト数は `usize` の幅と `Var` の大きさに依存するので、ネイティブと wasm で値が違う。
+検証するのは、各行の分類と詳細が上の表のとおりであること、失敗した変換が勾配を変えないこと、テープが保持するバイト数が成功しても失敗しても上限を超えないことである。
+
+```rust
+//| id: ad-tape-option-errors
+//| ref: ad-tape-option-errors
+//| title: テープの設定によって起こるエラーを分類する
+//| run: reactive
+//| crates: [scioxide-ad, scioxide-core]
+//| uses: [ad-tape-rosenbrock-model, ad-tape-error-row]
+//| inputs:
+//|   byte_limit: {"type":"range","label":"バイト上限 L [B]","description":"16 次元の拡張 Rosenbrock 関数を記録するテープのバイト上限。","min":0,"max":8192,"step":128,"value":2048}
+//| cases:
+//|   - {"id":"roomy","label":"L = 4096 B","description":"記録に必要なバイト数が上限に収まり、勾配を書く。","inputs":{"byte_limit":4096}}
+//|   - {"id":"tight","label":"L = 3712 B","description":"記録が成功したときに保持するバイト数をわずかに下回る上限で、記録のための広げ直しが拒まれる。","inputs":{"byte_limit":3712}}
+//|   - {"id":"zero","label":"L = 0 B","description":"記録の前に変数の領域を広げる段階から拒まれる。","inputs":{"byte_limit":0}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"errors","path":"/rows/0/1","equals":"ResourceLimit"}
+//|       - {"artifact":"errors","path":"/rows/0/2","equals":"tape_bytes"}
+//|       - {"artifact":"errors","path":"/rows/0/4","range":{"min":2049}}
+//|       - {"artifact":"errors","path":"/rows/0/5","equals":2048}
+//|       - {"artifact":"errors","path":"/rows/0/6","range":{"min":1,"max":2048}}
+//|       - {"artifact":"errors","path":"/rows/0/7","equals":"変わらない"}
+//|       - {"artifact":"errors","path":"/rows/1/1","equals":"NonFinite"}
+//|       - {"artifact":"errors","path":"/rows/1/3","equals":"Input"}
+//|       - {"artifact":"errors","path":"/rows/2/1","equals":"NonFinite"}
+//|       - {"artifact":"errors","path":"/rows/2/3","equals":"Output"}
+//|       - {"artifact":"errors","path":"/rows/2/7","equals":"変わらない"}
+//|       - {"artifact":"errors","path":"/rows/3/1","equals":"DomainError"}
+//|       - {"artifact":"errors","path":"/rows/3/2","equals":"point"}
+//|       - {"artifact":"errors","path":"/rows/3/3","equals":"Undefined"}
+//|   - case: roomy
+//|     expect:
+//|       - {"artifact":"errors","path":"/rows/0/1","equals":"Ok"}
+//|       - {"artifact":"errors","path":"/rows/0/6","range":{"min":3713,"max":4096}}
+//|       - {"artifact":"errors","path":"/rows/0/7","equals":"書き込んだ"}
+//|   - case: tight
+//|     expect:
+//|       - {"artifact":"errors","path":"/rows/0/1","equals":"ResourceLimit"}
+//|       - {"artifact":"errors","path":"/rows/0/4","range":{"min":3713}}
+//|       - {"artifact":"errors","path":"/rows/0/6","range":{"min":1,"max":3712}}
+//|       - {"artifact":"errors","path":"/rows/0/7","equals":"変わらない"}
+//|   - case: zero
+//|     expect:
+//|       - {"artifact":"errors","path":"/rows/0/1","equals":"ResourceLimit"}
+//|       - {"artifact":"errors","path":"/rows/0/5","equals":0}
+//|       - {"artifact":"errors","path":"/rows/0/6","equals":0}
+use scioxide_ad::{KinkPolicy, NonFinitePolicy, Real, Tape, TapeOptions};
+use scioxide_core::ExecutionContext;
+
+let cx = ExecutionContext::sequential();
+let point: Vec<f64> = (0..16).map(|i| 0.5 + 0.1 * (i % 7) as f64).collect();
+let mut rows = Vec::new();
+
+// バイト上限 L のテープに 16 次元の関数を記録する。
+let limited = TapeOptions::new().with_byte_limit(Some(byte_limit as usize));
+let mut tape = Tape::<f64>::new(limited);
+let mut g = vec![7.0; 16];
+let result = tape.gradient_into(|x| Ok(rosenbrock(x)), &point, &mut g, cx);
+// 失敗したときも、テープが保持するバイト数を上限と並べる。
+let held = Some(tape.reserved_bytes());
+rows.push(describe("バイト上限 L", result, &g, held));
+
+// NonFinitePolicy::Error: NaN の点と、√x の x = 0 での無限大の導関数。
+let strict = TapeOptions::new().with_non_finite_policy(NonFinitePolicy::Error);
+let mut g = [7.0];
+let result =
+    Tape::<f64>::new(strict).gradient_into(|x| Ok(x[0] * 2.0), &[f64::NAN], &mut g, cx);
+rows.push(describe("NaN の点", result, &g, None));
+let mut g = [7.0];
+let result = Tape::<f64>::new(strict).gradient_into(|x| Ok(x[0].sqrt()), &[0.0], &mut g, cx);
+rows.push(describe("√x の x = 0", result, &g, None));
+
+// KinkPolicy::Error: |x| の折れ点 x = 0。
+let kinks = TapeOptions::new().with_kink_policy(KinkPolicy::Error);
+let mut g = [7.0];
+let result = Tape::<f64>::new(kinks).gradient_into(|x| Ok(x[0].abs()), &[0.0], &mut g, cx);
+rows.push(describe("|x| の x = 0", result, &g, None));
+
+let columns = serde_json::json!([
+    { "key": "0", "label": "状況" },
+    { "key": "1", "label": "kind()" },
+    { "key": "2", "label": "引数・量", "nullText": "なし" },
+    { "key": "3", "label": "理由・発生源", "nullText": "なし" },
+    { "key": "4", "label": "必要量 [B]", "type": "integer", "nullText": "なし" },
+    { "key": "5", "label": "上限 [B]", "type": "integer", "nullText": "なし" },
+    { "key": "6", "label": "保持 [B]", "type": "integer", "nullText": "なし" },
+    { "key": "7", "label": "勾配の出力" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "errors", "title": "設定によるエラー" })
+);
+```
+
+既定の $L = 2{,}048$ B では、1 行目が量 `tape_bytes` の `ResourceLimit` になり、必要量は wasm で 3,764 B（64 ビットのネイティブでは 4,036 B）である。
+これは記録が成功したテープが保持するバイト数（$L = 4{,}096$ B の行の保持量）そのものである。
+変換は記録の前に変数の領域を入力 16 個と出力 1 個の 17 個分まで広げ（wasm で 748 B）、1 回目の記録で数えた大きさまで広げようとしたところで拒まれる。
+拒まれた広げ直しは領域を変えないので、テープは 748 B（ネイティブでは 1,020 B）を保持したままで、勾配は 7 のままである。
+NaN の点は記録の前に発生源 `Input` の `NonFinite` で拒まれる。
+$\sqrt{x}$ の $x = 0$ は値 0 は有限だが導関数が $+\infty$ なので、書き込みの前に発生源 `Output` の `NonFinite` で拒まれる。
+$|x|$ の $x = 0$ は引数 `point`、理由 `Undefined` の `DomainError` になる。
+$L = 4{,}096$ B では必要量が上限に収まり、1 行目も勾配を書いて、テープは 3,764 B を保持する。
+$L = 3{,}712$ B は 3,764 B より 52 B 小さいだけだが、記録のための広げ直しは同じく拒まれる。
+上限と比べるのは広げた後に保持するバイト数そのものなので、この記録が成功するのは $L \ge 3{,}764$ B（ネイティブでは $L \ge 4{,}036$ B）のときである。
+$L = 0$ B では記録の前に変数の領域を広げる段階で拒まれ、必要量は 748 B（ネイティブでは 1,020 B）、保持するバイト数は 0 になる。
+上限を決めるときは、上限のないテープで同じ関数を最も大きな点で記録し、その `reserved_bytes()` を目安にする。
+
+次のセルは記録と停止の手順によるエラーと、失敗の後のテープの再利用を確かめる。
+1 行目は実行のたびに $\sin$ を 1 回多く重ねる決定論的でない関数で、2 行目は同じテープで $\sin x$ の勾配を求める。
+3 行目は停止を要求したコンテキストで $n$ 次元の拡張 Rosenbrock 関数（$9n - 8$ ワード）の勾配を求める。
+4 行目は同じテープで、停止を要求しないコンテキストで同じ関数を線形化し、その `vjp_into` だけに停止を要求したコンテキストを渡す。
+5 行目は同じテープで停止を要求しないコンテキストを使う。
+入力は 3〜5 行目の次元 $n$（2〜256）である。
+表は状況、分類、引数か量、理由か発生源、勾配の出力を示し、この 5 行では空になる必要量、上限、保持の列を省く。
+拡張 Rosenbrock 関数の文はどれも 1 ワードなので、逆走査がたどるワードの数は記録のワードの数に等しい。
+検証するのは、決定論的でない関数が `InvalidInput` になること、勾配の変換と線形化の積が $n$ によらず API で停止すること、失敗の後のテープが通常どおり勾配を求めることである。
+
+```rust
+//| id: ad-tape-protocol-errors
+//| ref: ad-tape-protocol-errors
+//| title: 決定論的でない関数と停止の要求を確かめる
+//| run: reactive
+//| crates: [scioxide-ad, scioxide-core]
+//| uses: [ad-tape-rosenbrock-model, ad-tape-error-row]
+//| inputs:
+//|   dimension: {"type":"range","label":"3〜5 行目の次元 n","description":"停止を要求したコンテキストで微分する拡張 Rosenbrock 関数の変数の数。記録は 9n − 8 ワードになる。","min":2,"max":256,"step":1,"value":200}
+//| cases:
+//|   - {"id":"short","label":"n = 2","description":"記録は 10 ワードで、1,024 ワードに届く走査はない。変換も積も API で停止する。","inputs":{"dimension":2}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"errors","path":"/rows/0/1","equals":"InvalidInput"}
+//|       - {"artifact":"errors","path":"/rows/0/2","equals":"function"}
+//|       - {"artifact":"errors","path":"/rows/0/3","equals":"Inconsistent"}
+//|       - {"artifact":"errors","path":"/rows/0/4","equals":"変わらない"}
+//|       - {"artifact":"errors","path":"/rows/1/1","equals":"Ok"}
+//|       - {"artifact":"errors","path":"/rows/1/4","equals":"書き込んだ"}
+//|       - {"artifact":"errors","path":"/rows/2/1","equals":"ExecutionStopped"}
+//|       - {"artifact":"errors","path":"/rows/2/3","equals":"Cancelled"}
+//|       - {"artifact":"errors","path":"/rows/2/4","equals":"変わらない"}
+//|       - {"artifact":"errors","path":"/rows/3/1","equals":"ExecutionStopped"}
+//|       - {"artifact":"errors","path":"/rows/3/3","equals":"Cancelled"}
+//|       - {"artifact":"errors","path":"/rows/3/4","equals":"変わらない"}
+//|       - {"artifact":"errors","path":"/rows/4/1","equals":"Ok"}
+//|       - {"artifact":"errors","path":"/rows/4/4","equals":"書き込んだ"}
+//|   - case: short
+//|     expect:
+//|       - {"artifact":"errors","path":"/rows/2/1","equals":"ExecutionStopped"}
+//|       - {"artifact":"errors","path":"/rows/2/4","equals":"変わらない"}
+//|       - {"artifact":"errors","path":"/rows/3/1","equals":"ExecutionStopped"}
+//|       - {"artifact":"errors","path":"/rows/3/4","equals":"変わらない"}
+//|       - {"artifact":"errors","path":"/rows/4/1","equals":"Ok"}
+use core::cell::Cell;
+
+use scioxide_ad::{Real, Tape};
+use scioxide_core::{CancellationToken, ExecutionContext};
+
+let cx = ExecutionContext::sequential();
+let mut rows = Vec::new();
+
+// 実行のたびに sin を 1 回多く重ねる、決定論的でない関数。
+let runs = Cell::new(0_usize);
+let mut tape = Tape::<f64>::default();
+let mut g = [7.0];
+let result = tape.gradient_into(
+    |x| {
+        runs.set(runs.get() + 1);
+        let mut y = x[0];
+        for _ in 0..runs.get() {
+            y = y.sin();
+        }
+        Ok(y)
+    },
+    &[0.5],
+    &mut g,
+    cx,
+);
+rows.push(describe("決定論的でない関数", result, &g, None));
+// 失敗したテープは、次の関数を通常どおり記録する。
+let mut g = [7.0];
+let result = tape.gradient_into(|x| Ok(x[0].sin()), &[0.5], &mut g, cx);
+rows.push(describe("同じテープで sin x", result, &g, None));
+
+// 停止を要求したコンテキスト。変換と積は API で、走査は 1,024 ワードごとに停止を確かめる。
+let token = CancellationToken::new();
+token.cancel();
+let stopped = ExecutionContext::sequential().with_cancellation(&token);
+let n = dimension as usize;
+let point: Vec<f64> = (0..n).map(|i| 0.5 + 0.1 * (i % 7) as f64).collect();
+let mut tape = Tape::<f64>::default();
+let mut g = vec![7.0; n];
+let result = tape.gradient_into(|x| Ok(rosenbrock(x)), &point, &mut g, stopped);
+rows.push(describe("勾配の変換に停止の要求", result, &g, None));
+// 停止を要求しないコンテキストで線形化し、積の逆走査にだけ停止を要求したコンテキストを渡す。
+let mut g = vec![7.0; n];
+let result = tape
+    .linearize(
+        |x, outputs| {
+            outputs.push(rosenbrock(x));
+            Ok(())
+        },
+        &point,
+        cx,
+    )
+    .and_then(|mut linear| linear.vjp_into(&[1.0], &mut g, stopped));
+rows.push(describe("線形化の積に停止の要求", result, &g, None));
+let mut g = vec![7.0; n];
+let result = tape.gradient_into(|x| Ok(rosenbrock(x)), &point, &mut g, cx);
+rows.push(describe("同じテープで停止なし", result, &g, None));
+
+let columns = serde_json::json!([
+    { "key": "0", "label": "状況" },
+    { "key": "1", "label": "kind()" },
+    { "key": "2", "label": "引数・量", "nullText": "なし" },
+    { "key": "3", "label": "理由・発生源", "nullText": "なし" },
+    { "key": "7", "label": "勾配の出力" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "errors", "title": "手順によるエラーと再利用" })
+);
+```
+
+決定論的でない関数は 1 回目の実行で数えた 3 ワード（定数、入力、$\sin$ 1 回）にテープを広げ、2 回目の実行で 4 ワードを記録しようとして、引数 `function`、理由 `Inconsistent` の `InvalidInput` になる。
+同じテープは次の $\sin x$ を通常どおり記録し、勾配 $\cos 0.5$ を書く。
+3 行目の `gradient_into` は API で停止を確かめ、関数を実行せずに `ExecutionStopped`（理由 `Cancelled`）を返すので、どの $n$ でも勾配は変わらない。
+4 行目の `vjp_into` も逆走査の前に停止を確かめ、同じく `ExecutionStopped` を返して勾配を変えない。
+5 行目は同じテープで、勾配を通常どおり求める。
+記録が 10 ワードの $n = 2$ でも、3 行目と 4 行目は API で停止する。
+
+## スレッドと借用
+
+`Tape` は `Send` と `Sync` を実装し、別のスレッドへ移せる。
+変換は `&mut self` を取るので、1 つのテープを同時に使えるのは 1 つのスレッドだけである。
+並列に微分するときは、スレッドごとに 1 つのテープを持たせ、必要なら同じ要件で `try_reserve` しておく。
+`Var` は `Send` でも `Sync` でもなく、記録中の関数は変換を呼んだスレッドで動く。
+記録器は変換のスタックの上に作られ、テープの外にスレッドローカルな状態や大域の状態はない。
+
+`linearize` が返す `Linearization<'a, V>` はテープを可変で借用する。
+線形化が生きている間、そのテープで別の変換はできないので、別の関数を記録するには線形化を手放す（スコープを抜ける）。
+1 つの線形化の積（`vjp_into`、`jvp_into`、`jacobian_into`）も `&mut self` を取り、同じ記録を順に使う。
+多数の独立な項目の和や平均を並列に微分するときは、テープを自分で分けるより[多数の項目の一括評価](../batches/)の `BatchPlan` が向く。
+
+## まとめ
+
+`Tape` は `TapeOptions` で方針、ヤコビ行列の向き、バイト上限を固定し、作った後は設定を変えない（バイト上限は保持するバイト数 `reserved_bytes()` を抑える）。
+容量が足りない記録は数えてからテープを広げてもう一度実行するので、関数は決定論的に書き、新しいテープの最初の変換では関数が 2 回実行されると見込む。
+同じ関数を多くの点で微分するときはテープを使い回し、確保を許さない区間や記録が次第に大きくなる繰り返しの前に、最も大きな記録の要件（`requirements()` か記録の規則から作る）で `try_reserve` しておく。
+繰り返しの中で `TapeReport::recorded_twice()` が真になったら、記録が大きくなって確保が起きたと判断できる。
+失敗した変換は出力を変えず、テープもそのまま使えるので、`kind()` と `view()` で原因を確かめてから同じテープでやり直せる。
+スレッドごとに 1 つのテープを持たせ、`Linearization` を使い終えてから次の関数を記録する。
+
+## 次に読むページ
+
+- [逆モードとテープ](../reverse-mode-and-replay/)：文を記録する規則、逆走査の精度、`Linearization` の積とヤコビ行列の向きを確かめる。
+- [折れ点と非有限値の扱い](../nonsmooth-and-nonfinite-policies/)：`KinkPolicy` と `NonFinitePolicy` の数学的な意味と、`kinks()` の数え方を確かめる。
+- [多数の項目の一括評価](../batches/)：多数の独立な項目の和や平均を、前進モードかテープの逆モードで、ワーカーの数によらない同じ結果として微分する方法を確かめる。
+- [作業領域と再現性](../../../concepts/workspaces-and-reproducibility/)：`Capacity`、`try_reserve`、`ResourceLimit` の、クレートに共通する仕様を確かめる。

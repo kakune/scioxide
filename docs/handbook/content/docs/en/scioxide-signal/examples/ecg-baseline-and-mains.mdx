@@ -1,0 +1,458 @@
+---
+title: "Removing ECG baseline wander and mains interference"
+description: "Add respiratory baseline wander, 50 Hz mains interference, and white EMG noise to a synthetic ECG, apply a cascade of notch and Butterworth second-order sections with zero phase, and compare waveform error and R-wave timing shifts with causal processing."
+sidebar:
+  order: 415
+---
+
+An electrocardiogram (ECG) measures the potential from the heart muscle's electrical activity at the body surface, with an amplitude of about 1 mV.
+The record includes slow baseline wander below 1 Hz from breathing and body motion, a 50 Hz sinusoid from mains power (60 Hz in some regions), and broadband noise from muscle activity.
+The ST segment used in diagnosis (between the S and T waves) contains low-frequency components, so phase distortion by the high-pass filter that removes baseline wander changes the waveform's shape.
+This page adds these three noises to a synthetic ECG and applies an IIR cascade of second-order sections with zero phase to check waveform error and R-wave timing.
+
+The APIs used are `design_notch_peak` for notch design, `design_iir` for Butterworth design, causal `filter` and forward–backward `forward_backward` processing of `SecondOrderSections`, `detrend` for detrending, and `find_peaks_with_options` for peak detection.
+Design theory is covered in [IIR filter design](../../algorithms/iir-design/), and execution and endpoint handling in [IIR filtering and zero phase](../../algorithms/iir-filtering-and-zero-phase/).
+
+## Synthetic ECG
+
+Use a sampling rate of $f_s = 500$ Hz and a 10 s record (5000 samples).
+The heart rate is 72 beats/min, with R waves at $t_j = 0.4 + j \cdot (60/72)$ s ($j = 0, \dots, 11$).
+Represent each beat as a sum of five Gaussian functions with offsets $\mu$ from the R-wave time, amplitudes $a$, and widths $\sigma$:
+
+$$
+s(t) = \sum_{j} \sum_{w} a_w \exp\!\left(-\frac{(t - t_j - \mu_w)^2}{2\sigma_w^2}\right)
+$$
+
+
+The parameters below define the model for this page; they do not reproduce a real recording.
+
+| Wave | Amplitude $a$ [mV] | Offset $\mu$ [s] | Width $\sigma$ [s] |
+|---|---|---|---|
+| P | 0.15 | −0.200 | 0.025 |
+| Q | −0.10 | −0.025 | 0.008 |
+| R | 1.20 | 0 | 0.010 |
+| S | −0.25 | 0.025 | 0.008 |
+| T | 0.30 | 0.250 | 0.040 |
+
+Add the following three components to obtain the recorded signal.
+
+- Baseline wander: $b \sin(2\pi \cdot 0.3\,t + 0.7)$ (models a respiratory period of 3.3 s)
+- Mains interference: $m \sin(2\pi \cdot 50\,t)$
+- EMG noise: white Gaussian noise with standard deviation $\sigma_n$ (change the sequence with the random seed)
+
+## Filter configuration
+
+Apply three cascaded filters to address the three noises.
+Pass frequencies to the design functions as ratios to the Nyquist frequency of 250 Hz.
+
+- 50 Hz notch: `design_notch_peak(0.2, Q, ResonanceKind::Notch)`.
+  Its −3 dB bandwidth is $50/Q$ Hz; a larger $Q$ preserves more ECG components near 50 Hz.
+- High-pass filter for baseline wander: second-order Butterworth (`IirBand::Highpass`).
+  The default cutoff is 0.5 Hz, below the 1.2 Hz heartbeat fundamental and above the 0.3 Hz respiration frequency.
+- Low-pass filter for EMG noise: fourth-order Butterworth (`IirBand::Lowpass`).
+  The default cutoff is 40 Hz.
+
+Combining the second-order-section rows from all three designs (1 + 1 + 2 = 4 rows) into one `SecondOrderSections` applies the entire cascade in a single call.
+Causal `filter` has amplitude response $|H|$ and frequency-dependent group delay.
+Forward–backward `forward_backward` has amplitude response $|H|^2$ and leaves phase unchanged.
+With $|H|^2$, stopband attenuation doubles in dB and the gain at cutoff becomes $1/2$ (−6 dB).
+
+Before filtering, subtract a least-squares line from the record with `detrend(record, DetrendKind::Linear)`.
+This brings the endpoint values and slope closer to 0, reducing endpoint transients in forward–backward processing.
+
+### Cascade frequency response
+
+The next cell constructs the cascade from the notch $Q$ and the high-pass and low-pass cutoffs, and tabulates responses at key frequencies.
+The table frequencies represent baseline wander (0.3 Hz), the heartbeat fundamental (1.2 Hz), the main QRS components (10 Hz), and mains power (50 Hz).
+It shows the causal amplitude $|H|$ and group delay [ms], and the forward–backward amplitude $|H|^2$.
+As an independent check, evaluate the closed-form notch expression using `f64` complex arithmetic and report its difference from `SecondOrderSections::response`.
+Group delay is undefined at the notch zero at 50 Hz, so leave it blank.
+This cell passes the cascade rows to the next cell.
+
+```rust
+//| id: signal-ecg-filter-response
+//| ref: signal-ecg-filter-response
+//| title: "Frequency response of the cascade for ECG preprocessing"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-signal]
+//| exports: [rows]
+//| inputs:
+//|   quality: {"type":"range","label":"Notch Q factor [-]","description":"Ratio of 50 Hz to the −3 dB bandwidth.","min":5,"max":60,"step":5,"value":30}
+//|   highpass_hz: {"type":"range","label":"High-pass cutoff [Hz]","description":"Second-order Butterworth filter for baseline wander.","min":0.1,"max":1.5,"step":0.1,"value":0.5}
+//|   lowpass_hz: {"type":"range","label":"Low-pass cutoff [Hz]","description":"Fourth-order Butterworth filter for EMG noise.","min":20,"max":100,"step":5,"value":40}
+//| cases:
+//|   - {"id":"aggressive-highpass","label":"High-pass 1.5 Hz","description":"Bringing the cutoff closer to the heartbeat fundamental reduces the 1.2 Hz component.","inputs":{"highpass_hz":1.5}}
+//|   - {"id":"wide-notch","label":"Q = 5","description":"The notch bandwidth becomes 10 Hz.","inputs":{"quality":5}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"response","path":"/rows/0/2","approx":{"value":0.1147,"rtol":1e-3}}
+//|       - {"artifact":"response","path":"/rows/1/2","approx":{"value":0.9707,"rtol":1e-4}}
+//|       - {"artifact":"response","path":"/rows/2/3","approx":{"value":11.74,"atol":0.01}}
+//|       - {"artifact":"response","path":"/rows/3/1","range":{"min":0,"max":1e-12}}
+//|       - {"artifact":"response","path":"/rows/3/3","equals":null}
+//|       - {"artifact":"response","path":"/rows/0/5","range":{"min":0,"max":1e-13}}
+//|       - {"artifact":"response","path":"/rows/2/5","range":{"min":0,"max":1e-13}}
+//|   - case: aggressive-highpass
+//|     expect:
+//|       - {"artifact":"response","path":"/rows/0/2","approx":{"value":1.597e-3,"rtol":1e-3}}
+//|       - {"artifact":"response","path":"/rows/1/2","approx":{"value":0.2906,"rtol":1e-3}}
+//|   - case: wide-notch
+//|     expect:
+//|       - {"artifact":"response","path":"/rows/2/4","approx":{"value":0.99907,"rtol":1e-4}}
+use scioxide_core::Complex;
+use scioxide_signal::{
+    IirBand, IirDomain, IirFamily, ResonanceKind, SecondOrderSections, design_iir,
+    design_notch_peak,
+};
+
+let nyquist = 250.0;
+let center = 50.0 / nyquist;
+let notch =
+    design_notch_peak(center, quality, ResonanceKind::Notch).map_err(|e| e.to_string())?;
+let butterworth = |order, band| {
+    design_iir(order, IirFamily::Butterworth, band, IirDomain::Digital)
+        .and_then(|design| design.to_sos())
+        .map_err(|e| e.to_string())
+};
+let highpass = butterworth(2, IirBand::Highpass(highpass_hz / nyquist))?;
+let lowpass = butterworth(4, IirBand::Lowpass(lowpass_hz / nyquist))?;
+// Combine the rows of the three designs into one cascade
+let rows: Vec<[f64; 6]> = notch
+    .sections()
+    .iter()
+    .chain(highpass.sections())
+    .chain(lowpass.sections())
+    .copied()
+    .collect();
+let cascade = SecondOrderSections::new(IirDomain::Digital, &rows).map_err(|e| e.to_string())?;
+
+// Independent check: closed-form notch g(1 − 2cos(πf₀)z⁻¹ + z⁻²)/(1 − 2g cos(πf₀)z⁻¹ + (2g − 1)z⁻²)
+let pi = std::f64::consts::PI;
+let gain = 1.0 / (1.0 + (0.5 * pi * center / quality).tan());
+let c0 = (pi * center).cos();
+let closed_notch = |f: f64| {
+    let z1 = Complex::new((pi * f).cos(), -(pi * f).sin());
+    let z2 = z1 * z1;
+    let one = Complex::new(1.0, 0.0);
+    let numerator = (one - z1 * Complex::new(2.0 * c0, 0.0) + z2) * Complex::new(gain, 0.0);
+    let denominator = one - z1 * Complex::new(2.0 * gain * c0, 0.0)
+        + z2 * Complex::new(2.0 * gain - 1.0, 0.0);
+    (numerator / denominator).norm()
+};
+
+let mut rows_out = Vec::new();
+for hz in [0.3, 1.2, 10.0, 50.0] {
+    let f = hz / nyquist;
+    let h = cascade.response(f).map_err(|e| e.to_string())?.norm();
+    // Convert group delay [samples] to ms. Omit it at the notch zero (|H| ≈ 0), where it is undefined
+    let delay = if h > 1e-8 {
+        cascade.group_delay(f).ok().map(|d| 1000.0 * d / 500.0)
+    } else {
+        None
+    };
+    let notch_gain = notch.response(f).map_err(|e| e.to_string())?.norm();
+    rows_out.push((
+        hz,
+        h,
+        h * h,
+        delay,
+        notch_gain,
+        (notch_gain - closed_notch(f)).abs(),
+    ));
+}
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Frequency [Hz]", "type": "number" },
+    { "key": "1", "label": "Causal |H| [-]", "type": "number", "format": sci2 },
+    { "key": "2", "label": "Zero-phase |H|² [-]", "type": "number", "format": sci2 },
+    { "key": "3", "label": "Group delay [ms]", "type": "number", "format": fixed2, "nullText": "Undefined" },
+    { "key": "4", "label": "Notch |H| [-]", "type": "number", "format": sci2 },
+    { "key": "5", "label": "Difference from closed form [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows_out,
+    metadata = serde_json::json!({ "id": "response" })
+);
+
+// Sample 0.05–245 Hz at logarithmically uniform intervals and plot |H|² (omit zero values)
+let mut curve = Vec::new();
+for i in 0..=400 {
+    let hz = 0.05 * (245.0_f64 / 0.05).powf(i as f64 / 400.0);
+    let power = cascade
+        .response(hz / nyquist)
+        .map_err(|e| e.to_string())?
+        .norm_sqr();
+    if power > 0.0 {
+        curve.push([hz, power]);
+    }
+}
+emit_line_chart!(
+    &vec![serde_json::json!({ "name": "Zero-phase |H|²", "points": curve })],
+    options = &serde_json::json!({
+        "xLabel": "Frequency [Hz]",
+        "yLabel": "Squared amplitude |H|² [-]",
+        "xType": "log",
+        "yType": "log",
+        "yMin": 1e-12,
+        "yMax": 2.0,
+        "annotations": [
+            { "kind": "line", "axis": "x", "value": 0.3, "label": "Baseline wander" },
+            { "kind": "line", "axis": "x", "value": 50.0, "label": "Mains power" }
+        ]
+    })
+);
+export!(rows, &rows);
+```
+
+At the defaults $Q = 30$, high-pass 0.5 Hz, and low-pass 40 Hz, the zero-phase $|H|^2$ is 0.115 at 0.3 Hz, 0.971 at 1.2 Hz, and 0.99993 at 10 Hz.
+Baseline wander is reduced to about one ninth, but is not eliminated.
+At 50 Hz, $|H|$ is $1.4 \times 10^{-15}$, with the notch zero exactly at the mains frequency.
+The difference from the closed-form notch expression is at most $4 \times 10^{-15}$ at every frequency.
+
+Causal group delay varies strongly with frequency: 552 ms at 0.3 Hz, 99 ms at 1.2 Hz, and 11.7 ms at 10 Hz.
+Lower frequencies are delayed more, disrupting the relative positions of the P, QRS, and T waves.
+Raising the high-pass cutoff to 1.5 Hz reduces $|H|^2$ at 0.3 Hz to $1.6 \times 10^{-3}$, but also scales the 1.2 Hz heartbeat fundamental by 0.29, changing the waveform.
+Setting $Q = 5$ widens the notch bandwidth to 10 Hz; even at 10 Hz the notch alone reduces the gain to $|H| = 0.99907$.
+
+## Time-domain processing and checks
+
+The next cell processes the synthetic record with the cascade from the previous cell.
+Inputs are the random seed, baseline-wander amplitude $b$, mains-interference amplitude $m$, EMG-noise standard deviation $\sigma_n$, and whether to use zero phase.
+There are three checks.
+
+- Compare RMS errors against the noise-free ECG (with its mean subtracted) before and after processing.
+  Measure over 1–9 s to exclude endpoint transients.
+- Also show the RMS error against the noise-free ECG subjected to the same processing.
+  This measures only residual noise, excluding waveform changes caused by the filter itself.
+  Predict this value from the frequency response as an independent check.
+  A sinusoid of amplitude $A$ leaves RMS $A|H|^p/\sqrt2$, and white noise leaves variance $\sigma_n^2 \int_0^1 |H(f)|^{2p}\, df$ ($p = 2$ for zero phase, $p = 1$ for causal processing; use the trapezoidal rule with 1000 intervals for integration).
+- Detect R waves in the processed waveform with `find_peaks_with_options` (height at least 0.6 mV, spacing at least 200 samples), and report their shifts from the true R-wave times in ms.
+
+The charts show the recorded, processed, and noise-free ECG waveforms over 2–4 s, and the processed error over the full record, with linked time axes.
+
+```rust
+//| id: signal-ecg-cleaning
+//| ref: signal-ecg-cleaning
+//| title: "Remove noise from a synthetic ECG and check R-wave timing"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-random, scioxide-signal]
+//| dependsOn:
+//|   filters: signal-ecg-filter-response
+//| inputs:
+//|   seed: {"type":"integer","label":"Random seed","description":"Change the EMG-noise sequence.","min":1,"max":9999,"value":11}
+//|   baseline: {"type":"range","label":"Baseline-wander amplitude b [mV]","description":"Amplitude of the 0.3 Hz sinusoid.","min":0,"max":1.5,"step":0.1,"value":0.5}
+//|   mains: {"type":"range","label":"Mains-interference amplitude m [mV]","description":"Amplitude of the 50 Hz sinusoid.","min":0,"max":0.5,"step":0.05,"value":0.2}
+//|   noise: {"type":"range","label":"EMG noise σ_n [mV]","description":"Standard deviation of white Gaussian noise.","min":0.005,"max":0.1,"step":0.005,"value":0.02}
+//|   zero_phase: {"type":"checkbox","label":"Zero phase (forward–backward)","description":"Clear to process with the causal filter.","value":true}
+//| cases:
+//|   - {"id":"causal","label":"Causal processing","description":"Group delay delays the R waves and increases error against the original ECG.","inputs":{"zero_phase":false}}
+//|   - {"id":"strong-noise","label":"b = 1.5 mV, m = 0.5 mV, σ_n = 0.1 mV","description":"R-wave timing remains unchanged even with strong noise.","inputs":{"baseline":1.5,"mains":0.5,"noise":0.1,"seed":2024}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"cleaning","path":"/rows/0/0","approx":{"value":0.3796,"rtol":1e-3}}
+//|       - {"artifact":"cleaning","path":"/rows/0/1","approx":{"value":0.04255,"rtol":1e-3}}
+//|       - {"artifact":"cleaning","path":"/rows/0/2","approx":{"value":0.04188,"rtol":1e-3}}
+//|       - {"artifact":"cleaning","path":"/rows/0/3","approx":{"value":0.04125,"rtol":1e-3}}
+//|       - {"artifact":"cleaning","path":"/rows/0/4","equals":12}
+//|       - {"artifact":"cleaning","path":"/rows/0/5","range":{"min":-1e-9,"max":1e-9}}
+//|       - {"artifact":"cleaning","path":"/rows/0/6","range":{"min":0,"max":1.01}}
+//|   - case: causal
+//|     expect:
+//|       - {"artifact":"cleaning","path":"/rows/0/1","approx":{"value":0.1824,"rtol":1e-3}}
+//|       - {"artifact":"cleaning","path":"/rows/0/3","approx":{"value":0.1200,"rtol":1e-3}}
+//|       - {"artifact":"cleaning","path":"/rows/0/5","approx":{"value":10.67,"atol":0.01}}
+//|   - case: strong-noise
+//|     expect:
+//|       - {"artifact":"cleaning","path":"/rows/0/0","approx":{"value":1.113,"rtol":1e-3}}
+//|       - {"artifact":"cleaning","path":"/rows/0/4","equals":12}
+//|       - {"artifact":"cleaning","path":"/rows/0/5","range":{"min":-1e-9,"max":1e-9}}
+use scioxide_core::Interval;
+use scioxide_random::{Distribution, Normal, SeedableRng, SplitMix64};
+use scioxide_signal::{
+    DetrendKind, IirDomain, PeakOptions, SecondOrderSections, detrend, find_peaks_with_options,
+};
+
+let rows: Vec<[f64; 6]> =
+    serde_json::from_value(filters["rows"].clone()).map_err(|e| e.to_string())?;
+let cascade = SecondOrderSections::new(IirDomain::Digital, &rows).map_err(|e| e.to_string())?;
+let (fs, n) = (500.0, 5000_usize);
+let pi = std::f64::consts::PI;
+// Synthetic ECG model (synthesized with f64 inherent methods). (Amplitude [mV], offset [s], width [s])
+let waves = [
+    (0.15, -0.200, 0.025),
+    (-0.10, -0.025, 0.008),
+    (1.20, 0.0, 0.010),
+    (-0.25, 0.025, 0.008),
+    (0.30, 0.250, 0.040),
+];
+let beats: Vec<f64> = (0..12).map(|j| 0.4 + j as f64 * 60.0 / 72.0).collect();
+let ecg = |t: f64| -> f64 {
+    let wave = |tr: f64| -> f64 {
+        waves
+            .iter()
+            .map(|&(a, mu, s)| a * (-0.5 * ((t - tr - mu) / s).powi(2)).exp())
+            .sum()
+    };
+    beats.iter().map(|&tr| wave(tr)).sum()
+};
+let normal = Normal::new(0.0, noise).map_err(|e| e.to_string())?;
+let mut rng = SplitMix64::from_seed(seed as u64);
+let clean: Vec<f64> = (0..n).map(|k| ecg(k as f64 / fs)).collect();
+// Recorded signal = ECG + baseline wander + mains interference + EMG noise
+let mut recorded = Vec::with_capacity(n);
+for (k, &s) in clean.iter().enumerate() {
+    let t = k as f64 / fs;
+    let interference =
+        baseline * (2.0 * pi * 0.3 * t + 0.7).sin() + mains * (2.0 * pi * 50.0 * t).sin();
+    let emg = normal.sample(&mut rng).map_err(|e| e.to_string())?;
+    recorded.push(s + interference + emg);
+}
+
+// After detrending, apply the cascade forward–backward or causally
+let process = |x: &[f64]| -> Result<Vec<f64>, String> {
+    let detrended = detrend(x, DetrendKind::Linear).map_err(|e| e.to_string())?;
+    let y = if zero_phase {
+        cascade.forward_backward(&detrended)
+    } else {
+        cascade.filter(&detrended)
+    };
+    y.map_err(|e| e.to_string())
+};
+let output = process(&recorded)?;
+let reference = process(&clean)?;
+let mean = clean.iter().sum::<f64>() / n as f64;
+let rms = |a: &[f64], b: &dyn Fn(usize) -> f64| -> f64 {
+    let sum: f64 = (500..4500).map(|k| (a[k] - b(k)).powi(2)).sum();
+    (sum / 4000.0).sqrt()
+};
+let before = rms(&recorded, &|k| clean[k] - mean);
+let after = rms(&output, &|k| clean[k] - mean);
+let residual = rms(&output, &|k| reference[k]);
+
+// Independent check: predict residual-noise RMS from the frequency response.
+// Sinusoid: amplitude × |H|^p / √2; white noise: σ_n² ∫₀¹ |H(f)|^(2p) df (p = 2 for zero phase)
+let p = if zero_phase { 2 } else { 1 };
+let gain = |hz: f64| -> Result<f64, String> {
+    Ok(cascade
+        .response(hz / 250.0)
+        .map_err(|e| e.to_string())?
+        .norm()
+        .powi(p))
+};
+let mut white = 0.0;
+for i in 0..=1000 {
+    let weight = if i == 0 || i == 1000 { 0.5 } else { 1.0 };
+    let h = cascade
+        .response(i as f64 / 1000.0)
+        .map_err(|e| e.to_string())?
+        .norm();
+    white += weight * h.powi(2 * p) / 1000.0;
+}
+let predicted = ((baseline * gain(0.3)?).powi(2) / 2.0
+    + (mains * gain(50.0)?).powi(2) / 2.0
+    + noise * noise * white)
+    .sqrt();
+
+// Detect R waves and measure shifts from true times (nearest beat) [ms]
+let options = PeakOptions::new()
+    .with_height(Interval::new(0.6, 10.0).map_err(|e| e.to_string())?)
+    .with_distance(200);
+let peaks = find_peaks_with_options(&output, options).map_err(|e| e.to_string())?;
+let shifts: Vec<f64> = peaks
+    .iter()
+    .map(|p| {
+        let t = p.index() as f64 / fs;
+        let nearest = beats.iter().fold(f64::INFINITY, |m, &tr| {
+            if (t - tr).abs() < m.abs() { t - tr } else { m }
+        });
+        1000.0 * nearest
+    })
+    .collect();
+let mean_shift = shifts.iter().sum::<f64>() / shifts.len().max(1) as f64;
+let max_shift = shifts.iter().fold(0.0_f64, |m, s| m.max(s.abs()));
+
+let fixed3 = serde_json::json!({ "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "RMS error before processing [mV]", "type": "number", "format": fixed3 },
+    { "key": "1", "label": "RMS error after processing [mV]", "type": "number", "format": fixed3 },
+    { "key": "2", "label": "RMS difference from identically processed ECG [mV]", "type": "number", "format": fixed3 },
+    { "key": "3", "label": "Predicted RMS difference [mV]", "type": "number", "format": fixed3 },
+    { "key": "4", "label": "Detected R waves", "type": "integer" },
+    { "key": "5", "label": "Mean R-wave shift [ms]", "type": "number", "format": fixed3 },
+    { "key": "6", "label": "Maximum R-wave shift [ms]", "type": "number", "format": fixed3 }
+]);
+let row = (
+    before,
+    after,
+    residual,
+    predicted,
+    peaks.len(),
+    mean_shift,
+    max_shift,
+);
+emit_table_with_columns!(
+    columns,
+    vec![row],
+    metadata = serde_json::json!({ "id": "cleaning" })
+);
+
+// Waveforms over 2–4 s and full-record error
+let window =
+    |y: &[f64]| -> Vec<[f64; 2]> { (1000..2000).map(|k| [k as f64 / fs, y[k]]).collect() };
+let clean_points: Vec<[f64; 2]> = (1000..2000)
+    .map(|k| [k as f64 / fs, clean[k] - mean])
+    .collect();
+emit_line_chart!(
+    &vec![
+        serde_json::json!({ "name": "Recorded signal", "points": window(&recorded) }),
+        serde_json::json!({ "name": "Processed", "points": window(&output) }),
+        serde_json::json!({
+            "name": "Noise-free ECG (mean subtracted)",
+            "points": clean_points,
+            "style": { "lineType": "dashed" }
+        }),
+    ],
+    options = &serde_json::json!({
+        "xLabel": "Time t [s]",
+        "yLabel": "Potential [mV]",
+        "link": { "group": "ecg-time" }
+    })
+);
+let error: Vec<[f64; 2]> = (0..n)
+    .step_by(2)
+    .map(|k| [k as f64 / fs, output[k] - (clean[k] - mean)])
+    .collect();
+emit_line_chart!(
+    &vec![serde_json::json!({ "name": "Processed − noise-free ECG", "points": error })],
+    options = &serde_json::json!({
+        "xLabel": "Time t [s]",
+        "yLabel": "Error [mV]",
+        "link": { "group": "ecg-time" }
+    })
+);
+```
+
+At the default inputs, the RMS error over 1–9 s decreases from 0.380 mV before processing to 0.0425 mV afterward.
+The difference from the identically processed noise-free ECG is 0.0419 mV, indicating that the filter itself causes little waveform change.
+This residual closely matches the 0.0413 mV predicted from the frequency response, and consists mainly of residual 0.3 Hz baseline wander (amplitude $0.5 \times 0.115$ mV).
+The prediction is the steady-state response for an infinitely long record; it differs from the measurement because the 8 s interval contains only 2.4 cycles of baseline wander and because of noise-sample variability.
+All 12 R waves are detected, with a mean timing shift of 0 ms and a maximum of 0.67 ms.
+The true R-wave times (beat spacing 416.67 samples) do not lie on the sampling grid, so shifts smaller than the 2 ms sample interval arise from rounding to the grid.
+
+Switching to causal processing increases the RMS error after processing to 0.182 mV.
+The difference from the identically processed ECG is 0.118 mV (prediction 0.120 mV), mainly because a larger fraction $|H| = 0.339$ of the baseline wander remains.
+The remaining difference is waveform delay and distortion due to group delay; R waves are delayed by a mean of 10.7 ms and a maximum of 11.3 ms.
+This is close to the table's 11.7 ms group delay at 10 Hz and can be explained as delay of the main QRS components.
+Even with stronger noise ($b = 1.5$ mV, $m = 0.5$ mV, $\sigma_n = 0.1$ mV), zero-phase processing gives a mean R-wave timing shift of 0 ms.
+
+## Summary
+
+ECG preprocessing can remove mains interference with a notch, baseline wander with a high-pass filter, and EMG noise with a low-pass filter, applying all three as one cascade of second-order sections.
+When the full record is available, use `forward_backward` for zero phase to preserve R-wave timing and ST-segment shape.
+The amplitude response becomes $|H|^2$, so account for cutoff attenuation and residual baseline wander during design.
+Residual noise can be predicted from the frequency response; agreement between prediction and measurement checks the processing effect.
+When only causal processing is possible, as in real-time monitoring, estimate group-delay latency using the method in the [group-delay example](../iir-group-delay-zero-phase/).

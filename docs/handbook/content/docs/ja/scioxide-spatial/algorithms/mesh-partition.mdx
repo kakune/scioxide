@@ -1,0 +1,340 @@
+---
+title: 適応メッシュの領域分割と再分割
+description: 適応メッシュの活性セルを部分に割り当てる MeshPartition、所有セル・1 層のゴーストセル・界面の断片と共有する実体の所有者、分割を替えるときにセルの値を並べ替える RepartitionMap。
+sidebar:
+  order: 375
+references:
+  spatial-adaptive-partition: "領域分割とゴーストセル"
+  spatial-adaptive-repartition: "再分割とセルの値の並べ替え"
+---
+
+適応メッシュを複数のプロセスで並列に計算するときは、活性セルをいくつかの部分（part）に分け、各部分が自分のセルだけを更新する。
+流束や拘束を組み立てるには、隣の部分にあるセルの値も要るので、境目の外側にある 1 層のセルを写し（ゴーストセル）として持ち、その値を通信で受け取る。
+細分で負荷が偏れば、セルの所有者を替えて値を移す。
+このページは `scioxide-spatial` の分割 `MeshPartition` と再分割 `RepartitionMap` の定義、所有の規則、計算量、API と失敗の分類を説明し、細分した単位正方形で結果を確かめる。
+メッシュの revision、ハンギング実体、界面の断片は[適応メッシュの細分とトポロジーの対応](../adaptive-mesh-and-shared-tessellation/)で定義している。
+
+## 領域分割とゴーストセル
+
+`MeshPartition` はある revision の活性セルを部分に割り当て、各部分に 1 層のゴーストセルを付ける。
+作り方は次の 2 つである。
+
+- `MeshPartition::balanced(&mesh, parts)` は、活性セルを `active_cells()` の順に `parts` 個の連続な区間へ等分する。
+  割り切れないときは番号の小さい部分が 1 個多く持ち、空の部分もありうる。
+- `MeshPartition::new(&mesh, parts, &owners)` は、活性セル $i$ を部分 `owners[i]` に割り当てる。
+  空間充填曲線やグラフ分割による割り当ては、呼び出し側が `owners` として与える。
+
+`parts` が 0 のとき、`owners` の長さが活性セルの数と違うとき、`owners` に `parts` 以上の値があるときは `InvalidInput` になる。
+構築の計算量は活性な実体と界面の数 $N$ に対して $O(N \log N)$ で、メッシュの `AdaptationLimits` に数えられ、上限を超えると `ResourceLimit` になる。
+
+分割は次の量を持つ。
+
+- 部分の数は `partition_count()`、各活性セルの部分は `owners()` で得る。
+- 部分の所有セルは `owned_cells(part)`（昇順）で、部分ごとにまとめた全体の並びは `cell_order()` で得る。
+  `local_cell(i)` は、活性セル $i$ の部分と、その部分の所有セルの中での位置を返す。
+- `ghost_cells(part)` は、他の部分に属し、その部分のセルと面を共有するセルである。
+  界面の断片の両側の所有者が違えば、それぞれの側のセルが相手の部分のゴーストセルになる。
+- `interfaces(part)` は、`mesh.interfaces()` のうち他の部分との境目にある断片の番号を返す。
+- 複数の部分が共有する頂点・面・辺は、番号が最小の部分が所有し、`vertex_owner`、`face_owner`、`edge_owner` で引く。
+  界面の断片や周期的な継ぎ目を挟んで対応する実体も、共有とみなす。
+
+保存した組の数を $G$ とすると、`ghost_cells` と `interfaces` の照会は $O(\log G)$ と返す個数に比例する手間で済む。
+部分の番号が範囲外なら `OutOfBounds` になる。
+分割は作ったときの revision のトークンを `mesh_token()` で返し、その revision のメッシュとだけ組み合わせる。
+
+## 再分割とセルの値の並べ替え
+
+セルの値は部分ごとにまとめ、`cell_order()` の順に並べて持つ。
+`RepartitionMap::new(&source, &destination)` は、同じ revision の 2 つの分割の間でこの並びを並べ替える置換を作る。
+2 つの分割の部分の数は違ってよい。
+実行方針を選ぶときは `RepartitionMap::with_options(&source, &destination, options)` を使い、`RepartitionOptions` は `gather_into` の実行方針だけを持つ（既定は逐次）。
+revision の違う分割を渡すと、兄弟の revision でも `InvalidInput` になる。
+
+- `permutation()[i]` は、新しい並びの位置 $i$ に来るセルの、元の並びでの位置である。
+- `migration_cells(from, to)` は、部分 `from` から `to` へ移るセルを返す。
+  受け取る側の `to` にとっては受け取るセルの一覧でもある。
+- `gather_into(&input, &mut output, &mut staging, cx)` は `output[i] = input[permutation()[i]]` を確保なしで計算する。
+  `input` と `output` の長さは活性セルの数、`staging` の長さはそれ以上でなければならず、満たさなければ `DimensionMismatch` になる。
+  実行コンテキストで取り消しや期限に達すると `ExecutionStopped` になる。
+
+`gather_into` は分割を受け取らず、長さだけを照合する。
+値の並びが作ったときの分割のものであることを確かめるには `validate(&source, &destination)` を呼ぶ。
+各分割は作るたびに固有の識別を持つので、`validate` は同じ所有者で作り直した分割も別の分割として拒む。
+細分で revision が変わったときは、`TopologyMap` で値を新しい revision へ移してから、新しい revision で分割を作り直す。
+
+## 部分ごとのセル数
+
+単位正方形を $2 \times 2$ の根のセルに分け、中心 $(1/2, 1/2)$ を頂点に持つ活性セルのうち最も深いものを繰り返し細分する。
+[適応メッシュの細分とトポロジーの対応](oxref:spatial-adaptive-mesh-epoch)の既定値と同じ細分で、3 回の細分で活性セルは 28 個になる。
+次の定義のブロックはこの revision を作る `refined_square` を、このページの 2 つのセルに渡す。
+
+```rust
+//| id: spatial-mesh-partition-model
+//| kind: definitions
+//| title: 中心へ向けて細分した単位正方形の適応メッシュ
+//| crates: [scioxide-core, scioxide-spatial]
+use scioxide_spatial::{
+    AdaptationLimits, AdaptationRequest, AdaptiveMesh, AxisTopology, CellMesh, CoordinateAxis,
+    Grid2d,
+};
+
+/// 単位正方形を 2 × 2 の根のセルに分け、中心 (1/2, 1/2) を頂点に持つ最も深い活性セル
+/// （同じ深さなら活性セルの順で最初）を steps 回細分した revision を返す（深さの上限 8）。
+pub(crate) fn refined_square(steps: usize) -> Result<AdaptiveMesh<f64, 2>, String> {
+    let axis = CoordinateAxis::uniform(0.0, 1.0, 3).map_err(|e| e.to_string())?;
+    let bounded = [AxisTopology::Bounded; 2];
+    let grid = Grid2d::new([axis.clone(), axis], bounded).map_err(|e| e.to_string())?;
+    let roots = CellMesh::new(grid).map_err(|e| e.to_string())?;
+    let limits = AdaptationLimits::new().with_max_depth(8);
+    let mut mesh = AdaptiveMesh::from_structured(&roots, limits).map_err(|e| e.to_string())?;
+    for _ in 0..steps {
+        let mut chosen: Option<(usize, u8)> = None;
+        for (index, &id) in mesh.active_cells().iter().enumerate() {
+            let level = mesh.level(id).map_err(|e| e.to_string())?;
+            for vertex in mesh.cell_vertices(index).map_err(|e| e.to_string())? {
+                let point = mesh.point(vertex).map_err(|e| e.to_string())?;
+                if *point.as_array() == [0.5, 0.5] && chosen.is_none_or(|(_, best)| level > best) {
+                    chosen = Some((id, level));
+                }
+            }
+        }
+        let (id, _) = chosen.ok_or("中心を頂点に持つセルがない")?;
+        let request = AdaptationRequest {
+            source: mesh.mesh_token(),
+            refine: &[id],
+            coarsen: &[],
+        };
+        mesh = mesh.adapt(request).map_err(|e| e.to_string())?.mesh;
+    }
+    Ok(mesh)
+}
+```
+
+次のセルは細分の回数と部分の数を選び、`MeshPartition::balanced` で分割して、各部分の所有セル、ゴーストセル、他の部分との界面の断片、所有する頂点の数を表にする。
+ゴーストセルは、`mesh.interfaces()` の断片のうち両側の所有者が違うものから数え直した値と並べて、定義どおりかを確かめる。
+細分の回数と部分の数は、次のセルに渡す。
+
+```rust
+//| id: spatial-mesh-partition
+//| ref: spatial-mesh-partition
+//| title: 細分したメッシュを等分し、所有セル・ゴーストセル・界面・所有する頂点を数える
+//| run: reactive
+//| uses: [spatial-mesh-partition-model]
+//| crates: [scioxide-core, scioxide-spatial]
+//| exports: [refinements, parts]
+//| inputs:
+//|   steps: {"type":"range","label":"細分の回数","min":1,"max":6,"step":1,"value":3}
+//|   parts: {"type":"range","label":"部分の数","min":1,"max":6,"step":1,"value":3}
+//| cases:
+//|   - {"id":"six-parts","label":"6 分割","description":"部分を増やすと、所有セルに対するゴーストセルの割合が増える。","inputs":{"parts":6}}
+//|   - {"id":"one-step","label":"細分 1 回","description":"活性セル 7 個を 3 つに分けると、割り切れない 1 個を部分 0 が持つ。","inputs":{"steps":1}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"partition","path":"/rows/0/1","equals":10}
+//|       - {"artifact":"partition","path":"/rows/1/1","equals":9}
+//|       - {"artifact":"partition","path":"/rows/1/2","equals":11}
+//|       - {"artifact":"partition","path":"/rows/1/3","equals":11}
+//|       - {"artifact":"partition","path":"/rows/0/5","equals":19}
+//|   - case: six-parts
+//|     expect:
+//|       - {"artifact":"partition","path":"/rows/5/1","equals":4}
+//|       - {"artifact":"partition","path":"/rows/3/2","equals":12}
+//|       - {"artifact":"partition","path":"/rows/3/3","equals":12}
+//|   - case: one-step
+//|     expect:
+//|       - {"artifact":"partition","path":"/rows/0/1","equals":3}
+//|       - {"artifact":"partition","path":"/rows/2/1","equals":2}
+use scioxide_spatial::MeshPartition;
+
+let mesh = refined_square(steps as usize)?;
+let count = parts as usize;
+let partition = MeshPartition::balanced(&mesh, count).map_err(|e| e.to_string())?;
+// 独立な検算: 両側の所有者が違う界面の断片から、各部分のゴーストセルを数え直す。
+let owners = partition.owners();
+let mut ghost_pairs = std::collections::BTreeSet::new();
+for interface in mesh.interfaces() {
+    if let Some(right) = interface.right {
+        let (a, b) = (owners[interface.left_cell], owners[right.cell]);
+        if a != b {
+            ghost_pairs.insert((a, right.cell));
+            ghost_pairs.insert((b, interface.left_cell));
+        }
+    }
+}
+let mut rows = Vec::new();
+for part in 0..count {
+    let owned = partition
+        .owned_cells(part)
+        .map_err(|e| e.to_string())?
+        .len();
+    let ghosts = partition
+        .ghost_cells(part)
+        .map_err(|e| e.to_string())?
+        .count();
+    let recount = ghost_pairs.iter().filter(|&&(p, _)| p == part).count();
+    let pieces = partition
+        .interfaces(part)
+        .map_err(|e| e.to_string())?
+        .count();
+    let mut vertices = 0;
+    for v in 0..mesh.vertex_count() {
+        vertices += usize::from(partition.vertex_owner(v).map_err(|e| e.to_string())? == part);
+    }
+    rows.push((part, owned, ghosts, recount, pieces, vertices));
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "部分", "type": "integer" },
+    { "key": "1", "label": "所有セル [個]", "type": "integer" },
+    { "key": "2", "label": "ゴーストセル [個]", "type": "integer" },
+    { "key": "3", "label": "界面から数えたゴーストセル [個]", "type": "integer" },
+    { "key": "4", "label": "他の部分との界面の断片 [個]", "type": "integer" },
+    { "key": "5", "label": "所有する頂点 [個]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "partition" })
+);
+export!(refinements, steps as u64);
+export!(parts, count as u64);
+```
+
+既定値（細分 3 回、3 分割）では、活性セル 28 個が 10、9、9 個に分かれ、割り切れない 1 個は番号の小さい部分 0 に入る。
+どの部分でも、`ghost_cells` の数は界面から数え直した値と一致する。
+部分 1 は活性セルの並びの中ほどにあって両側の部分と接するので、ゴーストセルが 11 個、界面の断片が 13 個と最も多い。
+共有する頂点は番号の小さい部分が所有するので、所有する頂点は部分 0 が 19 個と最も多い。
+
+「6 分割」では各部分が 4〜5 個のセルを持ち、ゴーストセルは 5〜12 個で、どの部分でも所有セルより多い。
+分割を細かくすると、計算するセルに比べて通信するセルの割合が増える。
+「細分 1 回」では活性セル 7 個が 3、2、2 個に分かれる。
+
+## 再分割の置換
+
+次のセルは前のセルと同じ revision と分割を作り直し、所有者を付け替えた分割を `MeshPartition::new` で作って、`RepartitionMap` でセルの値を並べ替える。
+付け替え方は部分の番号を逆にする（$p \mapsto P - 1 - p$、$P$ は部分の数）か、1 つずらす（$p \mapsto (p + 1) \bmod P$）かを選ぶ。
+値は活性セルの番号そのものなので、並べ替えた結果が新しい分割の `cell_order()` に一致すれば、置換が正しい。
+`migration_cells` で数えた移るセルは、2 つの分割で所有者が違うセルの数と比べる。
+最後に、同じ所有者で作り直した分割を `validate` に渡し、別の分割として拒まれることを確かめる。
+
+```rust
+//| id: spatial-mesh-repartition
+//| ref: spatial-mesh-repartition
+//| title: 所有者を付け替えた分割へセルの値を並べ替え、置換と移るセルを確かめる
+//| run: reactive
+//| uses: [spatial-mesh-partition-model]
+//| crates: [scioxide-core, scioxide-spatial]
+//| dependsOn:
+//|   upstream: spatial-mesh-partition
+//| inputs:
+//|   rule: {"type":"select","label":"所有者の付け替え","options":["部分の番号を逆にする","部分の番号を 1 つずらす"],"value":"部分の番号を逆にする"}
+//| cases:
+//|   - {"id":"shift","label":"1 つずらす","description":"部分 p のセルを部分 (p + 1) mod P へ移すと、部分が 2 つ以上あればすべてのセルが移る。","inputs":{"rule":"部分の番号を 1 つずらす"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"repartition","path":"/rows/0/0","equals":28}
+//|       - {"artifact":"repartition","path":"/rows/0/1","equals":19}
+//|       - {"artifact":"repartition","path":"/rows/0/2","equals":19}
+//|       - {"artifact":"repartition","path":"/rows/0/3","equals":true}
+//|       - {"artifact":"repartition","path":"/rows/0/4","equals":true}
+//|       - {"artifact":"repartition","path":"/rows/0/5","equals":"InvalidInput"}
+//|   - case: shift
+//|     expect:
+//|       - {"artifact":"repartition","path":"/rows/0/1","equals":28}
+//|       - {"artifact":"repartition","path":"/rows/0/3","equals":true}
+use scioxide_core::ExecutionContext;
+use scioxide_spatial::{MeshPartition, RepartitionMap};
+
+// 前のセルと同じ revision と分割を作り直す（メッシュそのものは受け渡せない）。
+let steps = upstream["refinements"].as_u64().ok_or("細分の回数がない")? as usize;
+let count = upstream["parts"].as_u64().ok_or("部分の数がない")? as usize;
+let mesh = refined_square(steps)?;
+let source = MeshPartition::balanced(&mesh, count).map_err(|e| e.to_string())?;
+let reverse = rule.starts_with("部分の番号を逆");
+let owners: Vec<usize> = source
+    .owners()
+    .iter()
+    .map(|&p| {
+        if reverse {
+            count - 1 - p
+        } else {
+            (p + 1) % count
+        }
+    })
+    .collect();
+let destination = MeshPartition::new(&mesh, count, &owners).map_err(|e| e.to_string())?;
+let map = RepartitionMap::new(&source, &destination).map_err(|e| e.to_string())?;
+// 値は活性セルの番号。source の並び（部分ごと）で入れ、destination の並びで受け取る。
+let input = source.cell_order().to_vec();
+let (mut output, mut staging) = (vec![0; input.len()], vec![0; input.len()]);
+map.gather_into(
+    &input,
+    &mut output,
+    &mut staging,
+    ExecutionContext::sequential(),
+)
+.map_err(|e| e.to_string())?;
+let mut moved = 0;
+for from in 0..count {
+    for to in (0..count).filter(|&to| to != from) {
+        moved += map
+            .migration_cells(from, to)
+            .map_err(|e| e.to_string())?
+            .count();
+    }
+}
+// 独立な検算: 2 つの分割で所有者が違うセルを数える。
+let changed = (0..mesh.cell_count())
+    .filter(|&c| source.owners()[c] != destination.owners()[c])
+    .count();
+// 同じ所有者で作り直した分割は、別の分割として validate に拒まれる。
+let rebuilt = MeshPartition::new(&mesh, count, &owners).map_err(|e| e.to_string())?;
+let accepted = map.validate(&source, &destination).is_ok();
+let rebuilt_kind = match map.validate(&source, &rebuilt) {
+    Ok(()) => "受理".to_string(),
+    Err(e) => format!("{:?}", e.kind()),
+};
+let columns = serde_json::json!([
+    { "key": "0", "label": "活性セル [個]", "type": "integer" },
+    { "key": "1", "label": "移るセル [個]", "type": "integer" },
+    { "key": "2", "label": "所有者が変わるセル [個]", "type": "integer" },
+    { "key": "3", "label": "並べ替えた値が新しい並びと一致", "type": "boolean" },
+    { "key": "4", "label": "元の分割で validate を通る", "type": "boolean" },
+    { "key": "5", "label": "作り直した分割の validate" }
+]);
+let summary = vec![(
+    input.len(),
+    moved,
+    changed,
+    output == destination.cell_order(),
+    accepted,
+    rebuilt_kind,
+)];
+emit_table_with_columns!(
+    columns,
+    summary,
+    metadata = serde_json::json!({ "id": "repartition" })
+);
+```
+
+既定値（部分の番号を逆にする）では、部分 0 と 2 のセル 19 個が移り、中央の部分 1 の 9 個は移らない。
+`migration_cells` で数えた 19 個は、所有者が変わるセルの数と一致する。
+並べ替えた値は新しい分割の `cell_order()` と一致し、作った 2 つの分割は `validate` を通る。
+同じ所有者で作り直した分割は、中身が同じでも `InvalidInput` で拒まれる。
+
+「1 つずらす」では、すべての部分の番号が変わるので 28 個のセルがすべて移る。
+前のセルで部分の数を 1 にすると、どちらの付け替えでも所有者は変わらず、移るセルは 0 個になる。
+
+## まとめ
+
+並列計算では、`MeshPartition::balanced` か、呼び出し側の割り当てを渡す `MeshPartition::new` で活性セルを部分に分ける。
+各部分は所有セルを更新し、`ghost_cells` の値を隣の部分から受け取り、`interfaces(part)` の断片で流束を組み立てる。
+共有する頂点・面・辺は番号が最小の部分が所有するので、自由度の番号付けや総和の重複はこの規則で避ける。
+所有者を替えるときは `RepartitionMap` を作り、`gather_into` で値を確保なしに並べ替え、`migration_cells` で送るセルを決める。
+細分で revision が変わったときは、`TopologyMap` で値を移してから分割を作り直す。
+
+## 次に読むページ
+
+- [適応メッシュの細分とトポロジーの対応](../adaptive-mesh-and-shared-tessellation/)：分割する revision を作る細分・粗化と、界面の断片やハンギング実体の定義を確かめる。
+- [適応細分化](../../../scioxide-pde/api/adaptive-refinement/)：偏微分方程式の適応細分で、マーキングから細分と場の移し替えまでの流れを確かめる。

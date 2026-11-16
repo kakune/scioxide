@@ -1,0 +1,480 @@
+---
+title: 正規化と行列積の微分
+description: 配列を受け取る構造化演算の微分。logsumexp と softmax の最大値によるずらしと −∞ によるマスク、softmax のヤコビ行列と誤差の限界、内積・行列積の JVP と VJP、Frobenius 内積による随伴の恒等式、テープに記録する文・ワード・偏導関数の数。
+sidebar:
+  order: 330
+references:
+  ad-logsumexp-softmax: "logsumexp-と-softmax"
+  ad-matrix-products: "内積と行列積"
+---
+
+分類の確率や対数尤度には対数和 $\ln \sum_j e^{x_j}$ と softmax が、線形の層や線形写像には内積と行列積が現れる。
+対数和を式どおりに計算すると、要素が大きいときに指数があふれる。
+`scioxide-ad` はこれらを、どの数値型でも使える構造化演算（配列を受け取り、計算の順序とテープへの記録の形をクレートが決める関数）として提供する。
+このページは `logsumexp`・`softmax_into`・`log_softmax_into` と `dot`・`gemv_into`・`gemm_into` について、値の計アルゴリズム、導関数とヤコビ行列、テープへの記録、誤差の限界を導き、セルで確かめる。
+個々の初等関数の偏導関数と精度は[初等関数の微分と精度](../elementary-functions/)、テープの記録と走査は[逆モードとテープ](../reverse-mode-and-replay/)で扱う。
+
+## logsumexp と softmax
+
+$x \in \mathbb{R}^n$ の対数和 $\operatorname{lse}(x) = \ln \sum_j e^{x_j}$ を式どおりに計算すると、`f64` では $x_j > 709.78$ で $e^{x_j}$ があふれ、すべての $x_j < -745.13$ では和が 0 になる。
+`logsumexp` は base の値（入れ子の数値型の最も内側にある `f64` などの値）の最大値 $m = \max_j x_j$ でずらし
+
+$$
+\operatorname{lse}(x) = m + \ln \sum_{j=1}^{n} e^{x_j - m}
+$$
+
+として計算する。
+指数はすべて 0 以下で、最大の項は 1 なので、和は $[1, n]$ にあり、あふれない。
+
+勾配は softmax
+
+$$
+\frac{\partial \operatorname{lse}}{\partial x_i} = p_i = \frac{e^{x_i - m}}{\sum_j e^{x_j - m}}, \qquad
+\frac{\partial p_i}{\partial x_j} = p_i(\delta_{ij} - p_j), \qquad
+\frac{\partial \ln p_i}{\partial x_j} = \delta_{ij} - p_j
+$$
+
+で、softmax のヤコビ行列は $\operatorname{diag}(p) - p p^{\mathsf T}$ である。
+ずらし $m$ は base の値からレーン（lane、`Lanes` 型の SIMD の 1 要素）ごとに取り、微分対象外の値（入力に依存しない定数）として扱い、微分しない。
+上の等式は任意の定数 $m$ で成り立つので、$m$ を定数として右辺を微分した値は、ずらさない関数の導関数に等しい。
+$m$ は微分しないので、最大値の同点は折れ点（kink、片側導関数が一致しない点）として数えない。
+
+`softmax_into` は $p_i$ を、`log_softmax_into` は $\ln p_i = (x_i - m) - \ln \sum_j e^{x_j - m}$ を出力に書く。
+値が $-\infty$ の要素はマスク（除外した要素）として扱われ、$e^{-\infty - m}$ は厳密に 0 になる。
+マスクした要素 $x_j$ の softmax は $p_j = +0$、log-softmax は $-\infty$ である。
+$p_j = 0$ なので、$\operatorname{lse}$ の $x_j$ についての偏導関数と、softmax のヤコビ行列の第 $j$ 行と第 $j$ 列はすべて 0 になる。
+log-softmax のヤコビ行列 $\delta_{ij} - p_j$ では第 $j$ 列のうち $i \ne j$ の成分が 0 になるが、マスクした要素自身の行 $\delta_{jk} - p_k$ は 0 にならない（$x_j$ についての成分は 1）。
+
+| 入力 | `logsumexp` | `softmax_into`、`log_softmax_into` |
+|---|---|---|
+| 空の配列 | $-\infty$ | `DomainError`（引数 `values`、理由 `Undefined`） |
+| すべての要素が $-\infty$（ある lane で） | $-\infty$ | `DomainError`（引数 `values`、理由 `Undefined`） |
+| $+\infty$ の要素がある | $+\infty$（導関数は 0） | — |
+| NaN の要素がある（ある lane で） | NaN | その lane のすべての出力が NaN |
+| 出力と長さが違う | — | `DimensionMismatch` |
+
+`logsumexp` は現在エラーを返さず、`Result` は検査付きの形のために残してある。
+`softmax_into` と `log_softmax_into` は検査に失敗すると出力を書き換えない。
+
+精度は Blanchard、Higham、Higham の解析（*IMA J. Numer. Anal.* 41, 2021）に従う。
+機械イプシロンを $\varepsilon$ とすると、一次の近似で、`logsumexp` の結果 $y$ の絶対誤差は `exp` の誤差を 2 ulp 以内として約 $\varepsilon(|y| + 5n)$ 以下である。
+softmax の各成分の相対誤差は約 $\varepsilon(4n + |x_i - m|)$ 以下で、和の $(n - 1)\varepsilon$ と、丸めたずらし $x_i - m$ が指数に入る分から来る。
+log-softmax の各成分の絶対誤差は約 $\varepsilon(|x_i - m| + |\ln p_i| + 5n)$ 以下である。
+3 つとも要素ごとの減算・指数・和・対数・除算からなる汎用の関数で、テープには要素ごとの文（statement、テープの 1 記録）として記録され、文の数は $n$ に比例する。
+`scioxide_core` の `logsumexp` と softmax の精度の保証は[対数和・重み付き和・正規化](../../../scioxide-core/algorithms/logarithmic-reductions/)にある。
+
+次のセルは $x_j = c + v_j$、$v = (0.25, -1.5, 2, 0.5, -0.75)$ について、`logsumexp`、`softmax_into`、`log_softmax_into` の値と、`grad` による $\operatorname{lse}$ の勾配、`jacobian` による softmax のヤコビ行列を求める。
+入力はずらし $c$（無次元の定数）と、$x_1$ を $-\infty$ にしてマスクするかどうかである。
+$v_j$ は $1/4$ の倍数なので、整数の $c$ を足しても丸めは起きない。
+参照値はずらす前の $v_j$ から f64 の固有メソッドで作った $p_j = e^{v_j}/\sum_k e^{v_k}$ と $c + \ln \sum_k e^{v_k}$ である。
+1 つ目の表は各要素の softmax $p_j$、テープによる勾配 $\partial \operatorname{lse}/\partial x_j$、log-softmax $\ln p_j$ を示す。
+2 つ目の表は `logsumexp` の値と式どおりの $\ln \sum_j e^{x_j}$（あふれた場合は $+\infty$ と表示）、参照値、誤差を上の限界 $\varepsilon(|y| + 5n)$ で割った値を示す。
+3 つ目の表は勾配とヤコビ行列の参照値との差の最大を $\varepsilon$ で割った値と、マスクした要素の行と列に残った非零成分の数を示す。
+
+```rust
+//| id: ad-softmax-jacobian
+//| ref: ad-softmax-jacobian
+//| title: logsumexp の勾配と softmax のヤコビ行列
+//| run: reactive
+//| crates: [scioxide-ad, scioxide-core]
+//| inputs:
+//|   shift: {"type":"range","label":"ずらし c","description":"すべての要素に足す定数（無次元）。c ≥ 708 では e^{x_j} が f64 であふれる。","min":0,"max":1000,"step":50,"value":800}
+//|   mask: {"type":"checkbox","label":"x₁ を −∞ にする（マスク）","description":"マスクした要素の確率と導関数は 0 になる。","value":false}
+//| cases:
+//|   - {"id":"no-shift","label":"c = 0","description":"式どおりの対数和もあふれない。","inputs":{"shift":0}}
+//|   - {"id":"masked","label":"x₁ をマスク","description":"マスクした要素の行と列のヤコビ行列は 0 になる。","inputs":{"mask":true}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"entries","path":"/rows/2/2","approx":{"value":0.6706776101949348,"rtol":1e-14}}
+//|       - {"artifact":"values","path":"/rows/0/0","approx":{"value":802.3994667191756,"rtol":1e-15}}
+//|       - {"artifact":"values","path":"/rows/0/1","equals":null}
+//|       - {"artifact":"values","path":"/rows/0/3","range":{"max":1}}
+//|       - {"artifact":"checks","path":"/rows/0/0","range":{"max":4}}
+//|       - {"artifact":"checks","path":"/rows/0/1","range":{"max":4}}
+//|   - case: no-shift
+//|     expect:
+//|       - {"artifact":"values","path":"/rows/0/1","approx":{"value":2.3994667191756704,"rtol":1e-14}}
+//|       - {"artifact":"entries","path":"/rows/2/2","approx":{"value":0.6706776101949348,"rtol":1e-14}}
+//|       - {"artifact":"checks","path":"/rows/0/1","range":{"max":4}}
+//|   - case: masked
+//|     expect:
+//|       - {"artifact":"entries","path":"/rows/1/2","equals":0}
+//|       - {"artifact":"entries","path":"/rows/1/3","equals":0}
+//|       - {"artifact":"entries","path":"/rows/1/4","equals":null}
+//|       - {"artifact":"entries","path":"/rows/2/2","approx":{"value":0.6845414285092583,"rtol":1e-14}}
+//|       - {"artifact":"checks","path":"/rows/0/1","range":{"max":4}}
+//|       - {"artifact":"checks","path":"/rows/0/2","equals":0}
+use scioxide_ad::{Real, Var, grad, jacobian, log_softmax_into, logsumexp, softmax_into};
+use scioxide_core::RealScalar;
+
+// x_j = c + v_j。v_j は 1/4 の倍数なので、整数の c を足しても丸めは起きない。
+let offsets = [0.25, -1.5, 2.0, 0.5, -0.75];
+let n = offsets.len();
+let masked = |j: usize| mask && j == 1;
+let x: Vec<f64> = (0..n)
+    .map(|j| {
+        if masked(j) {
+            f64::NEG_INFINITY
+        } else {
+            shift + offsets[j]
+        }
+    })
+    .collect();
+
+// SciOxide の計算: 値、テープによる lse の勾配と softmax のヤコビ行列。
+let lse = logsumexp(&x).map_err(|e| e.to_string())?;
+let mut p = vec![0.0; n];
+softmax_into(&x, &mut p).map_err(|e| e.to_string())?;
+let mut log_p = vec![0.0; n];
+log_softmax_into(&x, &mut log_p).map_err(|e| e.to_string())?;
+let gradient = grad(|v| logsumexp(v), &x).map_err(|e| e.to_string())?;
+let jac = jacobian(
+    |v, out| {
+        let mut probabilities = vec![Var::constant(0.0); v.len()];
+        softmax_into(v, &mut probabilities)?;
+        out.extend(probabilities);
+        Ok(())
+    },
+    &x,
+)
+.map_err(|e| e.to_string())?;
+let entries: Vec<_> = (0..n)
+    .map(|j| {
+        let offset = (!masked(j)).then_some(offsets[j]);
+        let log_value = log_p[j].is_finite().then_some(log_p[j]);
+        (j, offset, p[j], gradient.as_slice()[j], log_value)
+    })
+    .collect();
+
+// 参照値（f64 の固有メソッド）: ずらす前の v_j で e^{v_j} を作る。
+let weights: Vec<f64> = (0..n)
+    .map(|j| if masked(j) { 0.0 } else { offsets[j].exp() })
+    .collect();
+let total: f64 = weights.iter().sum();
+let reference: Vec<f64> = weights.iter().map(|w| w / total).collect();
+// 検算: lse の誤差を限界 ε(|y| + 5n) で割る。式どおりの ln Σ e^{x_j} はあふれうる。
+let reference_lse = shift + total.ln();
+let bound = f64::EPSILON * (lse.abs() + 5.0 * n as f64);
+let naive = RealScalar::ln(x.iter().map(|&v| RealScalar::exp(v)).sum::<f64>());
+let values = vec![(
+    lse,
+    naive.is_finite().then_some(naive),
+    reference_lse,
+    (lse - reference_lse).abs() / bound,
+)];
+// 検算: 勾配と p、ヤコビ行列と diag(p) − ppᵀ の差、マスクした行と列の非零成分。
+let mut jacobian_gap = 0.0_f64;
+let mut masked_nonzeros = 0_u32;
+for i in 0..n {
+    for j in 0..n {
+        let diagonal = if i == j { reference[i] } else { 0.0 };
+        let entry = jac.as_slice()[i * n + j];
+        let gap = (entry - (diagonal - reference[i] * reference[j])).abs();
+        jacobian_gap = jacobian_gap.max(gap);
+        masked_nonzeros += u32::from((masked(i) || masked(j)) && entry != 0.0);
+    }
+}
+let gradient_gap = (0..n)
+    .map(|j| (gradient.as_slice()[j] - reference[j]).abs())
+    .fold(0.0, f64::max);
+let checks = vec![(
+    gradient_gap / f64::EPSILON,
+    jacobian_gap / f64::EPSILON,
+    mask.then_some(masked_nonzeros),
+)];
+
+let digits = serde_json::json!({ "significantDigits": 16 });
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let entry_columns = serde_json::json!([
+    { "key": "0", "label": "j", "type": "integer" },
+    { "key": "1", "label": "x_j − c [-]", "type": "number", "nullText": "−∞（マスク）" },
+    { "key": "2", "label": "p_j [-]", "type": "number", "format": digits },
+    { "key": "3", "label": "∂lse/∂x_j [-]", "type": "number", "format": digits },
+    { "key": "4", "label": "ln p_j [-]", "type": "number", "format": digits, "nullText": "−∞" }
+]);
+emit_table_with_columns!(
+    entry_columns,
+    entries,
+    metadata = serde_json::json!({ "id": "entries" })
+);
+let value_columns = serde_json::json!([
+    { "key": "0", "label": "logsumexp [-]", "type": "number", "format": digits },
+    { "key": "1", "label": "ln Σ e^x [-]", "type": "number", "format": digits, "nullText": "+∞" },
+    { "key": "2", "label": "参照値 [-]", "type": "number", "format": digits },
+    { "key": "3", "label": "誤差 / ε(|y| + 5n) [-]", "type": "number", "format": fixed2 }
+]);
+emit_table_with_columns!(
+    value_columns,
+    values,
+    metadata = serde_json::json!({ "id": "values" })
+);
+let check_columns = serde_json::json!([
+    { "key": "0", "label": "max |∂lse/∂x_j − p_j| / ε [-]", "type": "number", "format": fixed2 },
+    { "key": "1", "label": "max |J − (diag p − ppᵀ)| / ε [-]", "type": "number", "format": fixed2 },
+    { "key": "2", "label": "マスクした行と列の非零成分 [個]", "type": "integer", "nullText": "マスクなし" }
+]);
+emit_table_with_columns!(
+    check_columns,
+    checks,
+    metadata = serde_json::json!({ "id": "checks" })
+);
+```
+
+## 内積と行列積
+
+`dot(left, right)` は内積 $\sum_k l_k r_k$ を添字の順に足す。
+テープでは、ベクトルの長さ $n$ によらず $2n$ 個の引数を持つ 1 つの文として記録し、$l_k$ の偏導関数として $r_k$ の値を、$r_k$ の偏導関数として $l_k$ の値を保存する。
+値は積の再帰的な和なので、単位丸めを $u$（`f64` で $2^{-53}$）、$\gamma_n = nu/(1 - nu)$ とすると、誤差は
+
+$$
+\Bigl|\widehat{\textstyle\sum_k l_k r_k} - \textstyle\sum_k l_k r_k\Bigr| \le \gamma_n \sum_k |l_k r_k|
+$$
+
+以下である（Higham, *Accuracy and Stability of Numerical Algorithms*, §3.1）。
+導関数も同じ形の和なので、同じ形の限界を持つ。
+長さが違えば `DimensionMismatch` を返す。
+
+`gemv_into(matrix, rows, cols, vector, out)` は行優先の $\text{rows} \times \text{cols}$ 行列と長さ $\text{cols}$ のベクトルの積を、行ごとの `dot` として `out` に書く。
+`cols` が 0 なら `out` を 0 で埋める。
+`gemm_into(left, rows, inner, right, cols, out)` は行優先の $\text{rows} \times \text{inner}$ 行列と $\text{inner} \times \text{cols}$ 行列の積を、成分ごとの `dot` として書く。
+各成分の精度は $n = \text{cols}$（`gemv_into`）、$n = \text{inner}$（`gemm_into`）の `dot` と同じである。
+どちらも、スライスの長さが合わなければ `DimensionMismatch` を、行数と列数の積が `usize` を超えれば `SizeOverflow` を返す。
+
+$A \in \mathbb{R}^{m \times k}$、$B \in \mathbb{R}^{k \times n}$、$C = AB$ とする。
+$C$ は $(A, B)$ について双線形なので、方向（入力の接ベクトル、tangent）$(\dot A, \dot B)$ への微分は積の微分の規則から
+
+$$
+\dot C = \dot A\,B + A\,\dot B
+$$
+
+である。
+方向から $\dot C$ を求めるこの積が、前進モードのヤコビ行列・ベクトル積（JVP）である。
+逆モードのベクトル・ヤコビ行列積（VJP）は、出力の余接（cotangent）$W = \bar C \in \mathbb{R}^{m \times n}$ にこの線形写像の転置を作用させる。
+行列の内積を Frobenius 内積 $\langle X, Y \rangle = \operatorname{tr}(X^{\mathsf T} Y) = \sum_{i,j} X_{ij} Y_{ij}$ で測り、トレースの巡回性 $\operatorname{tr}(XY) = \operatorname{tr}(YX)$ を使うと、すべての方向について
+
+$$
+\begin{aligned}
+\langle \dot A B, W \rangle &= \operatorname{tr}(B^{\mathsf T} \dot A^{\mathsf T} W) = \operatorname{tr}(\dot A^{\mathsf T} W B^{\mathsf T}) = \langle \dot A, W B^{\mathsf T} \rangle, \\
+\langle A \dot B, W \rangle &= \operatorname{tr}(\dot B^{\mathsf T} A^{\mathsf T} W) = \langle \dot B, A^{\mathsf T} W \rangle
+\end{aligned}
+$$
+
+が成り立つ。
+したがって随伴（adjoint）は $\bar A = W B^{\mathsf T}$、$\bar B = A^{\mathsf T} W$ で、
+
+$$
+\langle \dot C, W \rangle = \langle \dot A, \bar A \rangle + \langle \dot B, \bar B \rangle
+$$
+
+が成り立つ。
+この恒等式は転置の定義そのもので、JVP と VJP の整合を確かめる検算になる。
+`gemv_into`（$n = 1$）と `dot`（$m = n = 1$）は同じ規則の特別な場合である。
+
+`gemm_into` をテープに記録すると、$C$ の各成分が `dot` の 1 文になる。
+テープは文を 64 ビットのワード（statement word）の列で表し、引数の多い文は見出しのワード 2 個と引数ごとのワード 1 個を使う。
+逆走査（記録を末尾から先頭へたどり、随伴を足す走査）はその文から $\bar A_{ik} \mathrel{+}= \bar C_{ij} B_{kj}$、$\bar B_{kj} \mathrel{+}= A_{ik} \bar C_{ij}$ を足すので、行列の形の式を書かなくても $\bar A = W B^{\mathsf T}$、$\bar B = A^{\mathsf T} W$ が得られる。
+記録は $mn$ 個の文、$1 + mk + kn + mn(2k + 2)$ 個の文のワード（定数の枠 1、入力 $mk + kn$、各文の見出し 2 と引数 $2k$）、$2mnk$ 個の偏導関数からなる。
+偏導関数は $A$ と $B$ の成分の写しなので、偏導関数のメモリ使用量は $A$ と $B$ そのもの（$mk + kn$ 個）の $2mnk/(mk + kn)$ 倍になる。
+JVP と VJP は 1 回の走査でそれぞれ $2mnk$ 回の積を行う。
+
+次のセルは $A$、$B$、方向 $\dot A$、$\dot B$、余接 $W$ の成分を $[-1, 1)$ の擬似乱数で作り、`Tape::linearize` で $C = AB$ を記録して、`jvp_into` で $\dot C$ を、`vjp_into` で $(\bar A, \bar B)$ を求める。
+入力は $m$、$k$、$n$ である。
+1 つ目の表は記録のワード数と上の式の値、恒等式の両辺、両辺の差を $u S$ で割った値を示す。
+両辺の内積は正しく丸めた内積 `scioxide_core::checked_sum_of_products` で計算する。
+2 つ目の表は $\dot C$、$\bar A$、$\bar B$ の各成分と `checked_sum_of_products` による参照値の差を、限界 $\gamma_N \sum|\text{項}|$（$N$ は和の項数）で割った値の最大を示す。
+$S = \sum_{i,j,k} |W_{ij}|(|\dot A_{ik} B_{kj}| + |A_{ik} \dot B_{kj}|)$ は左辺の三重和の項の絶対値の和で、両辺の差は $(\gamma_{2k} + \gamma_{\max(m, n)}) S$ 程度以下になるはずである。
+
+```rust
+//| id: ad-gemm-adjoint
+//| ref: ad-gemm-adjoint
+//| title: 行列積の JVP・VJP と随伴の恒等式
+//| run: reactive
+//| crates: [scioxide-ad, scioxide-core]
+//| inputs:
+//|   m_rows: {"type":"range","label":"A の行数 m","min":1,"max":8,"step":1,"value":3}
+//|   k_inner: {"type":"range","label":"内側の次元 k","min":1,"max":32,"step":1,"value":8}
+//|   n_cols: {"type":"range","label":"B の列数 n","min":1,"max":8,"step":1,"value":2}
+//| cases:
+//|   - {"id":"long-inner","label":"k = 32","description":"内積が長く、和の限界 γ_N が大きくなる。","inputs":{"k_inner":32}}
+//|   - {"id":"matrix-vector","label":"m = 8、n = 1","description":"n = 1 は行列ベクトル積で、gemv_into と同じ規則になる。","inputs":{"m_rows":8,"n_cols":1}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":149}
+//|       - {"artifact":"summary","path":"/rows/0/1","equals":149}
+//|       - {"artifact":"errors","path":"/rows/0/2","range":{"max":1}}
+//|       - {"artifact":"errors","path":"/rows/1/2","range":{"max":1}}
+//|       - {"artifact":"errors","path":"/rows/2/2","range":{"max":1}}
+//|       - {"artifact":"summary","path":"/rows/0/2","approx":{"value":-2.554543701983218,"rtol":1e-14}}
+//|       - {"artifact":"summary","path":"/rows/0/4","range":{"max":19}}
+//|   - case: long-inner
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":557}
+//|       - {"artifact":"errors","path":"/rows/0/2","range":{"max":1}}
+//|       - {"artifact":"summary","path":"/rows/0/4","range":{"max":67}}
+//|   - case: matrix-vector
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":217}
+//|       - {"artifact":"errors","path":"/rows/1/2","equals":0}
+//|       - {"artifact":"errors","path":"/rows/2/2","range":{"max":1}}
+use scioxide_ad::{Real, Tape, TapeOptions, Var, gemm_into};
+use scioxide_core::{ExecutionContext, checked_sum_of_products};
+
+let (m, k, n) = (m_rows as usize, k_inner as usize, n_cols as usize);
+// 入力の生成だけに使う線形合同法。成分は [−1, 1)。
+let mut state = 0x2545_f491_4f6c_dd1d_u64;
+let mut fill = |len: usize| -> Vec<f64> {
+    (0..len)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 11) as f64 / (1_u64 << 52) as f64 - 1.0
+        })
+        .collect()
+};
+let (a, b) = (fill(m * k), fill(k * n));
+let (da, db, w) = (fill(m * k), fill(k * n), fill(m * n));
+let point = [a.as_slice(), &b].concat();
+let direction = [da.as_slice(), &db].concat();
+
+// テープに C = A·B を記録し、JVP で dC、VJP で (Ā, B̄) を求める。
+let cx = ExecutionContext::sequential();
+let mut tape = Tape::<f64>::new(TapeOptions::new());
+let mut dc = vec![0.0; m * n];
+let mut bars = vec![0.0; m * k + k * n];
+{
+    let mut linear = tape
+        .linearize(
+            |x, out| {
+                let (left, right) = x.split_at(m * k);
+                let mut c = vec![Var::constant(0.0); m * n];
+                gemm_into(left, m, k, right, n, &mut c)?;
+                out.extend(c);
+                Ok(())
+            },
+            &point,
+            cx,
+        )
+        .map_err(|e| e.to_string())?;
+    linear
+        .jvp_into(&direction, &mut dc, cx)
+        .map_err(|e| e.to_string())?;
+    linear
+        .vjp_into(&w, &mut bars, cx)
+        .map_err(|e| e.to_string())?;
+}
+let words = tape.report().words();
+
+// 検算: 正しく丸めた内積と、項の絶対値の和 Σ|項| を作る。
+let exact = |l: &[f64], r: &[f64]| -> Result<(f64, f64), String> {
+    let value = checked_sum_of_products(l, r).map_err(|e| e.to_string())?;
+    let size: f64 = l.iter().zip(r).map(|(p, q)| (p * q).abs()).sum();
+    Ok((value, size))
+};
+let u = f64::EPSILON / 2.0;
+let gamma = |terms: usize| terms as f64 * u / (1.0 - terms as f64 * u);
+let row = |x: &[f64], cols: usize, i: usize| x[i * cols..(i + 1) * cols].to_vec();
+let col = |x: &[f64], cols: usize, j: usize| -> Vec<f64> {
+    x.iter().skip(j).step_by(cols).copied().collect()
+};
+let mut worst = [0.0_f64; 3];
+for i in 0..m {
+    for j in 0..n {
+        // dC_ij = Σ_k (dA_ik B_kj + A_ik dB_kj)、2k 項。
+        let left = [row(&da, k, i), row(&a, k, i)].concat();
+        let right = [col(&b, n, j), col(&db, n, j)].concat();
+        let (value, size) = exact(&left, &right)?;
+        worst[0] = worst[0].max((dc[i * n + j] - value).abs() / (gamma(2 * k) * size));
+    }
+    for p in 0..k {
+        // Ā_ip = Σ_j W_ij B_pj、n 項。
+        let (value, size) = exact(&row(&w, n, i), &row(&b, n, p))?;
+        worst[1] = worst[1].max((bars[i * k + p] - value).abs() / (gamma(n) * size));
+    }
+}
+for p in 0..k {
+    for j in 0..n {
+        // B̄_pj = Σ_i A_ip W_ij、m 項。
+        let (value, size) = exact(&col(&a, k, p), &col(&w, n, j))?;
+        let ad = bars[m * k + p * n + j];
+        worst[2] = worst[2].max((ad - value).abs() / (gamma(m) * size));
+    }
+}
+let errors = vec![
+    ("dC = dA·B + A·dB", 2 * k, worst[0]),
+    ("Ā = W·Bᵀ", n, worst[1]),
+    ("B̄ = Aᵀ·W", m, worst[2]),
+];
+
+// 恒等式 ⟨dC, W⟩ = ⟨dA, Ā⟩ + ⟨dB, B̄⟩ と、三重和の項の絶対値の和 S。
+let lhs = checked_sum_of_products(&dc, &w).map_err(|e| e.to_string())?;
+let rhs = checked_sum_of_products(&direction, &bars).map_err(|e| e.to_string())?;
+let mut scale = 0.0;
+for i in 0..m {
+    for j in 0..n {
+        for p in 0..k {
+            let terms =
+                (da[i * k + p] * b[p * n + j]).abs() + (a[i * k + p] * db[p * n + j]).abs();
+            scale += w[i * n + j].abs() * terms;
+        }
+    }
+}
+let summary = vec![(
+    words,
+    1 + m * k + k * n + m * n * (2 * k + 2),
+    lhs,
+    rhs,
+    (lhs - rhs).abs() / (u * scale),
+)];
+
+let digits = serde_json::json!({ "significantDigits": 16 });
+let fixed3 = serde_json::json!({ "fractionDigits": 3 });
+let summary_columns = serde_json::json!([
+    { "key": "0", "label": "記録のワード数 [ワード]", "type": "integer" },
+    { "key": "1", "label": "1 + mk + kn + mn(2k + 2) [ワード]", "type": "integer" },
+    { "key": "2", "label": "⟨dC, W⟩ [-]", "type": "number", "format": digits },
+    { "key": "3", "label": "⟨dA, Ā⟩ + ⟨dB, B̄⟩ [-]", "type": "number", "format": digits },
+    { "key": "4", "label": "|両辺の差| / (u S) [-]", "type": "number", "format": fixed3 }
+]);
+emit_table_with_columns!(
+    summary_columns,
+    summary,
+    metadata = serde_json::json!({ "id": "summary" })
+);
+let error_columns = serde_json::json!([
+    { "key": "0", "label": "量" },
+    { "key": "1", "label": "和の項数 N", "type": "integer" },
+    { "key": "2", "label": "max |AD − 参照値| / (γ_N Σ|項|) [-]", "type": "number", "format": fixed3 }
+]);
+emit_table_with_columns!(
+    error_columns,
+    errors,
+    metadata = serde_json::json!({ "id": "errors" })
+);
+```
+
+既定の $m = 3$、$k = 8$、$n = 2$ では、記録のワード数は 149 で、式 $1 + mk + kn + mn(2k + 2)$ と一致する。
+$C$ の 6 成分がそれぞれ 1 つの `dot` の文として記録されたことを示す。
+誤差の比は $\dot C$ で 0.032、$\bar A$ で 0.79、$\bar B$ で 0.56 で、どれも限界 $\gamma_N \sum|\text{項}|$ の内側にある。
+$\bar A$ の成分は 2 項の和で、丸めの回数が少なく打ち消し合う余地もないので、比は 1 に近い。
+16 項の和である $\dot C$ では、限界 $\gamma_N$ は項数に比例して増えるが、実際の丸め誤差は互いに打ち消し合うので、比は限界よりずっと小さい。
+恒等式の両辺は $-2.554543701983218$ と $-2.5545437019832185$ で、差は $0.30\,uS$ である。
+
+$k = 32$ ではワード数が 557 に増え、$\dot C$ の和は 64 項になるが、誤差の比は 0.017 にとどまり、恒等式の両辺はビットで一致する。
+$m = 8$、$n = 1$ は行列ベクトル積で、$\bar A_{ip} = W_i B_p$ は 1 回の積なので正しく丸められ、比は 0 になる。
+
+## まとめ
+
+対数和と正規化を `logsumexp`、`softmax_into`、`log_softmax_into` で書くと、base の値の最大値でずらしてあふれを避け、ずらしは微分しないので、導関数はずらさない関数の導関数に等しい。
+除外する要素は $-\infty$ にすればマスクとなり、その要素の確率と、`logsumexp` と softmax のその要素についての導関数が 0 になる。
+すべての要素をマスクした `softmax_into` と `log_softmax_into` は `DomainError` を返すので、すべての要素がマスクされうる入力では事前に分岐する。
+行列の積を `dot`、`gemv_into`、`gemm_into` で書くと成分ごとに 1 つの文として記録され、$C = AB$ だけを記録したテープは $1 + mk + kn + mn(2k + 2)$ ワードと $2mnk$ 個の偏導関数からなる。
+随伴は $\bar A = W B^{\mathsf T}$、$\bar B = A^{\mathsf T} W$ で、$\langle \dot C, W \rangle = \langle \dot A, \bar A \rangle + \langle \dot B, \bar B \rangle$ を計算すれば JVP と VJP の整合を確かめられる。
+
+## 次に読むページ
+
+- [二階微分とヘッセ行列の作用素](../second-order-derivatives/)：JVP と VJP を、行列を作らない作用素として反復解法に渡す方法を確かめる。
+- [線形系の解と分解の微分](../linear-solutions/)：行列積と同じ考え方で、線形系の解と分解の随伴を確かめる。
+- [JVP と VJP の双対性](../../examples/jvp-vjp-duality/)：随伴の恒等式を一般の関数で試す例題を確かめる。

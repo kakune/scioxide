@@ -1,0 +1,811 @@
+---
+title: 記述統計・標準化・べき変換の数理
+description: 統計量のセレクター Statistic と型による組み合わせの制限、L モーメント、軸に沿った集約と作業領域、z スコア標準化、Box–Cox と Yeo–Johnson のべき変換、プロファイル対数尤度による λ の推定と区間、Filliben の確率プロットと PPCC。
+sidebar:
+  order: 330
+references:
+  stats-descriptive-algorithms-and-api: "アルゴリズムと-api"
+  stats-descriptive-axis-reduction-workspace: "軸に沿った集約と作業領域"
+  stats-descriptive-box-cox-yeo-johnson: "boxcox-変換と-yeojohnson-変換"
+  stats-descriptive-l-moments: "l-モーメント"
+  stats-descriptive-lambda-hat-likelihood-interval: "hatlambda-と尤度区間を確かめる"
+  stats-descriptive-ppcc: "確率プロット相関係数ppcc"
+  stats-descriptive-quantile-grid-population-check: "分位点の格子で母集団の値と照合する"
+  stats-descriptive-selectors-and-type-limits: "統計量のセレクターと型による制限"
+  stats-descriptive-z-score-standardization: "z-スコア標準化"
+---
+
+記述統計は標本の中心（位置）、散らばり、非対称性（歪み）、裾の重さ（尖り）を少数の数で要約する。
+要約の値はどの定義で数えたか（自由度の補正、分位点の定義、重みの意味）と、どの精度で計算したかによって変わる。
+また、計測データは右に長い裾を持つことや正の値に限られることが多く、正規分布を仮定する回帰や分散分析の前提から外れる。
+べき変換はそのような標本を正規分布に近い形へ写す 1 パラメータの単調変換である。
+
+このページでは、`scioxide-stats` が記述統計をどう選び、どう集約し、どう標準化するかを説明し、続いて Box–Cox 変換と Yeo–Johnson 変換、変換パラメータ $\lambda$ の最尤推定と信頼区間、正規確率プロットと確率プロット相関係数（PPCC）を導出から順に扱う。
+
+## 記述統計の集約と標準化
+
+### 統計量のセレクターと型による制限
+
+`Statistic<T, M>` は、スカラー型 `T` と重みのモデル `M` を型の引数に持つ、統計量のセレクターである。
+平均・分散・極値・幾何平均・調和平均・べき平均・分位点・中央値絶対偏差（MAD）・トリム平均・L モーメント・最頻値・エクスペクタイル・四分位範囲・パーセンタイル順位・同順位の補正係数・円周統計・エントロピーを、同じ関数に渡せる。
+1 本のスライスには `statistic(values, weights, selector)` を、ストライドを持つ配列の各一括処理（バッチ）には後述の `statistics_into` を使う。
+中央値は `Statistic::quantile` に確率 0.5 と分位点の規則 `QuantileRule` を渡して選ぶ。
+
+統計量と重みの組み合わせには、意味を持たないものがある。
+たとえば相対質量 `Mass` の重みに対する「不偏な標本分散」は、重みの和が標本数を表さないので定義できない。
+`scioxide-stats` は、このような組み合わせを実行時のエラーではなくコンパイルエラーにする。
+各列挙子は `StatisticCapability<T, M, K>` という値を持ち、この値は `Statistic` の構築関数の中でしか作れない。
+構築関数は、定義される `T` と `M` の組に対してだけ用意されているので、`Statistic` の値があれば、その組で計算できることが型で保証される。
+利用者が `StatisticCapability` を直接扱うことはない。
+
+| 構築関数 | `T` | `M` | 型の上での条件 |
+|---|---|---|---|
+| `sum`、`mean` | 実数・複素数 | 複素数では `Unweighted`、実数ではすべての重みのモデル | `M: LocationModel<T>` |
+| `variance(ddof)`、`standard_deviation(ddof)` | 実数・複素数 | `Unweighted` | なし |
+| `geometric_mean`、`harmonic_mean`、`power_mean`、`quantile`、`circular` | 実数 | `Unweighted`、`Frequency`、`Mass` | `M: EmpiricalWeights` |
+| `expectile` | 実数 | `Unweighted`、`Mass` | `M: ExpectileWeights` |
+| その他（極値、MAD、トリム平均、L モーメント、最頻値、四分位範囲、エントロピーなど） | 実数 | `Unweighted` | なし |
+
+`LocationModel<T>` は、和と平均を定義できる重みのモデルを表すトレイトである。
+重みなしの `Unweighted` は実数と複素数の両方で、`Frequency`・`Mass`・`Reliability`・`Analytic` は実数でだけ実装されている。
+`ExpectileWeights` は、エクスペクタイル（非対称な最小 2 乗の位置）を受け付ける `Unweighted` と `Mass` だけが実装するトレイトである。
+エクスペクタイルの定義とアルゴリズムは[経験分布・標本分位点・補間規約の数理](oxref:stats-quantile-expectiles)で扱う。
+
+結果の `StatisticValue<T>` は値の種類ごとに列挙子を分ける。
+`Location(T)` は和・平均・極値・L モーメントなど観測と同じ型の量、`Dispersion(T::Real)` は分散と標準偏差（複素数の標本でも実数）、`Order` は分位点・最頻値・エクスペクタイルなど規約と診断を伴う量、`Circular` は円周統計、`Information` はエントロピーである。
+通常の実数として解釈するときは `scalar()` を使う。
+複素数の標本の分散は偏差の絶対値の 2 乗 $\lvert x_i-\bar x\rvert^2$ の和で定義する。
+
+### L モーメント
+
+$r$ 次の L モーメント $\lambda_r$ は、大きさ $r$ の標本の順序統計量 $X_{1:r}\le\cdots\le X_{r:r}$ の符号付きの線形結合の期待値である（Hosking, 1990）。
+
+$$
+\lambda_r = \frac{1}{r}\sum_{k=0}^{r-1}(-1)^k\binom{r-1}{k}\,\mathrm E\,X_{r-k:r}
+$$
+
+$\lambda_1$ は平均、$\lambda_2=\tfrac12\mathrm E(X_{2:2}-X_{1:2})$ は 2 個の観測の差の期待値の半分で、散らばりの尺度になる。
+$r\ge3$ では比 $\tau_r=\lambda_r/\lambda_2$ を使い、$\tau_3$ を L 歪度、$\tau_4$ を L 尖度と呼ぶ。
+L 歪度は $-1<\tau_3<1$ を満たし、通常の歪度・尖度と違って 3 次・4 次のモーメントの存在を必要としない。
+そのため、裾の重い分布や小さな標本でも値が大きく振れにくい。
+
+標本の L モーメント $l_r$ は、$n$ 個から $r$ 個を選ぶすべての部分標本について上の結合を平均した U 統計量であり、$\lambda_r$ の不偏推定量である。
+整列した標本 $x_{(1)}\le\cdots\le x_{(n)}$ を使うと、$l_r$ は $x_{(i)}$ の重み付き和になる。
+`Statistic::l_moment(r, normalization)` はこの $l_r$ を計算し、`LMomentNormalization::Raw` なら観測と同じ単位の $l_r$ を、`Standardized` なら $r\ge3$ で比 $t_r=l_r/l_2$ を返す（$r\le2$ では `Raw` と同じ値）。
+計算は 1 回の整列 $O(n\log n)$ と、組合せの比を漸化式で求める $O(nr^2)$ の和で、和は補償加算で累積する。
+$1\le r\le n$ でなければ、また `Standardized` で $l_2=0$（定数の標本）なら `InvalidInput` を返す。
+
+| 分布 | 平均 $\lambda_1$ | $\lambda_2$ | $\tau_3$ | $\tau_4$ |
+|---|---|---|---|---|
+| 一様分布 $U(0,1)$ | $1/2$ | $1/6$ | $0$ | $0$ |
+| 指数分布（率 1） | $1$ | $1/2$ | $1/3$ | $1/6$ |
+| ロジスティック分布（位置 0、尺度 1） | $0$ | $1$ | $0$ | $1/6$ |
+| 標準正規分布 | $0$ | $1/\sqrt\pi\approx0.5642$ | $0$ | $0.1226$ |
+
+表の値は Hosking（1990）の表から取った母集団の値で、下のセルの照合に使う。
+
+### 軸に沿った集約と作業領域
+
+多次元配列の各行や各列の統計量は、`BatchView` で配列のストライドと標本の軸を指定して、`statistics_into(view, selector, options, output, workspace, context)` で求める。
+`output[b]` に一括処理 $b$ の統計量が入る。
+`StatisticsOptions` は欠測と非有限値の扱い（拒否か除外）、実行の方針、作業領域のバイト数の上限をまとめ、`ExecutionContext` は並列のワーカーを供給する。
+並列でも逐次でも、各一括処理の結果は同じである。
+作業領域を内部で確保して結果を `Vec` で返す形として、`statistics(view, selector)` と `statistics_with_options` もある。
+
+`StatisticsWorkspace::workspace_requirements(geometry, window, options, context)` は、必要な作業領域を `StatisticsRequirements` として返す。
+`geometry` の型は `StatisticsGeometry` トレイトで制限され、`BatchView` か、値がまだない段階の `(StridedLayout, Axis)` の組を受け付ける。
+組で渡すと重みなしの形として見積もるので、データを読み込む前に作業領域を一度だけ確保し、同じ形の配列を繰り返し集約できる。
+`StatisticsGeometry` は sealed トレイトで、利用者が実装を追加することはできない。
+`window` を `None` にして見積もった作業領域は、`statistics_into` のほかに標準化の `standardize_axes_into` と順位の `rank_axes_into` でも使え、移動ウインドウの `rolling_statistics_into` にはウインドウ `RollingWindow` を渡して見積もる。
+事前確保した後の出力先を指定する API は確保を行わず、失敗したときは出力を変えない。
+
+和・平均・分散・標準偏差・極値・幾何平均・調和平均・べき平均・円周統計・エントロピーは作業領域なしで計算でき、分位点・MAD・トリム平均・L モーメントのような順序に基づく量は、標本の写しを整列する領域を使う。
+
+### z スコア標準化
+
+標本 $x_1,\dots,x_n$ の z スコアは、平均 $\bar x$ と自由度 $n-\mathrm{ddof}$ で割った標準偏差
+
+$$
+s=\sqrt{\frac{1}{n-\mathrm{ddof}}\sum_{i=1}^n(x_i-\bar x)^2}
+$$
+
+を使って $z_i=(x_i-\bar x)/s$ と定義する。
+$\mathrm{ddof}=0$ は母集団の標準偏差、$\mathrm{ddof}=1$ は不偏分散の平方根を使う規約である。
+`standardize(scores, reference, ddof)` は、基準の標本 `reference` の $\bar x$ と $s$ で、別の標本 `scores` を標準化する。
+同じスライスを両方に渡すと通常の z スコアになり、異なる標本を渡すと、対照群を基準に処置群を測る z-map になる。
+複素数の標本では $s^2=\sum\lvert x_i-\bar x\rvert^2/(n-\mathrm{ddof})$ とし、実部と虚部の偏差をそれぞれ $s$ で割る。
+平均と 2 乗和は補償加算で累積し、平均を 2 個の `f64` の和として保持して偏差 $x_i-\bar x$ を両方の部分から作るので、大きな共通の値を持つ標本でも差の桁を失いにくい。
+$2^{-64}\le\lvert x\rvert<2^{65}$ の範囲を外れる成分を含む値は、指数の範囲を広げた算術で扱い、途中の値はあふれない。
+
+繰り返し標準化するときは、`StandardizationWorkspace::workspace_requirements(n, options)` で長さ $n$ までの `StandardizationRequirements` を求め、`try_reserve` した作業領域で `standardize_into` を呼ぶ。
+基準の標本が $n\le\mathrm{ddof}$ のとき、その標準偏差が 0 のとき、基準の標本か `scores` に NaN・無限大があるとき、`standardize` と `standardize_into` は `InvalidInput` を返し、z スコアがあふれると `NumericalInstability` を返す。
+軸に沿った `standardize_axes_into(view, ddof, options, output, workspace, context)` は各一括処理をその中の平均と標準偏差で標準化し、出力を一括処理の順に並べる。
+こちらは非有限値を `NonFinite` で拒み、すべての観測に z スコアが要るので、欠測や非有限値を除外する方針を `InvalidInput` で拒む。
+
+### 分位点の格子で母集団の値と照合する
+
+次のセルは一様分布・指数分布・ロジスティック分布の分位点関数 $Q$ を等間隔の確率 $u_i=(i-1/2)/n$ で評価した 3 行 $n$ 列の配列を作り、各行の平均、標準偏差（$\mathrm{ddof}=1$）、$l_2$、$t_3$、$t_4$ を `statistics_into` で求めて、上の表の母集団の値と並べる。
+分位点の格子は乱数を使わない標本なので、標本の量と母集団の値の差は $n$ を増やすと決まった速さで小さくなり、乱数による揺らぎと区別できる。
+作業領域は配列の値を作る前に `(StridedLayout, Axis)` の組から確保し、同じ作業領域で行ごとの z スコアも計算する。
+2 つ目の表は、z スコアの各行の平均と標準偏差が 0 と 1 になること、1 個目の z スコアが表の平均と標準偏差から手で計算した値と一致することを確かめる。
+
+```rust
+//| id: stats-descriptive-axis-moments
+//| ref: stats-descriptive-axis-moments
+//| title: 分位点の格子で L モーメント比と標準化を母集団の値と照合する
+//| run: reactive
+//| crates: [scioxide-core, scioxide-stats]
+//| inputs:
+//|   sample_size: {"type":"range","label":"各行の標本数 n [個]","description":"分位点の格子 u_i = (i − 1/2)/n の点数。","min":10,"max":2000,"step":10,"value":200}
+//| cases:
+//|   - {"id":"small","label":"n = 10","description":"格子が粗く、指数分布とロジスティック分布の標準偏差が母集団の値より小さくなり、l₂ と t₄ は大きくなる。","inputs":{"sample_size":10}}
+//|   - {"id":"large","label":"n = 2000","description":"l₂、t₃、t₄ と母集団の値の差が n = 200 の約 1/10 になる。","inputs":{"sample_size":2000}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"moments","path":"/rows/0/1","approx":{"value":0.5,"atol":1e-12}}
+//|       - {"artifact":"moments","path":"/rows/2/4","approx":{"value":0.3333,"atol":2e-3}}
+//|       - {"artifact":"moments","path":"/rows/4/5","approx":{"value":0.1667,"atol":5e-3}}
+//|       - {"artifact":"zscores","path":"/rows/0/1","range":{"min":-1e-12,"max":1e-12}}
+//|       - {"artifact":"zscores","path":"/rows/1/2","approx":{"value":1.0,"atol":1e-12}}
+//|       - {"artifact":"zscores","path":"/rows/2/3","range":{"min":0,"max":1e-12}}
+//|   - case: small
+//|     expect:
+//|       - {"artifact":"moments","path":"/rows/0/3","approx":{"value":0.183333,"atol":1e-6}}
+//|       - {"artifact":"moments","path":"/rows/2/2","range":{"min":0.7,"max":0.95}}
+//|   - case: large
+//|     expect:
+//|       - {"artifact":"moments","path":"/rows/2/4","approx":{"value":0.3333,"atol":3e-4}}
+use scioxide_core::{ExecutionContext, RealScalar, StridedLayout};
+use scioxide_stats::{
+    Axis, BatchView, LMomentNormalization, Statistic, StatisticValue, StatisticsOptions,
+    StatisticsWorkspace, standardize_axes_into, statistics_into,
+};
+
+let n = sample_size as usize;
+let (shape, strides) = ([3_usize, n], [n, 1_usize]);
+let layout = StridedLayout::new(&shape, &strides).map_err(|e| e.to_string())?;
+let (options, context) = (StatisticsOptions::new(), ExecutionContext::sequential());
+// 値を作る前に、配列の形 (StridedLayout, Axis) だけから作業領域を確保する。
+let req = StatisticsWorkspace::<f64>::workspace_requirements(
+    (layout, Axis::Index(1)),
+    None,
+    options,
+    context,
+)
+.map_err(|e| e.to_string())?;
+let mut workspace = StatisticsWorkspace::workspace(&req).map_err(|e| e.to_string())?;
+
+// 行 0: 一様 Q(u) = u、行 1: 指数 Q(u) = −ln(1 − u)、行 2: ロジスティック Q(u) = ln(u/(1 − u))
+let mut values = Vec::with_capacity(3 * n);
+for row in 0..3 {
+    for i in 0..n {
+        let u = (i as f64 + 0.5) / n as f64;
+        values.push(match row {
+            0 => u,
+            1 => -RealScalar::ln_1p(-u),
+            _ => RealScalar::ln(u / (1.0 - u)),
+        });
+    }
+}
+let view = BatchView::new(&values, layout, Axis::Index(1)).map_err(|e| e.to_string())?;
+let mut z = vec![0.0; 3 * n];
+standardize_axes_into(view, 1, options, &mut z, &mut workspace, context)
+    .map_err(|e| e.to_string())?;
+let mut by_row = |data: &[f64], request: Statistic<f64>| -> Result<[f64; 3], String> {
+    let view = BatchView::new(data, layout, Axis::Index(1)).map_err(|e| e.to_string())?;
+    let mut out = [StatisticValue::Location(0.0); 3];
+    statistics_into(view, request, options, &mut out, &mut workspace, context)
+        .map_err(|e| e.to_string())?;
+    let mut row = [0.0; 3];
+    for (slot, value) in row.iter_mut().zip(out) {
+        *slot = value.scalar().map_err(|e| e.to_string())?;
+    }
+    Ok(row)
+};
+let mean = by_row(&values, Statistic::mean())?;
+let sd = by_row(&values, Statistic::standard_deviation(1))?;
+let l2 = by_row(&values, Statistic::l_moment(2, LMomentNormalization::Raw))?;
+let t3 = by_row(
+    &values,
+    Statistic::l_moment(3, LMomentNormalization::Standardized),
+)?;
+let t4 = by_row(
+    &values,
+    Statistic::l_moment(4, LMomentNormalization::Standardized),
+)?;
+let z_mean = by_row(&z, Statistic::mean())?;
+let z_sd = by_row(&z, Statistic::standard_deviation(1))?;
+
+// 母集団の値 (平均, 標準偏差, λ₂, τ₃, τ₄)。ロジスティックの標準偏差は π/√3。
+let population = [
+    ("一様", [0.5, (1.0_f64 / 12.0).sqrt(), 1.0 / 6.0, 0.0, 0.0]),
+    ("指数", [1.0, 1.0, 0.5, 1.0 / 3.0, 1.0 / 6.0]),
+    (
+        "ロジスティック",
+        [
+            0.0,
+            core::f64::consts::PI / 3.0_f64.sqrt(),
+            1.0,
+            0.0,
+            1.0 / 6.0,
+        ],
+    ),
+];
+let mut moments = Vec::new();
+let mut zscores = Vec::new();
+for (row, (name, exact)) in population.iter().enumerate() {
+    let sample = [mean[row], sd[row], l2[row], t3[row], t4[row]];
+    moments.push((
+        format!("{name}（格子）"),
+        sample[0],
+        sample[1],
+        sample[2],
+        sample[3],
+        sample[4],
+    ));
+    moments.push((
+        format!("{name}（母集団）"),
+        exact[0],
+        exact[1],
+        exact[2],
+        exact[3],
+        exact[4],
+    ));
+    // 独立な検算: 1 個目の z スコアを表の平均と標準偏差から計算する。
+    let by_hand = (values[row * n] - mean[row]) / sd[row];
+    zscores.push((
+        name.to_string(),
+        z_mean[row],
+        z_sd[row],
+        (z[row * n] - by_hand).abs(),
+    ));
+}
+let fixed4 = serde_json::json!({ "fractionDigits": 4 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "分布" },
+    { "key": "1", "label": "平均 [-]", "type": "number", "format": fixed4 },
+    { "key": "2", "label": "標準偏差 [-]", "type": "number", "format": fixed4 },
+    { "key": "3", "label": "λ₂ または l₂ [-]", "type": "number", "format": fixed4 },
+    { "key": "4", "label": "τ₃ または t₃ [-]", "type": "number", "format": fixed4 },
+    { "key": "5", "label": "τ₄ または t₄ [-]", "type": "number", "format": fixed4 }
+]);
+emit_table_with_columns!(
+    columns,
+    moments,
+    metadata = serde_json::json!({ "id": "moments" })
+);
+let columns = serde_json::json!([
+    { "key": "0", "label": "分布" },
+    { "key": "1", "label": "z の平均 [-]", "type": "number", "format": sci2 },
+    {
+        "key": "2",
+        "label": "z の標準偏差 [-]",
+        "type": "number",
+        "format": { "fractionDigits": 15 }
+    },
+    { "key": "3", "label": "1 個目の z と手計算の差 [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    columns,
+    zscores,
+    metadata = serde_json::json!({ "id": "zscores" })
+);
+```
+
+既定の $n=200$ では、一様分布の格子の平均は 0.5 に一致し、対称な一様分布とロジスティック分布の $t_3$ は $10^{-16}$ 程度になる。
+指数分布の $t_3$ は 0.3343（母集団の値 $1/3$）、$t_4$ は 0.1679（$1/6\approx0.1667$）である。
+格子は確率 $1/(2n)$ より外側の分位点を含まないので、裾の長い指数分布とロジスティック分布では標準偏差が母集団の値より小さく（0.9912 と 1.8040、母集団では 1 と 1.8138）、$n=10$ では 0.9167 と 1.7198 まで下がる。
+$n=2000$ にすると、$l_2$、$t_3$、$t_4$ と母集団の値の差は $n=200$ のおよそ 1/10 になり、標準偏差の差は約 1/7 になる。
+z スコアの各行の平均は $10^{-17}$ 程度、標準偏差と 1 の差は $10^{-16}$ 程度で、1 個目の z スコアは表の平均と標準偏差から計算した値と一致する。
+
+## Box–Cox 変換と Yeo–Johnson 変換
+
+正の観測値 $x>0$ に対し、Box と Cox（1964）はべきパラメータ $\lambda$ を持つ変換
+
+$$
+\psi_{\mathrm{BC}}(x;\lambda)=\begin{cases}
+\dfrac{x^\lambda-1}{\lambda} & (\lambda\ne0)\\[1ex]
+\ln x & (\lambda=0)
+\end{cases}
+$$
+
+を考えた。
+$x^\lambda=e^{\lambda\ln x}=1+\lambda\ln x+O(\lambda^2)$ なので、$\lambda\to0$ の極限は $\ln x$ に一致し、$\psi_{\mathrm{BC}}$ は $\lambda$ について連続である。
+$\lambda=1$ は平行移動だけで分布の形を変えず、$\lambda<1$ は右の裾を縮め、$\lambda>1$ は左の裾を縮める。
+いずれの $\lambda$ でも $x$ について狭義に増加するので、順位は変わらない。
+
+Box–Cox 変換は正の値にしか使えない。
+Yeo と Johnson（2000）は、0 と負の値を含む実数の観測に、次の変換を提案した。
+
+$$
+\psi_{\mathrm{YJ}}(x;\lambda)=\begin{cases}
+\dfrac{(x+1)^\lambda-1}{\lambda} & (\lambda\ne0,\ x\ge0)\\[1ex]
+\ln(1+x) & (\lambda=0,\ x\ge0)\\[1ex]
+-\dfrac{(1-x)^{2-\lambda}-1}{2-\lambda} & (\lambda\ne2,\ x<0)\\[1ex]
+-\ln(1-x) & (\lambda=2,\ x<0)
+\end{cases}
+$$
+
+$x\ge0$ の枝は $x+1$ の Box–Cox 変換で、$x<0$ の枝は $-x$ の側に指数 $2-\lambda$ を使って折り返したものである。
+2 つの枝は $x=0$ で値と 1 階導関数（どちらも 1）が連続になる。
+
+`PowerTransform::BoxCox` と `PowerTransform::YeoJohnson` がこの 2 つの族を表す。
+どちらも、平行移動のパラメータ（Box–Cox の $\lambda_2$）は推定しない。
+`apply(x, lambda)` は 1 個の値を $O(1)$ で変換し、べきを `expm1` で計算するので、$\lambda=0$（Yeo–Johnson の負の枝では $\lambda=2$）の近くでも、$(x^\lambda-1)/\lambda$ の分子の桁落ちが起きない。
+`log_jacobian(x, lambda)` は後述の尤度に現れる $\ln\lvert d\psi/dx\rvert$ を返す。
+$x$ か $\lambda$ が NaN・無限大なら `NonFinite`、Box–Cox で $x\le0$ なら `InvalidInput`、結果があふれると `NumericalInstability` になる。
+スライス全体の変換は `power_transform_into(kind, samples, lambda, options, output, scratch, context)` で行い、`output` と `scratch` には標本と同じ長さの領域を渡す。
+
+## プロファイル対数尤度によるパラメータ推定
+
+### 変換した標本の尤度
+
+変換後の値 $y_i=\psi(x_i;\lambda)$ が独立に正規分布 $N(\mu,\sigma^2)$ に従うと仮定する。
+観測 $x_i$ の密度は、変数変換の公式により $y_i$ の正規密度に変換の導関数（ヤコビアン）$\lvert d\psi/dx\rvert$ を掛けたものなので、対数尤度は
+
+$$
+\ell(\lambda,\mu,\sigma^2)=-\frac n2\ln(2\pi\sigma^2)-\frac{1}{2\sigma^2}\sum_{i=1}^n(y_i-\mu)^2+\sum_{i=1}^n\ln\left\lvert\frac{d\psi}{dx}(x_i;\lambda)\right\rvert
+$$
+
+になる。
+ヤコビアンの項は Box–Cox では $(\lambda-1)\ln x_i$、Yeo–Johnson では $x_i\ge0$ で $(\lambda-1)\ln(1+x_i)$、$x_i<0$ で $(1-\lambda)\ln(1-x_i)$ である。
+この項がなければ、$\lambda$ を小さくして $y$ の散らばりを縮めるだけで尤度が増えてしまう。
+
+$\lambda$ を固定すると、$\mu$ と $\sigma^2$ の最尤推定量は $\bar y(\lambda)$ と $\hat\sigma^2(\lambda)=n^{-1}\sum_i(y_i-\bar y)^2$ である。
+これを代入して $\mu,\sigma^2$ を消去したものがプロファイル対数尤度で、定数 $-\tfrac n2(1+\ln2\pi)$ を除くと
+
+$$
+\ell_p(\lambda)=-\frac n2\ln\hat\sigma^2(\lambda)+\sum_{i=1}^n\ln\left\lvert\frac{d\psi}{dx}(x_i;\lambda)\right\rvert
+$$
+
+となる。
+$\lambda$ の最尤推定量 $\hat\lambda$ は $\ell_p$ を最大にする点である。
+尤度比検定の漸近論（Wilks の定理）により、$2\{\ell_p(\hat\lambda)-\ell_p(\lambda_0)\}$ は真の値 $\lambda_0$ で自由度 1 の $\chi^2$ 分布に近づく。
+したがって
+
+$$
+\left\{\lambda:\ \ell_p(\lambda)\ge\ell_p(\hat\lambda)-\tfrac12\chi^2_{1,\,0.95}\right\},\qquad \tfrac12\chi^2_{1,\,0.95}\approx1.9207
+$$
+
+が $\lambda$ の近似 95% 信頼区間（プロファイル尤度区間）になる。
+実務では、区間に入る切りのよい値（$0$、$\pm1/2$、$1$ など）を選んで解釈しやすくすることが多い（Box と Cox, 1964）。
+
+### アルゴリズムと API
+
+`power_transform_llf(kind, lambda, samples)` は上の $\ell_p(\lambda)$ を $O(n)$ で返す。
+変換値の分散は中心化した逐次更新で、ヤコビアンの項の和は補償加算で累積する。
+$\ln\hat\sigma^2$ は分散を丸める前に指数の範囲を広げた算術で対数を取るので、$\hat\sigma^2$ が `f64` でアンダーフローする場合でも正しい。
+標本が 2 個未満か、変換後の標本が定数なら `InvalidInput` を返す。
+
+$\hat\lambda$ の探索は、目的関数 $-\ell_p(\lambda)$ を `PreparedPowerFit` に準備し、利用者が渡すソルバー `FitSolver` で最小化する。
+`scioxide-stats` 自身は最適化法を持たず、たとえば `scioxide-optimize` の `LbfgsBFitSolver`（上下限付きの L-BFGS-B）を渡せる。
+一度だけ推定するなら `power_transform_normmax(kind, samples, method, bounds, initial, solver)` を使う。
+これは成功で終わらなかった探索をエラーにするワンショット呼び出しの形で、メモリ使用量の上限を変えてレポートをそのまま受け取るオプション付き形式 `power_transform_normmax_with_options` と、親の計算のコンテキストを渡すスコープ付き API `power_transform_normmax_scoped` もある。
+結果の `FitResult` では、`parameters()` が推定値（最後の評価の前に止まったときは `None`）を、`report()` が終了状態 `StatsTermination` と評価の回数を含むレポートを返す。
+`method` は基準を選び、`PowerFitMethod::Likelihood` は $\ell_p$ の最大化、`PowerFitMethod::Pearson` は次の節の確率プロットの相関の最大化である。
+
+### $\hat\lambda$ と尤度区間を確かめる
+
+次のセルは正規分布 $N(2,0.4^2)$ の値 $w$ から $x=w^{1/\lambda_0}$（$\lambda_0=0$ では $x=e^w$）を作る。
+$x^{\lambda_0}=w$ なので、$\psi_{\mathrm{BC}}(x;\lambda_0)=(w-1)/\lambda_0$ は正規分布に従い、真の $\lambda$ は $\lambda_0$ である（$w\le0$ の値は捨てるが、その確率は $3\times10^{-7}$ 程度である）。
+$\ell_p(\lambda)$ を $[-2,2]$ で描き、`power_transform_normmax_with_options` と `LbfgsBFitSolver` で $\hat\lambda$（尤度と相関の 2 つの基準）を求め、尤度区間の端を二分法で求めて、区間が $\lambda_0$ を含むかを表で示す。
+標本と 2 つの推定値は次の節のセルに渡す。
+
+```rust
+//| id: stats-boxcox-profile-likelihood
+//| ref: stats-boxcox-profile-likelihood
+//| title: Box–Cox 変換の λ を最尤推定し、プロファイル尤度区間と照合する
+//| run: reactive
+//| crates: [scioxide-core, scioxide-optimize, scioxide-random, scioxide-stats]
+//| exports: [samples, true_lambda, likelihood_lambda, pearson_lambda]
+//| inputs:
+//|   true_lambda: {"type":"range","label":"真の λ₀ [-]","description":"x^λ₀ が正規分布に従うように標本を作る。","min":-1,"max":1,"step":0.25,"value":0}
+//|   sample_size: {"type":"range","label":"標本数 n [個]","description":"区間の幅はおよそ 1/√n で狭くなる。","min":20,"max":400,"step":10,"value":60}
+//|   sampling_seed: {"type":"integer","label":"乱数のシード","min":0,"max":100000,"value":7}
+//| cases:
+//|   - {"id":"square-root","label":"λ₀ = 0.5","description":"平方根の変換で正規になる標本で、区間は 0.5 を含み、0 をわずかに外れる。","inputs":{"true_lambda":0.5}}
+//|   - {"id":"large-sample","label":"n = 400","description":"区間の幅が n = 60 の約 0.35 倍になる。","inputs":{"sample_size":400}}
+//|   - {"id":"unlucky-seed","label":"シード 21","description":"95% 区間が真の λ₀ を外す標本の例。","inputs":{"sampling_seed":21}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"estimates","path":"/rows/0/2","approx":{"value":-0.0142,"atol":0.01}}
+//|       - {"artifact":"estimates","path":"/rows/0/4","approx":{"value":-0.5495,"atol":0.01}}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+//|   - case: square-root
+//|     expect:
+//|       - {"artifact":"estimates","path":"/rows/0/2","approx":{"value":0.468,"atol":0.01}}
+use scioxide_core::{Bounds, RealScalar};
+use scioxide_optimize::{LbfgsB, LbfgsBFitSolver};
+use scioxide_random::{Distribution, Normal, SeedableRng, SplitMix64};
+use scioxide_stats::{
+    PowerFitMethod, PowerTransform, StatisticsOptions, power_transform_llf,
+    power_transform_normmax_with_options,
+};
+
+// w ~ N(2, 0.4²) を正に限り、x = w^(1/λ₀)（λ₀ = 0 では e^w）にする。
+let n = sample_size as usize;
+let mut rng = SplitMix64::from_seed(sampling_seed as u64);
+let law = Normal::<f64>::new(2.0, 0.4).map_err(|e| e.to_string())?;
+let mut samples = Vec::with_capacity(n);
+while samples.len() < n {
+    let w = law.sample(&mut rng).map_err(|e| e.to_string())?;
+    if w > 0.0 {
+        samples.push(if true_lambda == 0.0 {
+            RealScalar::exp(w)
+        } else {
+            RealScalar::powf(w, 1.0 / true_lambda)
+        });
+    }
+}
+let llf = |lambda: f64| power_transform_llf(PowerTransform::BoxCox, lambda, &samples);
+let curve: Vec<[f64; 2]> = (0..=80)
+    .map(|i| {
+        let lambda = -2.0 + 0.05 * f64::from(i);
+        llf(lambda).map(|value| [lambda, value])
+    })
+    .collect::<Result<_, _>>()
+    .map_err(|e| e.to_string())?;
+
+// 2 つの基準で λ̂ を求める。探索範囲は [−3, 3]、初期値は 1（無変換）。
+let bounds = Bounds::new(vec![(Some(-3.0), Some(3.0))]).map_err(|e| e.to_string())?;
+let estimate = |method: PowerFitMethod| -> Result<(f64, String, bool), String> {
+    let mut solver = LbfgsBFitSolver::new(LbfgsB::default(), 1).map_err(|e| e.to_string())?;
+    let fit = power_transform_normmax_with_options(
+        PowerTransform::BoxCox,
+        &samples,
+        method,
+        &bounds,
+        1.0,
+        &mut solver,
+        StatisticsOptions::new(),
+    )
+    .map_err(|e| e.to_string())?;
+    let termination = fit.report().termination();
+    let lambda = fit.parameters().ok_or("推定値がない")?[0];
+    Ok((lambda, format!("{termination:?}"), termination.is_success()))
+};
+let (likelihood_lambda, likelihood_status, converged) = estimate(PowerFitMethod::Likelihood)?;
+let (pearson_lambda, pearson_status, _) = estimate(PowerFitMethod::Pearson)?;
+
+// 尤度区間の端: ℓ_p(λ) = ℓ_p(λ̂) − χ²₁(0.95)/2 を、λ̂ と ±3 の間の二分法で解く。
+let half_chi2 = 0.5 * 3.841458820694124;
+let peak = llf(likelihood_lambda).map_err(|e| e.to_string())?;
+let endpoint = |outer: f64| -> Result<Option<f64>, String> {
+    let gap = |lambda: f64| llf(lambda).map(|v| peak - v - half_chi2);
+    if gap(outer).map_err(|e| e.to_string())? < 0.0 {
+        return Ok(None);
+    }
+    let (mut inside, mut outside) = (likelihood_lambda, outer);
+    for _ in 0..60 {
+        let middle = 0.5 * (inside + outside);
+        if gap(middle).map_err(|e| e.to_string())? < 0.0 {
+            inside = middle;
+        } else {
+            outside = middle;
+        }
+    }
+    Ok(Some(0.5 * (inside + outside)))
+};
+let (lower, upper) = (endpoint(-3.0)?, endpoint(3.0)?);
+let covered = lower.is_none_or(|l| l <= true_lambda) && upper.is_none_or(|u| true_lambda <= u);
+
+let fixed3 = serde_json::json!({ "fractionDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "基準" },
+    { "key": "1", "label": "終了状態" },
+    { "key": "2", "label": "λ̂ [-]", "type": "number", "format": fixed3 },
+    { "key": "3", "label": "ℓ_p(λ̂) [-]", "type": "number", "format": fixed3 },
+    {
+        "key": "4",
+        "label": "95% 区間の下端 [-]",
+        "type": "number",
+        "format": fixed3,
+        "nullText": "−3 より外"
+    },
+    {
+        "key": "5",
+        "label": "95% 区間の上端 [-]",
+        "type": "number",
+        "format": fixed3,
+        "nullText": "3 より外"
+    }
+]);
+let pearson_llf = llf(pearson_lambda).map_err(|e| e.to_string())?;
+let rows = vec![
+    (
+        "尤度 Likelihood",
+        likelihood_status.clone(),
+        likelihood_lambda,
+        peak,
+        lower,
+        upper,
+    ),
+    (
+        "相関 Pearson",
+        pearson_status,
+        pearson_lambda,
+        pearson_llf,
+        None,
+        None,
+    ),
+];
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "estimates" })
+);
+
+let mut markers = vec![
+    serde_json::json!({ "kind": "line", "axis": "x", "value": true_lambda, "label": "真の λ₀" }),
+    serde_json::json!({
+        "kind": "line",
+        "axis": "y",
+        "value": peak - half_chi2,
+        "label": "ℓ_p(λ̂) − 1.92"
+    }),
+];
+if let (Some(from), Some(to)) = (lower, upper) {
+    markers.push(serde_json::json!({
+        "kind": "range",
+        "axis": "x",
+        "from": from,
+        "to": to,
+        "label": "95% 尤度区間"
+    }));
+}
+emit_line_chart!(
+    &vec![serde_json::json!({ "name": "プロファイル対数尤度 ℓ_p(λ)", "points": curve })],
+    options = &serde_json::json!({
+        "xLabel": "Box–Cox の λ [-]",
+        "yLabel": "ℓ_p(λ)（定数を除く）[-]",
+        "annotations": markers
+    })
+);
+export!(samples, samples);
+export!(true_lambda, true_lambda);
+export!(likelihood_lambda, likelihood_lambda);
+export!(pearson_lambda, pearson_lambda);
+let outcome = if converged {
+    Outcome::satisfied("尤度の基準で λ̂ の探索が収束した").explanation(if covered {
+        "95% 尤度区間は真の λ₀ を含む。"
+    } else {
+        "この標本では 95% 尤度区間が真の λ₀ を外した。"
+    })
+} else {
+    Outcome::partial("探索が収束せずに止まった")
+        .explanation("表の λ̂ は止まった時点の値で、最大点とは限らない。")
+};
+emit_outcome!(
+    outcome
+        .status(likelihood_status)
+        .diagnostic("λ̂", likelihood_lambda, None)
+);
+```
+
+既定の $\lambda_0=0$、$n=60$、シード 7 では、尤度の基準の $\hat\lambda$ は $-0.014$、95% 尤度区間は $[-0.549,0.529]$ で、真の値 0 を含む。
+区間は $\pm1/2$ も含むので、この標本だけでは対数変換と平方根の変換を区別できないが、無変換の $\lambda=1$ は区間の外にある。
+相関の基準の $\hat\lambda=-0.024$ は尤度の基準に近く、その点の $\ell_p$ は最大値より $6.5\times10^{-4}$ だけ小さい。
+$\lambda_0=0.5$ では $\hat\lambda=0.468$、区間は $[-0.038,1.005]$ である。
+$n=400$ では区間が $[-0.154,0.218]$ に縮み、幅は $n=60$ の約 0.35 倍で、$\sqrt{60/400}\approx0.39$ に近い。
+シード 21 の標本では $\hat\lambda=-0.761$、区間は $[-1.353,-0.202]$ で、真の値 0 を含まない。
+95% 区間は、標本の約 5% でこのように真の値を外す。
+この例の $w$ は変動係数が $0.4/2=0.2$ と小さく、どの $\lambda$ でも変換後の分布が正規分布に近いので、標本が $\lambda$ について持つ情報は少ない。
+
+## 正規確率プロットと PPCC
+
+### Filliben の打点位置
+
+正規確率プロット（Q–Q プロット）は、整列した標本 $x_{(1)}\le\cdots\le x_{(n)}$ を、正規分布の分位点 $\Phi^{-1}(m_i)$ に対して打点した図である。
+標本が正規分布 $N(\mu,\sigma^2)$ に従うなら、$x_{(i)}\approx\mu+\sigma\Phi^{-1}(m_i)$ なので、点は傾き $\sigma$、切片 $\mu$ の直線の近くに並ぶ。
+右の裾が長い標本では右上の点が直線より上に、裾の短い標本では両端の点が直線の内側に外れる。
+
+$m_i$ は打点位置と呼ばれ、$U(0,1)$ の順序統計量 $U_{(i)}$ の代表値を選ぶ規約である。
+Filliben（1975）は $U_{(i)}$ の中央値を近似する
+
+$$
+m_1=1-0.5^{1/n},\qquad m_n=0.5^{1/n},\qquad m_i=\frac{i-0.3175}{n+0.365}\quad(1<i<n)
+$$
+
+を使った。
+両端の $m_1$ と $m_n$ は $U_{(1)}$ と $U_{(n)}$ の中央値そのものである。
+`scioxide-stats` の確率プロットはこの位置を使い、Blom の $(i-3/8)/(n+1/4)$ や Hazen の $(i-1/2)/n$ は使わない。
+
+### 確率プロット相関係数（PPCC）
+
+打点 $(\Phi^{-1}(m_i),x_{(i)})$ の Pearson 相関係数 $r$ を確率プロット相関係数（PPCC）と呼ぶ。
+$r\le1$ で、点が直線に近いほど 1 に近づく。
+Filliben は正規母集団からの標本で $r$ の分布の下側の分位点を表にし、$r$ が小さすぎるときに正規性を棄却する検定を作った。
+$r$ は位置と尺度を変えても変わらないので、$\mu$ と $\sigma$ を推定せずに形だけを比べられる。
+
+べき変換では、変換後の標本の PPCC を最大にする $\lambda$ を選ぶこともできる（`PowerFitMethod::Pearson`）。
+尤度の基準は正規モデルの尤度を最大にし、相関の基準は Q–Q プロットの直線性を最大にするので、2 つの $\hat\lambda$ は一般に一致しないが、正規モデルが正しければどちらも $\lambda_0$ の近くに来る。
+相関の基準には尤度区間のような確率的な解釈がないので、区間を求めるときは尤度の基準を使う。
+
+`probplot(samples, model, parameters)` は、分布のモデル `DistributionFitModel`（または `FitModel` を実装した型）の分位点関数と母数で $Q(m_i)$ を計算し、整列した標本と組にした `ProbabilityPlot` を返す。
+`theoretical()` が $Q(m_i)$、`ordered()` が整列した標本、`fit()` が `ProbabilityPlotFit`（最小 2 乗直線の傾き `slope`、切片 `intercept`、相関 `correlation`）である。
+`correlation` は標本が定数のとき `None` になる。
+計算は 1 回の整列 $O(n\log n)$ と $n$ 回の分位点の評価である。
+標本が 2 個未満なら `InvalidInput`、NaN・無限大があれば `NonFinite` を返す。
+オプション付き形式 `probplot_with_options` は `StatisticsOptions` の `max_bytes` を図の 2 本のベクトルの上限に使い、超えると `ResourceLimit` を返す。
+
+分布族の形の母数（Tukey の λ 分布の $\lambda$ や Weibull 分布の形状母数など）を PPCC の最大化で選ぶときは、`PreparedPpcc::new(samples, model, bounds, integer, options)` で目的関数 $-r(\theta)$ を準備し、`ppcc_max(problem, initial, solver)` で最大化する（範囲は `PreparedPpcc` に渡した `bounds` を使う）。
+オプション付き形式 `ppcc_max_with_options` とスコープ付き API `ppcc_max_scoped` もある。
+`PreparedPpcc` は標本を一度だけ整列し、各評価ではモデルの分位点を $n$ 回計算する。
+
+### 選んだ λ の確率プロット
+
+次のセルは前のセルの標本を受け取り、選んだ $\lambda$ で Box–Cox 変換した標本の正規確率プロットを描く。
+最小 2 乗直線は破線で重ねる。
+表は選んだ $\lambda$、尤度の $\hat\lambda$、相関の $\hat\lambda$、無変換（$\lambda=1$）での PPCC と $\ell_p$ を並べる。
+`theoretical()` の両端と中央の値を、Filliben の式と `scioxide-random` の正規分布の分位点から独立に計算した値と照合する。
+
+```rust
+//| id: stats-boxcox-probability-plot
+//| ref: stats-boxcox-probability-plot
+//| title: 選んだ λ で変換した標本の正規確率プロットと PPCC
+//| run: reactive
+//| crates: [scioxide-random, scioxide-stats]
+//| dependsOn:
+//|   fit: stats-boxcox-profile-likelihood
+//| inputs:
+//|   selected_lambda: {"type":"range","label":"確率プロットに使う λ [-]","description":"Box–Cox 変換のパラメータ。0 は対数変換、1 は無変換。","min":-1,"max":2,"step":0.05,"value":1}
+//| cases:
+//|   - {"id":"logarithm","label":"λ = 0","description":"既定の標本では真の λ₀ = 0 なので、点がほぼ直線に並ぶ。","inputs":{"selected_lambda":0}}
+//|   - {"id":"over-transformed","label":"λ = −1","description":"変換しすぎて左の裾が長くなり、左下の点が直線より下に外れる。","inputs":{"selected_lambda":-1}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"positions","path":"/rows/0/3","range":{"min":0,"max":1e-12}}
+//|       - {"artifact":"positions","path":"/rows/1/3","range":{"min":0,"max":1e-12}}
+//|       - {"artifact":"positions","path":"/rows/2/3","range":{"min":0,"max":1e-12}}
+//|   - case: logarithm
+//|     expect:
+//|       - {"artifact":"ppcc","path":"/rows/0/2","range":{"min":0.97,"max":1.0}}
+use scioxide_random::{Normal, Quantile};
+use scioxide_stats::{DistributionFitModel, PowerTransform, power_transform_llf, probplot};
+
+let samples: Vec<f64> = fit["samples"]
+    .as_array()
+    .ok_or("標本がない")?
+    .iter()
+    .map(|v| v.as_f64().ok_or("標本が数でない"))
+    .collect::<Result<_, _>>()?;
+let likelihood_lambda = fit["likelihood_lambda"].as_f64().ok_or("尤度の λ̂ がない")?;
+let pearson_lambda = fit["pearson_lambda"].as_f64().ok_or("相関の λ̂ がない")?;
+
+// 変換した標本の確率プロット、PPCC、ℓ_p を返す。
+let plot_at = |lambda: f64| -> Result<(scioxide_stats::ProbabilityPlot<f64>, f64), String> {
+    let transformed: Vec<f64> = samples
+        .iter()
+        .map(|&x| PowerTransform::BoxCox.apply(x, lambda))
+        .collect::<Result<_, _>>()
+        .map_err(|e| e.to_string())?;
+    let plot = probplot(&transformed, &DistributionFitModel::Normal, &[0.0, 1.0])
+        .map_err(|e| e.to_string())?;
+    let llf = power_transform_llf(PowerTransform::BoxCox, lambda, &samples)
+        .map_err(|e| e.to_string())?;
+    Ok((plot, llf))
+};
+let mut rows = Vec::new();
+for (name, lambda) in [
+    ("選んだ λ", selected_lambda),
+    ("尤度の λ̂", likelihood_lambda),
+    ("相関の λ̂", pearson_lambda),
+    ("無変換 λ = 1", 1.0),
+] {
+    let (plot, llf) = plot_at(lambda)?;
+    rows.push((name, lambda, plot.fit().correlation, llf));
+}
+let (plot, _) = plot_at(selected_lambda)?;
+let fit_line = plot.fit();
+let points: Vec<[f64; 2]> = plot
+    .theoretical()
+    .iter()
+    .zip(plot.ordered())
+    .map(|(&q, &y)| [q, y])
+    .collect();
+let ends = [points[0][0], points[points.len() - 1][0]];
+let line: Vec<[f64; 2]> = ends
+    .iter()
+    .map(|&q| [q, fit_line.intercept + fit_line.slope * q])
+    .collect();
+
+// 独立な検算: Filliben の位置 m_i を式で作り、scioxide-random の Φ⁻¹ で分位点にする。
+let n = samples.len();
+let normal = Normal::<f64>::new(0.0, 1.0).map_err(|e| e.to_string())?;
+let tail = 0.5_f64.powf(1.0 / n as f64);
+let middle = n / 2;
+let positions = [
+    (1, 1.0 - tail),
+    (
+        middle + 1,
+        (middle as f64 + 1.0 - 0.3175) / (n as f64 + 0.365),
+    ),
+    (n, tail),
+];
+let mut checks = Vec::new();
+for (rank, m) in positions {
+    let reference = normal.quantile(m).map_err(|e| e.to_string())?;
+    let value = plot.theoretical()[rank - 1];
+    checks.push((rank, m, value, (value - reference).abs()));
+}
+
+let fixed3 = serde_json::json!({ "fractionDigits": 3 });
+let fixed5 = serde_json::json!({ "fractionDigits": 5 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "λ の選び方" },
+    { "key": "1", "label": "λ [-]", "type": "number", "format": fixed3 },
+    { "key": "2", "label": "PPCC r [-]", "type": "number", "format": fixed5, "nullText": "定数" },
+    { "key": "3", "label": "ℓ_p(λ) [-]", "type": "number", "format": fixed3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "ppcc" })
+);
+let columns = serde_json::json!([
+    { "key": "0", "label": "順位 i", "type": "integer" },
+    { "key": "1", "label": "打点位置 m_i [-]", "type": "number", "format": fixed5 },
+    { "key": "2", "label": "theoretical()[i] [-]", "type": "number", "format": fixed5 },
+    {
+        "key": "3",
+        "label": "Φ⁻¹(m_i) との差 [-]",
+        "type": "number",
+        "format": { "notation": "scientific", "significantDigits": 2 }
+    }
+]);
+emit_table_with_columns!(
+    columns,
+    checks,
+    metadata = serde_json::json!({ "id": "positions" })
+);
+emit_chart!(
+    serde_json::json!({
+        "kind": "xy",
+        "dataZoom": true,
+        "tooltip": true,
+        "xLabel": "標準正規分布の分位点 Φ⁻¹(m_i) [-]",
+        "yLabel": "変換した標本 ψ(x; λ) の順序統計量 [-]",
+        "layers": [
+            {
+                "id": "points",
+                "kind": "scatter",
+                "name": "打点 (Φ⁻¹(m_i), y₍ᵢ₎)",
+                "points": points
+            },
+            {
+                "id": "line",
+                "kind": "line",
+                "name": "最小 2 乗直線",
+                "points": line,
+                "style": { "lineType": "dashed", "showSymbol": false }
+            }
+        ]
+    }),
+    metadata = serde_json::json!({ "id": "qq" })
+);
+```
+
+既定の $\lambda=1$（無変換）では PPCC は 0.9632 で、図の右上の点が直線より上に外れ、右の裾が長いことを示す。
+$\lambda=0$ では PPCC が 0.9967 に上がり、尤度の $\hat\lambda=-0.014$ と相関の $\hat\lambda=-0.024$ での値（どちらも 0.99676）とほとんど変わらない。
+$\lambda=-1$ では変換しすぎて PPCC が 0.9625 に下がり、左下の点が直線より下に外れる。
+$\ell_p$ も $\lambda=\pm1$ では $\hat\lambda$ より約 6.5 小さく、2 つの基準は同じ範囲の $\lambda$ を良いと判断する。
+打点位置の検算では、`theoretical()` の 1 番目、31 番目、60 番目の値が $\Phi^{-1}(m_i)$ と一致する。
+
+## まとめ
+
+統計量は `Statistic` の構築関数で選び、定義されないスカラー型と重みの組はコンパイルの段階で除かれる。
+L モーメントの比 $t_3,t_4$ は高次モーメントを必要としない形の要約で、`LMomentNormalization` で生の値と比を選ぶ。
+多次元配列の集約は、形だけから `StatisticsWorkspace` を確保して `statistics_into` と `standardize_axes_into` で繰り返し実行でき、z スコアの規約は `ddof` で明示する。
+正の標本は Box–Cox 変換、0 と負の値を含む標本は Yeo–Johnson 変換で正規分布に近づけ、$\lambda$ はプロファイル対数尤度の最大点と、$\ell_p(\hat\lambda)-1.92$ までの尤度区間で返す。
+変換の結果は Filliben の打点位置による確率プロットと PPCC で確かめ、区間に入る切りのよい $\lambda$ を選ぶと解釈しやすい。
+
+## 次に読むページ
+
+- [順序統計・極値・ロバスト位置推定量](../order-statistics-and-robust-estimation/)：外れ値に強い位置と尺度、シグマクリッピングと移動ウインドウの統計量を確かめる。
+- [分布フィッティング・反転信頼限界](../distribution-fitting-and-confidence-limits/)：`FitSolver` を注入する最尤推定を、変換ではなく分布のモデルで行う方法を確かめる。
+- [分布適合度検定と分散等質性検定](../distribution-and-variance-tests/)：変換後の標本の正規性を Shapiro–Wilk 検定などで検定するときの帰無分布と較正を確かめる。
+- [円周統計・情報量・分布間距離の数理](../circular-information-and-distances/)：角度の平均や分布の間の距離のように、通常のモーメントでは扱えない要約を確かめる。

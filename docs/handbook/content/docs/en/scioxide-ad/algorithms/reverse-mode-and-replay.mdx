@@ -1,0 +1,683 @@
+---
+title: "Reverse mode and tapes"
+description: "Derive adjoint accumulation from the chain rule; examine Var tape-recording rules, azmul reverse updates and their accuracy, Tape::gradient_into and Linearization VJP, JVP and Jacobians, JacobianMode sweep-direction selection, and one-shot grad, value_and_grad, vjp and jacobian calls."
+sidebar:
+  order: 315
+references:
+  ad-adjoint-accumulation: "adjoint-definition-and-accumulation"
+  ad-vjp-jvp-duality: "vjp-and-jvp-duality"
+  ad-var-recording-rules: "var-and-statement-recording-rules"
+  ad-reverse-sweep: "reverse-sweep-procedure-and-accuracy"
+  ad-tape-gradient: "gradients-with-a-tape"
+  ad-linearization-products: "linearization-and-products"
+  ad-jacobian-mode: "jacobian-assembly-direction"
+  ad-one-shot-reverse: "one-shot-functions"
+---
+
+Computing the gradient of a scalar function $f: \mathbb{R}^n \to \mathbb{R}$ with [forward mode and dual numbers](../forward-mode/) requires one evaluation per input direction, $n$ evaluations in total.
+Reverse mode sends output sensitivities back from outputs to inputs once, obtaining all $n$ partial derivatives together.
+It must retain the computation order and each operation's local partial derivatives until this backward propagation.
+`scioxide-ad` calls this recording a tape and stores it in a caller-owned `Tape`.
+This page derives adjoint accumulation from the chain rule and explains `Var` statement-recording rules, reverse-sweep procedures and accuracy, tape gradients and linearization, Jacobian assembly direction and one-shot functions.
+[Tape lifecycle and reuse](../tape-lifecycle/) covers capacity, reports and failures when reusing the same tape at many points.
+
+## Adjoint definition and accumulation
+
+Write function evaluation as a sequence of operations defining each value exactly once.
+Let the inputs be $v_1 = x_1, \dots, v_n = x_n$ and construct subsequent values as follows:
+
+$$
+v_i = \varphi_i\bigl(v_j\bigr)_{j \in P(i)}, \qquad P(i) \subset \{1, \dots, i - 1\}, \qquad i = n + 1, \dots, N
+$$
+
+The output is $f(\mathbf{x}) = v_N$.
+$\varphi_i$ is an operation such as arithmetic or an elementary function; $P(i)$ is the set of its argument indices.
+Write local partial derivatives at the evaluation point as $c_{ij} = \partial \varphi_i / \partial v_j$ ($j \in P(i)$).
+
+The adjoint $\bar v_j$ of $v_j$ is the rate of change $\partial v_N / \partial v_j$ of the output when only $v_j$ moves and subsequent operations are recomputed.
+Every path by which $v_j$ affects the output must pass through an operation $\varphi_i$ ($j \in P(i)$) using $v_j$ as an argument.
+The chain rule therefore gives
+
+$$
+\bar v_N = 1, \qquad \bar v_j = \sum_{i \,:\, j \in P(i)} \bar v_i \, c_{ij}
+$$
+
+and input adjoints $\bar v_1, \dots, \bar v_n$ are the components of gradient $\nabla f(\mathbf{x})$.
+Since $j \in P(i)$ implies $i > j$, traversing operations in order $i = N, N - 1, \dots, n + 1$ and adding $\bar v_i c_{ij}$ to every argument $j$ at each $i$ completes $\bar v_i$ before it is used.
+This single backward traversal is called a reverse sweep.
+
+Adjoint updates must add rather than assign.
+When a value is an argument of several operations, assignment would lose contributions from other paths.
+
+For example, consider $u = x_1 x_2$ and $f = u^2 + \sin u$.
+$u$ is an argument of two operations; writing $u^2$ as product $u \cdot u$ also makes it both arguments of the same operation.
+
+| Value | Operation | Local partial derivatives | Adjoint additions in reverse sweep |
+|---|---|---|---|
+| $v_1 = x_1$, $v_2 = x_2$ | Inputs | None | None |
+| $v_3 = v_1 v_2$ | Product | $c_{31} = v_2$, $c_{32} = v_1$ | $\bar v_1 \mathrel{+}= \bar v_3 v_2$, $\bar v_2 \mathrel{+}= \bar v_3 v_1$ |
+| $v_4 = v_3 v_3$ | Product | $v_3$ for both arguments | $\bar v_3 \mathrel{+}= \bar v_4 v_3$ twice |
+| $v_5 = \sin v_3$ | Elementary function | $c_{53} = \cos v_3$ | $\bar v_3 \mathrel{+}= \bar v_5 \cos v_3$ |
+| $v_6 = v_4 + v_5$ | Sum | $c_{64} = c_{65} = 1$ | $\bar v_4 \mathrel{+}= \bar v_6$, $\bar v_5 \mathrel{+}= \bar v_6$ |
+
+Executing the table from bottom to top with $\bar v_6 = 1$ gives $\bar v_3 = 2u + \cos u$.
+Gradient $(\bar v_1, \bar v_2) = \bigl((2u + \cos u)\,x_2,\ (2u + \cos u)\,x_1\bigr)$ agrees with direct differentiation $\partial f / \partial x_1 = 2 x_1 x_2^2 + x_2 \cos(x_1 x_2)$.
+$u$ is evaluated once, and three contributions are added to its adjoint.
+
+## VJP and JVP duality
+
+For a map $F: \mathbb{R}^n \to \mathbb{R}^m$ with $m$ outputs, seed output adjoints with cotangent vector $\mathbf{w} \in \mathbb{R}^m$.
+The reverse sweep gives $\bar{\mathbf{x}} = \mathbf{J}^\mathsf{T} \mathbf{w}$, called a vector-Jacobian product (VJP).
+$\mathbf{J} \in \mathbb{R}^{m \times n}$ is the Jacobian of $F$, with rows corresponding to outputs and columns to inputs.
+Traversing the same recording once from the beginning and computing $\dot v_i = \sum_{j \in P(i)} c_{ij} \dot v_j$ from input tangent $\dot{\mathbf{x}}$ gives the Jacobian-vector product (JVP) $\mathbf{J}\dot{\mathbf{x}}$ at the outputs.
+This single forward traversal is called a tangent sweep.
+
+Operation $i$ corresponds to linear map $\mathbf{D}_i$, replacing component $i$ of the full tangent vector $(\dot v_1, \dots, \dot v_N)$ with $\sum_j c_{ij} \dot v_j$.
+Writing input embedding as $\mathbf{P}_{\mathrm{in}}$ and output extraction as $\mathbf{P}_{\mathrm{out}}$ gives $\mathbf{J} = \mathbf{P}_{\mathrm{out}} \mathbf{D}_N \cdots \mathbf{D}_{n+1} \mathbf{P}_{\mathrm{in}}$.
+A JVP evaluates this product starting from $\dot{\mathbf{x}}$; a VJP evaluates the transposed product $\mathbf{P}_{\mathrm{in}}^\mathsf{T} \mathbf{D}_{n+1}^\mathsf{T} \cdots \mathbf{D}_N^\mathsf{T} \mathbf{P}_{\mathrm{out}}^\mathsf{T}$ starting from $\mathbf{w}$.
+Thus, for every $\mathbf{w}$ and $\dot{\mathbf{x}}$,
+
+$$
+\langle \mathbf{w}, \mathbf{J}\dot{\mathbf{x}} \rangle = \langle \mathbf{J}^\mathsf{T}\mathbf{w}, \dot{\mathbf{x}} \rangle
+$$
+
+and this identity can check the implementation (example: [JVP and VJP duality](../../examples/jvp-vjp-duality/)).
+
+Forward and reverse sweeps each use every $c_{ij}$ once, so one JVP and one VJP each cost a constant multiple of evaluating $F$.
+A scalar-function gradient is obtained with one VJP using $\mathbf{w} = 1$, at cost independent of input dimension $n$.
+Griewank and Walther showed that this constant is independent of $n$ in a cost model counting arithmetic, nonlinear operations and memory movement ([Bibliography](../../../reference/bibliography/)).
+The full Jacobian can be assembled from $n$ JVPs (one per column) or $m$ VJPs (one per row), seeded with unit vectors.
+
+A reverse sweep traverses operations backward using point-dependent $c_{ij}$.
+Forward evaluation must therefore retain local partial derivatives, so memory use is proportional to the number of operations $N$.
+Forward mode propagating tangents with `Dual` needs no such recording.
+
+## `Var` and statement-recording rules
+
+As with other number types, write reverse-mode functions once as generic functions for `R: Real` ([Number types, lanes and generic code](../number-types-and-lanes/)).
+`Tape::<V>::new(options)` creates an empty tape; transforms (tape differentiation functions such as `gradient_into` and `linearize`) execute the function with `Var<'t, V>` inputs.
+`Var` holds a value and the position of its defining statement (one tape record).
+The tape is a collection of flat vectors: 64-bit words describing statements, partial derivatives, an adjoint per word and a call table.
+Unary and binary statements use one word; word counts for multi-argument and call statements are described below.
+Transforms construct a recorder on their own stack, and `Var` operators append statements through it, using no thread-local or global state.
+
+`V` is a tape-recordable value type; sealed trait `TapeValue` restricts it to `f32`, `f64`, `Lanes<S, W>` and `Dual`, `MultiDual` and `Jet` built on them.
+`Tape<Lanes<f64, 8>>` obtains gradients across 8 lanes, or 8 independent points, in one recording.
+`Tape<Dual<f64>>` attaches directional derivatives to recorded values to compute Hessian-vector products ([Second derivatives and Hessian operators](../second-order-derivatives/)).
+
+Values depending on recording inputs are active; those independent of them are passive.
+`Var::is_active` returns this distinction; `Var::value` returns the value.
+Values constructed with `Real::constant`, `Real::passive` and `Real::lift` are passive.
+Operations record the following statements.
+In the table, $x$ and $y$ are differentiated values; $c$ is a scalar `S` constant or undifferentiated value.
+
+| Operation | Recording |
+|---|---|
+| Operation with only passive operands | Records nothing and returns an undifferentiated value |
+| $x + c$, $x - c$, $c + x$ | Records nothing and reuses $x$'s position |
+| $-x$, $c - x$ | Unary statement with partial derivative $-1$ |
+| $x \cdot c$, $c \cdot x$, $x / c$ | Unary statement with constant partial derivative ($c$ or $1/c$) |
+| $x + y$, $x - y$ | Binary statement with partial derivatives $\pm 1$. Partial-derivative values are not stored |
+| $x \cdot y$ | Binary statement with partial derivatives $y$ and $x$ |
+| $x / y$, $c / x$, elementary functions, two-argument functions | Unary or binary statement with partial derivatives at the evaluation point |
+| `floor`, `ceil`, `round`, `trunc`, `signum` | Zero derivative: records nothing and returns an undifferentiated value (kink encounters are counted) |
+| `dot`, `Real::combine`, lane-type `Real::gather` | One statement regardless of argument count |
+| `solve_into`, `checkpointed_loop`, `Var::external` | One call statement |
+
+A multi-argument statement uses one word per argument plus two surrounding words; a call statement additionally uses one word per output.
+Comparisons (such as `lt`) only compare values and record nothing.
+On scalar tapes, `select` and `gather` reuse the selected value's position and record nothing.
+Lane-type `select` records one statement with per-lane partial derivatives 1 and 0 only when lanes select different sides.
+Lane-type `gather` records one statement pointing to each lane's selected element if the table contains differentiated values.
+
+Functions passed to transforms must satisfy `Fn(&[Var<'t, V>]) -> Result<Var<'t, V>, SciOxideError>` for `gradient_into` and `Fn(&[Var<'t, V>], &mut Vec<Var<'t, V>>) -> Result<(), SciOxideError>` for `linearize` for every lifetime `'t` (the higher-ranked trait bound `for<'t>`).
+`'t` differs for each recording, so storing a `Var` in a variable outside the function is a compile error, and a `Var` from one recording cannot enter another.
+`Var` is neither `Send` nor `Sync`; the function executes on the thread calling the transform.
+Because of this lifetime bound, binding a closure to a variable with `let` before passing it causes type inference to fail.
+Write the closure directly in the transform's argument position and call a generic model function such as `fn model<R: Real>(x: &[R]) -> R` inside it.
+A function can be called up to twice per transform, so its recording must not change between calls ([Tape lifecycle and reuse](../tape-lifecycle/)).
+
+## Reverse-sweep procedure and accuracy
+
+A reverse sweep is one loop traversing words from the end of a recording to its beginning.
+For each statement, take its adjoint and reset it to 0, multiply by each argument's partial derivative and add to that argument's adjoint.
+Input words are skipped, leaving the gradient in input adjoints when the sweep finishes.
+A tangent sweep traverses the same recording from beginning to end and writes each statement's tangent.
+Both sweeps traverse words one by one (processing the surrounding and argument words of multi-argument and call statements together); before and after a sweep and every 1,024 traversed words, they check cancellation and deadlines with `context.check()` and return `ExecutionStopped` if stopping is requested.
+Argument words of multi-argument and call statements count toward this total, with checks every 1,024 arguments even within one statement.
+Transforms such as `gradient_into` and `linearize` call `context.check()` before recording the function; `Linearization` products call it before every sweep.
+
+Every sweep update uses the absolute-zero product `Real::azmul`.
+`azmul` returns ordinary product $ab$ unless either operand is exactly 0; then it returns $+0$ even if the other is infinity or NaN.
+Thus, multiplying an infinite partial derivative by a zero adjoint contributes 0.
+For example, differentiating $f(x_1, x_2) = x_1 x_2$ at $(x_1, x_2) = (\infty, 2)$ gives tape gradient $(2, \infty)$.
+At the same point, forward mode with `Dual` uses IEEE products in the product rule, so $\partial f / \partial x_1$ includes $\infty \cdot 0$ and becomes NaN.
+[Forward mode and dual numbers](../forward-mode/) covers the choice between IEEE products and `azmul` in forward rules; [Handling kinks and nonfinite values](../nonsmooth-and-nonfinite-policies/) covers `azmul`'s role at nonfinite values and kinks.
+
+Adjoints accumulate by addition starting from $+0$.
+Since $+0 + (-0) = +0$, the tape returns $+0$ even when the derivative is exactly $-0$.
+See [Floating-point arithmetic and conditioning](../../../concepts/floating-point-and-conditioning/) for general discussion of signed zero.
+
+A gradient recording just one operation agrees bit for bit with that operation's `Dual` derivative.
+The two exceptions are the sign of exactly zero derivatives (the tape uses $+0$), and IEEE-product rules where an infinite partial derivative meets an exactly zero tangent component, as with $x_1 x_2$ above (`Dual` gives NaN; the tape returns that input's partial derivative).
+Long recordings sum contributions to each adjoint in a different order from forward mode, so the two agree within rounding error.
+There is no truncation error as in difference quotients; error comes from rounding partial derivatives and accumulation in each operation.
+[Elementary-function derivatives and accuracy](../elementary-functions/) covers partial-derivative accuracy for each operation.
+
+## Gradients with a tape
+
+`Tape::gradient_into(function, point, gradient, context)` records scalar function `function` at `point`, writes the gradient to `gradient` with one reverse sweep and returns the function value.
+`gradient` has one component per input; a length differing from `point` returns `DimensionMismatch`.
+Cost is one recording and one reverse sweep, a small constant multiple of function evaluation.
+Memory is proportional to recorded word count; unary and binary statements for `Tape<f64>` use an 8-byte word, one adjoint value and 0–2 stored partial-derivative values.
+Function errors propagate unchanged, and failed transforms leave `gradient` unchanged.
+[Tape lifecycle and reuse](../tape-lifecycle/) collects policy errors, insufficient capacity and stopping behavior.
+
+The next cell computes and compares tape reverse-mode and forward-mode gradients of the extended Rosenbrock function
+
+$$
+f(\mathbf{x}) = \sum_{i=1}^{n-1} \Bigl[100\,(x_{i+1} - x_i^2)^2 + (1 - x_i)^2\Bigr]
+$$
+
+
+The input is dimension $n$ (2–256), with point $x_i = 0.6 + 0.1\,((i - 1) \bmod 5)$.
+Reverse mode calls `gradient_into` twice on the same tape and also calls one-shot `value_and_grad` once.
+Forward mode evaluates `Dual` with unit directions $n$ times, and `MultiDual<f64, 8>`, retaining 8 directions simultaneously, $\lceil n/8 \rceil$ times.
+For each method, the table shows function executions, reverse sweeps, recorded words from `TapeReport::words`, relative difference $\max_i |g_i - g_i^{\ast}| / \max_i |g_i^{\ast}|$ from closed-form gradient $\mathbf{g}^{\ast}$, and relative difference from the `Dual` gradient using the same denominator.
+Closed form $\partial f / \partial x_i = -400 x_i (x_{i+1} - x_i^2) - 2(1 - x_i) + 200 (x_i - x_{i-1}^2)$ (omitting out-of-range terms) is an independent check using `f64` arithmetic.
+Verify function execution counts and word count $9n - 8$ derived from the recording rules.
+
+```rust
+//| id: ad-reverse-forward-gradient
+//| ref: ad-reverse-forward-gradient
+//| title: "Compare reverse-mode and forward-mode gradients while changing input dimension"
+//| run: reactive
+//| crates: [scioxide-ad, scioxide-core]
+//| inputs:
+//|   dimension: {"type":"range","label":"Input dimension n","description":"Number of variables in the extended Rosenbrock function.","min":2,"max":256,"step":1,"value":16}
+//| cases:
+//|   - {"id":"two","label":"n = 2","description":"One term, so MultiDual also needs just one evaluation.","inputs":{"dimension":2}}
+//|   - {"id":"wide","label":"n = 200","description":"Dual evaluates 200 times and MultiDual 25 times.","inputs":{"dimension":200}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"gradients","path":"/rows/0/1","equals":2}
+//|       - {"artifact":"gradients","path":"/rows/1/1","equals":1}
+//|       - {"artifact":"gradients","path":"/rows/1/3","equals":136}
+//|       - {"artifact":"gradients","path":"/rows/2/1","equals":2}
+//|       - {"artifact":"gradients","path":"/rows/3/1","equals":16}
+//|       - {"artifact":"gradients","path":"/rows/4/1","equals":2}
+//|       - {"artifact":"gradients","path":"/rows/1/4","range":{"max":1e-15}}
+//|       - {"artifact":"gradients","path":"/rows/4/5","equals":0}
+//|   - case: two
+//|     expect:
+//|       - {"artifact":"gradients","path":"/rows/1/3","equals":10}
+//|       - {"artifact":"gradients","path":"/rows/4/1","equals":1}
+//|       - {"artifact":"gradients","path":"/rows/1/4","range":{"max":1e-15}}
+//|   - case: wide
+//|     expect:
+//|       - {"artifact":"gradients","path":"/rows/1/3","equals":1792}
+//|       - {"artifact":"gradients","path":"/rows/3/1","equals":200}
+//|       - {"artifact":"gradients","path":"/rows/4/1","equals":25}
+//|       - {"artifact":"gradients","path":"/rows/1/4","range":{"max":1e-15}}
+use core::cell::Cell;
+
+use scioxide_ad::{Dual, MultiDual, Real, Tape, TapeOptions, value_and_grad};
+use scioxide_core::ExecutionContext;
+
+/// Extended Rosenbrock function f(x) = Σᵢ [100 (xᵢ₊₁ − xᵢ²)² + (1 − xᵢ)²].
+fn rosenbrock<R: Real>(x: &[R]) -> R {
+    x.windows(2)
+        .map(|w| {
+            let a = w[1] - w[0] * w[0];
+            let b = -w[0] + 1.0;
+            a * a * 100.0 + b * b
+        })
+        .sum()
+}
+
+/// Divide the maximum difference max|gᵢ − rᵢ| from reference by scale.
+fn gap(gradient: &[f64], reference: &[f64], scale: f64) -> f64 {
+    let pairs = gradient.iter().zip(reference);
+    pairs.fold(0.0_f64, |m, (g, r)| m.max((g - r).abs())) / scale
+}
+
+const WIDTH: usize = 8;
+let n = dimension as usize;
+let point: Vec<f64> = (0..n).map(|i| 0.6 + 0.1 * (i % 5) as f64).collect();
+// Independent check: compute the closed-form gradient with f64 arithmetic.
+let p = &point;
+let exact: Vec<f64> = (0..n)
+    .map(|i| {
+        let mut g = 0.0;
+        if i + 1 < n {
+            g += -400.0 * p[i] * (p[i + 1] - p[i] * p[i]) - 2.0 * (1.0 - p[i]);
+        }
+        if i > 0 {
+            g += 200.0 * (p[i] - p[i - 1] * p[i - 1]);
+        }
+        g
+    })
+    .collect();
+let scale = exact.iter().fold(0.0_f64, |m, g| m.max(g.abs()));
+
+// Forward mode: evaluate once per input with a unit-direction Dual.
+let mut forward = vec![0.0; n];
+for (k, slot) in forward.iter_mut().enumerate() {
+    let seeded: Vec<Dual<f64>> = point
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| Dual::new(v, if i == k { 1.0 } else { 0.0 }))
+        .collect();
+    *slot = rosenbrock(&seeded).derivative();
+}
+// MultiDual retains WIDTH directions per evaluation.
+let passes = n.div_ceil(WIDTH);
+let mut blocked = vec![0.0; n];
+for block in 0..passes {
+    let seeded = point
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| match i.checked_sub(block * WIDTH) {
+            Some(d) if d < WIDTH => MultiDual::<f64, WIDTH>::variable(v, d),
+            _ => Ok(MultiDual::constant(v)),
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    for (d, g) in rosenbrock(&seeded).gradient().into_iter().enumerate() {
+        if let Some(slot) = blocked.get_mut(block * WIDTH + d) {
+            *slot = g;
+        }
+    }
+}
+
+// Reverse mode: compute twice with the same tape. Count function executions.
+// Each results element is (method, function executions, reverse sweeps, recorded words, gradient).
+let cx = ExecutionContext::sequential();
+let runs = Cell::new(0_usize);
+let mut tape = Tape::<f64>::new(TapeOptions::new());
+let mut results = Vec::new();
+for label in ["Tape first call", "Tape second call"] {
+    let mut reverse = vec![0.0; n];
+    runs.set(0);
+    tape.gradient_into(
+        |x| {
+            runs.set(runs.get() + 1);
+            Ok(rosenbrock(x))
+        },
+        &point,
+        &mut reverse,
+        cx,
+    )
+    .map_err(|e| e.to_string())?;
+    results.push((label, runs.get(), 1, Some(tape.report().words()), reverse));
+}
+// One-shot calls create a new tape on every call.
+runs.set(0);
+let (_, one_shot) = value_and_grad(
+    |x| {
+        runs.set(runs.get() + 1);
+        Ok(rosenbrock(x))
+    },
+    &point,
+)
+.map_err(|e| e.to_string())?;
+results.push((
+    "value_and_grad",
+    runs.get(),
+    1,
+    None,
+    one_shot.as_slice().to_vec(),
+));
+results.push(("Dual", n, 0, None, forward.clone()));
+results.push(("MultiDual<f64, 8>", passes, 0, None, blocked));
+let rows: Vec<_> = results
+    .iter()
+    .map(|(name, runs, sweeps, words, g)| {
+        let error = gap(g, &exact, scale);
+        (
+            *name,
+            *runs,
+            *sweeps,
+            *words,
+            error,
+            gap(g, &forward, scale),
+        )
+    })
+    .collect();
+
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Method" },
+    { "key": "1", "label": "Function executions", "type": "integer" },
+    { "key": "2", "label": "Reverse sweeps", "type": "integer" },
+    { "key": "3", "label": "Recorded words", "type": "integer", "nullText": "None" },
+    { "key": "4", "label": "Relative difference from closed form [-]", "type": "number", "format": sci2 },
+    { "key": "5", "label": "Relative difference from Dual [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "gradients", "title": "Comparison of gradient methods" })
+);
+```
+
+With the default $n = 16$, the first tape `gradient_into` executes the function twice; the second executes it once.
+The empty tape lacks capacity during the first recording, so it grows to the counted size and executes the function again.
+`value_and_grad` creates a new tape on every call, so it always executes twice.
+All reverse-mode methods use one reverse sweep; forward mode requires 16 evaluations with `Dual` or 2 with `MultiDual<f64, 8>`.
+
+The recorded word count 136 equals $9n - 8$ from the recording rules.
+Constants and inputs use $n + 1$ words, sums between terms use $n - 2$ statements, and each term uses 7 statements.
+Each term's 7 statements are $x_i^2$, $x_{i+1} - x_i^2$, its square, multiplication by 100, $-x_i$, $(1 - x_i)^2$ and the final sum; adding the constant in $-x_i + 1$ creates no statement.
+Word count is proportional to $n$, as is the cost of one reverse sweep, but the sweep count remains 1 independently of $n$.
+
+Every method differs relatively from the closed form by $7.2 \times 10^{-17}$; `Dual` and `MultiDual` gradients agree bit for bit.
+`MultiDual` is guaranteed to agree bit for bit with separate one-direction `Dual` evaluations.
+Differences between tape gradients and `Dual` gradients are rounding differences from the order of summing contributions.
+At $n = 2$, there is one term, the word count is 10, `MultiDual` needs one evaluation, and every method agrees with the closed form.
+At $n = 200$, the word count grows to 1,792 but reverse sweeps remain at 1, while `Dual` evaluates 200 times and `MultiDual` 25 times.
+
+## Linearization and products
+
+For vector-valued functions, use `Tape::linearize(function, point, context)`.
+`function` receives inputs and uses `push` to append outputs to the supplied vector.
+Output insertion order determines the component order of $\mathbf{y} = F(\mathbf{x})$; input order follows `point`.
+`linearize` records only and returns linearization `Linearization` at point `point`.
+`Linearization<'a, V>` mutably borrows the tape and obtains products any number of times from the same recording.
+
+- `inputs()` and `outputs()` return input count $n$ and output count $m$; `values()` returns output values $F(\mathbf{x})$.
+- `vjp_into(cotangent, out, context)` writes $\mathbf{J}^\mathsf{T}\mathbf{w}$ (one component per input) to `out` in one reverse sweep.
+- `jvp_into(direction, out, context)` writes $\mathbf{J}\dot{\mathbf{x}}$ (one component per output) to `out` in one tangent sweep.
+  It returns `CapabilityUnavailable` if the recording contains an `ExternalRule` call without a forward rule (pushforward).
+- `jacobian_into(out, context)` writes a dense Jacobian to `out` in row-major order (outputs × inputs).
+
+Each product traverses the full recording once, or several times for `jacobian_into`.
+Products allocate nothing after prior use on the tape; only `jacobian_into` allocates one matrix of workspace on its first call.
+Length mismatches return `DimensionMismatch`; nonfinite results under `NonFinitePolicy::Error` return `NonFinite` (source `Output`); stop requests return `ExecutionStopped`; failed products leave outputs unchanged.
+[Second derivatives and Hessian operators](../second-order-derivatives/) covers matrix-free operator `JacobianOperator`; [Structural patterns and sparse derivative recovery](../sparse-derivatives/) covers structural patterns and sparse Jacobians.
+
+### Jacobian assembly direction
+
+`jacobian_into` repeats sweeps according to `JacobianMode` selected through tape option `TapeOptions::with_jacobian_mode`.
+`Forward` performs $n$ tangent sweeps, each seeded with a unit vector for one input, filling columns one at a time.
+`Reverse` performs $m$ reverse sweeps, one per output, filling rows one at a time.
+The default `Auto` selects reverse sweeps when $m < n$ and tangent sweeps when $m \ge n$.
+In either direction, one sweep costs work proportional to recording length, so the direction with fewer sweeps $\min(m, n)$ is advantageous.
+For a recording containing `ExternalRule` without a forward rule, specify `Reverse` to assemble the Jacobian when $m \ge n$.
+
+The next cell computes the Jacobian of the following $m$ outputs:
+
+$$
+F_k(\mathbf{x}) = s_k^2, \qquad s_k = \sum_{i=1}^{n} a_{ki} x_i, \qquad a_{ki} = \frac{1}{k + i - 1} \quad (k = 1, \dots, m)
+$$
+
+The Jacobian $J_{ki} = 2 s_k a_{ki}$ is obtained with three tapes using `Auto`, `Forward` and `Reverse`, and one-shot `jacobian`.
+Inputs are input dimension $n$ (1–12) and output dimension $m$ (1–12), with point $x_i = 1 - 0.25\,(i - 1)$.
+To count sweeps, pass $x_1$ through an identity-map `ExternalRule` before use.
+Reverse and tangent sweeps each traverse the recorded call statement once, so the number of rule pullback and pushforward calls counts each type of sweep ([External derivative rules with ExternalRule](../external-rules/) explains writing rules).
+For each specified direction, the table shows the selected direction, reverse and tangent sweep counts, relative difference from the closed form, and the maximum Jacobian difference from rows obtained with `vjp_into` and columns obtained with `jvp_into`.
+Verify that `Auto` uses $\min(m, n)$ sweeps and every direction agrees with the closed form.
+
+```rust
+//| id: ad-linearization-jacobian-modes
+//| ref: ad-linearization-jacobian-modes
+//| title: "Count sweeps and compare Jacobian assembly directions"
+//| run: reactive
+//| crates: [scioxide-ad, scioxide-core]
+//| inputs:
+//|   inputs: {"type":"range","label":"Input dimension n","description":"Number of inputs of F.","min":1,"max":12,"step":1,"value":6}
+//|   outputs: {"type":"range","label":"Output dimension m","description":"Number of outputs of F.","min":1,"max":12,"step":1,"value":3}
+//| cases:
+//|   - {"id":"square","label":"n = m = 4","description":"Since m < n does not hold, Auto performs 4 tangent sweeps.","inputs":{"inputs":4,"outputs":4}}
+//|   - {"id":"tall","label":"n = 2, m = 10","description":"With many outputs, 2 tangent sweeps suffice.","inputs":{"inputs":2,"outputs":10}}
+//|   - {"id":"gradient","label":"n = 12, m = 1","description":"With one output, one reverse sweep obtains the gradient.","inputs":{"inputs":12,"outputs":1}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"modes","path":"/rows/0/2","equals":3}
+//|       - {"artifact":"modes","path":"/rows/0/3","equals":0}
+//|       - {"artifact":"modes","path":"/rows/1/3","equals":6}
+//|       - {"artifact":"modes","path":"/rows/2/2","equals":3}
+//|       - {"artifact":"modes","path":"/rows/3/2","equals":3}
+//|       - {"artifact":"modes","path":"/rows/3/3","equals":0}
+//|       - {"artifact":"modes","path":"/rows/0/4","range":{"max":1e-15}}
+//|       - {"artifact":"modes","path":"/rows/1/4","range":{"max":1e-15}}
+//|       - {"artifact":"modes","path":"/rows/2/5","equals":0}
+//|   - case: square
+//|     expect:
+//|       - {"artifact":"modes","path":"/rows/0/2","equals":0}
+//|       - {"artifact":"modes","path":"/rows/0/3","equals":4}
+//|       - {"artifact":"modes","path":"/rows/2/2","equals":4}
+//|   - case: tall
+//|     expect:
+//|       - {"artifact":"modes","path":"/rows/0/3","equals":2}
+//|       - {"artifact":"modes","path":"/rows/2/2","equals":10}
+//|       - {"artifact":"modes","path":"/rows/2/4","range":{"max":1e-15}}
+//|   - case: gradient
+//|     expect:
+//|       - {"artifact":"modes","path":"/rows/0/2","equals":1}
+//|       - {"artifact":"modes","path":"/rows/1/3","equals":12}
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use scioxide_ad::{ExternalRule, JacobianMode, Real, Tape, TapeOptions, Var, jacobian};
+use scioxide_core::{ExecutionContext, SciOxideError};
+
+/// Identity map y = x. Count reverse and forward product calls.
+#[derive(Default)]
+struct SweepCounter {
+    reverse: AtomicUsize,
+    tangent: AtomicUsize,
+}
+
+impl ExternalRule<f64> for SweepCounter {
+    fn evaluate(&self, x: &[f64], y: &mut [f64]) -> Result<(), SciOxideError> {
+        y.copy_from_slice(x);
+        Ok(())
+    }
+    fn pullback(
+        &self,
+        _: &[f64],
+        _: &[f64],
+        w: &[f64],
+        g: &mut [f64],
+    ) -> Result<(), SciOxideError> {
+        self.reverse.fetch_add(1, Ordering::Relaxed);
+        g[0] += w[0];
+        Ok(())
+    }
+    fn pushforward(
+        &self,
+        _: &[f64],
+        _: &[f64],
+        t: &[f64],
+        y: &mut [f64],
+    ) -> Result<(), SciOxideError> {
+        self.tangent.fetch_add(1, Ordering::Relaxed);
+        y[0] = t[0];
+        Ok(())
+    }
+}
+
+/// Coefficient a = 1/(k + i + 1). k and i are zero-based.
+fn weight(k: usize, i: usize) -> f64 {
+    1.0 / (k + i + 1) as f64
+}
+
+/// Fₖ(x) = sₖ², sₖ = Σᵢ aₖᵢ xᵢ. Pass x₀ through the identity map used for counting.
+fn model<'t>(
+    rule: &Arc<dyn ExternalRule<f64>>,
+    outputs: usize,
+    x: &[Var<'t, f64>],
+    y: &mut Vec<Var<'t, f64>>,
+) -> Result<(), SciOxideError> {
+    let mut first = [Var::constant(0.0)];
+    Var::external(rule, &x[..1], &mut first)?;
+    for k in 0..outputs {
+        let terms = (0..x.len()).map(|i| {
+            let xi = if i == 0 { first[0] } else { x[i] };
+            xi * weight(k, i)
+        });
+        let s: Var<'t, f64> = terms.sum();
+        y.push(s * s);
+    }
+    Ok(())
+}
+
+let (n, m) = (inputs as usize, outputs as usize);
+let point: Vec<f64> = (0..n).map(|i| 1.0 - 0.25 * i as f64).collect();
+// Independent check: compute Jₖᵢ = 2 sₖ aₖᵢ with f64 arithmetic.
+let mut exact = vec![0.0; m * n];
+for k in 0..m {
+    let s: f64 = (0..n).map(|i| point[i] * weight(k, i)).sum();
+    for i in 0..n {
+        exact[k * n + i] = 2.0 * s * weight(k, i);
+    }
+}
+let scale = exact.iter().fold(0.0_f64, |a, v| a.max(v.abs()));
+let error = |j: &[f64]| {
+    j.iter()
+        .zip(&exact)
+        .fold(0.0_f64, |a, (p, q)| a.max((p - q).abs()))
+        / scale
+};
+let counter = Arc::new(SweepCounter::default());
+let rule: Arc<dyn ExternalRule<f64>> = counter.clone();
+// Read counts and reset them to 0.
+let sweeps = || {
+    let reverse = counter.reverse.swap(0, Ordering::Relaxed);
+    (reverse, counter.tangent.swap(0, Ordering::Relaxed))
+};
+let chosen = |reverse: usize| {
+    if reverse > 0 {
+        "By row (reverse sweeps)"
+    } else {
+        "By column (tangent sweeps)"
+    }
+};
+let cx = ExecutionContext::sequential();
+let mut rows = Vec::new();
+let modes = [
+    ("Auto", JacobianMode::Auto),
+    ("Forward", JacobianMode::Forward),
+    ("Reverse", JacobianMode::Reverse),
+];
+for (name, mode) in modes {
+    let mut tape = Tape::<f64>::new(TapeOptions::new().with_jacobian_mode(mode));
+    let mut linear = tape
+        .linearize(|x, y| model(&rule, m, x, y), &point, cx)
+        .map_err(|e| e.to_string())?;
+    let mut jac = vec![0.0; linear.outputs() * linear.inputs()];
+    sweeps();
+    linear
+        .jacobian_into(&mut jac, cx)
+        .map_err(|e| e.to_string())?;
+    let (reverse, tangent) = sweeps();
+    // Recompute rows with unit-vector VJPs and columns with JVPs.
+    let mut product_gap = 0.0_f64;
+    let (mut seed, mut row) = (vec![0.0; m], vec![0.0; n]);
+    for k in 0..m {
+        seed.fill(0.0);
+        seed[k] = 1.0;
+        linear
+            .vjp_into(&seed, &mut row, cx)
+            .map_err(|e| e.to_string())?;
+        for i in 0..n {
+            product_gap = product_gap.max((row[i] - jac[k * n + i]).abs());
+        }
+    }
+    let (mut direction, mut column) = (vec![0.0; n], vec![0.0; m]);
+    for i in 0..n {
+        direction.fill(0.0);
+        direction[i] = 1.0;
+        linear
+            .jvp_into(&direction, &mut column, cx)
+            .map_err(|e| e.to_string())?;
+        for k in 0..m {
+            product_gap = product_gap.max((column[k] - jac[k * n + i]).abs());
+        }
+    }
+    rows.push((
+        name,
+        chosen(reverse),
+        reverse,
+        tangent,
+        error(&jac),
+        Some(product_gap),
+    ));
+}
+// One-shot jacobian uses a new tape with default Auto.
+sweeps();
+let one_shot = jacobian(|x, y| model(&rule, m, x, y), &point).map_err(|e| e.to_string())?;
+let (reverse, tangent) = sweeps();
+let name = "jacobian (one-shot)";
+rows.push((
+    name,
+    chosen(reverse),
+    reverse,
+    tangent,
+    error(one_shot.as_slice()),
+    None,
+));
+
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Specified direction" },
+    { "key": "1", "label": "Selected direction" },
+    { "key": "2", "label": "Reverse sweeps", "type": "integer" },
+    { "key": "3", "label": "Tangent sweeps", "type": "integer" },
+    { "key": "4", "label": "Relative difference from closed form [-]", "type": "number", "format": sci2 },
+    { "key": "5", "label": "Maximum difference from VJP/JVP", "type": "number", "format": sci2, "nullText": "None" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata =
+        serde_json::json!({ "id": "modes", "title": "Jacobian assembly direction and sweep counts" })
+);
+```
+
+With defaults $n = 6$ and $m = 3$, $m < n$ holds, so `Auto` performs 3 reverse sweeps like `Reverse`, while the tape specifying `Forward` performs 6 tangent sweeps.
+One-shot `jacobian` also performs 3 reverse sweeps with default `Auto`.
+Every direction has zero relative difference from the closed form; rows obtained with `vjp_into` and columns with `jvp_into` also agree bit for bit with the Jacobian.
+For this function, reverse and tangent sweeps form identically rounded products.
+In general, contribution summation order differs by direction, so agreement is within rounding error.
+
+At $n = m = 4$, $m < n$ does not hold, so `Auto` performs 4 tangent sweeps.
+At $n = 2$ and $m = 10$, 2 tangent sweeps suffice, while specifying `Reverse` gives 10 reverse sweeps.
+At $n = 12$ and $m = 1$, one reverse sweep obtains the gradient, while tangent sweeps require 12.
+Sweep count measures Jacobian computational cost in units of recording length.
+
+## One-shot functions
+
+`grad`, `value_and_grad`, `vjp` and `jacobian` create a new tape with default settings `TapeOptions::new()` on every call, execute with `ExecutionContext::sequential_native()` and return allocated results.
+
+- `grad(function, point)` returns a gradient; `value_and_grad(function, point)` returns a value-gradient pair, with the gradient as `scioxide_linalg::Vector<S>`.
+- `vjp(function, point, cotangent)` returns $\mathbf{J}^\mathsf{T}\mathbf{w}$ as `Vector<S>`.
+- `jacobian(function, point)` returns the $m \times n$ Jacobian as row-major `scioxide_linalg::Matrix<S>`.
+
+Functions for `grad` and `value_and_grad` have the same form as `gradient_into`; those for `vjp` and `jacobian` have the same form as `linearize`.
+Scalar type `S` is restricted to `f32` or `f64`; tapes recording `Lanes` or `Dual` use `Tape` directly.
+New tapes have no capacity, so one-shot calls allocate tape storage and execute the function twice on every call.
+Errors match the corresponding `Tape` transform, with `AllocationFailure` added if result allocation fails.
+`vjp` returns `DimensionMismatch` when `cotangent` length differs from the output count.
+Create and reuse a `Tape` when differentiating the same function at many points, specifying policies or cancellation, or avoiding allocation.
+Hessian one-shot calls `hvp` and `hessian` also create a new tape each time, so `hvp` executes the function twice and `hessian` executes it $n + 1$ times for $n$ inputs ([Second derivatives and Hessian operators](../second-order-derivatives/)).
+
+## Summary
+
+A reverse sweep traverses the recording backward from output adjoint 1, adding contributions from every use to obtain adjoints.
+A scalar-function gradient requires one reverse sweep costing a constant multiple of evaluation independently of input dimension, while recording memory is proportional to operation count.
+Write functions for `R: Real`, pass closures directly in the argument position of `Tape::gradient_into` or `Tape::linearize`, and inspect recording size with `TapeReport::words`.
+The Jacobian takes $\min(m, n)$ sweeps to assemble; default `JacobianMode::Auto` selects reverse sweeps when $m < n$.
+For recordings with custom rules lacking forward rules, specify `JacobianMode::Reverse`.
+When differentiating the same function at many points, reuse a tape instead of one-shot calls, limiting allocation and second function executions to the first transform.
+
+## Further reading
+
+- [Tape lifecycle and reuse](../tape-lifecycle/): examine counting insufficient capacity and rerecording, allocation-free reuse, reports and error classification.
+- [Second derivatives and Hessian operators](../second-order-derivatives/): examine Hessian-vector products with `Tape<Dual<f64>>` and matrix-free operators.
+- [Structural patterns and sparse derivative recovery](../sparse-derivatives/): examine recovering sparse Jacobians with fewer sweeps using recorded structural patterns and coloring.
+- [Handling kinks and nonfinite values](../nonsmooth-and-nonfinite-policies/): examine differences between `azmul` and forward-mode product rules and how kinks are counted.
+- [JVP and VJP duality](../../examples/jvp-vjp-duality/): verify $\langle \mathbf{w}, \mathbf{J}\dot{\mathbf{x}} \rangle = \langle \mathbf{J}^\mathsf{T}\mathbf{w}, \dot{\mathbf{x}} \rangle$ numerically.

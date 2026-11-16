@@ -1,0 +1,657 @@
+---
+title: 随伴法による勾配とチェックポイント
+description: 時間積分の結果に依存する目的関数の勾配を、随伴方程式の逆向きの積分で求める。連続随伴と離散随伴の違い、チェックポイントによるメモリと再計算の交換、ODE と指数 1 の DAE の Plan・問題・作業領域、終了状態と診断の読み方。
+sidebar:
+  order: 365
+references:
+  ode-continuous-adjoint: "連続随伴方程式"
+  ode-discrete-and-continuous-adjoint: "離散随伴と連続随伴"
+  ode-adjoint-checkpointing: "チェックポイントと再計算"
+  ode-adjoint-plans-and-workspaces: "plan問題作業領域"
+  ode-adjoint-termination: "終了状態と診断"
+  ode-adjoint-implicit: "陰的な前進の方式と-dae-の随伴"
+---
+
+パラメータ同定や最適制御では、ODE の解 $y(t; y_0, p)$ に依存するスカラーの目的関数 $J(y_0, p)$ の勾配 $\partial J/\partial y_0$ と $\partial J/\partial p$ が必要になる。
+[前進感度](../forward-sensitivities-and-ensembles/)は $\partial y/\partial p$ を状態と一緒に積分するので、パラメータが 1 個増えるごとに状態と同じ大きさの方程式が増える。
+随伴法（adjoint method）は前進の積分の後に逆向きの積分を 1 回行い、パラメータの個数によらない計算コストで勾配全体を求める。
+その代わり、逆向きの積分では前進の軌道を逆順にたどる必要がある。
+
+`scioxide-ode` は ODE 用の `OdeAdjointSolver`（前進は Dormand–Prince 5(4)）と、残差形式の指数 1 の DAE 用の `DaeAdjointSolver`（前進は BDF、後退 Euler 法、陰的台形則）を提供する。
+どちらも前進で受理した刻みを記録し、メモリの上限に合わせて一部を再計算しながら逆向きにたどる。
+
+## 連続随伴方程式
+
+区間 $[t_0, T]$ の目的関数を
+
+$$
+J(y_0, p) = \Phi\bigl(T, y(T), p\bigr) + \int_{t_0}^{T} L\bigl(t, y(t), p\bigr)\,dt + \sum_k G_k\bigl(y(t_k), p\bigr)
+$$
+
+とする。
+$\Phi$ は終端項、$L$ は積分項、$G_k$ は観測時刻 $t_k$ での項である。
+$y' = f(t, y, p)$ を拘束とする Lagrange 関数を時間について部分積分すると、随伴変数（共状態）$\lambda(t)$ について
+
+$$
+\lambda' = -\Bigl(\frac{\partial f}{\partial y}\Bigr)^{\mathsf T}\lambda - \Bigl(\frac{\partial L}{\partial y}\Bigr)^{\mathsf T}, \qquad \lambda(T) = \Bigl(\frac{\partial \Phi}{\partial y}\Bigr)^{\mathsf T}
+$$
+
+を $T$ から $t_0$ へ逆向きに解けばよいことが分かる。
+観測の項は時刻 $t_k$ で $\lambda$ に跳びを加える。
+勾配は
+
+$$
+\frac{\partial J}{\partial y_0} = \lambda(t_0), \qquad \frac{\partial J}{\partial p} = \frac{\partial \Phi}{\partial p} + \int_{t_0}^{T} \Bigl(\frac{\partial L}{\partial p} + \lambda^{\mathsf T}\frac{\partial f}{\partial p}\Bigr)\,dt
+$$
+
+である。
+必要なのはヤコビ行列と随伴変数の積 $(\partial f/\partial y)^{\mathsf T}w$ と $(\partial f/\partial p)^{\mathsf T}w$（pullback）だけで、ヤコビ行列全体は作らなくてよい。
+
+API では、系が `OdeAdjointSystem`（`OdeSystem` に `parameters`、`is_replayable`、`pullback` を加えたトレイト）を実装し、`pullback(t, y, w, …)` がこの二つの積を書き込む。
+密行列、疎行列、行列を作らない作用、scioxide-ad の逆モード自動微分のどれで積を作ってもよい。
+目的関数は `AdjointObjective` を実装し、`evaluate(part, t, y, p, …)` が終端項（`AdjointObjectivePart::Terminal`）か積分項（`Running`）の値 `AdjointObjectiveValue { value, time_derivative }` を返し、状態とパラメータの勾配を書き込む。
+観測時刻の項は `observation_times` と `observation` で与え、`AdjointMode::Discrete` で終端の事象のない問題だけが使える。
+状態は複素数でもよく、そのとき状態の勾配は $dJ = \operatorname{Re}(\bar{y}^{\mathsf T}\,dy)$ を満たす余接 $\bar y$ である。
+時刻とパラメータは実数である。
+
+## 離散随伴と連続随伴
+
+`AdjointMode` は何を微分するかを選ぶ。
+
+| `AdjointMode` | 求めるもの | 誤差の性質 |
+|---|---|---|
+| `Discrete` | 前進で受理した刻みの列を固定し、各刻みの写像の転置した微分を逆順に掛けた値 | 計算した $J$ の値の、刻みを固定した厳密な微分（丸め誤差を除く）。刻み幅の選び方が $p$ で変わることは含めない |
+| `Continuous` | 前進の軌道の連続出力に沿って上の随伴方程式を逆向きに解いた値 | 随伴と積分項の局所誤差の許容誤差（`with_adjoint_error`、`with_quadrature_error`）と前進の許容誤差に依存する推定値 |
+
+どちらも真の $J$ の勾配とは前進の離散化誤差の分だけ違う。
+離散随伴は計算した目的関数と食い違わない勾配を返すので、最適化の反復で目的関数の値と勾配を組み合わせる用途に向く。
+連続随伴は逆向きの刻みを前進と別に選び、記録した前進の各刻みの中を Dormand–Prince 5(4) で逆向きに積分する。
+二つの勾配の差はおおよそ許容誤差の大きさで、どちらかが正しいことの証明にはならない。
+
+## チェックポイントと再計算
+
+逆向きの積分は前進の状態を逆順に必要とする。
+受理した全刻みの状態を保持すると、メモリは刻みの数に比例する。
+一部の刻みの状態（チェックポイント）だけを保持し、その間を前進の再計算で埋めれば、メモリを減らす代わりに前進の刻みが増える。
+保持の方針は `CheckpointPolicy` で選ぶ。
+
+| `CheckpointPolicy` | 動作 |
+|---|---|
+| `StoreAll`（既定） | 受理した全刻みの再開状態を保持し、再計算しない |
+| `MemoryBudget` | 作業領域全体が `with_max_workspace_bytes` に収まれば全刻みを保持する。収まらなければ、作業領域が上限に収まり、再計算が `with_max_replay_steps` に収まる二項スケジュール（Griewank 1992）のうち、スナップショットの数が最も多いもの（64 個まで）を選ぶ |
+| `Explicit(schedule)` | scioxide-ad の `CheckpointSchedule` を使う。スケジュールは記録の上限 `with_tape_capacity` の刻みを覆い、再計算は `with_max_replay_steps` に収まらなければならない |
+
+二項スケジュールの理論は [scioxide-ad のチェックポイント](../../../scioxide-ad/algorithms/checkpointing/)にある。
+再計算は保持した状態を正しく再現しなければならないので、系は `is_replayable` で同じ入力に同じ出力を返すことを宣言する。
+`false` を返す系は作業領域の準備の段階で `InvalidInput` になる。
+再計算した状態と保持した状態の差は `with_replay_error` の許容誤差（既定は差を許さない）で検査し、超えると `ReplayMismatch` で失敗する。
+計算の途中で系のパラメータが変わった場合も `ReplayMismatch` になる。
+再計算の上限 `with_max_replay_steps` は、記録の上限まで刻みが増えたときの再計算の数で Plan の作成時に検査するので、実行中にこの上限で止まることはない。
+
+## Plan・問題・作業領域
+
+設定は ODE と DAE に共通の `AdjointOptions` と、族ごとの設定の 2 層に分かれる。
+`AdjointOptions::new(mode, initial_step)` は随伴の方式と初期刻みの大きさを受け取る。
+既定値は適応刻み、前進・随伴・積分項の局所誤差の許容誤差 $\sqrt{\varepsilon}$（絶対・相対、最大値ノルム）、差を許さない再計算、`StoreAll`、記録の上限 1024 刻みで、他の上限はない。
+`with_fixed_step(true)` は誤差制御をやめ、すべての前進の刻みを初期刻みの大きさにする。
+リソースの上限は次のとおりである。
+
+| 設定 | 制限する量 | 達したときの終了状態 |
+|---|---|---|
+| `with_tape_capacity` | 記録する受理した前進の刻みの数（既定 1024）。作業領域はこの刻み数で見積もる | `BudgetLimit(Iteration)` |
+| `with_max_steps` | 試行した積分の刻みの数（前進と連続随伴の逆向きの刻みの合計） | `BudgetLimit(Proposal)` |
+| `with_max_replay_steps` | 再計算する前進の刻みの数 | Plan の作成で検査し、実行中には止まらない |
+| `with_max_reverse_steps` | 逆向きの刻みの数（離散随伴では記録した刻みごとに 1、連続随伴では試行した小刻みごとに 1） | `BudgetLimit(Iteration)` |
+| `with_max_workspace_bytes` | 作業領域の数値のメモリのバイト数（線形解法のメモリを含み、コールバックが持つメモリを除く） | Plan と作業領域の準備で `InvalidInput` か `DimensionMismatch` |
+| `with_max_evaluations` | コールバックの評価回数（右辺か残差、pullback、目的関数、事象、線形解法） | `BudgetLimit(Evaluation)` |
+
+`OdeAdjointOptions::new(common)` は ODE の設定で、前進の Dormand–Prince 5(4) の許容誤差（`with_primal_error`）、終端の事象の探索と局所化（`with_event_options`）、連続随伴の補間の欠陥の測定（`with_interpolation_defect_sampling`）を加える。
+`DaeAdjointOptions::new(common, numerics)` は DAE の設定で、`DaeBdf` と共通の `DaeNumericalOptions` と、逆向きの転置した線形方程式が満たす相対残差（`with_linear_residual`、既定 $64\varepsilon$）を加える。
+随伴の許容誤差と補間の欠陥の測定は連続随伴だけの設定で、離散随伴に与えると Plan の作成で `InvalidInput` になる。
+
+Plan `OdeAdjointSolver::new(dimension, parameter_dimension, options)` は次元と設定だけを検査し、コールバックを借用しない。
+系、目的関数、初期値、区間、任意の終端の事象は `OdeAdjointProblem::new(&system, &objective, &initial, (t0, t1))` が借用する。
+`t1 < t0` なら時間を逆向きに積分する。
+`workspace_requirements(&problem)` は、系の再現性、質量行列の有無（`OdeAdjointSolver` は質量行列を持つ系を拒む）、次元、観測時刻を検査し、コールバックの作業用のメモリ、観測時刻、チェックポイントを含む作業領域を見積もる。
+返す `OdeAdjointRequirements` は勾配の長さ（`initial_gradient_len`、`parameter_gradient_len`）とメモリの上限 `required_bytes()` を持つ。
+`workspace(&problem)` はそれを満たす `OdeAdjointWorkspace` を確保し、上限に収まらなければ系や目的関数を評価する前にエラーを返す。
+`OdeAdjointWorkspace::check` と `try_reserve` で、既存の作業領域を確かめたり大きくしたりもできる。
+
+計算の API は 2 つある。
+
+- `solve_into(&problem, &mut initial_gradient, &mut parameter_gradient, &mut workspace, scope)` は、成功したときだけ二つの勾配を書き、`AdjointReport` を返す。
+  失敗した試行のレポートは作業領域の `last_attempt()` に残る。
+  準備した作業領域を渡し、コールバックがメモリを確保しなければ、終端の事象があってもメモリを確保しない。
+- `solve(&problem)` は作業領域と勾配のメモリを新しく確保し、`AdjointResult`（`initial_gradient()`、`parameter_gradient()`、`report()`、`into_parts()`）を返す。
+  失敗すると、失敗した試行の `AdjointReport` を持つ `PartialFailure` を返す。
+
+どちらも、失敗したときに途中までの勾配は返さない。
+
+### 経口投与モデルの AUC の勾配
+
+薬物動態の 1 コンパートメントモデルで、消化管の薬物量 $A_g$ と体内の薬物量 $A_c$ [mg] が
+
+$$
+A_g' = -k_a A_g, \qquad A_c' = k_a A_g - k_e A_c, \qquad A_g(0) = D,\ A_c(0) = 0
+$$
+
+に従うとする。
+吸収速度定数を $k_a = 1\ \mathrm{h^{-1}}$、消失速度定数を $k_e = 0.2\ \mathrm{h^{-1}}$、投与量を $D = 100$ mg とし、24 時間の体内量の時間積分（AUC）$J = \int_0^{24} A_c\,dt$ [mg·h] の勾配を求める。
+解析解 $A_c = D k_a (e^{-k_e t} - e^{-k_a t})/(k_a - k_e)$ から、$J$ と四つの偏導関数は閉形式で書ける。
+これを独立な検算に使う。
+
+次のブロックは二つのセルが共有する定義である。
+`OralDose` が系と pullback、`Auc` が積分項 $L = A_c$、`auc_closed_form` が閉形式の $J$ と勾配、`worst_relative` が四つの偏導関数の閉形式に対する最大相対誤差である。
+
+```rust
+//| id: ode-adjoint-oral-dose-model
+//| kind: definitions
+//| title: 経口投与モデルの系・pullback・AUC と閉形式
+//| crates: [scioxide-core, scioxide-ode]
+use scioxide_core::{SciOxideError, SolveContext};
+use scioxide_ode::{
+    AdjointObjective, AdjointObjectivePart, AdjointObjectiveValue, OdeAdjointSystem, OdeSystem,
+};
+
+/// 状態 y = (A_g, A_c) [mg]、パラメータ p = (k_a, k_e) [1/h] の 1 コンパートメントモデル。
+pub(crate) struct OralDose(pub(crate) [f64; 2]);
+impl OdeSystem<f64> for OralDose {
+    fn dimension(&self) -> usize {
+        2
+    }
+    fn rhs(
+        &self,
+        _: f64,
+        y: &[f64],
+        out: &mut [f64],
+        _: &mut SolveContext<'_, '_>,
+    ) -> Result<(), SciOxideError> {
+        let [ka, ke] = self.0;
+        out[0] = -ka * y[0];
+        out[1] = ka * y[0] - ke * y[1];
+        Ok(())
+    }
+}
+impl OdeAdjointSystem<f64> for OralDose {
+    fn parameters(&self) -> &[f64] {
+        &self.0
+    }
+    fn is_replayable(&self) -> bool {
+        true
+    }
+    /// シード w に対して (∂f/∂y)ᵀw と (∂f/∂p)ᵀw を書き込む。
+    fn pullback(
+        &self,
+        _: f64,
+        y: &[f64],
+        w: &[f64],
+        dy: &mut [f64],
+        dp: &mut [f64],
+        _: &mut [f64],
+        _: &mut SolveContext<'_, '_>,
+    ) -> Result<(), SciOxideError> {
+        let [ka, ke] = self.0;
+        dy.copy_from_slice(&[ka * (w[1] - w[0]), -ke * w[1]]);
+        dp.copy_from_slice(&[y[0] * (w[1] - w[0]), -y[1] * w[1]]);
+        Ok(())
+    }
+}
+/// J = ∫ A_c dt。積分項 L = A_c の状態の勾配は (0, 1)、終端項は 0。
+pub(crate) struct Auc;
+impl AdjointObjective<f64> for Auc {
+    fn evaluate(
+        &self,
+        part: AdjointObjectivePart,
+        _: f64,
+        y: &[f64],
+        _: &[f64],
+        dy: &mut [f64],
+        dp: &mut [f64],
+        _: &mut [f64],
+        _: &mut SolveContext<'_, '_>,
+    ) -> Result<AdjointObjectiveValue<f64>, SciOxideError> {
+        let running = if part == AdjointObjectivePart::Running {
+            1.0
+        } else {
+            0.0
+        };
+        dy.copy_from_slice(&[0.0, running]);
+        dp.fill(0.0);
+        Ok(AdjointObjectiveValue {
+            value: running * y[1],
+            time_derivative: 0.0,
+        })
+    }
+}
+/// 閉形式の (J, ∂J/∂A_g(0), ∂J/∂A_c(0), ∂J/∂k_a, ∂J/∂k_e)。指数関数は f64 の参照値。
+pub(crate) fn auc_closed_form(dose: f64, ka: f64, ke: f64, horizon: f64) -> [f64; 5] {
+    let (ea, ee) = ((-ka * horizon).exp(), (-ke * horizon).exp());
+    let (c, q) = (dose * ka / (ka - ke), (1.0 - ee) / ke - (1.0 - ea) / ka);
+    let dq_dka = ((1.0 - ea) - ka * horizon * ea) / (ka * ka);
+    let dq_dke = (ke * horizon * ee - (1.0 - ee)) / (ke * ke);
+    let scale = dose / (ka - ke).powi(2);
+    [
+        c * q,
+        q * ka / (ka - ke),
+        (1.0 - ee) / ke,
+        -scale * ke * q + c * dq_dka,
+        scale * ka * q + c * dq_dke,
+    ]
+}
+/// 閉形式に対する 4 つの偏導関数の最大相対誤差。
+pub(crate) fn worst_relative(gradient: [f64; 4], exact: [f64; 5]) -> f64 {
+    let pairs = gradient.iter().zip(&exact[1..]);
+    pairs.fold(0.0_f64, |m, (a, b)| m.max(((a - b) / b).abs()))
+}
+```
+
+次のセルは同じモデルを離散随伴と連続随伴の `OdeAdjointSolver::solve` で解き、閉形式と比べる。
+前進・随伴・積分項の許容誤差は同じ値 $10^q$ にそろえ、チェックポイントは `MemoryBudget` でメモリの上限を入力で与える。
+表の「最大相対誤差」は $\partial J/\partial A_g(0)$、$\partial J/\partial A_c(0)$、$\partial J/\partial k_a$、$\partial J/\partial k_e$ の四つの最大で、「作業領域の上限」は `OdeAdjointRequirements::required_bytes()` である。
+
+```rust
+//| id: ode-adjoint-auc-gradient
+//| ref: ode-adjoint-auc-gradient
+//| title: 経口投与モデルの AUC の勾配を随伴法で求めて閉形式と比べる
+//| run: button
+//| uses: [ode-adjoint-oral-dose-model]
+//| crates: [scioxide-core, scioxide-ode]
+//| inputs:
+//|   tolerance_exponent: {"type":"range","label":"局所誤差の許容誤差 10^q の指数 q","description":"前進・随伴・積分項の絶対と相対の許容誤差。","min":-12,"max":-4,"step":1,"value":-8}
+//|   checkpoint_kib: {"type":"range","label":"作業領域の上限 [KiB]","description":"MemoryBudget が使うメモリの上限。小さいほど再計算が増える。","min":80,"max":1024,"step":16,"value":96}
+//| cases:
+//|   - {"id":"loose","label":"q = −4","description":"刻みが減り、相対誤差は 10⁻⁵ 程度に増える。","inputs":{"tolerance_exponent":-4}}
+//|   - {"id":"store-all","label":"q = −11, 1024 KiB","description":"メモリが足りると全刻みを保持し、再計算しない。","inputs":{"tolerance_exponent":-11,"checkpoint_kib":1024}}
+//|   - {"id":"tape-full","label":"q = −12","description":"受理した刻みが記録の上限 1024 に達し、勾配は返らない。","inputs":{"tolerance_exponent":-12}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"gradients","path":"/rows/1/5","range":{"max":1e-8}}
+//|       - {"artifact":"gradients","path":"/rows/2/5","range":{"max":1e-8}}
+//|       - {"artifact":"gradients","path":"/rows/1/4","approx":{"value":-2357.26532461266,"rtol":1e-8}}
+//|       - {"artifact":"gradients","path":"/rows/1/7","range":{"min":1}}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+//|   - case: store-all
+//|     expect:
+//|       - {"artifact":"gradients","path":"/rows/1/7","equals":0}
+//|       - {"artifact":"gradients","path":"/rows/2/5","range":{"max":1e-11}}
+//|   - case: tape-full
+//|     expect:
+//|       - {"artifact":"gradients","path":"/rows/1/10","equals":"BudgetLimit(Iteration)"}
+//|       - {"artifact":"gradients","path":"/rows/1/2","equals":null}
+//|       - {"path":"/outputs/1/state","equals":"failed"}
+use scioxide_core::{ErrorTolerance, NormSelection};
+use scioxide_ode::{
+    AdjointMode, AdjointOptions, CheckpointPolicy, OdeAdjointOptions, OdeAdjointProblem,
+    OdeAdjointSolver, OdeAdjointSystem, OdeSystem,
+};
+
+let (dose, ka, ke, horizon) = (100.0, 1.0, 0.2, 24.0);
+let exact = auc_closed_form(dose, ka, ke, horizon);
+let epsilon = 10.0_f64.powf(tolerance_exponent);
+let tol = ErrorTolerance::scalar(epsilon, epsilon, NormSelection::Infinity)
+    .map_err(|e| e.to_string())?;
+let model = OralDose([ka, ke]);
+let initial = [dose, 0.0];
+let problem = OdeAdjointProblem::new(&model, &Auc, &initial, (0.0, horizon));
+let mut rows = vec![(
+    "閉形式",
+    Some(exact[0]),
+    Some(exact[1]),
+    Some(exact[3]),
+    Some(exact[4]),
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+)];
+let mut failure = None;
+for mode in [AdjointMode::Discrete, AdjointMode::Continuous] {
+    let common = AdjointOptions::new(mode, 0.1)
+        .map_err(|e| e.to_string())?
+        .with_quadrature_error(tol.clone())
+        .with_max_workspace_bytes(checkpoint_kib as usize * 1024)
+        .with_checkpoint_policy(CheckpointPolicy::MemoryBudget);
+    // 随伴方程式の誤差制御は連続随伴だけが持ち、離散随伴に与えると Plan の作成で拒否される。
+    let common = match mode {
+        AdjointMode::Continuous => common.with_adjoint_error(tol.clone()),
+        AdjointMode::Discrete => common,
+    };
+    let options = OdeAdjointOptions::new(common).with_primal_error(tol.clone());
+    let plan = OdeAdjointSolver::new(model.dimension(), model.parameter_dimension(), options)
+        .map_err(|e| e.to_string())?;
+    let bytes = plan
+        .workspace_requirements(&problem)
+        .map_err(|e| e.to_string())?
+        .required_bytes();
+    let name = if mode == AdjointMode::Discrete {
+        "離散随伴"
+    } else {
+        "連続随伴"
+    };
+    // 失敗のとき勾配は返らず、PartialFailure の進捗がレポートを持つ。
+    let (gradient, report) = match plan.solve(&problem) {
+        Ok(result) => {
+            let (initial, parameter) = (result.initial_gradient(), result.parameter_gradient());
+            let gradient = [initial[0], initial[1], parameter[0], parameter[1]];
+            (Some(gradient), *result.report())
+        }
+        Err(failure) => (
+            None,
+            *failure
+                .progress()
+                .ok_or_else(|| failure.error().to_string())?,
+        ),
+    };
+    if !report.is_success() {
+        failure = report.termination().map(|t| format!("{t:?}"));
+    }
+    let status = report.termination().map(|t| format!("{t:?}"));
+    rows.push((
+        name,
+        report.objective(),
+        gradient.map(|g| g[0]),
+        gradient.map(|g| g[2]),
+        gradient.map(|g| g[3]),
+        gradient.map(|g| worst_relative(g, exact)),
+        Some(report.accepted_steps()),
+        Some(report.replayed_steps()),
+        Some(report.reverse_steps()),
+        Some(bytes),
+        status,
+    ));
+}
+let sig10 = serde_json::json!({ "significantDigits": 10 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "方式" },
+    { "key": "1", "label": "J [mg·h]", "type": "number", "format": sig10, "nullText": "なし" },
+    { "key": "2", "label": "∂J/∂A_g(0) [h]", "type": "number", "format": sig10, "nullText": "なし" },
+    { "key": "3", "label": "∂J/∂k_a [mg·h²]", "type": "number", "format": sig10, "nullText": "なし" },
+    { "key": "4", "label": "∂J/∂k_e [mg·h²]", "type": "number", "format": sig10, "nullText": "なし" },
+    { "key": "5", "label": "最大相対誤差 [-]", "type": "number", "format": sci2, "nullText": "なし" },
+    { "key": "6", "label": "受理した刻み [回]", "type": "integer", "nullText": "-" },
+    { "key": "7", "label": "再計算した刻み [回]", "type": "integer", "nullText": "-" },
+    { "key": "8", "label": "逆向きの刻み [回]", "type": "integer", "nullText": "-" },
+    { "key": "9", "label": "作業領域の上限 [B]", "type": "integer", "nullText": "-" },
+    { "key": "10", "label": "終了状態", "nullText": "-" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "gradients" })
+);
+let outcome = if failure.is_none() {
+    Outcome::satisfied("離散随伴と連続随伴の両方で勾配が得られた")
+} else {
+    Outcome::failed("勾配が得られなかった方式がある")
+        .explanation("随伴法は失敗のとき勾配を返さない。終了状態の列で原因を確かめる。")
+};
+let status = failure.unwrap_or_else(|| "ReachedEnd".to_string());
+emit_outcome!(outcome.status(status).diagnostic("許容誤差", epsilon, None));
+```
+
+既定値（許容誤差 $10^{-8}$、作業領域の上限 96 KiB）では、前進の積分は 150 刻みで終わり、AUC は $J = 494.8564081$ mg·h で閉形式と表示した 10 桁まで一致する。
+四つの偏導関数の閉形式に対する最大相対誤差は、離散随伴で $7.0 \times 10^{-10}$、連続随伴で $1.1 \times 10^{-9}$ である。
+$\partial J/\partial k_e \approx -2357$ mg·h² は、消失が 1 % 速くなると（$\Delta k_e = 0.002\ \mathrm{h^{-1}}$）AUC が約 4.7 mg·h 減ることを表す。
+96 KiB では全刻みを保持できないので、`MemoryBudget` は二項スケジュールを選び、どちらの方式も 383 刻みを再計算する。
+作業領域の見積もりは離散随伴で 76 624 B、連続随伴で 76 144 B である（wasm の 32 ビットの `usize` での値）。
+上限を 1024 KiB にすると全刻みを保持して再計算は 0 刻みになり、見積もりは離散随伴で 498 448 B、連続随伴で 268 592 B に増える。
+離散随伴は段ごとの積分項の勾配も保持するので、連続随伴より多くのメモリを使う。
+どちらの保持の方式でも勾配の値は同じで、変わるのはメモリと再計算の刻み数だけである。
+
+許容誤差を $10^{-4}$ にすると刻みは 25 に減り、最大相対誤差は離散随伴で $2.8 \times 10^{-5}$、連続随伴で $2.3 \times 10^{-5}$ に増える。
+$10^{-11}$ では 653 刻みで、最大相対誤差は離散随伴で $5.9 \times 10^{-13}$、連続随伴で $6.2 \times 10^{-13}$ になる。
+$10^{-12}$ では受理した刻みが記録の上限 1024 に達し、どちらの方式も `BudgetLimit(Iteration)` で失敗して勾配は返らない。
+表の「受理した刻み」は失敗した試行のレポートから読んだ 1024 である。
+
+## 終了状態と診断
+
+`AdjointTermination` が唯一の終了状態である。
+随伴法は成功したときだけ勾配を書くので、成功した `AdjointReport` の終了状態は必ず `ReachedEnd` か `TerminalEvent` である。
+他の列挙子は失敗した試行のレポート（作業領域の `last_attempt()`、`solve` の `PartialFailure`）を分類する。
+
+| 終了状態 | 意味 | 返るエラー |
+|---|---|---|
+| `ReachedEnd`、`TerminalEvent` | 区間の終わりか終端の事象に達し、二つの勾配を求めた | なし |
+| `BudgetLimit(kind)` | 上の表の上限に達した。外側の求解の評価の上限も `Evaluation` になる | `ConvergenceFailure` |
+| `StepSizeLimit` | 表せる刻みでは時刻が進まない | `ConvergenceFailure` |
+| `ExecutionStopped(reason)` | 取り消しか期限で止まった | `ExecutionStopped` |
+| `ReplayMismatch` | 再計算が保持した状態を再現しなかった | `ConvergenceFailure` |
+| `EventDerivativeUnavailable` | 終端の事象の勾配が存在しない | `InvalidInput` |
+
+`AdjointReport::termination()` は `Option` を返し、上の分類に当たらない失敗（コールバックのエラーなど）では `None` になる。
+`is_success()` は勾配を求めたときだけ真である。
+`objective()` は前進の積分が終わった後の目的関数の値で、`final_time()` は最後に受理した前進の刻みの時刻である。
+`accepted_steps()` と `rejected_steps()` は最初の前進の積分の刻みを数え、再計算と逆向きの刻みは `replayed_steps()` と `reverse_steps()` で別に数える。
+`reverse_steps()` は逆向きに処理し終えた記録の刻みの数で、連続随伴が一つの記録の刻みを複数の小刻みで積分しても 1 と数える。
+`workspace_bytes()` は数値のメモリの上限、`counts()` と `accounting()` は評価の回数である。
+
+`errors()` が返す `AdjointErrorReport` は次の量を別々に記録する。
+
+- `primal()`：受理した前進の刻みの正規化した局所誤差の推定値の最大（推定値を持つ方式だけ）
+- `adjoint()`：連続随伴の受理した刻みの正規化した局所誤差の推定値の最大
+- `quadrature()`：積分項とパラメータの勾配の積分の正規化した局所誤差の推定値の最大
+- `replay()`：再計算した状態と保持した状態の差の最大
+- `interpolation_defect()`：前進の連続出力 $u$ の欠陥 $|u'(t) - f(t, u(t))|$ の標本の最大（`with_interpolation_defect_sampling(true)` のときだけ。
+  標本 1 つにつき右辺を 1 回余分に評価する）
+- `linear_residual()`：逆向きに解いた転置した線形方程式の相対残差の最大（DAE の随伴）
+
+どれも勾配の大域誤差の上限ではない。
+
+終端の事象で積分を止める目的関数には、`AdjointTerminalEvent` を `OdeAdjointProblem::with_terminal_event(Some(&event))` で渡す。
+事象関数 $g(t, y, p)$ の最初の根が終端の時刻 $T$ になり、勾配は $T$ が $y_0$ と $p$ に依存することも含む。
+根がその区間でただ一つであること（`unique_branch` が真）と、全微分の大きさ $|dg/dt| = |\partial g/\partial t + (\partial g/\partial y) f|$ の下限（`transversality_threshold`）は呼び出し側が宣言する。
+有限個の点での求根は根がただ一つであることを証明できないので、この宣言は呼び出し側の責任である。
+根が初期時刻にある場合、`unique_branch` が偽の場合、全微分の大きさが下限以下の場合は、勾配が存在しないので `EventDerivativeUnavailable` になる。
+事象の探索と局所化の既定は初期値問題の事象と同じで、`OdeAdjointOptions::with_event_options` で変えられる。
+事象に状態の更新（リセット写像）はない。
+
+## 陰的な前進の方式と DAE の随伴
+
+`DaeAdjointSolver` は残差形式の指数 1 の DAE $F(t, y, y', p) = 0$（[指数 1 の DAE](../dae-index-one/)）の勾配を求める。
+初期値の勾配は微分変数の座標だけを持ち、代数変数の初期値は拘束から決まるので独立な変数として扱わない。
+系は `DaeAdjointSystem` を実装し、`pullback` が $(\partial F/\partial y)^{\mathsf H}w$、$(\partial F/\partial y')^{\mathsf H}w$、$(\partial F/\partial p)^{\mathsf T}w$ を書き込む。
+DAE の随伴は終端の事象を持たない。
+1 回の求解は `DaeAdjointProblem::new(system, objective, initial, derivative, interval)` で表し、初期の状態と導関数の組、区間を借用する。
+前進の方式は構築関数で選ぶ。
+
+| 構築関数 | 前進の方式 | 条件 |
+|---|---|---|
+| `DaeAdjointSolver::new(partition, parameter_dimension, backend, options)` | 次数 1〜5 の可変次数 BDF（`DaeBdf` と同じ） | 微分変数と代数変数を `DaePartition` で指定する |
+| `DaeAdjointSolver::backward_euler(dimension, parameter_dimension, backend, options)` | 1 次の BDF（後退 Euler 法） | すべての座標が微分変数 |
+| `DaeAdjointSolver::trapezoid(dimension, parameter_dimension, backend, options)` | 固定刻みの陰的台形則 | すべての座標が微分変数。`AdjointMode::Discrete`、`with_fixed_step(true)` が必要で、`with_quadrature_error` は与えない |
+
+逆向きの積分では $\partial F/\partial y$ と $\partial F/\partial y'$ を組み合わせた行列の転置の線形方程式を、Plan の線形解法（`OdeStageBackend` の密、疎、Krylov）で解く。
+離散随伴は受理した刻みと次数を固定し、多段法のすべての履歴への依存を微分する。
+連続随伴は随伴の DAE を逆向きに積分し、刻み $h$ の 1 回の積分と $h/2$ の 2 回の積分の差から局所誤差を推定し（刻みの倍分割）、その差で解を補正する（局所補外）。
+
+`OdeAdjointResidual::new(&system)` は `OdeAdjointSystem` を残差 $F = y' - f(t, y, p)$ として `DaeAdjointSolver` に渡す変換である。
+剛性のある ODE の勾配は、これを後退 Euler 法か BDF の随伴で求める。
+ODE の解析的なヤコビ行列があればそれを使い、なければ DAE の設定の導関数の方針に従って残差を差分する。
+質量行列を持つ ODE は変換できないので、`DaeAdjointSystem` を直接実装する。
+陰的台形則の 1 刻みは $(t_0, y_0, y'_0)$ から $y'_1 = 2(y_1 - y_0)/h - y'_0$ として $F(t_0 + h, y_1, y'_1) = 0$ を Newton 法で解く。
+$F = y' - f$ では、これは $y_1 - y_0 = \tfrac{h}{2}(f_0 + f_1)$ と同じで、積分項も台形則 $\tfrac{h}{2}(L_0 + L_1)$ で積分する。
+誤差の推定値を持たないので、レポートの `primal()` と `quadrature()` は `None` になる。
+`DaeAdjointRequirements` と `DaeAdjointWorkspace` は ODE の場合と同じ役割を持ち、初期値の勾配の長さは微分変数の数である。
+
+次のセルは同じ経口投与モデルを `OdeAdjointResidual` で残差にし、陰的台形則（2 次）と後退 Euler 法（1 次）の固定刻みの離散随伴で、刻み幅 $h = 24/2^k$ を半分ずつにしながら勾配を求める。
+刻み幅と方式ごとに Plan を作り直すが、作業領域は一つの `DaeAdjointWorkspace` を `solve_into` で使い回す。
+勾配は前進の方式の離散化誤差を含むので、閉形式との差は $h$ の次数で減るはずである。
+表の「観測次数」は刻みを半分にしたときの誤差の比の $\log_2$ である。
+受理した刻みが記録の上限を超える刻み幅では、勾配は返らず、作業領域の `last_attempt()` のレポートから終了状態を読む。
+
+```rust
+//| id: ode-adjoint-implicit-convergence
+//| ref: ode-adjoint-implicit-convergence
+//| title: 陰的台形則と後退 Euler 法の離散随伴の収束次数
+//| run: button
+//| uses: [ode-adjoint-oral-dose-model]
+//| crates: [scioxide-core, scioxide-ode]
+//| inputs:
+//|   finest_level: {"type":"range","label":"最も細かい刻み幅 24/2^k h の指数 k","description":"k = 4 から 1 ずつ刻み幅を半分にする。","min":6,"max":10,"step":1,"value":9}
+//|   tape_capacity: {"type":"range","label":"記録の上限 [刻み]","description":"with_tape_capacity。これを超える刻み数の計算は失敗する。","min":128,"max":1024,"step":128,"value":1024}
+//| cases:
+//|   - {"id":"small-tape","label":"k = 8, 記録 128 刻み","description":"256 刻みが要る刻み幅は記録の上限で失敗する。","inputs":{"finest_level":8,"tape_capacity":128}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"convergence","path":"/rows/5/4","approx":{"value":2,"atol":0.05}}
+//|       - {"artifact":"convergence","path":"/rows/11/4","approx":{"value":1,"atol":0.05}}
+//|       - {"artifact":"convergence","path":"/rows/5/3","range":{"max":1e-4}}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+//|   - case: small-tape
+//|     expect:
+//|       - {"artifact":"convergence","path":"/rows/4/6","equals":"BudgetLimit(Iteration)"}
+//|       - {"artifact":"convergence","path":"/rows/4/3","equals":null}
+//|       - {"path":"/outputs/2/state","equals":"failed"}
+use scioxide_core::ExecutionContext;
+use scioxide_ode::{
+    AdjointMode, AdjointOptions, DaeAdjointOptions, DaeAdjointProblem, DaeAdjointSolver,
+    DaeAdjointWorkspace, DaeNumericalOptions, OdeAdjointResidual, OdeStageBackend,
+};
+
+let (dose, ka, ke, horizon) = (100.0, 1.0, 0.2, 24.0);
+let exact = auc_closed_form(dose, ka, ke, horizon);
+let model = OralDose([ka, ke]);
+// ODE を残差 F = y' − f(t, y, p) として DAE の随伴に渡す。初期の導関数は f(0, y₀)。
+let residual = OdeAdjointResidual::new(&model).map_err(|e| e.to_string())?;
+let (initial, derivative) = ([dose, 0.0], [-ka * dose, ka * dose]);
+let problem = DaeAdjointProblem::new(&residual, &Auc, &initial, &derivative, (0.0, horizon));
+// 一つの作業領域を、刻み幅と方式の異なるすべての Plan で使い回す。
+let mut workspace = DaeAdjointWorkspace::new();
+let (mut rows, mut series) = (Vec::new(), Vec::new());
+let (mut failures, mut failure) = (0, None);
+for name in ["trapezoid", "backward_euler"] {
+    let mut points = Vec::new();
+    let mut previous: Option<f64> = None;
+    for level in 4..=(finest_level as i32) {
+        // h = 24/2^k は 2 進で正確に表せるので、2^k 刻みでちょうど終端に着く。
+        let step = horizon / 2.0_f64.powi(level);
+        let common = AdjointOptions::new(AdjointMode::Discrete, step)
+            .map_err(|e| e.to_string())?
+            .with_fixed_step(true)
+            .with_tape_capacity(tape_capacity as usize);
+        let options = DaeAdjointOptions::new(common, DaeNumericalOptions::new())
+            .map_err(|e| e.to_string())?;
+        let backend = OdeStageBackend::Dense;
+        let plan = match name {
+            "trapezoid" => DaeAdjointSolver::trapezoid(2, 2, backend, options),
+            _ => DaeAdjointSolver::backward_euler(2, 2, backend, options),
+        }
+        .map_err(|e| e.to_string())?;
+        let requirements = plan
+            .workspace_requirements(&problem)
+            .map_err(|e| e.to_string())?;
+        let (mut initial_gradient, mut parameter_gradient) = ([0.0; 2], [0.0; 2]);
+        let solved = plan.solve_into(
+            &problem,
+            &mut initial_gradient,
+            &mut parameter_gradient,
+            &mut workspace,
+            ExecutionContext::sequential(),
+        );
+        let gradient = [
+            initial_gradient[0],
+            initial_gradient[1],
+            parameter_gradient[0],
+            parameter_gradient[1],
+        ];
+        let (error, status, steps) = match solved {
+            Ok(report) => (
+                Some(worst_relative(gradient, exact)),
+                report.termination(),
+                report.accepted_steps(),
+            ),
+            // 失敗した試行のレポートは作業領域の last_attempt に残る。
+            Err(_) => {
+                failures += 1;
+                let record = workspace.last_attempt().and_then(|a| a.progress());
+                let report = record.ok_or("失敗した試行のレポートがない")?;
+                (None, report.termination(), report.accepted_steps())
+            }
+        };
+        // 観測次数: 刻みを半分にしたときの誤差の比の log₂。
+        let order = match (previous, error) {
+            (Some(coarse), Some(fine)) => Some((coarse / fine).log2()),
+            _ => None,
+        };
+        previous = error;
+        if let Some(e) = error {
+            points.push([step, e]);
+        }
+        let status = status.map(|t| format!("{t:?}"));
+        if error.is_none() {
+            failure = status.clone();
+        }
+        rows.push((
+            name,
+            step,
+            steps,
+            error,
+            order,
+            requirements.required_bytes(),
+            status,
+        ));
+    }
+    series.push(serde_json::json!({ "name": name, "points": points, "kind": "scatter" }));
+}
+emit_line_chart!(
+    &series,
+    options = &serde_json::json!({
+        "xLabel": "刻み幅 h [h]",
+        "yLabel": "勾配の最大相対誤差 [-]",
+        "xType": "log",
+        "yType": "log"
+    })
+);
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "前進の方式" },
+    { "key": "1", "label": "刻み幅 h [h]", "type": "number", "format": { "significantDigits": 4 } },
+    { "key": "2", "label": "受理した刻み [回]", "type": "integer" },
+    { "key": "3", "label": "勾配の最大相対誤差 [-]", "type": "number", "format": sci2, "nullText": "なし" },
+    { "key": "4", "label": "観測次数 [-]", "type": "number", "format": fixed2, "nullText": "-" },
+    { "key": "5", "label": "作業領域の上限 [B]", "type": "integer" },
+    { "key": "6", "label": "終了状態", "nullText": "-" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "convergence" })
+);
+let outcome = if failures == 0 {
+    Outcome::satisfied("すべての刻み幅で勾配が得られた")
+} else {
+    Outcome::failed("記録の上限を超えた刻み幅では勾配が得られなかった").explanation(
+        "受理した刻みが記録の上限に達すると BudgetLimit(Iteration) で失敗し、勾配は返らない。",
+    )
+};
+let status = failure.unwrap_or_else(|| "ReachedEnd".to_string());
+emit_outcome!(
+    outcome
+        .status(status)
+        .diagnostic("失敗した計算", failures as f64, None)
+);
+```
+
+既定値（$k = 4$〜$9$、記録の上限 1024 刻み）では、陰的台形則の勾配の最大相対誤差は $h = 1.5$ h の $3.6 \times 10^{-2}$ から $h = 0.046875$ h の $3.5 \times 10^{-5}$ まで減り、観測次数は 1.99〜2.00 で 2 次の収束と合う。
+後退 Euler 法は同じ範囲で 0.83 から $2.3 \times 10^{-2}$ までしか減らず、観測次数は 1.09 から 1.01 へ 1 に近づく。
+作業領域の見積もりは記録の上限で決まり、刻み幅によらず台形則で 289 008 B、後退 Euler 法で 404 128 B である。
+記録の上限を 128 刻みにすると、256 刻みが要る $h = 0.09375$ h の計算は `BudgetLimit(Iteration)` で失敗し、誤差の列は空になる。
+このとき受理した刻みの列は、失敗した試行のレポートの 128 を示す。
+表の誤差は前進の方式の離散化誤差で、離散随伴が計算した目的関数の微分を丸め誤差の範囲で返すこととは別の量である。
+
+## まとめ
+
+随伴法は前進の積分と逆向きの積分を 1 回ずつ行い、パラメータの個数によらない計算コストで目的関数の勾配を求める。
+`AdjointMode::Discrete` は計算した目的関数と食い違わない微分を返し、`Continuous` は随伴方程式を別に誤差制御した推定値を返すので、どちらも閉形式や前進感度との比較で確かめる。
+メモリは `CheckpointPolicy` と `AdjointOptions` の上限で決まり、作業領域の準備で見積もりを上限と比べる。
+メモリが足りない分は再計算の刻みとしてレポートに現れ、記録の上限 `with_tape_capacity` を超える刻み数は失敗になる。
+勾配は成功したときだけ得られ、失敗の原因は作業領域の `last_attempt()` か `PartialFailure` のレポートの終了状態で読む。
+剛性のある ODE は `OdeAdjointResidual` で残差にし、`DaeAdjointSolver` の陰的な方式の随伴で解く。
+
+前進感度とアンサンブルは [前進感度とアンサンブル](../forward-sensitivities-and-ensembles/)、DAE の積分と整合な初期値は [指数 1 の DAE](../dae-index-one/)、自動微分の pullback とチェックポイントの一般論は [scioxide-ad の章](../../../scioxide-ad/)、型の一覧は [API ガイド](../../api/)にある。

@@ -1,0 +1,210 @@
+---
+title: "Bounded streams and execution-Plan partitioning"
+description: "Limit readable stream ranges with BoundedSubstream, and inspect the selectors StreamPartitioner assigns to execution-Plan partitions, their reproducibility, and overlap conditions."
+sidebar:
+  order: 309
+references:
+  random-prng-bounded-partitions: "bounded-streams"
+  random-prng-plan-partitions: "assignment-to-execution-plan-partitions"
+---
+
+When assigning streams to parallel workers, decide both which stream each receives and how many words each may read.
+This page explains bounded streams `BoundedSubstream` and `StreamPartitioner`, which selects streams per partition of `scioxide_core::ExecutionPlan`.
+See [Stream advancement, jumps, and splits](oxref:random-prng-advance-jump-split) for the mathematics of stream selection and spacing.
+
+## Bounded streams
+
+`BoundedSubstream` permits reading only a fixed range of generator transitions.
+`BoundedSubstream::for_chunk(&base, i, len)` permits only transitions $[i \cdot len, (i+1) \cdot len)$ counted from the current position of `base`.
+Position is counted from zero at the block start; `remaining()` returns remaining transitions.
+Reads or advances beyond the range fail with `OutOfBounds` without advancing the stream.
+Zero `len`, a block endpoint beyond `u128`, or an untracked position in `base` gives `InvalidInput`.
+
+## Assignment to execution-Plan partitions
+
+`StreamPartitioner` assigns a bounded stream to each partition of `scioxide_core::ExecutionPlan`.
+`StreamPartitioner::from_plan(plan, domain)` takes a Plan and caller region index `domain`; `for_partition(&base, &partition, len)` returns a `BoundedSubstream` of length `len`.
+The stream selector is a 128-bit key mixing partition identity (`PartitionId`) and `domain`; its low 64 bits are the `substream` stream index and its high 64 bits the substream index.
+Selectors depend only on partition identity and `domain`, while streams depend on the root generator and selector, making results independent of execution or thread-completion order.
+When unrelated computations share the same root and Plan, vary `domain` to use separate streams.
+A partition outside the Plan or zero length gives `InvalidInput`.
+
+Selectors are mixed 64-bit key values, rather than small consecutive indices such as 0, 1, 2, ….
+Assess overlap by applying the [Stream spacing and overlap](oxref:random-prng-stream-spacing) table to each generator.
+For counter-based generators, distinct selectors have disjoint counter inputs and each stream permits up to $2^{66}$ words; lengths at most $2^{66}$ therefore do not overlap.
+For `Mrg32k3a`, substream indices are usually at least $2^{51}$ (bit lengths 61–64 in the cell below), outside the range $j < 2^{51}$ where L'Ecuyer et al. guarantee substream nonoverlap.
+Here two partition streams overlap only if their starting positions on the period are less than `len` apart.
+Distinct selectors alone do not guarantee statistical independence for any generator.
+
+The next cell builds a Plan dividing 1,000 work items into $P$ partitions and uses `StreamPartitioner` to assign each a stream of length $L$.
+Because the cell runs sequentially in wasm, it declares a maximum of eight workers and uses an executor running partitions sequentially on the calling thread.
+Inputs are generator, partition count $P$ (2–8), region index, and length $L$ (1–64).
+For each partition, the table shows work-item range, selector bit lengths, first `next_u32`, differing-bit count after recreating the same partition stream and rereading $L$ words, and the result of reading word $L + 1$.
+
+```rust
+//| id: random-stream-partitions
+//| ref: random-stream-partitions
+//| title: "Check StreamPartitioner selectors and stream reproducibility per partition"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-random]
+//| inputs:
+//|   engine: {"type":"select","label":"Generator","description":"Choose a generator with SplittableRng and SkipAhead.","options":["Mrg32k3a","Pcg64","Philox4x64"],"value":"Mrg32k3a"}
+//|   partitions: {"type":"range","label":"Partition count P [count]","min":2,"max":8,"step":1,"value":4}
+//|   domain: {"type":"range","label":"Region index [-]","description":"Different region indices give different selectors even for the same Plan.","min":0,"max":100,"step":1,"value":17}
+//|   length: {"type":"range","label":"Stream length L [transitions]","min":1,"max":64,"step":1,"value":16}
+//| cases:
+//|   - {"id":"philox-eight","label":"Philox4x64, P = 8","description":"Selectors become counter words, giving disjoint stream inputs per partition.","inputs":{"engine":"Philox4x64","partitions":8}}
+//|   - {"id":"other-domain","label":"Region index 0, L = 1","description":"Changing region index changes selectors and first words; the second word is out of range.","inputs":{"domain":0,"length":1}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"partitions","path":"/rows/0/1","equals":0}
+//|       - {"artifact":"partitions","path":"/rows/3/2","equals":1000}
+//|       - {"artifact":"partitions","path":"/rows/0/4","range":{"min":52,"max":64}}
+//|       - {"artifact":"partitions","path":"/rows/3/4","range":{"min":52,"max":64}}
+//|       - {"artifact":"partitions","path":"/rows/0/6","equals":0}
+//|       - {"artifact":"partitions","path":"/rows/3/6","equals":0}
+//|       - {"artifact":"partitions","path":"/rows/3/7","equals":"OutOfBounds"}
+//|   - case: philox-eight
+//|     expect:
+//|       - {"artifact":"partitions","path":"/rows/7/2","equals":1000}
+//|       - {"artifact":"partitions","path":"/rows/7/6","equals":0}
+//|   - case: other-domain
+//|     expect:
+//|       - {"artifact":"partitions","path":"/rows/1/6","equals":0}
+//|       - {"artifact":"partitions","path":"/rows/1/7","equals":"OutOfBounds"}
+use core::num::NonZeroUsize;
+use scioxide_core::{
+    ExecutionContext, ExecutionPlan, ExecutionPolicy, Executor, SciOxideError, PartitionFn,
+    PlanLimits, SequentialExecutor,
+};
+use scioxide_random::{
+    BitGenerator, Mrg32k3a, Pcg64, Philox4x64, SeedableRng, SkipAhead, SplittableRng,
+    StreamPartitioner,
+};
+
+// Executor declaring at most eight workers and running partitions sequentially on the calling thread.
+struct InOrder;
+
+impl Executor for InOrder {
+    fn worker_budget(&self) -> NonZeroUsize {
+        NonZeroUsize::new(8).unwrap_or(NonZeroUsize::MIN)
+    }
+
+    fn execute(
+        &self,
+        context: ExecutionContext<'_>,
+        plan: ExecutionPlan,
+        operation: &PartitionFn<'_>,
+    ) -> Result<(), SciOxideError> {
+        SequentialExecutor.execute(context, plan, operation)
+    }
+}
+
+// (partition, range start, range end, stream-index bit length, substream-index bit length,
+//  first next_u32, differing bits on reread, result for word L + 1)
+type Row = (u64, u64, u64, u32, u32, u32, u32, String);
+
+fn assign<R>(
+    base: &R,
+    plan: ExecutionPlan,
+    domain: u64,
+    length: u64,
+) -> Result<Vec<Row>, String>
+where
+    R: SplittableRng + SkipAhead + Clone,
+{
+    let partitioner = StreamPartitioner::from_plan(plan, domain);
+    let bits = |value: u64| u64::BITS - value.leading_zeros();
+    let mut rows = Vec::new();
+    for partition in plan.partitions() {
+        let open = || {
+            partitioner
+                .for_partition(base, &partition, u128::from(length))
+                .map_err(|e| e.to_string())
+        };
+        let (mut stream, mut replay) = (open()?, open()?);
+        let selectors = stream.stream_identity().and_then(|id| id.selectors());
+        let (stream_id, subsequence) = selectors.ok_or("Missing selector")?;
+        let (mut first, mut differing) = (0, 0);
+        for index in 0..length {
+            let a = stream.next_u32().map_err(|e| e.to_string())?;
+            let b = replay.next_u32().map_err(|e| e.to_string())?;
+            differing += (a ^ b).count_ones();
+            if index == 0 {
+                first = a;
+            }
+        }
+        let beyond = match stream.next_u32() {
+            Ok(_) => "Read succeeded".to_string(),
+            Err(e) => format!("{:?}", e.kind()),
+        };
+        let range = partition.range();
+        let (start, end) = (range.start as u64, range.end as u64);
+        let index = partition.worker_index() as u64;
+        let selector_bits = (bits(stream_id), bits(subsequence));
+        rows.push((
+            index,
+            start,
+            end,
+            selector_bits.0,
+            selector_bits.1,
+            first,
+            differing,
+            beyond,
+        ));
+    }
+    Ok(rows)
+}
+
+let workers = NonZeroUsize::new(partitions.round() as usize).ok_or("Zero partitions")?;
+let limits = PlanLimits {
+    work_per_item: NonZeroUsize::MIN,
+    auto_threshold: NonZeroUsize::MIN,
+    worker_limit: workers,
+};
+let plan =
+    ExecutionContext::new(&InOrder).plan(ExecutionPolicy::Parallel(workers), 1000, limits);
+let (domain, length) = (domain.round() as u64, length.round() as u64);
+let rows = match engine.as_str() {
+    "Mrg32k3a" => assign(&Mrg32k3a::from_seed(42), plan, domain, length)?,
+    "Pcg64" => assign(&Pcg64::from_seed(42), plan, domain, length)?,
+    _ => assign(&Philox4x64::from_seed(42), plan, domain, length)?,
+};
+let columns = serde_json::json!([
+    { "key": "0", "label": "Partition", "type": "integer" },
+    { "key": "1", "label": "First work item", "type": "integer" },
+    { "key": "2", "label": "Work-item end (exclusive)", "type": "integer" },
+    { "key": "3", "label": "Stream-index bit length [bits]", "type": "integer" },
+    { "key": "4", "label": "Substream-index bit length [bits]", "type": "integer" },
+    { "key": "5", "label": "First next_u32", "type": "integer" },
+    { "key": "6", "label": "Differing bits on reread [bits]", "type": "integer" },
+    { "key": "7", "label": "Word L + 1" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "partitions" })
+);
+```
+
+With defaults (`Mrg32k3a`, $P = 4$, region index 17, $L = 16$), 1,000 work items split into four partitions of 250 each.
+Substream-index bit lengths range from 61 to 64, so the substream indices far exceed $2^{51}$ in every partition.
+Every partition has zero differing bits on reread, confirming identical streams for the same partition.
+Reading word $L + 1$ is rejected with `OutOfBounds`.
+Region index zero leaves bit lengths unchanged but changes selector values and every first word.
+Selectors depend only on partition and region index, so selecting `Pcg64` or `Philox4x64` uses the same selectors; for `Philox4x64`, they become counter stream and substream words.
+
+## Summary
+
+With `BoundedSubstream`, workers reading beyond assigned transitions stop with `OutOfBounds` without advancing the stream.
+`StreamPartitioner` selects streams solely from the root generator, partition identity, and region index, so the same Plan produces the same numbers despite changes in thread-completion order.
+Its selectors are mixed 64-bit values; for nonoverlap by construction, combine it with counter-based generators (`Philox4x64`, `Threefry4x64`).
+When combined with `Mrg32k3a`, assess nonoverlap through distances between starting positions on the period and length $L$ rather than the substream guarantee.
+When unrelated computations share a root and Plan, separate streams by changing region indices.
+
+## Further reading
+
+- [Seeds, saved state, and state after failure](../seeding-and-state/): use bounded streams to inspect failed-batch state.
+- [Seed collisions and stream partitioning](../../examples/seed-collisions-and-streams/): estimate collisions among randomly assigned seeds and inspect overlap guarantees from `seed_sequence`, `split`, jumps, and `StreamPartitioner`.
+- [Generators and streams API](../../api/engines-and-streams/): find contracts and errors for `BoundedSubstream` and `StreamPartitioner`.

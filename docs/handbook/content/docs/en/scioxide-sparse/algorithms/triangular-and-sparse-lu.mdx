@@ -1,0 +1,491 @@
+---
+title: "Sparse triangular substitution and sparse LU factorization"
+description: "Sparse triangular substitution and backward error, solution nonzero patterns from reachability, Gilbert–Peierls left-looking sparse LU with partial pivoting, separation of symbolic analysis, numerical factorization, and refactorization, limits, and all-in-one setup constructors."
+sidebar:
+  order: 315
+references:
+  sparse-lu-stages: "symbolic-analysis-factorization-and-refactorization"
+  sparse-partial-pivoting: "partial-pivoting"
+  sparse-reach: "sparse-right-hand-sides-and-reachability"
+  sparse-triangular-substitution: "triangular-substitution"
+---
+
+To solve a linear system $\mathbf{A}\mathbf{x} = \mathbf{b}$ for a general square sparse matrix $\mathbf{A}$ by a direct method, compute the row- and column-permuted LU factorization
+
+$$
+\mathbf{P}\mathbf{A}\mathbf{Q} = \mathbf{L}\mathbf{U}
+$$
+
+then solve triangular systems $\mathbf{L}\mathbf{z} = \mathbf{P}\mathbf{b}$ and $\mathbf{U}\mathbf{w} = \mathbf{z}$ and set $\mathbf{x} = \mathbf{Q}\mathbf{w}$.
+Here $\mathbf{L}$ is unit lower triangular, $\mathbf{U}$ upper triangular, and $\mathbf{P}$ and $\mathbf{Q}$ permutation matrices.
+Sparse elimination creates nonzeros at originally zero positions (**fill**).
+By default, `SparseLu` chooses column order $\mathbf{Q}$ from structure to reduce fill and row order $\mathbf{P}$ from values for numerical stability.
+This page explains triangular substitution and its error, solution nonzero patterns for sparse right-hand sides, Gilbert–Peierls sparse LU using column-wise triangular solves, and symbolic-analysis and refactorization reuse.
+
+## Triangular substitution
+
+For lower-triangular $\mathbf{L}$, solve $\mathbf{L}\mathbf{x} = \mathbf{b}$ from the top row downward using
+
+$$
+x_i = \frac{1}{l_{ii}} \left( b_i - \sum_{j < i,\ l_{ij} \ne 0} l_{ij}\, x_j \right), \qquad i = 0, 1, \dots, n - 1
+$$
+
+which is forward substitution.
+For upper-triangular matrices, perform the same calculation from the bottom upward (back substitution).
+Each stored entry requires one product and subtraction, and each row one division, giving work $O(n + \mathrm{nnz}(\mathbf{L}))$.
+
+Substitution is backward stable.
+For a real triangular matrix in floating-point arithmetic, the computed $\hat{\mathbf{x}}$ satisfies
+
+$$
+(\mathbf{L} + \Delta\mathbf{L})\,\hat{\mathbf{x}} = \mathbf{b}, \qquad |\Delta\mathbf{L}| \le \gamma_r\, |\mathbf{L}|
+$$
+
+as the bound (Higham, Chapter 8, assuming no underflow).
+Absolute values and inequalities are entrywise; $\gamma_k$ is the error-bound coefficient from [notation](oxref:sparse-notation), and $r$ is the maximum number of stored entries in any row of $\mathbf{L}$ ($r \le n$).
+Thus $\hat{\mathbf{x}}$ exactly solves a triangular system whose entries of $\mathbf{L}$ differ relatively by at most $\gamma_r$.
+Backward error is explained in [floating point and condition numbers](../../../concepts/floating-point-and-conditioning/).
+
+Forward error can be amplified by the triangular matrix's condition number.
+Using Skeel's condition number $\mathrm{cond}(\mathbf{L}, \mathbf{x}) = \| |\mathbf{L}^{-1}|\,|\mathbf{L}|\,|\mathbf{x}| \|_\infty / \|\mathbf{x}\|_\infty$ gives $\|\hat{\mathbf{x}} - \mathbf{x}\|_\infty / \|\mathbf{x}\|_\infty \lesssim \mathrm{cond}(\mathbf{L}, \mathbf{x})\, \gamma_r$ to first order.
+Even uniformly sized entries can give exponentially growing condition numbers in $n$: for example, a unit lower-triangular matrix with all entries below the diagonal equal to $-1$ has entries of $\mathbf{L}^{-1}$ growing to $2^{n-2}$.
+Estimate solution accuracy from conditioning separately from backward error.
+
+`SparseTriangular::new(matrix, triangle, diagonal)` owns CSR matrix `matrix` and constructs a checked triangular matrix, selecting orientation with `Triangle::Lower`/`Upper` and stored or unit diagonals with `DiagonalKind::Explicit`/`Unit`.
+Nonsquare matrices are rejected with `DimensionMismatch`.
+Entries outside the selected triangle and stored diagonals under `Unit` are rejected with `InvalidInput`.
+Missing or zero diagonals under `Explicit` are rejected with `Singular`.
+
+The output-buffer API `solve_into(rhs, operation, options, output, workspace, scope)` selects systems $\mathbf{L}$, $\mathbf{L}^{\mathsf{T}}$, or $\mathbf{L}^{\mathsf{H}}$ through `Normal`, `Transpose`, or `Adjoint` of `SparseOperation`.
+Transpose and adjoint substitution traverse the same CSR storage column-wise using its column indices (`opposite_traversal()`), without constructing a transposed copy.
+Workspace uses $2n$ scalars per right-hand side; create it with `workspace(rhs)` or borrow an array of the length given by `scalar_len()` of `workspace_requirements(rhs)` using `SparseSolveWorkspace::borrowed`.
+Standard forms `solve`, `solve_transpose`, and `solve_adjoint` return solutions in new arrays.
+Calling-form names are defined in [calling forms](oxref:sparse-execution-forms).
+Every form takes a dense right-hand-side vector and scans all rows, costing $O(n + \mathrm{nnz}(\mathbf{L}))$ even for sparse right-hand sides.
+
+## Sparse right-hand sides and reachability
+
+For sparse right-hand side $\mathbf{b}$, knowing solution $\mathbf{x}$'s nonzero positions in advance allows zero-entry computations to be skipped.
+Interpret the nonzero pattern of $\mathbf{L}$ as a directed graph $G(\mathbf{L})$ with edges $j \to i$ whenever $l_{ij} \ne 0$ ($i > j$).
+Since $\mathbf{L}$ is lower triangular, this graph is acyclic.
+The forward-substitution formula permits nonzero $x_i$ only when $b_i \ne 0$ or when an edge $j \to i$ comes from some $j$ with $x_j \ne 0$.
+Following this from smaller indices upward gives Gilbert and Peierls' theorem
+
+$$
+\{ i : x_i \ne 0 \} \subseteq \mathrm{Reach}_{G(\mathbf{L})}\bigl(\{ j : b_j \ne 0 \}\bigr)
+$$
+
+follows.
+The right side is the set of vertices reachable by following edges from vertices with $b_j \ne 0$ (the **reach set**).
+Strict inclusion occurs when contributions cancel exactly at a vertex; that zero may also propagate to later vertices.
+Structurally, ignoring cancellation, equality holds.
+
+Depth-first search finds the reach set; reverse finishing order gives a valid substitution order (topological order).
+Store $\mathbf{L}$ by column and process reached vertices $j$ topologically, finalizing $x_j$ before subtracting column $j$ contributions of $\mathbf{L}$ from remaining entries.
+Search and substitution then cost proportionally to reached vertices and their column nonzeros, namely actual multiply-add operations, rather than $n$.
+`scioxide-sparse` uses this substitution inside sparse LU and Cholesky (using elimination-tree reach sets for Cholesky) but exposes no sparse-right-hand-side substitution API.
+Sparse right-hand sides also use the `SparseTriangular` substitution scanning all rows.
+
+### Reachability and cancellation
+
+The following cell builds a lower-triangular matrix with six-vertex DAG pattern $0 \to 1$, $0 \to 2$, $1 \to 3$, $2 \to 3$, $2 \to 4$, and $3 \to 5$ (diagonal 2 and edge entries $-1$ except $l_{32}$), then substitutes right-hand side $\mathbf{b} = 4\mathbf{e}_s$.
+Inputs are source $s$ (0–5) and whether to change $l_{32}$ from $-1$ to $+1$.
+With $+1$ and $s = 0$, contributions of paths $0 \to 1 \to 3$ and $0 \to 2 \to 3$ cancel at vertex 3.
+Substitution uses the output-buffer API `solve_into` with workspace borrowed from a caller-owned array.
+As checks, it independently computes $\mathrm{Reach}(\{s\})$ by depth-first search and compares solution nonzeros, then computes $\mathbf{L}\hat{\mathbf{x}}$ from the edge list for residual $\|\mathbf{L}\hat{\mathbf{x}} - \mathbf{b}\|_\infty$.
+The first table shows vertex-wise values; the second shows reach-set size, solution nonzero count, nonzeros outside the reach set (zero by the theorem), and residual.
+
+```rust
+//| id: sparse-triangular-reach
+//| ref: sparse-triangular-reach
+//| title: "Sparse triangular solution nonzeros and reachability"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-sparse]
+//| inputs:
+//|   rhs_source: {"type":"range","label":"Right-hand-side nonzero position s","description":"Set the right-hand side to b = 4eₛ.","min":0,"max":5,"step":1,"value":0}
+//|   cancel: {"type":"checkbox","label":"Set l₃₂ = +1 (cancel contributions at vertex 3 for s = 0)","value":false}
+//| cases:
+//|   - {"id":"cancellation","label":"l₃₂ = +1","description":"Contributions from two paths cancel at vertex 3, making the solution zero at reached vertices 3 and 5.","inputs":{"cancel":true}}
+//|   - {"id":"middle-source","label":"s = 2","description":"Starting at vertex 2 shrinks the reach set to {2, 3, 4, 5}.","inputs":{"rhs_source":2}}
+//|   - {"id":"sink-source","label":"s = 5","description":"Starting at a zero-outdegree vertex reaches only that vertex.","inputs":{"rhs_source":5}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"solution","path":"/rows/0/2","equals":2}
+//|       - {"artifact":"solution","path":"/rows/3/2","equals":1}
+//|       - {"artifact":"solution","path":"/rows/5/2","equals":0.5}
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":6}
+//|       - {"artifact":"summary","path":"/rows/0/1","equals":6}
+//|       - {"artifact":"summary","path":"/rows/0/2","equals":0}
+//|       - {"artifact":"summary","path":"/rows/0/3","equals":0}
+//|   - case: cancellation
+//|     expect:
+//|       - {"artifact":"solution","path":"/rows/3/2","equals":0}
+//|       - {"artifact":"solution","path":"/rows/5/2","equals":0}
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":6}
+//|       - {"artifact":"summary","path":"/rows/0/1","equals":4}
+//|       - {"artifact":"summary","path":"/rows/0/2","equals":0}
+//|   - case: middle-source
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":4}
+//|       - {"artifact":"summary","path":"/rows/0/1","equals":4}
+//|       - {"artifact":"solution","path":"/rows/1/2","equals":0}
+//|   - case: sink-source
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":1}
+//|       - {"artifact":"solution","path":"/rows/5/2","equals":2}
+use scioxide_core::{DiagonalKind, ExecutionContext, Triangle};
+use scioxide_sparse::{
+    DuplicatePolicy, ExplicitZeroPolicy, SparseBuilder, SparseOperation, SparseSolveOptions,
+    SparseSolveWorkspace, SparseTriangular,
+};
+
+let n = 6;
+let s = rhs_source as usize;
+// (i, j, l_ij) represents edge j → i (i > j).
+let l32 = if cancel { 1.0 } else { -1.0 };
+let edges = [
+    (1, 0, -1.0_f64),
+    (2, 0, -1.0),
+    (3, 1, -1.0),
+    (3, 2, l32),
+    (4, 2, -1.0),
+    (5, 3, -1.0),
+];
+let mut builder = SparseBuilder::new(n, n);
+for i in 0..n {
+    builder.push(i, i, 2.0_f64).map_err(|e| e.to_string())?;
+}
+for &(i, j, v) in &edges {
+    builder.push(i, j, v).map_err(|e| e.to_string())?;
+}
+let l = builder
+    .finish_csr(DuplicatePolicy::Reject, ExplicitZeroPolicy::Drop)
+    .map_err(|e| e.to_string())?;
+let factor = SparseTriangular::new(l, Triangle::Lower, DiagonalKind::Explicit)
+    .map_err(|e| e.to_string())?;
+
+let mut b = vec![0.0_f64; n];
+b[s] = 4.0;
+let mut x = vec![0.0_f64; n];
+// Borrow workspace for one right-hand side (2n entries) from a caller-owned array.
+let requirements = factor
+    .workspace_requirements(1)
+    .map_err(|e| e.to_string())?;
+let mut scratch = vec![0.0_f64; requirements.scalar_len()];
+let mut workspace = SparseSolveWorkspace::borrowed(&mut scratch);
+factor
+    .solve_into(
+        &b,
+        SparseOperation::Normal,
+        SparseSolveOptions::new(),
+        &mut x,
+        &mut workspace,
+        ExecutionContext::sequential(),
+    )
+    .map_err(|e| e.to_string())?;
+
+// Independent check 1: find vertices reachable from s by depth-first search.
+let mut reached = vec![false; n];
+let mut stack = vec![s];
+while let Some(j) = stack.pop() {
+    if !reached[j] {
+        reached[j] = true;
+        stack.extend(edges.iter().filter(|e| e.1 == j).map(|e| e.0));
+    }
+}
+// Independent check 2: assemble L x from the edge list and compute residual ‖L x − b‖∞.
+let mut lx: Vec<f64> = x.iter().map(|v| 2.0 * v).collect();
+for &(i, j, v) in &edges {
+    lx[i] += v * x[j];
+}
+let residual = lx
+    .iter()
+    .zip(&b)
+    .fold(0.0_f64, |m, (p, q)| m.max((p - q).abs()));
+
+let rows: Vec<(usize, f64, f64, &str, &str)> = (0..n)
+    .map(|i| {
+        let reach = if reached[i] {
+            "Included"
+        } else {
+            "Excluded"
+        };
+        let nonzero = if x[i] != 0.0 { "Nonzero" } else { "0" };
+        (i, b[i], x[i], reach, nonzero)
+    })
+    .collect();
+let columns = serde_json::json!([
+    { "key": "0", "label": "Vertex i", "type": "integer" },
+    { "key": "1", "label": "bᵢ [-]", "type": "number" },
+    { "key": "2", "label": "xᵢ [-]", "type": "number" },
+    { "key": "3", "label": "Reach({s})" },
+    { "key": "4", "label": "xᵢ ≠ 0" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "solution" })
+);
+let count = |f: &dyn Fn(usize) -> bool| (0..n).filter(|&i| f(i)).count();
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let summary = serde_json::json!([
+    { "key": "0", "label": "Reach-set size [count]", "type": "integer" },
+    { "key": "1", "label": "Solution nonzeros [count]", "type": "integer" },
+    { "key": "2", "label": "Nonzeros outside reach set [count]", "type": "integer" },
+    { "key": "3", "label": "‖Lx̂ − b‖∞ [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    summary,
+    vec![(
+        count(&|i| reached[i]),
+        count(&|i| x[i] != 0.0),
+        count(&|i| x[i] != 0.0 && !reached[i]),
+        residual,
+    )],
+    metadata = serde_json::json!({ "id": "summary" })
+);
+```
+
+At the default $s = 0$, all six vertices are reachable, matching the nonzero positions of solution $\hat{\mathbf{x}} = (2, 1, 1, 1, 0.5, 0.5)$.
+Enabling cancellation gives $x_3 = -(l_{31} x_1 + l_{32} x_2)/2 = -(-1 + 1)/2 = 0$; vertices 3 and 5 beyond it remain reachable but have zero solution entries.
+The four solution nonzeros are then strictly contained in the six-vertex reach set.
+At $s = 2$, the reach set shrinks to $\{2, 3, 4, 5\}$; starting at a zero-outdegree vertex such as $s = 5$ reaches only itself.
+Every input has zero nonzeros outside the reach set.
+All entries are exactly representable in binary, so displayed $x_i$ values are exact without rounding and residuals are zero.
+
+## Left-looking sparse LU factorization
+
+Gilbert–Peierls builds $\mathbf{L}$ and $\mathbf{U}$ one column at a time from the left (left-looking).
+Symbolic analysis determines column order $\mathbf{Q}$; step $j$ uses column $j$, $\mathbf{a}$, of $\mathbf{A}\mathbf{Q}$.
+Let $\mathbf{L}_j$ contain the $j$ computed columns of $\mathbf{L}$ and unit vectors at not-yet-computed column positions (lower triangular when rows follow pivot order), and solve the triangular system
+
+$$
+\mathbf{L}_j\, \mathbf{x} = \mathbf{a}
+$$
+
+as the column solve.
+In solution $\mathbf{x}$, previously pivoted rows give entries above the diagonal in column $j$ of $\mathbf{U}$, while remaining entries are pivot candidates for column $j$.
+Since $\mathbf{a}$ is sparse, this triangular system uses the preceding reach-set method.
+Depth-first search for the reach set follows only nonzeros in computed columns of $\mathbf{L}$.
+
+Gilbert and Peierls showed work proportional to actual multiply-add count plus $O(n + \mathrm{nnz}(\mathbf{A}))$.
+Work depends on fill actually produced by ordering and pivoting, rather than a matrix-size expression such as $n^2$.
+
+### Partial pivoting
+
+At step $j$, choose candidate row $p$ of greatest absolute value ($|z|$ for complex values), breaking ties by smaller original row index.
+Using the selected row's value,
+
+$$
+u_{jj} = x_p, \qquad l_{ij} = \frac{x_i}{u_{jj}} \quad (i \text{ is a remaining candidate row})
+$$
+
+the expression above.
+This is partial pivoting; multipliers satisfy $|l_{ij}| \le 1$.
+No candidates, or all candidates exactly zero, returns `Singular` at that step.
+A nonzero multiplier rounded to zero returns `NumericalInstability` (`Underflow`); an unrepresentable value returns `NumericalInstability` (`Overflow`).
+Exactly zero entries of $\mathbf{L}$ and $\mathbf{U}$ are not stored, so stored count can be smaller than summed reach-set sizes.
+
+For real matrices without underflow, computed factors satisfy entrywise
+
+$$
+\mathbf{P}(\mathbf{A} + \Delta\mathbf{A})\mathbf{Q} = \hat{\mathbf{L}}\hat{\mathbf{U}}, \qquad |\Delta\mathbf{A}| \le \gamma_n\, \mathbf{P}^{\mathsf{T}} |\hat{\mathbf{L}}|\,|\hat{\mathbf{U}}|\, \mathbf{Q}^{\mathsf{T}}
+$$
+
+as the bound (Higham, Chapter 9).
+Partial pivoting bounds entries of $|\hat{\mathbf{L}}|$ by 1, but entries of $\hat{\mathbf{U}}$ can grow during elimination.
+The **growth factor** $\rho_n$, the largest entry encountered during elimination divided by the largest original entry of $\mathbf{A}$, can reach $2^{n-1}$ in the worst case but is usually small in practice.
+
+Many sparse direct methods preserve sparsity with threshold partial pivoting, allowing low-fill rows whose candidate magnitude is at least $\tau$ times the maximum.
+`SparseLu` provides no threshold pivoting and always selects a maximum-magnitude candidate.
+Its stability therefore matches ordinary partial pivoting, but pivot rows need not minimize fill.
+Reduce fill through column order selected with symbolic `SparseOrdering`.
+For Hermitian matrices, [sparse Cholesky and block LDL](../symmetric-factorizations/) compute and store only lower-triangular factors.
+
+## Symbolic analysis, factorization, and refactorization
+
+`SparseLu` separates structure-only symbolic analysis from numerical factorization using values.
+Symbolic analysis determines only column order $\mathbf{Q}$; numerical pivots determine row order $\mathbf{P}$, nonzero patterns of $\mathbf{L}$ and $\mathbf{U}$, and fill.
+Thus symbolic analysis does not predict factor size.
+
+1. `SparseLuSymbolic::analyze(pattern, ordering, limits)` accepts square structure `pattern` (`a.structural_pattern()`), determines column order $\mathbf{Q}$, and builds column-traversal indices.
+   `ordering` is `SparseOrdering::FillReducing` (default, AMD on the structure of $\mathbf{A} + \mathbf{A}^{\mathsf{T}}$), `Natural` (original order), or `Supplied(&q)` (supplied permutation, $\mathbf{B}_{ij} = \mathbf{A}_{i, q_j}$).
+   Stored zeros are included in the structure.
+   Nonsquare structures and wrong-length permutations return `DimensionMismatch`; analysis and temporary ordering storage exceeding the byte limit returns `ResourceLimit`.
+2. Standard form `SparseLu::factor(symbolic, matrix)` owns symbolic analysis, performs numerical factorization, and returns factors on success.
+   Scoped API `factor_scoped(symbolic, matrix, options, scope)` performs the same factorization under `SparseSolveOptions` and execution context `scope`.
+   Both allocate factors and temporary workspace.
+   Factor `row_permutation()` returns row order $p$, `symbolic().column_permutation()` column order $q$ (both $p[\text{new}] = \text{old}$), and `factor_entries()` the stored entry count of $\mathbf{L}$ and $\mathbf{U}$, excluding the unit diagonal of $\mathbf{L}$.
+   `lower_entries()` and `upper_entries()` return $(i, j, l_{ij})$ and $(i, j, u_{ij})$ by column in reordered coordinates.
+3. `refactor(matrix, options, workspace, scope)` refactorizes new matrix values whose structure matches symbolic analysis exactly.
+   Candidate factors are built in workspace `SparseLuWorkspace` and replace the factors only on success, so previous factors including permutations remain usable on failure.
+   A structure mismatch returns `InvalidInput`; shape mismatch or workspace preallocated for symbolic analysis with different order, structural entry count, or `max_factor_entries` returns `DimensionMismatch`.
+   Refactorization allocates nothing after preallocation.
+   Changed values may change pivot rows and fill.
+
+Create workspace with `symbolic.workspace(())`, or preallocate `SparseLuWorkspace::new()` with `try_reserve` for the `SparseLuRequirements` returned by `workspace_requirements(())`.
+`SparseLuRequirements` returns logical bytes of symbolic analysis, factors, and workspace (`symbolic_bytes()`, `factor_bytes()`, `workspace_bytes()`, and their sum `total_bytes()`); workspace includes a second factor.
+`factor` owns symbolic analysis; make a copy with `try_clone()` to create another factor from it.
+To avoid allocation even for the first factorization, pass symbolic analysis into workspace with `SparseLuWorkspace::prepare(symbolic)` and preallocate factor storage too, then create factors with its `factor_scoped(matrix, options, scope)`.
+This `factor_scoped` allocates nothing and preserves symbolic analysis and storage in workspace on failure.
+To move to another structure, `reprepare_natural(Some(factor), pattern, limits)` returns factor storage to workspace and rebuilds symbolic analysis in natural order.
+If existing storage suffices, neither this call nor the next `factor_scoped` allocates.
+
+Required limits `SparseLuLimits::new(max_factor_entries, max_workspace_bytes)` bound combined entries of $\mathbf{L}$ and $\mathbf{U}$ and logical bytes across symbolic analysis, factors, and workspace.
+`max_factor_entries` is also factor storage capacity; factors and workspace initially preallocate this many entries.
+Fill exceeding the limit returns `ResourceLimit` during numerical factorization, stopping before nearly dense fill exhausts memory.
+When solve workspace is owned (`factor.workspace(rhs)`), its size also counts toward the byte limit.
+When `SparseSolveOptions::with_budgets` supplies an iteration limit, factorization counts one per column and solves one per right-hand side, returning `ConvergenceFailure` (`IterationLimit`) at the limit.
+`with_accuracy` selects elimination and substitution arithmetic; `with_execution_policy` selects whether `solve_block_into` right-hand sides are solved in parallel.
+Factorization itself always runs sequentially.
+
+Solve forms and workspace match triangular systems: output-buffer API `solve_into(rhs, operation, options, output, workspace, scope)` selects systems $\mathbf{A}$, $\mathbf{A}^{\mathsf{T}}$, or $\mathbf{A}^{\mathsf{H}}$, using a `SparseSolveWorkspace` of $2n$ scalars per right-hand side.
+`solve_block_into` solves column-major multiple right-hand sides, writing output together only after every column succeeds.
+Standard forms `solve(rhs)`, `solve_transpose(rhs)`, and `solve_adjoint(rhs)` return solutions in new arrays with default options.
+Factors implement `LinearOperator` and `AdjointOperator` and can be passed to iterative methods as the actions of $\mathbf{A}^{-1}$ and $\mathbf{A}^{-\mathsf{H}}$.
+
+The all-in-one setup constructor `SparseLu::new(&a)` performs `FillReducing` symbolic analysis and numerical factorization without a byte limit.
+The factor-entry limit starts at $\mathrm{nnz}(\mathbf{A}) + n$, doubles after each `ResourceLimit`, and stops at $n^2$, which no factors exceed.
+There are at most $\lceil \log_2 n \rceil + 1$ attempts, recomputing columns from failed attempts.
+The resulting factors match calls to `analyze` and `factor` with sufficient limits.
+The one-shot function `solve(&a, &b)` solves once using `SparseLu::new(&a)` factors, returning `DimensionMismatch` for a right-hand-side length mismatch and `NonFinite` for NaN or infinity.
+
+### Pivot changes under refactorization and preservation on failure
+
+The following cell symbolically analyzes $\mathbf{A}(a) = \begin{pmatrix} a & 1 \\ 2 & 4 \end{pmatrix}$ once in natural order, then varies $a$ and repeats `refactor`.
+Stages use $a = 4$, input $a$ (0.5–5), then $a = 0.5$; the final $\mathbf{A}(0.5)$ matrix is singular with determinant $4a - 2 = 0$.
+After each stage, solve the system for value $a$ retained in the factors using right-hand side $\mathbf{b} = (a + 1, 6)^{\mathsf{T}}$ giving exact solution $(1, 1)$, and show the maximum exact-solution difference.
+A failed refactorization stage leaves the factors at the last accepted $a$.
+Table $u_{00}$ and $u_{11}$ are diagonals of $\mathbf{U}$ read with `upper_entries()`: pivots of the factors at that stage.
+
+```rust
+//| id: sparse-lu-refactor-pivoting
+//| ref: sparse-lu-refactor-pivoting
+//| title: "Sparse LU pivot changes under refactorization and factor preservation on failure"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-sparse]
+//| inputs:
+//|   second_diagonal: {"type":"range","label":"Second-stage diagonal entry a","description":"Rows exchange for |a| < 2, and A(a) is singular at a = 0.5.","min":0.5,"max":5.0,"step":0.5,"value":1.0}
+//| cases:
+//|   - {"id":"tie","label":"a = 2","description":"Equal candidate magnitudes select row 0 by smaller index, so no row exchange occurs.","inputs":{"second_diagonal":2.0}}
+//|   - {"id":"singular-step","label":"a = 0.5","description":"Second-stage refactorization also fails, leaving first-stage a = 4 factors.","inputs":{"second_diagonal":0.5}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"steps","path":"/rows/0/2","equals":"[0, 1]"}
+//|       - {"artifact":"steps","path":"/rows/0/4","approx":{"value":3.5,"atol":1e-15}}
+//|       - {"artifact":"steps","path":"/rows/1/2","equals":"[1, 0]"}
+//|       - {"artifact":"steps","path":"/rows/1/4","approx":{"value":-1.0,"atol":1e-15}}
+//|       - {"artifact":"steps","path":"/rows/2/1","equals":"Singular"}
+//|       - {"artifact":"steps","path":"/rows/2/5","equals":1}
+//|       - {"artifact":"steps","path":"/rows/2/6","range":{"max":1e-15}}
+//|   - case: tie
+//|     expect:
+//|       - {"artifact":"steps","path":"/rows/1/2","equals":"[0, 1]"}
+//|       - {"artifact":"steps","path":"/rows/1/4","approx":{"value":3.0,"atol":1e-15}}
+//|   - case: singular-step
+//|     expect:
+//|       - {"artifact":"steps","path":"/rows/1/1","equals":"Singular"}
+//|       - {"artifact":"steps","path":"/rows/1/2","equals":"[0, 1]"}
+//|       - {"artifact":"steps","path":"/rows/2/5","equals":4}
+//|       - {"artifact":"steps","path":"/rows/2/6","range":{"max":1e-15}}
+use scioxide_core::ExecutionContext;
+use scioxide_sparse::{
+    DuplicatePolicy, ExplicitZeroPolicy, SparseBuilder, SparseLu, SparseLuLimits,
+    SparseLuSymbolic, SparseOperation, SparseOrdering, SparseSolveOptions,
+};
+
+let mut builder = SparseBuilder::new(2, 2);
+builder
+    .extend(&[0, 0, 1, 1], &[0, 1, 0, 1], &[4.0_f64, 1.0, 2.0, 4.0])
+    .map_err(|e| e.to_string())?;
+// Fix structure with Preserve and refactorize changing only values.
+let mut a = builder
+    .finish_csr(DuplicatePolicy::Reject, ExplicitZeroPolicy::Preserve)
+    .map_err(|e| e.to_string())?;
+// Perform symbolic analysis once. Factor-entry limit 8 suffices for dense 2×2 L and U.
+let symbolic = SparseLuSymbolic::analyze(
+    a.structural_pattern(),
+    SparseOrdering::Natural,
+    SparseLuLimits::new(8, 1 << 16),
+)
+.map_err(|e| e.to_string())?;
+let (options, scope) = (SparseSolveOptions::new(), ExecutionContext::sequential());
+let mut work = symbolic.workspace(()).map_err(|e| e.to_string())?;
+let mut factor = SparseLu::factor(symbolic, a.view()).map_err(|e| e.to_string())?;
+let mut solve_work = factor.workspace(1).map_err(|e| e.to_string())?;
+
+let mut rows = Vec::new();
+let mut accepted = 4.0_f64;
+for diagonal in [4.0, second_diagonal, 0.5] {
+    // Position 0 in values() storage order is a₀₀.
+    a.set_value(0, diagonal).map_err(|e| e.to_string())?;
+    let status = match factor.refactor(a.view(), options, &mut work, scope) {
+        Ok(()) => {
+            accepted = diagonal;
+            "Accepted".to_string()
+        }
+        Err(e) => format!("{:?}", e.kind()),
+    };
+    // Solve A(accepted) retained in the factors with a right-hand side giving exact solution (1, 1).
+    let mut x = [0.0_f64; 2];
+    factor
+        .solve_into(
+            &[accepted + 1.0, 6.0],
+            SparseOperation::Normal,
+            options,
+            &mut x,
+            &mut solve_work,
+            scope,
+        )
+        .map_err(|e| e.to_string())?;
+    let error = (x[0] - 1.0).abs().max((x[1] - 1.0).abs());
+    let pivots: Vec<f64> = factor
+        .upper_entries()
+        .filter(|&(i, j, _)| i == j)
+        .map(|(_, _, value)| value)
+        .collect();
+    let order = format!("{:?}", factor.row_permutation());
+    rows.push((
+        diagonal, status, order, pivots[0], pivots[1], accepted, error,
+    ));
+}
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Diagonal a [-]", "type": "number" },
+    { "key": "1", "label": "Refactorization" },
+    { "key": "2", "label": "Row order p" },
+    { "key": "3", "label": "u₀₀ [-]", "type": "number" },
+    { "key": "4", "label": "u₁₁ [-]", "type": "number" },
+    { "key": "5", "label": "a represented by factors [-]", "type": "number" },
+    { "key": "6", "label": "Exact-solution difference [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "steps" })
+);
+```
+
+At the default $a = 1$, stage 1 ($a = 4$) has $|4| \ge 2$, so rows do not exchange, giving $p = [0, 1]$ and $u_{11} = 4 - (2/4) \cdot 1 = 3.5$.
+Stage 2 has $|1| < 2$, so row 1 is the pivot and $p = [1, 0]$, with $u_{00} = 2$ and $u_{11} = 1 - (1/2) \cdot 4 = -1$.
+Both stages have zero difference from the exact solution.
+At stage 3, $|0.5| < 2$ selects row 1 in column 0; the column-1 pivot $1 - (0.5/2) \cdot 4 = 0$ becomes exactly zero, failing with `Singular`.
+Failure preserves stage-2 factors, and solving $a = 1$ again gives the same solution.
+At $a = 2$, candidates have equal magnitude and smaller-index row 0 is selected, so rows do not exchange.
+At $a = 0.5$, stage 2 also fails and factors remain at first-stage $a = 4$ even after stage 3.
+
+## Summary
+
+Sparse triangular substitution is backward stable with work $O(n + \mathrm{nnz})$, but forward error can be amplified by triangular conditioning, so estimate solution accuracy with the condition number.
+For sparse right-hand sides, solution nonzeros lie in the reach set; `SparseLu` uses this to solve column triangular systems, making factorization work depend on actual multiply-add count.
+`SparseLu` uses partial pivoting without thresholds; symbolic analysis determines only column order (default AMD on $\mathbf{A} + \mathbf{A}^{\mathsf{T}}$), so allow for pivot-dependent fill in `max_factor_entries`.
+For unchanged structure with varying values, perform symbolic analysis once and repeat `refactor` using preallocated `SparseLuWorkspace`.
+If `refactor` fails, previous factors remain usable, allowing singular new values to be discarded and computation to continue with earlier factors.
+
+## Further reading
+
+- [Sparse Cholesky and block LDL factorization](../symmetric-factorizations/): examine Hermitian Cholesky structure determined in advance from elimination trees and inertia counting.
+- [Orderings and coloring](../orderings-and-coloring/): examine how column order determines fill and the ideas behind AMD and RCM.
+- [Direct factorizations](../../api/factorizations/): look up specifications for every triangular-system and LU symbolic-analysis, factor, workspace, and limit item.

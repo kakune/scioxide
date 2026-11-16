@@ -1,0 +1,280 @@
+---
+title: FFT の Plan・作業領域・キャッシュ
+description: FftPlanSpec から Plan を準備して再利用する手順、Plan の診断、作業領域の要件と所有、FftPlanCache の鍵と LRU による退去と統計を説明する。
+sidebar:
+  order: 312
+references:
+  fft-plan-preparation: "plan-の準備と所有"
+  fft-plan-diagnostics: "plan-の診断"
+  fft-workspace-requirements: "作業領域の要件と所有"
+  fft-plan-cache: "plan-のキャッシュ"
+---
+
+[FFT のアルゴリズムと任意長変換](../planner-and-arbitrary-lengths/)では、長さからアルゴリズムが決まり、準備に回転因子の表や畳み込みの核の計算が要ることを見た。
+このページでは準備の結果を持つ Plan、実行に要る作業領域、Plan を共有するキャッシュを説明する。
+三つはライフタイムが異なる。
+Plan は準備のあと変わらず、作業領域は呼び出し側が所有して使い回し、キャッシュは呼び出し側が置いた場所でだけ働く。
+外部の FFT 実装の注入と CPU の命令セットの選択は[外部 FFT 実装と CPU 命令セット](../providers-and-cpu-backends/)で扱う。
+
+## Plan の準備と所有
+
+`FftPlanSpec::new(length, direction, normalization, layout)` が一次元の Plan の仕様である。
+`length` は論理長で、パックした配置（`FftLayout::Real`、`Hermitian`）でもビンの個数ではなく実数列の長さを指す。
+実行方針は既定で `ExecutionPolicy::Sequential`、CPU の命令セットの方針は既定で `FftBackendStrategy::Automatic` で、`with_execution_policy` と `with_backend_strategy` で変える。
+仕様は値を持つだけで、検査は準備のときに行う。
+
+Plan は二通りに準備する。
+
+- `FftPlan::new(spec)` は `ExecutionContext::sequential_native()` の機能で準備する。
+  `std` の機能があれば、実行時に検出したホストの命令セットを使う。
+- `FftPlan::build(spec, context)` は渡したコンテキストの機能だけを使う。
+  `ExecutionContext::sequential()` はプロセッサの機能を返しないので、スカラー版の計算カーネルになる。
+
+準備は、長さが 0 か、使えない命令セットを要求したときに `InvalidInput` を返す。
+表や作業領域の大きさを表せないか確保できなければ `SizeOverflow`、`ResourceLimit`、`AllocationFailure` のどれかになる。
+`build` は、コンテキストがすでに取り消されているか期限を過ぎていれば `ExecutionStopped` を返す。
+
+Plan は長さ、方向、正規化、配置、実行方針、命令セットを固定し、準備のあとは変更できない。
+逆方向の変換には別の Plan を用意する。
+複製は準備した表を `Arc` で共有するので、表を写さない。
+Plan は準備に使ったコンテキストを保持しないので、準備したあとはどの実行コンテキストでも実行できる。
+実行時に Plan がコンテキストから使うのは、executor、取り消しフラグ、期限だけである。
+
+`execute_into(input, output, scratch, context)` は `&self` で Plan を借用し、入力を共有借用、出力と作業領域を可変借用する。
+入力と出力には、スライス、配列、`Vec`、`VectorView`、`HermitianSpectrum` の参照を渡せる。
+配置と方向に合う入出力の組は[Plan での格納形式](oxref:fft-real-plan-layout)にある。
+複素の配置では `execute_in_place(data, scratch, context)` も使える。
+失敗したときは呼び出し側の出力を変えない。
+複素の配置では、作業領域の先頭 $N$ 個で結果を組み立て、成功してから出力へ書き写す。
+`fft` や `rfft` などの関数は呼び出しのたびに Plan と作業領域を作って捨て、結果を新しい `Vec` で返す。
+
+## Plan の診断
+
+`plan.diagnostics()` は `FftPlanDiagnostics` を返す。
+`algorithm()` は選ばれた `FftAlgorithmKind`（`Identity`、`MixedRadix`、`Rader`、`Bluestein`、`Provider`）、`stage_count()` は実行経路の FFT の段数の最大である。
+パックした配置の Plan は内側の複素 FFT のアルゴリズムを返す。
+選択の規則と段数の数え方は[アルゴリズムの選択規則](oxref:fft-algorithm-selection)にある。
+
+`FftAlgorithmKind` は数学的なアルゴリズムの名前で、`FftBackendStrategy` は CPU の命令セットの方針であり、両者は独立である。
+実際に使われた実装は `plan.resolved_backends()` が `FftBackend` の反復子で返す。
+`FftBackend` は `Cpu(KernelBackend)` か `Provider` である。
+パックした配置で長さが 3・5・7 の真の倍数の奇数なら、Plan は複数の複素 FFT を持つので、反復子は複数の値を返し、同じ値が繰り返されることもある。
+`plan.plan_bytes()` は Plan が占めるバイト数で、共有した表も含む。
+同じ表を共有する複製もそれぞれ全量を返し、`FftPlanCache` の `retained_plan_bytes()` は共有した表を 1 回だけ数える。
+
+## 作業領域の要件と所有
+
+`plan.workspace_requirements(())` は `FftWorkspaceRequirements` を返す。
+`complex_len()` は要る複素数の個数、`bytes()` はそのバイト数、`alignment()` は要素の整列の境界、`byte_limit()` は Plan が受け入れる作業領域の容量の上限である。
+一次元の Plan で上限が付くのは外部の実装を使うときだけで、それ以外は `usize::MAX` になる（[リソースの上限](oxref:fft-provider-limits)）。
+
+長さ $m$ の複素 FFT の内部の作業領域を $A(m)$ とする。
+$A(m)$ は 2・3・5・7 の積の $m > 1$ で $m$、Rader で $2(m-1)$、Bluestein で畳み込みの長さ $L$ の 2 倍の $2L$、外部の実装ではプロバイダーが提示した値である。
+複素の配置の Plan は $N > 1$ で $N + A(N)$ 個、$N = 1$ で 0 個を要する。
+先頭の $N$ 個は結果を組み立てる場所で、失敗したときに出力を変えないために使う。
+パックした配置の要件 $R(N)$ は
+
+$$
+R(N)=\begin{cases}
+N/2+1+A(N/2) & N\ \text{が偶数},\\
+(N+1)/2+(p-1)m/2+R(m)+A(m) & N=pm\ \text{が奇数},\ m>1,\\
+N+A(N) & \text{その他の奇数}\ N>1,\\
+1 & N=1
+\end{cases}
+$$
+
+である。
+$p$ は 3・5・7 のうち $N$ を割る最小のものである。
+
+`FftWorkspace` は呼び出し側が所有する複素数のメモリ領域である。
+
+- `FftWorkspace::new()` は確保しない空の作業領域を作り、`from_vec(values)` は手持ちの `Vec` をメモリ領域として引き取る。
+- `check(&requirements)` は、長さ（`len`）が `complex_len()` 以上なら `Capacity::Sufficient`、足りなければ `Capacity::NeedsGrowth` を返す。
+  確保済みの容量（`capacity`）のバイト数が `byte_limit()` を超えていれば `ResourceLimit` になる。
+- `try_reserve(&requirements)` は長さを `complex_len()` まで伸ばす。
+  伸ばしたあとの容量が上限を超えるなら確保の前に `ResourceLimit`、確保できなければ `AllocationFailure` を返す。
+  以前の容量は捨てず、自動では縮まない。
+- 保持している容量全体が上限の判定に数えられるので、大きな Plan に使った作業領域を上限の付いた Plan へ回すと `ResourceLimit` になりうる。
+- `Deref` で `[Complex<S>]` のスライスとして参照できるので、`execute_into` の `scratch` にそのまま渡せる。
+
+`plan.workspace(())` は要件どおりの作業領域を新しく確保する。
+長さの足りない作業領域を渡すと `DimensionMismatch` になる。
+準備した Plan は十分な作業領域を渡せば実行のあいだヒープを確保しない。
+これは `scioxide-fft` の rustdoc が述べる仕様で、本書のセルは確保の回数を測っていない。
+複数の長さの Plan で 1 つの作業領域を使い回すには、Plan ごとに `try_reserve` を呼べば最大の要件まで伸びる。
+作業領域の一般論は[実行形式・作業領域・再現性](../../../concepts/workspaces-and-reproducibility/)にある。
+
+## Plan のキャッシュ
+
+`FftPlanCache` は呼び出し側が所有する、上限付きの LRU（最も長く使われていない項目から外す）キャッシュである。
+SciOxide はプロセス全体で共有する暗黙のキャッシュを持たない。
+`FftPlanCache::new(policy)` は項目の表を上限の数だけ先に確保し、確保できなければ `AllocationFailure` を返す。
+`cache.plan(spec, context)` は `FftPlan::build` と同じ Plan を返し、鍵が一致する項目があればその表を共有する。
+
+- 項目の鍵は長さ、複素かパックした配置か、実行方針、解決した CPU の命令セットである。
+  方向と正規化だけが違う Plan は 1 つの項目を共有し、`Real` と `Hermitian` も同じ項目を共有する。
+  `Automatic` の要求でも鍵は解決後の命令セットなので、機能の違うコンテキストどうしで項目を共有しない。
+- `FftCachePolicy::new(max_entries, max_plan_bytes)` が項目数と保持バイト数の上限を決める。
+  どちらかが 0 なら `InvalidInput`（`OutOfRange`）で、既定は 16 項目と 64 MiB である。
+- 新しい項目でどちらかの上限を超えるときは、最も長く使われていない項目から外す。
+  1 つで `max_plan_bytes` を超える Plan は返すだけで保持しないので、他の項目を押し出さない。
+- 返した Plan は表をキャッシュと共有し、項目が外れたあとも有効である。
+- 準備が失敗したときは項目を変えない。
+- 外部の実装を持つコンテキストで準備した Plan はキャッシュを通らず、統計にも数えない（プロバイダーと上限が鍵に含まれないため）。
+- `plan` は `&mut self` を取るので、1 つのキャッシュを複数のスレッドから同時には使えない。
+
+`cache.stats()` は `FftCacheStats` を返す。
+`hits()` はキャッシュから応えた要求の数、`misses()` は新しく準備した要求の数、`evictions()` は上限のために外した項目の数、`entries()` は現在の項目数、`retained_plan_bytes()` は現在の項目が保持するバイト数（共有した表は 1 回だけ数える）である。
+三つの回数はキャッシュのライフタイムを通した累計で、`clear()` は項目を空にするが回数を戻さない。
+これらは再利用とメモリ使用量の記録で、実行時間の測定値ではない。
+
+次のセルは長さ 64・97・100 のそれぞれについて、複素の順変換、複素の逆変換、実数の順変換の Plan を順に要求する巡回を 2 回行う。
+1 つの `FftWorkspace` を全 Plan で使い回し、要求ごとに `check` の結果と、`try_reserve` 後の長さを記録する。
+キャッシュの統計の横には鍵 (N, パックした配置か) の列を項目数の上限だけで追う LRU を手で模擬した独立な値を並べる。
+項目数の上限を変え、鍵の数 6 との大小で再利用の回数がどう変わるかを確かめる。
+
+```rust
+//| id: fft-plan-cache-reuse
+//| ref: fft-plan-cache-reuse
+//| title: キャッシュの項目数の上限と作業領域の使い回しを統計で確かめる
+//| run: reactive
+//| crates: [scioxide-core, scioxide-fft]
+//| inputs:
+//|   max_entries: {"type":"range","label":"項目数の上限","description":"鍵は 6 種類ある。上限が 6 未満だと巡回のたびに古い項目が外れる。","min":1,"max":8,"step":1,"value":4}
+//| cases:
+//|   - {"id":"all-fit","label":"上限 6","description":"6 つの鍵がすべて残り、2 巡目はすべて再利用になる。","inputs":{"max_entries":6}}
+//|   - {"id":"single-entry","label":"上限 1","description":"同じ鍵が続く逆変換だけが再利用になり、他は毎回準備し直す。","inputs":{"max_entries":1}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"cache-stats","path":"/rows/0/1","approx":{"value":6,"atol":0.5}}
+//|       - {"artifact":"cache-stats","path":"/rows/1/1","approx":{"value":12,"atol":0.5}}
+//|       - {"artifact":"cache-stats","path":"/rows/2/1","approx":{"value":8,"atol":0.5}}
+//|       - {"artifact":"cache-stats","path":"/rows/2/2","approx":{"value":8,"atol":0.5}}
+//|       - {"artifact":"requests","path":"/rows/0/6","equals":"NeedsGrowth"}
+//|       - {"artifact":"requests","path":"/rows/1/6","equals":"Sufficient"}
+//|   - case: all-fit
+//|     expect:
+//|       - {"artifact":"cache-stats","path":"/rows/0/1","approx":{"value":12,"atol":0.5}}
+//|       - {"artifact":"cache-stats","path":"/rows/2/1","approx":{"value":0,"atol":0.5}}
+//|   - case: single-entry
+//|     expect:
+//|       - {"artifact":"cache-stats","path":"/rows/1/1","approx":{"value":12,"atol":0.5}}
+//|       - {"artifact":"cache-stats","path":"/rows/2/1","approx":{"value":11,"atol":0.5}}
+use scioxide_core::ExecutionContext;
+use scioxide_fft::{
+    FftCachePolicy, FftDirection, FftLayout, FftPlanCache, FftPlanSpec, FftWorkspace,
+    Normalization,
+};
+
+let limit = max_entries.round() as usize;
+let cx = ExecutionContext::sequential();
+let policy = FftCachePolicy::new(limit, 64 << 20).map_err(|e| e.to_string())?;
+let mut cache = FftPlanCache::<f64>::new(policy).map_err(|e| e.to_string())?;
+let mut workspace = FftWorkspace::<f64>::new();
+// 1 巡の要求: 各長さで複素の順変換、複素の逆変換、実数の順変換
+let mut requests = Vec::new();
+for n in [64_usize, 97, 100] {
+    requests.push((n, FftDirection::Forward, FftLayout::Complex));
+    requests.push((n, FftDirection::Inverse, FftLayout::Complex));
+    requests.push((n, FftDirection::Forward, FftLayout::Real));
+}
+// 独立な模擬: 鍵 (N, パックした配置か) の LRU を項目数の上限だけで追う
+let mut lru: Vec<(usize, bool)> = Vec::new();
+let (mut hits, mut misses, mut evictions) = (0_u64, 0_u64, 0_u64);
+let mut rows = Vec::new();
+for round in 1..=2 {
+    for &(n, direction, layout) in &requests {
+        let spec = FftPlanSpec::new(n, direction, Normalization::Inverse, layout);
+        let plan = cache.plan(spec, cx).map_err(|e| e.to_string())?;
+        let requirements = plan.workspace_requirements(()).map_err(|e| e.to_string())?;
+        let before = workspace.check(&requirements).map_err(|e| e.to_string())?;
+        workspace
+            .try_reserve(&requirements)
+            .map_err(|e| e.to_string())?;
+        let key = (n, layout != FftLayout::Complex);
+        if let Some(index) = lru.iter().position(|k| *k == key) {
+            hits += 1;
+            let found = lru.remove(index);
+            lru.push(found);
+        } else {
+            misses += 1;
+            if lru.len() == limit {
+                lru.remove(0);
+                evictions += 1;
+            }
+            lru.push(key);
+        }
+        rows.push((
+            round,
+            n,
+            format!("{layout:?}・{direction:?}"),
+            format!("{:?}", plan.diagnostics().algorithm()),
+            plan.plan_bytes(),
+            requirements.complex_len(),
+            format!("{before:?}"),
+            workspace.len(),
+        ));
+    }
+}
+let stats = cache.stats();
+let stat_rows = vec![
+    ("hits()", stats.hits(), Some(hits)),
+    ("misses()", stats.misses(), Some(misses)),
+    ("evictions()", stats.evictions(), Some(evictions)),
+    ("entries()", stats.entries() as u64, Some(lru.len() as u64)),
+    (
+        "retained_plan_bytes() [B]",
+        stats.retained_plan_bytes() as u64,
+        None,
+    ),
+];
+let request_columns = serde_json::json!([
+    { "key": "0", "label": "巡", "type": "integer" },
+    { "key": "1", "label": "N", "type": "integer" },
+    { "key": "2", "label": "配置・方向" },
+    { "key": "3", "label": "アルゴリズム" },
+    { "key": "4", "label": "plan_bytes() [B]", "type": "integer" },
+    { "key": "5", "label": "complex_len() [個]", "type": "integer" },
+    { "key": "6", "label": "伸ばす前の check()" },
+    { "key": "7", "label": "try_reserve 後の長さ [個]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    request_columns,
+    rows,
+    metadata = serde_json::json!({ "id": "requests" })
+);
+let stat_columns = serde_json::json!([
+    { "key": "0", "label": "FftCacheStats" },
+    { "key": "1", "label": "SciOxide", "type": "integer" },
+    { "key": "2", "label": "手で模擬した LRU", "type": "integer", "nullText": "-" }
+]);
+emit_table_with_columns!(
+    stat_columns,
+    stat_rows,
+    metadata = serde_json::json!({ "id": "cache-stats" })
+);
+```
+
+既定の上限 4 では 6 つの鍵を順に巡るので、2 巡目では要求のたびに最も長く使われていない項目が外れ、再利用は同じ鍵が続く逆変換の 6 回だけになる（`hits()` 6、`misses()` 12、`evictions()` 8）。
+上限 6 では 2 巡目の 9 回がすべて再利用になり（`hits()` 12、`misses()` 6、`evictions()` 0）、上限 1 では退去が 11 回になる。
+手で模擬した LRU の回数は上限 1・4・6・8 のどれでも SciOxide の統計と一致する。
+
+作業領域は長さ 64 の最初の Plan で 128 個（$64 + 64$）に伸び、長さ 97 の Rader の Plan で 289 個（$97 + 2\cdot 96$）に伸びる。
+そのあとの Plan はすべて `Sufficient` になり、作業領域は縮まない。
+長さ 64 の実数の配置は 65 個（$33 + A(32)$）で、複素の配置の約半分である。
+長さ 97 の実数の配置は 3・5・7 で割り切れない奇数長なので、内側で長さ 97 の複素 FFT を使い、複素の配置と同じ 289 個を要する。
+
+## まとめ
+
+Plan は仕様とコンテキストから一度だけ準備し、変わらない表を `Arc` で共有して、どの実行コンテキストでも再利用する。
+作業領域は呼び出し側が `FftWorkspace` で所有し、`workspace_requirements` で大きさを問い合わせて、複数の Plan に使い回せる。
+`check` は十分かどうかを長さで判定し、上限との比較は確保済みの容量で行うので、大きく伸ばした作業領域は上限の付いた Plan で拒まれうる。
+`FftPlanCache` は呼び出し側が置く上限付きの LRU で、方向と正規化の違いを 1 つの項目にまとめ、`stats()` で再利用と退去の回数を数える。
+
+## 次に読むページ
+
+- [外部 FFT 実装と CPU 命令セット](../providers-and-cpu-backends/) で、Plan の中の複素 FFT を外部の実装に任せる方法と、SciOxide が確かめる範囲を確かめる。
+- [FFT のアルゴリズムと任意長変換](../planner-and-arbitrary-lengths/) で、Plan の中身であるアルゴリズムの選択と、その計算コストと丸め誤差を確かめる。
+- [多次元 Fourier 変換](../multidimensional-transforms/) で、多次元の Plan と、その作業領域の要件を確かめる。
+- [API ガイド](../../api/) で、Plan、作業領域、キャッシュの型と関数の一覧を確かめる。

@@ -1,0 +1,679 @@
+---
+title: "Rosenbrock-W methods and automatic stiffness switching"
+description: "Rosenbrock-W formulas with one linear system per stage, order preservation with approximate Jacobians and conditions for lost stability, time derivatives in nonautonomous systems, and nonstiff/stiff switching using indicator |h|ρ(J) and hysteresis."
+sidebar:
+  order: 330
+references:
+  ode-rosenbrock-w: "rosenbrock-w-stage-equations"
+  ode-w-method-jacobian: "approximate-jacobians-and-order"
+  ode-stiffness-indicator: "stiffness-indicator"
+  ode-stiffness-switching: "switching-rules"
+---
+
+Implicit Runge–Kutta and BDF solve nonlinear equations with Newton at each stiff-problem step.
+Rosenbrock incorporates only the first Newton iteration into the method formula, solving one linear system per stage.
+Without iteration convergence checks, per-step work is predictable and often lower than implicit Runge–Kutta at moderate accuracy.
+This page covers scioxide-ode's `RosenbrockW` formulas and two coefficient sets, why approximate Jacobians preserve order, and when stability can nevertheless be lost.
+The second half covers indicators and rules used by `AutoStiff` and `AdamsBdf` to switch between nonstiff and stiff methods as stiffness changes.
+Notation follows [Mathematics and shared conventions](../), with right-hand-side Jacobian $J = \partial f/\partial y$ and step size $h$.
+[Error order, stability, and stiffness](../error-order-and-stability/) gives the basics of stiffness and stability functions.
+
+## Rosenbrock-W stage equations
+
+An $s$-stage Rosenbrock-type method advances one step from $y_n$ to $y_{n+1}$ as follows.
+
+$$
+(I - h\gamma A)\,k_i = h\,f\!\left(t_n + \alpha_i h,\; y_n + \sum_{j<i} a_{ij} k_j\right) + hA\sum_{j<i}\gamma_{ij} k_j + h^2 \gamma_i\, \frac{\partial f}{\partial t}(t_n, y_n),
+$$
+
+$$
+y_{n+1} = y_n + \sum_{i=1}^{s} b_i k_i, \qquad \hat y_{n+1} = y_n + \sum_{i=1}^{s} \hat b_i k_i .
+$$
+
+Here $k_i$ is a stage increment; $a_{ij}$, $\gamma_{ij}$, $b_i$, and $\hat b_i$ are method coefficients, with $\alpha_i = \sum_{j<i} a_{ij}$ and $\gamma_i = \sum_{j\le i}\gamma_{ij}$ and shared diagonal coefficient $\gamma_{ii} = \gamma$.
+The matrix $A$ is Jacobian $J(t_n, y_n)$ itself or an approximation.
+A method satisfying order conditions assuming $A = J$ is called a Rosenbrock method; one satisfying them for arbitrary $A$ is a W method.
+
+The left-hand matrix $I - h\gamma A$ is shared across stages, requiring one LU factorization per step and only forward/back substitution per stage.
+Right-hand sides depend only on known stages, making stage equations linear without Newton iteration.
+The error estimate is the solution difference $y_{n+1} - \hat y_{n+1}$ obtained with weights $b_i$ and $\hat b_i$; acceptance and next-step selection follow explicit Runge–Kutta rules (PI control by default).
+
+The method `RosenbrockW` selects two coefficient sets through `RosenbrockMethod`.
+
+| Coefficient set | Stages $s$ | Order | Embedded order | $\gamma$ | Reference |
+|---|---:|---:|---:|---|---|
+| `RosenbrockMethod::Ros2` | 2 | 2 | 1 | $1 + 1/\sqrt{2} \approx 1.7071$ | Verwer et al. (1999) |
+| `RosenbrockMethod::Ros34Pw2` | 4 | 3 | 2 | $0.435866521508459$ | Rang–Angermann（2005） |
+
+Both coefficient sets are constructed as W methods and are L-stable when $A = J$.
+One attempt of an $s$-stage method needs $s - 1$ right-hand-side evaluations, one LU factorization, and $s - 1$ Jacobian–vector products.
+The quantities $f(t_n, y_n)$ and $\partial f/\partial t(t_n, y_n)$ are evaluated only once per accepted step and reused on retries with smaller steps after rejection.
+Dense output is cubic Hermite interpolation from endpoint values and slopes; the accepted endpoint slope becomes the next step's $f(t_n, y_n)$.
+Events and scheduled output are supported, but mass matrices are not; systems with mass matrices are rejected with `InvalidInput` (`UnsupportedConfiguration`).
+
+Jacobians are rebuilt after five consecutive accepted steps, a rejection, or a change in time or any state component exceeding half $\max(1, |\text{old}|, |\text{new}|)$.
+Systems whose `OdeSystem::jacobian_is_constant` returns `true` never rebuild them.
+LU always uses the current step's $h$.
+Select stage linear solvers through `with_backend`: dense LU by default, with sparse LU and restarted GMRES also available.
+Select Jacobian evaluation through `with_derivative_strategy`.
+[Jacobians and linear stage equations](../jacobians-and-linear-stages/) covers these choices and costs.
+
+## Approximate Jacobians and order
+
+Rosenbrock order conditions follow from Taylor expansion; using $A = J$ reduces their number.
+W coefficients expand $A$ and $J$ as separate quantities and satisfy conditions for every $A$.
+W methods retain their order as step size approaches zero with old Jacobians, finite-difference approximations, or Jacobians containing only some components.
+This permits `RosenbrockW` to rebuild Jacobians only every five steps and accept difference approximations by default.
+
+Stability, however, depends on $A$.
+Applying $A = \mu$ to test equation $y' = \lambda y$ gives amplification $R(z, w)$ depending on two variables $z = h\lambda$ and $w = h\mu$; $|R(z, z)| \le 1$ need not imply the same for $w \ne z$.
+For example, with $A = 0$, every stage matrix is identity, giving the form of explicit Runge–Kutta.
+Thus every W method diverges on stiff problems with large $|h\lambda|$ if the approximate Jacobian misses fast-component eigenvalues.
+
+This and the next section use the Prothero–Robinson-type test equation
+
+$$
+y' = \lambda(t)\,\bigl(y - \cos t\bigr) - \sin t, \qquad y(0) = 1
+$$
+
+
+Its exact solution is $y(t) = \cos t$ independently of $\lambda(t)$; the magnitude of $\lambda(t) < 0$ determines stiffness.
+The nonautonomous equation requires the time derivative
+
+$$
+\frac{\partial f}{\partial t} = \lambda'(t)\,(y - \cos t) + \lambda(t)\sin t - \cos t
+$$
+
+for Rosenbrock-W.
+The following block defines the model used by two cells.
+The parameter `peak` is maximum $\Lambda$ of $|\lambda|$; if `varying` is `false`, it is constant at $\lambda = -\Lambda$; if `true`, it follows $\lambda(t) = -\Lambda^{\sin^2(\pi t/10)}$, growing from $-1$ at $t = 0$ to $-\Lambda$ at $t = 5$, then returning to $-1$ at $t = 10$.
+The parameter `jacobian_scale` is multiplier $c$ changing the supplied Rosenbrock-W Jacobian to $c\lambda$; $c = 1$ gives the correct Jacobian.
+The method `time_derivative` returns $\partial f/\partial t$ above.
+
+```rust
+//| id: ode-prothero-robinson-model
+//| kind: definitions
+//| title: "Prothero–Robinson-type test problem"
+//| crates: [scioxide-core, scioxide-linalg, scioxide-ode]
+use scioxide_core::{SciOxideError, RealScalar, SolveContext};
+use scioxide_linalg::MatrixViewMut;
+use scioxide_ode::OdeSystem;
+
+/// y′ = λ(t)(y − cos t) − sin t. The exact solution for y(0) = 1 is y(t) = cos t.
+pub(crate) struct ProtheroRobinson {
+    /// Maximum |λ|, Λ.
+    pub(crate) peak: f64,
+    /// If true, λ(t) = −Λ^{sin²(πt/10)}; otherwise λ = −Λ.
+    pub(crate) varying: bool,
+    /// Multiplier c for the supplied Jacobian c λ (1 gives the correct Jacobian).
+    pub(crate) jacobian_scale: f64,
+}
+
+impl ProtheroRobinson {
+    /// Return λ(t) and λ′(t).
+    pub(crate) fn lambda(&self, t: f64) -> (f64, f64) {
+        if !self.varying {
+            return (-self.peak, 0.0);
+        }
+        let phase = std::f64::consts::PI * t / 10.0;
+        let log_peak = RealScalar::ln(self.peak);
+        let lambda = -RealScalar::exp(log_peak * RealScalar::powi(RealScalar::sin(phase), 2));
+        // d/dt sin²(πt/10) = (π/10) sin(πt/5).
+        let slope = lambda * log_peak * std::f64::consts::PI / 10.0 * RealScalar::sin(2.0 * phase);
+        (lambda, slope)
+    }
+}
+
+impl OdeSystem<f64> for ProtheroRobinson {
+    fn dimension(&self) -> usize {
+        1
+    }
+    fn rhs(
+        &self,
+        t: f64,
+        y: &[f64],
+        dydt: &mut [f64],
+        _: &mut SolveContext<'_, '_>,
+    ) -> Result<(), SciOxideError> {
+        let (lambda, _) = self.lambda(t);
+        dydt[0] = lambda * (y[0] - RealScalar::cos(t)) - RealScalar::sin(t);
+        Ok(())
+    }
+    fn jacobian(
+        &self,
+        t: f64,
+        _: &[f64],
+        jac: &mut MatrixViewMut<'_, f64>,
+        _: &mut SolveContext<'_, '_>,
+    ) -> Result<Option<()>, SciOxideError> {
+        jac.set(0, 0, self.jacobian_scale * self.lambda(t).0)?;
+        Ok(Some(()))
+    }
+    fn time_derivative(
+        &self,
+        t: f64,
+        y: &[f64],
+        output: &mut [f64],
+        _: &mut SolveContext<'_, '_>,
+    ) -> Result<Option<()>, SciOxideError> {
+        let (lambda, slope) = self.lambda(t);
+        let (sin, cos) = RealScalar::sin_cos(t);
+        output[0] = slope * (y[0] - cos) + lambda * sin - cos;
+        Ok(Some(()))
+    }
+}
+```
+
+The following cell solves the constant-$\lambda = -10^k$ problem with $[0, 2]$, computing terminal error $|y_N - \cos 2|$ against step $h = 2/N$ ($N = 8, 16, \ldots, 512$) for each Jacobian multiplier $c = 1, 1/2, 0$.
+Since `RosenbrockW` is adaptive, tolerance $10^6$ prevents error-based rejections; setting initial, minimum, and maximum step sizes all to $h$ enforces fixed-step integration.
+Steps are negative powers of two, reaching $t = 2$ in exactly $N$ steps.
+Observed orders in the table are adjacent-step error ratios $\log_2(e_{h}/e_{h/2})$.
+Combinations diverging beyond floating-point range or stopping after a rejected step are displayed as “Divergent.”
+
+```rust
+//| id: ode-rosenbrock-w-order
+//| ref: ode-rosenbrock-w-order
+//| title: "Rosenbrock-W error and order with approximate Jacobians"
+//| run: reactive
+//| uses: [ode-prothero-robinson-model]
+//| crates: [scioxide-core, scioxide-linalg, scioxide-ode]
+//| inputs:
+//|   coefficient_set: {"type":"select","label":"Coefficient set","description":"Select either RosenbrockMethod coefficient set.","options":["ROS2","ROS34PW2"],"value":"ROS34PW2"}
+//|   stiffness_exponent: {"type":"range","label":"Stiffness exponent k (λ = −10^k)","description":"More negative λ reveals stability differences under approximate Jacobians.","min":0,"max":4,"step":1,"value":0}
+//| cases:
+//|   - {"id":"stiff","label":"ROS34PW2, λ = −10³","description":"Only the correct Jacobian is stable at all steps; c = 1/2 and c = 0 diverge at large steps.","inputs":{"stiffness_exponent":3}}
+//|   - {"id":"ros2-stiff","label":"ROS2, λ = −10³","description":"Even c = 1/2 is stable, but observed order falls to 1.","inputs":{"coefficient_set":"ROS2","stiffness_exponent":3}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"orders","path":"/rows/6/2","approx":{"value":3.0,"atol":0.05}}
+//|       - {"artifact":"orders","path":"/rows/6/4","approx":{"value":3.0,"atol":0.05}}
+//|       - {"artifact":"orders","path":"/rows/6/6","approx":{"value":3.0,"atol":0.05}}
+//|   - case: stiff
+//|     expect:
+//|       - {"artifact":"orders","path":"/rows/0/1","range":{"max":1e-5}}
+//|       - {"artifact":"orders","path":"/rows/0/3","range":{"min":1e3}}
+//|       - {"artifact":"orders","path":"/rows/6/3","range":{"max":1e-3}}
+//|   - case: ros2-stiff
+//|     expect:
+//|       - {"artifact":"orders","path":"/rows/6/4","approx":{"value":1.1,"atol":0.15}}
+use scioxide_core::{ErrorTolerance, NormSelection, RealScalar};
+use scioxide_linalg::Vector;
+use scioxide_ode::{OdeMethod, OdeOptions, OdeProblem, OdeState, RosenbrockMethod, RosenbrockW};
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let (method, order) = match coefficient_set.as_str() {
+    "ROS2" => (RosenbrockMethod::Ros2, 2.0),
+    _ => (RosenbrockMethod::Ros34Pw2, 3.0),
+};
+let peak = 10.0_f64.powf(stiffness_exponent);
+let end = 2.0_f64;
+let scales = [1.0, 0.5, 0.0];
+let counts = [8_usize, 16, 32, 64, 128, 256, 512];
+// Use loose tolerances to prevent error-based rejection and set minimum and maximum step sizes to h.
+let loose = ErrorTolerance::scalar(1e6, 1e6, NormSelection::RootMeanSquare)
+    .map_err(|e| e.to_string())?;
+let mut errors = vec![[None; 3]; counts.len()];
+for (row, &n) in counts.iter().enumerate() {
+    let h = end / n as f64;
+    let options = OdeOptions::new()
+        .with_error_tolerance(loose.clone())
+        .with_initial_step(h)
+        .with_minimum_step(h)
+        .with_maximum_step(h);
+    for (column, &scale) in scales.iter().enumerate() {
+        let system = ProtheroRobinson {
+            peak,
+            varying: false,
+            jacobian_scale: scale,
+        };
+        let solver = RosenbrockW::<f64>::new(method).map_err(|e| e.to_string())?;
+        let initial = OdeState::new(0.0, Vector::from_vec(vec![1.0]));
+        // Divergence beyond floating-point range returns an error, so those combinations become None.
+        errors[row][column] =
+            match solver.solve(&OdeProblem::new(&system, end), &options, initial) {
+                Ok(solution) if solution.report().is_success() => {
+                    Some((solution.state().values()[0] - RealScalar::cos(end)).abs())
+                }
+                _ => None,
+            };
+    }
+}
+let observed = |row: usize, column: usize| -> Option<f64> {
+    let coarse = errors[row.checked_sub(1)?][column]?;
+    let fine = errors[row][column]?;
+    (fine > 0.0).then(|| (coarse / fine).log2())
+};
+let rows: Vec<_> = counts
+    .iter()
+    .enumerate()
+    .map(|(row, &n)| {
+        (
+            end / n as f64,
+            errors[row][0],
+            observed(row, 0),
+            errors[row][1],
+            observed(row, 1),
+            errors[row][2],
+            observed(row, 2),
+        )
+    })
+    .collect();
+let columns = serde_json::json!([
+    { "key": "0", "label": "Step h [-]", "type": "number", "format": sci3 },
+    { "key": "1", "label": "Error c = 1 [-]", "type": "number", "format": sci3, "nullText": "Divergent" },
+    { "key": "2", "label": "Order c = 1", "type": "number", "format": fixed2, "nullText": "—" },
+    { "key": "3", "label": "Error c = 1/2 [-]", "type": "number", "format": sci3, "nullText": "Divergent" },
+    { "key": "4", "label": "Order c = 1/2", "type": "number", "format": fixed2, "nullText": "—" },
+    { "key": "5", "label": "Error c = 0 [-]", "type": "number", "format": sci3, "nullText": "Divergent" },
+    { "key": "6", "label": "Order c = 0", "type": "number", "format": fixed2, "nullText": "—" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "orders" })
+);
+
+// Omit zero-error and divergent points from logarithmic axes.
+let names = ["Jacobian c = 1", "Jacobian c = 1/2", "Jacobian c = 0"];
+let mut series: Vec<_> = (0..3)
+    .map(|column| {
+        let points: Vec<[f64; 2]> = counts
+            .iter()
+            .enumerate()
+            .filter_map(|(row, &n)| {
+                let error = errors[row][column].filter(|e| *e > 0.0 && e.is_finite())?;
+                Some([end / n as f64, error])
+            })
+            .collect();
+        serde_json::json!({ "name": names[column], "points": points })
+    })
+    .collect();
+// Reference line: slope p through the finest-step error for c = 1.
+if let Some(anchor) = errors[counts.len() - 1][0].filter(|e| *e > 0.0) {
+    let finest = end / counts[counts.len() - 1] as f64;
+    let reference: Vec<[f64; 2]> = counts
+        .iter()
+        .map(|&n| {
+            let h = end / n as f64;
+            [h, anchor * (h / finest).powf(order)]
+        })
+        .collect();
+    series.push(serde_json::json!({
+        "name": format!("Slope {order}"),
+        "points": reference,
+        "style": { "lineType": "dashed", "showSymbol": false }
+    }));
+}
+emit_line_chart!(
+    &series,
+    options = &serde_json::json!({
+        "xLabel": "Step h [-]",
+        "yLabel": "Terminal error |y_N − cos 2| [-]",
+        "xType": "log",
+        "yType": "log"
+    })
+);
+```
+
+With default ROS34PW2 and $\lambda = -1$, all three multipliers' observed orders approach 3; at the finest step, $c = 1, 1/2, 0$ errors are $9.5 \times 10^{-10}$, $8.2 \times 10^{-10}$, and $5.8 \times 10^{-9}$.
+The case $c = 0$ computes the equivalent of an explicit method without a Jacobian, yet retains third-order convergence.
+Error constants vary with $A$; the error for $c = 0$ is about six times that for $c = 1$.
+
+With $\lambda = -10^3$, $c = 1$ remains stable even at $h = 1/4$, with error $3.4 \times 10^{-6}$.
+The case $c = 0$ diverges for every step size with $|h\lambda| \ge 3.9$; $c = 1/2$ also diverges at $h \ge 1/64$, first reducing error to $3.0 \times 10^{-3}$ at $h = 1/128$.
+For ROS2, $c = 1/2$ remains stable at every tested step size, but observed order falls to 1.04–1.13.
+Even with $c = 1$, ROS34PW2 observed orders of 2.0–2.4 do not reach 3.
+This is known Prothero–Robinson order reduction: while $|h\lambda|$ is large, local errors decrease only as lower powers of step size.
+Order preservation concerns the limit $h \to 0$; errors and stability at large $|h\lambda|$ depend on Jacobian approximation quality.
+For stiff problems, supply the correct Jacobian or at least an approximation capturing fast-component eigenvalues correctly.
+
+## Time derivatives in nonautonomous systems
+
+When $f$ explicitly depends on $t$, Rosenbrock-type methods need the $\partial f/\partial t$ term to retain order.
+The method `RosenbrockW` obtains this term from `OdeSystem::time_derivative` if available, otherwise through finite differences in $t$.
+The perturbation scale is $\max(|t|, 1)$; forward differences add one right-hand-side evaluation per accepted step.
+Automatic differentiation is unavailable for $\partial f/\partial t$.
+The preference order selected through `with_derivative_strategy` applies to both Jacobians and time derivatives.
+
+For autonomous $y' = f(y)$, writing 0 in `time_derivative` and returning `Ok(Some(()))` avoids difference evaluations.
+Closure-based `OdeFn` has no `time_derivative`, so time derivatives always use differences.
+To reduce evaluations or improve on difference accuracy, implement `OdeSystem` and supply `time_derivative`.
+
+## Stiffness indicator
+
+Explicit stability regions are bounded, with negative-real-axis interval $|h\lambda| \le c$ ($c \approx 3.3$ for Dormand–Prince 5(4)).
+When this condition rather than accuracy determines steps, the problem is stiff for that method.
+The type `AutoStiff` detects this through the product of step size and spectral radius
+
+$$
+\sigma = |h|\,\rho(J)
+$$
+
+
+Here $\rho(J)$ is the largest absolute Jacobian eigenvalue; when $\sigma$ exceeds roughly 1, explicit steps are likely stability-limited rather than accuracy-limited.
+
+The quantity $\rho(J)$ is estimated by power iteration without forming Jacobians.
+Directions persist across steps; the geometric mean of the last two ratios $\|Jv\|/\|v\|$ is the estimate, allowing convergence when equal-magnitude $\pm\lambda$ pairs or complex conjugate pairs dominate.
+Each iteration uses one product $Jv$.
+A current stiff-method Jacobian gives this product without extra evaluations; otherwise use `OdeSystem::jacobian_product` or forward differences of $f$ (one right-hand-side evaluation).
+At most one product is used per accepted step; estimation intervals double from one step after each estimate, capped at 12 steps.
+If the estimate is within a factor of two of the switching threshold and differs from the previous estimate by more than one-quarter, the interval resets to one step.
+The quantity $\sigma$ is estimated and does not prove stiffness.
+No indicator is computed for systems with mass matrices.
+
+## Switching rules
+
+The type `AutoStiff<S, N, F>` starts with adaptive nonstiff `N`, switches to stiff `F` under `StiffnessSwitchOptions` rules, and switches back.
+It switches from `N` to `F` when accepted-step $\sigma$ exceeds threshold `enter` for `enter_steps` consecutive steps, or after `rejections` consecutive rejections.
+It returns from `F` to `N` after at least `residence` acceptances in `F` and `leave_steps` consecutive values of $\sigma$ below threshold `leave`.
+While integrating with `F`, the $h$ in $\sigma$ uses the largest step taken by `F` since switching.
+This avoids returning to `N` solely because of rejections or temporary step reductions.
+
+| Settings | Default | Setter |
+|---|---|---|
+| `enter`, `leave` | $1$, $1/4$ | `with_thresholds(enter, leave)` |
+| `enter_steps`, `leave_steps` | 2, 6 | `with_evidence_steps(enter, leave)` |
+| `residence` | 8 | `with_residence(accepted_steps)` |
+| `rejections` | 3 | `with_rejections(consecutive)` |
+
+Setters do not validate; `AutoStiff::new` validates the combined values.
+Nonpositive or nonfinite `enter`, `leave` failing $0 \le \text{leave} < \text{enter}$, or any zero count returns `InvalidInput`.
+If either `N` or `F` is not adaptive (fixed-step methods or multistep methods with `MultistepOrder::Fixed`), it returns `InvalidInput` (`UnsupportedConfiguration`).
+Separating `enter` and `leave` and requiring repeated satisfaction gives hysteresis, preventing oscillation between methods near thresholds.
+
+A newly active method starts at the switching time with empty history and restarted step-size control.
+Multistep history is not transferred, so BDF as `F` starts at order 1.
+With mass matrices, the first step switches to `F` (reason `MassMatrix`), without switching back.
+Thus `F` must support mass matrices, and pairings using `F` for `RosenbrockW` cannot handle them.
+Scheduled output and events use dense output from both methods.
+
+The type `AdamsBdf` aliases `AutoStiff<S, AdamsMoulton<S>, Bdf<S>>`; `AdamsBdf::adams_bdf()` constructs an Adams predictor–corrector (PECE) and BDF pair with automatic orders up to 5 and default switching rules.
+Construct other pairs, such as `DormandPrince5` and `RosenbrockW`, through `AutoStiff::new`.
+[Linear multistep methods](../multistep-methods/) covers the numerics of both methods.
+
+Switching records remain in `method_switches()` (count) and `last_method_switch()` (latest switch) of `OdeSolveReport`.
+The record `OdeMethodSwitch` returns time `time()` when the new method starts its first step, method names `from()` and `to()`, reason `reason()`, and estimate `indicator()` of $\sigma$ at that time.
+The value `indicator()` is `None` when no estimate exists, such as with mass matrices.
+The four reasons `OdeSwitchReason` are:
+
+| `OdeSwitchReason` | Switch | Condition |
+|---|---|---|
+| `Stiffness` | `N` → `F` | $\sigma >$ `enter` for `enter_steps` consecutive steps |
+| `Rejections` | `N` → `F` | `N` rejected `rejections` consecutive steps |
+| `Nonstiffness` | `F` → `N` | After `residence` acceptances, $\sigma <$ `leave` for `leave_steps` consecutive steps |
+| `MassMatrix` | `N` → `F` | System has a mass matrix |
+
+Switches are not sent to the output sink (`OdeOutputSink`), and only the latest remains in the report.
+To list all switches, solve the same problem again with a terminal event just before the recorded switching time and read that report's latest switch.
+Events only stop integration without changing earlier steps, so the repeated integration follows the original step sequence.
+The following cell repeats this until no switches remain.
+
+It solves the problem with $\lambda(t) = -\Lambda^{\sin^2(\pi t/10)}$ using $[0, 10]$ at tolerance $\varepsilon_{\mathrm{rel}} = 10^{-6}$ and $\varepsilon_{\mathrm{abs}} = 10^{-8}$.
+Choose method pair `AdamsBdf` or `AutoStiff` pairing `DormandPrince5` with ROS34PW2.
+The first table lists switch times, old and new methods, reasons, estimated $\sigma$, and $|\lambda(t)|$ at those times.
+For this one-component problem, $\rho(J) = |\lambda(t)|$, and $\sigma/|\lambda(t)|$ corresponds to the indicator's step size.
+The second table gives total integration work and terminal error $|y(10) - \cos 10|$.
+The plot shows accepted step sizes $h_n$ versus time, with dashed explicit-stability guide $1/|\lambda(t)|$ and vertical switching-time lines.
+
+```rust
+//| id: ode-auto-stiff-switch
+//| ref: ode-auto-stiff-switch
+//| title: "Method switches for changing stiffness"
+//| run: reactive
+//| uses: [ode-prothero-robinson-model]
+//| crates: [scioxide-core, scioxide-linalg, scioxide-ode]
+//| inputs:
+//|   peak_exponent: {"type":"range","label":"Maximum-stiffness exponent m (Λ = 10^m)","description":"Vary maximum |λ| at t = 5.","min":2,"max":6,"step":1,"value":4}
+//|   method_pair: {"type":"select","label":"Method pair","description":"Choose the nonstiff and stiff method pair.","options":["AdamsBdf","DormandPrince5 and RosenbrockW"],"value":"AdamsBdf"}
+//| cases:
+//|   - {"id":"rosenbrock-pair","label":"DormandPrince5 and RosenbrockW","description":"Returns to the nonstiff method as stiffness falls, switching around the threshold near the endpoint.","inputs":{"method_pair":"DormandPrince5 and RosenbrockW"}}
+//|   - {"id":"mild","label":"Λ = 10²","description":"Weaker stiffness gives later and fewer switches.","inputs":{"peak_exponent":2}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"switches","path":"/rows/0/4","equals":"Rejections"}
+//|       - {"artifact":"summary","path":"/rows/0/4","equals":3}
+//|       - {"artifact":"summary","path":"/rows/0/5","range":{"max":1e-5}}
+//|       - {"path":"/outputs/3/state","equals":"satisfied"}
+//|   - case: rosenbrock-pair
+//|     expect:
+//|       - {"artifact":"switches","path":"/rows/0/4","equals":"Stiffness"}
+//|       - {"artifact":"switches","path":"/rows/1/4","equals":"Nonstiffness"}
+//|       - {"artifact":"summary","path":"/rows/0/4","equals":2}
+//|       - {"artifact":"summary","path":"/rows/0/5","range":{"max":1e-5}}
+//|   - case: mild
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/4","equals":1}
+use scioxide_core::{ErrorTolerance, EvaluationRole, SciOxideError, NormSelection, RealScalar};
+use scioxide_linalg::Vector;
+use scioxide_ode::{
+    AdamsBdf, AutoStiff, DormandPrince5, EventFn, EventFunction, OdeMethod, OdeMethodSwitch,
+    OdeOptions, OdeOutputSchedule, OdeProblem, OdeSolveReport, OdeState, RosenbrockMethod,
+    RosenbrockW, StiffnessSwitchOptions,
+};
+
+/// Return the full-interval report, accepted times, and switches traced from last to first.
+fn switch_log<M: OdeMethod<f64> + Clone>(
+    method: &M,
+    system: &ProtheroRobinson,
+    options: &OdeOptions<f64>,
+    end: f64,
+) -> Result<
+    (
+        OdeSolveReport<f64>,
+        f64,
+        Vec<f64>,
+        Vec<OdeMethodSwitch<f64>>,
+    ),
+    String,
+> {
+    let initial = || OdeState::new(0.0, Vector::from_vec(vec![1.0]));
+    let accepted = options
+        .clone()
+        .with_output_schedule(OdeOutputSchedule::AcceptedSteps);
+    let full = method
+        .solve(&OdeProblem::new(system, end), &accepted, initial())
+        .map_err(|e| SciOxideError::from(e).to_string())?;
+    let report = *full.report();
+    let final_value = full.state().values()[0];
+    let mut switches = Vec::new();
+    let mut last = report.last_method_switch();
+    while let Some(switch) = last {
+        switches.push(switch);
+        // Terminal event stopping just before the recorded switch. Earlier steps match the original integration.
+        let stop = switch.time() - 1e-9 * switch.time().abs().max(1.0);
+        let event = EventFn::new(move |t: f64, _: &[f64]| Ok(t - stop)).with_terminal(true);
+        let events: [&dyn EventFunction<f64>; 1] = [&event];
+        let problem = OdeProblem::new(system, end).with_events(&events);
+        let earlier = method
+            .solve(&problem, options, initial())
+            .map_err(|e| SciOxideError::from(e).to_string())?;
+        last = earlier.report().last_method_switch();
+    }
+    switches.reverse();
+    Ok((
+        report,
+        final_value,
+        full.trajectory().times().to_vec(),
+        switches,
+    ))
+}
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed3 = serde_json::json!({ "fractionDigits": 3 });
+let end = 10.0_f64;
+let system = ProtheroRobinson {
+    peak: 10.0_f64.powf(peak_exponent),
+    varying: true,
+    jacobian_scale: 1.0,
+};
+let tolerance = ErrorTolerance::scalar(1e-8, 1e-6, NormSelection::RootMeanSquare)
+    .map_err(|e| e.to_string())?;
+let options = OdeOptions::new().with_error_tolerance(tolerance);
+let (report, final_value, times, switches) = match method_pair.as_str() {
+    "AdamsBdf" => {
+        let method = AdamsBdf::<f64>::adams_bdf().map_err(|e| e.to_string())?;
+        switch_log(&method, &system, &options, end)?
+    }
+    _ => {
+        let stiff =
+            RosenbrockW::<f64>::new(RosenbrockMethod::Ros34Pw2).map_err(|e| e.to_string())?;
+        let method =
+            AutoStiff::new(DormandPrince5::new(), stiff, StiffnessSwitchOptions::new())
+                .map_err(|e| e.to_string())?;
+        switch_log(&method, &system, &options, end)?
+    }
+};
+
+let switch_rows: Vec<_> = switches
+    .iter()
+    .enumerate()
+    .map(|(k, s)| {
+        (
+            k + 1,
+            s.time(),
+            s.from(),
+            s.to(),
+            format!("{:?}", s.reason()),
+            s.indicator(),
+            system.lambda(s.time()).0.abs(),
+        )
+    })
+    .collect();
+let switch_columns = serde_json::json!([
+    { "key": "0", "label": "Number", "type": "integer" },
+    { "key": "1", "label": "Time t [s]", "type": "number", "format": fixed3 },
+    { "key": "2", "label": "Before switch" },
+    { "key": "3", "label": "After switch" },
+    { "key": "4", "label": "Reason" },
+    { "key": "5", "label": "Indicator σ [-]", "type": "number", "format": sci3, "nullText": "None" },
+    { "key": "6", "label": "|λ(t)| [1/s]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    switch_columns,
+    switch_rows,
+    metadata = serde_json::json!({ "id": "switches" })
+);
+
+let error = (final_value - RealScalar::cos(end)).abs();
+let termination = report
+    .termination()
+    .map_or_else(|| "None".to_string(), |t| t.to_string());
+let counts = report.counts();
+let summary_columns = serde_json::json!([
+    { "key": "0", "label": "Accepted steps", "type": "integer" },
+    { "key": "1", "label": "Rejected steps", "type": "integer" },
+    { "key": "2", "label": "Right-hand-side evaluations [count]", "type": "integer" },
+    { "key": "3", "label": "Jacobian evaluations [count]", "type": "integer" },
+    { "key": "4", "label": "Switches [count]", "type": "integer" },
+    { "key": "5", "label": "Terminal error |y(10) − cos 10| [-]", "type": "number", "format": sci3 },
+    { "key": "6", "label": "Termination" }
+]);
+emit_table_with_columns!(
+    summary_columns,
+    vec![(
+        report.accepted_steps(),
+        report.rejected_steps(),
+        counts.provider(EvaluationRole::RightHandSide),
+        counts.provider(EvaluationRole::Jacobian),
+        report.method_switches(),
+        error,
+        termination.clone(),
+    )],
+    metadata = serde_json::json!({ "id": "summary" })
+);
+
+// Accepted step size h_n = t_{n+1} − t_n and stability guide 1/|λ(t)|.
+let steps: Vec<[f64; 2]> = times.windows(2).map(|w| [w[0], w[1] - w[0]]).collect();
+let guide: Vec<[f64; 2]> = (0..=400)
+    .map(|i| {
+        let t = end * f64::from(i) / 400.0;
+        [t, 1.0 / system.lambda(t).0.abs()]
+    })
+    .collect();
+let marks: Vec<_> = switches
+    .iter()
+    .map(|s| {
+        serde_json::json!({
+            "kind": "line",
+            "axis": "x",
+            "value": s.time(),
+            "label": format!("→ {}", s.to()),
+            "style": { "lineType": "dotted" }
+        })
+    })
+    .collect();
+emit_line_chart!(
+    &vec![
+        serde_json::json!({
+            "name": "Accepted step h_n",
+            "points": steps,
+            "style": { "showSymbol": false }
+        }),
+        serde_json::json!({
+            "name": "1/|λ(t)|",
+            "points": guide,
+            "style": { "lineType": "dashed", "showSymbol": false }
+        })
+    ],
+    options = &serde_json::json!({
+        "xLabel": "Time t [s]",
+        "yLabel": "Step size [s]",
+        "yType": "log",
+        "annotations": marks
+    })
+);
+
+let outcome = if report.is_success() {
+    Outcome::satisfied("Integrated to the endpoint with method switching")
+} else {
+    Outcome::partial("Stopped before reaching the endpoint")
+        .explanation("Treat values through the last accepted point as estimates and reconsider tolerances or limits.")
+};
+emit_outcome!(
+    outcome
+        .status(termination)
+        .diagnostic("Switches", report.method_switches() as f64, None)
+        .diagnostic("Terminal error", error, None)
+);
+```
+
+With default `AdamsBdf` and $\Lambda = 10^4$, three switches occurred.
+The first, at $t = 2.199$, had reason `Rejections` after three consecutive Adams rejections, with small indicator $\sigma$ equal to $4.3 \times 10^{-3}$.
+The value $\sigma$ is small just after rejection shrinks the step, so rejection count rather than the indicator triggers this switch.
+After eight BDF acceptances followed by repeated $\sigma = 0.16 < 1/4$, it returns to Adams at $t = 2.209$ (`Nonstiffness`); at $t = 2.319$, two consecutive $\sigma = 1.38$ trigger another BDF switch (`Stiffness`).
+It then stays with BDF to the endpoint even as $|\lambda(t)|$ falls to 1, because its product with the maximum BDF step never falls below $1/4$.
+Total work is 159 accepted steps, 13 rejections, 608 right-hand-side evaluations, and 21 Jacobian evaluations, with terminal error $2.6 \times 10^{-6}$.
+
+The pair of `DormandPrince5` and ROS34PW2 switches to ROS34PW2 at $t = 2.561$ ($|\lambda| = 119$ s⁻¹, $\sigma = 1.03$) for reason `Stiffness`, returning to Dormand–Prince at $t = 8.511$ ($|\lambda| = 6.5$ s⁻¹, $\sigma = 0.20$) for reason `Nonstiffness`.
+Dormand–Prince has stability interval $|h\lambda| \le 3.3$, so $\sigma$ exceeds the `enter` threshold of 1 only once steps approach one-third of the stability limit.
+Third-order ROS34PW2 takes small steps at tolerance $10^{-6}$, needing 1305 acceptances and 5797 right-hand-side evaluations, far more than `AdamsBdf`.
+At $\Lambda = 10^2$, `AdamsBdf` switches only once, at $t = 2.855$.
+The plot shows explicit steps shrinking along a few times dashed guide $1/|\lambda(t)|$ before switching; stiff-method steps then grow away from the guide.
+
+## Choosing a method
+
+Rosenbrock-W has no Newton convergence checks; stage count determines per-step work.
+It suits moderately sized stiff problems with analytically available or inexpensive difference Jacobians and tolerances around $10^{-3}$ to $10^{-6}$.
+Third-order ROS34PW2 needs small steps at tight tolerances; fifth-order `RadauIia` or `Bdf` up to order 5 often needs fewer steps then.
+For stiffness confined to part of an interval or unknown stiffness, switch using `AutoStiff` or `AdamsBdf`.
+With `AdamsBdf`, larger BDF steps make the indicator harder to reduce, preventing a return from the stiff method in the example above.
+For problems with a mass matrix, $M y' = f$, `RosenbrockW` is unavailable; use `Bdf` or `RadauIia`.
+[Choosing a method](../../choosing/) collects overall selection guidance.
+
+## Summary
+
+The method `RosenbrockW` solves linear systems with matrix $I - h\gamma A$ at each stage, using only one LU factorization per step.
+As W methods, ROS2 and ROS34PW2 retain orders 2 and 3 at $h \to 0$ even with approximate Jacobians; the experiment also converged at order 3 with $A = 0$.
+Stability at large $|h\lambda|$ still depends on approximation quality; at $\lambda = -10^3$, $A = 0$ and $A = J/2$ diverged for large steps.
+For nonautonomous systems, supply $\partial f/\partial t$ through `time_derivative`; for autonomous systems, returning 0 avoids difference evaluations.
+The types `AutoStiff` and `AdamsBdf` switch using estimated $|h|\rho(J)$ and rejection counts; reports retain switch count and the latest switch.
+
+## Further reading
+
+- [Jacobians and linear stage equations](../jacobians-and-linear-stages/): examine dense, sparse, and Krylov backends for `RosenbrockW` stages and Jacobian evaluation preferences.
+- [Linear multistep methods](../multistep-methods/): examine stability and starting procedures for the variable-order Adams and BDF combined by `AdamsBdf`.
+- [Implicit Runge–Kutta methods and mass matrices](../implicit-runge-kutta-and-mass-matrices/): examine Newton stage solves in `RadauIia` and mass-matrix handling.
+- [Van der Pol oscillator and the onset of stiffness](../../examples/van-der-pol-stiffness/): compare work in `RosenbrockW`, `Bdf`, and `AutoStiff` while varying stiffness.

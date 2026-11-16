@@ -1,0 +1,422 @@
+---
+title: "Estimating a variable star's period"
+description: "Estimate a variable star's period from irregular brightness observations with Lomb–Scargle, and interpret daily aliases and false alarm probabilities by comparison with noise-only simulated observations."
+sidebar:
+  order: 410
+references:
+  signal-variable-star-data: "synthetic-data"
+  signal-variable-star-fap: "false-alarm-probability"
+---
+
+RR Lyrae variables change brightness with periods of roughly half a day.
+Ground-based observations are restricted to nighttime and may miss days because of weather, so observation times are irregular.
+An FFT periodogram assumes uniformly spaced samples and cannot be used directly, so search for periods with Lomb–Scargle, which fits sinusoids at the observation times.
+This example uses false alarm probability (FAP) to assess whether a detected peak could arise by chance from noise.
+The method's derivation and API conventions are covered in the Lomb–Scargle section of [Spectral estimation](../../algorithms/spectral-estimation/).
+
+## Synthetic data
+
+Suppose a variable star with period $P = 0.567$ days is observed six times per night for 40 nights, at irregular times within a 0.25-day nightly window.
+The time of observation $j$ [days] is
+
+$$
+t_j = \lfloor j/6 \rfloor + 0.05 + 0.25\,\{ 0.6180339887498949\, j \} \qquad (j = 0, \dots, 239)
+$$
+
+where $\{\cdot\}$ denotes the fractional part.
+The coefficient $0.618\ldots$ is the fractional part of the golden ratio and spreads times within each night without overlap.
+Times within a night are not in ascending order; the minimum is $t_0 = 0.05$ days and the maximum is $t_{236} = 39.264$ days.
+
+Define the brightness variation [mag] as the sum of the fundamental and second harmonic plus Gaussian noise $\sigma g_j$ with standard deviation $\sigma$:
+
+$$
+y_j = 0.3 \sin\left(\frac{2\pi t_j}{P}\right) + 0.1 \sin\left(\frac{4\pi t_j}{P} + 0.7\right) + \sigma g_j
+$$
+
+
+Here $g_j$ is a standard normal variate generated from the seed by these rules.
+
+1. Initialize a 64-bit state with the seed and use splitmix64 to generate uniform variates $u \in (0, 1)$ (multiply a 53-bit integer by $2^{-53}$ and add $2^{-54}$).
+2. In observation order $j = 0, 1, \dots$, draw two uniform variates in the order $u_1$ then $u_2$, and transform them using Box–Muller $g_j = \sqrt{-2\ln u_1}\cos(2\pi u_2)$.
+
+[Computing Fourier sums of irregular observations with the NUFFT](../../../scioxide-fft/examples/nonuniform-periodogram/) in scioxide-fft uses the same times, light curve, and random-number rules (default $\sigma = 0.3$ mag, seed 2024), and covers only Fourier-sum accuracy and computational cost.
+
+The following block defines functions shared by the two cells.
+`observation_times` gives $t_j$, `SplitMix` implements the random-number rules, `light_curve` gives $y_j$, `frequency_grid` gives the search frequencies, and `FalseAlarm` implements the false-alarm approximations described later.
+Evaluate the random-number transform and approximations with `f64` inherent methods as reference values.
+
+```rust
+//| id: signal-variable-star-model
+//| kind: definitions
+//| title: "Synthetic light curve and false alarm probability approximations"
+//| crates: [scioxide-core, scioxide-special]
+use scioxide_core::SciOxideError;
+use scioxide_special::ln_gamma;
+
+/// Period P [days] and observation count N.
+pub(crate) const PERIOD: f64 = 0.567;
+pub(crate) const OBSERVATIONS: usize = 240;
+/// Upper search frequency f_max [day⁻¹]. The lower limit is 0.2 day⁻¹.
+pub(crate) const F_MAX: f64 = 4.0;
+
+/// Observation times t_j = ⌊j/6⌋ + 0.05 + 0.25 {0.618… j} [days].
+pub(crate) fn observation_times() -> Vec<f64> {
+    (0..OBSERVATIONS)
+        .map(|j| (j / 6) as f64 + 0.05 + 0.25 * (j as f64 * 0.618_033_988_749_894_9).fract())
+        .collect()
+}
+
+/// splitmix64 uniform variates and Box–Muller standard normal variates.
+pub(crate) struct SplitMix {
+    state: u64,
+}
+
+impl SplitMix {
+    pub(crate) fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+    pub(crate) fn uniform(&mut self) -> f64 {
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        ((z ^ (z >> 31)) >> 11) as f64 / (1u64 << 53) as f64 + 0.5 / (1u64 << 53) as f64
+    }
+    pub(crate) fn gauss(&mut self) -> f64 {
+        let radius = (-2.0 * self.uniform().ln()).sqrt();
+        radius * (core::f64::consts::TAU * self.uniform()).cos()
+    }
+}
+
+/// Brightness y_j [mag]: fundamental and second harmonic plus σ g_j.
+pub(crate) fn light_curve(times: &[f64], sigma: f64, seed: u64) -> Vec<f64> {
+    let mut rng = SplitMix::new(seed);
+    times
+        .iter()
+        .map(|&t| {
+            let phase = core::f64::consts::TAU * t / PERIOD;
+            let gauss = rng.gauss();
+            0.3 * phase.sin() + 0.1 * (2.0 * phase + 0.7).sin() + sigma * gauss
+        })
+        .collect()
+}
+
+/// Frequencies [day⁻¹] and angular frequencies [rad/day] passed to lomb_scargle.
+pub(crate) fn frequency_grid(points: usize) -> (Vec<f64>, Vec<f64>) {
+    let step = (F_MAX - 0.2) / (points - 1) as f64;
+    let freqs: Vec<f64> = (0..points).map(|k| 0.2 + step * k as f64).collect();
+    let omegas = freqs.iter().map(|f| core::f64::consts::TAU * f).collect();
+    (freqs, omegas)
+}
+
+/// False alarm probability approximations for floating-mean normalized power.
+pub(crate) struct FalseAlarm {
+    n: f64,
+    baseline: f64,
+    effective: f64,
+    gamma: f64,
+}
+
+impl FalseAlarm {
+    /// T = max t − min t, T_eff = √(4π Var t), γ(N − 1) = √(2/(N−1)) Γ((N−1)/2)/Γ((N−2)/2).
+    pub(crate) fn new(times: &[f64]) -> Result<Self, SciOxideError> {
+        let n = times.len() as f64;
+        let max = times.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let min = times.iter().copied().fold(f64::INFINITY, f64::min);
+        let mean = times.iter().sum::<f64>() / n;
+        let variance = times.iter().map(|t| (t - mean).powi(2)).sum::<f64>() / n;
+        let ratio = ln_gamma((n - 1.0) / 2.0)? - ln_gamma((n - 2.0) / 2.0)?;
+        Ok(Self {
+            n,
+            baseline: max - min,
+            effective: (4.0 * core::f64::consts::PI * variance).sqrt(),
+            gamma: (2.0 / (n - 1.0)).sqrt() * ratio.exp(),
+        })
+    }
+    /// Single-frequency probability p₁(z) = (1 − z)^((N−3)/2).
+    pub(crate) fn single(&self, z: f64) -> f64 {
+        (1.0 - z).powf((self.n - 3.0) / 2.0)
+    }
+    /// Naive approximation 1 − (1 − p₁)^M, M = f_max T.
+    pub(crate) fn naive(&self, z: f64) -> f64 {
+        -(F_MAX * self.baseline * (-self.single(z)).ln_1p()).exp_m1()
+    }
+    /// Baluev approximation 1 − (1 − p₁) e^(−τ). Write as (1 − e^(−τ)) + p₁ e^(−τ) to avoid cancellation for small values.
+    pub(crate) fn baluev(&self, z: f64) -> f64 {
+        let tau = self.gamma
+            * F_MAX
+            * self.effective
+            * (1.0 - z).powf((self.n - 4.0) / 2.0)
+            * ((self.n - 1.0) * z / 2.0).sqrt();
+        -(-tau).exp_m1() + self.single(z) * (-tau).exp()
+    }
+    /// Power at which the Baluev approximation equals level (bisection, since it decreases monotonically with z).
+    pub(crate) fn threshold(&self, level: f64) -> f64 {
+        let (mut lo, mut hi) = (0.0_f64, 1.0_f64);
+        for _ in 0..60 {
+            let mid = 0.5 * (lo + hi);
+            if self.baluev(mid) > level {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+}
+```
+
+## Normalized Lomb–Scargle power
+
+At each angular frequency $\omega$, fit brightness $y_j$ by least squares to a constant plus sine and cosine $c + a \cos \omega t_j + b \sin \omega t_j$ (floating mean).
+Let $\chi^2_0$ be the residual sum of squares of the constant-only model and $\chi^2(\omega)$ that of the model with the sinusoid; then `LombScargleNormalization::Normalized` power is
+
+$$
+z(\omega) = \frac{\chi^2_0 - \chi^2(\omega)}{\chi^2_0} \in [0, 1]
+$$
+
+This represents the fraction of variance explained by the sinusoid.
+`lomb_scargle` computes this value with defaults of unit weights, a floating mean, and normalized power; complexity is proportional to sample count times frequency count.
+Pass frequencies as angular frequencies [rad/day].
+
+Because observations occur only at night, the window spectrum (from the observation-time pattern) has strong peaks spaced 1 day⁻¹ apart.
+Power appears at daily aliases $f_0 \pm 1$ day⁻¹ as well as the true frequency $f_0 = 1/P = 1.764$ day⁻¹.
+
+## False alarm probability
+
+Consider the null hypothesis of no periodic signal and independent Gaussian noise of equal variance.
+For the floating-mean model under the null hypothesis, the single-frequency power $z$ follows a beta distribution $\mathrm{Beta}(1, (N-3)/2)$, and its probability of exceeding $z$ is
+
+$$
+p_1(z) = (1 - z)^{(N-3)/2}
+$$
+
+where $N$ is the sample count.
+Searching many frequencies and taking the maximum increases the probability of a large value by chance.
+A naive approximation estimates the number of independent frequencies as $M \approx f_{\max} T$ from the frequency range $f_{\max}$ and observation span $T = \max_j t_j - \min_j t_j$:
+
+$$
+\mathrm{FAP}_{\mathrm{naive}} \approx 1 - (1 - p_1)^M
+$$
+
+
+The approximation of Baluev (2008) defines an effective span $T_{\mathrm{eff}} = \sqrt{4\pi \operatorname{Var}(t)}$ from the observation-time variance and uses
+
+$$
+\mathrm{FAP} \approx 1 - (1 - p_1(z))\, e^{-\tau(z)}, \qquad
+\tau(z) = \gamma(N-1)\, f_{\max} T_{\mathrm{eff}}\, (1 - z)^{(N-4)/2} \sqrt{\tfrac{(N-1) z}{2}}
+$$
+
+
+Here $\gamma(n) = \sqrt{2/n}\, \Gamma(n/2) / \Gamma((n-1)/2)$ is a correction close to 1.
+Because $\tau$ is derived from the Davies upper bound, the Baluev approximation overestimates FAP.
+Both approximate probabilities under the null hypothesis, rather than the probability that a signal exists.
+
+The next cell computes power from the synthetic data using `lomb_scargle` at 1901 points from 0.2 to 4 day⁻¹.
+It tabulates the strongest peak's frequency, period, and power, the three probabilities, and the power giving 1% FAP in the Baluev approximation.
+Evaluate the logarithm of $\Gamma$ with `scioxide_special::ln_gamma`.
+
+```rust
+//| id: signal-variable-star-lomb-scargle
+//| ref: signal-variable-star-lomb-scargle
+//| title: "Estimate a variable star's period and false alarm probability from irregular observations"
+//| run: reactive
+//| uses: [signal-variable-star-model]
+//| crates: [scioxide-signal]
+//| inputs:
+//|   noise_sigma: {"type":"range","label":"Noise standard deviation σ [mag]","description":"Magnitude of Gaussian noise added to each observation.","min":0.1,"max":1.5,"step":0.1,"value":0.3}
+//|   seed: {"type":"integer","label":"Random seed","description":"Change the noise sequence.","min":1,"max":9999,"value":2024}
+//| cases:
+//|   - {"id":"quiet","label":"σ = 0.1 mag","description":"Peak power increases and the estimated period approaches the true value.","inputs":{"noise_sigma":0.1}}
+//|   - {"id":"noisy","label":"σ = 1.5 mag","description":"The strongest peak moves to another frequency and FAP increases.","inputs":{"noise_sigma":1.5}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"peak","path":"/rows/0/0","approx":{"value":1.762,"atol":0.0011}}
+//|       - {"artifact":"peak","path":"/rows/0/5","range":{"max":1e-10}}
+//|   - case: quiet
+//|     expect:
+//|       - {"artifact":"peak","path":"/rows/0/0","approx":{"value":1.764,"atol":0.0011}}
+//|   - case: noisy
+//|     expect:
+//|       - {"artifact":"peak","path":"/rows/0/5","range":{"min":0.1}}
+use scioxide_signal::lomb_scargle;
+
+let times = observation_times();
+let light = light_curve(&times, noise_sigma, seed as u64);
+let (freqs, omegas) = frequency_grid(1901);
+// One-shot function: unit weights, floating mean, normalized power
+let power = lomb_scargle(&times, &light, &omegas).map_err(|e| e.to_string())?;
+let best = (0..power.len())
+    .max_by(|&a, &b| power[a].total_cmp(&power[b]))
+    .ok_or("No frequencies")?;
+let z = power[best];
+let fap = FalseAlarm::new(&times).map_err(|e| e.to_string())?;
+let level = fap.threshold(0.01);
+
+let fixed3 = serde_json::json!({ "fractionDigits": 3 });
+let fixed4 = serde_json::json!({ "fractionDigits": 4 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Peak frequency [day⁻¹]", "type": "number", "format": fixed3 },
+    { "key": "1", "label": "Estimated period [days]", "type": "number", "format": fixed4 },
+    { "key": "2", "label": "Power z [-]", "type": "number", "format": fixed4 },
+    { "key": "3", "label": "p₁(z) [-]", "type": "number", "format": sci2 },
+    { "key": "4", "label": "Naive FAP [-]", "type": "number", "format": sci2 },
+    { "key": "5", "label": "Baluev FAP [-]", "type": "number", "format": sci2 },
+    { "key": "6", "label": "Power at 1% FAP [-]", "type": "number", "format": fixed4 }
+]);
+let row = (
+    freqs[best],
+    1.0 / freqs[best],
+    z,
+    fap.single(z),
+    fap.naive(z),
+    fap.baluev(z),
+    level,
+);
+emit_table_with_columns!(columns, vec![row], metadata = serde_json::json!({ "id": "peak" }));
+
+let curve: Vec<[f64; 2]> = freqs.iter().zip(&power).map(|(&f, &p)| [f, p]).collect();
+let f0 = 1.0 / PERIOD;
+emit_line_chart!(
+    &vec![serde_json::json!({ "name": "Normalized power z", "points": curve })],
+    options = &serde_json::json!({
+        "xLabel": "Frequency f [day⁻¹]",
+        "yLabel": "Normalized power z [-]",
+        "yMin": 0.0,
+        "yMax": 1.0,
+        "annotations": [
+            { "kind": "line", "axis": "x", "value": f0, "label": "True frequency 1/P" },
+            { "kind": "line", "axis": "x", "value": f0 - 1.0, "label": "f₀ − 1" },
+            { "kind": "line", "axis": "x", "value": f0 + 1.0, "label": "f₀ + 1" },
+            { "kind": "line", "axis": "y", "value": level, "label": "FAP 1 %" }
+        ]
+    })
+);
+```
+
+At the default $\sigma = 0.3$ mag and seed 2024, the strongest peak is at 1.762 day⁻¹ (period 0.5675 days), within the 0.002 day⁻¹ frequency step of the true frequency 1.7637 day⁻¹.
+Peak power is $z = 0.2933$, with $p_1 = 1.4 \times 10^{-18}$, naive FAP $2.2 \times 10^{-16}$, and Baluev FAP $1.6 \times 10^{-15}$.
+It far exceeds the power 0.0880 giving 1% FAP under the Baluev approximation, making a chance noise peak unlikely.
+The chart also shows smaller peaks at daily aliases $f_0 \pm 1$ day⁻¹.
+
+At $\sigma = 0.1$ mag, power rises to $z = 0.740$ and the peak lies on the 1.764 day⁻¹ grid point (period 0.5669 days).
+At $\sigma = 1.5$ mag, the strongest peak moves to 2.680 day⁻¹, with $z = 0.0515$, Baluev FAP 0.55, and naive FAP 0.26; this peak cannot be considered a period detection.
+The power giving 1% FAP depends only on observation times, sample count, and frequency range, not on noise magnitude.
+
+## Checking with noise-only simulated observations
+
+Because FAP formulas are approximations, generate many noise-only simulated observations at the same times and compare with the distribution of maximum power.
+Repeated calculations at the same times and frequencies let the cell prepare the `LombScargle` method object and workspace for one series (`workspace(1)`) once, reusing them for each simulation with the destination-specified API `power_into`.
+To limit computation time, double the previous cell's frequency step (0.004 day⁻¹, 951 points).
+This step remains much finer than the peak width (about $1/T \approx 0.025$ day⁻¹), but missing the exact peak with grid points slightly underestimates the maximum.
+Across $R$ simulated observations, the fraction $\hat q$ whose maximum power exceeds threshold $z_c$ estimates FAP, with standard error $\sqrt{\hat q(1-\hat q)/R}$.
+Set noise standard deviation to 1 because normalized power is independent of the brightness scale.
+The chart shows exceedance fractions as markers, ±2 standard errors as a band, and both approximations as dashed lines.
+
+```rust
+//| id: signal-variable-star-false-alarm
+//| ref: signal-variable-star-false-alarm
+//| title: "Check false alarm probability approximations with noise-only simulated observations"
+//| run: button
+//| uses: [signal-variable-star-model]
+//| crates: [scioxide-core, scioxide-signal]
+//| inputs:
+//|   realizations: {"type":"range","label":"Simulation count R","description":"Number of noise-only observations to generate. More simulations reduce standard error.","min":20,"max":100,"step":20,"value":40}
+//|   seed: {"type":"integer","label":"Random seed","description":"Change the simulated-noise sequence.","min":1,"max":9999,"value":7}
+//| cases:
+//|   - {"id":"many","label":"R = 100","description":"Smaller standard errors make differences from the approximations easier to read.","inputs":{"realizations":100}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"exceedance","path":"/rows/0/0","approx":{"value":0.04,"atol":1e-12}}
+//|       - {"artifact":"exceedance","path":"/rows/1/1","range":{"min":0.15,"max":0.6}}
+use scioxide_core::ExecutionContext;
+use scioxide_signal::{LombScargle, LombScargleOptions};
+
+let times = observation_times();
+// Search with twice the previous cell's step (951 points) to limit computation time
+let (_, omegas) = frequency_grid(951);
+let periodogram = LombScargle::new(&times, &omegas, None, LombScargleOptions::default())
+    .map_err(|e| e.to_string())?;
+// Prepare the method object and workspace for one series once, reusing them with power_into for each simulation
+let mut work = periodogram.workspace(1).map_err(|e| e.to_string())?;
+let mut power = vec![0.0; omegas.len()];
+let mut rng = SplitMix::new(seed as u64);
+let r = realizations.round() as usize;
+let mut maxima = Vec::with_capacity(r);
+for _ in 0..r {
+    let noise: Vec<f64> = (0..times.len()).map(|_| rng.gauss()).collect();
+    periodogram
+        .power_into(&noise, &mut power, &mut work, ExecutionContext::sequential())
+        .map_err(|e| e.to_string())?;
+    maxima.push(power.iter().copied().fold(0.0_f64, f64::max));
+}
+
+let fap = FalseAlarm::new(&times).map_err(|e| e.to_string())?;
+let rows: Vec<(f64, f64, f64, f64, f64)> = [0.04, 0.05, 0.06, 0.07, 0.08, 0.09]
+    .iter()
+    .map(|&zc| {
+        let q = maxima.iter().filter(|&&m| m > zc).count() as f64 / r as f64;
+        let se = (q * (1.0 - q) / r as f64).sqrt();
+        (zc, q, se, fap.baluev(zc), fap.naive(zc))
+    })
+    .collect();
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let fixed3 = serde_json::json!({ "fractionDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Threshold z_c [-]", "type": "number", "format": fixed2 },
+    { "key": "1", "label": "Simulated exceedance fraction [-]", "type": "number", "format": fixed3 },
+    { "key": "2", "label": "Standard error [-]", "type": "number", "format": fixed3 },
+    { "key": "3", "label": "Baluev FAP [-]", "type": "number", "format": fixed3 },
+    { "key": "4", "label": "Naive FAP [-]", "type": "number", "format": fixed3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows.clone(),
+    metadata = serde_json::json!({ "id": "exceedance" })
+);
+
+let band: Vec<[f64; 4]> = rows
+    .iter()
+    .map(|&(z, q, se, _, _)| [z, q, q - 2.0 * se, q + 2.0 * se])
+    .collect();
+let observed: Vec<[f64; 2]> = rows.iter().map(|&(z, q, _, _, _)| [z, q]).collect();
+let grid: Vec<f64> = (0..=60).map(|i| 0.035 + 0.001 * i as f64).collect();
+let baluev: Vec<[f64; 2]> = grid.iter().map(|&z| [z, fap.baluev(z)]).collect();
+let naive: Vec<[f64; 2]> = grid.iter().map(|&z| [z, fap.naive(z)]).collect();
+let dashed = serde_json::json!({ "lineType": "dashed", "showSymbol": false });
+emit_chart!(serde_json::json!({
+    "kind": "xy",
+    "xLabel": "Threshold z_c [-]",
+    "yLabel": "Probability that maximum power exceeds z_c [-]",
+    "xMin": 0.035,
+    "xMax": 0.095,
+    "yMin": 0.0,
+    "yMax": 1.0,
+    "layers": [
+        { "id": "band", "kind": "band", "name": "Exceedance fraction ± 2 SE", "points": band },
+        { "id": "observed", "kind": "scatter", "name": "Simulated exceedance fraction", "points": observed },
+        { "id": "baluev", "kind": "line", "name": "Baluev approximation", "points": baluev, "style": dashed },
+        { "id": "naive", "kind": "line", "name": "Naive approximation", "points": naive, "style": dashed }
+    ],
+    "dataZoom": true,
+    "tooltip": true
+}));
+```
+
+At the default $R = 40$ and seed 7, the fraction exceeding threshold 0.05 is $0.275 \pm 0.071$ (±1 standard error), close to the naive approximation 0.302 and below the Baluev approximation 0.609.
+At $R = 100$ it is $0.330 \pm 0.047$, showing the same pattern.
+At threshold 0.08, the Baluev approximation is 0.027, the naive approximation 0.008, and 100 simulated observations give $0.010 \pm 0.010$.
+The Baluev approximation overestimates FAP because it is based on the Davies upper bound, approaching the actual value more closely as FAP becomes small.
+The naive approximation's agreement with simulation is specific to this observation-time pattern and does not hold in general.
+Each simulated observation evaluates 951 frequencies against 240 samples, taking several seconds even at $R = 40$.
+
+## Summary
+
+For irregular observations, pass times and angular frequencies to `lomb_scargle` and interpret normalized power $z$ as the fraction of variance explained by a sinusoid.
+Night-only observations create daily aliases spaced 1 day⁻¹ apart, so the strongest peak need not represent the true period and can swap with an alias or noise peak as noise increases.
+Assess peak significance with false alarm probability, using an approximation that accounts for the searched frequency range rather than the single-frequency probability $p_1$ directly.
+Use the Baluev approximation for a conservative decision; if the value itself is needed at moderate FAP, compare it within standard errors with noise-only simulations at the same observation times.
+See [Spectral estimation](../../algorithms/spectral-estimation/) for Lomb–Scargle conventions and the connection with uniformly spaced data, and [Nonuniform FFT](../../../scioxide-fft/algorithms/nonuniform-fft/) in scioxide-fft for fast Fourier sums at many frequencies.

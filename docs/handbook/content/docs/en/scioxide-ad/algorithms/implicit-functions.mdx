@@ -1,0 +1,325 @@
+---
+title: "Differentiating implicit functions"
+description: "Obtain derivatives of solutions y(p) of nonlinear equations F(y, p) = 0 with the implicit function theorem. Examine implicit_solution_into, which applies the theorem at each numeric-type level to a caller-supplied solution; Residual for writing a residual once; residual checks and errors; and derivative errors when accepting approximate solutions, using first- and second-order sensitivities of Kepler's equation."
+sidebar:
+  order: 370
+references:
+  ad-implicit-solution-into: "implicit_solution_into-and-residual"
+  ad-implicit-error: "error-when-accepting-an-approximate-solution"
+  ad-kepler-sensitivity: "sensitivities-of-a-kepler-equation-solution"
+---
+
+A solution $y$ of a nonlinear equation $F(y, p) = 0$ is defined indirectly as a function of parameters $p$.
+Solutions are often computed iteratively, for example with Newton's method.
+Differentiating the iteration's operations directly makes the tape recording grow in proportion to the iteration count, and derivatives depend on where iteration stops.
+Differentiating the equation satisfied by the solution instead obtains derivatives from partial derivatives of $F$ at the solution by solving one linear system.
+
+This page covers solution differentiation with the implicit function theorem, `implicit_solution_into` for applying it at each numeric-type level, and derivative errors when approximate solutions are accepted.
+[Differentiating linear solutions and factorizations](../linear-solutions/) explains differentiation of the linear systems solved along the way and the algorithm of `solve_into`.
+[Numeric types, lanes, and generic code](../number-types-and-lanes/) defines numeric-type levels (`Real::LEVEL`), the type `Primal` one level below, and base values.
+[Differentiation rules for scalar functions](../custom-primitives/) explains `combine` for assembling a value from partial derivatives.
+
+## Solution differentiation with the implicit function theorem
+
+If $F: \mathbb{R}^n \times \mathbb{R}^q \to \mathbb{R}^n$ is continuously differentiable near $(y^*, p)$, $F(y^*, p) = 0$, and $F_y = \partial F / \partial y$ is nonsingular at $(y^*, p)$, the implicit function theorem gives a continuously differentiable solution $y(p)$ satisfying $F(y(p), p) = 0$ near $p$, with
+
+$$
+\frac{\partial y}{\partial p} = -F_y^{-1} F_p
+$$
+
+
+For tangents, solve $F_y \dot y = -F_p \dot p$; for cotangents, solve $F_y^\top \lambda = \bar y$ and set $\bar p = -F_p^\top \lambda$.
+Both require only one linear solve with $F_y$ or its transpose and do not depend on the method used to obtain $y^*$.
+The linear equation $AX = B$ is the case $F(X; A, B) = AX - B$, $F_y = A$; its tangent formula agrees with the derivative $\dot X = A^{-1}(\dot B - \dot A X)$ of a linear-system solution ([Differentiating linear solutions and factorizations](../linear-solutions/)).
+If $F$ is twice continuously differentiable, differentiating the identity $F(y(p), p) = 0$ once more also expresses second derivatives using second derivatives of $F$ and linear systems with $F_y$.
+
+## `implicit_solution_into` and `Residual`
+
+`Residual<S>` is a trait for writing the residual $F(y, p)$ once for all numeric types with `Mask = bool` (types whose comparisons return `bool`).
+`residual<R: Real<S, Mask = bool>>(&self, solution, parameters, out)` writes $n$ values $F(y, p)$ to `out` and returns errors unchanged.
+
+`implicit_solution_into(residual, solution, parameters, tolerance, out)` writes the solution $y(p)$ with derivatives to `out` from the base-valued solution `solution` ($n$ values of `S`) and derivative-carrying parameters `parameters` ($q$ values of `R`).
+The caller computes and supplies the solution, for example with Newton's method; this function does not solve $F = 0$.
+The values in `out` equal `solution`, and derivatives are evaluated at the supplied solution.
+
+Derivatives are constructed by recursively applying the implicit function theorem at each numeric-type level.
+Let $L$ be the level of `R` (`Real::LEVEL`: `f64` has level 0, `Var<f64>` and `Dual<f64>` level 1, and `Var<Dual<f64>>` level 2).
+
+1. At $L = 0$, evaluate the residual once, check $\|F(y, p)\|_2 \le \text{atol} + \text{rtol}\,\|y\|_2$ (`ResidualTolerance`), and write `solution` directly.
+2. At $L \ge 1$, call the same function with parameters one level below (`R::Primal`) to obtain the solution at that lower level.
+3. Evaluate the residual $n + q$ times using `Dual<R::Primal>` with unit tangents attached to that solution and the parameters, constructing columns of $F_y$ and $F_p$.
+4. Solve $M = F_y^{-1} F_p$ with `solve_into` in `R::Primal` arithmetic, and assemble each component with `R::combine` from value $y_k$ and partial derivatives $-M_{k,\cdot}$.
+
+`solve_into` in step 4 factors the base values of $F_y$ once by LU factorization with partial pivoting, reusing those factors for the $q$ columns of $F_p$ and every derivative component in `R::Primal`.
+
+`combine` receives partial derivatives in arithmetic one level below, so the result is exact through the nesting order.
+Thus `hvp` and `hessian` using `Var<Dual<f64>>`, and second derivatives using `Dual<Dual<f64>>`, also work through implicit solutions.
+On a tape (`Var`), residual evaluation uses `Dual` outside the tape and records just one `combine` statement per output.
+`Jet` can also be used, but assembly through `combine` makes coefficients from $c_2$ onward NaN ([Taylor jets and higher-order coefficients](../taylor-jets/)).
+Types containing `Lanes` do not satisfy `Mask = bool` and cannot be used.
+
+At each level, the cost is $n + q$ residual evaluations with `Dual`, one factorization of the $n \times n$ matrix $F_y$ (about $\tfrac{2}{3}n^3$ floating-point operations), substitutions for $q$ columns, and allocation of $O(n(n + q))$ values.
+Level 0 additionally evaluates the residual once to check the tolerance.
+
+Errors are as follows.
+
+- It returns `DimensionMismatch` if the length of `out` differs from `solution`.
+- At level 0, if the residual fails the tolerance or the residual or `solution` is nonfinite, it returns `InvalidInput` (argument `solution`, `OutOfRange`).
+  Both norms accumulate with `hypot` and avoid overflow even for large solutions such as $10^{200}$.
+- At a differentiation level, a zero or nonfinite pivot in the LU factorization of the base values of $F_y$ (the maximum absolute remaining entry in its column) returns `Singular`.
+  Ordinary-number calls at level 0 do not construct $F_y$ and do not return `Singular`.
+  No condition number is estimated, so a merely nearly singular $F_y$ does not cause an error and returns large derivatives.
+- At a differentiation level, if the size of $F_y$ or $F_p$ does not fit in `usize`, it returns `SizeOverflow` before calling the residual.
+- It returns `AllocationFailure` if workspace cannot be allocated.
+- Errors from the residual are returned unchanged.
+
+## Error when accepting an approximate solution
+
+An approximate solution $\tilde y$ within tolerance is accepted, and derivatives are evaluated at $\tilde y$ rather than $y^*$.
+Since $\tilde y - y^* \approx F_y^{-1} F(\tilde y, p)$, we have $\|\tilde y - y^*\| \lesssim \|F_y^{-1}\|\,\|F(\tilde y, p)\|$.
+If $L_D$ is the Lipschitz constant in $y$ of the solution derivative $D(y) = -F_y^{-1}F_p$, the derivative error is, to first order,
+
+$$
+\bigl\| D(\tilde y) - D(y^*) \bigr\| \lesssim L_D\,\|F_y^{-1}\|\,\|F(\tilde y, p)\|
+$$
+
+
+The default `ResidualTolerance` (both atol and rtol equal $\sqrt{\varepsilon} \approx 1.5 \times 10^{-8}$) can accept solutions with residuals on the order of $10^{-8}$, and derivative error can be on the order of $L_D\,\|F_y^{-1}\| \times 10^{-8}$ ([Tolerance and residual scaling theory](../../../concepts/tolerances-and-residuals/)).
+For derivatives at the rounding level, solve until the residual reaches that level and set the tolerance accordingly.
+
+## Sensitivities of a Kepler-equation solution
+
+The eccentric anomaly $E$ of an elliptical orbit is defined by the mean anomaly $M$ and eccentricity $e$ as the solution of Kepler's equation $F(E; M, e) = E - e \sin E - M = 0$.
+Compute first and second derivatives of $E(M, e)$ with `implicit_solution_into` and compare them with closed forms (the default $e = 0.6$ and $M = 1.2$ rad match [Kepler's equation and eccentricity](../../../scioxide-rootfind/examples/kepler-equation/)).
+Since $F_E = 1 - e\cos E \ge 1 - e > 0$, the solution is unique and the implicit function theorem applies everywhere.
+
+The caller uses Newton's method $E \leftarrow E - F/F_E$, evaluating $F$ and $F_E$ with `Dual` on the same `Residual` and iterating $K$ times from $E_0 = \pi$.
+Use only an absolute tolerance atol (rtol = 0) and call `implicit_solution_into` inside `grad` and `hessian`.
+`hessian` computes a Hessian–vector product for each direction on `Var<Dual<f64>>`.
+
+For an independent check, compare the closed forms below using $D = 1 - e \cos E^*$ at reference solution $E^*$ obtained by 100 bisection steps:
+
+$$
+\frac{\partial E}{\partial M} = \frac{1}{D}, \quad
+\frac{\partial E}{\partial e} = \frac{\sin E^*}{D}, \quad
+\frac{\partial^2 E}{\partial M^2} = -\frac{e \sin E^*}{D^3}, \quad
+\frac{\partial^2 E}{\partial M \partial e} = \frac{\cos E^* - e}{D^3}, \quad
+\frac{\partial^2 E}{\partial e^2} = \frac{2 \sin E^* \cos E^*\, D - e \sin^3 E^*}{D^3}
+$$
+
+
+The next cell's inputs are $e$, $M$, iteration count $K$, and atol.
+The first table shows the caller's solution, residual, and check result; the second shows derivatives.
+
+```rust
+//| id: ad-implicit-solution
+//| ref: ad-implicit-solution
+//| title: "Solution sensitivities for Kepler's equation using the implicit function theorem"
+//| run: reactive
+//| crates: [scioxide-ad, scioxide-core]
+//| inputs:
+//|   eccentricity: {"type":"range","label":"Eccentricity e [-]","description":"Closer to 1, F_E = 1 − e cos E can become smaller.","min":0.05,"max":0.95,"step":0.05,"value":0.6}
+//|   mean_anomaly: {"type":"range","label":"Mean anomaly M [rad]","description":"Range from 0 to 2π.","min":0.1,"max":6.2,"step":0.1,"value":1.2}
+//|   iterations: {"type":"range","label":"Newton iteration count K","description":"Number of iterations used by the caller to compute E from E₀ = π.","min":0,"max":8,"step":1,"value":6}
+//|   tolerance: {"type":"select","label":"Residual tolerance atol [rad]","description":"Check |F(E_K)| ≤ atol (rtol = 0) at level 0 (base values).","options":["1e-12","1e-8","1e-4"],"value":"1e-12"}
+//| cases:
+//|   - {"id":"early","label":"K = 3","description":"The residual fails the tolerance, returning InvalidInput.","inputs":{"iterations":3}}
+//|   - {"id":"loose","label":"K = 3, atol = 10⁻⁴","description":"A loose tolerance accepts an approximate solution; derivatives are evaluated at that point.","inputs":{"iterations":3,"tolerance":"1e-4"}}
+//|   - {"id":"eccentric","label":"e = 0.95, M = 0.3","description":"Small F_E and large second derivatives.","inputs":{"eccentricity":0.95,"mean_anomaly":0.3}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"solution","path":"/rows/0/4","equals":"Accepted"}
+//|       - {"artifact":"derivatives","path":"/rows/0/1","approx":{"value":0.8863591446259845,"rtol":1e-14}}
+//|       - {"artifact":"derivatives","path":"/rows/0/3","range":{"max":1e-13}}
+//|       - {"artifact":"derivatives","path":"/rows/2/3","range":{"max":1e-13}}
+//|       - {"artifact":"derivatives","path":"/rows/4/3","range":{"max":1e-13}}
+//|   - case: early
+//|     expect:
+//|       - {"artifact":"solution","path":"/rows/0/4","equals":"InvalidInput (argument solution, OutOfRange)"}
+//|       - {"artifact":"derivatives","path":"/rows/0/1","equals":null}
+//|   - case: loose
+//|     expect:
+//|       - {"artifact":"solution","path":"/rows/0/4","equals":"Accepted"}
+//|       - {"artifact":"derivatives","path":"/rows/0/3","range":{"min":1e-7,"max":1e-4}}
+//|   - case: eccentric
+//|     expect:
+//|       - {"artifact":"derivatives","path":"/rows/0/1","approx":{"value":1.5726167673887486,"rtol":1e-13}}
+//|       - {"artifact":"derivatives","path":"/rows/2/3","range":{"max":1e-13}}
+use scioxide_ad::{Dual, Real, Residual, grad, hessian, implicit_solution_into};
+use scioxide_core::{
+    SciOxideError, SciOxideErrorKind, SciOxideErrorView, InvalidInputReason, ResidualTolerance,
+};
+
+/// F(E; M, e) = E − e sin E − M. Solution: [E]; parameters: [M, e].
+struct Kepler;
+impl Residual for Kepler {
+    fn residual<R: Real<f64, Mask = bool>>(
+        &self,
+        y: &[R],
+        p: &[R],
+        out: &mut [R],
+    ) -> Result<(), SciOxideError> {
+        out[0] = y[0] - p[1] * y[0].sin() - p[0];
+        Ok(())
+    }
+}
+
+let (m, e) = (mean_anomaly, eccentricity);
+// Caller solver: Newton's method, evaluating F and F_E with Dual.
+let mut estimate = core::f64::consts::PI;
+for _ in 0..iterations as usize {
+    let mut f = [Dual::constant(0.0)];
+    let parameters = [Dual::constant(m), Dual::constant(e)];
+    Kepler
+        .residual(&[Dual::variable(estimate)], &parameters, &mut f)
+        .map_err(|e| e.to_string())?;
+    estimate -= f[0].value() / f[0].derivative();
+}
+let mut f = [0.0];
+Kepler
+    .residual(&[estimate], &[m, e], &mut f)
+    .map_err(|e| e.to_string())?;
+let atol: f64 = tolerance
+    .parse()
+    .map_err(|_| "Cannot parse the tolerance".to_string())?;
+let tol = ResidualTolerance::new(atol, 0.0).map_err(|e| e.to_string())?;
+
+// Implicit differentiation: gradient (Var<f64>) and Hessian (Var<Dual<f64>>).
+let point = [m, e];
+let gradient = grad(
+    |p| {
+        let mut y = [p[0]];
+        implicit_solution_into(&Kepler, &[estimate], p, tol, &mut y)?;
+        Ok(y[0])
+    },
+    &point,
+);
+let curvature = hessian(
+    |p| {
+        let mut y = [p[0]];
+        implicit_solution_into(&Kepler, &[estimate], p, tol, &mut y)?;
+        Ok(y[0])
+    },
+    &point,
+);
+let verdict = match &gradient {
+    Ok(_) => "Accepted".to_string(),
+    Err(error) => match (error.kind(), error.view()) {
+        (
+            SciOxideErrorKind::InvalidInput,
+            SciOxideErrorView::InvalidInput {
+                argument,
+                reason: InvalidInputReason::OutOfRange,
+                ..
+            },
+        ) => format!("InvalidInput (argument {argument}, OutOfRange)"),
+        _ => error.to_string(),
+    },
+};
+
+// Independent reference solution: 100 bisection steps (native f64 methods are used for reference values).
+let (mut low, mut high) = (0.0_f64, 2.0 * core::f64::consts::PI);
+for _ in 0..100 {
+    let middle = 0.5 * (low + high);
+    if middle - e * middle.sin() - m < 0.0 {
+        low = middle;
+    } else {
+        high = middle;
+    }
+}
+let star = 0.5 * (low + high);
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let digits = serde_json::json!({ "significantDigits": 16 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Iteration count K", "type": "integer" },
+    { "key": "1", "label": "E_K [rad]", "type": "number", "format": digits },
+    { "key": "2", "label": "|F(E_K)| [rad]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "|E_K − E*| [rad]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "Residual check" }
+]);
+let solution = vec![(
+    iterations as u32,
+    estimate,
+    f[0].abs(),
+    (estimate - star).abs(),
+    verdict,
+)];
+emit_table_with_columns!(
+    columns,
+    solution,
+    metadata = serde_json::json!({ "id": "solution" })
+);
+
+// Closed form (independent check): D = 1 − e cos E*.
+let (s, c) = (star.sin(), star.cos());
+let d = 1.0 - e * c;
+let exact = [
+    1.0 / d,
+    s / d,
+    -e * s / d.powi(3),
+    (c - e) / d.powi(3),
+    (2.0 * s * c * d - e * s.powi(3)) / d.powi(3),
+];
+let computed: [Option<f64>; 5] = match (&gradient, &curvature) {
+    (Ok(g), Ok(h)) => {
+        let (g, h) = (g.as_slice(), h.as_slice());
+        [Some(g[0]), Some(g[1]), Some(h[0]), Some(h[1]), Some(h[3])]
+    }
+    _ => [None; 5],
+};
+let names = [
+    "∂E/∂M [-]",
+    "∂E/∂e [rad]",
+    "∂²E/∂M² [1/rad]",
+    "∂²E/∂M∂e [-]",
+    "∂²E/∂e² [rad]",
+];
+let rows: Vec<_> = names
+    .iter()
+    .zip(computed.iter().zip(&exact))
+    .map(|(name, (value, &reference))| {
+        let gap = value.map(|v| ((v - reference) / reference).abs());
+        (*name, *value, reference, gap)
+    })
+    .collect();
+let derivative_columns = serde_json::json!([
+    { "key": "0", "label": "Quantity" },
+    { "key": "1", "label": "Implicit derivative", "type": "number", "format": digits, "nullText": "Rejected" },
+    { "key": "2", "label": "Closed form (evaluated at E*)", "type": "number", "format": digits },
+    { "key": "3", "label": "Relative difference [-]", "type": "number", "format": sci3, "nullText": "Rejected" }
+]);
+emit_table_with_columns!(
+    derivative_columns,
+    rows,
+    metadata = serde_json::json!({ "id": "derivatives" })
+);
+```
+
+At the default $K = 6$, $E_6 = 1.786141603274313$ rad; the residual $2.2 \times 10^{-16}$ meets atol $= 10^{-12}$ and passes the check.
+The difference from the reference solution is zero.
+The five derivatives agree with the closed forms within relative difference $3 \times 10^{-16}$, so second derivatives using `Var<Dual<f64>>` are also obtained at the rounding level.
+
+At $K = 3$, the residual $6.6 \times 10^{-6}$ exceeds atol $= 10^{-12}$, returning `InvalidInput` (argument `solution`, `OutOfRange`) without derivatives.
+With the same $K = 3$ and atol $= 10^{-4}$, approximate solution $E_3$ is accepted; in accordance with $|E_3 - E^*| = 5.9 \times 10^{-6}$, derivative relative differences range from $1.8 \times 10^{-6}$ to $1.0 \times 10^{-5}$.
+The derivative of $\partial E/\partial M = 1/D$ with respect to $E$ is $-e \sin E/D^2 \approx -0.46$, so the estimate $0.46 \times 5.9 \times 10^{-6} / 0.886 \approx 3.0 \times 10^{-6}$ agrees with the observed $3.0 \times 10^{-6}$.
+
+At $e = 0.95$ and $M = 0.3$, $F_E = 0.636$ is smaller and $\partial^2 E / \partial M^2 = -3.41$ is more than eight times the default magnitude, but the maximum relative difference is $4.0 \times 10^{-16}$.
+
+## Summary
+
+The caller computes a nonlinear-equation solution, for example with Newton's method, and passes it to `implicit_solution_into` together with a residual implementing `Residual`.
+After checking the residual with `ResidualTolerance`, `implicit_solution_into` constructs derivatives from gradients through Hessian–vector products using the implicit function theorem; the tape retains just one `combine` statement per output, rather than the iteration history.
+Derivatives are evaluated at the supplied solution, so loosening tolerance can increase derivative error in proportion to the residual of the accepted approximation.
+For derivatives at the rounding level, reduce the residual to that level before passing the solution.
+A zero or nonfinite pivot in the LU factorization of $F_y$ gives `Singular`, but near singularity alone does not cause an error; the caller must check the condition number of $F_y$.
+For `Jet`, coefficients from $c_2$ onward become NaN; types containing `Lanes` cannot be used.
+
+## Further reading
+
+- [Real coordinates and derivatives of complex numbers](../complex-derivatives/): continue to the next page to examine the convention for differentiating complex values as pairs of real and imaginary parts.
+- [Differentiation rules for scalar functions](../custom-primitives/): examine the accuracy limits of `combine`, which `implicit_solution_into` uses to assemble derivatives.
+- [Second derivatives and Hessian operators](../second-order-derivatives/): examine combining `hvp` and `hessian` through implicit solutions with Hessian operators.
+- [Loops and checkpointing](../checkpointing/): examine the allocation of memory and recomputation when differentiating the iterative solution process itself.
+- [Implicit sensitivities of the van der Waals equation of state](../../examples/van-der-waals-implicit/): treat volume as an implicit function of pressure and temperature and examine sensitivity divergence near the critical point.
+- [Kepler's equation and eccentricity](../../../scioxide-rootfind/examples/kepler-equation/): examine evaluation counts and residuals when solving the same equation with root-finding methods.

@@ -1,0 +1,582 @@
+---
+title: IIR フィルタの実行とゼロ位相
+description: 二次節（SOS）の縦続による実行と高次の伝達関数の悪条件、転置直接 II 形の状態と作業領域、チャンクに分けた逐次処理、前後方向のゼロ位相フィルタリングと端の延長・初期状態。
+sidebar:
+  order: 325
+references:
+  signal-iir-sos: "二次節sosによる実行"
+  signal-iir-state: "手法オブジェクトと状態"
+  signal-iir-zero-phase: "前後方向のゼロ位相フィルタリング"
+---
+
+[IIR フィルタの設計](../iir-design/)で得た零点・極・利得を、記録に適用するときの問題を扱う。
+同じ伝達関数でも、係数をどの形で保持し、どの順で計算するかで丸め誤差の伝わり方が変わる。
+また、IIR の出力は過去の出力に依存するので、記録を分けて処理するときは遅延の状態を引き継ぐ必要がある。
+最後に、位相のずれを打ち消す前後方向の実行と、その端の扱いを導く。
+
+## 二次節（SOS）による実行
+
+$N$ 次の伝達関数 $H(z) = B(z)/A(z)$ をそのまま差分方程式にすると、分母の係数 $a_1, \dots, a_N$ の丸め誤差が極の位置を動かす。
+多項式の根は係数に対して悪条件になりうる。
+特に遮断の低い低域通過では極が $z = 1$ の近くに集まり、$m$ 個の極が近接すると、係数の相対誤差 $\varepsilon$ が根を $\varepsilon^{1/m}$ 程度動かす。
+極が単位円の外に出れば、安定に設計したフィルタが発散する。
+
+二次節（second-order sections、SOS）の縦続は、$H$ を
+
+$$
+H(z) = \prod_{\ell=1}^{L} \frac{b_{0\ell} + b_{1\ell} z^{-1} + b_{2\ell} z^{-2}}{1 + a_{1\ell} z^{-1} + a_{2\ell} z^{-2}}
+$$
+
+と共役な極の対ごとに分けて持つ。
+各節の係数は二つの根だけで決まるので、丸め誤差がほかの極に広がらない。
+`IirDesign::to_sos()` はこの分解を行い、安定境界に近い極を持つ節を最後に置く。
+
+`SecondOrderSections::new(domain, rows)` は、各行 $[b_0, b_1, b_2, a_0, a_1, a_2]$ を先頭の 0 でない分母の係数で割り、二次方程式の解の公式（打ち消しを避けた形）で各節の極を求め、厳密に安定かを確かめる。
+デジタルの行は $z^{-1}$ の昇べき、アナログの行は $s$ の降べきである。
+係数が非有限なら `NonFinite`、分母が 0 か極が安定でなければ `InvalidInput` になる。
+
+- `response(f)` は節の応答の積、`group_delay(f)` は節の群遅延の和で、高次の多項式に展開せずに評価する。
+- `to_zpk()` は節ごとに根を求めて零点・極・利得に戻し、`to_zpk_scoped` はその求根を外側のスコープの上限に数える。
+- `to_real(tolerance)` は虚部が許容誤差以内の複素数の節を実数の節にする。
+- `to_transfer()` は節の多項式を掛け合わせて一つの伝達関数にする。
+  高次では係数が悪条件になるので、比較や表示のための変換である。
+
+各節は**転置直接 II 形**の漸化式
+
+$$
+y[k] = b_0 x[k] + s_1[k-1], \qquad
+s_j[k] = s_{j+1}[k-1] + b_j x[k] - a_j y[k] \quad (j = 1, 2), \quad s_3 = 0
+$$
+
+で計算する（$s_j$ は節の遅延）。
+1 標本・1 チャネルあたりの演算は遅延の数 $d$ に比例し、二次節の縦続では $d = 2L$ である。
+`SecondOrderSections::filter(input)` は 0 の初期遅延から記録全体を因果的に処理するワンショット呼び出しの形で、`TransferFunction::filter` は伝達関数を次数 $\max(\mathrm{len}(a), \mathrm{len}(b)) - 1$ の一つの節として同じ漸化式で処理する。
+
+### 伝達関数に展開したときの誤差
+
+次のセルは、Butterworth の低域通過（次数 $N$、遮断 $f_c$）を `design_iir` で設計し、二次節 `sos` と、それを展開した伝達関数 `sos.to_transfer()` を比べる。
+展開した分母の根を `to_zpk()` で求め、設計の極との距離の最大と、安定性を示す。
+両方の形で 400 標本の単位ステップを処理し、出力の差の最大を求める。
+直流の利得は 1 のはずなので、各形の $|H(0)| - 1$ も示す。
+伝達関数の根の検査や実行が失敗した場合は、その欄を空にする。
+
+```rust
+//| id: signal-iir-sos-vs-transfer
+//| ref: signal-iir-sos-vs-transfer
+//| title: 二次節と展開した伝達関数でステップ応答を比べる
+//| run: reactive
+//| crates: [scioxide-signal]
+//| inputs:
+//|   order: {"type":"range","label":"次数 N","description":"Butterworth の極の数。","min":2,"max":20,"step":1,"value":12}
+//|   cutoff: {"type":"range","label":"遮断 f_c [Nyquist 比]","description":"低いほど極が z = 1 の近くに集まる。","min":0.01,"max":0.3,"step":0.01,"value":0.05}
+//| cases:
+//|   - {"id":"low-order","label":"N = 4","description":"低い次数では二つの形がほぼ一致する。","inputs":{"order":4}}
+//|   - {"id":"high-order","label":"N = 20、f_c = 0.02","description":"展開した伝達関数の極が大きくずれる。","inputs":{"order":20,"cutoff":0.02}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"forms","path":"/rows/0/0","equals":6}
+//|       - {"artifact":"forms","path":"/rows/0/1","approx":{"value":497.54,"rtol":1e-4}}
+//|       - {"artifact":"forms","path":"/rows/0/2","approx":{"value":7.58e-3,"rtol":5e-2}}
+//|       - {"artifact":"forms","path":"/rows/0/3","equals":1}
+//|       - {"artifact":"forms","path":"/rows/0/4","range":{"min":-1e-13,"max":1e-13}}
+//|       - {"artifact":"forms","path":"/rows/0/5","approx":{"value":2.97e-4,"rtol":0.1}}
+//|       - {"artifact":"forms","path":"/rows/0/6","approx":{"value":7.1e-4,"rtol":0.1}}
+//|   - case: low-order
+//|     expect:
+//|       - {"artifact":"forms","path":"/rows/0/2","range":{"min":0,"max":1e-11}}
+//|       - {"artifact":"forms","path":"/rows/0/6","range":{"min":0,"max":1e-11}}
+//|   - case: high-order
+//|     expect:
+//|       - {"artifact":"forms","path":"/rows/0/3","equals":0}
+//|       - {"artifact":"forms","path":"/rows/0/2","range":{"min":0.05,"max":1}}
+//|       - {"artifact":"forms","path":"/rows/0/6","range":{"min":1e10}}
+use scioxide_signal::{IirBand, IirDomain, IirFamily, design_iir};
+
+let n = order.round() as usize;
+let design = design_iir(
+    n,
+    IirFamily::Butterworth,
+    IirBand::Lowpass(cutoff),
+    IirDomain::Digital,
+)
+.map_err(|e| e.to_string())?;
+let sos = design.to_sos().map_err(|e| e.to_string())?;
+let transfer = sos.to_transfer().map_err(|e| e.to_string())?;
+let largest_coefficient = transfer
+    .denominator()
+    .iter()
+    .fold(0.0_f64, |m, a| m.max(a.abs()));
+
+// 展開した分母の根と設計の極の距離（設計の各極から最も近い根まで）
+let roots = transfer.to_zpk().ok();
+let pole_error = roots.as_ref().map(|zpk| {
+    design
+        .zpk()
+        .poles()
+        .iter()
+        .map(|p| {
+            zpk.poles()
+                .iter()
+                .map(|q| (*p - *q).norm())
+                .fold(f64::INFINITY, f64::min)
+        })
+        .fold(0.0_f64, f64::max)
+});
+let stable = roots
+    .as_ref()
+    .map(|zpk| if zpk.is_stable() { 1 } else { 0 });
+
+let step = vec![1.0_f64; 400];
+let by_sections = sos.filter(&step).map_err(|e| e.to_string())?;
+let by_transfer = transfer.filter(&step).ok();
+let step_gap = by_transfer.as_ref().map(|y| {
+    y.iter()
+        .zip(&by_sections)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f64, f64::max)
+});
+let dc_sections = sos.response(0.0).map_err(|e| e.to_string())?.norm() - 1.0;
+let dc_transfer = transfer.response(0.0).ok().map(|h| h.norm() - 1.0);
+
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+// 根の検査や実行が失敗した欄の表示
+let failed = "失敗";
+let columns = serde_json::json!([
+    { "key": "0", "label": "二次節の数", "type": "integer" },
+    { "key": "1", "label": "分母の係数の最大 [-]", "type": "number", "format": sci2 },
+    { "key": "2", "label": "極の距離の最大 [-]", "type": "number", "format": sci2, "nullText": failed },
+    { "key": "3", "label": "展開した形の安定性（1 = 安定）", "type": "integer", "nullText": failed },
+    { "key": "4", "label": "SOS の |H(0)| − 1 [-]", "type": "number", "format": sci2 },
+    { "key": "5", "label": "展開した形の |H(0)| − 1 [-]", "type": "number", "format": sci2, "nullText": failed },
+    { "key": "6", "label": "ステップ応答の差の最大 [-]", "type": "number", "format": sci2, "nullText": failed }
+]);
+let row = (
+    sos.sections().len(),
+    largest_coefficient,
+    pole_error,
+    stable,
+    dc_sections,
+    dc_transfer,
+    step_gap,
+);
+emit_table_with_columns!(
+    columns,
+    vec![row],
+    metadata = serde_json::json!({ "id": "forms" })
+);
+let points = |y: &[f64]| -> Vec<[f64; 2]> {
+    y.iter().enumerate().map(|(k, &v)| [k as f64, v]).collect()
+};
+let mut series = vec![serde_json::json!({ "name": "二次節", "points": points(&by_sections) })];
+if let Some(y) = &by_transfer {
+    series.push(serde_json::json!({
+        "name": "展開した伝達関数",
+        "points": points(y),
+        "style": { "lineType": "dashed" }
+    }));
+}
+emit_line_chart!(
+    &series,
+    options = &serde_json::json!({
+        "xLabel": "標本 k [-]",
+        "yLabel": "ステップ応答 y[k] [-]",
+        "yMin": -0.5,
+        "yMax": 2.0
+    })
+);
+```
+
+既定の $N = 12$、$f_c = 0.05$ では二次節が 6 個で、展開した伝達関数の分母の係数は最大 498 に達する。
+展開した分母の根は設計の極から最大 $7.6 \times 10^{-3}$ ずれるが、まだ単位円の内側にある。
+それでも直流の利得の誤差は $3.0 \times 10^{-4}$ で、二次節の $6.4 \times 10^{-15}$ より 10 桁大きく、ステップ応答の差は最大 $7.1 \times 10^{-4}$ になる。
+$N = 4$ では根のずれは $3.3 \times 10^{-13}$、ステップ応答の差は $5.0 \times 10^{-13}$ で、二つの形はほぼ一致する。
+
+$N = 20$、$f_c = 0.02$ では分母の係数が最大 $1.2 \times 10^{5}$ になり、根は 0.13 ずれて単位円の外に出る。
+展開した形のステップ応答は発散し、差の最大は $1.6 \times 10^{30}$ に達する（図の縦軸は $-0.5$〜$2$ に固定してある）。
+二次節の直流の利得の誤差は $1.6 \times 10^{-15}$ のままである。
+展開した係数の丸め誤差は $10^{-16}$ 程度でも、密集した根がそれを大きく増幅する。
+
+## 手法オブジェクトと状態
+
+記録を一度に処理するなら `SecondOrderSections::filter` で足りる。
+同じフィルタで多くの記録やチャネルを処理するとき、記録をチャンクに分けて逐次に処理するときは、手法オブジェクト `IirFilter` を使う。
+
+- `IirFilter::from_sos(&sos, options)` は安定な二次節の縦続から、`IirFilter::from_transfer(&transfer, options)` は伝達関数から作る。
+  どちらもデジタルでなければ `InvalidInput` になる。
+  `from_transfer` は不安定な有限の伝達関数も受け付けるので、安定性が必要なら `transfer.to_zpk()?.is_stable()` で確かめる。
+- 構築では係数を検査して保持するだけで、計算しない。
+  `options` の `SignalExecutionOptions` は、軸に沿った形でレーンを並列に処理するときのスレッドの上限を決める。
+- `delays()` は 1 チャネルあたりの遅延の数で、二次節の縦続では節あたり 2 個（一次の節も 2 個）である。
+
+遅延の値は `IirState` に入れて呼び出し側が持つ。
+`IirState::new(&filter, channels)` は全チャネルの遅延を 0 で作り、値はチャネルごとに `delays()` 個ずつ、節の順に並ぶ。
+`values()` で読み、`values_mut()` で書き換え（次の実行で有限性を確かめる）、`reset()` で 0 に戻し、`channels()` でチャネル数を返す。
+
+`filter_into(input, output, state, workspace, cx)` は 1 チャネルの記録の一部を処理し、`output` の先頭に `input.len()` 個を書き、`state` を最後の標本の後の遅延に置き換える。
+同じ `state` を続けて渡せば、記録を一回で処理した結果と同じになる。
+作業領域は `filter.workspace(IirRequest::Filter(SignalLayout::Contiguous(n)))` で作り、長さ $n$ 以下のどの呼び出しにも使える。
+必要な値の数は $n + d$ である。
+実行が失敗すると、`output` も `state` も変わらない。
+`filter(input)` は 0 の初期遅延から始める所有値を返す API である。
+
+配列の一つの軸に沿った各レーンは、`filter_axis_into(input, axis, output, state, workspace, cx)` で独立なチャネルとして処理する。
+`state` はレーンごとに 1 チャネルを持ち、レーンは `axis` を除いた形の行優先の順に並ぶ。
+作業領域は `IirRequest::Filter(SignalLayout::Axis { shape, axis })` で問い合わせる。
+レーンを並列に処理しても各レーンの漸化式は同じなので、結果はスレッドの数によらない。
+
+### チャンクに分けた処理と一回の処理
+
+次のセルは、Chebyshev I 型（0.5 dB）の 4 次プロトタイプから作った帯域通過 $[0.1, 0.3]$（8 個の極、4 個の二次節）で、600 標本の記録を処理する。
+入力は二つの正弦波の和と、標本 300 の単位インパルスである。
+`IirFilter::filter` による一回の処理と、長さ $n_c$ のチャンクごとに `filter_into` を呼ぶ処理を比べる。
+チェックを入れると、チャンクごとに `IirState::reset` で遅延を 0 に戻し、状態を引き継がない場合の誤りを示す。
+
+```rust
+//| id: signal-iir-chunked-state
+//| ref: signal-iir-chunked-state
+//| title: 遅延の状態を引き継いでチャンクごとに処理する
+//| run: reactive
+//| crates: [scioxide-core, scioxide-signal]
+//| inputs:
+//|   chunk_len: {"type":"range","label":"チャンクの長さ n_c [標本]","description":"filter_into に一度に渡す標本の数。","min":1,"max":200,"step":1,"value":37}
+//|   restart: {"type":"checkbox","label":"チャンクごとに状態を 0 に戻す","description":"IirState を引き継がない誤った処理。","value":false}
+//| cases:
+//|   - {"id":"restart","label":"状態を引き継がない","description":"チャンクの境界ごとに過渡が生じ、一回の処理と大きく違う。","inputs":{"restart":true}}
+//|   - {"id":"single-sample","label":"n_c = 1","description":"1 標本ずつ処理しても、状態を引き継げば同じ出力になる。","inputs":{"chunk_len":1}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"chunks","path":"/rows/0/0","equals":17}
+//|       - {"artifact":"chunks","path":"/rows/0/1","equals":8}
+//|       - {"artifact":"chunks","path":"/rows/0/2","equals":45}
+//|       - {"artifact":"chunks","path":"/rows/0/3","equals":0}
+//|   - case: restart
+//|     expect:
+//|       - {"artifact":"chunks","path":"/rows/0/3","approx":{"value":0.9675,"rtol":1e-3}}
+//|   - case: single-sample
+//|     expect:
+//|       - {"artifact":"chunks","path":"/rows/0/0","equals":600}
+//|       - {"artifact":"chunks","path":"/rows/0/2","equals":9}
+//|       - {"artifact":"chunks","path":"/rows/0/3","equals":0}
+use scioxide_core::ExecutionContext;
+use scioxide_signal::{
+    IirBand, IirDomain, IirFamily, IirFilter, IirRequest, IirState, SignalExecutionOptions,
+    SignalLayout, design_iir,
+};
+
+let band = IirBand::Bandpass(0.1, 0.3);
+let family = IirFamily::ChebyshevI { ripple: 0.5 };
+let sos = design_iir(4, family, band, IirDomain::Digital)
+    .and_then(|design| design.to_sos())
+    .map_err(|e| e.to_string())?;
+let filter =
+    IirFilter::from_sos(&sos, SignalExecutionOptions::new()).map_err(|e| e.to_string())?;
+// 通過域の正弦波（0.2）と阻止域の正弦波（0.6）の和に、標本 300 の単位インパルスを足す
+let pi = std::f64::consts::PI;
+let input: Vec<f64> = (0..600)
+    .map(|k| {
+        let t = k as f64;
+        (pi * 0.2 * t).sin() + 0.5 * (pi * 0.6 * t).sin() + if k == 300 { 1.0 } else { 0.0 }
+    })
+    .collect();
+let whole = filter.filter(&input).map_err(|e| e.to_string())?;
+
+let chunk = chunk_len.round() as usize;
+let request = IirRequest::Filter(SignalLayout::Contiguous(chunk));
+let mut workspace = filter.workspace(request).map_err(|e| e.to_string())?;
+let mut state = IirState::new(&filter, 1).map_err(|e| e.to_string())?;
+let mut chunked = vec![0.0; input.len()];
+for (piece, out) in input.chunks(chunk).zip(chunked.chunks_mut(chunk)) {
+    if restart {
+        state.reset();
+    }
+    filter
+        .filter_into(
+            piece,
+            out,
+            &mut state,
+            &mut workspace,
+            ExecutionContext::sequential(),
+        )
+        .map_err(|e| e.to_string())?;
+}
+let gap = whole
+    .iter()
+    .zip(&chunked)
+    .map(|(a, b)| (a - b).abs())
+    .fold(0.0_f64, f64::max);
+
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "チャンクの数", "type": "integer" },
+    { "key": "1", "label": "遅延の数 d", "type": "integer" },
+    { "key": "2", "label": "作業領域の値の数", "type": "integer" },
+    { "key": "3", "label": "一回の処理との差の最大 [-]", "type": "number", "format": sci2 }
+]);
+let values = filter
+    .workspace_requirements(request)
+    .map_err(|e| e.to_string())?
+    .values_len();
+let row = (input.len().div_ceil(chunk), filter.delays(), values, gap);
+emit_table_with_columns!(
+    columns,
+    vec![row],
+    metadata = serde_json::json!({ "id": "chunks" })
+);
+let points = |y: &[f64]| -> Vec<[f64; 2]> {
+    y.iter().enumerate().map(|(k, &v)| [k as f64, v]).collect()
+};
+emit_line_chart!(
+    &vec![
+        serde_json::json!({ "name": "一回の処理", "points": points(&whole) }),
+        serde_json::json!({
+            "name": "チャンクごとの処理",
+            "points": points(&chunked),
+            "style": { "lineType": "dashed" }
+        }),
+    ],
+    options = &serde_json::json!({ "xLabel": "標本 k [-]", "yLabel": "出力 y[k] [-]" })
+);
+```
+
+既定の $n_c = 37$ では 17 回の呼び出しで処理し、一回の処理との差の最大はちょうど 0 である。
+遅延を引き継げば各標本での漸化式の計算は一回の処理と同じなので、結果は丸めまで一致する。
+$n_c = 1$ でも差は 0 で、作業領域の値の数は $n_c + d = 9$ になる。
+状態を毎回 0 に戻すと各チャンクの先頭で過渡が始まり、差の最大は 0.97 になる。
+逐次の処理では `IirState` を記録の一部として保存し、次の呼び出しに渡す。
+
+## 前後方向のゼロ位相フィルタリング
+
+因果的な IIR フィルタは周波数ごとに違う遅れ（群遅延）を持ち、波形の形を変える。
+記録を全部持っているなら、記録を前向きに処理し、出力を時間反転してもう一度処理し、もう一度反転すれば位相を打ち消せる。
+実数の係数では時間反転が周波数応答を共役に変えるので、全体の周波数応答は
+
+$$
+H_{\mathrm{fb}}(f) = H(f)\, \overline{H(f)} = |H(f)|^2
+$$
+
+となる。
+位相は 0、振幅は 2 乗になり、実効的な次数は 2 倍になる。
+未来の標本を使うので因果的ではなく、逐次の処理には使えない。
+
+$|H|^2$ の式は無限に長い記録の定常応答の話で、有限の記録では両端に過渡が残る。
+前向きの処理は記録の始まりで 0 の遅延から立ち上がり、後向きの処理は記録の終わりで同じことが起こる。
+そこで、記録の両端を延長し、各方向の初期の遅延を定常状態に合わせてから処理し、最後に延長を取り除く。
+
+`IirPadding` は両端に加える標本の数 $L$ と作り方を選ぶ。
+記録 $x_0, \dots, x_{n-1}$ の前に加える標本は、$k = 1, \dots, L$ について次のとおりで、終わりの側も $x_{n-1}$ のまわりで同じように作る。
+
+| `IirPadding` | 前に加える標本 |
+|---|---|
+| `None` | 加えない |
+| `Odd(L)` | $x_{-k} = 2x_0 - x_k$（端点のまわりの奇反射） |
+| `Even(L)` | $x_{-k} = x_k$（端点を繰り返さない偶反射） |
+| `Constant(L)` | $x_{-k} = x_0$ |
+
+正の $L$ は $n$ より小さくなければならず、満たさなければ `InvalidInput` になる。
+奇反射は端点での値と傾きを連続に保つので、傾きを持つ記録の過渡を小さくする。
+
+`IirInitialization` は一方向の処理の初期の遅延を選ぶ。
+`Zero` は 0、`SteadyState` はその方向の最初の標本 $x_0$ が続く定常状態で、出力は最初から $H(1)\,x_0$（$H(1)$ は直流の利得）になる。
+直流で分母が 0 になる節を持つフィルタは定常状態を持たず、`DomainError` になる。
+`State(&values)` は呼び出し側の遅延（`IirState` と同じ並び）を使う。
+
+`ForwardBackwardOptions` は延長と二つの方向の初期化をまとめる。
+`ForwardBackwardOptions::new()`（`default()` と同じ）は延長なし、両方向とも 0 の初期遅延で、どの長さの記録も受け付ける。
+`with_padding`、`with_forward`、`with_backward` で変え、`IirFilter::forward_backward_with_options(input, options)` に渡す。
+出力先を指定する API `forward_backward_into(input, options, output, workspace, cx)` の作業領域は `IirRequest::ForwardBackward(SignalLayout::Contiguous(n), padding)` で問い合わせ、延長した記録の長さ分の値を持つ。
+計算コストは遅延 $d$、標本 $n$、延長 $p$ について $O(d(n + 2p))$ である。
+軸に沿った形は `forward_backward_axis_into` である。
+
+ワンショット呼び出しの `SecondOrderSections::forward_backward(input)` は端の扱いを次のように固定する。
+二次節が $L$ 個（遅延 $d = 2L$）で記録の長さが $n$ なら、両端を $\min(3(d+1), n-1)$ 標本の奇反射で延長し、両方向を `SteadyState` から始める。
+`TransferFunction::forward_backward` も同じ規則で、遅延 $d = \max(\mathrm{len}(a), \mathrm{len}(b)) - 1$ に対して $\min(3\max(\mathrm{len}(a), \mathrm{len}(b)), n-1)$ 標本を延長する。
+延長の長さがフィルタと記録で決まるので、ほかの扱いが必要なら `IirFilter::forward_backward_with_options` を使う。
+
+### 端の扱いによる誤差の違い
+
+次のセルは、Butterworth の 4 次の低域通過（遮断 $f_c$、二次節 2 個、$d = 4$）で、傾きと正弦波を含む 400 標本の記録
+
+$$
+x[k] = 1 + \frac{k}{2n} + \sin(\pi f_x k)
+$$
+
+を処理する。
+対称なインパルス応答と直流の利得 1 を持つゼロ位相のフィルタは一次式をそのまま通すので、無限に長い記録での理想の出力は $1 + k/(2n) + |H(f_x)|^2 \sin(\pi f_x k)$ である。
+因果的な処理の理想の出力は、一次式を直流の群遅延 $\tau(0)$ だけ遅らせ、正弦波の振幅に $|H(f_x)|$ を掛けて位相を $\arg H(f_x)$ だけずらしたものである。
+四つの処理（固定の扱いの `forward_backward`、延長なしで 0 から始める処理、奇反射の延長だけで 0 から始める処理、因果的な `filter`）について、先頭と末尾の 40 標本、中央（$100 \le k < 300$）での理想の出力との差の最大を比べる。
+図は理想の出力との差の絶対値を対数軸で描く（差がちょうど 0 の点は描かない）。
+
+```rust
+//| id: signal-iir-forward-backward
+//| ref: signal-iir-forward-backward
+//| title: 前後方向の処理の端の扱いと理想の出力を比べる
+//| run: reactive
+//| crates: [scioxide-signal]
+//| inputs:
+//|   cutoff: {"type":"range","label":"遮断 f_c [Nyquist 比]","description":"低いほど過渡が長く続く。","min":0.02,"max":0.3,"step":0.01,"value":0.1}
+//|   tone: {"type":"range","label":"正弦波の周波数 f_x [Nyquist 比]","description":"通過域では |H|² ≈ 1、遷移帯では減衰する。","min":0.01,"max":0.3,"step":0.01,"value":0.05}
+//| cases:
+//|   - {"id":"low-cutoff","label":"f_c = 0.03","description":"過渡が記録の中央まで残り、固定の扱いでも中央の誤差が 10⁻² 程度になる。","inputs":{"cutoff":0.03,"tone":0.02}}
+//|   - {"id":"transition","label":"f_x = f_c = 0.1","description":"遮断の周波数では |H|² = 1/2 になる。","inputs":{"tone":0.1}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"ends","path":"/rows/0/1","equals":15}
+//|       - {"artifact":"ends","path":"/rows/0/2","approx":{"value":1.82e-2,"rtol":1e-2}}
+//|       - {"artifact":"ends","path":"/rows/0/3","approx":{"value":4.41e-2,"rtol":1e-2}}
+//|       - {"artifact":"ends","path":"/rows/0/4","range":{"min":0,"max":1e-6}}
+//|       - {"artifact":"ends","path":"/rows/1/3","approx":{"value":1.343,"rtol":1e-2}}
+//|       - {"artifact":"ends","path":"/rows/3/2","approx":{"value":0.339,"rtol":1e-2}}
+//|       - {"artifact":"ends","path":"/rows/3/3","range":{"min":0,"max":1e-12}}
+//|       - {"artifact":"response","path":"/rows/0/1","approx":{"value":8.2493,"rtol":1e-4}}
+//|       - {"artifact":"response","path":"/rows/0/2","equals":0}
+//|   - case: low-cutoff
+//|     expect:
+//|       - {"artifact":"ends","path":"/rows/0/4","approx":{"value":1.17e-2,"rtol":2e-2}}
+//|       - {"artifact":"response","path":"/rows/0/1","approx":{"value":27.706,"rtol":1e-4}}
+//|   - case: transition
+//|     expect:
+//|       - {"artifact":"response","path":"/rows/0/0","approx":{"value":0.5,"atol":1e-12}}
+//|       - {"artifact":"ends","path":"/rows/0/4","range":{"min":0,"max":5e-6}}
+use scioxide_signal::{
+    ForwardBackwardOptions, IirBand, IirDomain, IirFamily, IirFilter, IirInitialization,
+    IirPadding, SignalExecutionOptions, design_iir,
+};
+
+let n = 400;
+let sos = design_iir(
+    4,
+    IirFamily::Butterworth,
+    IirBand::Lowpass(cutoff),
+    IirDomain::Digital,
+)
+.and_then(|design| design.to_sos())
+.map_err(|e| e.to_string())?;
+let filter =
+    IirFilter::from_sos(&sos, SignalExecutionOptions::new()).map_err(|e| e.to_string())?;
+let pi = std::f64::consts::PI;
+let trend = |k: f64| 1.0 + k / (2.0 * n as f64);
+let x: Vec<f64> = (0..n)
+    .map(|k| trend(k as f64) + (pi * tone * k as f64).sin())
+    .collect();
+
+// 理想の出力（無限に長い記録の定常応答）。H と τ(0) は SciOxide で評価する
+let h = sos.response(tone).map_err(|e| e.to_string())?;
+let delay = sos.group_delay(0.0).map_err(|e| e.to_string())?;
+let zero_phase = |k: f64| trend(k) + h.norm_sqr() * (pi * tone * k).sin();
+let causal = |k: f64| trend(k - delay) + h.norm() * (pi * tone * k + h.arg()).sin();
+
+let padding = (3 * (filter.delays() + 1)).min(n - 1);
+let steady = IirInitialization::SteadyState;
+let odd_only = ForwardBackwardOptions::new().with_padding(IirPadding::Odd(padding));
+let fixed = sos.forward_backward(&x).map_err(|e| e.to_string())?;
+let rest = filter
+    .forward_backward_with_options(&x, ForwardBackwardOptions::new())
+    .map_err(|e| e.to_string())?;
+let padded = filter
+    .forward_backward_with_options(&x, odd_only)
+    .map_err(|e| e.to_string())?;
+let forward = sos.filter(&x).map_err(|e| e.to_string())?;
+// 固定の扱いが奇反射と定常状態の組と同じであることも確かめる
+let explicit = filter
+    .forward_backward_with_options(&x, odd_only.with_forward(steady).with_backward(steady))
+    .map_err(|e| e.to_string())?;
+let same = fixed
+    .iter()
+    .zip(&explicit)
+    .map(|(a, b)| (a - b).abs())
+    .fold(0.0_f64, f64::max);
+
+let edge = 40;
+let mut rows = Vec::new();
+let mut series = Vec::new();
+let runs: [(&str, &Vec<f64>, bool, usize); 4] = [
+    ("forward_backward（固定）", &fixed, true, padding),
+    ("延長なし・0 から", &rest, true, 0),
+    ("奇反射・0 から", &padded, true, padding),
+    ("因果的な filter", &forward, false, 0),
+];
+for (name, y, symmetric, extension) in runs {
+    let errors: Vec<f64> = y
+        .iter()
+        .enumerate()
+        .map(|(k, &v)| {
+            let ideal = if symmetric {
+                zero_phase(k as f64)
+            } else {
+                causal(k as f64)
+            };
+            (v - ideal).abs()
+        })
+        .collect();
+    // 先頭と末尾の 40 標本、中央の 100 ≤ k < 300 で最大の誤差を取る
+    let largest = |part: &[f64]| part.iter().fold(0.0_f64, |m, &e| m.max(e));
+    let (head, tail) = (largest(&errors[..edge]), largest(&errors[n - edge..]));
+    rows.push((name, extension, head, tail, largest(&errors[100..300])));
+    let points: Vec<[f64; 2]> = errors
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| **e > 0.0)
+        .map(|(k, &e)| [k as f64, e])
+        .collect();
+    series.push(serde_json::json!({ "name": name, "points": points }));
+}
+
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "処理" },
+    { "key": "1", "label": "延長 [標本]", "type": "integer" },
+    { "key": "2", "label": "先頭 40 標本の最大誤差 [-]", "type": "number", "format": sci2 },
+    { "key": "3", "label": "末尾 40 標本の最大誤差 [-]", "type": "number", "format": sci2 },
+    { "key": "4", "label": "中央の最大誤差 [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "ends" })
+);
+let summary = serde_json::json!([
+    { "key": "0", "label": "|H(f_x)|² [-]", "type": "number", "format": sci2 },
+    { "key": "1", "label": "τ(0) [標本]", "type": "number", "format": sci2 },
+    { "key": "2", "label": "固定の扱いと明示した組の差 [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    summary,
+    vec![(h.norm_sqr(), delay, same)],
+    metadata = serde_json::json!({ "id": "response" })
+);
+emit_line_chart!(
+    &series,
+    options = &serde_json::json!({
+        "xLabel": "標本 k [-]",
+        "yLabel": "理想の出力との差 [-]",
+        "yType": "log",
+        "yMin": 1e-17,
+        "yMax": 10.0
+    })
+);
+```
+
+既定の $f_c = 0.1$、$f_x = 0.05$ では $|H(f_x)|^2 = 0.9963$、直流の群遅延は $\tau(0) = 8.25$ 標本で、固定の扱いの延長は $\min(3 \cdot 5, 399) = 15$ 標本である。
+固定の扱いの `forward_backward` は、先頭 40 標本の最大誤差 $1.8 \times 10^{-2}$、末尾 $4.4 \times 10^{-2}$、中央 $4.8 \times 10^{-7}$ で、四つの中で最も小さい。
+奇反射と定常状態を明示して `forward_backward_with_options` に渡した結果とは、差がちょうど 0 になる。
+
+延長なしで 0 から始めると、末尾の誤差が 1.34 に達する。
+後向きの処理が記録の終わりの値（約 1.3）に 0 の遅延から立ち上がるからである。
+奇反射の延長だけを加えると先頭の誤差は $2.0 \times 10^{-2}$ に下がるが、末尾は 0.27 残り、延長と定常状態の両方が要る。
+因果的な `filter` は末尾で定常に達して誤差が $7 \times 10^{-15}$ になる一方、先頭の 40 標本で 0.34 の過渡を持つ。
+中央の誤差はどの処理でも $3 \times 10^{-6}$ 以下で、ゼロ位相の処理は記録の内部で位相を変えず、振幅を $|H|^2$ 倍にすることが分かる。
+
+$f_x = f_c = 0.1$ では $|H(f_x)|^2 = 0.5$ になり、正弦波の振幅は半分になる（Butterworth の遮断は半電力点）。
+$f_c = 0.03$ では $\tau(0)$ が 27.7 標本に延び、固定の扱いでも中央の誤差が $1.2 \times 10^{-2}$ 残る。
+過渡の長さはフィルタの極で決まるので、遮断の低いフィルタには、過渡の長さより十分長い記録が要る。
+
+## まとめ
+
+IIR フィルタは `IirDesign::to_sos()` で二次節にしてから適用し、高次の伝達関数に展開した係数で計算しない。
+記録を一度に処理するなら `SecondOrderSections::filter` を、チャンクに分けるなら `IirFilter::filter_into` と `IirState` を使い、状態を呼び出しの間で引き継ぐ。
+位相を変えたくないオフラインの処理では `SecondOrderSections::forward_backward` を使い、振幅が $|H|^2$ になることを設計の段階で見込む。
+端の扱いを変えるときは `ForwardBackwardOptions` で延長と初期状態を選び、過渡の長さに比べて記録が十分長いかを確かめる。
+族による群遅延の違いとパルスの歪みは[群遅延の例題](../../examples/iir-group-delay-zero-phase/)で、生体信号への適用は[心電図の例題](../../examples/ecg-baseline-and-mains/)で確かめる。

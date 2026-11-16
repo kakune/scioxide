@@ -1,0 +1,683 @@
+---
+title: 逆モードとテープ
+description: 随伴の累積を連鎖律から導き、Var が文をテープに記録する規則、azmul で更新する逆走査とその精度、Tape::gradient_into と Linearization の VJP・JVP・ヤコビ行列、JacobianMode が走査の向きを選ぶ規則、ワンショット呼び出しの grad・value_and_grad・vjp・jacobian を確かめる。
+sidebar:
+  order: 315
+references:
+  ad-adjoint-accumulation: "随伴の定義と累積"
+  ad-vjp-jvp-duality: "vjp-と-jvp-の双対性"
+  ad-var-recording-rules: "var-と文の記録規則"
+  ad-reverse-sweep: "逆走査の手順と精度"
+  ad-tape-gradient: "テープによる勾配"
+  ad-linearization-products: "線形化と積"
+  ad-jacobian-mode: "ヤコビ行列を組む向き"
+  ad-one-shot-reverse: "ワンショット関数"
+---
+
+スカラー関数 $f: \mathbb{R}^n \to \mathbb{R}$ の勾配を[前進モードと二重数](../forward-mode/)で求めると、入力の方向ごとに 1 回、合計 $n$ 回の評価が要る。
+逆モード（reverse mode）は、出力に対する感度を出力から入力へ向かって一度だけ送り返し、$n$ 個の偏導関数をまとめて求める。
+その代わり、計算の順序と各演算の局所的な偏導関数を、送り返すときまで覚えておく必要がある。
+`scioxide-ad` はこの記録をテープ（tape）と呼び、呼び出し側が所有する `Tape` に置く。
+このページは随伴の累積を連鎖律から導き、`Var` が文を記録する規則、逆走査の手順と精度、テープによる勾配と線形化、ヤコビ行列を組む向き、ワンショット関数を説明する。
+同じテープを多くの点で使い回すときの容量、レポート、失敗の扱いは[テープのライフサイクルと再利用](../tape-lifecycle/)で扱う。
+
+## 随伴の定義と累積
+
+関数の評価を、それぞれの値を一度だけ定義する演算の列として書く。
+入力を $v_1 = x_1, \dots, v_n = x_n$ とし、続く値を
+
+$$
+v_i = \varphi_i\bigl(v_j\bigr)_{j \in P(i)}, \qquad P(i) \subset \{1, \dots, i - 1\}, \qquad i = n + 1, \dots, N
+$$
+
+で作り、出力を $f(\mathbf{x}) = v_N$ とする。
+$\varphi_i$ は四則演算や初等関数のような演算、$P(i)$ はその引数の添字の集合である。
+評価点での局所的な偏導関数を $c_{ij} = \partial \varphi_i / \partial v_j$（$j \in P(i)$）と書く。
+
+$v_j$ の随伴（adjoint）$\bar v_j$ は、$v_j$ だけを動かし、それより後の演算を計算し直したときの出力の変化率 $\partial v_N / \partial v_j$ である。
+$v_j$ が出力に影響する経路は、$v_j$ を引数に使う演算 $\varphi_i$（$j \in P(i)$）のどれかを必ず通る。
+したがって連鎖律から
+
+$$
+\bar v_N = 1, \qquad \bar v_j = \sum_{i \,:\, j \in P(i)} \bar v_i \, c_{ij}
+$$
+
+が成り立ち、入力の随伴 $\bar v_1, \dots, \bar v_n$ が勾配 $\nabla f(\mathbf{x})$ の成分になる。
+$j \in P(i)$ なら $i > j$ なので、$i = N, N - 1, \dots, n + 1$ の順に演算をたどり、各 $i$ で引数のすべての $j$ に $\bar v_i c_{ij}$ を加えれば、$\bar v_i$ を使う時点でその値は完成している。
+この逆順の 1 回の計算を逆走査（reverse sweep）と呼ぶ。
+
+随伴の更新は代入ではなく加算でなければならない。
+1 つの値が複数の演算の引数になるとき、代入すると他の経路からの寄与が失われる。
+
+例として $u = x_1 x_2$、$f = u^2 + \sin u$ を考える。
+$u$ は 2 つの演算の引数になり、$u^2$ を積 $u \cdot u$ として書くと、同じ演算の左右の引数にもなる。
+
+| 値 | 演算 | 局所的な偏導関数 | 逆走査での随伴の加算 |
+|---|---|---|---|
+| $v_1 = x_1$、$v_2 = x_2$ | 入力 | なし | なし |
+| $v_3 = v_1 v_2$ | 積 | $c_{31} = v_2$、$c_{32} = v_1$ | $\bar v_1 \mathrel{+}= \bar v_3 v_2$、$\bar v_2 \mathrel{+}= \bar v_3 v_1$ |
+| $v_4 = v_3 v_3$ | 積 | 左右の引数ともに $v_3$ | $\bar v_3 \mathrel{+}= \bar v_4 v_3$ を 2 回 |
+| $v_5 = \sin v_3$ | 初等関数 | $c_{53} = \cos v_3$ | $\bar v_3 \mathrel{+}= \bar v_5 \cos v_3$ |
+| $v_6 = v_4 + v_5$ | 和 | $c_{64} = c_{65} = 1$ | $\bar v_4 \mathrel{+}= \bar v_6$、$\bar v_5 \mathrel{+}= \bar v_6$ |
+
+表を下から上へ $\bar v_6 = 1$ で実行すると $\bar v_3 = 2u + \cos u$ となる。
+勾配 $(\bar v_1, \bar v_2) = \bigl((2u + \cos u)\,x_2,\ (2u + \cos u)\,x_1\bigr)$ は、直接の微分 $\partial f / \partial x_1 = 2 x_1 x_2^2 + x_2 \cos(x_1 x_2)$ と一致する。
+$u$ は一度だけ評価され、その随伴に 3 つの寄与が加わる。
+
+## VJP と JVP の双対性
+
+出力が $m$ 個の写像 $F: \mathbb{R}^n \to \mathbb{R}^m$ では、出力の随伴に余接ベクトル（cotangent）$\mathbf{w} \in \mathbb{R}^m$ をシード（seed）として与える。
+逆走査の結果は $\bar{\mathbf{x}} = \mathbf{J}^\mathsf{T} \mathbf{w}$ で、これをベクトル・ヤコビ行列積（VJP、vector-Jacobian product）と呼ぶ。
+$\mathbf{J} \in \mathbb{R}^{m \times n}$ は $F$ のヤコビ行列で、行が出力、列が入力に対応する。
+同じ記録を先頭から 1 回たどり、入力の接ベクトル（tangent）$\dot{\mathbf{x}}$ から $\dot v_i = \sum_{j \in P(i)} c_{ij} \dot v_j$ を計算すると、出力にヤコビ行列・ベクトル積（JVP）$\mathbf{J}\dot{\mathbf{x}}$ が得られる。
+この前向きの 1 回の計算を前進走査（tangent sweep）と呼ぶ。
+
+演算 $i$ はすべての値の接ベクトル $(\dot v_1, \dots, \dot v_N)$ の第 $i$ 成分を $\sum_j c_{ij} \dot v_j$ で置き換える線形写像 $\mathbf{D}_i$ に当たる。
+入力の埋め込みを $\mathbf{P}_{\mathrm{in}}$、出力の取り出しを $\mathbf{P}_{\mathrm{out}}$ とすると、$\mathbf{J} = \mathbf{P}_{\mathrm{out}} \mathbf{D}_N \cdots \mathbf{D}_{n+1} \mathbf{P}_{\mathrm{in}}$ である。
+JVP はこの積を $\dot{\mathbf{x}}$ の側から、VJP は転置の積 $\mathbf{P}_{\mathrm{in}}^\mathsf{T} \mathbf{D}_{n+1}^\mathsf{T} \cdots \mathbf{D}_N^\mathsf{T} \mathbf{P}_{\mathrm{out}}^\mathsf{T}$ を $\mathbf{w}$ の側から計算する。
+したがって、どの $\mathbf{w}$ と $\dot{\mathbf{x}}$ についても
+
+$$
+\langle \mathbf{w}, \mathbf{J}\dot{\mathbf{x}} \rangle = \langle \mathbf{J}^\mathsf{T}\mathbf{w}, \dot{\mathbf{x}} \rangle
+$$
+
+が成り立ち、この恒等式は実装の検査に使える（例題 [JVP と VJP の双対性](../../examples/jvp-vjp-duality/)）。
+
+前進走査も逆走査も各 $c_{ij}$ を 1 回ずつ使うので、JVP 1 回と VJP 1 回の演算量はどちらも $F$ の評価の定数倍である。
+スカラー関数の勾配は $\mathbf{w} = 1$ の VJP 1 回で得られ、その演算量は入力次元 $n$ によらない。
+Griewank と Walther は、算術、非線形演算、メモリの移動を数える計算コストモデルで、この定数が $n$ によらないことを示した（[参考文献案内](../../../reference/bibliography/)）。
+全ヤコビ行列は単位ベクトルをシードにした $n$ 回の JVP（列ごと）か $m$ 回の VJP（行ごと）で組める。
+
+逆走査は演算を逆順にたどり、評価点に依存する $c_{ij}$ を使う。
+そのため前向きの評価で局所的な偏導関数を残しておく必要があり、メモリ使用量は演算の数 $N$ に比例する。
+`Dual` で接ベクトルを伝播させる前進モードには、この記録が要らない。
+
+## `Var` と文の記録規則
+
+逆モードで微分する関数も、他の数値型と同じく `R: Real` に対する汎用の関数として一度だけ書く（[数値型・lane・汎用コード](../number-types-and-lanes/)）。
+`Tape::<V>::new(options)` は空のテープを作り、変換（`gradient_into`、`linearize` などテープを使う微分の関数）は、関数に `Var<'t, V>` の入力を渡して実行する。
+`Var` は値と、その値を作った文（statement、テープの 1 つの記録）の位置を持つ。
+テープは平らなベクトルの集まりで、文の情報を表す 64 ビットのワード（word）の列、偏導関数の列、ワードごとの随伴、呼び出しの表を持つ。
+単項と 2 項の文はワードを 1 つ使い、多引数の文と呼び出し文のワードの数は下で述べる。
+変換は自分のスタックの上に記録器を作り、`Var` の演算子はその記録器を通して文を追加するので、スレッドローカルな状態や大域の状態は使わない。
+
+`V` はテープが記録できる値の型で、sealed トレイト `TapeValue` が `f32`、`f64`、`Lanes<S, W>` と、それらの上の `Dual`、`MultiDual`、`Jet` に限る。
+`Tape<Lanes<f64, 8>>` は 8 個のレーン（lane）、つまり 8 個の独立な点の勾配を 1 回の記録で求める。
+`Tape<Dual<f64>>` は記録する値に方向微分を持たせ、ヘッセ行列・ベクトル積を求める（[二階微分とヘッセ行列の作用素](../second-order-derivatives/)）。
+
+記録の入力に依存する値を能動的（active）、依存しない値を受動的（passive）と呼ぶ。
+`Var::is_active` はこの区別を返し、`Var::value` は値を返す。
+`Real::constant`、`Real::passive`、`Real::lift` で作った値は受動的である。
+各演算が記録する文は次のとおりである。
+表の $x$ と $y$ は微分対象の値、$c$ はスカラー `S` の定数か微分対象外の値を表す。
+
+| 演算 | 記録するもの |
+|---|---|
+| 被演算子がすべて受動的な演算 | 何も記録せず、微分対象外の値を返す |
+| $x + c$、$x - c$、$c + x$ | 何も記録せず、$x$ の位置をそのまま使う |
+| $-x$、$c - x$ | 偏導関数 $-1$ の単項の文 |
+| $x \cdot c$、$c \cdot x$、$x / c$ | 定数の偏導関数（$c$ か $1/c$）を持つ単項の文 |
+| $x + y$、$x - y$ | 偏導関数 $\pm 1$ の 2 項の文。偏導関数の値は保存しない |
+| $x \cdot y$ | 偏導関数 $y$ と $x$ を持つ 2 項の文 |
+| $x / y$、$c / x$、初等関数、2 引数の関数 | 評価点の偏導関数を持つ単項か 2 項の文 |
+| `floor`、`ceil`、`round`、`trunc`、`signum` | 導関数が 0 なので何も記録せず、微分対象外の値を返す（折れ点に当たった回数は数える） |
+| `dot`、`Real::combine`、lane の型の `Real::gather` | 引数の数によらず 1 つの文 |
+| `solve_into`、`checkpointed_loop`、`Var::external` | 1 つの呼び出し文 |
+
+多引数の文は引数ごとに 1 ワードと前後の 2 ワードを使い、呼び出し文はさらに出力ごとに 1 ワードを使う。
+比較（`lt` など）は値を比べるだけで、何も記録しない。
+`select` と `gather` は、スカラーのテープでは選んだ値の位置をそのまま使い、何も記録しない。
+lane の型の `select` は、lane ごとに選ぶ側が分かれるときだけ、lane ごとの偏導関数 1 と 0 を持つ文を 1 つ記録する。
+lane の型の `gather` は、表の要素に微分対象の値があれば、lane ごとに選んだ要素への文を 1 つ記録する。
+
+変換に渡す関数はどのライフタイム `'t` についても `gradient_into` では `Fn(&[Var<'t, V>]) -> Result<Var<'t, V>, SciOxideError>`、`linearize` では `Fn(&[Var<'t, V>], &mut Vec<Var<'t, V>>) -> Result<(), SciOxideError>` を満たさなければならない（高階のトレイト境界 `for<'t>`）。
+`'t` は記録ごとに別のライフタイムになるので、`Var` を関数の外の変数に保存するとコンパイルエラーになり、ある記録の `Var` を別の記録に持ち込むこともできない。
+`Var` は `Send` でも `Sync` でもなく、関数は変換を呼んだスレッドで動く。
+このライフタイムの境界のため、クロージャを `let` で変数に束縛してから渡すと型推論が失敗する。
+クロージャは変換の引数の位置に書き、モデルは `fn model<R: Real>(x: &[R]) -> R` のような汎用の関数にしてその中で呼ぶ。
+関数は 1 回の変換で最大 2 回呼ばれるので、呼ぶたびに記録が変わってはならない（[テープのライフサイクルと再利用](../tape-lifecycle/)）。
+
+## 逆走査の手順と精度
+
+逆走査は記録の末尾から先頭へワードをたどる 1 つのループである。
+文ごとに、その文の随伴を取り出して 0 に戻し、各引数の偏導関数を掛けて引数の随伴に加える。
+入力のワードは飛ばすので、走査が終わると入力の随伴に勾配が残る。
+前進走査は同じ記録を先頭から末尾へたどり、各文の接ベクトルを書く。
+どちらの走査もワードを 1 つずつたどり（多引数の文と呼び出し文は、前後と引数のワードをまとめて処理する）、走査の前と後、およびたどったワードが 1,024 ワードに達するごとに `context.check()` で取り消しと期限を確かめ、停止が要求されていれば `ExecutionStopped` を返す。
+多引数の文と呼び出し文の引数のワードも、このワードの数に含め、1 つの文の中でも引数 1,024 個ごとに確かめる。
+`gradient_into` や `linearize` などの変換は関数を記録する前に、`Linearization` の積は走査の前ごとに、`context.check()` を呼ぶ。
+
+走査の更新はすべて絶対零積（absolute-zero product）`Real::azmul` で行う。
+`azmul` は通常の積 $ab$ を返すが、どちらかの被演算子がちょうど 0 なら、相手が無限大や NaN でも $+0$ を返す。
+そのため、無限大の偏導関数に 0 の随伴を掛けた寄与は 0 になる。
+例えば $f(x_1, x_2) = x_1 x_2$ を $(x_1, x_2) = (\infty, 2)$ で微分すると、テープの勾配は $(2, \infty)$ である。
+同じ点で `Dual` の前進モードは積の規則に IEEE の積を使うので、$\partial f / \partial x_1$ は $\infty \cdot 0$ を含み NaN になる。
+前進モードの規則が IEEE の積と `azmul` をどう使い分けるかは[前進モードと二重数](../forward-mode/)、`azmul` が非有限値と折れ点で果たす役割は[折れ点と非有限値の扱い](../nonsmooth-and-nonfinite-policies/)で扱う。
+
+随伴は $+0$ から加算で累積する。
+$+0 + (-0) = +0$ なので、導関数がちょうど $-0$ になる場合も、テープは $+0$ を返す。
+符号付きゼロの一般論は[浮動小数点と条件数](../../../concepts/floating-point-and-conditioning/)にある。
+
+1 つの演算だけを記録した勾配は、同じ演算の `Dual` の導関数とビット単位で一致する。
+例外は 2 つあり、ちょうど 0 の導関数の符号（テープは $+0$）と、上の $x_1 x_2$ のように IEEE の積を使う規則で無限大の偏導関数とちょうど 0 の接成分が出会う場合（`Dual` は NaN、テープはその入力の偏導関数を返す）である。
+長い記録では 1 つの随伴への寄与を前進モードと別の順序で足すので、両者は丸めの範囲で一致する。
+差分商と違って打ち切り誤差はなく、誤差は各演算の偏導関数と累積の丸めから生じる。
+各演算の偏導関数の精度は[初等関数の微分と精度](../elementary-functions/)で扱う。
+
+## テープによる勾配
+
+`Tape::gradient_into(function, point, gradient, context)` は、スカラー関数 `function` を `point` で記録し、逆走査 1 回で勾配を `gradient` に書いて、関数の値を返す。
+`gradient` は入力ごとに 1 成分を持ち、長さが `point` と違えば `DimensionMismatch` を返す。
+計算コストは記録 1 回と逆走査 1 回で、関数の評価の小さな定数倍である。
+メモリ使用量は記録したワードの数に比例し、`Tape<f64>` の単項と 2 項の文はワードの 8 バイトと随伴 1 値に、保存する偏導関数 0〜2 値を使う。
+関数が返したエラーはそのまま返り、失敗した変換は `gradient` を変えない。
+方針によるエラー、容量の不足、停止の扱いは[テープのライフサイクルと再利用](../tape-lifecycle/)にまとめてある。
+
+次のセルは拡張 Rosenbrock 関数
+
+$$
+f(\mathbf{x}) = \sum_{i=1}^{n-1} \Bigl[100\,(x_{i+1} - x_i^2)^2 + (1 - x_i)^2\Bigr]
+$$
+
+の勾配を、テープの逆モードと前進モードで求めて比べる。
+入力は入力次元 $n$（2〜256）で、点は $x_i = 0.6 + 0.1\,((i - 1) \bmod 5)$ である。
+逆モードは同じテープで `gradient_into` を 2 回呼び、ワンショット呼び出しの `value_and_grad` も 1 回呼ぶ。
+前進モードは単位方向の `Dual` で $n$ 回、8 方向を同時に保持する `MultiDual<f64, 8>` で $\lceil n/8 \rceil$ 回評価する。
+表は方式ごとに、関数の実行回数、逆走査の回数、`TapeReport::words` が返す記録のワード数、閉形式の勾配 $\mathbf{g}^{\ast}$ に対する相対差 $\max_i |g_i - g_i^{\ast}| / \max_i |g_i^{\ast}|$、同じ分母で測った `Dual` の勾配との相対差を示す。
+閉形式 $\partial f / \partial x_i = -400 x_i (x_{i+1} - x_i^2) - 2(1 - x_i) + 200 (x_i - x_{i-1}^2)$（範囲外の項は除く）は `f64` の四則演算による独立な検算である。
+検証するのは、関数の実行回数と、記録規則から数えたワード数 $9n - 8$ である。
+
+```rust
+//| id: ad-reverse-forward-gradient
+//| ref: ad-reverse-forward-gradient
+//| title: 入力次元を変えて逆モードと前進モードの勾配を比べる
+//| run: reactive
+//| crates: [scioxide-ad, scioxide-core]
+//| inputs:
+//|   dimension: {"type":"range","label":"入力次元 n","description":"拡張 Rosenbrock 関数の変数の数。","min":2,"max":256,"step":1,"value":16}
+//| cases:
+//|   - {"id":"two","label":"n = 2","description":"項が 1 つで、MultiDual も 1 回の評価で足りる。","inputs":{"dimension":2}}
+//|   - {"id":"wide","label":"n = 200","description":"Dual は 200 回、MultiDual は 25 回評価する。","inputs":{"dimension":200}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"gradients","path":"/rows/0/1","equals":2}
+//|       - {"artifact":"gradients","path":"/rows/1/1","equals":1}
+//|       - {"artifact":"gradients","path":"/rows/1/3","equals":136}
+//|       - {"artifact":"gradients","path":"/rows/2/1","equals":2}
+//|       - {"artifact":"gradients","path":"/rows/3/1","equals":16}
+//|       - {"artifact":"gradients","path":"/rows/4/1","equals":2}
+//|       - {"artifact":"gradients","path":"/rows/1/4","range":{"max":1e-15}}
+//|       - {"artifact":"gradients","path":"/rows/4/5","equals":0}
+//|   - case: two
+//|     expect:
+//|       - {"artifact":"gradients","path":"/rows/1/3","equals":10}
+//|       - {"artifact":"gradients","path":"/rows/4/1","equals":1}
+//|       - {"artifact":"gradients","path":"/rows/1/4","range":{"max":1e-15}}
+//|   - case: wide
+//|     expect:
+//|       - {"artifact":"gradients","path":"/rows/1/3","equals":1792}
+//|       - {"artifact":"gradients","path":"/rows/3/1","equals":200}
+//|       - {"artifact":"gradients","path":"/rows/4/1","equals":25}
+//|       - {"artifact":"gradients","path":"/rows/1/4","range":{"max":1e-15}}
+use core::cell::Cell;
+
+use scioxide_ad::{Dual, MultiDual, Real, Tape, TapeOptions, value_and_grad};
+use scioxide_core::ExecutionContext;
+
+/// 拡張 Rosenbrock 関数 f(x) = Σᵢ [100 (xᵢ₊₁ − xᵢ²)² + (1 − xᵢ)²]。
+fn rosenbrock<R: Real>(x: &[R]) -> R {
+    x.windows(2)
+        .map(|w| {
+            let a = w[1] - w[0] * w[0];
+            let b = -w[0] + 1.0;
+            a * a * 100.0 + b * b
+        })
+        .sum()
+}
+
+/// 基準 reference に対する差の最大値 max|gᵢ − rᵢ| を scale で割る。
+fn gap(gradient: &[f64], reference: &[f64], scale: f64) -> f64 {
+    let pairs = gradient.iter().zip(reference);
+    pairs.fold(0.0_f64, |m, (g, r)| m.max((g - r).abs())) / scale
+}
+
+const WIDTH: usize = 8;
+let n = dimension as usize;
+let point: Vec<f64> = (0..n).map(|i| 0.6 + 0.1 * (i % 5) as f64).collect();
+// 独立な検算: 閉形式の勾配を f64 の四則演算で求める。
+let p = &point;
+let exact: Vec<f64> = (0..n)
+    .map(|i| {
+        let mut g = 0.0;
+        if i + 1 < n {
+            g += -400.0 * p[i] * (p[i + 1] - p[i] * p[i]) - 2.0 * (1.0 - p[i]);
+        }
+        if i > 0 {
+            g += 200.0 * (p[i] - p[i - 1] * p[i - 1]);
+        }
+        g
+    })
+    .collect();
+let scale = exact.iter().fold(0.0_f64, |m, g| m.max(g.abs()));
+
+// 前進モード: 入力ごとに単位方向の Dual で 1 回評価する。
+let mut forward = vec![0.0; n];
+for (k, slot) in forward.iter_mut().enumerate() {
+    let seeded: Vec<Dual<f64>> = point
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| Dual::new(v, if i == k { 1.0 } else { 0.0 }))
+        .collect();
+    *slot = rosenbrock(&seeded).derivative();
+}
+// MultiDual は 1 回の評価で WIDTH 方向を保持する。
+let passes = n.div_ceil(WIDTH);
+let mut blocked = vec![0.0; n];
+for block in 0..passes {
+    let seeded = point
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| match i.checked_sub(block * WIDTH) {
+            Some(d) if d < WIDTH => MultiDual::<f64, WIDTH>::variable(v, d),
+            _ => Ok(MultiDual::constant(v)),
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    for (d, g) in rosenbrock(&seeded).gradient().into_iter().enumerate() {
+        if let Some(slot) = blocked.get_mut(block * WIDTH + d) {
+            *slot = g;
+        }
+    }
+}
+
+// 逆モード: 同じテープで 2 回求める。関数の実行を数える。
+// results の要素は (方式, 関数の実行回数, 逆走査の回数, 記録のワード数, 勾配)。
+let cx = ExecutionContext::sequential();
+let runs = Cell::new(0_usize);
+let mut tape = Tape::<f64>::new(TapeOptions::new());
+let mut results = Vec::new();
+for label in ["Tape の 1 回目", "Tape の 2 回目"] {
+    let mut reverse = vec![0.0; n];
+    runs.set(0);
+    tape.gradient_into(
+        |x| {
+            runs.set(runs.get() + 1);
+            Ok(rosenbrock(x))
+        },
+        &point,
+        &mut reverse,
+        cx,
+    )
+    .map_err(|e| e.to_string())?;
+    results.push((label, runs.get(), 1, Some(tape.report().words()), reverse));
+}
+// ワンショット呼び出しは、呼ぶたびに新しいテープを作る。
+runs.set(0);
+let (_, one_shot) = value_and_grad(
+    |x| {
+        runs.set(runs.get() + 1);
+        Ok(rosenbrock(x))
+    },
+    &point,
+)
+.map_err(|e| e.to_string())?;
+results.push((
+    "value_and_grad",
+    runs.get(),
+    1,
+    None,
+    one_shot.as_slice().to_vec(),
+));
+results.push(("Dual", n, 0, None, forward.clone()));
+results.push(("MultiDual<f64, 8>", passes, 0, None, blocked));
+let rows: Vec<_> = results
+    .iter()
+    .map(|(name, runs, sweeps, words, g)| {
+        let error = gap(g, &exact, scale);
+        (
+            *name,
+            *runs,
+            *sweeps,
+            *words,
+            error,
+            gap(g, &forward, scale),
+        )
+    })
+    .collect();
+
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "方式" },
+    { "key": "1", "label": "関数の実行回数", "type": "integer" },
+    { "key": "2", "label": "逆走査の回数", "type": "integer" },
+    { "key": "3", "label": "記録のワード数", "type": "integer", "nullText": "なし" },
+    { "key": "4", "label": "閉形式との相対差 [-]", "type": "number", "format": sci2 },
+    { "key": "5", "label": "Dual との相対差 [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "gradients", "title": "勾配を求める方式の比較" })
+);
+```
+
+既定の $n = 16$ では、テープの 1 回目の `gradient_into` が関数を 2 回実行し、2 回目は 1 回だけ実行する。
+空のテープは 1 回目の記録で容量が足りず、数えた大きさまで広げてから関数をもう一度実行するからである。
+`value_and_grad` は呼ぶたびに新しいテープを作るので、毎回 2 回実行する。
+どの逆モードも逆走査は 1 回で、前進モードは `Dual` で 16 回、`MultiDual<f64, 8>` で 2 回の評価を要する。
+
+記録のワード数 136 は記録規則から数えた $9n - 8$ に等しい。
+定数と入力が $n + 1$ ワード、項どうしの和が $n - 2$ 文、各項が 7 文である。
+各項の 7 文は、$x_i^2$、$x_{i+1} - x_i^2$、その 2 乗、その 100 倍、$-x_i$、$(1 - x_i)^2$、最後の和で、$-x_i + 1$ の定数の加算は文を作らない。
+ワード数は $n$ に比例し、逆走査 1 回の計算コストもそれに比例するが、走査の回数は $n$ によらず 1 である。
+
+どの方式も閉形式との相対差は $7.2 \times 10^{-17}$ で、`Dual` と `MultiDual` の勾配はビット単位で一致する。
+`MultiDual` は 1 方向ずつの `Dual` とビット単位で一致すると約束されている。
+テープの勾配と `Dual` の勾配の差は寄与を足す順序の違いによる丸めの差である。
+$n = 2$ では項が 1 つなのでワード数は 10 で、`MultiDual` も 1 回の評価で足り、どの方式も閉形式と一致する。
+$n = 200$ ではワード数が 1,792 に増えるが逆走査は 1 回のままで、`Dual` は 200 回、`MultiDual` は 25 回評価する。
+
+## 線形化と積
+
+ベクトル値の関数には `Tape::linearize(function, point, context)` を使う。
+`function` は入力を受け取り、出力を受け取ったベクトルに `push` する。
+出力を積んだ順序が $\mathbf{y} = F(\mathbf{x})$ の成分の順序で、入力の順序は `point` の順序である。
+`linearize` は記録だけを行い、点 `point` での線形化 `Linearization` を返す。
+`Linearization<'a, V>` はテープを可変で借用し、同じ記録から何回でも積を求める。
+
+- `inputs()` と `outputs()` は入力の数 $n$ と出力の数 $m$、`values()` は出力の値 $F(\mathbf{x})$ を返す。
+- `vjp_into(cotangent, out, context)` は逆走査 1 回で $\mathbf{J}^\mathsf{T}\mathbf{w}$（入力ごとに 1 成分）を `out` に書く。
+- `jvp_into(direction, out, context)` は前進走査 1 回で $\mathbf{J}\dot{\mathbf{x}}$（出力ごとに 1 成分）を `out` に書く。
+  前進の規則（pushforward）を持たない `ExternalRule` の呼び出しを記録していると、`CapabilityUnavailable` を返す。
+- `jacobian_into(out, context)` は密なヤコビ行列を行優先（出力 × 入力）で `out` に書く。
+
+各積は記録全体を 1 回か、`jacobian_into` では複数回たどる。
+テープで一度使った後の積は確保をせず、`jacobian_into` だけが最初の呼び出しで行列 1 枚分の作業域を確保する。
+長さの合わない引数は `DimensionMismatch`、`NonFinitePolicy::Error` のもとでの非有限な結果は `NonFinite`（発生源 `Output`）、停止の要求は `ExecutionStopped` になり、失敗した積は出力を変えない。
+行列を作らない作用素 `JacobianOperator` は[二階微分とヘッセ行列の作用素](../second-order-derivatives/)、構造パターンと疎なヤコビ行列は[構造パターンと疎な微分の復元](../sparse-derivatives/)で扱う。
+
+### ヤコビ行列を組む向き
+
+`jacobian_into` は、テープの設定 `TapeOptions::with_jacobian_mode` で選んだ `JacobianMode` に従って走査を繰り返す。
+`Forward` は入力ごとに単位ベクトルをシードにした前進走査を $n$ 回行い、列を 1 本ずつ埋める。
+`Reverse` は出力ごとに逆走査を $m$ 回行い、行を 1 本ずつ埋める。
+既定の `Auto` は $m < n$ なら逆走査、$m \ge n$ なら前進走査を選ぶ。
+1 回の走査の計算コストはどちらの向きも記録の長さに比例するので、走査の回数 $\min(m, n)$ が少ない向きが有利になる。
+前進の規則を持たない `ExternalRule` を含む記録で $m \ge n$ のときは、`Reverse` を指定すればヤコビ行列を組める。
+
+次のセルは $m$ 個の出力
+
+$$
+F_k(\mathbf{x}) = s_k^2, \qquad s_k = \sum_{i=1}^{n} a_{ki} x_i, \qquad a_{ki} = \frac{1}{k + i - 1} \quad (k = 1, \dots, m)
+$$
+
+のヤコビ行列 $J_{ki} = 2 s_k a_{ki}$ を、`Auto`、`Forward`、`Reverse` の 3 つのテープとワンショット呼び出しの `jacobian` で求める。
+入力は入力次元 $n$（1〜12）と出力次元 $m$（1〜12）で、点は $x_i = 1 - 0.25\,(i - 1)$ である。
+走査の回数を数えるため、$x_1$ を恒等写像の `ExternalRule` に通してから使う。
+逆走査と前進走査は記録した呼び出し文を 1 回ずつ通るので、規則の逆向きの積（pullback）と前向きの積（pushforward）が呼ばれた回数が、それぞれの走査の回数になる（規則の書き方は[外部の微分規則 ExternalRule](../external-rules/)）。
+表は向きの指定ごとに、選ばれた向き、逆走査と前進走査の回数、閉形式との相対差、`vjp_into` で求めた行と `jvp_into` で求めた列とのヤコビ行列の最大差を示す。
+検証するのは、`Auto` の走査の回数が $\min(m, n)$ になることと、どの向きでも閉形式と一致することである。
+
+```rust
+//| id: ad-linearization-jacobian-modes
+//| ref: ad-linearization-jacobian-modes
+//| title: 走査の回数を数えてヤコビ行列を組む向きを比べる
+//| run: reactive
+//| crates: [scioxide-ad, scioxide-core]
+//| inputs:
+//|   inputs: {"type":"range","label":"入力次元 n","description":"F の入力の数。","min":1,"max":12,"step":1,"value":6}
+//|   outputs: {"type":"range","label":"出力次元 m","description":"F の出力の数。","min":1,"max":12,"step":1,"value":3}
+//| cases:
+//|   - {"id":"square","label":"n = m = 4","description":"m < n が成り立たないので、Auto は前進走査を 4 回行う。","inputs":{"inputs":4,"outputs":4}}
+//|   - {"id":"tall","label":"n = 2、m = 10","description":"出力が多いので、前進走査 2 回で足りる。","inputs":{"inputs":2,"outputs":10}}
+//|   - {"id":"gradient","label":"n = 12、m = 1","description":"出力が 1 つなので、逆走査 1 回で勾配が求まる。","inputs":{"inputs":12,"outputs":1}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"modes","path":"/rows/0/2","equals":3}
+//|       - {"artifact":"modes","path":"/rows/0/3","equals":0}
+//|       - {"artifact":"modes","path":"/rows/1/3","equals":6}
+//|       - {"artifact":"modes","path":"/rows/2/2","equals":3}
+//|       - {"artifact":"modes","path":"/rows/3/2","equals":3}
+//|       - {"artifact":"modes","path":"/rows/3/3","equals":0}
+//|       - {"artifact":"modes","path":"/rows/0/4","range":{"max":1e-15}}
+//|       - {"artifact":"modes","path":"/rows/1/4","range":{"max":1e-15}}
+//|       - {"artifact":"modes","path":"/rows/2/5","equals":0}
+//|   - case: square
+//|     expect:
+//|       - {"artifact":"modes","path":"/rows/0/2","equals":0}
+//|       - {"artifact":"modes","path":"/rows/0/3","equals":4}
+//|       - {"artifact":"modes","path":"/rows/2/2","equals":4}
+//|   - case: tall
+//|     expect:
+//|       - {"artifact":"modes","path":"/rows/0/3","equals":2}
+//|       - {"artifact":"modes","path":"/rows/2/2","equals":10}
+//|       - {"artifact":"modes","path":"/rows/2/4","range":{"max":1e-15}}
+//|   - case: gradient
+//|     expect:
+//|       - {"artifact":"modes","path":"/rows/0/2","equals":1}
+//|       - {"artifact":"modes","path":"/rows/1/3","equals":12}
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use scioxide_ad::{ExternalRule, JacobianMode, Real, Tape, TapeOptions, Var, jacobian};
+use scioxide_core::{ExecutionContext, SciOxideError};
+
+/// 恒等写像 y = x。逆向きと前向きの積が呼ばれた回数を数える。
+#[derive(Default)]
+struct SweepCounter {
+    reverse: AtomicUsize,
+    tangent: AtomicUsize,
+}
+
+impl ExternalRule<f64> for SweepCounter {
+    fn evaluate(&self, x: &[f64], y: &mut [f64]) -> Result<(), SciOxideError> {
+        y.copy_from_slice(x);
+        Ok(())
+    }
+    fn pullback(
+        &self,
+        _: &[f64],
+        _: &[f64],
+        w: &[f64],
+        g: &mut [f64],
+    ) -> Result<(), SciOxideError> {
+        self.reverse.fetch_add(1, Ordering::Relaxed);
+        g[0] += w[0];
+        Ok(())
+    }
+    fn pushforward(
+        &self,
+        _: &[f64],
+        _: &[f64],
+        t: &[f64],
+        y: &mut [f64],
+    ) -> Result<(), SciOxideError> {
+        self.tangent.fetch_add(1, Ordering::Relaxed);
+        y[0] = t[0];
+        Ok(())
+    }
+}
+
+/// 係数 a = 1/(k + i + 1)。k と i は 0 始まり。
+fn weight(k: usize, i: usize) -> f64 {
+    1.0 / (k + i + 1) as f64
+}
+
+/// Fₖ(x) = sₖ²、sₖ = Σᵢ aₖᵢ xᵢ。x₀ は計数用の恒等写像を通す。
+fn model<'t>(
+    rule: &Arc<dyn ExternalRule<f64>>,
+    outputs: usize,
+    x: &[Var<'t, f64>],
+    y: &mut Vec<Var<'t, f64>>,
+) -> Result<(), SciOxideError> {
+    let mut first = [Var::constant(0.0)];
+    Var::external(rule, &x[..1], &mut first)?;
+    for k in 0..outputs {
+        let terms = (0..x.len()).map(|i| {
+            let xi = if i == 0 { first[0] } else { x[i] };
+            xi * weight(k, i)
+        });
+        let s: Var<'t, f64> = terms.sum();
+        y.push(s * s);
+    }
+    Ok(())
+}
+
+let (n, m) = (inputs as usize, outputs as usize);
+let point: Vec<f64> = (0..n).map(|i| 1.0 - 0.25 * i as f64).collect();
+// 独立な検算: Jₖᵢ = 2 sₖ aₖᵢ を f64 の四則演算で求める。
+let mut exact = vec![0.0; m * n];
+for k in 0..m {
+    let s: f64 = (0..n).map(|i| point[i] * weight(k, i)).sum();
+    for i in 0..n {
+        exact[k * n + i] = 2.0 * s * weight(k, i);
+    }
+}
+let scale = exact.iter().fold(0.0_f64, |a, v| a.max(v.abs()));
+let error = |j: &[f64]| {
+    j.iter()
+        .zip(&exact)
+        .fold(0.0_f64, |a, (p, q)| a.max((p - q).abs()))
+        / scale
+};
+let counter = Arc::new(SweepCounter::default());
+let rule: Arc<dyn ExternalRule<f64>> = counter.clone();
+// 数えた回数を読み、0 に戻す。
+let sweeps = || {
+    let reverse = counter.reverse.swap(0, Ordering::Relaxed);
+    (reverse, counter.tangent.swap(0, Ordering::Relaxed))
+};
+let chosen = |reverse: usize| {
+    if reverse > 0 {
+        "行ごと（逆走査）"
+    } else {
+        "列ごと（前進走査）"
+    }
+};
+let cx = ExecutionContext::sequential();
+let mut rows = Vec::new();
+let modes = [
+    ("Auto", JacobianMode::Auto),
+    ("Forward", JacobianMode::Forward),
+    ("Reverse", JacobianMode::Reverse),
+];
+for (name, mode) in modes {
+    let mut tape = Tape::<f64>::new(TapeOptions::new().with_jacobian_mode(mode));
+    let mut linear = tape
+        .linearize(|x, y| model(&rule, m, x, y), &point, cx)
+        .map_err(|e| e.to_string())?;
+    let mut jac = vec![0.0; linear.outputs() * linear.inputs()];
+    sweeps();
+    linear
+        .jacobian_into(&mut jac, cx)
+        .map_err(|e| e.to_string())?;
+    let (reverse, tangent) = sweeps();
+    // 単位ベクトルの VJP で行を、JVP で列を求め直す。
+    let mut product_gap = 0.0_f64;
+    let (mut seed, mut row) = (vec![0.0; m], vec![0.0; n]);
+    for k in 0..m {
+        seed.fill(0.0);
+        seed[k] = 1.0;
+        linear
+            .vjp_into(&seed, &mut row, cx)
+            .map_err(|e| e.to_string())?;
+        for i in 0..n {
+            product_gap = product_gap.max((row[i] - jac[k * n + i]).abs());
+        }
+    }
+    let (mut direction, mut column) = (vec![0.0; n], vec![0.0; m]);
+    for i in 0..n {
+        direction.fill(0.0);
+        direction[i] = 1.0;
+        linear
+            .jvp_into(&direction, &mut column, cx)
+            .map_err(|e| e.to_string())?;
+        for k in 0..m {
+            product_gap = product_gap.max((column[k] - jac[k * n + i]).abs());
+        }
+    }
+    rows.push((
+        name,
+        chosen(reverse),
+        reverse,
+        tangent,
+        error(&jac),
+        Some(product_gap),
+    ));
+}
+// ワンショット呼び出しの jacobian は、新しいテープを既定の Auto で使う。
+sweeps();
+let one_shot = jacobian(|x, y| model(&rule, m, x, y), &point).map_err(|e| e.to_string())?;
+let (reverse, tangent) = sweeps();
+let name = "jacobian（ワンショット呼び出し）";
+rows.push((
+    name,
+    chosen(reverse),
+    reverse,
+    tangent,
+    error(one_shot.as_slice()),
+    None,
+));
+
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "指定した向き" },
+    { "key": "1", "label": "選ばれた向き" },
+    { "key": "2", "label": "逆走査の回数", "type": "integer" },
+    { "key": "3", "label": "前進走査の回数", "type": "integer" },
+    { "key": "4", "label": "閉形式との相対差 [-]", "type": "number", "format": sci2 },
+    { "key": "5", "label": "VJP・JVP との最大差", "type": "number", "format": sci2, "nullText": "なし" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata =
+        serde_json::json!({ "id": "modes", "title": "ヤコビ行列を組む向きと走査の回数" })
+);
+```
+
+既定の $n = 6$、$m = 3$ では $m < n$ なので、`Auto` は `Reverse` と同じく逆走査を 3 回行い、`Forward` を指定したテープは前進走査を 6 回行う。
+ワンショット呼び出しの `jacobian` も既定の `Auto` で逆走査を 3 回行う。
+どの向きでも閉形式との相対差は 0 で、`vjp_into` で求めた行と `jvp_into` で求めた列もヤコビ行列とビット単位で一致する。
+この関数では、逆走査と前進走査が同じ丸めの積を作る。
+一般には寄与を足す順序が向きによって違うので、両者は丸めの範囲で一致する。
+
+$n = m = 4$ では $m < n$ が成り立たないので、`Auto` は前進走査を 4 回行う。
+$n = 2$、$m = 10$ では前進走査 2 回で足り、`Reverse` を指定すると逆走査が 10 回になる。
+$n = 12$、$m = 1$ では逆走査 1 回で勾配が求まり、前進走査なら 12 回を要する。
+走査の回数は記録の長さを単位にしたヤコビ行列の計算コストである。
+
+## ワンショット関数
+
+`grad`、`value_and_grad`、`vjp`、`jacobian` は、呼び出しのたびに新しいテープを既定の設定 `TapeOptions::new()` で作り、`ExecutionContext::sequential_native()` で実行して、結果を確保して返す。
+
+- `grad(function, point)` は勾配を、`value_and_grad(function, point)` は値と勾配の組を返し、勾配は `scioxide_linalg::Vector<S>` である。
+- `vjp(function, point, cotangent)` は $\mathbf{J}^\mathsf{T}\mathbf{w}$ を `Vector<S>` で返す。
+- `jacobian(function, point)` は $m \times n$ のヤコビ行列を行優先の `scioxide_linalg::Matrix<S>` で返す。
+
+`grad` と `value_and_grad` の関数は `gradient_into` と、`vjp` と `jacobian` の関数は `linearize` と同じ形である。
+スカラーの型 `S` は `f32` か `f64` に限り、`Lanes` や `Dual` を記録するテープは `Tape` を直接使う。
+新しいテープは容量を持たないので、ワンショット呼び出しは毎回テープの領域を確保し、関数を 2 回実行する。
+エラーは対応する `Tape` の変換と同じで、結果を確保できなければ `AllocationFailure` が加わる。
+`vjp` は `cotangent` の長さが出力の数と違えば `DimensionMismatch` を返す。
+同じ関数を多くの点で微分するとき、方針や取り消しを指定するとき、確保を避けたいときは、`Tape` を作って使い回す。
+ヘッセ行列のワンショット呼び出し `hvp` と `hessian` も呼ぶたびに新しいテープを作るので、`hvp` は関数を 2 回、`hessian` は入力の数 $n$ に対して $n + 1$ 回実行する（[二階微分とヘッセ行列の作用素](../second-order-derivatives/)）。
+
+## まとめ
+
+逆走査は出力の随伴 1 から記録を逆順にたどり、使われた先の数だけ寄与を加算して随伴を求める。
+スカラー関数の勾配は逆走査 1 回で得られ、その計算コストは評価の定数倍で入力次元によらないが、記録のメモリ使用量は演算の数に比例する。
+関数は `R: Real` に対して書き、`Tape::gradient_into` か `Tape::linearize` の引数の位置にクロージャを書いて渡し、記録の大きさは `TapeReport::words` で確かめる。
+ヤコビ行列は $\min(m, n)$ 回の走査で組め、既定の `JacobianMode::Auto` は $m < n$ のとき逆走査を選ぶ。
+前進の規則を持たない独自の規則を使う記録では、`JacobianMode::Reverse` を指定する。
+多くの点で同じ関数を微分するときは、ワンショット呼び出しではなくテープを使い回し、確保と関数の 2 回目の実行を最初の変換だけにする。
+
+## 次に読むページ
+
+- [テープのライフサイクルと再利用](../tape-lifecycle/)：容量の不足を数えてもう一度記録する手順、確保しない再利用、レポートとエラーの分類を確かめる。
+- [二階微分とヘッセ行列の作用素](../second-order-derivatives/)：`Tape<Dual<f64>>` によるヘッセ行列・ベクトル積と、行列を作らない作用素を確かめる。
+- [構造パターンと疎な微分の復元](../sparse-derivatives/)：記録から求めた構造パターンと彩色で、疎なヤコビ行列を少ない走査で復元する方法を確かめる。
+- [折れ点と非有限値の扱い](../nonsmooth-and-nonfinite-policies/)：`azmul` と前進モードの積の規則の違い、折れ点の数え方を確かめる。
+- [JVP と VJP の双対性](../../examples/jvp-vjp-duality/)：$\langle \mathbf{w}, \mathbf{J}\dot{\mathbf{x}} \rangle = \langle \mathbf{J}^\mathsf{T}\mathbf{w}, \dot{\mathbf{x}} \rangle$ を数値で確かめる。

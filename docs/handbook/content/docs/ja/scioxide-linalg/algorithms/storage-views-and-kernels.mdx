@@ -1,0 +1,466 @@
+---
+title: メモリレイアウト・ビュー・密行列カーネルと精度階層
+description: 行優先の格納と行列の作り方、ストライド付きビュー、転置・随伴・ブロックの借用、有限ビュー、BLAS 1〜3 に相当する密行列カーネルとその呼び出しの形、行列ノルム、パック GEMM のタイル、Standard と Exact の誤差限界。
+sidebar:
+  order: 305
+references:
+  linalg-row-major-storage: "行優先の格納とストライド"
+  linalg-dense-kernels: "密行列カーネルの演算と演算量"
+  linalg-accuracy-levels: "精度階層-standard-と-exact"
+  linalg-view-borrowing: "ビューの変換と借用規則"
+  linalg-finite-views: "有限ビュー"
+---
+
+数式の行列 $A = (a_{ij}) \in \mathbb{K}^{m \times n}$（$\mathbb{K}$ は $\mathbb{R}$ か $\mathbb{C}$）は、計算機の上では一次元の配列に並んだ $mn$ 個の数である。
+このページは `scioxide-linalg` がその配列をどう解釈し、部分行列や転置を複製せずに扱い、積と内積をどの精度で計算するかを説明する。
+後のページの分解や反復法はここで述べるビューとカーネルを使う。
+標準形式・オプション付き形式・出力先を指定する API・スコープ付き API などの呼び出しの形は[作業領域・実行コンテキスト・試行記録](oxref:linalg-execution-forms)で定義する。
+
+---
+
+## 行優先の格納とストライド
+
+`Matrix<S>` は成分を行優先（row-major）で連続に所有し、成分 $(i, j)$ を `data[i * cols + j]` に置く（添字は 0 始まり）。
+行列は次の関数で作る。
+
+| 関数 | 作る行列 | 失敗 |
+|---|---|---|
+| `Matrix::zeros(m, n)` | $m \times n$ の零行列 | $mn$ が `usize` に収まらなければ `SizeOverflow`、確保できなければ `AllocationFailure` |
+| `Matrix::from_rows(&[[a, b, c], [d, e, f]])` | 配列の $i$ 番目を第 $i$ 行とする行列。空のスライスなら $0 \times C$ | 確保できなければ `AllocationFailure` |
+| `Matrix::from_vec(m, n, data)` | 行優先の `Vec` をそのまま所有する行列 | 長さが $mn$ でなければ `DimensionMismatch`、$mn$ が `usize` に収まらなければ `SizeOverflow` |
+| `Matrix::identity(n)` | $n \times n$ の単位行列 | `zeros` と同じ |
+
+どの関数も成分が有限かを調べない。
+NaN や無限大は、行列を使う演算が計算を始める前に、その演算が読む成分について調べて `NonFinite` で拒む（たとえば $\alpha = 0$ の積は $A$ も $B$ も読まず、$\beta = 0$ の更新は出力の古い値を読まない）。
+ベクトルは `Vector::from_vec(data)` と `Vector::zeros(n)` で作る。
+
+ビューは先頭位置 $b$ と二つのストライド $s_r, s_c$ を持ち、論理位置 $(i, j)$ を
+
+$$
+\operatorname{offset}(i, j) = b + i\, s_r + j\, s_c
+$$
+
+の格納位置に対応させる。
+所有する行列のビューは $s_r = n$、$s_c = 1$ で、同じ行の隣り合う成分がメモリ上でも隣り合う。
+列優先に並んだ配列は $s_r = 1$、$s_c = m$ のビューとして複製せずに読める。
+
+| 操作 | 行数・列数 | ストライド $(s_r, s_c)$ | 先頭位置 |
+|---|---|---|---|
+| `Matrix::view()` | $m \times n$ | $(n, 1)$ | $0$ |
+| `block(r0, c0, p, q)` | $p \times q$ | 元のまま | $b + r_0 s_r + c_0 s_c$ |
+| `transpose()` | $n \times m$ | $(s_c, s_r)$ | 元のまま |
+| `adjoint()` | $n \times m$ | $(s_c, s_r)$、共役フラグを反転 | 元のまま |
+| `row(i)`、`col(j)` | 長さ $n$、$m$ の `VectorView` | $s_c$、$s_r$ | $b + i s_r$、$b + j s_c$ |
+| `try_diag()` | 長さ $\min(m, n)$ の `VectorView` | $s_r + s_c$ | $b$ |
+
+どの操作も成分を複製せず、定数時間で終わる。
+転置と随伴は添字の役割を入れ替えるだけなので、転置したビューを行方向に読むと元の配列を飛び飛びに読むことになる。
+カーネルはこの走査順の違いを、後述のパッキングで吸収する。
+
+`MatrixView::from_slice_with_strides` は任意のスライスとストライドからビューを作る。
+到達できる最後の位置がスライスの外なら `DimensionMismatch`、大きさの積や最後の位置が `usize` に収まらなければ `SizeOverflow` で拒否する。
+不変ビューでは異なる論理位置が同じ格納位置を指してもよく、スライスは到達する最後の位置より長くてもよい。
+
+次のセルは $a_{ij} = 10 i + j$ の $4 \times 5$ 行列を `Matrix::from_rows` で作り、$2 \times 3$ のブロックを `block` と `from_slice_with_strides` の二通りで借用する。
+入力はブロックの先頭の行 $r_0$ と列 $c_0$（0〜2）と、表に並べるビュー（ブロック、その転置、元の行列の対角）で、対角を選ぶと $r_0$ と $c_0$ は使わない。
+一つ目の表は選んだビューの各成分について、論理位置、値、式 $b + i s_r + j s_c$ による格納位置、値から求めた行優先の位置を並べる。
+値 $10 i' + j'$ から元の添字 $(i', j')$ が読めるので、式による格納位置が行優先の位置 $5 i' + j'$ と一致するかを独立に確かめられる。
+二つ目の表はストライド、先頭位置、二通りの借用の差、格納位置が一致しない成分の件数を示す。
+テストは格納位置とストライドを、手で数えた値と比べる。
+
+```rust
+//| id: linalg-view-strides
+//| ref: linalg-view-strides
+//| title: ブロック・転置・対角のビューと格納位置
+//| run: reactive
+//| crates: [scioxide-linalg]
+//| inputs:
+//|   first_row: {"type":"range","label":"ブロックの先頭行 r₀","description":"4×5 行列から 2×3 のブロックを取り出す先頭の行。","min":0,"max":2,"step":1,"value":1}
+//|   first_col: {"type":"range","label":"ブロックの先頭列 c₀","description":"ブロックの先頭の列。","min":0,"max":2,"step":1,"value":1}
+//|   view_kind: {"type":"select","label":"ビュー","description":"ブロックそのもの、その転置、または元の行列の対角。","options":["ブロック","ブロックの転置","元の行列の対角"],"value":"ブロック"}
+//| cases:
+//|   - {"id":"transposed","label":"ブロックの転置","description":"ストライドが (1, 5) に入れ替わり、同じ 6 か所を列の順に読む。","inputs":{"view_kind":"ブロックの転置"}}
+//|   - {"id":"diagonal","label":"元の行列の対角","description":"ストライド 6 の長さ 4 のベクトルになる。","inputs":{"view_kind":"元の行列の対角"}}
+//|   - {"id":"corner","label":"r₀ = 2, c₀ = 2","description":"右下の隅のブロックは格納位置 12 から始まる。","inputs":{"first_row":2,"first_col":2}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"entries","path":"/rows/0/2","equals":11}
+//|       - {"artifact":"entries","path":"/rows/0/3","equals":6}
+//|       - {"artifact":"entries","path":"/rows/5/3","equals":13}
+//|       - {"artifact":"entries","path":"/rows/5/4","equals":13}
+//|       - {"artifact":"layout","path":"/rows/0/0","equals":5}
+//|       - {"artifact":"layout","path":"/rows/0/1","equals":1}
+//|       - {"artifact":"layout","path":"/rows/0/4","equals":0}
+//|       - {"artifact":"layout","path":"/rows/0/5","equals":0}
+//|   - case: transposed
+//|     expect:
+//|       - {"artifact":"layout","path":"/rows/0/0","equals":1}
+//|       - {"artifact":"layout","path":"/rows/0/1","equals":5}
+//|       - {"artifact":"entries","path":"/rows/1/3","equals":11}
+//|       - {"artifact":"layout","path":"/rows/0/5","equals":0}
+//|   - case: diagonal
+//|     expect:
+//|       - {"artifact":"layout","path":"/rows/0/2","equals":6}
+//|       - {"artifact":"layout","path":"/rows/0/0","equals":null}
+//|       - {"artifact":"entries","path":"/rows/3/2","equals":33}
+//|       - {"artifact":"entries","path":"/rows/3/3","equals":18}
+//|       - {"artifact":"layout","path":"/rows/0/5","equals":0}
+//|   - case: corner
+//|     expect:
+//|       - {"artifact":"layout","path":"/rows/0/3","equals":12}
+//|       - {"artifact":"entries","path":"/rows/5/2","equals":34}
+//|       - {"artifact":"layout","path":"/rows/0/5","equals":0}
+use scioxide_linalg::{Matrix, MatrixView};
+
+// a_ij = 10 i + j の 4×5 行列。行優先なので (i, j) の格納位置は 5 i + j。
+let a = Matrix::from_rows(&[
+    [0.0_f64, 1.0, 2.0, 3.0, 4.0],
+    [10.0, 11.0, 12.0, 13.0, 14.0],
+    [20.0, 21.0, 22.0, 23.0, 24.0],
+    [30.0, 31.0, 32.0, 33.0, 34.0],
+])
+.map_err(|e| e.to_string())?;
+let cols = a.cols();
+let (r0, c0) = (first_row.round() as usize, first_col.round() as usize);
+let block = a.view().block(r0, c0, 2, 3).map_err(|e| e.to_string())?;
+// 同じブロックを、先頭位置 r₀ n + c₀ と元の行ストライド n から直接借用する。
+let tail = &a.as_slice()[r0 * cols + c0..];
+let direct =
+    MatrixView::from_slice_with_strides(2, 3, tail, cols, 1).map_err(|e| e.to_string())?;
+let mut gap = 0.0_f64;
+for (i, j) in (0..2).flat_map(|i| (0..3).map(move |j| (i, j))) {
+    let left = block.get(i, j).map_err(|e| e.to_string())?;
+    gap = gap.max((left - direct.get(i, j).map_err(|e| e.to_string())?).abs());
+}
+// 値 10 i′ + j′ から求めた行優先の位置 5 i′ + j′（独立な検算）。
+let from_value = |value: f64| value as usize / 10 * cols + value as usize % 10;
+// (i, j, 値, b + i s_r + j s_c, 5 i′ + j′)。ベクトルのビューは j を持たない。
+let mut rows: Vec<(usize, Option<usize>, f64, usize, usize)> = Vec::new();
+// (行ストライド, 列ストライド, ベクトルのストライド, 先頭位置)。
+let (row_stride, col_stride, vector_stride, base) = if view_kind == "元の行列の対角" {
+    let diag = a.view().try_diag().map_err(|e| e.to_string())?;
+    for k in 0..diag.len() {
+        let value = diag.get(k).map_err(|e| e.to_string())?;
+        rows.push((k, None, value, k * diag.stride(), from_value(value)));
+    }
+    (None, None, Some(diag.stride()), 0)
+} else {
+    let view = if view_kind == "ブロックの転置" {
+        block.transpose()
+    } else {
+        block
+    };
+    let (rs, cs, base) = (view.row_stride(), view.col_stride(), r0 * cols + c0);
+    for (i, j) in (0..view.rows()).flat_map(|i| (0..view.cols()).map(move |j| (i, j))) {
+        let value = view.get(i, j).map_err(|e| e.to_string())?;
+        rows.push((i, Some(j), value, base + i * rs + j * cs, from_value(value)));
+    }
+    (Some(rs), Some(cs), None, base)
+};
+let mismatches = rows.iter().filter(|r| r.3 != r.4).count();
+let whole = serde_json::json!({ "fractionDigits": 0 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "ビューの位置 i", "type": "integer" },
+    { "key": "1", "label": "ビューの位置 j", "type": "integer", "nullText": "（ベクトル）" },
+    { "key": "2", "label": "値 a", "type": "number", "format": whole },
+    { "key": "3", "label": "格納位置 b + i s_r + j s_c", "type": "integer" },
+    { "key": "4", "label": "値から求めた位置 5 i′ + j′", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "entries" })
+);
+let layout = serde_json::json!([
+    { "key": "0", "label": "行ストライド s_r", "type": "integer", "nullText": "（ベクトル）" },
+    { "key": "1", "label": "列ストライド s_c", "type": "integer", "nullText": "（ベクトル）" },
+    { "key": "2", "label": "ベクトルのストライド", "type": "integer", "nullText": "（行列）" },
+    { "key": "3", "label": "先頭位置 b", "type": "integer" },
+    { "key": "4", "label": "二通りの借用の差", "type": "number" },
+    { "key": "5", "label": "格納位置の不一致 [件]", "type": "integer" }
+]);
+let summary = vec![(row_stride, col_stride, vector_stride, base, gap, mismatches)];
+emit_table_with_columns!(
+    layout,
+    summary,
+    metadata = serde_json::json!({ "id": "layout" })
+);
+```
+
+既定の $(r_0, c_0) = (1, 1)$ では、ブロックの先頭は格納位置 6 で、行ストライド 5 と列ストライド 1 によって 6, 7, 8, 11, 12, 13 を指す。
+二通りの借用の差と格納位置の不一致はどちらも 0 で、`block` が先頭位置 $b + r_0 s_r + c_0 s_c$ とストライドをそのまま引き継ぐことが分かる。
+転置を選ぶとストライドが $(1, 5)$ に入れ替わるだけで、同じ六つの位置を列の順に読む。
+対角はストライド $5 + 1 = 6$ の長さ 4 のベクトルで、位置 0, 6, 12, 18 の成分 0, 11, 22, 33 を指す。
+$(r_0, c_0) = (2, 2)$ では先頭位置が $2 \cdot 5 + 2 = 12$ になり、最後の成分は位置 $12 + 5 + 2 = 19$ の $a_{34} = 34$ である。
+
+## ビューの変換と借用規則
+
+可変ビュー `MatrixViewMut` と `VectorViewMut` は出力を受け取るための型で、Rust の借用規則により、同じメモリ領域を指す不変ビューと同時には存在できない。
+そのため `a.view().mul_mat_into(&b, …, a.view_mut(), …)` のような入力と出力の重なりはコンパイル時に排除され、実行時には形状、有限性、作業領域の大きさを検査する。
+可変ビューは共役フラグを持たない。
+そのコンストラクターは二つの論理位置が同じ格納位置を指すストライド（ベクトルでは長さ 2 以上でストライド 0）を `InvalidInput` で拒む。
+出力に書く関数は、すべての検査と計算が終わってから出力を書き換え、失敗したときは出力を変えない。
+入力を受け取る引数の多くは `impl Into<MatrixView>` なので、`&Matrix` やビューをそのまま渡せる。
+
+## 有限ビュー
+
+`try_finite()` はビューのすべての論理成分を一度だけ調べ、NaN や無限大があれば `NonFinite` を返し、なければ成分（複素数では実部と虚部）の絶対値の最大を記録した `FiniteMatrixView` を返す。
+有限ビューの転置・共役・随伴・ブロックは検査をやり直さない。
+有限ビューは `scioxide_core` の `LinearOperator` と `AdjointOperator` を実装するので、密行列を反復法の作用素として渡すときに使い、各反復で行列を読み直して有限性を調べる計算コストを避ける（[クリロフ部分空間法](../krylov-and-preconditioning/)）。
+ビューの論理成分を別の出力へ写す `copy_into` は、有限性の扱いを `CopyPolicy` で明示する。
+`RequireFinite` は写す前にすべての成分を調べて NaN や無限大を拒み、`Preserve` は検査せずに非有限値も含めて写す。
+転置や随伴を選んでから呼べば、変換した値が出力に並ぶ。
+行列の `copy_into(policy, &options, output, cx)` は作業領域を取らず、ベクトルの `copy_into` は BLAS プロバイダーに写しを任せるときに使う作業領域も受け取る。
+
+## 密行列カーネルの演算と演算量
+
+ビューの型の関数は BLAS の水準 1〜3 に対応する（外部の BLAS ライブラリに回す方法は[外部 BLAS プロバイダーの仕様](../blas-provider/)）。
+水準は扱うデータ量に対する演算量の比（演算強度）で分かれ、水準 3 だけが読み込んだ成分を何度も使えるので、分解の大部分はブロック化によって水準 3 の積に帰着させる。
+
+| 水準 | 主な関数 | 演算量 | データ量 |
+|---|---|---|---|
+| 1（ベクトル） | `dotu`、`dotc_left`、`norm2`、`asum`、`iamax`、`axpy_in_place`、`axpby_in_place`、`scale_in_place`、`swap_in_place`、`rotate_in_place`、`modified_rotate_in_place` | $O(n)$ | $O(n)$ |
+| 2（行列とベクトル） | `mul_vec`、`symmetric_mul_vec`、`hermitian_mul_vec`、帯・パック行列の `mul_vec`、`rank_one_update_in_place` など | $O(mn)$ | $O(mn)$ |
+| 3（行列と行列） | `mul_mat`、`symmetric_mul_mat`、`hermitian_mul_mat`、`triangular_mul_mat`、`triangular_solve_mat`、`symmetric_rank_k_in_place`、`hermitian_rank_two_k_in_place` など | $O(mkn)$ | $O(mk + kn + mn)$ |
+
+行列積 $C = AB$（$A \in \mathbb{K}^{m \times k}$、$B \in \mathbb{K}^{k \times n}$）の各成分は $k$ 回の乗算と $k - 1$ 回の加算なので、実数の演算数は $mn(2k - 1)$ で、通常は $2mkn$ と数える。
+
+配列を返す `mul_vec`、`mul_mat` は標準形式、オプション付き形式（`mul_vec_with_options` など）、出力先を指定する API（`mul_vec_into` など）を持つ。
+内積やノルムのように値を返す `dotu`、`dotc_left`、`norm2`、`asum`、`iamax` は、標準形式とスコープ付き API（`dotu_scoped(&y, &options, cx)` など）を持つ。
+標準形式はいつも既定の `Standard` で計算するので、精度階層やバイト上限を選ぶとき、コンテキストの取り消しや BLAS プロバイダーを使うときは、`LinalgExecutionOptions` を受け取るほかの形を使う。
+`_in_place` の名前の関数（`VectorViewMut::axpy_in_place`、`MatrixView::symmetric_mul_vec_in_place` など）は、可変ビューの現在の値を入力にも使う更新（$y \leftarrow \alpha x + \beta y$ など）で、出力先を指定する API と同じく作業領域とコンテキストを受け取る。
+`f32` のベクトルには積を `f64` で累積して `f64` で返す `dot_wide` と、定数を足して `f32` で返す `dot_plus` と、それぞれのスコープ付き API もある。
+
+平面回転の係数は `givens_rotation(a, b)` が作る。
+結果の `GivensRotationResult` は $(a, b)$ を $(r, 0)$ に写す回転 `rotation()`（余弦 `cosine()` と正弦 `sine()` を持つ `GivensRotation`）、$r$ を返す `r()`、BLAS の ROTG と同じ補助値を返す `z()` を持ち、$r$ の符号も ROTG の規約に従う。
+`modified_givens_rotation(d1, d2, x1, y1)` は平方根を使わない修正 Givens 変換（Gentleman の方法、BLAS の ROTMG）を作り、更新した重み `d1()`、`d2()`、座標 `x1()` と、変換 `ModifiedRotation`（形を表す `ModifiedRotationFlag`）を `ModifiedRotationResult` で返す。
+どちらも計算量が一定のカーネルだが、コンテキストに付けた BLAS プロバイダーが ROTG・ROTMG を計算できるので、コンテキストの取り消しも確かめるスコープ付き API `givens_rotation_scoped(a, b, &options, cx)` と `modified_givens_rotation_scoped(d1, d2, x1, y1, &options, cx)` を持つ。
+作った回転をベクトルの組に掛けるのは `VectorViewMut::rotate_in_place` と `modified_rotate_in_place` である。
+
+行列ノルムは二通りに求める。
+`MatrixView::norm(MatrixNorm::One)` は列和の最大 $\lVert A \rVert_1$、`MatrixNorm::Infinity` は行和の最大 $\lVert A \rVert_\infty$、`MatrixNorm::Frobenius` は $\lVert A \rVert_F = (\sum_{ij} \lvert a_{ij} \rvert^2)^{1/2}$ を、成分を読むだけの $O(mn)$ の手間（空のビューでは $O(1)$）で計算し、何も確保しない。
+1 ノルムと ∞ ノルムの誤差は $m$ 個か $n$ 個の非負の項の和の丸めだけである。
+Frobenius ノルムは、成分がメモリ上で連続していれば全成分をあふれない 2 ノルムで一度に求め、そうでなければ行と列のうち数の少ない方のあふれない 2 ノルムを尺度付きの和で合わせる。
+$p$ 個の実数成分を持つ $k$ 本のベクトルの和として求めた場合の相対誤差は、非正規化数の丸めを除いて $\gamma_{2p+5} + \gamma_{8k+8} + \gamma_{2p+5}\gamma_{8k+8}$ 以下である（$\gamma_j = ju/(1 - ju)$ は[章の記号](../#記号)）。
+`operator_norm(op, kind)` は行列を持たない $m \times n$ の作用素 `op` を単位ベクトル $e_j$ に $n$ 回掛けて、同じノルムを丸め誤差の範囲で正確に求める。
+オプション付き形式 `operator_norm_with_options(op, kind, &options)` はバイト上限や反復の上限を選べ、スコープ付き API `operator_norm_scoped(op, kind, &options, &mut ws, cx)` は呼び出し側の作業領域とコンテキストを使う。
+どの形も各列を反復 1 回と数える。
+数回の積で 1 ノルムを推定するには `OneNormEstimator` を使う（[1 ノルムの推定と作用素の厳密なノルム](../norm-estimation/)）。
+
+列ごとの Kronecker 積である Khatri–Rao 積 `khatri_rao(a, b)` は、$m \times n$ の $A$ と $p \times n$ の $B$ から、第 $j$ 列が $a_{:,j} \otimes b_{:,j}$ の $mp \times n$ の行列を返す。
+オプション付き形式 `khatri_rao_with_options(a, b, &options)` はバイト上限を結果の大きさに当て、超えれば確保の前に `ResourceLimit` を返す。
+出力先を指定する API `khatri_rao_into(a, b, out, cx)` は呼び出し側の出力に書く。
+対称・Hermitian・三角の行列の積と三角行列の求解に渡す `MatrixSide` は、構造を持つ行列を左右どちらから掛けるかを指定する。
+
+## 行列積のパッキングとタイル
+
+行列積のカーネルは Goto と van de Geijn の方法（BLIS と同じ構成）で、$A$ の $m_c \times k_c$ ブロックと $B$ の $k_c \times n_c$ ブロックを連続な作業領域へ詰め直し（パッキング）、$m_r \times n_r$ のレジスタタイルを小さなカーネルで計算する。
+パッキングによってストライドや転置に関係なく単位ストライドで読めるようになり、詰めたブロックはキャッシュに残る間に繰り返し使われる。
+
+| 実行環境 | 対象 | $m_r \times n_r$ | $m_c$ | $k_c$ | $n_c$ |
+|---|---|---|---|---|---|
+| スカラー（Wasm を含む） | `f64` / `f32` | $4 \times 4$ | 64 | 128 | 128 |
+| x86-64 AVX2+FMA | `f64` / `f32` | $6 \times 8$ / $4 \times 16$ | 120 | 256 | 256 |
+| x86-64 AVX-512 | `f64` / `f32` | $4 \times 16$ / $4 \times 32$ | 128 | 256 | 256 |
+| AArch64 NEON | `f64` / `f32` | $4 \times 4$ / $4 \times 8$ | 96 | 256 | 256 |
+
+タイルの寸法は命令セットごとの固定値で、実行時にキャッシュの大きさを調べて変えることはない。
+複素数の積は実部と虚部を並べてパックし、深さを 2 倍にした実数の積として同じ実数のタイルで計算する（1m 法）。
+そのため複素数の個数で数えた $n_r$、$k_c$、$n_c$ は表の半分になり、誤差限界は各成分を $2k$ 項の実数の積として数える。
+命令セットはコンテキストのプロセッサ機能から一度だけ決まる。
+所有値を返す API は `ExecutionContext::sequential_native()` で検証済みのネイティブ命令を使い、出力先を指定する API に `ExecutionContext::sequential()` を渡すと移植可能なスカラーのタイルを使う。
+このハンドブックの Wasm セルはどちらのコンテキストでもスカラーのタイルで動く。
+
+## 精度階層 Standard と Exact
+
+積と集約の精度は `scioxide_core::Accuracy` で選び、既定は `Standard` である。
+標準形式はいつも `Standard` で計算し、`Exact` は `LinalgExecutionOptions::new().with_accuracy(Accuracy::Exact)` をオプション付き形式・出力先を指定する API・スコープ付き API に渡して選ぶ。
+
+scioxide-core の `Accuracy` の文書は `Standard` の限界を機械イプシロン $\varepsilon$ を使った $k\varepsilon/(1 - k\varepsilon)$ で書く。
+これは章の記号 $\gamma_k = ku/(1 - ku)$（$u = \varepsilon/2$）では $\gamma_{2k}$ にあたるので、以下ではこの形で書く。
+内側の次元が $k$ の実数の積で、`Standard` は成分ごとに
+
+$$
+\lvert \hat c_{ij} - c_{ij} \rvert \le \gamma_{2k} \,(\lvert A \rvert \lvert B \rvert)_{ij} + k\, u_{\mathrm{sub}}, \qquad \gamma_{2k} = \frac{k \varepsilon}{1 - k \varepsilon}
+$$
+
+を満たす。
+$u_{\mathrm{sub}}$ は出力の型の最小の非正規化数に 2 の冪の尺度を掛けた値で、この限界は $k \varepsilon < 1$ のときに意味を持つ。
+長さ $k$ の内積も同じ形で、右辺は $\gamma_{2k} \sum_i \lvert x_i y_i \rvert + k u_{\mathrm{sub}}$ になる。
+右辺が $\lvert A \rvert \lvert B \rvert$ で書かれているため、打ち消しのある内積では相対誤差の保証にならない。
+途中でオーバーフローしそうな場合は、成分を 2 の冪で尺度を変えて計算する。
+三角行列の求解は成分ごとの後退誤差 $\lvert r \rvert \le \gamma_{2n+2} (\lvert T \rvert \lvert X \rvert + \lvert \alpha B \rvert)$ を満たし、前進誤差はさらに条件数に比例する。
+$T$、$B$、$\alpha$ の 0 でない成分の大きさが $[2^{-e_{\max}/4}, 2^{e_{\max}/4}]$（$2^{e_{\max}}$ は最大の有限数を超える最小の 2 の冪）に入れば、`Standard` は通常の算術でブロック化した代入を行い、`Exact` は各残差 $\alpha b_i - \sum_j t_{ij} x_j$ を厳密に累積して一度丸めてから対角で割るので、`Exact` の結果はどの環境でも同じになる。
+その範囲の外では、どちらも行ごとに 2 の冪で尺度を変えるブロック化しない代入を使い、代入の途中で成分が増大して浮動小数点の範囲を超えた場合も $B$ から解き直すので、`S` に収まらない解だけを拒否する。
+`Exact` は積を厳密に累積して最後に一度だけ丸めるので、結果は正しく丸めた値になり、結果が正規化数の範囲にあれば誤差は $u \lvert c_{ij} \rvert$ 以下である。
+ノルム `norm2` は `Standard` では実数で尺度の調整が要らなければブロックごとの二乗和を、複素数や範囲の極端な値では Blue の 3 区分の尺度付き二乗和を使い、相対誤差の限界は非正規化数の丸めを除いて $\gamma_{4n+10}$ である（$n$ は実数成分の数）。
+`Exact` のノルムは尺度付き二乗和の漸化式を使う。
+どちらも平方根の正しい丸めまでは約束しない。
+
+再現性も階層で異なる。
+`Standard` は、同じオプションと同じ命令セットならワーカー（スレッド）の数によらずビット単位で同じ結果を返すが、命令セットが違えば同じ誤差限界の範囲で異なりうる。
+`Exact` は命令セットにもよらない（[共通概念の再現性の説明](../../../concepts/workspaces-and-reproducibility/#浮動小数点の非結合性と再現性の-3-段階)）。
+
+次のセルは $x = (1, 10^{e}, 1, -10^{e})$ を $p$ 回繰り返したベクトルと $y = (1, \dots, 1)$ の内積を計算する。
+入力は大きな項の指数 $e$（0〜20）と繰り返しの数 $p$（1〜64）で、内積の長さは $k = 4p$、厳密な値は $2p$ である。
+$10^{e}$ が $2^{53} \approx 9.0 \times 10^{15}$ を超えると隣の浮動小数点数との間隔が 2 以上になり、通常の和では 1 が大きな項に吸収されて失われる。
+表は標準形式 `dotu`、`Standard` のスコープ付き API（移植可能なコンテキスト `ExecutionContext::sequential()`）、`Exact` のスコープ付き API の計算値、誤差 $\lvert \hat s - 2p \rvert$、誤差限界と、誤差と限界の比を示す。
+誤差限界は `Standard` では $\gamma_{2k} \sum_i \lvert x_i y_i \rvert$（この入力では非正規化数の項 $k u_{\mathrm{sub}}$ は効かないので省く）、`Exact` では $u \cdot 2p$ で、比が 1 以下なら限界を満たしている。
+グラフは $e = 0, \dots, 20$ の `Standard` の誤差と限界を対数軸で示し、$10^e = 2^{53}$ の位置に縦線を引く。
+テストは計算値を厳密な $2p$ と、限界を式から求めた値と比べる。
+
+```rust
+//| id: linalg-accuracy-tiers
+//| ref: linalg-accuracy-tiers
+//| title: Standard と Exact の内積の誤差と誤差限界
+//| run: reactive
+//| crates: [scioxide-core, scioxide-linalg]
+//| inputs:
+//|   magnitude_exponent: {"type":"range","label":"大きな項の指数 e","description":"x = (1, 10^e, 1, −10^e) を繰り返す。","min":0,"max":20,"step":1,"value":17}
+//|   pairs: {"type":"range","label":"繰り返し p","description":"内積の長さは 4p。厳密な値は 2p。","min":1,"max":64,"step":1,"value":4}
+//| cases:
+//|   - {"id":"no-absorption","label":"e = 15","description":"10^15 は 2^53 より小さいので、Standard も厳密な 2p を返す。","inputs":{"magnitude_exponent":15}}
+//|   - {"id":"long","label":"e = 20, p = 64","description":"長さ 256 の内積でも、Exact は 2p = 128 を返す。","inputs":{"magnitude_exponent":20,"pairs":64}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"dots","path":"/rows/1/1","equals":0}
+//|       - {"artifact":"dots","path":"/rows/1/2","equals":8}
+//|       - {"artifact":"dots","path":"/rows/1/3","approx":{"value":2842.170943040401,"rtol":1e-12}}
+//|       - {"artifact":"dots","path":"/rows/2/1","equals":8}
+//|       - {"artifact":"dots","path":"/rows/0/4","range":{"max":1}}
+//|   - case: no-absorption
+//|     expect:
+//|       - {"artifact":"dots","path":"/rows/1/1","equals":8}
+//|       - {"artifact":"dots","path":"/rows/2/2","equals":0}
+//|       - {"artifact":"dots","path":"/rows/0/4","range":{"max":1}}
+//|   - case: long
+//|     expect:
+//|       - {"artifact":"dots","path":"/rows/2/1","equals":128}
+//|       - {"artifact":"dots","path":"/rows/1/4","range":{"max":1}}
+//|       - {"artifact":"dots","path":"/rows/0/4","range":{"max":1}}
+use scioxide_core::{Accuracy, ExecutionContext};
+use scioxide_linalg::{LinalgExecutionOptions, VectorView};
+
+let p = pairs.round() as usize;
+let exact = 2.0 * p as f64;
+// x = (1, 10^e, 1, −10^e) を p 回並べる。y = (1, …, 1)。
+let operands = |exponent: i32| -> (Vec<f64>, Vec<f64>) {
+    let big = 10.0_f64.powi(exponent);
+    let x = (0..p).flat_map(|_| [1.0, big, 1.0, -big]).collect();
+    (x, vec![1.0_f64; 4 * p])
+};
+// Standard の限界 γ_2k Σ|x_i y_i| = kε/(1 − kε) Σ|x_i y_i|（k = 4p）。f64 の演算による参照値。
+let standard_bound = |x: &[f64]| {
+    let k = x.len() as f64;
+    k * f64::EPSILON / (1.0 - k * f64::EPSILON) * x.iter().map(|v| v.abs()).sum::<f64>()
+};
+// スコープ付き API: 精度階層をオプションで選び、移植可能な逐次のコンテキストで計算する。
+let scoped = |exponent: i32, accuracy: Accuracy| -> Result<f64, String> {
+    let (x, y) = operands(exponent);
+    let options = LinalgExecutionOptions::new().with_accuracy(accuracy);
+    let cx = ExecutionContext::sequential();
+    let y = VectorView::from_slice(&y);
+    VectorView::from_slice(&x)
+        .dotu_scoped(y, &options, cx)
+        .map_err(|e| e.to_string())
+};
+let e = magnitude_exponent.round() as i32;
+let (x, y) = operands(e);
+// 標準形式: Standard を sequential_native() で計算する。
+let plain = VectorView::from_slice(&x)
+    .dotu(VectorView::from_slice(&y))
+    .map_err(|e| e.to_string())?;
+let limit = standard_bound(&x);
+// 正しく丸めた値の誤差は u |2p| 以下（u = ε/2）。
+let rounding = f64::EPSILON / 2.0 * exact;
+let row = |name: &'static str, value: f64, bound: f64| {
+    let error = (value - exact).abs();
+    (name, value, error, bound, error / bound)
+};
+let rows = vec![
+    row("dotu（標準形式、Standard）", plain, limit),
+    row(
+        "dotu_scoped（Standard、移植可能）",
+        scoped(e, Accuracy::Standard)?,
+        limit,
+    ),
+    row(
+        "dotu_scoped（Exact）",
+        scoped(e, Accuracy::Exact)?,
+        rounding,
+    ),
+];
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let sig6 = serde_json::json!({ "significantDigits": 6 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "形と精度階層" },
+    { "key": "1", "label": "計算値 [-]", "type": "number", "format": sig6 },
+    { "key": "2", "label": "誤差 |計算値 − 2p| [-]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "誤差限界 [-]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "誤差 / 限界 [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "dots" })
+);
+// 誤差が厳密に 0 の点は対数軸に描けないので系列から除く。
+let mut error_points = Vec::new();
+let mut bound_points = Vec::new();
+for exponent in 0..=20 {
+    let error = (scoped(exponent, Accuracy::Standard)? - exact).abs();
+    if error > 0.0 {
+        error_points.push([f64::from(exponent), error]);
+    }
+    bound_points.push([f64::from(exponent), standard_bound(&operands(exponent).0)]);
+}
+let threshold = 53.0 * 2.0_f64.log10();
+emit_line_chart!(
+    &vec![
+        serde_json::json!({
+            "name": "Standard の誤差",
+            "points": error_points,
+            "style": { "showSymbol": true }
+        }),
+        serde_json::json!({
+            "name": "限界 γ₂ₖ Σ|xᵢ yᵢ|",
+            "points": bound_points,
+            "style": { "lineType": "dashed" }
+        }),
+    ],
+    options = &serde_json::json!({
+        "xLabel": "大きな項の指数 e [-]",
+        "yLabel": "誤差 |計算値 − 2p| [-]",
+        "yType": "log",
+        "annotations": [{ "kind": "line", "axis": "x", "value": threshold, "label": "10^e = 2⁵³" }]
+    })
+);
+```
+
+$e \le 15$ では `Standard` も厳密な $2p$ を返し、誤差の系列には点がない（誤差 0 は対数軸に描けないので除いている）。
+$e = 16$ では $10^{16}$ の隣の浮動小数点数との間隔が 2 になり、$10^{16} + 1$ が $10^{16}$ に丸められて 1 がすべて失われる。
+既定の $e = 17$、$p = 4$ では `Standard` の結果は 0 で、誤差 $2p = 8$ は限界 $2.8 \times 10^{3}$ の範囲に収まっている。
+限界は $\sum_i \lvert x_i y_i \rvert$ に比例して $e$ とともに増えるので、打ち消しが大きい内積の相対誤差については何も保証しない。
+$p$ を増やすと誤差は $2p$ に比例し、限界は $k = 4p$ と $\sum_i \lvert x_i y_i \rvert$ の両方に比例して増える（$e = 20$、$p = 64$ で誤差 128、限界 $7.3 \times 10^{8}$）。
+`Exact` はどの $e$ と $p$ でも $2p$ を返し、誤差は 0 である。
+`Standard` のスコープ付き API は移植可能なスカラーのカーネルで計算し、ネイティブと Wasm の両方でここに書いた値になった。
+ネイティブ環境の標準形式 `dotu` はベクトル命令を使って和の順序を変えるので、同じ限界の範囲で別の値になりうる。
+このハンドブックの Wasm セルでは標準形式もスカラーのカーネルで動くので、表の 1 行目と 2 行目は一致する。
+
+---
+
+## まとめ
+
+`Matrix` は行優先の連続な配列で、`zeros`、`from_rows`、`from_vec`、`identity` で作り、成分の有限性は演算が計算の前に調べる。
+ブロック・転置・随伴・対角はビューとして複製なしに定数時間で作れるので、部分行列や列優先の配列を写さずにカーネルへ渡せる。
+配列を返すカーネルは標準形式・オプション付き形式・出力先を指定する API を、値を返すカーネルは標準形式とスコープ付き API を持ち、精度階層、バイト上限、コンテキストの取り消しや BLAS プロバイダーを使うときは標準形式以外の形を選ぶ。
+行列のノルムは `MatrixView::norm`、行列を持たない作用素のノルムは `operator_norm` で求め、1 ノルムを数回の積で見積もるなら `OneNormEstimator` を使う。
+`Standard` の誤差限界は $\gamma_{2k} \lvert A \rvert \lvert B \rvert$ の形で打ち消しのある成分の相対誤差を保証しないので、打ち消しの大きい内積や積が問題になるときは `with_accuracy(Accuracy::Exact)` をオプション付き形式かスコープ付き API に渡す。
+
+## 次に読むページ
+
+- [作業領域・実行コンテキスト・試行記録](../workspaces-and-execution/)：呼び出しの形の定義と、出力先を指定する API に渡す作業領域の大きさの決め方、取り消しや試行記録の読み方を確かめる。
+- [LU・Cholesky・LDL 分解と直接解の受理](../direct-and-structured-solvers/)：ここで述べた水準 3 の積が、ブロック化した分解でどう使われるかを確かめる。
+- [外部 BLAS プロバイダーの仕様](../blas-provider/)：スコープ付き API と出力先を指定する API に渡したコンテキストから、どの演算が外部の BLAS に回るかを確かめる。

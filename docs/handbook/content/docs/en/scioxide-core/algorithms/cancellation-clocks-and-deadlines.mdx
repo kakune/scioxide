@@ -1,0 +1,217 @@
+---
+title: "Cancellation, clocks, and deadlines"
+description: "Injected Cancellation, monotonic Clock and ClockBinding, Deadline and combined time limits, stop_reason and check priorities and boundaries, and clock restrictions in Wasm."
+sidebar:
+  order: 325
+references:
+  core-wasm-clocks: "clocks-and-time-limits-in-wasm"
+  core-stop-reasons: "stop-reasons-and-check-boundaries"
+  core-cancellation-injection: "injecting-cancellation-clocks-and-deadlines"
+---
+
+Iterative methods and large batched array transformations may need to stop early in response to user actions or time limits.
+`scioxide-core` checks stop requests at processing boundaries.
+Computations check requests cooperatively between work units; running callbacks are not interrupted externally.
+Inject stop requests into the execution context `ExecutionContext` as cancellation signals or deadlines on a monotonic clock.
+This page explains injection, deadline combination, the two stop-checking methods, and where checks occur.
+[Execution policies, partitioning, and execution contexts](oxref:core-execution-context) covers context construction and executors.
+
+## Injecting cancellation, clocks, and deadlines
+
+A newly constructed execution context has no cancellation, clock, or deadline.
+The following methods take a context by value and return it with added capabilities.
+
+- Inject cancellation with `with_cancellation(&token)`.
+  Query the `Cancellation` trait through `is_cancelled()`; its `CancellationToken` implementation is a thread-safe flag, requested through `cancel()` and reset with `reset()` before reuse.
+- Inject a clock with `with_clock(&binding)`.
+  The `Clock` trait's `now()` returns monotonic time `MonotonicInstant` (elapsed time from a clock-specific origin; `duration_since_epoch()`, `checked_add`).
+  A clock wrapped in `ClockBinding::new(&clock)` defines one origin.
+  Distinct bindings are treated as distinct origins even when wrapping the same clock; subsequently supplying a binding different from the context's produces `CapabilityFailure`.
+  Supplying the same binding again preserves an existing deadline.
+  A failure `CapabilityError` returned by `now()` propagates to the caller as a `CapabilityFailure` error.
+- Set deadlines through `with_deadline(Deadline::after(&binding, duration)?)`, `Deadline::at(&binding, instant)`, or `with_time_limit(duration)`.
+  A deadline updates only when earlier than the existing deadline; a later deadline cannot relax it.
+  `with_time_limit` measures from the context clock's current time and returns `CapabilityUnavailable` if no clock is bound.
+  A zero-duration time limit is valid and expires immediately.
+  `Deadline::after` and `with_time_limit` return `CapabilityFailure` if the clock fails or the deadline time overflows.
+
+Child contexts passed to partition execution inherit the parent's cancellation and deadline unchanged.
+
+## Stop reasons and check boundaries
+
+A stop request takes effect when the algorithm checks at a boundary with consistent state.
+A deadline expires when the clock's current time reaches or exceeds its time.
+`stop_reason()` checks cancellation before deadlines and returns the stop reason (`ExecutionStopReason::Cancelled` or `DeadlineReached`) as a value, allowing iterative methods to publish partial results before exiting.
+Because the order is fixed, simultaneous cancellation and expiry report `Cancelled`.
+If cancellation is requested, `stop_reason()` returns without reading the clock.
+`check()` performs the same checks and returns a `ExecutionStopped` error if stopped.
+Both methods return `CapabilityFailure` if reading the clock fails during a deadline check.
+A running callback is not interrupted; stopping is not observed until it returns.
+The batched transformation `transform_into` in `scioxide-core` checks before at most every 256 scalar calls per partition; axiswise normalization and logarithmic sums check before each lane.
+All check again immediately before writing output.
+If stopping is observed, output is unchanged.
+
+The following cell implements a manual `Clock` advancing by 1 ms per work unit and checks `stop_reason()` at the boundaries of eight units.
+Inputs are time to deadline $D$ (1–12 ms) and the unit before which cancellation is requested, $c$ (1–9; 9 means no request).
+The context first receives a $D$ ms limit, then a 100 ms limit, checking that the earlier deadline remains.
+The first table shows the clock, cancellation flag, and displayed `stop_reason()` at each boundary.
+The second shows completed units, the category of `check()` at the final boundary, and the category from requesting a time limit without a clock.
+Check that completed units equal $\min(D, c - 1, 8)$ and cancellation is reported when cancellation and expiry coincide at a boundary.
+
+```rust
+//| id: core-stop-reason-boundaries
+//| ref: core-stop-reason-boundaries
+//| title: "Checking cancellation and deadlines at work boundaries"
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   deadline_ms: {"type":"range","label":"Time to deadline D [ms]","description":"The manual clock advances 1 ms per work unit. At 9 or above, the deadline is not reached within eight units.","min":1,"max":12,"step":1,"value":5}
+//|   cancel_unit: {"type":"range","label":"Cancellation unit c","description":"Request cancellation just before starting this unit. 9 means no request.","min":1,"max":9,"step":1,"value":9}
+//| cases:
+//|   - {"id":"cancelled","label":"Cancel before unit 2","description":"Only one unit completes; the reason is cancelled.","inputs":{"cancel_unit":2}}
+//|   - {"id":"both","label":"D = 3 ms, cancel before unit 4","description":"The deadline has also expired at this boundary, but cancellation is checked first and reported.","inputs":{"deadline_ms":3,"cancel_unit":4}}
+//|   - {"id":"completed","label":"D = 12 ms, no cancellation","description":"All eight units complete and no stop is observed.","inputs":{"deadline_ms":12}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"checks","path":"/rows/4/3","equals":null}
+//|       - {"artifact":"checks","path":"/rows/5/1","equals":5}
+//|       - {"artifact":"checks","path":"/rows/5/3","equals":"deadline reached"}
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":5}
+//|       - {"artifact":"summary","path":"/rows/0/1","equals":"ExecutionStopped"}
+//|       - {"artifact":"summary","path":"/rows/0/2","equals":"CapabilityUnavailable"}
+//|   - case: cancelled
+//|     expect:
+//|       - {"artifact":"checks","path":"/rows/1/3","equals":"cancelled"}
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":1}
+//|   - case: both
+//|     expect:
+//|       - {"artifact":"checks","path":"/rows/3/1","equals":3}
+//|       - {"artifact":"checks","path":"/rows/3/3","equals":"cancelled"}
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":3}
+//|   - case: completed
+//|     expect:
+//|       - {"artifact":"checks","path":"/rows/7/3","equals":null}
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":8}
+//|       - {"artifact":"summary","path":"/rows/0/1","equals":"Ok"}
+use core::sync::atomic::{AtomicU32, Ordering};
+use core::time::Duration;
+use scioxide_core::{
+    CancellationToken, CapabilityError, Clock, ClockBinding, ExecutionContext, SciOxideError,
+    SciOxideErrorKind, MonotonicInstant,
+};
+
+/// Manual clock: return the stored value as elapsed time from the origin [ms].
+struct StepClock(AtomicU32);
+impl Clock for StepClock {
+    fn now(&self) -> Result<MonotonicInstant, CapabilityError> {
+        let elapsed = Duration::from_millis(u64::from(self.0.load(Ordering::Relaxed)));
+        Ok(MonotonicInstant::from_duration_since_epoch(elapsed))
+    }
+}
+
+const UNITS: u32 = 8;
+let cancel_at = cancel_unit as u32;
+let clock = StepClock(AtomicU32::new(0));
+let binding = ClockBinding::new(&clock);
+let token = CancellationToken::new();
+// Add a 100 ms limit after the D ms limit. The earlier deadline remains.
+let cx = ExecutionContext::sequential()
+    .with_cancellation(&token)
+    .with_clock(&binding)
+    .and_then(|cx| cx.with_time_limit(Duration::from_millis(deadline_ms as u64)))
+    .and_then(|cx| cx.with_time_limit(Duration::from_millis(100)))
+    .map_err(|e| e.to_string())?;
+
+let mut checks = Vec::new();
+let mut completed = 0_u32;
+for unit in 1..=UNITS {
+    if unit == cancel_at {
+        token.cancel();
+    }
+    // Check at work boundaries. Reasons return as values, allowing completed work to be retained on exit.
+    let reason = cx.stop_reason().map_err(|e| e.to_string())?;
+    let requested = if unit >= cancel_at {
+        "Yes"
+    } else {
+        "No"
+    };
+    let now = clock.0.load(Ordering::Relaxed);
+    checks.push((unit, now, requested, reason.map(|r| r.to_string())));
+    if reason.is_some() {
+        break;
+    }
+    // One work unit advances the clock by 1 ms.
+    clock.0.fetch_add(1, Ordering::Relaxed);
+    completed += 1;
+}
+
+let kind_name = |result: Result<(), SciOxideError>| match result.map_err(|e| e.kind()) {
+    Ok(()) => "Ok",
+    Err(SciOxideErrorKind::ExecutionStopped) => "ExecutionStopped",
+    Err(SciOxideErrorKind::CapabilityUnavailable) => "CapabilityUnavailable",
+    Err(_) => "Other category",
+};
+let check_columns = serde_json::json!([
+    { "key": "0", "label": "Next unit to start", "type": "integer" },
+    { "key": "1", "label": "Clock [ms]", "type": "integer" },
+    { "key": "2", "label": "Cancellation requested" },
+    { "key": "3", "label": "Displayed stop_reason()", "nullText": "None (continue)" }
+]);
+emit_table_with_columns!(
+    check_columns,
+    checks,
+    metadata = serde_json::json!({ "id": "checks", "title": "Boundary checks" })
+);
+// A context without a clock binding does not accept a time limit.
+let without_clock = ExecutionContext::sequential().with_time_limit(Duration::from_millis(1));
+let summary_columns = serde_json::json!([
+    { "key": "0", "label": "Completed work [units]", "type": "integer" },
+    { "key": "1", "label": "check() at final boundary" },
+    { "key": "2", "label": "with_time_limit without a clock" }
+]);
+emit_table_with_columns!(
+    summary_columns,
+    vec![(
+        completed,
+        kind_name(cx.check()),
+        kind_name(without_clock.map(|_| ())),
+    )],
+    metadata = serde_json::json!({ "id": "summary", "title": "Stopping results" })
+);
+```
+
+At the defaults ($D = 5$ ms, no cancellation), five units complete; at the boundary before unit six, the clock reaches 5 ms and `stop_reason()` returns `deadline reached` (`DeadlineReached`).
+The later 100 ms limit has not relaxed the 5 ms deadline.
+Calling `check()` at the same boundary produces a `ExecutionStopped` error.
+Requesting a time limit on `ExecutionContext::sequential()` without a clock binding returns `CapabilityUnavailable`.
+
+Requesting cancellation before unit two completes only one unit and reports `cancelled` (`Cancelled`).
+With $D = 3$ ms and cancellation before unit four, the clock is 3 ms and the deadline has expired at that boundary, but cancellation is checked first and reported.
+With $D = 12$ ms and no cancellation, all eight units complete and the final `check()` returns `Ok`.
+At $D = 8$ ms, all eight units complete, but the clock then reaches the deadline, so the final `check()` is `ExecutionStopped`.
+This illustrates stopping observed by the check immediately before output is written.
+
+## Clocks and time limits in Wasm
+
+Handbook cells run on `wasm32-unknown-unknown`.
+The standard clock `StdClock` (the `std` feature) is based on `std::time::Instant` and cannot be used in this environment.
+Cells therefore cannot set real-time limits.
+Cancellation and deadlines on a custom `Clock` still work, so the cell above checks deadline behavior using a manual clock.
+[Execution policies, partitioning, and execution contexts](oxref:core-wasm-execution-limits) covers restrictions on parallel execution and processor instructions.
+
+## Summary
+
+Inject stop requests as cancellation through `with_cancellation` or deadlines (`with_deadline`, `with_time_limit`) on a clock bound through `with_clock`.
+Combining deadlines retains the earlier one; later calls cannot relax it.
+Iterative methods call `stop_reason()` at work boundaries and, when a reason is returned, publish the accepted state before exiting.
+Use `check()` when only propagating an error is required.
+Simultaneous cancellation and expiry report `Cancelled`.
+A context without a clock binding rejects time limits with `CapabilityUnavailable`, so call `with_clock` before using them.
+
+## Further reading
+
+- [Execution policies, partitioning, and execution contexts](../execution-and-partitions/): Check construction of contexts carrying stop requests and contracts of executors running partitions.
+- [Solve lifecycle and computation count management](../solve-lifecycle-and-accounting/): Check stop tests at iteration boundaries and associated accounting.
+- [Error categories and detailed views](../errors-and-diagnostic-views/): Check how to read details of `ExecutionStopped`, `CapabilityUnavailable`, and `CapabilityFailure` through `view()`.
+- [Solve accounting and execution APIs](../../api/solve-and-execution/): Look up all cancellation, clock, and deadline items.

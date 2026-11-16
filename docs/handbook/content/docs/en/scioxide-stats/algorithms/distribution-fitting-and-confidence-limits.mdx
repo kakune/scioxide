@@ -1,0 +1,740 @@
+---
+title: "Distribution fitting and the observed information matrix"
+description: "Maximum likelihood for censored and truncated observations, distribution fitting by moments and quantile matching, injected solvers and derivative capabilities, fitting reports, and asymptotic covariance and identifiability diagnostics from the observed information matrix."
+sidebar:
+  order: 370
+references:
+  stats-fitting-censored-lifetimes: "censored-lifetime-data"
+  stats-fitting-distribution-protocol: "distribution-fitting-protocol"
+  stats-fitting-likelihood-moment-quantile-objectives: "likelihood-moment-and-quantile-objectives"
+  stats-fitting-model-types: "model-types"
+  stats-fitting-normal-three-methods: "fit-a-normal-distribution-with-three-methods"
+  stats-fitting-observations-censoring-truncation: "observations-censoring-and-truncation"
+  stats-fitting-observed-information-covariance: "observed-information-and-asymptotic-covariance"
+  stats-fitting-prepared-objective: "prepared-objective"
+  stats-fitting-request-and-fit-calls: "requests-and-fitting-calls"
+  stats-fitting-results-and-reporting: "results-and-reports"
+  stats-fitting-solver-derivative-capabilities: "solver-and-derivative-capabilities"
+---
+
+Fitting a parametric probability family to a sample seeks parameter estimates and their statistical uncertainty.
+This page first formulates fitting a distribution family to observations as objective minimization, explaining how `scioxide-stats` constructs the objective and a caller-supplied solver minimizes it.
+It then derives maximum-likelihood uncertainty from the observed information matrix and examines diagnostics for nonidentifiability and estimates on bounds.
+Intervals maintaining at least nominal coverage even for finite samples (Clopper–Pearson and Garwood limits), and parameter inversion by solving tail-probability equations, appear in [Parameter inversion by tail probabilities and exact confidence limits](../parameter-inversion-and-confidence-limits/).
+Box–Cox and Yeo–Johnson power transformations and normal probability plots use the same solver mechanism but appear in [Mathematics of descriptive statistics, standardization, and power transformations](../descriptive-statistics-and-transforms/).
+Definitions of one-shot, detailed, borrowed, and scoped calls appear in [Call forms](oxref:stats-execution-forms).
+
+## Observations, censoring, and truncation
+
+Assume a random variable $X$ follows a family $\{P_\theta\}$ with parameter vector $\theta \in \mathbb{R}^d$.
+Write its density as $f(x;\theta)$ for continuous distributions, probability mass as $p(x;\theta)$ for count distributions, and cumulative distribution function as $F(x;\theta) = P_\theta(X \le x)$.
+Assume observations $o_1, \dots, o_n$ are independent.
+
+Real data may reveal only a range containing a value, rather than the value itself.
+If a lifetime test stops at time $c$, an individual that has not failed reveals only $X > c$.
+This is called censoring.
+`FitObservation` represents observations in four ways; every interval is half-open $(l, u]$, excluding its left endpoint and including its right.
+
+| Variant | Known information | Likelihood contribution |
+|---|---|---|
+| `Exact(x)` | $X = x$ | $f(x;\theta)$ for continuous distributions, $p(x;\theta)$ for count distributions |
+| `LeftCensored(x)` | $X \le x$ | $F(x;\theta)$ |
+| `RightCensored(x)` | $X > x$ | $1 - F(x;\theta)$ |
+| `IntervalCensored { lower, upper }` | $l < X \le u$ | $F(u;\theta) - F(l;\theta)$ |
+
+Separately from censoring, only values within a range $(a, b]$ may be recorded at all.
+Measurements that do not record values below a detection limit are an example; this is called truncation.
+With truncation, even the number of unobserved individuals is unknown.
+`FitTruncation { lower, upper }` represents truncation interval $(a, b]$ with `Option` endpoints; a `None` side is unbounded.
+Under truncation, divide each observation's likelihood by the interval probability $P_\theta(a < X \le b)$.
+
+Censored-observation probabilities are evaluated directly in logarithmic form with `log_interval_probability` from `scioxide-random`.
+This function constructs interval probabilities from the smaller of the lower tail $\ln F$ and upper tail $\ln(1-F)$, avoiding cancellation in $F(u) - F(l)$ and preserving relative accuracy even in far tails where both endpoint cumulative probabilities round to 1.
+
+## Likelihood, moment, and quantile objectives
+
+`FitMethod` chooses one of three fitting objectives $J(\theta)$ to minimize.
+
+**Maximum likelihood** (`FitMethod::Likelihood`) minimizes negative log-likelihood.
+
+$$
+J(\theta) = -\sum_{i=1}^{n} \Bigl[ \ln L_i(\theta) - \ln P_\theta(a < X \le b) \Bigr]
+$$
+
+Here, $L_i$ is the contribution in the table above; censored intervals are intersected with the truncation interval before evaluation.
+Without truncation, the second term is 0.
+The sum uses compensated summation.
+At parameters assigning zero probability to an observation (such as an observation outside uniform support or a noninteger Poisson observation), objective evaluation returns `DomainError`.
+
+**Method of moments** (`FitMethod::Moments { orders, scales }`) matches raw moments $\mu'_k(\theta) = E_\theta[X^k]$ of orders $k$ to sample raw moments $m'_k = n^{-1}\sum_i x_i^k$.
+**Quantile matching** (`FitMethod::Quantiles { probabilities, scales, convention }`) matches quantiles $Q(p_j;\theta)$ at probabilities $p_j$ to sample quantiles $\hat q(p_j)$ computed with convention `convention` of `QuantileMethod`.
+Both minimize the sum of squares of residuals after dividing each residual by its positive scale $s_j$.
+
+$$
+J(\theta) = \sum_{j} r_j(\theta)^2, \qquad
+r_j(\theta) = \frac{(\text{model value})_j - (\text{sample value})_j}{s_j}
+$$
+
+No coefficient $\tfrac12$ is applied.
+The scales $s_j$ weight residuals to comparable magnitudes; they leave the solution unchanged when equal numbers of equations and parameters can be solved exactly, but change overdetermined quantile-matching solutions.
+Sample raw moments are computed once with compensated extended-exponent-range sums; sample quantiles are also computed once during preparation.
+Neither matching method handles censoring or truncation; either causes preparation to return `NotImplemented`.
+
+The three methods give different estimators.
+Under regularity conditions, maximum likelihood is asymptotically efficient (its asymptotic variance reaches the Cramér–Rao bound) and naturally handles censoring and truncation.
+The method of moments often has a closed-form solution, but higher moments are sensitive to outliers and it is generally less efficient than maximum likelihood.
+Quantile matching is less affected by a few outliers when central quantiles are selected.
+For a normal distribution, matching first and second moments gives $\hat\mu = \bar x$ and $\hat\sigma^2 = n^{-1}\sum_i (x_i - \bar x)^2$, agreeing with maximum-likelihood estimates.
+
+### Model types
+
+The `FitModel` trait represents a distribution family.
+`parameter_count` gives the parameter count; `validate` checks membership in the family, including coupled constraints such as $\sigma > 0$.
+`log_observation` returns one observation's log density, log mass, or log interval probability, and returns $-\infty$ for zero-probability observations.
+`moment` and `quantile` return `NotImplemented` by default and are implemented only when needed for moments or quantile matching.
+Methods must be pure functions of their arguments and may be called from multiple threads.
+
+The built-in family `DistributionFitModel` has four variants and adds no location or scale parameters automatically.
+
+| Variant | Parameters | Notes |
+|---|---|---|
+| `Normal` | $[\mu, \sigma]$, $\sigma > 0$ | |
+| `Exponential` | $[\lambda]$, rate $\lambda > 0$ | Support $[0, \infty)$ |
+| `Uniform` | $[a, b]$, $a < b$ | Assigns density $1/(b-a)$ even to observations at $x = b$, allowing maximum-likelihood estimates $[\min x_i, \max x_i]$ |
+| `Poisson` | $[\lambda]$, $\lambda \ge 0$ | Noninteger `Exact` observations have zero probability. Quantiles return `NotImplemented` |
+
+Built-in families provide only first and second raw moments, derived from their means and variances; orders three and above return `NotImplemented`.
+Fit other continuous distributions with `LawFitModel::new(dimension, constructor)`.
+`constructor` constructs a `scioxide-random` distribution (or a type implementing density, CDF, survival, mean, variance, and quantile traits) from a parameter slice; it is called at every evaluation and should be lightweight and draw no random values.
+A zero `dimension` returns `InvalidInput`.
+Implement `FitModel` yourself for moments of order three or higher or for discrete-distribution quantiles.
+
+### Prepared objective
+
+`PreparedFit::new(model, observations, method, truncation, bounds, integer, options)` validates observations and the method, computes matching targets (sample moments or quantiles), and constructs a minimizable objective.
+`bounds` contains per-parameter bounds as `Bounds` from `scioxide-core`; equal bounds fix a parameter.
+`integer` marks per-parameter integer constraints.
+Observations, model, and bounds are borrowed; only matching targets are owned.
+`bounds()`, `integrality()`, and `method()` return the prepared bounds, integer constraints, and method.
+`StatisticsOptions::max_bytes` limits memory used for matching targets and sample copies.
+
+Preparation fails in these cases.
+
+- `InvalidInput`: empty observations, a model with no parameters, a `bounds` or `integer` length differing from the parameter count, integer-parameter bounds containing no integer, empty censoring or truncation intervals, observations outside the truncation interval, moment order 0, quantile probabilities outside $(0, 1)$, or empty, mismatched, or nonpositive scales.
+- `NonFinite`: NaN or infinite observations or truncation endpoints.
+- `NotImplemented`: censoring or truncation with a matching method.
+- `ResourceLimit`: required memory exceeds `options.max_bytes()`.
+
+`PreparedFit` implements the `FitObjective` trait.
+This trait provides parameter count `dimension`, domain validation `validate`, objective value `value`, residual count `residual_count` and residuals `residuals` for sum-of-squares objectives, and evaluation-workspace size `workspace_bytes` and construction `workspace`.
+`PreparedFit` uses workspace `()` and allocates nothing during evaluation.
+The power-transformation objectives `PreparedPowerFit` and `PreparedPpcc` and orthogonal-distance-regression objective `PreparedOdr` implement the same trait and can be minimized by the fitting functions below.
+The objective does not count its evaluations; the solver records them in the execution context.
+
+`fit_objectives_into(objective, parameters, options, output, scratch, workers, context)` evaluates the objective at $m$ parameter vectors in `parameters` at once and writes values to `output[i]`.
+`workers` supplies workspace per execution-plan worker (at most 64); values are independent of worker count.
+Use it when implementing `FitSolver` for population optimizers such as differential evolution or CMA-ES.
+These evaluations are not counted in the execution context, so the solver must count them.
+
+## Distribution fitting protocol
+
+`scioxide-stats` contains no optimization algorithm.
+The caller supplies a solver implementing `FitSolver` to minimize the objective.
+The same objective can therefore be solved by quasi-Newton, nonlinear least-squares, or constrained methods.
+`scioxide-optimize` provides the following implementations.
+
+| Type | Method | Bounds | Integers | Requirements |
+|---|---|---|---|---|
+| `LbfgsBFitSolver` | L-BFGS-B | Finite, one-sided, fixed | Unsupported | Optional gradient (otherwise numerical differentiation according to `LbfgsB` settings) |
+| `LeastSquaresFitSolver` | Gauss–Newton, Levenberg–Marquardt | Unsupported | Unsupported | Residuals (sum-of-squares objective) |
+| `SqpFitSolver` | Sequential quadratic programming | Same bounds as constraints | Unsupported | Nonlinear constraints |
+
+`LeastSquaresFitSolver` minimizes $\tfrac12\sum r_j^2$, with the same minimizer as $\sum r_j^2$.
+To fit integer parameters, implement a solver supporting integer constraints.
+
+### Solver and derivative capabilities
+
+`FitSolver::capabilities` returns `FitSolverCapabilities`, declaring support for bounds (`bounds`) and integer constraints (`integrality`), whether residuals are required (`requires_residuals`), and required derivatives (`derivatives`).
+Pass derivatives with the objective through `FitDerivatives`; `FitDerivativeCapabilities` returned by `capabilities` declares whether gradients (`gradient`), Hessians (`hessian`, row-major $d \times d$), or residual Jacobians (`jacobian`, one row per residual) can be computed.
+Each method defaults to `NotImplemented`, and `scioxide-stats` supplies no finite-difference approximations.
+Derivatives must refer to the same objective, data, and normalization; inconsistencies are not detected.
+
+Before solving, fitting checks whether solver and derivative capabilities meet the requested bounds, integer constraints, residuals, and derivatives.
+Unsupported bounds (any endpoint at all) or integer constraints, or missing residuals or derivatives required by the solver, return `NotImplemented`.
+Passing a bounded request to `LeastSquaresFitSolver` above stops at this check.
+
+`ExactFitDerivatives { model, samples }` supplies analytical gradients and Hessians of the built-in families' negative log-likelihood $\ell(\theta)$ for uncensored, untruncated `Exact` samples $x_1, \dots, x_n$.
+
+```text
+Normal [μ, σ]:      ∂ℓ/∂μ = Σ (μ − xᵢ)/σ²,   ∂ℓ/∂σ = Σ (1 − zᵢ²)/σ,   zᵢ = (μ − xᵢ)/σ
+               ∂²ℓ/∂μ² = n/σ²,   ∂²ℓ/∂μ∂σ = −2 Σ zᵢ/σ²,   ∂²ℓ/∂σ² = Σ (3zᵢ² − 1)/σ²
+Exponential [λ]:   ∂ℓ/∂λ = Σ (xᵢ − 1/λ),     ∂²ℓ/∂λ² = n/λ²
+Poisson [λ]:   ∂ℓ/∂λ = Σ (1 − xᵢ/λ),     ∂²ℓ/∂λ² = Σ xᵢ/λ²
+```
+
+The uniform family is nonregular because support depends on parameters; derivatives are not supplied and return `NotImplemented`.
+Derivatives do not exist at Poisson rate 0, returning `InvalidInput`.
+`evaluate(p, gradient, hessian)` writes both at once and returns `InvalidInput` for an empty sample or mismatched output lengths.
+For censored or truncated likelihoods it cannot be used; implement `FitDerivatives` yourself (the lifetime-data example below).
+
+### Requests and fitting calls
+
+`FitRequest { objective, derivatives, bounds, integrality, initial }` combines an objective, optional derivatives, bounds, integer constraints, and an initial point into one request.
+The initial point must be finite, lie within bounds, and satisfy integer constraints.
+The central fitting operation is the borrowed form `fit_into(request, solver, output, workspace, scope)`, proceeding in four steps.
+
+1. Check shapes, the initial point, and solver and derivative capabilities.
+2. Validate the initial point with `FitObjective::validate` (one domain evaluation).
+3. Call the solver.
+4. Check solver results against bounds and integer constraints and reevaluate the objective there (one objective evaluation).
+
+`output` is written only after step 4 succeeds.
+If an evaluation limit or stop request prevents step 2 or 4, `output` remains unchanged and the report has no objective value, returning `BudgetExhausted` or `Stopped`.
+The solver must return `Converged`, `BudgetExhausted`, `Stopped`, or `NotConverged`; any other status produces `InvalidInput`.
+Before each evaluation, the solver checks stop requests and the shared evaluation budget; its iteration count is bounded by its own configured limit.
+
+Workspace `FitWorkspace` holds one parameter vector and objective workspace, excluding the solver's own workspace.
+`FitWorkspace::new(dimension, options)` supports objectives without workspace; `FitWorkspace::for_objective(objective, options)` also constructs objective workspace.
+`last_attempt()` returns the record of the most recent fitting attempt.
+
+Other call forms add allocation and defaults to this borrowed form.
+
+| Form | Call | Difference |
+|---|---|---|
+| One-shot function | `fit(request, solver)` | Uses default `StatisticsOptions`. Unsuccessful termination becomes `Err` (`ConvergenceFailure` for `BudgetExhausted` and `NotConverged`; `ExecutionStopped` for `Stopped`) |
+| Detailed | `fit_with_options(request, solver, options)` | Returns the report in `Ok` even after stopping at a limit |
+| Scoped | `fit_scoped(request, solver, options, scope)` | Accepts an execution context or parent `SolveContext` and counts evaluations against the parent budget |
+| Borrowed | `fit_into(request, solver, output, workspace, scope)` | Writes to reserved output and workspace without allocation |
+
+Detailed and scoped forms allocate two parameter vectors (output and candidate) and one objective workspace; a total exceeding `options.max_bytes()` returns `ResourceLimit`.
+
+### Results and reports
+
+`FitResult` returned by detailed and scoped forms contains fitted parameters `parameters()` (`None` if stopped before final evaluation) and report `report()`; `into_parts()` extracts both.
+`FitReport` has four components.
+
+- `termination()`: `StatsTermination`.
+  `is_success()` is true only for `Converged` (fitting returns neither `Completed` nor `ExactFit`).
+- `objective()`: objective value reevaluated at the solver's returned point; `None` if stopped before final evaluation.
+- `active_bounds()`: number of parameters exactly on bounds, including fixed parameters.
+- `counts()`: `SolveCounts` from `scioxide-core`, counting solver iterations and evaluations by role, including final evaluation.
+
+Parameters published after unsuccessful termination are values at the limit and have not satisfied the convergence criterion.
+Always check termination status before using parameters.
+
+## Observed information and asymptotic covariance
+
+The Hessian of negative log-likelihood $\ell$ at the maximum-likelihood estimate $\hat\theta$,
+
+$$
+I(\hat\theta) = \nabla^2 \ell(\hat\theta)
+$$
+
+is called the observed information matrix.
+Under regularity conditions such as an interior true parameter, identifiability, and sufficiently smooth log-likelihood, $\hat\theta$ approximately follows $N(\theta, I(\hat\theta)^{-1})$.
+Thus, square roots of the diagonal of $I^{-1}$ estimate parameter standard errors $\mathrm{SE}(\hat\theta_j)$, and $\hat\theta_j \pm z_{1-\alpha/2}\,\mathrm{SE}(\hat\theta_j)$ gives approximate Wald confidence intervals.
+This is an asymptotic approximation; coverage can depart from nominal in small samples or near boundaries.
+
+`fit_information(parameters, bounds, integrality, hessian, rank_tolerance, options)` analyzes a caller-supplied Hessian (row-major $d \times d$) and returns `FitInformation`.
+Obtain the Hessian from `ExactFitDerivatives` or derive it yourself.
+Hessians of moment or quantile-matching objectives are not information matrices and do not yield meaningful covariance here.
+After excluding parameters fixed by equal bounds, symmetric eigendecomposition gives eigenvalues $\lambda_i$ of the remaining free-parameter submatrix $I_f$.
+`rank_tolerance` (`RankThreshold`) forms threshold $\tau$ scaled by the largest $|\lambda_i|$; the number of eigenvalues satisfying $|\lambda_i| > \tau$ is the numerical rank.
+Default absolute and relative `RankThreshold` are both $\sqrt{\varepsilon}$; the absolute component means changing parameter units may change the rank classification.
+Classification `FitIdentifiability` follows this order.
+
+| Classification | Condition | Covariance |
+|---|---|---|
+| `Nonregular` | Any free parameter is integer or lies exactly on a bound | `None` |
+| `Indefinite` | An eigenvalue is less than $-\tau$ (the estimate is not a local minimum) | `None` |
+| `RankDeficient` | Numerical rank is less than the free-parameter count | `None` |
+| `Identifiable` | None of the above | $I_f^{-1}$. Fixed-parameter rows and columns are 0 |
+
+`FitInformation` contains classification `identifiability()`, numerical rank `rank()`, `condition()` for condition number $\lambda_{\max}/\lambda_{\min}$ (`None` if rank-deficient or indefinite), and covariance `covariance()`; extract them with `into_parts()`.
+The classification is a numerical diagnostic at this point, not a proof of model identifiability.
+The cost is one symmetric eigendecomposition, $O(d^3)$.
+A free Hessian block that is not exactly symmetric returns `InvalidInput`; nonfinite parameters or Hessians, or parameters outside bounds, also cause errors.
+
+`scioxide-stats` does not provide profile likelihood confidence intervals.
+When Wald intervals are inaccurate near a boundary or for skewed likelihoods, repeatedly fix one parameter and refit the rest (equal bounds fix a parameter), then solve the likelihood-ratio equation $2\{\ell(\theta_j) - \ell(\hat\theta)\} = \chi^2_{1,1-\alpha}$ yourself.
+
+### Fit a normal distribution with three methods
+
+The next cell fits component lengths [mm] to a normal distribution $N(\mu, \sigma^2)$.
+It draws 29 values from $N(10, 2^2)$ and sets the 30th from the outlier-magnitude input.
+“None” draws the 30th from the same distribution; “+5σ” and “+20σ” set values of $10 + 5 \times 2$ and $10 + 20 \times 2$ [mm].
+Maximum likelihood uses `LbfgsBFitSolver` with the gradient from `ExactFitDerivatives` and bounds $\mu \in [-100, 100]$ and $\sigma \in [10^{-3}, 100]$.
+Moments (orders 1 and 2, scales 1 and 10) and quantile matching (probabilities 0.25, 0.5, and 0.75, scale 1, type-7 quantiles) use residual-based `LeastSquaresFitSolver` without bounds.
+All initial points are $(\mu, \sigma) = (5, 1)$.
+
+At the maximum-likelihood estimate, the Hessian from `ExactFitDerivatives::evaluate` is passed to `fit_information` for standard errors.
+The last row independently checks closed forms, manually computing $\bar x$ and $\hat\sigma = \sqrt{n^{-1}\sum_i (x_i - \bar x)^2}$ and their theoretical standard errors $\hat\sigma/\sqrt n$ and $\hat\sigma/\sqrt{2n}$.
+The outcome is `satisfied` if all three fits terminate successfully.
+
+```rust
+//| id: stats-distribution-fitting-and-confidence-limits-api-3
+//| ref: stats-distribution-fitting-and-confidence-limits-api-3
+//| title: "Fit a normal distribution by likelihood, moments, and quantiles and compare outlier effects"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-linalg, scioxide-optimize, scioxide-random, scioxide-stats]
+//| inputs:
+//|   outlier: {"type":"select","label":"30th value","options":[{"label":"None (draw from the same distribution)","value":"0"},{"label":"+5σ","value":"5"},{"label":"+20σ","value":"20"}],"value":"20"}
+//|   seed: {"type":"range","label":"Random seed","min":1,"max":100,"step":1,"value":7}
+//| cases:
+//|   - {"id":"clean","label":"No outlier","description":"All three methods give similar estimates.","inputs":{"outlier":"0"}}
+//|   - {"id":"mild","label":"+5σ","description":"Maximum-likelihood and moment estimates of σ begin to increase.","inputs":{"outlier":"5"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"fits","path":"/rows/0/1","equals":"Converged"}
+//|       - {"artifact":"fits","path":"/rows/0/2","approx":{"value":11.55216944846,"rtol":1e-6}}
+//|       - {"artifact":"fits","path":"/rows/0/3","approx":{"value":7.47819941347,"rtol":1e-6}}
+//|       - {"artifact":"fits","path":"/rows/1/3","approx":{"value":7.47819941347,"rtol":1e-6}}
+//|       - {"artifact":"fits","path":"/rows/0/4","approx":{"value":1.36532616943,"rtol":1e-6}}
+//|       - {"artifact":"fits","path":"/rows/2/3","approx":{"value":2.24535884644,"rtol":1e-6}}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+//|   - case: clean
+//|     expect:
+//|       - {"artifact":"fits","path":"/rows/0/3","approx":{"value":2.23861990592,"rtol":1e-6}}
+//|       - {"artifact":"fits","path":"/rows/2/3","approx":{"value":2.04204270669,"rtol":1e-6}}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+//|   - case: mild
+//|     expect:
+//|       - {"artifact":"fits","path":"/rows/0/3","approx":{"value":2.83333820157,"rtol":1e-6}}
+//|       - {"artifact":"fits","path":"/rows/2/3","approx":{"value":2.24535884644,"rtol":1e-6}}
+use scioxide_core::{Bounds, RankThreshold, RealScalar};
+use scioxide_linalg::HermitianEigenOptions;
+use scioxide_optimize::{LbfgsB, LbfgsBFitSolver, LeastSquares, LeastSquaresFitSolver};
+use scioxide_random::{Distribution, Normal, SeedableRng, SplitMix64};
+use scioxide_stats::{
+    DistributionFitModel, ExactFitDerivatives, FitMethod, FitObjective, FitObservation,
+    FitRequest, FitSolver, PreparedFit, QuantileMethod, StatisticsOptions, fit_information,
+    fit_with_options,
+};
+
+let k: f64 = outlier
+    .parse()
+    .map_err(|_| format!("Cannot parse outlier {outlier} as a number"))?;
+let mut rng = SplitMix64::from_seed(seed as u64);
+let law = Normal::new(10.0_f64, 2.0).map_err(|e| e.to_string())?;
+let mut samples = Vec::with_capacity(30);
+for _ in 0..29 {
+    samples.push(law.sample(&mut rng).map_err(|e| e.to_string())?);
+}
+let last = law.sample(&mut rng).map_err(|e| e.to_string())?;
+samples.push(if k == 0.0 { last } else { 10.0 + k * 2.0 });
+let observations: Vec<_> = samples.iter().map(|&x| FitObservation::Exact(x)).collect();
+let model = DistributionFitModel::Normal;
+let boxed = Bounds::new(vec![(Some(-100.0), Some(100.0)), (Some(1e-3), Some(100.0))])
+    .map_err(|e| e.to_string())?;
+let free = Bounds::new(vec![(None, None); 2]).map_err(|e| e.to_string())?;
+let integer = [false; 2];
+let derivatives = ExactFitDerivatives {
+    model,
+    samples: &samples,
+};
+let probabilities = [0.25, 0.5, 0.75];
+let methods = [
+    ("Maximum likelihood", FitMethod::Likelihood),
+    (
+        "Method of moments",
+        FitMethod::Moments {
+            orders: &[1, 2],
+            scales: &[1.0, 10.0],
+        },
+    ),
+    (
+        "Quantile matching",
+        FitMethod::Quantiles {
+            probabilities: &probabilities,
+            scales: &[1.0; 3],
+            convention: QuantileMethod::Linear,
+        },
+    ),
+];
+let mut rows = Vec::new();
+let mut all_success = true;
+let mut ml_estimate = [0.0; 2];
+for (name, method) in methods {
+    let likelihood = matches!(method, FitMethod::Likelihood);
+    let bounds = if likelihood { &boxed } else { &free };
+    let options = StatisticsOptions::new();
+    let objective = PreparedFit::new(
+        &model,
+        &observations,
+        method,
+        None,
+        bounds,
+        &integer,
+        options,
+    )
+    .map_err(|e| e.to_string())?;
+    let residuals = objective.residual_count().unwrap_or(1);
+    let mut quasi_newton =
+        LbfgsBFitSolver::new(LbfgsB::default(), 2).map_err(|e| e.to_string())?;
+    let mut least_squares = LeastSquaresFitSolver::new(LeastSquares::default(), 2, residuals)
+        .map_err(|e| e.to_string())?;
+    let solver: &mut dyn FitSolver<f64> = if likelihood {
+        &mut quasi_newton
+    } else {
+        &mut least_squares
+    };
+    let request = FitRequest {
+        objective: &objective,
+        derivatives: if likelihood { Some(&derivatives) } else { None },
+        bounds,
+        integrality: &integer,
+        initial: &[5.0, 1.0],
+    };
+    let result = fit_with_options(request, solver, options).map_err(|e| e.to_string())?;
+    let report = result.report();
+    let termination = report.termination();
+    all_success &= termination.is_success();
+    let p = result.parameters().ok_or("Fitted parameters are absent")?;
+    let iterations = report
+        .counts()
+        .total()
+        .map_err(|e| e.to_string())?
+        .iterations();
+    // Analyze the Hessian at the maximum-likelihood estimate as observed information
+    let (mut se_mu, mut se_sigma) = (None, None);
+    if likelihood {
+        ml_estimate.copy_from_slice(p);
+        let (mut gradient, mut hessian) = ([0.0; 2], [0.0; 4]);
+        derivatives
+            .evaluate(p, &mut gradient, &mut hessian)
+            .map_err(|e| e.to_string())?;
+        let eig = HermitianEigenOptions::default();
+        let info = fit_information(
+            p,
+            bounds,
+            &integer,
+            &hessian,
+            RankThreshold::default(),
+            &eig,
+        )
+        .map_err(|e| e.to_string())?;
+        if let Some(cov) = info.covariance() {
+            se_mu = Some(RealScalar::sqrt(cov[0]));
+            se_sigma = Some(RealScalar::sqrt(cov[3]));
+        }
+    }
+    let state = Some(format!("{termination:?}"));
+    rows.push((name, state, p[0], p[1], se_mu, se_sigma, Some(iterations)));
+}
+// Check: closed-form maximum-likelihood estimates and theoretical standard errors (manual calculation)
+let n = samples.len() as f64;
+let mean = samples.iter().sum::<f64>() / n;
+let scatter: f64 = samples.iter().map(|x| (x - mean) * (x - mean)).sum();
+let sigma = RealScalar::sqrt(scatter / n);
+let (se_mu, se_sigma) = (
+    sigma / RealScalar::sqrt(n),
+    sigma / RealScalar::sqrt(2.0 * n),
+);
+rows.push((
+    "Closed form (check)",
+    None,
+    mean,
+    sigma,
+    Some(se_mu),
+    Some(se_sigma),
+    None,
+));
+let fixed4 = serde_json::json!({ "fractionDigits": 4 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Method" },
+    { "key": "1", "label": "Termination", "nullText": "－" },
+    { "key": "2", "label": "μ̂ [mm]", "type": "number", "format": fixed4 },
+    { "key": "3", "label": "σ̂ [mm]", "type": "number", "format": fixed4 },
+    { "key": "4", "label": "SE(μ̂) [mm]", "type": "number", "format": fixed4, "nullText": "－" },
+    { "key": "5", "label": "SE(σ̂) [mm]", "type": "number", "format": fixed4, "nullText": "－" },
+    { "key": "6", "label": "Iterations", "type": "integer", "nullText": "－" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "fits" })
+);
+
+let gap = (ml_estimate[0] - mean)
+    .abs()
+    .max((ml_estimate[1] - sigma).abs());
+let outcome = if all_success {
+    Outcome::satisfied("All three fits converged")
+        .explanation("The maximum-likelihood estimate agrees with its closed form; standard errors come from observed information.")
+} else {
+    Outcome::partial("Some fits stopped without satisfying convergence criteria")
+        .explanation("Estimates in rows whose termination status is not Converged are values at the limit.")
+};
+emit_outcome!(
+    outcome
+        .status(if all_success {
+            "Converged"
+        } else {
+            "NotConverged"
+        })
+        .diagnostic("Maximum-likelihood estimate minus closed form [mm]", gap, Some("mm"))
+);
+```
+
+With the default “+20σ”, the 30th value is 50 mm; maximum likelihood and moments both give $\hat\mu = 11.552$ and $\hat\sigma = 7.478$ mm, agreeing with closed forms to four decimal places.
+A single outlier makes $\hat\sigma$ about 3.7 times the true 2 mm and shifts $\hat\mu$ by 1.55 mm from the true 10 mm.
+Quantile matching considers only quartiles, staying at $\hat\mu = 10.544$ and $\hat\sigma = 2.245$ mm.
+Observed-information values $\mathrm{SE}(\hat\mu) = 1.3653$ and $\mathrm{SE}(\hat\sigma) = 0.9654$ mm agree with theory, but assume a correct normal model and exclude outlier bias.
+With “None”, the three estimates are close ($\hat\sigma$ is 2.239 for maximum likelihood and 2.042 mm for quantile matching), and the standard error falls to $\mathrm{SE}(\hat\mu) = 0.409$ mm.
+With “+5σ”, maximum-likelihood $\hat\sigma$ grows to 2.833 mm; quantile-matching estimates equal those for “+20σ”, unaffected by outlier magnitude.
+Iteration counts are 22 for L-BFGS-B maximum likelihood, 9 for Gauss–Newton moments, and 2 for quantile matching.
+Normal quantiles $Q(p) = \mu + \sigma z_p$ are linear in the parameters, making quantile matching linear least squares; Gauss–Newton reaches the solution in essentially one step.
+Quantile matching has three equations and two parameters, so residuals remain nonzero and scales $s_j$ affect the solution.
+
+### Censored lifetime data
+
+Start a component lifetime test with $n$ units and stop at time $c$ (type-I censoring).
+Assume exponential lifetimes with mean $1/\lambda$; $d$ units fail by $c$, revealing lifetimes $t_i$, while the remaining $n - d$ reveal only $X > c$.
+Writing total time on test as $T = \sum_{\text{failures}} t_i + (n - d)c$, the negative log-likelihood and its derivatives are
+
+$$
+\ell(\lambda) = -d \ln\lambda + \lambda T, \qquad
+\ell'(\lambda) = -\frac{d}{\lambda} + T, \qquad
+\ell''(\lambda) = \frac{d}{\lambda^2}
+$$
+
+For $d > 0$, the maximum-likelihood estimate is $\hat\lambda = d/T$, observed information is $I(\hat\lambda) = d/\hat\lambda^2$, and standard error is $\hat\lambda/\sqrt d$.
+Standard error is determined by failure count $d$, rather than sample size $n$.
+At $d = 0$, $\ell$ increases monotonically in $\lambda$, so no maximum-likelihood estimate exists (it lies on the lower bound).
+
+The next cell draws $n$ lifetimes from an exponential distribution with true mean 1000 h ($\lambda = 10^{-3}$ /h), selects censoring time $c$ as a multiple of the mean, and fits three ways.
+“Account for censoring” uses the correct likelihood with `RightCensored(c)`; “Treat censoring as observed” incorrectly uses $c$ as each censored lifetime with `Exact(c)`; “Discard censored” incorrectly uses only failures.
+The latter two overestimate $\lambda$ and underestimate mean lifetime.
+`ExactFitDerivatives` cannot handle censored likelihoods, so implement the above $\ell'$ and $\ell''$ as `FitDerivatives` and pass them to the solver and `fit_information`.
+The table's $z$ is $(\hat\lambda - \lambda)/\mathrm{SE}(\hat\lambda)$ and should be close to a standard-normal value under the correct likelihood.
+
+```rust
+//| id: stats-fit-censored-lifetimes
+//| ref: stats-fit-censored-lifetimes
+//| title: "Fit censored lifetimes with an exponential distribution and compare estimates ignoring censoring"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-linalg, scioxide-optimize, scioxide-random, scioxide-stats]
+//| inputs:
+//|   units: {"type":"range","label":"Number of units tested n","min":10,"max":200,"step":10,"value":40}
+//|   censor: {"type":"range","label":"Censoring time c (multiples of mean lifetime)","min":0.05,"max":3,"step":0.05,"value":1}
+//|   seed: {"type":"range","label":"Random seed","min":1,"max":100,"step":1,"value":1}
+//| cases:
+//|   - {"id":"light","label":"c = 3, n = 200","description":"With little censoring, the three estimates are close.","inputs":{"units":200,"censor":3}}
+//|   - {"id":"no-failure","label":"c = 0.05, n = 10, seed 4","description":"No failures occur, and the correct-likelihood estimate lies on the lower bound.","inputs":{"units":10,"censor":0.05,"seed":4}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"lifetimes","path":"/rows/0/2","equals":27}
+//|       - {"artifact":"lifetimes","path":"/rows/0/4","approx":{"value":1.10971171372e-3,"rtol":1e-6}}
+//|       - {"artifact":"lifetimes","path":"/rows/0/5","approx":{"value":1.10971171372e-3,"rtol":1e-12}}
+//|       - {"artifact":"lifetimes","path":"/rows/0/7","approx":{"value":2.13564118880e-4,"rtol":1e-6}}
+//|       - {"artifact":"lifetimes","path":"/rows/1/4","approx":{"value":1.64401735366e-3,"rtol":1e-6}}
+//|       - {"artifact":"lifetimes","path":"/rows/2/4","approx":{"value":2.38291851672e-3,"rtol":1e-6}}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+//|   - case: light
+//|     expect:
+//|       - {"artifact":"lifetimes","path":"/rows/0/2","equals":191}
+//|       - {"artifact":"lifetimes","path":"/rows/0/6","approx":{"value":1023.6917325,"rtol":1e-6}}
+//|   - case: no-failure
+//|     expect:
+//|       - {"artifact":"lifetimes","path":"/rows/0/1","equals":"Converged / Nonregular"}
+//|       - {"artifact":"lifetimes","path":"/rows/0/2","equals":0}
+//|       - {"artifact":"lifetimes","path":"/rows/0/7","equals":null}
+//|       - {"artifact":"lifetimes","path":"/rows/1/4","approx":{"value":0.02,"rtol":1e-6}}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+use scioxide_core::{Bounds, SciOxideError, RankThreshold, RealScalar};
+use scioxide_linalg::HermitianEigenOptions;
+use scioxide_optimize::{LbfgsB, LbfgsBFitSolver};
+use scioxide_random::{Distribution, Exponential, SeedableRng, SplitMix64};
+use scioxide_stats::{
+    DistributionFitModel, FitDerivativeCapabilities, FitDerivatives, FitMethod, FitObservation,
+    FitRequest, PreparedFit, StatisticsOptions, fit_information, fit_with_options,
+};
+
+/// Derivatives of exponential negative log-likelihood −d ln λ + λT (d is failure count, T is total time on test).
+struct TotalTimeDerivatives {
+    failures: f64,
+    exposure: f64,
+}
+impl FitDerivatives<f64> for TotalTimeDerivatives {
+    fn capabilities(&self) -> FitDerivativeCapabilities {
+        FitDerivativeCapabilities {
+            gradient: true,
+            hessian: true,
+            jacobian: false,
+        }
+    }
+    fn gradient(&self, p: &[f64], out: &mut [f64]) -> Result<(), SciOxideError> {
+        out[0] = -self.failures / p[0] + self.exposure;
+        Ok(())
+    }
+    fn hessian(&self, p: &[f64], out: &mut [f64]) -> Result<(), SciOxideError> {
+        out[0] = self.failures / (p[0] * p[0]);
+        Ok(())
+    }
+}
+
+let rate = 1e-3; // True failure rate [1/h] (mean lifetime 1000 h)
+let limit = censor * 1000.0; // Censoring time [h]
+let law = Exponential::new(rate).map_err(|e| e.to_string())?;
+let mut rng = SplitMix64::from_seed(seed as u64);
+let mut lifetimes = Vec::with_capacity(units as usize);
+for _ in 0..units as usize {
+    lifetimes.push(law.sample(&mut rng).map_err(|e| e.to_string())?);
+}
+let failed: Vec<f64> = lifetimes.iter().copied().filter(|&t| t <= limit).collect();
+let observed = |t: f64| {
+    if t <= limit {
+        FitObservation::Exact(t)
+    } else {
+        FitObservation::RightCensored(limit)
+    }
+};
+let designs = [
+    (
+        "Account for censoring",
+        lifetimes.iter().map(|&t| observed(t)).collect::<Vec<_>>(),
+    ),
+    (
+        "Treat censoring as observed",
+        lifetimes
+            .iter()
+            .map(|&t| FitObservation::Exact(t.min(limit)))
+            .collect(),
+    ),
+    (
+        "Discard censored",
+        failed.iter().map(|&t| FitObservation::Exact(t)).collect(),
+    ),
+];
+let bounds = Bounds::new(vec![(Some(1e-7), Some(0.1))]).map_err(|e| e.to_string())?;
+let model = DistributionFitModel::Exponential;
+let mut rows = Vec::new();
+let mut primary = None;
+for (name, observations) in &designs {
+    if observations.is_empty() {
+        continue; // With no failures, the “Discard” estimate cannot be constructed
+    }
+    // Sufficient likelihood statistics: failure count d and total time on test T
+    let mut failures = 0.0;
+    let mut exposure = 0.0;
+    for o in observations {
+        match *o {
+            FitObservation::Exact(t) => (failures, exposure) = (failures + 1.0, exposure + t),
+            FitObservation::RightCensored(c) => exposure += c,
+            _ => return Err("Unexpected observation".to_string()),
+        }
+    }
+    let derivatives = TotalTimeDerivatives { failures, exposure };
+    let options = StatisticsOptions::new();
+    let objective = PreparedFit::new(
+        &model,
+        observations,
+        FitMethod::Likelihood,
+        None,
+        &bounds,
+        &[false],
+        options,
+    )
+    .map_err(|e| e.to_string())?;
+    let mut solver = LbfgsBFitSolver::new(LbfgsB::default(), 1).map_err(|e| e.to_string())?;
+    let request = FitRequest {
+        objective: &objective,
+        derivatives: Some(&derivatives),
+        bounds: &bounds,
+        integrality: &[false],
+        initial: &[0.01],
+    };
+    let result = fit_with_options(request, &mut solver, options).map_err(|e| e.to_string())?;
+    let termination = result.report().termination();
+    let estimate = result.parameters().ok_or("Fitted parameters are absent")?[0];
+    let mut hessian = [0.0];
+    derivatives
+        .hessian(&[estimate], &mut hessian)
+        .map_err(|e| e.to_string())?;
+    let eig = HermitianEigenOptions::default();
+    let info = fit_information(
+        &[estimate],
+        &bounds,
+        &[false],
+        &hessian,
+        RankThreshold::default(),
+        &eig,
+    )
+    .map_err(|e| e.to_string())?;
+    let se = info.covariance().map(|c| RealScalar::sqrt(c[0]));
+    let z = se.map(|s| (estimate - rate) / s);
+    let closed = (failures > 0.0).then(|| failures / exposure);
+    if primary.is_none() {
+        primary = Some((termination, info.identifiability(), estimate));
+    }
+    let state = format!("{termination:?} / {:?}", info.identifiability());
+    rows.push((
+        *name,
+        state,
+        failures as u32,
+        exposure,
+        estimate,
+        closed,
+        1.0 / estimate,
+        se,
+        z,
+    ));
+}
+let sci4 = serde_json::json!({ "notation": "scientific", "significantDigits": 4 });
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let fixed0 = serde_json::json!({ "fractionDigits": 0 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Likelihood" },
+    { "key": "1", "label": "Termination status / information matrix" },
+    { "key": "2", "label": "Failure count d", "type": "integer" },
+    { "key": "3", "label": "Total time on test T [h]", "type": "number", "format": fixed0 },
+    { "key": "4", "label": "λ̂ [1/h]", "type": "number", "format": sci4 },
+    { "key": "5", "label": "d/T [1/h]", "type": "number", "format": sci4, "nullText": "Does not exist" },
+    { "key": "6", "label": "Mean lifetime 1/λ̂ [h]", "type": "number", "format": fixed0 },
+    { "key": "7", "label": "SE(λ̂) [1/h]", "type": "number", "format": sci4, "nullText": "Nonregular" },
+    { "key": "8", "label": "z [-]", "type": "number", "format": fixed2, "nullText": "－" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "lifetimes" })
+);
+
+let (termination, identifiability, estimate) = primary.ok_or("No fit")?;
+let outcome = if termination.is_success() {
+    Outcome::satisfied("The fit accounting for censoring converged")
+        .explanation("With Nonregular information, the estimate is on the lower bound and its standard error is unavailable.")
+} else {
+    Outcome::partial("The fit accounting for censoring stopped at a limit")
+};
+emit_outcome!(
+    outcome
+        .status(format!("{termination:?} / {identifiability:?}"))
+        .diagnostic("λ̂", estimate, Some("1/h"))
+);
+```
+
+At the defaults ($n = 40$, $c = 1000$ h, seed 1), $d = 27$ units fail and $T = 24331$ h.
+The censoring-aware estimate $\hat\lambda = 1.1097 \times 10^{-3}$ /h (mean lifetime 901 h) agrees with $d/T$ to 12 digits, and $\mathrm{SE} = 2.14 \times 10^{-4}$ /h and $z = 0.51$ are consistent with the true value.
+Treating censoring as observed shortens mean lifetime to 608 h; discarding censored units shortens it to 420 h, corresponding to biases of $z = 2.48$ and $3.02$ measured in each incorrect model's standard errors.
+At “c = 3, n = 200”, 191 of 200 units fail; the correct estimate is 1024 h ($z = -0.33$), the observed-value estimate 978 h, and the discard estimate 882 h ($z = 1.63$), so less censoring reduces the impact of the errors.
+At “c = 0.05, n = 10, seed 4”, no failures occur; the correct-likelihood estimate is on the lower bound $10^{-7}$ /h and information is `Nonregular`, so no standard error is available.
+With no failures, the “Discard censored” row cannot be constructed.
+The solver status is `Converged` and the outcome is `satisfied`, but this means optimization converged within bounds, not that the estimate is useful.
+Even with zero failures, treating the failure count over total time $T$ as Poisson gives the one-sided upper limit $\lambda_U = -\ln\beta/T$ with confidence level $1-\beta$ (the $k = 0$ case of Garwood limits in [Parameter inversion by tail probabilities and exact confidence limits](oxref:stats-inversion-closed-form-check)).
+
+## Summary
+
+Fit distributions by preparing an objective from observations and a method with `PreparedFit` and calling `fit_with_options` or `fit_into` with a solver implementing `FitSolver` (such as `LbfgsBFitSolver` in `scioxide-optimize`).
+Maximum likelihood handles censoring and truncation with `FitObservation` and `FitTruncation`; choose quantile matching for outlier resistance.
+Required residuals and derivatives and supported bounds and integer constraints are checked before solving, so supply compatible `FitSolverCapabilities` and `FitDerivativeCapabilities`.
+Check `FitReport::termination` before using estimates, derive standard errors by analyzing observed information with `fit_information`, and avoid Wald intervals unless the classification is `Identifiable`.
+`ExactFitDerivatives` cannot provide derivatives of censored or truncated likelihoods; implement `FitDerivatives` yourself.
+
+## Further reading
+
+- [Mathematics of descriptive statistics, standardization, and power transformations](../descriptive-statistics-and-transforms/): fit Box–Cox and Yeo–Johnson transformation parameters through the same solver mechanism and examine the transformed distribution with normal probability plots.
+- [Parameter inversion by tail probabilities and exact confidence limits](../parameter-inversion-and-confidence-limits/): invert tests for intervals maintaining nominal finite-sample coverage instead of using asymptotic Wald intervals.
+- [Survival analysis](../survival-analysis/): handle censored lifetimes with nonparametric Kaplan–Meier estimates and proportional-hazards models.

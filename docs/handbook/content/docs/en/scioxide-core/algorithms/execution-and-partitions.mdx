@@ -1,0 +1,447 @@
+---
+title: "Execution policies, partitioning, and execution contexts"
+description: "Partition selection from ExecutionPolicy and PlanLimits, partition identities and random keys, reproducibility through partition-ordered reduction, executor contracts, four execution context constructors and processor policies, and unavailable parallelism and instruction sets in Wasm."
+sidebar:
+  order: 320
+references:
+  core-execution-context: "constructing-execution-contexts"
+  core-wasm-execution-limits: "wasm-restrictions"
+  core-executor-contract: "executor-contracts"
+  core-execution-policy: "execution-policies-and-partition-selection"
+  core-ordered-reduction: "partition-ordered-reduction-and-reproducibility"
+  core-partition-ids: "partition-identities-and-random-keys"
+---
+
+Floating-point addition is not associative, so changing the order of partial sums can change trailing result digits.
+Parallel reduction in completion order can vary between executions even with identical inputs.
+`scioxide-core` determines partitions solely from input size and limits, merging partial results in partition-index order.
+Pass parallelization intent as `ExecutionPolicy` separately from the executor and clock in `ExecutionContext`.
+SciOxide does not read these from global state; computational resources are determined entirely by the supplied context.
+[Cancellation, clocks, and deadlines](../cancellation-clocks-and-deadlines/) covers external stopping through cancellation and deadlines.
+
+## Execution policies and partition selection
+
+`ExecutionPolicy` expresses parallelization intent and defaults to `Auto`.
+
+| Policy | Meaning |
+|---|---|
+| `Sequential` | Execute items in order within one partition |
+| `Auto` | Increase partitions only when the operation's size threshold and work estimate satisfy the executor's minimum work requirement |
+| `Parallel(n)` | Request at most `n` partitions (`NonZeroUsize`) |
+
+`ExecutionContext::plan(policy, work_items, limits)` chooses partition count $W$ from three operation-supplied `PlanLimits` values and available workers $A$ at the context's nesting depth (`worker_budget()`), returning `ExecutionPlan`.
+
+- `auto_threshold`: The minimum work-item count at which `Auto` considers partitioning.
+- `work_per_item`: Estimated work per item.
+  One unit is approximately one scalar operation; use 1 if no estimate is available.
+  This value affects only the partition count for `Auto`.
+- `worker_limit`: The operation's maximum allowed partition count.
+
+Let $n$ be the item count and $m$ the executor's minimum work per partition for `Auto` (`Executor::auto_min_work_per_worker`).
+When $n > 0$,
+
+$$
+W =
+\begin{cases}
+1 & \texttt{Sequential}, \text{ or } \texttt{Auto} \text{ and } n < \texttt{auto\_threshold}, \\
+\min\left(A,\ \texttt{worker\_limit},\ \max\left(1, \left\lfloor n / \lceil m / \texttt{work\_per\_item} \rceil \right\rfloor\right)\right) & \texttt{Auto} \text{ and } n \ge \texttt{auto\_threshold}, \\
+\min\left(r,\ A,\ \texttt{worker\_limit},\ n\right) & \texttt{Parallel}(r)
+\end{cases}
+$$
+
+For $n = 0$ there are no partitions.
+The third term of `Auto` requires at least $\lceil m / \texttt{work\_per\_item} \rceil$ items in every partition.
+Since partition sizes are at least $\lfloor n / W \rfloor$, choosing $W$ no larger than this quotient ensures even the smallest partition has estimated work at least $m$.
+A zero quotient, meaning total estimated work $n \times \texttt{work\_per\_item}$ is below $m$, gives one partition.
+Dividing by the ceiling of $m / \texttt{work\_per\_item}$ instead of multiplying to form total work $n \times \texttt{work\_per\_item}$ avoids overflow.
+For $A = 1$, the executor is not queried for $m$, and the partition count is 1.
+`Parallel(r)` ignores minimum work $m$.
+A plan created inside partition execution has $A = 1$, so nested work executes directly on the caller's worker.
+
+Partition $i$ ($0 \le i < W$) is a contiguous half-open interval; with $b = \lfloor n / W \rfloor$ and $r = n \bmod W$,
+
+$$
+[\, b\,i + \min(i, r),\ \ b\,i + \min(i, r) + b + [i < r] \,)
+$$
+
+
+Square brackets $[i < r]$ denote 1 when the condition holds and 0 otherwise.
+The first $r$ partitions contain one extra item each; no partition is empty.
+Partition indices and ranges do not depend on executor scheduling.
+
+`ThreadExecutor` requires $m = 32768$, so `Auto` uses one partition for small workloads.
+The default `Executor::auto_min_work_per_worker` is 1, in which case only `auto_threshold` applies.
+
+The following cell constructs plans for five policies using `ThreadExecutor` with eight workers, `auto_threshold` $= 500$, and `worker_limit` $= 8$.
+Inputs are work-item count $n$ (100–20000) and work per item `work_per_item` (1–200).
+It only constructs plans without executing them, so it creates no threads even in browser Wasm.
+The first table shows each policy's partition count, largest and smallest partition sizes, and total item count.
+The second computes the `Auto` formula without using `plan`.
+Check that totals equal $n$, largest and smallest sizes differ by at most 1, and the `Auto` partition count matches the formula.
+
+```rust
+//| id: core-execution-plan-resolution
+//| ref: core-execution-plan-resolution
+//| title: "Determining partition counts from policies and limits"
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   items_count: {"type":"range","label":"Work-item count n [items]","description":"The number of items to partition.","min":100,"max":20000,"step":100,"value":1000}
+//|   work_per_item: {"type":"range","label":"Work per item work_per_item [units]","description":"Estimated work per item supplied to PlanLimits.","min":1,"max":200,"step":1,"value":10}
+//| cases:
+//|   - {"id":"auto-splits","label":"n = 20000, work 10","description":"The minimum partition size is 3277 items, so Auto uses six partitions.","inputs":{"items_count":20000}}
+//|   - {"id":"heavy-items","label":"n = 20000, work 200","description":"The minimum partition size falls to 164 items, so Auto uses eight partitions, matching the worker count.","inputs":{"items_count":20000,"work_per_item":200}}
+//|   - {"id":"below-threshold","label":"n = 400, work 200","description":"Work suffices for two partitions, but n is below auto_threshold's 500 items, so Auto uses one partition.","inputs":{"items_count":400,"work_per_item":200}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"plans","path":"/rows/0/1","equals":1}
+//|       - {"artifact":"plans","path":"/rows/1/1","equals":1}
+//|       - {"artifact":"plans","path":"/rows/2/1","equals":2}
+//|       - {"artifact":"plans","path":"/rows/3/2","equals":125}
+//|       - {"artifact":"plans","path":"/rows/4/1","equals":8}
+//|       - {"artifact":"plans","path":"/rows/4/4","equals":1000}
+//|       - {"artifact":"auto","path":"/rows/0/1","equals":3277}
+//|       - {"artifact":"auto","path":"/rows/0/3","equals":1}
+//|   - case: auto-splits
+//|     expect:
+//|       - {"artifact":"plans","path":"/rows/1/1","equals":6}
+//|       - {"artifact":"plans","path":"/rows/1/2","equals":3334}
+//|       - {"artifact":"plans","path":"/rows/1/3","equals":3333}
+//|       - {"artifact":"plans","path":"/rows/1/4","equals":20000}
+//|       - {"artifact":"auto","path":"/rows/0/3","equals":6}
+//|   - case: heavy-items
+//|     expect:
+//|       - {"artifact":"plans","path":"/rows/1/1","equals":8}
+//|       - {"artifact":"auto","path":"/rows/0/1","equals":164}
+//|       - {"artifact":"auto","path":"/rows/0/2","equals":121}
+//|       - {"artifact":"auto","path":"/rows/0/3","equals":8}
+//|   - case: below-threshold
+//|     expect:
+//|       - {"artifact":"plans","path":"/rows/1/1","equals":1}
+//|       - {"artifact":"plans","path":"/rows/3/1","equals":8}
+//|       - {"artifact":"plans","path":"/rows/3/2","equals":50}
+//|       - {"artifact":"auto","path":"/rows/0/2","equals":2}
+//|       - {"artifact":"auto","path":"/rows/0/3","equals":1}
+use core::num::NonZeroUsize;
+use scioxide_core::{ExecutionContext, ExecutionPolicy, Executor, PlanLimits, ThreadExecutor};
+
+let nonzero = |value: usize| NonZeroUsize::new(value).ok_or("Zero cannot be specified");
+let (workers, threshold) = (nonzero(8)?, nonzero(500)?);
+// Only construct plans without executing them, so no threads are created.
+let executor = ThreadExecutor::new(workers);
+let cx = ExecutionContext::new(&executor);
+let limits = PlanLimits {
+    work_per_item: nonzero(work_per_item as usize)?,
+    auto_threshold: threshold,
+    worker_limit: workers,
+};
+let n = items_count as usize;
+
+let mut rows = Vec::new();
+for (label, policy) in [
+    ("Sequential", ExecutionPolicy::Sequential),
+    ("Auto", ExecutionPolicy::Auto),
+    ("Parallel(2)", ExecutionPolicy::Parallel(nonzero(2)?)),
+    ("Parallel(8)", ExecutionPolicy::Parallel(nonzero(8)?)),
+    ("Parallel(16)", ExecutionPolicy::Parallel(nonzero(16)?)),
+] {
+    let plan = cx.plan(policy, n, limits);
+    let sizes: Vec<usize> = plan.partitions().map(|p| p.range().len()).collect();
+    rows.push((
+        label,
+        plan.worker_count(),
+        sizes.iter().copied().max(),
+        sizes.iter().copied().min(),
+        sizes.iter().sum::<usize>(),
+    ));
+}
+let plan_columns = serde_json::json!([
+    { "key": "0", "label": "Policy" },
+    { "key": "1", "label": "Partition count W [partitions]", "type": "integer" },
+    { "key": "2", "label": "Largest partition [items]", "type": "integer", "nullText": "No partitions" },
+    { "key": "3", "label": "Smallest partition [items]", "type": "integer", "nullText": "No partitions" },
+    { "key": "4", "label": "Total items [items]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    plan_columns,
+    rows,
+    metadata = serde_json::json!({ "id": "plans", "title": "Plans by policy" })
+);
+
+// Independent check: evaluate Auto's formula without plan (A = worker_limit = 8).
+let m = executor.auto_min_work_per_worker().get();
+let minimum_items = m.div_ceil(work_per_item as usize);
+let quotient = n / minimum_items;
+let auto_by_formula = if n < threshold.get() {
+    1
+} else {
+    workers.get().min(quotient.max(1))
+};
+let auto_columns = serde_json::json!([
+    { "key": "0", "label": "Executor minimum work m [units]", "type": "integer" },
+    { "key": "1", "label": "Minimum items per partition ⌈m / work_per_item⌉ [items]", "type": "integer" },
+    { "key": "2", "label": "Quotient ⌊n / ⌈m / work_per_item⌉⌋", "type": "integer" },
+    { "key": "3", "label": "Auto partition count from formula [partitions]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    auto_columns,
+    vec![(m, minimum_items, quotient, auto_by_formula)],
+    metadata = serde_json::json!({ "id": "auto", "title": "Checking the Auto formula" })
+);
+```
+
+With the defaults $n = 1000$ and `work_per_item` $= 10$, the minimum partition size is $\lceil 32768 / 10 \rceil = 3277$ items; since $\lfloor 1000 / 3277 \rfloor = 0$, `Auto` uses one partition.
+`Parallel(8)` uses eight partitions of 125 items, while `Parallel(16)` is limited by `worker_limit` and eight executor workers to the same eight partitions.
+At $n = 20000$, the quotient is 6, and `Auto` creates two partitions of 3334 items and four of 3333 items.
+Increasing `work_per_item` to 200 reduces the minimum partition size to 164; the quotient 121 exceeds the worker count, so `Auto` uses eight partitions.
+At $n = 400$ and `work_per_item` $= 200$, the quotient is 2, but $n$ remains below `auto_threshold`'s 500, so `Auto` stays at one partition; only `Parallel(8)` uses eight partitions of 50 items.
+
+### Partition identities and random keys
+
+A plan's partitions are `WorkPartition` values with index `worker_index()`, half-open range `range()`, and hierarchical identity `id()` (`PartitionId`).
+`ExecutionPlan::partitions()` is an iterator `WorkPartitions` yielding partitions in index order, while `partition(i)` returns only partition `i`.
+The root context identity is `PartitionId::ROOT`; partition $i$ derives identity `child(i)` from its parent's identity.
+Nested partitioning follows the same tree rule, so identities depend only on tree position, not which worker executes them or when.
+
+`stream_key(domain)` derives a 128-bit key from this identity and purpose number `domain` (`u64`).
+The key requires no entropy-source query; generating each partition's random sequence from it reproduces that sequence independently of executor scheduling.
+
+## Partition-ordered reduction and reproducibility
+
+Regardless of arrival order, `ExecutionPlan::reduce(results, initial, reduce)` verifies that exactly one result arrived from every partition, then calls `reduce` in partition-index order.
+Unknown, duplicate, or missing partition results produce `ExecutionFailure` (`UnknownPartition`, `DuplicatePartition`, `MissingPartition`).
+`reduce` allocates result storage per partition and returns `AllocationFailure` if allocation fails.
+Errors returned by the argument closure `reduce` propagate unchanged.
+For a fixed partition count, reduction order therefore remains the same between executions.
+
+However, changing partition count $W$ changes partial-sum boundaries, so a sum computed with floating-point addition depends on $W$.
+For partition-independent sums, retain partial sums unrounded in `RangeAccumulator`, combine them through `merge`, and round once at the end with `finish`.
+Because `merge` introduces no rounding, it depends on neither merge order nor partition count.
+
+The following cell partitions the eight terms $(L, 1, 1, 1, -L, 1, 1, 1)$, mixing a large term $\pm L$ with ones, using a $W = 1, 2, 3, 4$ plan.
+It combines floating-point partial sums and partial `RangeAccumulator` states separately through `reduce`.
+The input is exponent $p$ (12–17) of $L = 10^p$; the mathematical sum is 6 regardless of $L$.
+The first table shows partition ranges and floating-point partial sums; the second shows merged sums and the low 16 bits of partition 0's `stream_key(1)`.
+In double precision, adjacent spacing becomes at least 2 above $2^{53} \approx 9.0 \times 10^{15}$, so for $L = 10^{16}$ the 1 in $L + 1$ is lost to rounding.
+
+```rust
+//| id: core-partition-reduction-determinism
+//| ref: core-partition-reduction-determinism
+//| title: "Varying partition counts and merging partial sums"
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   large_exponent: {"type":"range","label":"Large term exponent p (L = 10^p)","description":"At p of 16 or above, adding 1 to L loses the 1 to rounding.","min":12,"max":17,"step":1,"value":16}
+//| cases:
+//|   - {"id":"exact-range","label":"L = 10¹⁵","description":"L + 1 is representable in double precision, so floating-point sums also equal 6 regardless of partition count.","inputs":{"large_exponent":15}}
+//|   - {"id":"larger-gap","label":"L = 10¹⁷","description":"Adjacent spacing becomes 16, so even 2 added to L is lost.","inputs":{"large_exponent":17}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"sums","path":"/rows/0/1","approx":{"value":3,"atol":1e-12}}
+//|       - {"artifact":"sums","path":"/rows/1/1","approx":{"value":0,"atol":1e-12}}
+//|       - {"artifact":"sums","path":"/rows/2/1","approx":{"value":2,"atol":1e-12}}
+//|       - {"artifact":"sums","path":"/rows/3/1","approx":{"value":4,"atol":1e-12}}
+//|       - {"artifact":"sums","path":"/rows/0/2","approx":{"value":6,"atol":1e-12}}
+//|       - {"artifact":"sums","path":"/rows/3/2","approx":{"value":6,"atol":1e-12}}
+//|       - {"artifact":"sums","path":"/rows/0/3","equals":21708}
+//|       - {"artifact":"sums","path":"/rows/3/3","equals":21708}
+//|       - {"artifact":"parts","path":"/rows/9/3","equals":8}
+//|   - case: exact-range
+//|     expect:
+//|       - {"artifact":"sums","path":"/rows/0/1","approx":{"value":6,"atol":1e-12}}
+//|       - {"artifact":"sums","path":"/rows/1/1","approx":{"value":6,"atol":1e-12}}
+//|       - {"artifact":"sums","path":"/rows/3/1","approx":{"value":6,"atol":1e-12}}
+//|       - {"artifact":"sums","path":"/rows/2/2","approx":{"value":6,"atol":1e-12}}
+//|   - case: larger-gap
+//|     expect:
+//|       - {"artifact":"sums","path":"/rows/3/1","approx":{"value":2,"atol":1e-12}}
+//|       - {"artifact":"sums","path":"/rows/1/2","approx":{"value":6,"atol":1e-12}}
+use core::num::NonZeroUsize;
+use scioxide_core::{
+    ExecutionContext, ExecutionPolicy, PlanLimits, RangeAccumulator, ThreadExecutor,
+};
+
+// Integer powers of 10 through 10²² are exactly representable in double precision.
+let large = 10.0_f64.powi(large_exponent as i32);
+// The mathematical sum is 6.
+let terms = [large, 1.0, 1.0, 1.0, -large, 1.0, 1.0, 1.0];
+let nonzero = |value: usize| NonZeroUsize::new(value).ok_or("Zero cannot be specified");
+// Only construct plans without executing them, so no threads are created.
+let executor = ThreadExecutor::new(nonzero(4)?);
+let cx = ExecutionContext::new(&executor);
+let limits = PlanLimits {
+    work_per_item: NonZeroUsize::MIN,
+    auto_threshold: NonZeroUsize::MIN,
+    worker_limit: nonzero(4)?,
+};
+
+let mut parts = Vec::new();
+let mut sums = Vec::new();
+for workers in 1..=4_usize {
+    let policy = ExecutionPolicy::Parallel(nonzero(workers)?);
+    let plan = cx.plan(policy, terms.len(), limits);
+    let mut naive_parts = Vec::new();
+    let mut exact_parts = Vec::new();
+    for partition in plan.partitions() {
+        let range = partition.range();
+        let chunk = &terms[range.clone()];
+        let naive = chunk.iter().fold(0.0, |sum, &x| sum + x);
+        let mut state = RangeAccumulator::new();
+        for &x in chunk {
+            state.add(x).map_err(|e| e.to_string())?;
+        }
+        parts.push((
+            workers,
+            partition.worker_index(),
+            range.start,
+            range.end,
+            naive,
+        ));
+        naive_parts.push((partition.clone(), naive));
+        exact_parts.push((partition, state));
+    }
+    // Even when partial results are supplied in reverse order, reduce merges in partition-index order.
+    let naive = plan
+        .reduce(naive_parts.into_iter().rev(), 0.0, |sum, part| {
+            Ok(sum + part)
+        })
+        .map_err(|e| e.to_string())?;
+    let merge = |mut sum: RangeAccumulator<f64>, part| {
+        sum.merge(&part)?;
+        Ok(sum)
+    };
+    let exact = plan
+        .reduce(
+            exact_parts.into_iter().rev(),
+            RangeAccumulator::new(),
+            merge,
+        )
+        .and_then(|sum| sum.finish())
+        .map_err(|e| e.to_string())?;
+    // Partition 0's random key stays the same even when W changes its range.
+    let first = plan.partition(0).ok_or("No partitions")?;
+    sums.push((workers, naive, exact, first.id().stream_key(1) as u16));
+}
+
+let general = serde_json::json!({ "notation": "auto", "significantDigits": 3 });
+let part_columns = serde_json::json!([
+    { "key": "0", "label": "Partition count W [partitions]", "type": "integer" },
+    { "key": "1", "label": "Partition index i", "type": "integer" },
+    { "key": "2", "label": "Range start", "type": "integer" },
+    { "key": "3", "label": "Range end (exclusive)", "type": "integer" },
+    { "key": "4", "label": "Floating-point partial sum [-]", "type": "number", "format": general }
+]);
+emit_table_with_columns!(
+    part_columns,
+    parts,
+    metadata = serde_json::json!({ "id": "parts", "title": "Partial sums by partition" })
+);
+let fixed1 = serde_json::json!({ "fractionDigits": 1 });
+let sum_columns = serde_json::json!([
+    { "key": "0", "label": "Partition count W [partitions]", "type": "integer" },
+    { "key": "1", "label": "Merged floating-point partial sums [-]", "type": "number", "format": fixed1 },
+    { "key": "2", "label": "Merged RangeAccumulator [-]", "type": "number", "format": fixed1 },
+    { "key": "3", "label": "Low 16 bits of partition 0's stream_key(1)", "type": "integer" }
+]);
+emit_table_with_columns!(
+    sum_columns,
+    sums,
+    metadata = serde_json::json!({ "id": "sums", "title": "Merged sums" })
+);
+```
+
+At the default $L = 10^{16}$, floating-point sums are 3, 0, 2, and 4 in $W = 1, 2, 3, 4$ order; none equals 6.
+For example, at $W = 2$, partition 0's sum rounds to $L$ and partition 1's to $-L$, losing all six ones.
+The `RangeAccumulator` column equals 6 for every $W$.
+Although partial results are supplied in reverse order, `reduce` merges in partition-index order, giving the same value on repeated execution for the same $W$.
+
+At $L = 10^{15}$ or below, $L + 1$ is representable in double precision, so floating-point sums also equal 6 independently of partition count.
+At $L = 10^{17}$, adjacent spacing is 16, changing the $W = 4$ sum from 4 to 2.
+The final column is partition 0's random key; changing its range through $W$ leaves the key unchanged when the index is unchanged.
+
+## Executor contracts
+
+An implementation of `Executor` must execute every plan partition exactly once and release all borrows before returning.
+Execution order is unrestricted, but partition indices and ranges cannot change.
+It must not return on timeout while abandoning running callbacks.
+If multiple partitions fail, report the failure with the smallest index after every started partition finishes.
+
+- `SequentialExecutor`: Executes in index order on the caller's thread.
+  Callback panics propagate unchanged.
+- `ThreadExecutor::new(workers)` (the `std` feature): Executes with scoped threads.
+  Threads exist only during parallel work; the caller executes partition 0, and all workers are joined before return.
+  Callback panics produce `ExecutionFailure` (`CallbackPanicked`); failure to create a thread produces `ExecutionFailure` (`WorkerCreation`).
+  Work started inside a callback executes on that callback's thread.
+
+`ExecutionContext::execute(plan, operation)` passes the plan to the executor and calls `operation` after checking cancellation and deadlines before each partition ([check rules](oxref:core-stop-reasons)).
+Use `ExecutionContext::execute_partitioned(plan, slots, f)` and `backend::PartitionSlot` to supply owned data per partition.
+The `f` type `PartitionFn` is `Fn(WorkPartition, I, ExecutionContext) -> Result<(), SciOxideError>`, receiving a partition, extracted input, and child context; the child context cannot escape the call.
+A slot count different from the partition count produces `DimensionMismatch`.
+Each slot is extracted once; duplicate or missing partitions are detected as `ExecutionFailure`.
+
+### Constructing execution contexts
+
+`ExecutionContext` is a copyable value bundling borrowed access to an executor, cancellation, clock, entropy source, and processor policy.
+Its four constructors differ in executor and processor policy.
+All start without cancellation, a clock, or an entropy source.
+
+| Construction | Executor | Processor policy |
+|---|---|---|
+| `ExecutionContext::sequential()` | `SequentialExecutor` (one worker) | `PortableProcessor` |
+| `ExecutionContext::sequential_native()` | `SequentialExecutor` (one worker) | `StdProcessor` with the `std` feature, otherwise `PortableProcessor` |
+| `ExecutionContext::new(&executor)` | Supplied executor | `PortableProcessor` |
+| `ExecutionContext::native(&executor)` | Supplied executor | `StdProcessor` with the `std` feature, otherwise `PortableProcessor` |
+
+`PortableProcessor` permits no instruction sets, so kernels use portable scalar implementations.
+`StdProcessor` permits all instruction sets detected as available on the running processor.
+The relationship between `native(&executor)` and `new(&executor)` matches that between `sequential_native()` and `sequential()`; `native(&SequentialExecutor)` equals `sequential_native()`.
+
+Functions without execution context arguments use `ExecutionContext::sequential_native()`.
+This includes owned-output `scioxide-core` functions such as `softmax` and `softmax_axis`, and context-free forms in other crates.
+Context-taking forms (such as `softmax_axis_into`) use the supplied context and policy unchanged.
+Passing `sequential()` selects portable implementations; `sequential_native()` or `native(&executor)` selects implementations using processor instructions.
+Results from the two implementations may differ within each kernel's documented error bounds.
+Use `ExecutionContext::native(&executor)` for parallel execution with the same kernels as context-free forms.
+
+Inject cancellation through `with_cancellation`, and clocks and deadlines through `with_clock`, `with_deadline`, and `with_time_limit` ([Cancellation, clocks, and deadlines](../cancellation-clocks-and-deadlines/)).
+Inject entropy sources through `with_entropy(&source)`.
+The `EntropySource` trait's `fill_bytes` fills byte slices; `scioxide-core` itself provides no implementation.
+Reproducible computations use `stream_key` from [Partition identities and random keys](#partition-identities-and-random-keys), rather than an entropy source.
+
+Processor policies implement `ProcessorCapabilities` and are injected through `ExecutionContext::with_processor`.
+`supports(feature)` only answers whether use of instruction set `ProcessorFeature` (`X86Sse2`, `X86Avx2`, `X86Fma`, `X86Avx512F`, `X86Avx512Dq`, `X86Avx512Vl`, `Aarch64Neon`) is permitted; it is not proof that those instructions can execute.
+Kernels separately check availability on the running processor, so policies can only restrict available instructions (returning `false` prevents use even on supported processors).
+With the `std` feature, this check uses runtime detection; otherwise it uses compile-time target features.
+Using SIMD in `no_std` therefore requires enabling target features at compile time.
+
+## Wasm restrictions
+
+Handbook cells execute sequentially on `wasm32-unknown-unknown`.
+This environment restricts parallel execution and processor instructions as follows.
+
+| Capability | Wasm behavior | Alternative |
+|---|---|---|
+| Parallel execution through `ThreadExecutor` | Cannot create threads, so plans with at least two partitions cannot execute | Execute sequentially with `ExecutionContext::sequential()` or `sequential_native()` |
+| Instruction sets permitted by `StdProcessor` | None are permitted because no supported sets are detected | Kernels use portable scalar implementations |
+
+`ThreadExecutor` can still be constructed to create plans, as the partition-demonstration cells do.
+Context-free functions also use `sequential_native()` in Wasm, but no implementations using `ProcessorFeature` instructions are selected.
+Because `usize` is 32 bits, work-item and count limits are also smaller than in native environments.
+[Cancellation, clocks, and deadlines](oxref:core-wasm-clocks) explains restrictions on the standard clock `StdClock` and time limits.
+
+## Summary
+
+Policy, item count, `PlanLimits`, executor workers, and minimum work uniquely determine partition count; partitions are contiguous and nonempty.
+`ExecutionPlan::reduce` merges in partition-index order, giving consistent results between executions for a fixed partition count.
+For sums that must remain unchanged across partition counts, retain partial states in `RangeAccumulator` and combine them through `merge`.
+Context-free functions use `sequential_native()`; pass `ExecutionContext::native(&executor)` for the same kernels in parallel, or `sequential()` or `new(&executor)` to fix portable implementations.
+Generate partition-specific randomness from `PartitionId::stream_key` rather than entropy sources, and use processor policies only to restrict instructions.
+
+## Further reading
+
+- [Cancellation, clocks, and deadlines](../cancellation-clocks-and-deadlines/): Check how cancellation and deadlines stop long computations and how to inspect reasons at work boundaries.
+- [Exact accumulation and range-safe arithmetic](../range-safe-arithmetic/): Check how `RangeAccumulator` accumulates without rounding.
+- [Solve lifecycle and computation count management](../solve-lifecycle-and-accounting/): Check accounting in `SolveContext` with an execution context and cancellation checks at iteration boundaries.
+- [Solve accounting and execution APIs](../../api/solve-and-execution/): Look up all execution policy, context, and executor items.

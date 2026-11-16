@@ -1,0 +1,146 @@
+---
+title: 非線形の定常問題
+description: 連成した非線形の定常残差を NonlinearPdeProblem と PdeResidual で Newton–Krylov 法に渡す方法。ヤコビ行列の三つの表現、場の区画と場ごとの前処理、接線作用素、終了理由と診断。
+sidebar:
+  order: 347
+references:
+  pde-nonlinear-residual: "定常残差と-newtonkrylov-法"
+  pde-jacobian-modes: "ヤコビ行列の三つの表現"
+  pde-field-layout-preconditioner: "場の区画と場ごとの前処理"
+  pde-nonlinear-termination: "終了理由と診断"
+---
+
+反応や非線形の物性を含む偏微分方程式の定常解は、空間を離散化したあとの非線形の連立方程式 $\mathbf{F}(\mathbf{u})=\mathbf{0}$ の解である。
+`scioxide-pde` はこの方程式の残差とヤコビ行列の作用を作り、反復は `scioxide-rootfind` の Newton–Krylov 法に任せる。
+このページでは定常残差の作り方、ヤコビ行列の三つの表現、連成した場ごとの前処理、終了理由と診断を説明する。
+膜の両側から拡散してくる二種の物質が反応する問題での実行例は[対向拡散する反応面の定常解](../../examples/reaction-front-steady-newton/)にある。
+時間発展を常微分方程式の解法へ渡す方法は[線の方法と半離散系](../method-of-lines-and-nonlinear/)で扱う。
+
+## 定常残差と Newton–Krylov 法
+
+空間を離散化した系は、集中化した対角の質量行列 $\mathbf{M}$ を使って
+
+$$
+\mathbf{M}\,\frac{d\mathbf{u}}{dt}=\mathbf{f}(t,\mathbf{u})
+$$
+
+と書ける（[線の方法と半離散系](oxref:pde-method-of-lines-normalization)）。
+ここで $\mathbf{u}\in\mathbb{R}^n$ は自由な未知数（Dirichlet 条件で値が決まる節点を除いた未知数）、$\mathbf{f}$ は離散化した物理の残差である。
+$\mathbf{M}$ は正則なので、時刻 $t_\ast$ の定常解は $\mathbf{F}(\mathbf{u})=\mathbf{f}(t_\ast,\mathbf{u})=\mathbf{0}$ を満たし、質量は定常解に影響しない。
+
+`NonlinearPdeProblem::new(provider, time, fields, mode)` は、`scioxide_ode::OdeSystem` を実装したプロバイダーを時刻 `time` に固定し、その右辺 `rhs` を残差 $\mathbf{F}$ として扱う。
+同じプロバイダーを、時間積分では[線の方法の Plan `MethodOfLinesPlan`](oxref:pde-method-of-lines-normalization) に、定常問題ではこの Plan に渡せる。
+プロバイダーが自分の質量行列を提示していると（`mass_matrix_revision` が `Some`）、結合はそれを拒否する。
+質量は `MethodOfLinesPlan` が受け持つ量で、定常残差には入らないからである。
+
+Newton 法は反復 $k$ で線形方程式
+
+$$
+J(\mathbf{u}_k)\,\mathbf{s}_k=-\mathbf{F}(\mathbf{u}_k),\qquad J=\frac{\partial\mathbf{F}}{\partial\mathbf{u}}
+$$
+
+を解き、$\mathbf{u}_{k+1}=\mathbf{u}_k+\alpha_k\mathbf{s}_k$ と更新する（$\alpha_k\in(0,1]$ は直線探索のステップ幅）。
+`NewtonKrylovSolver` はこの線形方程式を前処理付きの GMRES で近似的に解き、相対残差の目標（強制項）$\eta_k$ を Eisenstat–Walker の規則で反復ごとに決める。
+GMRES が使うのはヤコビ行列とベクトルの積（JVP）$J\mathbf{v}$ だけである。
+強制項、直線探索、既定の制御値は[行列を形成しない Newton–Krylov 法](../../../scioxide-rootfind/algorithms/matrix-free-newton-krylov/)にある。
+
+Plan の `bind(&mut workspace)` が返す `PdeResidual` は、残差の作用 `ResidualOperator` と JVP の作用 `JacobianOperator`（どちらも `scioxide-core`）を実装する。
+これを `NewtonKrylovProblem::with_jacobian` にそのまま渡す。
+`PdeResidual` の出力は作業用の領域で計算して有限であることを確かめてから書き込むので、エラーのときは出力が変わらない。
+解法のコンテキストの中での評価（`*_scoped`）は、プロバイダーの呼び出しを解法の評価回数に数える。
+コンテキストの外での評価（`residual_into` など）は、回数を捨てる非公開の逐次のコンテキストでプロバイダーを呼ぶ。
+
+## ヤコビ行列の三つの表現
+
+JVP の作り方は `PdeJacobianMode` で明示して選ぶ。
+選んだ機能をプロバイダーが持たないとき、Plan は別の表現や差分に切り替えず、`InvalidInput`（`UnsupportedConfiguration`）のエラーを返す。
+
+| `PdeJacobianMode` | プロバイダーに必要なもの | メモリ領域 | JVP の求め方 |
+|---|---|---|---|
+| `Dense` | `OdeSystem::jacobian` | $n\times n$ の密行列 | 組み立てた行列との積 |
+| `Sparse(pattern)` | `OdeSystem::sparse_jacobian` | 構造 `pattern` の CSR 行列 | 組み立てた行列との積 |
+| `Operator { operator_scratch }` | `OdeSystem::jacobian_product` | 行列なし（作業領域 `operator_scratch` 個） | プロバイダーの JVP を毎回呼ぶ |
+
+`problem.workspace()` は、選んだ表現のメモリ領域を数値のコールバックを呼ばずに一度だけ確保し、`NonlinearPdeWorkspace` として返す。
+密と疎の表現は、組み立てた行列一つと、それを組み立てた点の写し（長さ $n$）を持つ。
+GMRES が同じ点で JVP を繰り返し求めるあいだは行列を再利用し、点が変わったときだけ組み立て直す。
+組み立ての回数は評価の役割 `EvaluationRole::Jacobian` として数えられ、評価の上限で組み立てが拒まれると `EvaluationLimit` の収束失敗のエラーになる。
+結合のたびに再利用は初期化されるので、プロバイダーが捕捉したデータを変えたときは、同じ点でも結合し直す。
+作業領域の表現と Plan の表現が違うと、結合は失敗する。
+
+疎の表現の構造はヤコビ行列のすべての非零要素を含む固定した構造で、プロバイダーは構造の各位置に値を書く。
+作用素の表現は行列を持たず、プロバイダーの `jacobian_product` を JVP のたびに呼ぶ。
+プロバイダーが `None` を返すと、その時点でエラーになる。
+行列を作らないぶんメモリ領域は $O(n)$ で済むが、GMRES の 1 反復ごとにプロバイダーの JVP を 1 回評価する。
+三つの表現の JVP が丸めの範囲で一致していれば、Newton 法と GMRES の反復の経過も同じになり、違いはメモリ領域とプロバイダーを呼ぶ回数に現れる。
+
+固定した点 $\mathbf{u}$ の線形化 $J(\mathbf{u})$ を作用素として扱うときは、`PdeTangent::new(&residual, point)` を使う。
+`PdeTangent` は `LinearOperator` を実装し、`apply_into` で $J(\mathbf{u})\mathbf{v}$ を返す。
+構築では JVP を評価せず、正方でないプロバイダー、長さの合わない点、非有限の座標を拒否する。
+プロバイダーが随伴の積 $J^{\mathsf H}\mathbf{w}$（`PdeAdjointJacobian`）も持てば、`AdjointOperator` としても使える。
+`PdeResidual` では、密と疎の表現は組み立てた行列の共役転置を使い、作用素の表現は `NonlinearPdeProblem::with_adjoint` で与えた随伴の積を使う。
+組み立てる表現に随伴の積を与えると、結合が拒否する。
+同じ `PdeTangent` は超弾性体（`HyperelasticityPlan`）と Navier–Stokes 方程式（`NavierStokesPlan`）の線形化にも使われる。
+
+## 場の区画と場ごとの前処理
+
+二つ以上の物理量（場）を同じ節点で解く連成系では、未知数を場ごとに連続した区画に並べる。
+`PdeFieldLayout::new(&[n_0, n_1, …])` は各場の長さから区画の境界を作り、`range(i)` で場 $i$ の添字の範囲、`field(values, i)` と `field_mut(values, i)` でその場の部分を借用する。
+長さ 0 の場（すべての節点が拘束された場）は許すが、全体の次元 0 は拒否する。
+メッシュとの対応や物理場の再構成は、区画ではなく離散化の側が受け持つ。
+
+二つの場 $a,b$ の残差のヤコビ行列は、区画に沿って
+
+$$
+J=\begin{pmatrix} J_{aa} & J_{ab}\\ J_{ba} & J_{bb}\end{pmatrix}
+$$
+
+と分かれる。
+拡散が支配的な問題では、対角のブロック $J_{aa},J_{bb}$ が離散ラプラシアンを含んで条件数が $O(h^{-2})$ になる。
+反応のように同じ節点の値だけで場が結合するなら、非対角のブロック $J_{ab},J_{ba}$ は対角行列である。
+前処理なしの GMRES は、条件数が大きいほど多くの反復を要する。
+ブロック対角の前処理 $P^{-1}=\operatorname{diag}(\tilde J_{aa}^{-1},\tilde J_{bb}^{-1})$ は、場ごとの近似逆 $\tilde J_{ii}^{-1}$ を並べたもので、結合のブロックを無視するぶん安く作れる。
+
+`PdeFieldPreconditioner::new(&layout, &blocks)` は、場ごとに準備した `Preconditioner` を借用して、このブロック対角の作用を組む。
+ブロックの数と区画の数、各ブロックの次元と区画の長さが合わないと、構築は失敗する。
+因子分解や入れ子の求解はこの型の中では行わず、各ブロックの準備は呼び出し側が受け持つ。
+適用は全ブロックの寸法を確かめてから一つずつ呼び、結果が有限であることを確かめてから出力に書く。
+合成した適用は呼び出した解法の中で前処理の評価 1 回として数える。
+[反応面の例](oxref:pde-coupled-steady-newton)（場ごとに 99 節点）では、拡散の部分の逆を各ブロックにすると、GMRES の反復の合計が 1107 回から 43 回に減る。
+
+## 終了理由と診断
+
+`NonlinearPdeProblem` と `PdeResidual` は反復を持たず、終了の判定は `NewtonKrylovSolver` の結果 `NewtonKrylovResult` が持つ。
+`termination()` は `scioxide-rootfind` の `RootTermination` を返し、成功は残差が許容誤差 $\|\mathbf{F}\|_2\le\varepsilon_{\mathrm{abs}}+\varepsilon_{\mathrm{rel}}\|\mathbf{F}(\mathbf{u}_0)\|_2$ を満たした `ResidualTolerance` だけである。
+`is_success()` が偽のとき、`point()` は最後に受理した点で、`residual_report()` が `Some` のときだけ意味を持つ。
+[対向拡散する反応面の例](../../examples/reaction-front-steady-newton/)のセルでは、`GlobalizationFailure`（直線探索が受理できるステップ幅を見つけられない）と `LinearFailure(_)`（内側の GMRES の破綻）を failed、反復の上限や停滞などのそれ以外を partial としている。
+終了理由の一覧は[行列を形成しない Newton–Krylov 法](../../../scioxide-rootfind/algorithms/matrix-free-newton-krylov/)にある。
+
+残差が小さいことは、離散化した方程式を解いたことを示すが、偏微分方程式の解との誤差の大きさは示さない。
+反応面の例では、不変量のずれで連成の正しさを、極限の濃度との差の Da 依存性でモデルの振る舞いを、節点数を変えた比較で格子の影響を確かめる。
+
+回数は `NewtonKrylovResult` の二か所に分かれる。
+`iterations()` は Newton 法の反復の回数である。
+`accounting().nested()` は入れ子の処理で、`iterations()` が GMRES の反復の回数、`provider(EvaluationRole::Jacobian)` がヤコビ行列を組み立てた回数、`provider(EvaluationRole::Preconditioner)` が前処理を適用した回数である。
+`PdeFieldPreconditioner` の 1 回の適用はブロックの数によらず前処理 1 回と数える。
+
+結合はプロバイダーのコールバックを呼ぶ前に入力の誤りを拒否する。
+区画とプロバイダーの次元の不一致は `DimensionMismatch` になる。
+質量を提示したプロバイダー、非有限の時刻、表現と合わない作業領域、組み立てる表現に与えた随伴の積は `InvalidInput` になる。
+プロバイダーの出力が非有限なら、Plan は出力を書かずに `NonFinite` のエラーを返す。
+
+## まとめ
+
+定常解は半離散系の右辺 $\mathbf{f}(t_\ast,\mathbf{u})$ を残差とする非線形方程式の解で、`NonlinearPdeProblem` と `PdeResidual` を通して `NewtonKrylovSolver` に渡せる。
+ヤコビ行列は `PdeJacobianMode` で密・疎・作用素から明示して選び、密と疎は同じ点で組み立てた行列を再利用し、作用素は行列を持たずにプロバイダーの JVP を毎回呼ぶ。
+連成系では `PdeFieldLayout` で場の区画を決め、場ごとに準備した近似逆を `PdeFieldPreconditioner` で並べると、拡散が支配的な問題の GMRES の反復を大きく減らせる。
+`PdeTangent` で解の点の線形化を作用素として取り出せば、残差の差分と比べて微分の誤りを確かめられる。
+終了の判定は `RootTermination` で読み、残差の小ささとは別に、不変量や極限・精度改善による検算で解の質を確かめる。
+
+## 次に読むページ
+
+- [対向拡散する反応面の定常解](../../examples/reaction-front-steady-newton/)：三つの表現と場ごとの前処理を実際の連成系で比べ、閉形式の極限で解を検算する。
+- [線の方法と半離散系](../method-of-lines-and-nonlinear/)：同じ形のプロバイダーを、質量と座標の尺度で正規化して時間積分に渡す。
+- [行列を形成しない Newton–Krylov 法](../../../scioxide-rootfind/algorithms/matrix-free-newton-krylov/)：強制項、直線探索、終了理由の詳細を確かめる。
+- [クリロフ部分空間法と前処理](../../../scioxide-linalg/algorithms/krylov-and-preconditioning/)：内側の線形解法と前処理の理論を確かめる。
+- [線の方法と非線形問題の API](../../api/method-of-lines-and-nonlinear/)：このページの型の仕様を一覧で確かめる。

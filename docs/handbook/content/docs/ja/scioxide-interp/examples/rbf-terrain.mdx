@@ -1,0 +1,507 @@
+---
+title: 散在センサーから地形断面を作る
+description: 16 点の散在標高から Gaussian 核の RBF 補間で地形を作り、形状係数・対角正則化・平均の除去による未使用点の誤差と逆条件数の変化を既知の地形で検算する。
+sidebar:
+  order: 420
+---
+
+地質調査や環境観測では、測定点が格子に並ばず平面に散らばることが多い。
+このような散在点には、セルの境界を使う双線形や双 3 次の格子補間をそのまま使えない。
+この例題では、16 点の散在標高から放射基底関数（RBF）で地形を作り、真の地形との差で未使用点の誤差を測る。
+形状係数、対角正則化、観測値の平均の除去が、標本点での当てはめ、未使用点の誤差、行列の条件をそれぞれどう変えるかを確かめる。
+
+放射基底関数（RBF）法は各標本点からの距離 $r = \|\mathbf{x} - \mathbf{p}_j\|_2$ だけに依存する核 $\phi(r)$ を重ね合わせて曲面を作る。
+三角形分割などの幾何の前処理を使わずに、散在点から滑らかな曲面を作れる。
+`RbfInterpolator` は 2 次元の点 `[x, y]` と、その値、核を受け取る。
+正則化と数値ランクの閾値は `RbfOptions` の設定関数で決め、`RbfInterpolator::with_options(points, values, kernel, options)` に渡す。
+
+## RBF の連立方程式と正定値な核
+
+$n$ 個の標本点 $\mathbf{p}_j = (x_j, y_j)$ と標高 $z_j$ が与えられたとき、RBF の補間面は
+
+$$
+s(\mathbf{x}) = \sum_{j=1}^n c_j \phi(\|\mathbf{x} - \mathbf{p}_j\|_2)
+$$
+
+である。
+すべての標本点で $s(\mathbf{p}_i) = z_i$ を課すと、係数 $\mathbf{c}$ は連立 1 次方程式
+
+$$
+\Phi \mathbf{c} = \mathbf{z}, \qquad \Phi_{ij} = \phi(\|\mathbf{p}_i - \mathbf{p}_j\|_2)
+$$
+
+の解になる。
+$\Phi$ は対称な $n\times n$ の密行列で、準備には $O(n^2)$ のメモリと $O(n^3)$ の計算が要る。
+評価は 1 点あたり $O(n)$ である。
+
+この例では Gaussian 核
+
+$$
+\phi(r) = \exp\left( - (\varepsilon r)^2 \right)
+$$
+
+を使う。
+$\varepsilon > 0$ は形状係数で、$1/\varepsilon$ が基底の広がりの長さになる。
+`RbfKernel::Gaussian(c)` の引数 $c$ がこの $\varepsilon$ である。
+Gaussian の Fourier 変換は正なので、Bochner の定理から、相異なる点に対する $\Phi$ は正定値になる（Wendland の第 6 章）。
+そのため `RbfInterpolator` は Gaussian 核の行列を Cholesky 分解で解く。
+Cholesky 分解が破綻した場合や、数値ランクと逆条件数の検査に通らない場合は、特異値分解（SVD）で分解し直す。
+
+`RbfInterpolator` は核の和だけを使い、定数や 1 次式の項を加えない。
+Gaussian 核の和は標本点から離れると 0 に近づくので、標高 120 m 付近の地形をそのまま当てはめると、点の間や外側で値が 0 へ下がりやすい。
+観測値の平均 $\bar z$ を引いた $z_j-\bar z$ を当てはめ、評価値に $\bar z$ を足すと、離れた所の値は 0 ではなく $\bar z$ に近づく。
+外挿の領域は標本点の凸包ではなく、座標の最小値と最大値で決まる長方形である。
+
+## 形状係数と逆条件数
+
+形状係数 $\varepsilon$ は、補間面の形と行列の条件の両方を決める。
+
+| 形状係数 | 基底の広がり | 行列と近似への影響 |
+|---|---|---|
+| 大きい | 標本の近くに局在する | 行列は単位行列へ近づいて良条件になるが、標本の間で値が下がりやすい |
+| 小さい | 平坦になり遠くまで重なる | 行列の列が似て悪条件になり、係数が丸め誤差やノイズに敏感になる |
+
+逆条件数 $\kappa^{-1}(\Phi)=1/(\|\Phi\|\,\|\Phi^{-1}\|)$ は 1 に近いほど良条件で、0 に近いほど解が入力の誤差に敏感になる。
+値は選んだノルムに依存する。
+`conditioning()` が返す `RbfConditioning` は、Cholesky や LU の直接分解なら 1 ノルムでの推定値を、SVD なら 2 ノルムの値 $\sigma_{\min}/\sigma_{\max}$ を返す。
+返すのは実際に解いた行列（正則化したときは次節の $\Phi+\lambda I$）の値である。
+`condition_norm()` と `factorization()` で、どちらの値かを確かめる。
+1 ノルムの値は推定値であり、誤差の上界の証明ではない。
+
+数値ランクの閾値 `RankThreshold::new(atol, rtol)` は、直接分解を受け入れるかを決める。
+直接分解の逆条件数が $\mathrm{rtol}$（$\mathrm{atol}=0$ のとき）を下回ると SVD に移り、SVD で $\mathrm{atol}+\mathrm{rtol}\,\sigma_{\max}$ を超える特異値が $n$ 個より少なければ、構築は `Singular` のエラーで止まる。
+既定の閾値は $\mathrm{atol}=\mathrm{rtol}=\varepsilon_{\mathrm{mach}}\approx2.2\times10^{-16}$ で、作業精度で特異な行列だけを拒む。
+この例では $\mathrm{rtol}=10^{-12}$ とし、条件数が $10^{12}$ を超える行列を拒む。
+
+## 対角正則化
+
+観測した標高に測定誤差 $e_i$ があると、$\Phi \mathbf{c} = \mathbf{z}$ を厳密に解いた曲面は誤差まで通る。
+`RbfRegularization::Diagonal(λ)` は、核の行列の対角に $\lambda>0$ を加えた
+
+$$
+(\Phi + \lambda I) \mathbf{c} = \mathbf{z}
+$$
+
+を解く。
+$\Phi$ が正定値なら、これは
+
+$$
+\min_{\mathbf{c}} \left( \|\Phi \mathbf{c} - \mathbf{z}\|_2^2 + \lambda\, \mathbf{c}^\mathsf{T} \Phi \mathbf{c} \right)
+$$
+
+の解である。
+実際、この目的関数の勾配を 0 とおくと $\Phi\bigl((\Phi+\lambda I)\mathbf c-\mathbf z\bigr)=\mathbf 0$ となり、$\Phi$ が正則なので上の方程式に一致する。
+第 1 項は標本点での当てはめの残差、第 2 項は核が定める関数空間（再生核 Hilbert 空間）でのノルムの二乗 $\|s\|^2$ で、曲面の振れの大きさを表す。
+$\lambda$ を大きくすると、標本点の残差 $|s(\mathbf{p}_i) - z_i|$ が増える代わりに、ノイズに対する曲面の変動が小さくなる。
+これは偏り（バイアス）を増やして分散を減らす交換である。
+$\Phi+\lambda I$ の固有値は $\Phi$ の固有値に $\lambda$ を足したものなので、最小固有値が $\lambda$ 以上になり、条件も改善する。
+Gaussian 核の行列の成分は 1 以下なので最大固有値は $n$ 以下で、2 ノルムの条件数は $(n+\lambda)/\lambda$ 以下になる。
+この例の $n=16$、$\lambda\ge10^{-10}$ では $1.6\times10^{11}$ 以下で、上の閾値 $10^{12}$ を超えない。
+$\lambda$ は核の行列と同じ単位（Gaussian 核では無次元）で与える。
+
+## 検算に使う地形と観測
+
+真の地形は単位正方形 $[0,1]^2$ の上の丘と谷と緩い傾きの和
+
+$$
+z(x,y)=120+45e^{-18[(x-0.32)^2+(y-0.62)^2]}-28e^{-24[(x-0.76)^2+(y-0.36)^2]}+8x-4y\quad[\mathrm m]
+$$
+
+とする。
+$x$ は東西、$y$ は南北の無次元の座標である。
+丘と谷の幅（$e^{-1}$ になる距離）はそれぞれ約 0.24 と 0.20 で、16 点の間隔（約 0.3）と同じ程度である。
+観測値には点の番号 $k$ ごとに決まる誤差 $a\sin(1.7k+0.3)$ を加える。
+$a$ は誤差の振幅で、16 点での誤差の二乗平均平方根はほぼ $a/\sqrt2$ である。
+真の地形がわかっているので、四隅を除いて標本点と重ならない $31\times31$ の検証格子で誤差を測れる。
+これがこの例の独立検算である。
+
+次のブロックはこのページの三つのセルが共有する定義である。
+`sample_points` が 16 点の座標、`terrain` が真の地形 $z(x,y)$、`observations` が誤差を加えた観測値、`validation_grid` が検証格子、`fit_terrain` が平均の除去と正則化を含む当てはめに対応する。
+地形と観測値は `RealScalar::exp` と `RealScalar::sin` で作り、f64 の固有メソッドは使わない。
+
+```rust
+//| id: interp-rbf-terrain-model
+//| kind: definitions
+//| title: 散在点、真の地形、観測値と RBF の当てはめ
+//| crates: [scioxide-core, scioxide-interp]
+use scioxide_core::{SciOxideError, RankThreshold, RealScalar};
+use scioxide_interp::{RbfInterpolator, RbfKernel, RbfOptions, RbfRegularization};
+
+/// 16 点の散在観測座標 [x, y]（x は東西、y は南北、無次元）。
+pub(crate) fn sample_points() -> Vec<[f64; 2]> {
+    let xs = [
+        0.0, 0.32, 0.68, 1.0, 0.0, 0.24, 0.61, 1.0, 0.0, 0.39, 0.76, 1.0, 0.0, 0.29, 0.71, 1.0,
+    ];
+    let ys = [
+        0.0, 0.0, 0.0, 0.0, 0.34, 0.28, 0.38, 0.31, 0.67, 0.58, 0.72, 0.64, 1.0, 1.0, 1.0, 1.0,
+    ];
+    xs.into_iter().zip(ys).map(|(x, y)| [x, y]).collect()
+}
+
+/// 真の地形 z(x, y) [m]: 丘と谷と緩い傾き。
+pub(crate) fn terrain(x: f64, y: f64) -> f64 {
+    let hill = RealScalar::exp(-18.0 * ((x - 0.32) * (x - 0.32) + (y - 0.62) * (y - 0.62)));
+    let valley = RealScalar::exp(-24.0 * ((x - 0.76) * (x - 0.76) + (y - 0.36) * (y - 0.36)));
+    120.0 + 45.0 * hill - 28.0 * valley + 8.0 * x - 4.0 * y
+}
+
+/// 観測値 [m] = 真の地形 + 点ごとに決まる誤差 a sin(1.7k + 0.3)。
+pub(crate) fn observations(noise: f64) -> Vec<f64> {
+    sample_points()
+        .iter()
+        .enumerate()
+        .map(|(k, p)| terrain(p[0], p[1]) + noise * RealScalar::sin(1.7 * k as f64 + 0.3))
+        .collect()
+}
+
+/// 31×31 の検証格子 [x, y]（x が先に変わる）。
+pub(crate) fn validation_grid() -> Vec<[f64; 2]> {
+    (0..31 * 31)
+        .map(|k| [(k % 31) as f64 / 30.0, (k / 31) as f64 / 30.0])
+        .collect()
+}
+
+/// 観測値の平均 z̄ を引く（subtract_mean が真のとき）当てはめ。評価値には z̄ を足す。
+pub(crate) fn fit_terrain(
+    shape: f64,
+    lambda: f64,
+    observed: &[f64],
+    subtract_mean: bool,
+) -> Result<(RbfInterpolator<f64>, f64), SciOxideError> {
+    let offset = if subtract_mean {
+        observed.iter().sum::<f64>() / observed.len() as f64
+    } else {
+        0.0
+    };
+    let shifted: Vec<f64> = observed.iter().map(|z| z - offset).collect();
+    let options = RbfOptions::new()
+        .with_regularization(RbfRegularization::Diagonal(lambda))
+        .with_rank_threshold(RankThreshold::new(0.0, 1.0e-12)?);
+    let kernel = RbfKernel::Gaussian(shape);
+    let rbf = RbfInterpolator::with_options(sample_points(), shifted, kernel, options)?;
+    Ok((rbf, offset))
+}
+```
+
+## 形状係数・正則化・ノイズの実験
+
+次のセルの入力は形状係数 $\varepsilon$、正則化の指数 $q$（$\lambda=10^q$）、誤差の振幅 $a$ [m]、断面の位置 $y^*$、平均を引くかどうかである。
+1 つ目の表は、標本点での当てはめの残差の最大、標本点での真の地形との RMSE、検証格子の RMSE と最大誤差である。
+2 つ目の表は `conditioning()` のレポートで、使った分解、逆条件数のノルム、逆条件数、数値ランクを示す。
+グラフは $y=y^*$ の東西断面で、真の地形を破線で描く。
+このセルは検証格子の符号付きの誤差を、次のセルの誤差の分布の図に渡す。
+
+```rust
+//| id: interp-rbf-terrain
+//| ref: interp-rbf-terrain
+//| title: RBF の核幅・正則化・測定ノイズ・断面位置を動かす
+//| run: reactive
+//| uses: [interp-rbf-terrain-model]
+//| crates: [scioxide-core, scioxide-interp]
+//| exports: [error_map]
+//| inputs:
+//|   rbf_shape_parameter: {"type":"range","label":"Gaussian 形状係数 ε [-]","description":"基底の広がり 1/ε を変える。","min":0.8,"max":6,"step":0.2,"value":2}
+//|   regularization_exponent: {"type":"range","label":"正則化指数 q（λ=10ᑫ）","description":"標本点での残差とノイズへの感度の交換を変える。","min":-10,"max":-2,"step":0.5,"value":-6}
+//|   terrain_noise_m: {"type":"range","label":"観測誤差の振幅 a [m]","description":"標本点ごとに決まる誤差 a sin(1.7k + 0.3) の振幅。","min":0,"max":8,"step":0.5,"value":2}
+//|   cross_section_y: {"type":"range","label":"東西断面の y 位置 [-]","description":"丘と谷を横切る断面位置を変える。","min":0,"max":1,"step":0.05,"value":0.5}
+//|   subtract_mean: {"type":"checkbox","label":"観測値の平均を引いてから当てはめる","value":false}
+//| cases:
+//|   - {"id":"strong-regularization","label":"λ = 10⁻²","description":"標本点の残差は増えるが、検証格子の RMSE は少し下がる。","inputs":{"regularization_exponent":-2}}
+//|   - {"id":"narrow-kernel","label":"ε = 6","description":"基底が点の間隔より狭く、点の間で曲面が 0 へ下がる。","inputs":{"rbf_shape_parameter":6}}
+//|   - {"id":"narrow-kernel-mean","label":"ε = 6、平均を引く","description":"平均を引くと、点の間の値が平均へ戻り、誤差が大きく減る。","inputs":{"rbf_shape_parameter":6,"subtract_mean":true}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"accuracy","path":"/rows/0/1","approx":{"value":4.8e-4,"rtol":0.05}}
+//|       - {"artifact":"accuracy","path":"/rows/1/1","approx":{"value":1.39,"atol":0.01}}
+//|       - {"artifact":"accuracy","path":"/rows/2/1","approx":{"value":5.97,"atol":0.01}}
+//|       - {"artifact":"conditioning","path":"/rows/0/0","equals":"Cholesky"}
+//|       - {"artifact":"conditioning","path":"/rows/0/3","equals":16}
+//|   - case: strong-regularization
+//|     expect:
+//|       - {"artifact":"accuracy","path":"/rows/0/1","approx":{"value":3.8,"atol":0.05}}
+//|       - {"artifact":"accuracy","path":"/rows/2/1","approx":{"value":5.82,"atol":0.01}}
+//|   - case: narrow-kernel
+//|     expect:
+//|       - {"artifact":"accuracy","path":"/rows/2/1","approx":{"value":43.9,"atol":0.1}}
+//|   - case: narrow-kernel-mean
+//|     expect:
+//|       - {"artifact":"accuracy","path":"/rows/2/1","approx":{"value":6.69,"atol":0.01}}
+use scioxide_core::RealScalar;
+use scioxide_interp::{ExtrapolationPolicy, Interpolant};
+
+let lambda = RealScalar::powf(10.0, regularization_exponent);
+let observed = observations(terrain_noise_m);
+let (rbf, offset) = fit_terrain(rbf_shape_parameter, lambda, &observed, subtract_mean)
+    .map_err(|e| e.to_string())?;
+let at = |x: f64, y: f64| {
+    rbf.evaluate([x, y], ExtrapolationPolicy::Reject)
+        .map(|v| v + offset)
+        .map_err(|e| e.to_string())
+};
+
+// 東西断面 y = y* の復元と真の地形
+let (mut section, mut exact) = (Vec::new(), Vec::new());
+for i in 0..=160 {
+    let x = f64::from(i) / 160.0;
+    section.push([x, at(x, cross_section_y)?]);
+    exact.push([x, terrain(x, cross_section_y)]);
+}
+// 独立な検算: 検証格子で真の地形との符号付きの誤差を測る
+let mut error_map = Vec::new();
+for p in validation_grid() {
+    error_map.push([p[0], p[1], at(p[0], p[1])? - terrain(p[0], p[1])]);
+}
+let squared: f64 = error_map.iter().map(|e| e[2] * e[2]).sum();
+let worst = error_map.iter().fold(0.0_f64, |m, e| m.max(e[2].abs()));
+// 標本点での当てはめの残差（観測値との差）と、真の地形との差
+let (mut fit_residual, mut node_squared) = (0.0_f64, 0.0_f64);
+for (p, &z) in sample_points().iter().zip(&observed) {
+    let fitted = at(p[0], p[1])?;
+    fit_residual = fit_residual.max((fitted - z).abs());
+    let node_error = fitted - terrain(p[0], p[1]);
+    node_squared += node_error * node_error;
+}
+let sig3 = serde_json::json!({ "significantDigits": 3 });
+emit_table_with_columns!(
+    serde_json::json!([
+        { "key": "0", "label": "量" },
+        { "key": "1", "label": "値 [m]", "type": "number", "format": sig3 }
+    ]),
+    vec![
+        ("標本点での当てはめの残差の最大", fit_residual),
+        ("標本点での真の地形との RMSE", RealScalar::sqrt(node_squared / 16.0)),
+        ("検証格子の RMSE", RealScalar::sqrt(squared / error_map.len() as f64)),
+        ("検証格子の最大誤差", worst),
+    ],
+    metadata = serde_json::json!({ "id": "accuracy" })
+);
+let report = rbf.conditioning();
+emit_table_with_columns!(
+    serde_json::json!([
+        { "key": "0", "label": "分解" },
+        { "key": "1", "label": "ノルム" },
+        { "key": "2", "label": "逆条件数 [-]", "type": "number", "format": sig3 },
+        { "key": "3", "label": "数値ランク", "type": "integer" }
+    ]),
+    vec![(
+        format!("{:?}", report.factorization()),
+        format!("{:?}", report.condition_norm()),
+        report.reciprocal_condition_number(),
+        report.numerical_rank(),
+    )],
+    metadata = serde_json::json!({ "id": "conditioning" })
+);
+emit_line_chart!(
+    &vec![
+        serde_json::json!({ "name": "RBF の復元", "points": section }),
+        serde_json::json!({
+            "name": "真の地形",
+            "points": exact,
+            "style": { "lineType": "dashed", "showSymbol": false }
+        }),
+    ],
+    options = &serde_json::json!({ "xLabel": "東西位置 x [-]", "yLabel": "標高 z [m]" })
+);
+export!(error_map, &error_map);
+```
+
+既定（$\varepsilon = 2$、$\lambda = 10^{-6}$、$a=2$ m、平均を引かない）では、標本点での当てはめの残差の最大は $4.8 \times 10^{-4}$ m、検証格子の RMSE は 5.97 m、最大誤差は 16.7 m である。
+標本点での真の地形との RMSE 1.39 m は、加えた誤差の二乗平均平方根 $a/\sqrt2\approx1.41$ m とほぼ同じで、曲面が誤差ごと標本を通っていることを示す。
+行列は Cholesky 分解で解け、1 ノルムの逆条件数の推定値は $1.76\times10^{-3}$、数値ランクは 16 である。
+
+$\lambda = 10^{-10}$ にすると残差は $4.8 \times 10^{-8}$ m まで下がるが、検証格子の RMSE は 5.97 m のまま変わらない。
+$\lambda = 10^{-2}$ では残差が 3.8 m に増え、標本点での真の地形との RMSE も 1.85 m に増えるが、検証格子の RMSE は 5.82 m に少し下がる。
+誤差を $a=0$ にしても検証格子の RMSE は 5.92 m で、$a=8$ m で 7.90 m になる。
+この配置では未使用点の誤差の大部分はノイズではなく、16 点で丘と谷を表しきれないことから来る。
+
+$\varepsilon=6$ では基底の広がりが約 0.17 で点の間隔より狭く、点の間で曲面が 0 へ下がるので、検証格子の RMSE は 43.9 m、最大誤差は 100 m になる。
+逆条件数は 0.70 まで上がり、行列は単位行列に近い。
+平均を引くと同じ $\varepsilon=6$ で RMSE は 6.69 m まで下がり、既定の $\varepsilon=2$ でも 5.97 m から 4.94 m に下がる。
+断面の位置 $y^*$ はグラフだけを変え、表の値は変えない。
+
+## 誤差の分布
+
+次のセルは上のセルが渡す検証格子の符号付きの誤差（RBF − 真の地形）を heatmap に描く。
+上のセルの入力を変えると、この図も同じ条件で描き直される。
+色は 0 を中間色とする発散色で、標本点の位置は誤差が 0 に近い点として見える。
+表は最大の誤差とその位置、誤差の平均、負になる点の数である。
+
+```rust
+//| id: interp-rbf-error-map
+//| ref: interp-rbf-error-map
+//| title: RBF の復元誤差の分布を heatmap で見る
+//| run: reactive
+//| crates: []
+//| dependsOn:
+//|   fit: interp-rbf-terrain
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"distribution","path":"/rows/0/0","approx":{"value":16.7,"atol":0.05}}
+//|       - {"artifact":"distribution","path":"/rows/0/1","approx":{"value":0.2,"atol":1e-9}}
+//|       - {"artifact":"distribution","path":"/rows/0/2","approx":{"value":0.8333333333333334,"atol":1e-9}}
+let error_map: Vec<[f64; 3]> =
+    serde_json::from_value(fit["error_map"].clone()).map_err(|e| e.to_string())?;
+let worst = error_map
+    .iter()
+    .fold([0.0_f64, 0.0, 0.0], |m, &e| if e[2].abs() > m[2].abs() { e } else { m });
+let mean = error_map.iter().map(|e| e[2]).sum::<f64>() / error_map.len() as f64;
+let negative = error_map.iter().filter(|e| e[2] < 0.0).count();
+let sig3 = serde_json::json!({ "significantDigits": 3 });
+let fixed3 = serde_json::json!({ "fractionDigits": 3 });
+emit_table_with_columns!(
+    serde_json::json!([
+        { "key": "0", "label": "最大の誤差 [m]", "type": "number", "format": sig3 },
+        { "key": "1", "label": "その x [-]", "type": "number", "format": fixed3 },
+        { "key": "2", "label": "その y [-]", "type": "number", "format": fixed3 },
+        { "key": "3", "label": "誤差の平均 [m]", "type": "number", "format": sig3 },
+        { "key": "4", "label": "負になる点 [点]", "type": "integer" }
+    ]),
+    vec![(worst[2], worst[0], worst[1], mean, negative)],
+    metadata = serde_json::json!({ "id": "distribution" })
+);
+emit_chart!(
+    serde_json::json!({
+        "kind": "heatmap",
+        "data": error_map,
+        "xLabel": "東西位置 x [-]",
+        "yLabel": "南北位置 y [-]",
+        "colorScale": "diverging",
+        "center": 0.0,
+        "tooltip": true,
+        "style": { "animation": false }
+    }),
+    metadata = serde_json::json!({ "title": "復元誤差 RBF − 真の地形 [m]" })
+);
+```
+
+既定の $\varepsilon=2$ では正と負の誤差が入り混じり（負の点は 961 点中 335 点、平均 $+2.07$ m）、最大誤差は丘の北西の $(0.2,0.83)$ での $+16.7$ m である。
+丘の形を 16 点で捉えきれないことによる誤差で、標本点から離れた所ほど大きい。
+上のセルで $\varepsilon=6$ にすると、heatmap は 961 点中 925 点で負になり、誤差の平均は $-35.5$ m で、点の間で曲面が下がっていることがわかる。
+さらに平均を引くと、負の点は 513 点に減り、誤差の平均は $-0.7$ m になる。
+残る大きな誤差は、丘の頂の近くの $(0.23,0.67)$ での $-20.8$ m の過小と、谷の底の近くの $(0.8,0.37)$ での $+20.5$ m の過大である。
+狭い基底は標本点の間で平均へ戻るので、丘と谷の振れを小さく見積もる。
+
+## 形状係数と検証誤差の走査
+
+核の行列 $\Phi+\lambda I$ は点の配置、核、$\lambda$ だけで決まり、観測値によらない。
+ここでは、条件の良さと未使用点での正確さが別の性質であることを確かめる。
+次のセルは $\varepsilon$ を 0.8 から 6.0 まで 0.4 ずつ変え、各値で観測値から RBF を作り、逆条件数、標本点での残差の最大、検証格子の RMSE を測る。
+入力は正則化の指数 $q$、誤差の振幅 $a$、平均を引くかどうかで、上のセルとは独立な実験である。
+二つのグラフは横軸の $\varepsilon$ が連動し、どちらも縦軸が対数軸である。
+形状係数と正則化による逆条件数の変化は、[Franke 関数による RBF の交差検証](../station-cross-validation/)の最初のセルでも調べる。
+
+```rust
+//| id: interp-rbf-shape-accuracy
+//| ref: interp-rbf-shape-accuracy
+//| title: 形状係数を掃引して標本点の残差と検証誤差を比べる
+//| run: reactive
+//| uses: [interp-rbf-terrain-model]
+//| crates: [scioxide-core, scioxide-interp]
+//| inputs:
+//|   regularization_exponent: {"type":"range","label":"正則化指数 q（λ=10ᑫ）","description":"対角に加える λ を変える。","min":-10,"max":-2,"step":0.5,"value":-6}
+//|   terrain_noise_m: {"type":"range","label":"観測誤差の振幅 a [m]","description":"標本点ごとに決まる誤差 a sin(1.7k + 0.3) の振幅。","min":0,"max":8,"step":0.5,"value":2}
+//|   subtract_mean: {"type":"checkbox","label":"観測値の平均を引いてから当てはめる","value":false}
+//| cases:
+//|   - {"id":"tiny-regularization","label":"λ = 10⁻¹⁰","description":"小さい ε の残差は下がるが、RMSE は改善しない。","inputs":{"regularization_exponent":-10}}
+//|   - {"id":"mean-removed","label":"平均を引く","description":"最小の RMSE が下がり、最適な ε が大きい方へ移る。逆条件数は変わらない。","inputs":{"subtract_mean":true}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"sweep","path":"/rows/3/3","approx":{"value":5.97,"atol":0.01}}
+//|       - {"artifact":"sweep","path":"/rows/0/2","approx":{"value":0.70,"atol":0.01}}
+//|       - {"artifact":"sweep","path":"/rows/13/3","approx":{"value":43.9,"atol":0.1}}
+//|   - case: tiny-regularization
+//|     expect:
+//|       - {"artifact":"sweep","path":"/rows/0/3","approx":{"value":8.99,"atol":0.01}}
+//|   - case: mean-removed
+//|     expect:
+//|       - {"artifact":"sweep","path":"/rows/7/3","approx":{"value":2.67,"atol":0.01}}
+use scioxide_core::RealScalar;
+use scioxide_interp::{ExtrapolationPolicy, Interpolant};
+
+let lambda = RealScalar::powf(10.0, regularization_exponent);
+let observed = observations(terrain_noise_m);
+let grid = validation_grid();
+let (mut rows, mut rmse_curve, mut rcond_curve) = (Vec::new(), Vec::new(), Vec::new());
+for step in 0..=13 {
+    let shape = f64::from(8 + 4 * step) / 10.0;
+    let (rbf, offset) =
+        fit_terrain(shape, lambda, &observed, subtract_mean).map_err(|e| e.to_string())?;
+    let at = |p: &[f64; 2]| {
+        rbf.evaluate(*p, ExtrapolationPolicy::Reject)
+            .map(|v| v + offset)
+            .map_err(|e| e.to_string())
+    };
+    let mut residual = 0.0_f64;
+    for (p, &z) in sample_points().iter().zip(&observed) {
+        residual = residual.max((at(p)? - z).abs());
+    }
+    // 独立な検算: 検証格子で真の地形との誤差を測る
+    let mut squared = 0.0_f64;
+    for p in &grid {
+        let error = at(p)? - terrain(p[0], p[1]);
+        squared += error * error;
+    }
+    let rmse = RealScalar::sqrt(squared / grid.len() as f64);
+    let rcond = rbf.conditioning().reciprocal_condition_number();
+    rmse_curve.push([shape, rmse]);
+    rcond_curve.push([shape, rcond]);
+    rows.push((shape, rcond, residual, rmse));
+}
+let sig3 = serde_json::json!({ "significantDigits": 3 });
+emit_table_with_columns!(
+    serde_json::json!([
+        { "key": "0", "label": "ε [-]", "type": "number", "format": { "fractionDigits": 1 } },
+        { "key": "1", "label": "逆条件数（1 ノルム）[-]", "type": "number", "format": sig3 },
+        { "key": "2", "label": "標本点の残差の最大 [m]", "type": "number", "format": sig3 },
+        { "key": "3", "label": "検証格子の RMSE [m]", "type": "number", "format": sig3 }
+    ]),
+    rows,
+    metadata = serde_json::json!({ "id": "sweep" })
+);
+emit_line_chart!(
+    &vec![serde_json::json!({ "name": "検証格子の RMSE", "points": rmse_curve })],
+    options = &serde_json::json!({
+        "link": { "group": "rbf-shape" },
+        "xLabel": "形状係数 ε [-]",
+        "yLabel": "RMSE [m]",
+        "yType": "log"
+    })
+);
+emit_line_chart!(
+    &vec![serde_json::json!({ "name": "逆条件数", "points": rcond_curve })],
+    options = &serde_json::json!({
+        "link": { "group": "rbf-shape" },
+        "xLabel": "形状係数 ε [-]",
+        "yLabel": "逆条件数 [-]",
+        "yType": "log"
+    })
+);
+```
+
+既定（$\lambda=10^{-6}$、$a=2$ m、平均を引かない）では、検証格子の RMSE は $\varepsilon=2$ の 5.97 m が最小である。
+それより小さい $\varepsilon$ では基底が平らになりすぎて丘と谷の形を表せず、大きい $\varepsilon$ では点の間で値が下がるために RMSE が増え、$\varepsilon=6$ では 43.9 m になる。
+逆条件数は $\varepsilon=0.8$ の $6.8\times10^{-7}$ から $\varepsilon=6$ の 0.70 まで単調に増えるが、RMSE は $\varepsilon=2$ で最小になったあと増える。
+$\varepsilon=0.8$ の残差 0.70 m は、$\lambda=10^{-6}$ が行列の最小固有値（逆条件数から $10^{-5}$ 程度と見積もれる）に比べて無視できない大きさになったことによる。
+$\lambda=10^{-10}$ ではこの残差は $7.4\times10^{-5}$ m に下がるが、RMSE は 8.99 m で改善しない。
+反対に $\lambda=10^{-2}$ では小さい $\varepsilon$ の曲面の振れが抑えられ、$\varepsilon=1.6$ の RMSE が 5.35 m まで下がる。
+
+平均を引くと最小の RMSE は $\varepsilon=3.6$ の 2.67 m まで下がり、最適な形状係数も大きい方へ移る。
+逆条件数の列は平均を引いても変わらないので、この改善は条件ではなく近似のモデルの違いから来る。
+$a=8$ m で平均を引くと、最小の RMSE は $\varepsilon=4.0$ の 4.58 m になる。
+良条件であることと未使用点で正確であることは別の性質であり、両方を並べて形状係数を選ぶ。
+
+## まとめ
+
+RBF は格子に並ばない標高の標本から、核の重ね合わせで曲面を作る。
+`RbfInterpolator` は定数の項を持たないので、Gaussian 核では観測値の平均を引いてから当てはめると、点の間の値が 0 へ下がらない。
+形状係数を大きくすると逆条件数は 1 に近づくが、点の間の近似は悪くなるので、`conditioning()` の値と未使用点の誤差を並べて選ぶ。
+対角正則化は標本点の残差を許す代わりにノイズへの感度を下げ、条件数を $(n+\lambda)/\lambda$ 以下に抑えるが、点の配置が粗いときは未使用点の誤差を大きくは変えない。
+1 ノルムの逆条件数は推定値であり、誤差の保証として読まない。
+
+## 次に読むページ
+
+- [Franke 関数による RBF の交差検証](../station-cross-validation/)：真値を使わない一つ抜き誤差で形状係数を選び、真の誤差と比べる。
+- [規則格子の補間と RBF](../../algorithms/grids-and-rbf/)：核ごとの行列の性質、分解の切り替え、条件の推定の読み方を確かめる。

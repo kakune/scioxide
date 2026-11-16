@@ -1,0 +1,563 @@
+---
+title: 幾何 Brownian 運動の同一経路比較と強次数
+description: Brownian 橋で作った 1 本の Wiener 経路を刻みだけ変えて共有し、Itô と Stratonovich の幾何 Brownian 運動を解析解と比べ、Euler–Maruyama 法と確率 Heun 法の強次数を傾きと信頼区間で測る。
+sidebar:
+  order: 430
+---
+
+株価のように、変化の速さが現在の値に比例し、揺らぎの大きさも値に比例する量は、幾何 Brownian 運動（geometric Brownian motion、GBM）
+
+$$
+dY = a\,Y\,dt + \sigma\,Y\,dW, \qquad Y(0) = Y_0
+$$
+
+で表される。
+$a$ はドリフトの率、$\sigma$ は揺らぎの強さ（ボラティリティ）である。
+GBM は同じ Wiener 経路での厳密解を持つので、数値解の経路ごとの誤差、つまり強誤差を直接測れる。
+この例題では、1 本の経路を Brownian 橋で作って刻みだけを変えて共有し、Itô と Stratonovich の解釈の違いと、二つの解法の強次数を確かめる。
+解釈とドリフトの補正、強収束の定義は[確率微分方程式の解釈と解法](../../algorithms/stochastic-equations/)で説明した。
+
+## 二つの解釈の厳密解
+
+係数が同じでも、Itô の方程式と Stratonovich の方程式の解は
+
+$$
+Y^{\mathrm I}(t) = Y_0 \exp\!\left(\left(a - \frac{\sigma^2}{2}\right)t + \sigma W(t)\right), \qquad
+Y^{\mathrm S}(t) = Y_0 \exp\bigl(a t + \sigma W(t)\bigr)
+$$
+
+と異なる。
+Stratonovich の解は通常の連鎖律で $d \log Y = a\,dt + \sigma \circ dW$ を積分して得られ、Itô の解は Itô の公式による $-\sigma^2/2$ の補正を含む。
+期待値は $\mathbb E\, Y^{\mathrm I}(t) = Y_0 e^{at}$、$\mathbb E\, Y^{\mathrm S}(t) = Y_0 e^{(a + \sigma^2/2)t}$ である。
+以下では $a = 0.4$、$\sigma = 0.7$、$Y_0 = 1$、$t \in [0, 1]$ とする（時間の単位は年、$a$ と $\sigma^2$ の単位は 1/年）。
+
+`EulerMaruyama` は Itô の解、`StochasticHeun` は Stratonovich の解に収束する。
+ノイズはスカラーなので、確率 Heun 法の強次数は 1、Euler–Maruyama 法の強次数は 1/2 と予想できる。
+
+## 同じ経路を刻みだけ変えて使う
+
+強誤差を刻み幅の関数として測るには、刻み幅だけを変え、Wiener 経路は変えてはならない。
+刻み数を変えるたびに新しい乱数で増分を作ると、別の経路の解を比べることになる。
+
+この例題は、細かい格子 $t_i = i/1024$ の上の経路 $W(t_1), \dots, W(t_{1024})$ を scioxide-random の `BrownianBridgePlan` で作る。
+Brownian 橋は、最初の座標で $W(1)$ を、次の座標で $W(1/2)$ を両端の値の条件付き分布から、と粗い時刻から細かい時刻へ値を決める（[Brownian 橋過程による確率経路の階層的生成](../../../scioxide-random/examples/brownian-bridge/)）。
+そのため、粗い格子の上の経路は先頭の座標だけで決まり、格子を細かくしても粗い時刻の値は変わらない。
+増分 $\Delta W_i = W(t_{i+1}) - W(t_i)$ を `SdeProblem` に渡し、`with_step_boundaries` で $1024/N$ 区間ごとに刻みの境目を置くと、刻み数 $N$ の解は間の増分の和を使う。
+こうして、同じ経路で $N = 4, 8, \dots, 256$ の解を作れる。
+
+次のブロックはこのページのセルが使うモデルと経路の作り方である。
+`Gbm` は GBM の `SdeSystem` の実装、`fine_times` は細かい格子、`bridge_increments` は標準正規座標から Brownian 橋で経路と増分を作る処理、`step_boundaries` は刻み数 $N$ の境目、`gbm_exact` は二つの解釈の厳密解に対応する。
+
+```rust
+//| id: ode-gbm-model
+//| kind: definitions
+//| title: 幾何 Brownian 運動の係数、Brownian 橋の増分と厳密解
+//| crates: [scioxide-core, scioxide-random, scioxide-ode]
+use scioxide_core::{SciOxideError, RealScalar, SolveContext};
+use scioxide_ode::SdeSystem;
+use scioxide_random::{BrownianBridgePlan, SamplingWorkspace};
+
+/// dY = a Y dt + σ Y dW（a = 0.4、σ = 0.7 [1/年]）。
+pub(crate) struct Gbm;
+pub(crate) const DRIFT: f64 = 0.4;
+pub(crate) const VOLATILITY: f64 = 0.7;
+/// 細かい格子の区間の数。
+pub(crate) const FINE: usize = 1024;
+
+impl SdeSystem<f64> for Gbm {
+    fn dimension(&self) -> usize {
+        1
+    }
+
+    fn noise_dimension(&self) -> usize {
+        1
+    }
+
+    fn drift(
+        &self,
+        _: f64,
+        y: &[f64],
+        out: &mut [f64],
+        _: &mut SolveContext<'_, '_>,
+    ) -> Result<(), SciOxideError> {
+        out[0] = DRIFT * y[0];
+        Ok(())
+    }
+
+    fn diffusion_product(
+        &self,
+        _: f64,
+        y: &[f64],
+        dw: &[f64],
+        out: &mut [f64],
+        _: &mut SolveContext<'_, '_>,
+    ) -> Result<(), SciOxideError> {
+        out[0] = VOLATILITY * y[0] * dw[0];
+        Ok(())
+    }
+}
+
+/// 細かい格子 t_i = i/1024（i = 0, …, 1024）。
+pub(crate) fn fine_times() -> Vec<f64> {
+    (0..=FINE).map(|i| i as f64 / FINE as f64).collect()
+}
+
+/// 座標 z から path = (W(t₁), …, W(t₁₀₂₄)) を作り、増分 W(t_{i+1}) − W(t_i) を書く。
+pub(crate) fn bridge_increments(
+    bridge: &BrownianBridgePlan<f64>,
+    z: &[f64],
+    path: &mut [f64],
+    increments: &mut [f64],
+    workspace: &mut SamplingWorkspace<f64>,
+) -> Result<(), SciOxideError> {
+    bridge.apply_into(z, path, workspace)?;
+    increments[0] = path[0];
+    for i in 1..FINE {
+        increments[i] = path[i] - path[i - 1];
+    }
+    Ok(())
+}
+
+/// 刻み数 N の境目 0, 1024/N, 2·1024/N, …, 1024（細かい格子の番号）。
+pub(crate) fn step_boundaries(steps: usize) -> Vec<usize> {
+    (0..=steps).map(|k| k * FINE / steps).collect()
+}
+
+/// 厳密解。Itô は exp((a − σ²/2)t + σW)、Stratonovich は exp(at + σW)（Y₀ = 1）。
+pub(crate) fn gbm_exact(stratonovich: bool, t: f64, w: f64) -> f64 {
+    let correction = if stratonovich {
+        0.0
+    } else {
+        VOLATILITY * VOLATILITY / 2.0
+    };
+    RealScalar::exp((DRIFT - correction) * t + VOLATILITY * w)
+}
+```
+
+次のセルは選んだシードの 1 本の経路で、刻み数 $N$ の二つの解法の数値解を、それぞれの解釈の厳密解と比べる。
+上のグラフは数値解（記号）と厳密解（線）、下のグラフは Wiener 経路で、横軸の時刻は連動する。
+表は $t = 1$ での値と誤差を示す。
+
+```rust
+//| id: ode-geometric-brownian-path
+//| ref: ode-geometric-brownian-path
+//| title: 1 本の Wiener 経路で二つの解釈の数値解と厳密解を比べる
+//| run: reactive
+//| uses: [ode-gbm-model]
+//| crates: [scioxide-core, scioxide-linalg, scioxide-random, scioxide-ode]
+//| inputs:
+//|   seed: {"type":"range","label":"乱数のシード","description":"Wiener 経路を変える。","min":1,"max":1000,"step":1,"value":663}
+//|   level: {"type":"range","label":"刻み数の指数 ℓ（N = 2^ℓ）","description":"同じ経路のまま刻み幅 h = 1/N を変える。","min":2,"max":8,"step":1,"value":4}
+//| cases:
+//|   - {"id":"fine","label":"N = 256","description":"同じ経路で刻みを細かくすると、どちらの誤差も減る。","inputs":{"level":8}}
+//|   - {"id":"other-path","label":"シード 1","description":"別の経路では誤差の大きさが変わる。","inputs":{"seed":1}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"endpoint","path":"/rows/0/3","approx":{"value":1.038692,"atol":1e-6}}
+//|       - {"artifact":"endpoint","path":"/rows/0/4","range":{"max":0.2}}
+//|       - {"artifact":"endpoint","path":"/rows/1/4","range":{"max":0.05}}
+//|       - {"path":"/outputs/3/state","equals":"satisfied"}
+//|   - case: fine
+//|     expect:
+//|       - {"artifact":"endpoint","path":"/rows/1/4","range":{"max":1e-3}}
+use scioxide_core::{ExecutionContext, SciOxideError};
+use scioxide_linalg::MatrixView;
+use scioxide_ode::{OdeState, SdeMethod, SdeOptions, SdeProblem, SdeWorkspace};
+use scioxide_random::{BrownianBridgePlan, Distribution, Normal, SeedableRng, SplitMix64};
+
+let fixed6 = serde_json::json!({ "fractionDigits": 6 });
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let steps = 1_usize << (level.round() as u32);
+let times = fine_times();
+let bridge = BrownianBridgePlan::new(&times).map_err(|e| e.to_string())?;
+let mut bridge_workspace = bridge.workspace(()).map_err(|e| e.to_string())?;
+let mut rng = SplitMix64::from_seed(seed.round() as u64);
+let z = Normal::<f64>::standard()
+    .sample_n(&mut rng, FINE)
+    .map_err(|e| e.to_string())?;
+let (mut path, mut increments) = (vec![0.0; FINE], vec![0.0; FINE]);
+bridge_increments(
+    &bridge,
+    &z,
+    &mut path,
+    &mut increments,
+    &mut bridge_workspace,
+)
+.map_err(|e| e.to_string())?;
+let boundaries = step_boundaries(steps);
+let view = MatrixView::from_slice(FINE, 1, &increments).map_err(|e| e.to_string())?;
+let problem = SdeProblem::new(&Gbm, &times, view).with_step_boundaries(&boundaries);
+let options = SdeOptions::new();
+let mut workspace = SdeWorkspace::new();
+let (mut layers, mut rows, mut success) = (Vec::new(), Vec::new(), true);
+for method in [SdeMethod::EulerMaruyama, SdeMethod::StochasticHeun] {
+    let stratonovich = method == SdeMethod::StochasticHeun;
+    let mut state = OdeState::from_slice(0.0, &[1.0]).map_err(|e| e.to_string())?;
+    // 受理した刻みの (t, Y) を記録する。初期値は送られないので先に入れる。
+    let mut points = vec![[0.0, 1.0]];
+    let mut sink = |t: f64, y: &[f64]| {
+        points.push([t, y[0]]);
+        Ok::<(), SciOxideError>(())
+    };
+    let cx = ExecutionContext::sequential();
+    let report = method
+        .advance(
+            &problem,
+            &options,
+            &mut state,
+            &mut sink,
+            &mut workspace,
+            cx,
+        )
+        .map_err(|e| e.to_string())?;
+    success &= report.is_success();
+    let reference: Vec<[f64; 2]> = std::iter::once([0.0, 1.0])
+        .chain(
+            (0..FINE).map(|i| [times[i + 1], gbm_exact(stratonovich, times[i + 1], path[i])]),
+        )
+        .collect();
+    let end = gbm_exact(stratonovich, 1.0, path[FINE - 1]);
+    let name = format!("{method:?}");
+    rows.push((
+        name.clone(),
+        format!("{:?}", method.interpretation()),
+        state.values()[0],
+        end,
+        (state.values()[0] - end).abs(),
+        format!("{:?}", report.termination()),
+    ));
+    layers.push(serde_json::json!({
+        "id": name.clone(),
+        "kind": "scatter",
+        "name": format!("{name}（N = {steps}）"),
+        "points": points
+    }));
+    layers.push(serde_json::json!({
+        "id": format!("{name}-exact"),
+        "kind": "line",
+        "name": format!("{:?} の厳密解", method.interpretation()),
+        "points": reference,
+        "style": { "lineType": "dashed", "showSymbol": false }
+    }));
+}
+emit_chart!(serde_json::json!({
+    "kind": "xy",
+    "link": { "group": "gbm-time" },
+    "xLabel": "時刻 t [年]",
+    "yLabel": "Y(t) [Y₀]",
+    "dataZoom": true,
+    "tooltip": true,
+    "layers": layers
+}));
+let wiener: Vec<[f64; 2]> = std::iter::once([0.0, 0.0])
+    .chain((0..FINE).map(|i| [times[i + 1], path[i]]))
+    .collect();
+emit_line_chart!(
+    &vec![serde_json::json!({ "name": "W(t)（Brownian 橋、1024 区間）", "points": wiener })],
+    options = &serde_json::json!({
+        "link": { "group": "gbm-time" },
+        "xLabel": "時刻 t [年]",
+        "yLabel": "W(t) [√年]"
+    })
+);
+let columns = serde_json::json!([
+    { "key": "0", "label": "解法" },
+    { "key": "1", "label": "解釈" },
+    { "key": "2", "label": "数値解 Y(1) [Y₀]", "type": "number", "format": fixed6 },
+    { "key": "3", "label": "厳密解 Y(1) [Y₀]", "type": "number", "format": fixed6 },
+    { "key": "4", "label": "誤差 [Y₀]", "type": "number", "format": sci3 },
+    { "key": "5", "label": "終了状態" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "endpoint" })
+);
+let (outcome, status) = if success {
+    (
+        Outcome::satisfied("両方の解法が t = 1 に達した（精度は厳密解との差で読む）"),
+        "ReachedEnd",
+    )
+} else {
+    (
+        Outcome::partial("終端に達しなかった解法がある"),
+        "一部が未完了",
+    )
+};
+emit_outcome!(
+    outcome
+        .status(status)
+        .diagnostic("W(1)", path[FINE - 1], Some("√年"))
+        .diagnostic("刻み数 N", steps as f64, None)
+);
+```
+
+既定のシード 663 では $W(1) = -0.1672$ で、Itô の厳密解は $Y^{\mathrm I}(1) = 1.038692$、Stratonovich の厳密解は $Y^{\mathrm S}(1) = 1.327056$ である。
+二つの厳密解の差 0.288 は解釈の違い（ドリフトの $\sigma^2/2 = 0.245$）によるもので、離散化の誤差ではない。
+$N = 16$ では Euler–Maruyama 法の誤差は 0.0854、確率 Heun 法の誤差は 0.0225 である。
+同じ経路のまま $N = 256$ にすると、誤差は 0.0188 と $4.9 \times 10^{-4}$ に減る。
+刻み幅を 1/16 にしたとき、Euler–Maruyama 法の誤差は 1/4.5 に、確率 Heun 法の誤差は 1/46 になり、強次数 1/2 と 1 から予想される 1/4 と 1/16 とは一致しない。
+シード 1 では $N = 16$ の誤差が 0.0039 と 0.066 で大小が逆になるように、1 本の経路の誤差は経路ごとに大きく揺らぐ。
+次数を読むには、次のセルのように多くの経路の平均を使う。
+
+## 強次数の測定
+
+強誤差 $\mathbb E\,|Y(1) - Y_N|$ は多くの経路の平均で推定する。
+次のセルは $M$ 本の経路のそれぞれで $N = 4, 8, \dots, 256$ の解を作り、刻み数ごとに誤差の平均と標準誤差（SE）を求める。
+両対数のグラフで誤差 $e(h) \approx C h^{\gamma}$ の傾きが強次数 $\gamma$ になる。
+この関係は $h \to 0$ の漸近的な性質で、粗い刻みでは高次の項が残るので、表には隣り合う刻みの局所の傾き $\log_2\bigl(e(2h)/e(h)\bigr)$ も示す。
+経路は 10 組に等分し、組ごとの誤差の平均を次のセルに渡す。
+
+```rust
+//| id: ode-gbm-strong-errors
+//| ref: ode-gbm-strong-errors
+//| title: 同じ経路の刻みを変えて強誤差を集める
+//| run: button
+//| cache: inputs
+//| uses: [ode-gbm-model]
+//| crates: [scioxide-core, scioxide-linalg, scioxide-random, scioxide-ode]
+//| exports: [group_errors]
+//| inputs:
+//|   paths: {"type":"range","label":"経路数 M [本]","description":"10 組に等分する。傾きの信頼区間は 1/√M で縮む。","min":100,"max":600,"step":100,"value":300}
+//|   seed: {"type":"range","label":"乱数のシード","min":1,"max":1000,"step":1,"value":26}
+//| cases:
+//|   - {"id":"few-paths","label":"M = 100","description":"SE が広がる。","inputs":{"paths":100}}
+//|   - {"id":"other-seed","label":"シード 5","description":"別の経路の集合。","inputs":{"seed":5}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"errors","path":"/rows/6/6","range":{"min":0.9,"max":1.15}}
+//|       - {"artifact":"errors","path":"/rows/0/1","range":{"min":0.15,"max":0.2}}
+use scioxide_core::{ExecutionContext, RealScalar};
+use scioxide_linalg::MatrixView;
+use scioxide_ode::{OdeState, SdeMethod, SdeOptions, SdeProblem, SdeWorkspace};
+use scioxide_random::{BrownianBridgePlan, Distribution, Normal, SeedableRng, SplitMix64};
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed3 = serde_json::json!({ "fractionDigits": 3 });
+let (groups, levels) = (10_usize, [4_usize, 8, 16, 32, 64, 128, 256]);
+let m = (paths.round() as usize / groups) * groups;
+let times = fine_times();
+let bridge = BrownianBridgePlan::new(&times).map_err(|e| e.to_string())?;
+let mut bridge_workspace = bridge.workspace(()).map_err(|e| e.to_string())?;
+let standard = Normal::<f64>::standard();
+let mut rng = SplitMix64::from_seed(seed.round() as u64);
+let (mut z, mut path, mut increments) = (vec![0.0; FINE], vec![0.0; FINE], vec![0.0; FINE]);
+let boundaries: Vec<Vec<usize>> = levels.iter().map(|&n| step_boundaries(n)).collect();
+let options = SdeOptions::new();
+let methods = [SdeMethod::EulerMaruyama, SdeMethod::StochasticHeun];
+// errors[k][l][p] = 解法 k、刻み数 levels[l]、経路 p の |Y(1) − Y_N|。
+let mut errors = vec![vec![vec![0.0; m]; levels.len()]; 2];
+// 作業領域は全ての解で使い回す。
+let mut workspace = SdeWorkspace::new();
+for p in 0..m {
+    for value in &mut z {
+        *value = standard.sample(&mut rng).map_err(|e| e.to_string())?;
+    }
+    bridge_increments(
+        &bridge,
+        &z,
+        &mut path,
+        &mut increments,
+        &mut bridge_workspace,
+    )
+    .map_err(|e| e.to_string())?;
+    let view = MatrixView::from_slice(FINE, 1, &increments).map_err(|e| e.to_string())?;
+    for (k, method) in methods.into_iter().enumerate() {
+        let exact = gbm_exact(k == 1, 1.0, path[FINE - 1]);
+        for (l, cuts) in boundaries.iter().enumerate() {
+            let problem = SdeProblem::new(&Gbm, &times, view).with_step_boundaries(cuts);
+            let mut state = OdeState::from_slice(0.0, &[1.0]).map_err(|e| e.to_string())?;
+            let cx = ExecutionContext::sequential();
+            let report = method
+                .advance(&problem, &options, &mut state, &mut (), &mut workspace, cx)
+                .map_err(|e| e.to_string())?;
+            if !report.is_success() {
+                return Err(format!("{method:?} が未完了: {:?}", report.termination()));
+            }
+            errors[k][l][p] = (state.values()[0] - exact).abs();
+        }
+    }
+}
+let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+// group_errors[k][l][g] = 組 g の誤差の平均。
+let size = m / groups;
+let group_errors: Vec<Vec<Vec<f64>>> = (0..2)
+    .map(|k| {
+        (0..levels.len())
+            .map(|l| {
+                (0..groups)
+                    .map(|g| mean(&errors[k][l][g * size..(g + 1) * size]))
+                    .collect()
+            })
+            .collect()
+    })
+    .collect();
+export!(group_errors, &group_errors);
+let mut rows = Vec::new();
+for (l, &n) in levels.iter().enumerate() {
+    let stats = |k: usize| {
+        let e = &errors[k][l];
+        let mu = mean(e);
+        let var = e.iter().map(|v| (v - mu) * (v - mu)).sum::<f64>() / (m - 1) as f64;
+        (mu, RealScalar::sqrt(var / m as f64))
+    };
+    // 隣の刻みとの局所の傾き log₂(e(2h)/e(h))。
+    let local = |k: usize| {
+        (l > 0)
+            .then(|| RealScalar::ln(mean(&errors[k][l - 1]) / mean(&errors[k][l])) / 2f64.ln())
+    };
+    let ((em, em_se), (heun, heun_se)) = (stats(0), stats(1));
+    rows.push((n, em, em_se, heun, heun_se, local(0), local(1)));
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "刻み数 N [-]", "type": "integer" },
+    { "key": "1", "label": "EM の平均誤差 [Y₀]", "type": "number", "format": sci3 },
+    { "key": "2", "label": "EM の SE [Y₀]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "Heun の平均誤差 [Y₀]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "Heun の SE [Y₀]", "type": "number", "format": sci3 },
+    { "key": "5", "label": "EM の局所の傾き [-]", "type": "number", "format": fixed3, "nullText": "-" },
+    { "key": "6", "label": "Heun の局所の傾き [-]", "type": "number", "format": fixed3, "nullText": "-" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "errors" })
+);
+```
+
+既定値（$M = 300$、シード 26）では、Euler–Maruyama 法の平均誤差は $N = 4$ の 0.173 から $N = 256$ の 0.026 に、確率 Heun 法の平均誤差は 0.070 から $1.39 \times 10^{-3}$ に減る。
+Euler–Maruyama 法の局所の傾きは 0.41〜0.52 で 1/2 のまわりに散らばる。
+確率 Heun 法の局所の傾きは $N \le 64$ では 0.86〜0.94 で 1 より小さく、$N = 128$ と $256$ で 1.02 と 1.03 になる。
+確率 Heun 法は 1 刻みあたりの評価回数が 2 倍だが、評価回数が同じ $N = 128$ の確率 Heun 法の誤差 $2.8 \times 10^{-3}$ は、$N = 256$ の Euler–Maruyama 法の誤差 0.026 の約 1/9 である。
+
+傾きは、最小の刻み数 $N_{\min}$ 以上の点で $\log e$ を $\log h$ に最小二乗で当てはめて求める。
+傾きの不確かさは、組ごとに求めた傾きのばらつきから推定する。
+組ごとの傾き $\gamma_1, \dots, \gamma_{10}$ の平均を $\bar\gamma$、標準偏差を $s_\gamma$ とすると、95% 信頼区間は $\bar\gamma \pm t_{0.975, 9}\, s_\gamma/\sqrt{10}$（$t_{0.975, 9} = 2.262$）である。
+次のセルは $N_{\min}$ を入力とし、全経路の平均誤差の傾き、組ごとの傾きの平均と信頼区間を求める。
+グラフの破線は最も細かい刻みの誤差を通る傾き 1/2 と 1 の参照線である。
+
+```rust
+//| id: ode-gbm-strong-order
+//| ref: ode-gbm-strong-order
+//| title: 強誤差の傾きと信頼区間から強次数を読む
+//| run: reactive
+//| crates: [scioxide-core]
+//| dependsOn:
+//|   collected: ode-gbm-strong-errors
+//| inputs:
+//|   fit_from: {"type":"range","label":"当てはめの最小の刻み数の指数（N_min = 2^k）","description":"粗い刻みを当てはめから外す。","min":2,"max":6,"step":1,"value":4}
+//| cases:
+//|   - {"id":"all-levels","label":"N_min = 4","description":"粗い刻みを含めると、確率 Heun 法の傾きが 1 より小さく出る。","inputs":{"fit_from":2}}
+//|   - {"id":"fine-levels","label":"N_min = 64","description":"細かい 3 点だけで当てはめると、信頼区間が広がる。","inputs":{"fit_from":6}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"orders","path":"/rows/0/1","range":{"min":0.4,"max":0.6}}
+//|       - {"artifact":"orders","path":"/rows/1/1","range":{"min":0.9,"max":1.1}}
+//|   - case: all-levels
+//|     expect:
+//|       - {"artifact":"orders","path":"/rows/1/1","range":{"min":0.85,"max":1.0}}
+use scioxide_core::RealScalar;
+
+let fixed3 = serde_json::json!({ "fractionDigits": 3 });
+let group_errors: Vec<Vec<Vec<f64>>> =
+    serde_json::from_value(collected["group_errors"].clone()).map_err(|e| e.to_string())?;
+let levels = [4_usize, 8, 16, 32, 64, 128, 256];
+let first = (fit_from.round() as usize).saturating_sub(2);
+let log_h: Vec<f64> = levels[first..]
+    .iter()
+    .map(|&n| RealScalar::ln(1.0 / n as f64))
+    .collect();
+let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+// log e を log h に最小二乗で当てはめた傾き（e は N ≥ N_min の誤差）。
+let slope = |e: &[f64]| {
+    let y: Vec<f64> = e.iter().map(|v| RealScalar::ln(*v)).collect();
+    let (xm, ym) = (mean(&log_h), mean(&y));
+    let num: f64 = log_h.iter().zip(&y).map(|(x, v)| (x - xm) * (v - ym)).sum();
+    num / log_h.iter().map(|x| (x - xm) * (x - xm)).sum::<f64>()
+};
+let (mut rows, mut series) = (Vec::new(), Vec::new());
+for (k, name) in ["EulerMaruyama", "StochasticHeun"].into_iter().enumerate() {
+    let errors = &group_errors[k];
+    let groups = errors[0].len();
+    let overall: Vec<f64> = errors.iter().map(|e| mean(e)).collect();
+    let slopes: Vec<f64> = (0..groups)
+        .map(|g| slope(&errors[first..].iter().map(|e| e[g]).collect::<Vec<_>>()))
+        .collect();
+    let gm = mean(&slopes);
+    let var = slopes.iter().map(|s| (s - gm) * (s - gm)).sum::<f64>() / (groups - 1) as f64;
+    // t 分布の 97.5% 点（自由度 9）。
+    let half = 2.262 * RealScalar::sqrt(var / groups as f64);
+    let theory = if k == 0 { 0.5 } else { 1.0 };
+    rows.push((
+        name,
+        slope(&overall[first..]),
+        gm,
+        gm - half,
+        gm + half,
+        theory,
+    ));
+    let points: Vec<[f64; 2]> = levels
+        .iter()
+        .zip(&overall)
+        .map(|(&n, &e)| [1.0 / n as f64, e])
+        .collect();
+    // 最も細かい刻みの誤差を通る傾き γ の参照線。
+    let finest = overall[levels.len() - 1];
+    let reference: Vec<[f64; 2]> = levels
+        .iter()
+        .map(|&n| [1.0 / n as f64, finest * (256.0 / n as f64).powf(theory)])
+        .collect();
+    series.push(serde_json::json!({ "name": format!("{name} の平均誤差"), "points": points }));
+    series.push(serde_json::json!({
+        "name": format!("傾き {theory}（参照）"),
+        "points": reference,
+        "style": { "lineType": "dashed" }
+    }));
+}
+emit_line_chart!(
+    &series,
+    options = &serde_json::json!({
+        "xLabel": "刻み幅 h [年]",
+        "yLabel": "強誤差 E|Y(1) − Y_N| [Y₀]",
+        "xType": "log",
+        "yType": "log"
+    })
+);
+let columns = serde_json::json!([
+    { "key": "0", "label": "解法" },
+    { "key": "1", "label": "全経路の傾き [-]", "type": "number", "format": fixed3 },
+    { "key": "2", "label": "組ごとの傾きの平均 [-]", "type": "number", "format": fixed3 },
+    { "key": "3", "label": "95% 信頼区間の下限 [-]", "type": "number", "format": fixed3 },
+    { "key": "4", "label": "95% 信頼区間の上限 [-]", "type": "number", "format": fixed3 },
+    { "key": "5", "label": "理論の強次数 [-]", "type": "number", "format": { "fractionDigits": 1 } }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "orders" })
+);
+```
+
+既定の $N_{\min} = 16$ では、Euler–Maruyama 法の傾きは 0.448、組ごとの傾きの 95% 信頼区間は $[0.363, 0.556]$ で、理論の強次数 1/2 を含む。
+確率 Heun 法の傾きは 0.957、信頼区間は $[0.923, 0.981]$ で、1 をわずかに外れる。
+$N_{\min} = 4$ にすると確率 Heun 法の傾きは 0.936、信頼区間は $[0.913, 0.955]$ に下がり、$N_{\min} = 64$ にすると傾きは 1.029、信頼区間は $[0.904, 1.131]$ で 1 を含む。
+信頼区間は経路の選び方によるばらつきだけを表し、粗い刻みに残る高次の項による系統的なずれは含まない。
+粗い刻みを当てはめに含めるほど区間は狭くなるが、中心は漸近の次数からずれる。
+傾きを理論の次数と比べるときは、局所の傾きが落ち着いた漸近域を選び、その範囲の点の数による区間の広がりも合わせて読む。
+
+## まとめ
+
+同じ係数の GBM でも、Itô の解と Stratonovich の解はドリフトの $\sigma^2/2$ だけ違い、`EulerMaruyama` は前者、`StochasticHeun` は後者に収束する。
+強誤差を刻み幅の関数として測るには、Brownian 橋などで作った 1 本の経路を `with_step_boundaries` で粗くし、経路を変えずに刻みだけを変える。
+多数の経路の平均誤差の両対数の傾きから、Euler–Maruyama 法の強次数 1/2 と、スカラーのノイズでの確率 Heun 法の強次数 1 が確かめられる。
+傾きの不確かさは経路の組ごとの傾きのばらつきで見積もり、1 本の経路の誤差だけから次数を読まない。
+信頼区間は標本のばらつきだけを表すので、当てはめる刻みの範囲は局所の傾きが落ち着いた漸近域から選ぶ。
+
+## 次に読むページ
+
+- [確率微分方程式の解釈と解法](../../algorithms/stochastic-equations/)：ドリフトの補正、強次数と弱次数の条件、細分化を確かめる。
+- [Ornstein–Uhlenbeck 過程の弱収束と標本誤差](../ornstein-uhlenbeck-weak-order/)：期待値の誤差（弱誤差）を偏りと標本誤差に分けて測る。
+- [Brownian 橋による経路の構成](../../../scioxide-random/algorithms/brownian-bridge-construction/)：座標の割り当ての順序と、先頭の座標が経路の分散を担う理由を確かめる。

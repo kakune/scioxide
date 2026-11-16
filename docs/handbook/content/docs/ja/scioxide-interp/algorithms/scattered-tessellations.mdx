@@ -1,0 +1,462 @@
+---
+title: 三角形分割を共有する散在点補間
+description: Delaunay 分割と値の対応、最近傍・単体線形・Clough–Tocher・自然近傍の補間、凸包への射影と外側の勾配。
+sidebar:
+  order: 345
+references:
+  interp-clough-tocher: "cloughtocher-の三次パッチ"
+  interp-convex-hull-extrapolation: "凸包と外挿"
+  interp-edge-gradients: "辺の両側の勾配"
+  interp-natural-neighbor: "自然近傍の補間"
+  interp-nearest-and-linear: "最近傍と単体線形"
+  interp-tessellation-values: "分割と値の対応"
+---
+
+散在点の補間では、問い合わせ点の近くにある標本の選び方が曲面の形を決める。
+Delaunay 分割を一度作れば、その三角形（一般の次元では単体）を複数の値の組や補間方式で共有できる。
+分割の構築、退化した配置の扱い、重複点の統合は[凸包・Delaunay 分割・Voronoi 図](oxref:spatial-delaunay-lifting)で扱う。
+このページでは、固定した分割の上で各方式が何を再現し、どの導関数を計算でき、凸包の外で何を返すかを説明する。
+
+## 分割と値の対応
+
+`ScatteredValues` は値を一つの `Delaunay` の点（サイト）の順序に結び付ける。
+分割は座標がちょうど等しい入力点を一つのサイトに統合するので、サイトの数と順序は入力と一般に異なる。
+`from_input_values(&mesh, values)` は分割の元になった入力の順序で値を受け取り、統合された重複点には同じ値を要求する（異なれば `InvalidInput`）。
+`from_input_view` は `[入力点, 成分]` の形の実数のビューから同じことをする。
+`from_site_values` はサイトの順序ですでに並べた値を受け取る。
+値の個数が合わなければ `DimensionMismatch`、非有限の値があれば `NonFinite` になる。
+値は実数・複素数・配列のどれでもよく、各実数成分を同じ規則で補間する。
+値は分割の `MeshToken` を記録するので、別の分割や作り直した分割と組み合わせると、補間器の構築が `InvalidInput` で拒否される。
+同じ座標から作り直した分割でも、別のものとして扱われる。
+
+補間器は分割と値を借用するので、これらは補間器を使う間保持する。
+4 方式とも標準形式 `new(&mesh, &values)` で作り、設定を変えるときはオプション付き形式 `with_options(&mesh, &values, options)` を使う。
+最近傍・単体線形・自然近傍の設定は `ScatteredOptions` で、`ScatteredOptions::with_maximum_workspace_bytes` は問い合わせの作業領域のメモリの上限を与える（既定は無制限）。
+上限は補間器の構築時に作業領域の正確な大きさと比べ、超えると `ResourceLimit` になる。
+`ScatteredWorkspace` は補間器の `workspace()` から作り、問い合わせで再利用する。
+位置探索、凸包への射影、各方式の局所的な計算に要るメモリを前もって確保するので、`evaluate_into` などの事前確保済みの形は問い合わせの中で確保しない。
+一つの作業領域は、大きさが足りる限り4方式で共有でき、足りるかどうかは `workspace_capacity` で確かめる。
+足りない作業領域は `DimensionMismatch` で拒否され、失敗した問い合わせのあとも作業領域は再利用できる。
+
+## 最近傍と単体線形
+
+`NearestNeighborInterpolator` は最も近い標本の値を返す区分定数の補間である。
+最近点は Euclid 距離の正確な k-d 木の探索で求め、$n$ 個のサイトに対する探索の手間の期待値は $O(\log n)$ である。
+丸めた距離が等しければ、分割の順序で最小の番号の点を選ぶ。
+値は Voronoi 領域の境界で跳ぶので、導関数は提供しない。
+
+`SimplexLinearInterpolator` は問い合わせ点を含む単体の頂点の値を、重心座標 $\lambda_j$ で結ぶ。
+
+$$
+s(x)=\sum_{j=0}^D\lambda_j(x)y_j,\qquad
+\sum_j\lambda_j=1,\qquad x=\sum_j\lambda_jx_j.
+$$
+
+ここで $x_j$ と $y_j$ は単体の $D+1$ 個の頂点とその値である。
+退化していない単体の上では1次関数を再現し、隣り合う単体の共有面で値が連続になる。
+滑らかな関数では、単体の直径 $h$ に対して値の誤差は $O(h^2)$、勾配の誤差は $O(h)$ である。
+勾配は単体ごとに一定で、共有面の両側で一般に異なる。
+共有面の上の点では、位置探索が選んだ単体の勾配を返す。
+細長い単体では重心座標を求める連立方程式が悪条件になり、位置の判定が正確な述語によるものでも値の精度は保証されない。
+アフィン座標系を作れないほど平たい単体では、問い合わせ点が最も近い面から $32\varepsilon$（凸包の大きさと問い合わせ点の大きさに対する相対値）以内にあればその面で評価し、それ以外は `NumericalInstability` を返す。
+
+一組の問い合わせだけを評価するなら、ワンショット関数 `interpolate_scattered(points, values, queries)` が既定の幾何の設定で Delaunay 分割を作り、単体線形補間の値を `Reject` の方針で返す。
+サイトが $D$ 次元に広がらなければ `Singular` になる。
+呼び出しのたびに分割を作り直すので、問い合わせを繰り返すなら `SimplexLinearInterpolator` を保持する。
+
+## Clough–Tocher の三次パッチ
+
+`CloughTocherInterpolator` は平面の各三角形を重心で三つの小三角形に分け、それぞれに3次の Bézier パッチを置く。
+各頂点の値と勾配、各辺を横切る方向の導関数を隣の三角形と共有するので、曲面は凸包の上で全体に $C^1$ 級になる。
+1次関数は正確に再現する。
+標本には勾配がないので、頂点の勾配は分割全体で推定する。
+SciOxide は Nielson（1983）の大域的な方法で、三角形のすべての辺に沿う3次曲線の曲率の近似的な総和を最小にする勾配を求める。
+各サイトの勾配は隣のサイトの勾配と結び付いた $2\times2$ の連立方程式を満たし、勾配 0 から始めた Gauss–Seidel の掃引でこれを解く。
+この推定は2次関数を正確に再現することを保証しない。
+あるサイトの $2\times2$ の系が特異なら `Singular`、反復が溢れれば `NonFinite` になる。
+
+`CloughTocherOptions` は掃引の変化に対する許容誤差（既定は絶対・相対とも $\sqrt{\varepsilon}$）、成分ごとの掃引回数の上限（既定400回、0 は `InvalidInput`）、準備のメモリの上限、提案と反復回数の上限を指定する。
+一つの値の成分は、一回の掃引での頂点の勾配の変化の最大が、$\max(1,|\nabla f|)$ に対する許容誤差を満たしたときに収束する。
+勾配は座標を外接長方形の長いほうの辺で割った座標で測るので、判定は座標の単位によらない。
+`gradient_report()` が返す `CloughTocherReport` の `termination()` が唯一の終了状態である。
+`CloughTocherTermination` は、全成分が許容誤差を満たした `Converged`、掃引の上限に先に達した `IterationLimit`、一回以上の掃引のあとで反復回数の上限に達した `BudgetExhausted` の三つで、`is_success()` は `Converged` のときだけ真になる。
+
+標準形式 `CloughTocherInterpolator::new(&mesh, &values)` は既定の設定で推定し、`Converged` でなければ `ConvergenceFailure`（`IterationLimit`）を返して補間器を返さない。
+オプション付き形式 `with_options(&mesh, &values, options)` と実行スコープを受け取る `build` は、`IterationLimit` と `BudgetExhausted` でも、少なくとも一回の掃引が済んでいれば補間器を返す。
+その曲面も標本を通る $C^1$ 級の曲面であり、精度が下がるのは推定した頂点の勾配だけである。
+反復回数の上限が一回の掃引も許さないときは `ConvergenceFailure`（`IterationLimit`）、提案回数の上限に達したときは `ConvergenceFailure`（`ResourceLimit`）になり、補間器は返らない。
+`iterations()` は全成分のうち最も多い完了した掃引の回数、`final_change()` は最後の掃引での正規化した変化の最大で、未知の関数の勾配の誤差ではない。
+
+平たい三角形では、問い合わせ点が辺や頂点から $32\varepsilon$ 以内にあれば、その辺の3次 Hermite 曲線か頂点の値で評価し、それ以外は `NumericalInstability` を返す。
+
+## 辺の両側の勾配
+
+次の二つのセルは単位正方形の4隅と中心の5点に $f(x,y)=x^2+xy+y^2$ の値を与えた同じ標本を使う。
+この5点の Delaunay 分割は中心から4隅への4本の辺を持ち、中心と原点を結ぶ対角線は内部の辺になる。
+標本点、$f$、分割の構築は次の定義のブロックにまとめる。
+
+```rust
+//| id: interp-scattered-square-model
+//| kind: definitions
+//| title: 単位正方形の 5 点と 2 次関数の標本
+//| crates: [scioxide-core, scioxide-spatial]
+use scioxide_core::SciOxideError;
+use scioxide_spatial::{Delaunay, PointSet};
+
+/// 単位正方形の 4 隅と中心。各点は [x, y]。
+pub(crate) const SITES: [[f64; 2]; 5] =
+    [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.5, 0.5]];
+
+/// 標本に使う 2 次関数 f(x, y) = x² + xy + y²。
+pub(crate) fn quadratic(x: f64, y: f64) -> f64 {
+    x * x + x * y + y * y
+}
+
+/// 5 点の Delaunay 分割を作る。
+pub(crate) fn square_mesh() -> Result<Delaunay<f64>, SciOxideError> {
+    Delaunay::new(&PointSet::from_points(&SITES)?)
+}
+```
+
+最初のセルは内部の対角線からの距離 $\delta$ で、点 $(0.25-\delta,0.25+\delta)$ と $(0.25+\delta,0.25-\delta)$ の勾配の差のノルムを求める。
+$f$ そのものの勾配の差は $2\sqrt2\,\delta$ で、$\delta\to0$ で 0 になる。
+$C^1$ 級の曲面なら勾配の差は $\delta$ に比例して 0 へ近づき、勾配が跳ぶ曲面なら $\delta\to0$ でも一定の値が残る。
+あわせて、$21\times21$ の格子での値の最大誤差を4方式で比べる。
+もう一つの入力は Clough–Tocher の掃引回数の上限で、オプション付き形式 `with_options` に渡す。
+上限で止まっても補間器は返るので、表に終了状態と掃引の回数を示し、セルの結論として終了状態を outcome に出す。
+
+```rust
+//| id: interp-clough-tocher-quadratic
+//| ref: interp-clough-tocher-quadratic
+//| title: Clough–Tocher の値誤差と辺の両側の勾配を測る
+//| run: reactive
+//| uses: [interp-scattered-square-model]
+//| crates: [scioxide-core, scioxide-interp, scioxide-spatial]
+//| inputs:
+//|   offset: {"type":"range","label":"辺からの距離 δ [-]","min":0.0001,"max":0.01,"step":0.0001,"value":0.001}
+//|   max_sweeps: {"type":"range","label":"掃引回数の上限","description":"Clough–Tocher の頂点の勾配の Gauss–Seidel 掃引の上限。","min":1,"max":400,"step":1,"value":400}
+//| cases:
+//|   - {"id":"near-edge","label":"δ = 0.0001","description":"辺に近づけても Clough–Tocher の勾配の差 / δ は変わらず、単体線形の差は残る。","inputs":{"offset":0.0001}}
+//|   - {"id":"one-sweep","label":"掃引 1 回","description":"掃引の上限で止まり IterationLimit になるが、曲面は C¹ 級のまま標本を通る。","inputs":{"max_sweeps":1}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"gradients","path":"/rows/0/2","approx":{"value":10.949919932023723,"rtol":1e-6}}
+//|       - {"artifact":"gradients","path":"/rows/0/3","approx":{"value":0.12148407580323717,"rtol":1e-6}}
+//|       - {"artifact":"gradients","path":"/rows/1/1","approx":{"value":0.7071067811865476,"rtol":1e-12}}
+//|       - {"artifact":"gradients","path":"/rows/2/1","equals":null}
+//|       - {"artifact":"gradients","path":"/rows/4/2","approx":{"value":2.8284271247461903,"rtol":1e-9}}
+//|       - {"artifact":"report","path":"/rows/0/0","equals":"Converged"}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+//|   - case: near-edge
+//|     expect:
+//|       - {"artifact":"gradients","path":"/rows/0/2","approx":{"value":10.968498447696856,"rtol":1e-6}}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+//|   - case: one-sweep
+//|     expect:
+//|       - {"artifact":"report","path":"/rows/0/0","equals":"IterationLimit"}
+//|       - {"artifact":"report","path":"/rows/0/1","equals":1}
+//|       - {"artifact":"gradients","path":"/rows/0/3","approx":{"value":0.25492928581210816,"rtol":1e-6}}
+//|       - {"path":"/outputs/2/state","equals":"partial"}
+use scioxide_core::RealScalar;
+use scioxide_interp::{
+    CloughTocherInterpolator, CloughTocherOptions, Differentiable, ExtrapolationPolicy,
+    Interpolant, NaturalNeighborInterpolator, NearestNeighborInterpolator, ScatteredValues,
+    SimplexLinearInterpolator,
+};
+
+let mesh = square_mesh().map_err(|e| e.to_string())?;
+let data: Vec<f64> = SITES.iter().map(|p| quadratic(p[0], p[1])).collect();
+let values = ScatteredValues::from_input_values(&mesh, data).map_err(|e| e.to_string())?;
+// オプション付き形式は掃引の上限で止まっても補間器を返し、終了状態をレポートに残す
+let options = CloughTocherOptions::new().with_maximum_iterations(max_sweeps as usize);
+let cubic = CloughTocherInterpolator::with_options(&mesh, &values, options)
+    .map_err(|e| e.to_string())?;
+let linear =
+    SimplexLinearInterpolator::<_, 2>::new(&mesh, &values).map_err(|e| e.to_string())?;
+let natural = NaturalNeighborInterpolator::new(&mesh, &values).map_err(|e| e.to_string())?;
+let nearest =
+    NearestNeighborInterpolator::<_, 2>::new(&mesh, &values).map_err(|e| e.to_string())?;
+let policy = ExtrapolationPolicy::Reject;
+// 内部の辺 y = x の両側の 2 点
+let left = [0.25 - offset, 0.25 + offset];
+let right = [0.25 + offset, 0.25 - offset];
+let gap = |a: [f64; 2], b: [f64; 2]| RealScalar::hypot(a[0] - b[0], a[1] - b[1]);
+let cubic_gap = gap(
+    cubic.gradient(left, policy).map_err(|e| e.to_string())?,
+    cubic.gradient(right, policy).map_err(|e| e.to_string())?,
+);
+let linear_gap = gap(
+    linear.gradient(left, policy).map_err(|e| e.to_string())?,
+    linear.gradient(right, policy).map_err(|e| e.to_string())?,
+);
+// 独立な検算: f の勾配 (2x + y, x + 2y) の差
+let exact = |p: [f64; 2]| [2.0 * p[0] + p[1], p[0] + 2.0 * p[1]];
+let exact_gap = gap(exact(left), exact(right));
+// 21 × 21 の格子での値の最大誤差。並びは [Clough–Tocher, 単体線形, 自然近傍, 最近傍]
+let mut errors = [0.0_f64; 4];
+for i in 0..=20 {
+    for j in 0..=20 {
+        let p = [i as f64 / 20.0, j as f64 / 20.0];
+        let computed = [
+            cubic.evaluate(p, policy).map_err(|e| e.to_string())?,
+            linear.evaluate(p, policy).map_err(|e| e.to_string())?,
+            natural.evaluate(p, policy).map_err(|e| e.to_string())?,
+            nearest.evaluate(p, policy).map_err(|e| e.to_string())?,
+        ];
+        for (error, value) in errors.iter_mut().zip(computed) {
+            *error = error.max((value - quadratic(p[0], p[1])).abs());
+        }
+    }
+}
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed3 = serde_json::json!({ "fractionDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "補間" },
+    {
+        "key": "1",
+        "label": "勾配の差 [-]",
+        "type": "number",
+        "format": sci3,
+        "nullText": "提供しない"
+    },
+    {
+        "key": "2",
+        "label": "勾配の差 / δ [-]",
+        "type": "number",
+        "format": fixed3,
+        "nullText": "提供しない"
+    },
+    { "key": "3", "label": "値の最大誤差 [-]", "type": "number", "format": sci3, "nullText": "—" }
+]);
+let rows = vec![
+    (
+        "Clough–Tocher",
+        Some(cubic_gap),
+        Some(cubic_gap / offset),
+        Some(errors[0]),
+    ),
+    (
+        "単体線形",
+        Some(linear_gap),
+        Some(linear_gap / offset),
+        Some(errors[1]),
+    ),
+    ("自然近傍", None, None, Some(errors[2])),
+    ("最近傍", None, None, Some(errors[3])),
+    ("f（参照）", Some(exact_gap), Some(exact_gap / offset), None),
+];
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "gradients" })
+);
+let report = cubic.gradient_report();
+let termination = report.termination();
+emit_table_with_columns!(
+    [
+        "勾配の推定の終了状態",
+        "掃引の回数",
+        "最後の正規化した変化 [-]"
+    ],
+    vec![(
+        format!("{termination:?}"),
+        report.iterations(),
+        report.final_change()
+    )],
+    metadata = serde_json::json!({ "id": "report" })
+);
+let outcome = if termination.is_success() {
+    Outcome::satisfied("頂点の勾配の推定が許容誤差 √ε を満たした")
+} else {
+    Outcome::partial("頂点の勾配の推定が掃引の上限で止まった").explanation(
+        "曲面は標本を通る C¹ 級のままだが、推定した頂点の勾配と曲面の精度が下がる。",
+    )
+};
+emit_outcome!(
+    outcome
+        .status(format!("{termination:?}"))
+        .diagnostic("掃引の回数", report.iterations() as f64, None)
+        .diagnostic("最後の正規化した変化", report.final_change(), None)
+);
+```
+
+既定の設定では、勾配の推定は15回の掃引で `Converged` になり、outcome は `satisfied` である。
+Clough–Tocher の勾配の差を $\delta$ で割った値は 10.9 で、$\delta=0.0001$（`near-edge`）でも 11.0 とほぼ変わらず、差そのものは $\delta$ に比例して 0 へ近づく。
+これは辺の上で勾配が連続していることを示す。
+比例係数が $f$ 自身の $2\sqrt2\approx2.83$ と異なるのは、曲面の2階導関数が $f$ と違うからである。
+単体線形の勾配の差は $\delta$ によらず 0.71 で残り、勾配が辺で跳ぶことが分かる。
+値の最大誤差は Clough–Tocher で 0.12、単体線形と自然近傍で 0.25、最近傍で 1.2 である。
+頂点の勾配を推定しても2次関数が正確に再現されるわけではなく、勾配の連続性と未知の関数の正確な再現は別の性質である。
+掃引を1回に制限すると（`one-sweep`）、終了状態は `IterationLimit`、outcome は `partial` になる。
+勾配の差 $/\delta$ は 21.2 で、曲面は依然として $C^1$ 級だが、値の最大誤差は 0.25 に増え、推定した頂点の勾配の精度が下がったことが分かる。
+
+## 自然近傍の補間
+
+`NaturalNeighborInterpolator` は平面の Sibson 補間を行う。
+問い合わせ点を標本に加えたと考えると、その点の Voronoi 領域は既存の標本の Voronoi 領域から面積を奪って作られる。
+標本 $i$ から奪う面積を $A_i(x)$ とすると、補間は
+
+$$
+s(x)=\sum_iw_i(x)y_i,\qquad w_i(x)=\frac{A_i(x)}{\sum_jA_j(x)}
+$$
+
+である。
+$A_i>0$ になるのは、問い合わせ点の Voronoi 領域が接する標本（自然近傍）だけである。
+重みは非負で和が 1 になり、1次関数を再現する。
+全標本を毎回走査する代わりに、位置探索のあとで、外接円が問い合わせ点を含む三角形（挿入したときに作り直される範囲）だけをたどる。
+そのため位置探索のあとの手間は自然近傍の数に比例し、標本数によらない。
+面積は f64 で計算し、面積の和が正にならない問い合わせは `NumericalInstability` になる。
+標本点では値を再現し、凸包の辺の上では辺に沿う線形補間になる。
+Sibson の補間は標本点以外では $C^1$ 級、標本点では一般に $C^0$ 級である。
+SciOxide は自然近傍の補間の導関数を提供せず、`Interpolant` だけを実装する。
+
+## 凸包と外挿
+
+これらの補間の領域は標本点の凸包であり、外接する長方形ではない。
+凸包の外の問い合わせ点は Euclid 距離で最も近い凸包上の点へ射影して扱う。
+射影先は凸包の境界のすべての面を調べて決めるので、外側の問い合わせは内側よりも手間がかかり、その手間は分割の大きさとともに増える。
+方針ごとの動作は次のとおりである。
+
+| 方針 | 最近傍 | 単体線形 | Clough–Tocher | 自然近傍 |
+|---|---|---|---|---|
+| `Reject` | `DomainError` | `DomainError` | `DomainError` | `DomainError` |
+| `Clamp` | 射影した点に最も近い標本の値 | 射影した点で評価 | 射影した点で評価 | 射影した点で評価 |
+| `BoundedContinue` | 元の点に最も近い標本の値 | 最も近い境界の単体の1次式を延長 | 最も近い3次パッチを延長 | `DomainError` |
+| `MethodDefined` | 元の点に最も近い標本の値 | 最も近い境界の単体の1次式を延長 | 最も近い3次パッチを延長 | `DomainError` |
+
+`BoundedContinue { max_distance }` では、元の点と射影した点の各軸の座標の差が `max_distance` 以下でなければ `DomainError` になる。
+Sibson の座標は凸包の外へ延長できないので、自然近傍は外側では `Clamp` だけを受け付ける。
+
+`Clamp` での単体線形と Clough–Tocher の勾配は、射影と曲面の合成を微分したものである。
+凸包の辺に射影される領域では辺に沿う成分だけが残り、頂点に射影される領域では勾配が 0 になる。
+射影先が切り替わる所で、隣り合う合成の勾配の極限が丸め誤差の範囲で一致しなければ `DomainError`（`Undefined`）になる。
+凸包の境界の上の点では内部の単体やパッチの勾配を返す。
+`Interpolant::report` が返す `ExtrapolationReport` は、元の座標、有効な座標、凸包からの各軸の距離という幾何のレポートであり、外挿の誤差の評価ではない。
+
+次のセルは同じ5点の標本で凸包の外の点 $q=(1+d,\,0.4)$ を4方式と4方針で評価する。
+入力は凸包の右の辺 $x=1$ からの距離 $d$ で、`BoundedContinue` の `max_distance` は 0.1 に固定する。
+`DomainError` になった組は表の欄を `DomainError` と示し、ほかのエラーはセルのエラーとして返す。
+最後の列は、単体線形の補間器の `report` が返す有効な座標で $f$ を評価した参照値である。
+
+```rust
+//| id: interp-scattered-extrapolation
+//| ref: interp-scattered-extrapolation
+//| title: 凸包の外の点を 4 方式と 4 方針で評価する
+//| run: reactive
+//| uses: [interp-scattered-square-model]
+//| crates: [scioxide-core, scioxide-interp, scioxide-spatial]
+//| inputs:
+//|   distance: {"type":"range","label":"凸包からの距離 d [-]","min":0,"max":0.5,"step":0.01,"value":0.05}
+//| cases:
+//|   - {"id":"beyond-bound","label":"d = 0.3","description":"max_distance = 0.1 を超えるので BoundedContinue も DomainError になる。","inputs":{"distance":0.3}}
+//|   - {"id":"on-hull","label":"d = 0","description":"凸包の辺の上の点は内側として扱われ、どの方針でも同じ値になる。","inputs":{"distance":0}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"policies","path":"/rows/0/1","equals":null}
+//|       - {"artifact":"policies","path":"/rows/1/2","approx":{"value":1.8,"atol":1e-12}}
+//|       - {"artifact":"policies","path":"/rows/2/4","equals":null}
+//|       - {"artifact":"policies","path":"/rows/3/2","approx":{"value":1.925,"atol":1e-12}}
+//|   - case: beyond-bound
+//|     expect:
+//|       - {"artifact":"policies","path":"/rows/2/2","equals":null}
+//|       - {"artifact":"policies","path":"/rows/3/4","equals":null}
+//|   - case: on-hull
+//|     expect:
+//|       - {"artifact":"policies","path":"/rows/0/4","approx":{"value":1.8,"atol":1e-12}}
+use scioxide_core::{SciOxideError, SciOxideErrorKind};
+use scioxide_interp::{
+    CloughTocherInterpolator, ExtrapolationPolicy, Interpolant, NaturalNeighborInterpolator,
+    NearestNeighborInterpolator, ScatteredValues, SimplexLinearInterpolator,
+};
+
+let mesh = square_mesh().map_err(|e| e.to_string())?;
+let data: Vec<f64> = SITES.iter().map(|p| quadratic(p[0], p[1])).collect();
+let values = ScatteredValues::from_input_values(&mesh, data).map_err(|e| e.to_string())?;
+let nearest =
+    NearestNeighborInterpolator::<_, 2>::new(&mesh, &values).map_err(|e| e.to_string())?;
+let linear =
+    SimplexLinearInterpolator::<_, 2>::new(&mesh, &values).map_err(|e| e.to_string())?;
+let cubic = CloughTocherInterpolator::new(&mesh, &values).map_err(|e| e.to_string())?;
+let natural = NaturalNeighborInterpolator::new(&mesh, &values).map_err(|e| e.to_string())?;
+let mut workspace = linear.workspace().map_err(|e| e.to_string())?;
+// 凸包の右の辺 x = 1 から距離 d の点
+let q = [1.0 + distance, 0.4];
+// DomainError だけを欄の空白にし、それ以外のエラーはセルのエラーにする
+let keep = |result: Result<f64, SciOxideError>| match result {
+    Ok(value) => Ok(Some(value)),
+    Err(e) if e.kind() == SciOxideErrorKind::DomainError => Ok(None),
+    Err(e) => Err(e.to_string()),
+};
+let policies = [
+    ("Reject", ExtrapolationPolicy::Reject),
+    ("Clamp", ExtrapolationPolicy::Clamp),
+    (
+        "BoundedContinue（0.1）",
+        ExtrapolationPolicy::BoundedContinue { max_distance: 0.1 },
+    ),
+    ("MethodDefined", ExtrapolationPolicy::MethodDefined),
+];
+let mut rows = Vec::new();
+for (name, policy) in policies {
+    // 独立な検算: 有効な座標での f の値
+    let effective = match linear.report(q, policy, &mut workspace) {
+        Ok(report) => Some(report.effective()),
+        Err(e) if e.kind() == SciOxideErrorKind::DomainError => None,
+        Err(e) => return Err(e.to_string()),
+    };
+    rows.push((
+        name,
+        keep(nearest.evaluate(q, policy))?,
+        keep(linear.evaluate(q, policy))?,
+        keep(cubic.evaluate(q, policy))?,
+        keep(natural.evaluate(q, policy))?,
+        effective.map(|p| quadratic(p[0], p[1])),
+    ));
+}
+// 値の列はどれも小数 4 桁で、DomainError の欄を空にする
+let value_column = |key: &str, label: &str| {
+    serde_json::json!({
+        "key": key,
+        "label": label,
+        "type": "number",
+        "format": { "fractionDigits": 4 },
+        "nullText": "DomainError"
+    })
+};
+let columns = serde_json::json!([
+    { "key": "0", "label": "方針" },
+    value_column("1", "最近傍 [-]"),
+    value_column("2", "単体線形 [-]"),
+    value_column("3", "Clough–Tocher [-]"),
+    value_column("4", "自然近傍 [-]"),
+    value_column("5", "f（有効な座標）[-]")
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "policies" })
+);
+```
+
+既定の $d=0.05$ では、`Reject` はすべての方式で `DomainError` になる。
+`Clamp` は射影した点 $(1,0.4)$ で評価し、単体線形と自然近傍は辺に沿う線形補間の値 1.8、Clough–Tocher は 1.664、最近傍は射影した点に最も近い標本 $(1,0)$ の値 1 を返す。
+`BoundedContinue` と `MethodDefined` では、単体線形が最も近い境界の三角形の1次式を延長して 1.925、Clough–Tocher が3次パッチを延長して 1.749 を返し、自然近傍は `DomainError` になる。
+$d=0.3$（`beyond-bound`）では各軸の距離が `max_distance` を超えるので、`BoundedContinue` も全方式で `DomainError` になる。
+入力の上端 $d=0.5$ では、`MethodDefined` の Clough–Tocher は $-0.10$ を返し、参照値 3.01 から大きく外れる。
+延長した3次式は凸包から離れると急に精度を失うので、許可した外挿は精度の保証ではない。
+$d=0$（`on-hull`）では点が凸包の辺の上にあり、どの方針でも内側として同じ値を返す。
+
+## まとめ
+
+`ScatteredValues` は値を一つの分割のサイトの順序と `MeshToken` に結び付けるので、分割を作り直したら値も作り直す。
+最近傍は区分定数、単体線形は値が連続で勾配が跳び、Clough–Tocher は1階導関数まで連続で、自然近傍は1次関数を再現する重み付き平均である。
+Clough–Tocher では `CloughTocherReport::termination` を確かめ、`is_success()` が偽でも曲面は標本を通る $C^1$ 級だが、頂点の勾配の精度が下がることを考慮する。
+凸包の外では `Clamp` が射影した点の値と合成の勾配を返し、`BoundedContinue` と `MethodDefined` の動作は方式によって異なり、自然近傍はどちらも受け付けない。
+
+## 次に読むページ
+
+- [局所モデルと kriging の予測分散](../local-models-and-kriging/)：分割を使わずに近傍を選ぶ方法と、共分散に基づく予測の分散を確かめる。
+- [Franke 関数による RBF の交差検証](../../examples/station-cross-validation/)：Clough–Tocher と RBF を、一つ抜き誤差と独立な格子での誤差で比べる。
+- [2 次元・散在点・局所モデルの API](../../api/multidimensional/)：分割を共有する補間器とレポートの項目を引く。

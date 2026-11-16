@@ -1,0 +1,565 @@
+---
+title: 濃度の非負制約下で反応速度の感度を求める
+description: 冪乗型の反応速度式の勾配を濃度の非負の区間で求め、境界の近くで差分の節点が対称から片側に変わる様子と打ち切り誤差の式、非整数次数での次数の低下と外挿の破綻を解析式で確かめ、下限と上限が一致する触媒濃度を FixedCoordinatePolicy で扱う。
+sidebar:
+  order: 425
+references:
+  differentiate-pinned-catalyst: "値を固定した触媒濃度"
+  differentiate-boundary-order-loss: "境界での片側差分と次数の低下"
+---
+
+反応速度の濃度についての感度（偏微分）は、反応器の設計、速度定数の推定、陰的な時間積分のヤコビ行列に使う。
+濃度は負にならないので、負の濃度で速度式を評価すると、$c^{1.5}$ のような非整数の冪が NaN になったり、モデルの意味が失われたりする。
+この例題では冪乗型の速度式の勾配を、濃度の非負の区間を `Bounds` で与えて差分で求める。
+境界の近くで差分の節点がどう変わり、誤差がどう振る舞うかを解析式と比べ、下限と上限が一致する濃度の扱いを確かめる。
+境界の近くの節点の選び方の一般論は [定義域の境界と片側差分](../../algorithms/bounds-and-one-sided/) にある。
+
+## 冪乗型の速度式
+
+反応速度を次の冪乗型の式で表す。
+
+$$
+r(c_A, c_B) = k \, c_A^{\,n} \, c_B \quad [\mathrm{mol/(L \cdot s)}].
+$$
+
+$c_A$、$c_B$ [mol/L] は反応物の濃度、$n$ は $A$ についての反応次数で、全体の次数は $n + 1$ である。
+非整数の次数は複合反応の速度を実験式で表すときに現れる。
+速度定数は $k = 2.0\,\mathrm{(L/mol)^{n}\,s^{-1}}$ とし、$r$ の単位が $\mathrm{mol/(L \cdot s)}$ になるように $k$ の単位を選ぶ。
+次数は $1 \le n \le 3$、濃度は $c_A, c_B \ge 0$ とする。
+勾配の解析式は次のとおりで、単位はどちらも $\mathrm{s^{-1}}$ である。
+
+$$
+\frac{\partial r}{\partial c_A} = n k \, c_A^{\,n - 1} c_B, \qquad \frac{\partial r}{\partial c_B} = k \, c_A^{\,n}.
+$$
+
+$n$ が整数でなければ、$c_A^{\,n}$ は $c_A = 0$ で滑らかでない。
+$j$ 階導関数は $c_A^{\,n - j}$ に比例するので、$j > n$ の導関数は $c_A \to 0$ で発散する。
+$c_A > 0$ のまわりの Taylor 級数は、特異点 $c_A = 0$ までの距離 $c_A$ より内側でしか収束しない。
+
+次のブロックは、このページの三つのセルが共有する定義である。
+`rate` が $r$（先頭の濃度だけを $n$ 乗し、残りの濃度を 1 次で掛ける）、`rate_slope` が $\partial r / \partial c_A$ の解析式、`one_sided_value` が次の節で導く境界上の片側の公式の値に対応する。
+`rate` は SciOxide の `RealScalar::powf` で計算し、検算用の `rate_slope` と `one_sided_value` は f64 の固有メソッドで計算する。
+
+```rust
+//| id: differentiate-power-rate-model
+//| kind: definitions
+//| title: 冪乗型の反応速度式と境界上の片側の公式
+//| crates: [scioxide-core]
+use scioxide_core::RealScalar;
+
+/// 速度定数 k [(L/mol)ⁿ s⁻¹]。濃度を 1 個掛けるごとに単位の (L/mol) が 1 乗ずつ増える。
+pub(crate) const RATE_CONSTANT: f64 = 2.0;
+
+/// 反応速度 r = k c₀ⁿ c₁ c₂ … [mol/(L·s)]。c₀ < 0 で n が整数でなければ NaN になる。
+pub(crate) fn rate(order: f64, concentrations: &[f64]) -> f64 {
+    let others: f64 = concentrations[1..].iter().product();
+    RATE_CONSTANT * RealScalar::powf(concentrations[0], order) * others
+}
+
+/// 参照値: ∂r/∂c₀ = n k c₀ⁿ⁻¹ × others（others は残りの濃度の積）。c₀ = 0、n > 1 では 0。
+pub(crate) fn rate_slope(order: f64, c0: f64, others: f64) -> f64 {
+    if c0 == 0.0 && order > 1.0 {
+        0.0
+    } else {
+        order * RATE_CONSTANT * c0.powf(order - 1.0) * others
+    }
+}
+
+/// 参照値: c₀ = 0 での片側の公式 (−3r(0) + 4r(h) − r(2h))/(2h) = (4 − 2ⁿ) hⁿ⁻¹ k others / 2。
+pub(crate) fn one_sided_value(order: f64, h: f64, others: f64) -> f64 {
+    (4.0 - 2.0_f64.powf(order)) / 2.0 * h.powf(order - 1.0) * RATE_CONSTANT * others
+}
+```
+
+## 境界の近くの差分の節点
+
+`FiniteDifference` の既定は中心差分で、刻みは $h = \varepsilon^{1/3} \max(1, \lvert c_A \rvert)$ である。
+$c_A \le 1$ では $h = \varepsilon^{1/3} \approx 6.06 \times 10^{-6}$ mol/L になる。
+`Bounds` で下限 0 を渡すと、負の側の余地 $c_A$ が刻みに足りるかどうかで、節点が次の二通りに変わる。
+
+- **対称** $\{-h, 0, h\}$（$c_A \ge h$）：通常の中心差分で、打ち切り誤差の主項は $h^2 r'''/6$ である。
+- **片側** $\{0, h, 2h\}$（$c_A < h$）：負の側に刻みの分の余地がないので、評価点から内側へ向かう同じ二次の精度の片側の 3 点に切り替わる。
+  重みは $(-3, 4, -1)/(2h)$ で、境界上の点（$c_A = 0$）も境界のすぐ内側の点も同じ形である。
+
+どちらの形でも中心の節点は評価点そのもので、その値 $r(c_A)$ は勾配の全成分で共有されるので、1 座標あたりの評価は 2 回である。
+3 点の公式の重み $w_k$ は、$\sum_k w_k = 0$、$\sum_k w_k \delta_k = 1$、$\sum_k w_k \delta_k^2 = 0$（$\delta_k$ は変位）から決まる。
+Taylor 展開の 3 次の項を代入すると、打ち切り誤差の主項は $(r'''/6) \sum_k w_k \delta_k^3$ になる。
+対称なら $\sum_k w_k \delta_k^3 = h^2$ で $h^2 r'''/6$、片側 $\{0, h, 2h\}$ では $\sum_k w_k \delta_k^3 = -2h^2$ なので $-h^2 r'''/3$ である。
+負の側の変位だけを $c_A$ に縮めた非対称な節点を使わないのは、重みが $1/c_A$ に比例して大きくなり、丸め誤差が境界に近づくほど増えるからである（[定義域の境界と片側差分](oxref:differentiate-bounded-fixed-nodes)）。
+ある座標で節点が作れないとき（下限と上限が一致する座標など）は、関数を一度も呼ばずに `InvalidInput`（引数 `bounds`、`UnsupportedConfiguration`）を返す。
+
+適応差分 `AdaptiveDifference` も準位ごとに同じ規則で節点を選ぶ。
+刻みが $c_A$ を超える準位では片側の節点、$c_A$ 以下の準位では対称な節点を使い、節点の形が変わる準位で外挿の表をやり直す（[適応差分・方向微分・節点差分の境界](oxref:differentiate-bounded-other-methods)）。
+どちらの形でも刻みを $c_A$ まで縮めないので、境界のすぐ内側でも関数値の丸め誤差は増えない。
+
+## 境界での片側差分と次数の低下
+
+片側の公式の二次の精度は $r$ が $C^3$ 級であることを前提とするが、$c_A^{\,n}$ は $n$ が整数でなければ $c_A = 0$ で滑らかでない。
+$r(0) = 0$ なので、片側の公式の値は冪を直接代入して求まる。
+
+$$
+\frac{-3 r(0) + 4 r(h) - r(2h)}{2h} = \frac{4 h^n - (2h)^n}{2h} k c_B = \frac{4 - 2^n}{2} \, h^{n - 1} \, k c_B .
+$$
+
+$n > 1$ では $\partial r / \partial c_A = 0$ なので、この値がそのまま誤差になる。
+誤差は $h^{n-1}$ に比例し、$1 < n < 3$ では精度の次数が 2 から $n - 1$ に下がる。
+$n = 1.5$ では次数は 0.5 で、既定の刻みでの誤差は $0.586 \sqrt{h}\, k c_B \approx 2.88 \times 10^{-3}\,\mathrm{s^{-1}}$（$c_B = 1$ mol/L）になる。
+$n = 1$ では値は $k c_B$ で、厳密値に一致する。
+$n = 2$ では係数 $4 - 2^n$ が 0 になり、2 次式なので公式は正確になる。
+$n = 3$ では誤差は $-2 h^2 k c_B$ で、上の $-h^2 r'''/3$（$r''' = 6 k c_B$）と一致し、次数は本来の 2 に戻る。
+
+## 境界の近くの勾配
+
+次のセルは $c_B = 1$ mol/L に固定し、$c_A$ を 0 から 0.1 mol/L まで変えて、勾配を `FiniteDifference::gradient` で計算する。
+関数を呼ぶたびに $c_A$ の変位を記録し、実際に使われた節点の形、負の側の変位 $h_-$、正の側の最大の変位を表に示す。
+片側の節点では負の側の変位はなく、最大の変位は $2h$ になる。
+打ち切り誤差の予測は、境界上では上の片側の公式の値と厳密値の差、境界の内側では対称な節点で $\lvert r''' \rvert h^2 / 6$、片側の節点で $\lvert r''' \rvert h^2 / 3$ である。
+内側の予測は Taylor 級数が節点まで収束するとき（$n$ が整数か、最大の変位が $c_A$ より小さいとき）だけ示し、それ以外は「適用外」とする。
+区間を渡さない場合も選べ、そのとき失敗した行にはエラーの分類と原因を示す。
+
+```rust
+//| id: differentiate-bounded-rate
+//| ref: differentiate-bounded-rate
+//| title: 濃度の非負の区間での反応速度の勾配と差分の節点
+//| run: reactive
+//| uses: [differentiate-power-rate-model]
+//| crates: [scioxide-core, scioxide-differentiate]
+//| inputs:
+//|   order: {"type":"range","label":"反応次数 n","description":"c_A の次数。整数でなければ c_A = 0 で滑らかでない。","min":1.0,"max":3.0,"step":0.25,"value":1.5}
+//|   bounded: {"type":"checkbox","label":"濃度の区間 c ≥ 0 を渡す","description":"外すと、境界の近くで負の濃度を評価する。","value":true}
+//| cases:
+//|   - {"id":"unbounded","label":"区間を渡さない","description":"c_A < h の行では負の濃度を評価して NaN になり、DifferentiationFailure で止まる。","inputs":{"bounded":false}}
+//|   - {"id":"cubic","label":"n = 3","description":"多項式なので、境界の内側の片側の節点でも誤差は |r'''| h²/3 の予測に一致する。","inputs":{"order":3.0}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"rates","path":"/rows/0/1","equals":"片側"}
+//|       - {"artifact":"rates","path":"/rows/0/6","approx":{"value":2.883e-3,"rtol":1e-3}}
+//|       - {"artifact":"rates","path":"/rows/0/7","approx":{"value":2.883e-3,"rtol":1e-3}}
+//|       - {"artifact":"rates","path":"/rows/1/1","equals":"片側"}
+//|       - {"artifact":"rates","path":"/rows/1/2","equals":null}
+//|       - {"artifact":"rates","path":"/rows/1/3","approx":{"value":1.2110909e-5,"rtol":1e-6}}
+//|       - {"artifact":"rates","path":"/rows/1/7","equals":null}
+//|       - {"artifact":"rates","path":"/rows/2/1","equals":"対称"}
+//|       - {"artifact":"rates","path":"/rows/2/6","approx":{"value":4.58e-6,"rtol":0.01}}
+//|       - {"artifact":"rates","path":"/rows/2/7","approx":{"value":4.58e-6,"rtol":0.01}}
+//|   - case: unbounded
+//|     expect:
+//|       - {"artifact":"rates","path":"/rows/0/4","equals":null}
+//|       - {"artifact":"rates","path":"/rows/0/8","equals":"DifferentiationFailure（原因 NonFinite）"}
+//|       - {"artifact":"rates","path":"/rows/1/8","equals":"DifferentiationFailure（原因 NonFinite）"}
+//|       - {"artifact":"rates","path":"/rows/2/6","approx":{"value":4.58e-6,"rtol":0.01}}
+//|   - case: cubic
+//|     expect:
+//|       - {"artifact":"rates","path":"/rows/0/6","approx":{"value":1.467e-10,"rtol":1e-3}}
+//|       - {"artifact":"rates","path":"/rows/1/6","approx":{"value":1.467e-10,"rtol":0.05}}
+//|       - {"artifact":"rates","path":"/rows/1/7","approx":{"value":1.467e-10,"rtol":1e-3}}
+use scioxide_core::{Bounds, SciOxideError, SciOxideErrorView};
+use scioxide_differentiate::FiniteDifference;
+
+let cb = 1.0_f64;
+let bounds =
+    Bounds::new(vec![(Some(0.0), None), (Some(0.0), None)]).map_err(|e| e.to_string())?;
+let describe = |e: SciOxideError| match e.view() {
+    SciOxideErrorView::DifferentiationFailure { cause, .. } => {
+        format!("{:?}（原因 {:?}）", e.kind(), cause.kind())
+    }
+    _ => format!("{:?}", e.kind()),
+};
+let mut rows = Vec::new();
+for ca in [0.0, 1e-6, 1e-4, 1e-2, 0.1] {
+    // c_A を動かした標本の変位 δ を記録する（c_B を動かした標本では δ = 0）。
+    let mut offsets = Vec::new();
+    let result = FiniteDifference::default().gradient(
+        |c: &[f64], y: &mut [f64]| {
+            offsets.push(c[0] - ca);
+            y[0] = rate(order, c);
+            Ok::<(), SciOxideError>(())
+        },
+        &[ca, cb],
+        bounded.then_some(&bounds),
+        None,
+    );
+    let below = offsets.iter().fold(0.0_f64, |a, &d| a.max(-d));
+    let above = offsets.iter().fold(0.0_f64, |a, &d| a.max(d));
+    let exact = rate_slope(order, ca, cb);
+    let (value, failure) = match result {
+        Ok(r) => (r.values().map(|g| g[0]), None),
+        Err(e) => (None, Some(describe(e))),
+    };
+    let nodes = match (value.is_some(), below == 0.0) {
+        (false, _) => None,
+        (true, true) => Some("片側"),
+        (true, false) => Some("対称"),
+    };
+    // 打ち切り誤差の予測: 境界上は片側の公式の値と厳密値の差、内側は |r'''| |Σ w δ³| / 6。
+    // Σ w δ³ は対称な {−h, 0, h} で h²、片側の {0, h, 2h} で −2h²（h は最大の変位の半分）。
+    // r''' = k n(n − 1)(n − 2) c_Aⁿ⁻³。係数が 0 の整数次数では c_A = 0 でも 0 にする。
+    let coefficient = RATE_CONSTANT * order * (order - 1.0) * (order - 2.0);
+    let third = if coefficient == 0.0 {
+        0.0
+    } else {
+        coefficient * ca.powf(order - 3.0)
+    };
+    let moment = if below > 0.0 {
+        below * above
+    } else {
+        above * above / 2.0
+    };
+    let predicted = match nodes {
+        Some("片側") if ca == 0.0 => {
+            Some((one_sided_value(order, above / 2.0, cb) - exact).abs())
+        }
+        Some(_) if order.fract() == 0.0 || above < ca => {
+            Some((third * cb).abs() * moment / 6.0)
+        }
+        _ => None,
+    };
+    rows.push((
+        ca,
+        nodes,
+        (below > 0.0).then_some(below),
+        value.map(|_| above),
+        value,
+        exact,
+        value.map(|v| (v - exact).abs()),
+        predicted,
+        failure,
+    ));
+}
+let sci1 = serde_json::json!({ "notation": "scientific", "significantDigits": 1 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let sci6 = serde_json::json!({ "notation": "scientific", "significantDigits": 6 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "c_A [mol/L]", "type": "number", "format": sci1 },
+    { "key": "1", "label": "節点", "nullText": "—" },
+    { "key": "2", "label": "負の側の変位 h₋ [mol/L]", "type": "number", "format": sci3, "nullText": "なし" },
+    { "key": "3", "label": "正の側の最大の変位 [mol/L]", "type": "number", "format": sci3, "nullText": "—" },
+    { "key": "4", "label": "∂r/∂c_A 差分 [1/s]", "type": "number", "format": sci6, "nullText": "エラー" },
+    { "key": "5", "label": "∂r/∂c_A 解析 [1/s]", "type": "number", "format": sci6 },
+    { "key": "6", "label": "誤差 [1/s]", "type": "number", "format": sci2, "nullText": "—" },
+    { "key": "7", "label": "打ち切り誤差の予測 [1/s]", "type": "number", "format": sci2, "nullText": "適用外" },
+    { "key": "8", "label": "エラー", "nullText": "なし" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "rates" })
+);
+```
+
+既定の $n = 1.5$ では、$c_A = 0$ の行は片側の節点になり、正の側の最大の変位は $2h = 1.21 \times 10^{-5}$ mol/L である。
+差分の値 $2.88 \times 10^{-3}\,\mathrm{s^{-1}}$ がそのまま誤差で、上の片側の公式の値に一致する。
+$c_A = 10^{-6}$ では刻み $h = 6.06 \times 10^{-6}$ より境界が近いので、評価点から内側へ向かう片側の節点 $\{c_A, c_A + h, c_A + 2h\}$ になる。
+節点が Taylor 級数の収束半径 $c_A$ の外にあるので予測は適用外で、誤差は $1.04 \times 10^{-3}\,\mathrm{s^{-1}}$ と解析値 $3 \times 10^{-3}$ の 35% に達する。
+これは $c_A^{1.5}$ が境界で滑らかでないことによる誤差で、節点が収束半径の外にある限り、二次の精度の見積もりは成り立たない。
+$c_A \ge 10^{-4}$ では対称な中心差分に戻り、誤差（$4.59 \times 10^{-6}$、$4.58 \times 10^{-9}$、$1.45 \times 10^{-10}$）は予測 $h^2 \lvert r''' \rvert / 6$ と 0.2% 以内で一致する。
+対称な行では $h_- = h \le c_A$、片側の行では負の側に節点がないので、負の濃度は評価していない。
+
+区間を渡さないと、$c_A = 0$ と $10^{-6}$ の行では負の側の変位 $h$ が $c_A$ を超え、負の濃度で $c_A^{1.5}$ が NaN になる。
+差分は `DifferentiationFailure` で止まり、その原因は関数値が有限でないことを表す `NonFinite` である。
+$c_A \ge 10^{-4}$ の行は区間の有無によらず同じ値になる。
+$n = 3$ では $r$ が多項式なので、$c_A = 0$ と $10^{-6}$ の片側の節点の誤差はどちらも $1.47 \times 10^{-10}$ で、予測 $\lvert r''' \rvert h^2 / 3 = 2 h^2 k c_B$ に一致する。
+$c_A \ge 10^{-4}$ の対称な節点の誤差 $7.33 \times 10^{-11}$ はその半分で、境界のすぐ内側でも誤差は境界から離れた点の 2 倍にとどまる。
+
+## 刻みと誤差の次数
+
+次のセルは $c_A = 0$ で刻みを `DifferenceStep::absolute` により $10^{-1}$ から $10^{-8}$ mol/L まで変え、片側の公式の誤差を両対数で描く。
+所有値を返す API の `derivative` は区間を受け取らないので、区間を渡せる 1 座標の `gradient` で求める。
+破線は予測 $\lvert (4 - 2^n) h^{n - 1} k c_B / 2 \rvert$ で、表の観測次数は両端の刻みの誤差の比から求める。
+$n = 2$ では公式が正確で誤差が 0 になり、対数軸に描けないので、次数の選択肢から除いている。
+誤差がちょうど 0 になった点は図から除き、その数を表に示す。
+
+同じ点で `AdaptiveDifference::gradient` も呼び、外挿がこの誤差を消せるかを確かめる。
+適応差分の外挿は、片側の節点の誤差が $h^2, h^3, \dots$ の整数の冪で展開できると仮定して、その項を順に消す。
+ここでの誤差は $h^{n-1}$ の一項だけなので、この仮定が成り立たない。
+下の表は適応差分の終了理由、値、推定誤差、実際の誤差（解析値 0 との差）、評価回数で、セルの最後の判定は終了理由による。
+
+```rust
+//| id: differentiate-boundary-order
+//| ref: differentiate-boundary-order
+//| title: 濃度 0 の境界での片側差分の誤差の次数と適応差分の外挿
+//| run: reactive
+//| uses: [differentiate-power-rate-model]
+//| crates: [scioxide-core, scioxide-differentiate]
+//| inputs:
+//|   order: {"type":"select","label":"反応次数 n","description":"誤差の次数 n − 1 と係数 4 − 2ⁿ を変える。","options":["1.25","1.5","1.75","2.25","2.5","2.75"],"value":"1.5"}
+//| cases:
+//|   - {"id":"steep","label":"n = 2.75","description":"傾きが 1.75 に急になり、係数 4 − 2ⁿ が負になる。適応差分は同じく上限で止まる。","inputs":{"order":"2.75"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"order","path":"/rows/0/2","approx":{"value":0.5,"atol":0.005}}
+//|       - {"artifact":"order","path":"/rows/0/4","equals":0}
+//|       - {"artifact":"errors","path":"/spec/series/0/points/0/1","approx":{"value":0.3705,"rtol":1e-3}}
+//|       - {"artifact":"adaptive","path":"/rows/0/0","equals":"RefinementLimit"}
+//|       - {"artifact":"adaptive","path":"/rows/0/3","range":{"min":0.01}}
+//|       - {"path":"/outputs/3/state","equals":"partial"}
+//|   - case: steep
+//|     expect:
+//|       - {"artifact":"order","path":"/rows/0/2","approx":{"value":1.75,"atol":0.005}}
+//|       - {"artifact":"adaptive","path":"/rows/0/0","equals":"RefinementLimit"}
+//|       - {"path":"/outputs/3/state","equals":"partial"}
+use scioxide_core::{Bounds, SciOxideError, RealScalar};
+use scioxide_differentiate::{AdaptiveDifference, DifferenceStep, FiniteDifference};
+
+let order: f64 = order.parse().map_err(|_| "次数を読めない")?;
+let cb = 1.0_f64;
+let bounds = Bounds::new(vec![(Some(0.0), None)]).map_err(|e| e.to_string())?;
+let f = |c: &[f64], y: &mut [f64]| {
+    y[0] = rate(order, &[c[0], cb]);
+    Ok::<(), SciOxideError>(())
+};
+let (mut observed, mut predicted, mut dropped) = (Vec::new(), Vec::new(), 0);
+for j in 0..=28 {
+    let h = RealScalar::powf(10.0, -1.0 - 0.25 * j as f64);
+    let step = DifferenceStep::absolute(h).map_err(|e| e.to_string())?;
+    let result = FiniteDifference::default()
+        .with_step(step)
+        .gradient(f, &[0.0], Some(&bounds), None)
+        .map_err(|e| e.to_string())?;
+    // 解析値は 0 なので、差分の値の絶対値が誤差になる。0 の点は対数軸に描けない。
+    let error = result.values().ok_or("導関数が公開されない")?[0].abs();
+    if error > 0.0 {
+        observed.push([h, error]);
+    } else {
+        dropped += 1;
+    }
+    predicted.push([h, one_sided_value(order, h, cb).abs()]);
+}
+let (first, last) = (observed[0], observed[observed.len() - 1]);
+let slope = RealScalar::ln(first[1] / last[1]) / RealScalar::ln(first[0] / last[0]);
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let fixed3 = serde_json::json!({ "fractionDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "反応次数 n", "type": "number", "format": fixed2 },
+    { "key": "1", "label": "予測の次数 n − 1", "type": "number", "format": fixed2 },
+    { "key": "2", "label": "観測次数", "type": "number", "format": fixed3 },
+    { "key": "3", "label": "描いた点", "type": "integer" },
+    { "key": "4", "label": "誤差 0 で除いた点", "type": "integer" }
+]);
+let summary = vec![(order, order - 1.0, slope, observed.len(), dropped)];
+emit_table_with_columns!(
+    columns,
+    summary,
+    metadata = serde_json::json!({ "id": "order" })
+);
+emit_chart!(
+    serde_json::json!({
+        "kind": "line",
+        "series": [
+            { "name": "片側差分の誤差", "points": observed, "style": { "showSymbol": true } },
+            { "name": "予測 |4 − 2ⁿ| hⁿ⁻¹ k c_B / 2", "points": predicted, "style": { "lineType": "dashed" } }
+        ],
+        "xLabel": "刻み h [mol/L]",
+        "yLabel": "∂r/∂c_A の誤差 [1/s]",
+        "xType": "log",
+        "yType": "log",
+        "dataZoom": true,
+        "tooltip": true
+    }),
+    metadata = serde_json::json!({ "id": "errors" })
+);
+// 同じ点の適応差分。値と推定誤差は上限で止まっても出力に反映される。
+let adaptive = AdaptiveDifference::default()
+    .gradient(f, &[0.0], Some(&bounds))
+    .map_err(|e| e.to_string())?;
+let report = adaptive.report();
+let value = adaptive.values().ok_or("適応差分の値が出力に反映されない")?[0];
+let estimate = adaptive.errors().ok_or("推定誤差が出力に反映されない")?[0];
+let termination = report.termination().to_string();
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "終了理由" },
+    { "key": "1", "label": "値 [1/s]", "type": "number", "format": sci3 },
+    { "key": "2", "label": "推定誤差 [1/s]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "実際の誤差 [1/s]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "評価回数 [回]", "type": "integer" }
+]);
+let adaptive_row = vec![(
+    termination.clone(),
+    value,
+    estimate,
+    value.abs(),
+    report.evaluations(),
+)];
+emit_table_with_columns!(
+    columns,
+    adaptive_row,
+    metadata = serde_json::json!({ "id": "adaptive" })
+);
+let outcome = if report.is_success() {
+    Outcome::satisfied("適応差分の推定誤差が許容誤差を満たした")
+} else {
+    Outcome::partial("適応差分は許容誤差を満たす前に準位の上限で止まった")
+        .explanation("値と推定誤差は出力に反映されるが、誤差が hⁿ⁻¹ に比例するので外挿で消えず、推定誤差は上界ではない。")
+};
+emit_outcome!(
+    outcome
+        .status(termination)
+        .diagnostic("推定誤差", estimate, Some("1/s"))
+        .diagnostic("実際の誤差", value.abs(), Some("1/s"))
+        .diagnostic("評価回数", report.evaluations() as f64, None)
+);
+```
+
+既定の $n = 1.5$ では、観測次数は 0.500 で、29 点の誤差はすべて破線の予測に重なる。
+$n = 2.75$ では観測次数は 1.750 になる。
+係数 $4 - 2^n$ は $n < 2$ で正、$n > 2$ で負なので、差分の値は $n < 2$ で解析値 0 を上回り、$n > 2$ で下回る。
+次数が下がるのは差分のアルゴリズムの欠陥ではなく、関数が境界で滑らかでないためである。
+$n = 1.5$ では誤差を 10 分の 1 にするのに刻みを 100 分の 1 にする必要がある。
+
+適応差分は 16 準位を使い切って `RefinementLimit` で止まり、評価回数は $1 + 2 \cdot 16 = 33$ 回である。
+初めの刻みが $0.5$ mol/L と大きく、16 準位でも刻みは $0.5/1.4^{15} \approx 3.2 \times 10^{-3}$ mol/L までしか縮まないので、値 $3.94 \times 10^{-2}\,\mathrm{s^{-1}}$ の誤差は既定の固定刻みの $2.88 \times 10^{-3}$ より大きい。
+推定誤差 $7.25 \times 10^{-3}$ は実際の誤差の約 5 分の 1 で、誤差を過小に見積もっている。
+$n = 2.75$ でも推定誤差 $3.31 \times 10^{-6}$ は実際の誤差 $4.09 \times 10^{-6}$ より小さい。
+滑らかでない境界の上では適応差分の推定誤差を上界として読まず、解析的な導関数を使うか、次数が分かっている固定刻みの公式で刻みを選ぶ。
+
+## 値を固定した触媒濃度
+
+触媒を含む速度式 $r = k \, c_A^{\,n} c_B \, c_{\mathrm{cat}}$ で、触媒濃度が $c_{\mathrm{cat}} = 0.5$ mol/L に固定されている（下限と上限が等しい）とする。
+濃度を 1 個掛けたので、$k = 2.0$ の単位は $\mathrm{(L/mol)^{n+1}\,s^{-1}}$ になる。
+`FiniteDifference` は、下限と上限が一致する座標の扱いを `with_fixed_coordinates` に渡す `FixedCoordinatePolicy` で決める。
+
+- **`RequireStencil`（既定）**：その座標には節点が作れないので、関数を呼ぶ前に `InvalidInput`（引数 `bounds`、`UnsupportedConfiguration`）を返す。
+- **`FeasibleZero`**：固定した座標の偏微分を 0 とし、その座標の標本を評価しない。
+  受け付けるのは勾配とスカラーの導関数だけで、ほかの演算は `InvalidInput`（`self`、`Inconsistent`）、区間のない勾配は `InvalidInput`（`bounds`、`Inconsistent`）になる。
+
+`FeasibleZero` が返すのは、固定した座標を動かさない実行可能な方向に制限した関数の勾配で、元の関数の $\partial r / \partial c_{\mathrm{cat}} = k c_A^{\,n} c_B$ ではない。
+これは $\nabla r$ を実行可能な方向の部分空間へ射影したものにあたる。
+
+次のセルは $c_A$ を入力にとり、二つの方針で勾配を求めて、元の関数の解析的な勾配と並べる。
+$n = 1.5$、$c_B = 1$ mol/L とする。
+評価回数はレポートの値と、関数を呼んだ回数を数えた値を並べる。
+
+```rust
+//| id: differentiate-pinned-species
+//| ref: differentiate-pinned-species
+//| title: 値を固定した触媒濃度の勾配の方針
+//| run: reactive
+//| uses: [differentiate-power-rate-model]
+//| crates: [scioxide-core, scioxide-differentiate]
+//| inputs:
+//|   ca: {"type":"range","label":"濃度 c_A [mol/L]","description":"0 にすると、c_A の偏微分が境界上の片側の公式になる。","min":0.0,"max":2.0,"step":0.25,"value":1.0}
+//| cases:
+//|   - {"id":"on-bound","label":"c_A = 0","description":"c_A の成分は解析値 0 ではなく、片側の公式の誤差 1.44 × 10⁻³ になる。","inputs":{"ca":0.0}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"policies","path":"/rows/0/1","equals":null}
+//|       - {"artifact":"policies","path":"/rows/0/5","equals":0}
+//|       - {"artifact":"policies","path":"/rows/0/6","equals":"InvalidInput（bounds、UnsupportedConfiguration）"}
+//|       - {"artifact":"policies","path":"/rows/1/1","approx":{"value":1.5,"rtol":1e-8}}
+//|       - {"artifact":"policies","path":"/rows/1/2","approx":{"value":1.0,"rtol":1e-8}}
+//|       - {"artifact":"policies","path":"/rows/1/3","equals":0}
+//|       - {"artifact":"policies","path":"/rows/1/4","equals":5}
+//|       - {"artifact":"policies","path":"/rows/1/5","equals":5}
+//|       - {"artifact":"policies","path":"/rows/2/5","equals":null}
+//|       - {"artifact":"policies","path":"/rows/2/3","approx":{"value":2.0,"rtol":1e-12}}
+//|   - case: on-bound
+//|     expect:
+//|       - {"artifact":"policies","path":"/rows/1/1","approx":{"value":1.4415e-3,"rtol":1e-3}}
+//|       - {"artifact":"policies","path":"/rows/2/1","equals":0}
+use scioxide_core::{Bounds, SciOxideError, SciOxideErrorView};
+use scioxide_differentiate::{FiniteDifference, FixedCoordinatePolicy};
+
+let order = 1.5_f64;
+let c = [ca, 1.0, 0.5];
+let bounds = Bounds::new(vec![
+    (Some(0.0), None),
+    (Some(0.0), None),
+    (Some(0.5), Some(0.5)),
+])
+.map_err(|e| e.to_string())?;
+let mut rows = Vec::new();
+for (name, policy) in [
+    ("RequireStencil", FixedCoordinatePolicy::RequireStencil),
+    ("FeasibleZero", FixedCoordinatePolicy::FeasibleZero),
+] {
+    let mut calls = 0_usize;
+    let result = FiniteDifference::default()
+        .with_fixed_coordinates(policy)
+        .gradient(
+            |p: &[f64], y: &mut [f64]| {
+                calls += 1;
+                y[0] = rate(order, p);
+                Ok::<(), SciOxideError>(())
+            },
+            &c,
+            Some(&bounds),
+            None,
+        );
+    rows.push(match result {
+        Ok(r) => {
+            let g = r.values().ok_or("勾配が出力に反映されない")?;
+            let evaluations = r.report().evaluations();
+            (
+                name,
+                Some(g[0]),
+                Some(g[1]),
+                Some(g[2]),
+                Some(evaluations),
+                Some(calls),
+                None,
+            )
+        }
+        Err(e) => {
+            let detail = match e.view() {
+                SciOxideErrorView::InvalidInput {
+                    argument, reason, ..
+                } => format!("{:?}（{}、{:?}）", e.kind(), argument.as_str(), reason),
+                _ => format!("{:?}", e.kind()),
+            };
+            (name, None, None, None, None, Some(calls), Some(detail))
+        }
+    });
+}
+// 参照値: 元の関数の勾配 (n k c_Aⁿ⁻¹ c_B c_cat, k c_Aⁿ c_cat, k c_Aⁿ c_B)（f64 の固有メソッド）。
+let power = RATE_CONSTANT * ca.powf(order);
+rows.push((
+    "元の関数（解析）",
+    Some(rate_slope(order, ca, c[1] * c[2])),
+    Some(power * c[2]),
+    Some(power * c[1]),
+    None,
+    None,
+    None,
+));
+let fixed6 = serde_json::json!({ "fractionDigits": 6 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "方針" },
+    { "key": "1", "label": "∂r/∂c_A [1/s]", "type": "number", "format": fixed6, "nullText": "—" },
+    { "key": "2", "label": "∂r/∂c_B [1/s]", "type": "number", "format": fixed6, "nullText": "—" },
+    { "key": "3", "label": "∂r/∂c_cat [1/s]", "type": "number", "format": fixed6, "nullText": "—" },
+    { "key": "4", "label": "レポートの評価回数 [回]", "type": "integer", "nullText": "—" },
+    { "key": "5", "label": "数えた呼び出し [回]", "type": "integer", "nullText": "—" },
+    { "key": "6", "label": "エラー", "nullText": "なし" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "policies" })
+);
+```
+
+既定の $c_A = 1$ mol/L では、`RequireStencil` は関数を一度も呼ばずに `InvalidInput`（`bounds`、`UnsupportedConfiguration`）を返す。
+`FeasibleZero` は $(1.5, 1, 0)\,\mathrm{s^{-1}}$ を返し、評価回数は基準点の 1 回と $c_A$、$c_B$ の 2 回ずつの 5 回で、数えた呼び出しの回数と一致する。
+3 番目の成分は元の関数の偏微分 $k c_A^{1.5} c_B = 2$ ではなく 0 で、固定した座標を動かせないことを表す。
+$c_A = 0$ にすると、1 番目の成分は解析値 0 ではなく $1.44 \times 10^{-3}$ になる。
+これは片側の公式の誤差 $2.88 \times 10^{-3}$ に $c_{\mathrm{cat}} = 0.5$ を掛けた値である。
+最適化で下限と上限が一致する変数を扱うときは、この勾配が実行可能な方向へ射影した勾配であることを踏まえて使う。
+
+## まとめ
+
+濃度の非負の区間を `Bounds` で渡すと、`FiniteDifference` は区間の外を評価せず、境界までの距離が刻みに足りなければ対称な 3 点から内側へ向かう片側の 3 点に切り替える。
+どちらも二次の公式で、打ち切り誤差の主項は $h^2 r'''/6$（片側では $-h^2 r'''/3$）なので、関数が滑らかなら境界のすぐ内側でも誤差は内部と同じ大きさで、見積もりもできる。
+非整数の冪 $c^n$ は境界で滑らかでないので、境界上の誤差は $(4 - 2^n) h^{n-1} k c_B / 2$ となり、次数は $n - 1$ に下がる。
+この誤差は適応差分の外挿でも消えず、推定誤差は実際の誤差より小さくなるので、境界の上で `RefinementLimit` になった値は推定誤差を上界とみなさずに扱う。
+区間を渡さないと境界の近くで負の濃度を評価して `DifferentiationFailure` になり、下限と上限が一致する座標は既定で `InvalidInput`、`FeasibleZero` では偏微分を 0 とする射影された勾配になる。
+
+## 次に読むページ
+
+- [定義域の境界と片側差分](../../algorithms/bounds-and-one-sided/)：境界の近くの節点の選び方を、適応差分・方向微分・節点差分の場合も含めて確かめる。
+- [Taylor 展開と刻み幅の選択](../../algorithms/taylor-and-step-size/)：差分の次数が関数の滑らかさを前提とすることと、既定の刻みの根拠を確かめる。
+- [解析微分・自動微分・差分を方針で切り替える](../derivative-strategy-planck/)：導関数のプロバイダーを方針で選ぶ例題に進む。

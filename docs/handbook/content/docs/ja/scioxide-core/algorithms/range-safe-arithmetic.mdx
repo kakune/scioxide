@@ -1,0 +1,531 @@
+---
+title: 厳密累積と範囲安全な算術
+description: 固定長の整数累積器 RangeAccumulator、一回の丸めで結果を返す検査付き算術、端点を保つアフィン結合、LASSQ 型の尺度化ノルム、桁落ちを避ける二次方程式の根の公式と残差の仕様。
+sidebar:
+  order: 330
+references:
+  core-quadratic-roots: "二次方程式の根と残差の仕様"
+  core-compensated-summation: "補償和と厳密累積"
+  core-range-accumulator: "情報落ちと固定長の整数累積器"
+  core-checked-arithmetic: "検査付き算術関数の誤差の保証"
+  core-scaled-norm: "lassq-型の尺度化ノルム"
+  core-affine-ratio: "端点を保つアフィン結合"
+---
+
+数学的に同じ式でも、浮動小数点の手順として書くと結果は変わる。
+最終結果が表現できる大きさでも、途中の積や和がオーバーフローすれば結果は `inf` や `NaN` になる。
+大きさの異なる項を足すと、小さい項が丸めで消える（情報落ち）。
+`scioxide-core` の範囲安全な算術は、途中の値を厳密に保持して最後に一度だけ丸めるか、仮数と指数を分けて途中の値が範囲を出ないようにして、これらを避ける。
+単位丸め $u$ や桁落ちなどの一般論は[浮動小数点と条件数](../../../concepts/floating-point-and-conditioning/)にまとめてある。
+
+## 情報落ちと固定長の整数累積器
+
+$a = 10^{16}$、$b = 1$、$c = -10^{16}$ の和を左から計算すると、$10^{16}$ の近くの倍精度数の間隔は 2 なので $10^{16} + 1$ は $10^{16}$ に丸められ、結果は 0 になる（実数としての和は 1）。
+
+`RangeAccumulator` は有限な浮動小数点数を整数の桁として保持し、このシードの誤差をなくす。
+
+- 64 ビットのワードを 100 個並べた桁列（リム）を、正の項用と負の項用に一つずつ持つ。
+  最下位ビットの重みは $2^{-3222}$ で、倍精度の三つの数の積の最小値 $(2^{-1074})^3$ まで表せる。
+- 各項の仮数を指数に応じた位置のワードに丸めずに加える。
+  積 `add_product` や三重積 `add_triple_product` も仮数の整数積として厳密に加える。
+- `finish()` は正の桁列から負の桁列を引いた値を、一度だけ最近接偶数丸めで目的の型へ変換する。
+  厳密に打ち消し合った場合は $+0$ を返す。
+- メモリ領域は固定長のスタック領域で、ヒープを確保しない。
+  一回の更新と二つの状態の `merge` は、入力の長さによらず定数時間である。
+- `merge` は厳密なので、分割した部分和をどの順序でマージしても結果は同じである。
+
+非有限な入力は状態を変える前に `NonFinite`（`NonFiniteOrigin::Input`）として拒否する。
+最終結果が型の有限な範囲を超えると、`finish()` が `NumericalInstability`（`Overflow`）を返す。
+`finish()` は状態を借用するだけなので、累積した状態は保たれる。
+更新と `merge` も桁列の容量を超えると同じエラーを返すが、桁列は繰り上がりの余裕を持つので、メモリに収まる長さの入力の和では起きない。
+失敗した更新と `merge` は状態を変えない。
+
+`finish_scaled()` は範囲外の和を拡張範囲値 `Scaled` として受け取り、`finish_quotient(d)` は和を $d$ で割った商を一度の丸めで返す。
+
+`checked_sum` は、厳密な和を最近接偶数丸めした値を、入力の長さに比例する時間で返す。
+2 項までは IEEE の加算 1 回がその値である。
+3 項では TwoSum（和と丸め誤差を誤差なしに分ける変換）を、4 項以上では Ogita・Rump・Oishi の補償和 Sum2 を使い、誤差限界から丸め先の浮動小数点数が一つに決まると確かめられた場合に限ってその値を返す。
+確かめられなければ累積器で厳密に計算するので、どの経路でも結果は同じである。
+`checked_sum_of_products` も、4 対までの短い入力では誤差のない積と丸めの検査を使い、検査で決まらなければ累積器を使う。
+
+次のセルは $L + s - L$ を左から計算したときに $s$ のうち残る割合を、$L$ を $10^8$ から $10^{20}$ まで変えて描く。
+入力は小さな項 $s = 10^p$ の指数 $p$（$-2$ から 5 の整数）である。
+1 つ目のグラフは残る割合 $((L + s) - L)/s$、2 つ目のグラフは $L$ とその上側の隣接数との間隔を $s$ で割った値で、横軸の $L$ を共有する。
+表は 3 つの $L$ について、左からの和、`checked_sum`、二つに分けた `RangeAccumulator` を `merge` した結果を比べ、後の二つが $s$ に一致することを確かめる。
+
+```rust
+//| id: core-summation-cancellation
+//| ref: core-summation-cancellation
+//| title: 大きな項に足した小さな項がどれだけ残るか
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   small_exponent: {"type":"range","label":"小さな項の指数 p [-]","description":"s = 10^p を L と −L の間に置く。","min":-2,"max":5,"step":1,"value":0}
+//| cases:
+//|   - {"id":"small-term","label":"s = 0.01","description":"L = 10⁸ でも左からの和は s の下位の桁を失う。","inputs":{"small_exponent":-2}}
+//|   - {"id":"large-term","label":"s = 10⁵","description":"L = 10¹⁸ でも s の大半が残る。","inputs":{"small_exponent":5}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"sums","path":"/rows/1/1","equals":0}
+//|       - {"artifact":"sums","path":"/rows/1/2","equals":1}
+//|       - {"artifact":"sums","path":"/rows/2/3","equals":1}
+//|   - case: small-term
+//|     expect:
+//|       - {"artifact":"sums","path":"/rows/0/1","approx":{"value":0.01,"rtol":1e-6}}
+//|       - {"artifact":"sums","path":"/rows/2/2","approx":{"value":0.01,"rtol":1e-14}}
+//|       - {"artifact":"sums","path":"/rows/2/1","equals":0}
+//|   - case: large-term
+//|     expect:
+//|       - {"artifact":"sums","path":"/rows/2/1","approx":{"value":1e5,"rtol":1e-3}}
+//|       - {"artifact":"sums","path":"/rows/2/3","approx":{"value":1e5,"rtol":1e-14}}
+use scioxide_core::{RangeAccumulator, RealScalar, checked_sum};
+
+let s = RealScalar::powi(10.0_f64, small_exponent as i32);
+let mut retained = Vec::new();
+let mut gap_ratio = Vec::new();
+for index in 0..=96 {
+    let l = RealScalar::powf(10.0_f64, 8.0 + index as f64 * 12.0 / 96.0);
+    // 左からの浮動小数点の和で s のうち残った割合。
+    retained.push([l, ((l + s) - l) / s]);
+    // L の上側の隣接数との間隔を s で割った値。
+    let gap = RealScalar::next_after(l, f64::INFINITY) - l;
+    gap_ratio.push([l, gap / s]);
+}
+emit_line_chart!(
+    &vec![serde_json::json!({ "name": "((L + s) − L) / s", "points": retained })],
+    options = &serde_json::json!({
+        "link": { "group": "large-term" },
+        "xLabel": "大きな項 L [-]",
+        "yLabel": "残った割合 [-]",
+        "xType": "log"
+    })
+);
+// 間隔 / s が 2 を超えると s は間隔の半分より小さく、丸めで消える。
+emit_line_chart!(
+    &vec![serde_json::json!({ "name": "間隔 / s", "points": gap_ratio })],
+    options = &serde_json::json!({
+        "link": { "group": "large-term" },
+        "xLabel": "大きな項 L [-]",
+        "yLabel": "L の隣接数との間隔 / s [-]",
+        "xType": "log",
+        "yType": "log",
+        "annotations": [{ "kind": "line", "axis": "y", "value": 2.0, "label": "s = 間隔 / 2" }]
+    })
+);
+
+let mut rows = Vec::new();
+for exponent in [8, 16, 18] {
+    let l = RealScalar::powi(10.0_f64, exponent);
+    let terms = [l, s, -l];
+    let exact = checked_sum(&terms).map_err(|e| e.to_string())?;
+    // [L, s] と [−L] に分けて累積し、merge でマージしる。
+    let mut left = RangeAccumulator::new();
+    left.add(l).map_err(|e| e.to_string())?;
+    left.add(s).map_err(|e| e.to_string())?;
+    let mut right = RangeAccumulator::new();
+    right.add(-l).map_err(|e| e.to_string())?;
+    left.merge(&right).map_err(|e| e.to_string())?;
+    let merged = left.finish().map_err(|e| e.to_string())?;
+    rows.push((l, (l + s) - l, exact, merged));
+}
+let sci1 = serde_json::json!({ "notation": "scientific", "significantDigits": 1 });
+let digits = serde_json::json!({ "significantDigits": 6 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "大きな項 L [-]", "type": "number", "format": sci1 },
+    { "key": "1", "label": "左からの和 (L + s) − L [-]", "type": "number", "format": digits },
+    { "key": "2", "label": "checked_sum [-]", "type": "number", "format": digits },
+    { "key": "3", "label": "2 分割を merge [-]", "type": "number", "format": digits }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "sums" })
+);
+```
+
+既定の $s = 1$ では、$L < 2^{53} \approx 9.0 \times 10^{15}$ の範囲で間隔が 1 以下なので、残る割合は 1 である。
+間隔がちょうど 2 の範囲（2 つ目のグラフで横線の上にある点）では $L + 1$ が隣り合う二数の中点になり、偶数丸めで $L$ か $L + 2$ になるので、割合は 0 か 2 である。
+間隔が 4 以上になる $L > 2^{54} \approx 1.8 \times 10^{16}$ では $s$ が間隔の半分より小さく、割合は 0 になる。
+表の左からの和は $L = 10^{8}$ で 1、$L = 10^{16}$ と $10^{18}$ で 0 になり、`checked_sum` と `merge` の列はどの $L$ でも 1 である。
+
+$s = 0.01$ にすると、$L = 10^{8}$ の左からの和は $0.0100000054$ で、$s$ の有効数字の 8 桁目以降が間隔 $1.5 \times 10^{-8}$ の丸めで変わる。
+$s = 10^{5}$ では、$L = 10^{18}$ の左からの和は間隔 128 の倍数 99968 になる。
+左からの和は間隔の整数倍しか取れないので、間隔が $s$ に近づくと残る割合は段になり、間隔 / $s$ が 2 を超えると 0 になる。
+どの $s$ でも `checked_sum` と `merge` の列は $s$ と一致する。
+
+## 補償和と厳密累積
+
+`CompensatedSum` は Neumaier の補償和で、主和と丸め残差の二つのスカラーだけを保持する。
+`ZERO` から `add` を重ね、`total` で読み出す。
+`parts` と `from_parts` は有限な二成分の保存と復元に使う。
+各操作は定数の計算量で確保を伴わず、失敗した追加は二成分を変えない。
+
+複数の量の和を一度の走査で取るには `compensated_reduce` を使う。
+長さ `N` の配列を要素とする反復子から `N` 本の `CompensatedSum` を作る。
+各列を 4 本のレーンに分けて TwoSum で足し、256 行ごとにレーンを固定した順でマージしるので、結果は呼び出しごとに変わらない（`add` を順に重ねた結果とは丸めが異なりうる）。
+
+補償和は一次の丸め誤差を補正項に残すが、作業精度の計算であり、和の符号も正しい丸めも保証しない。
+厳密な一回の丸めが必要な場合は `RangeAccumulator` を選ぶ。
+
+`PromotingCompensatedSum` は通常範囲では `CompensatedSum` を使い、非正規化数の積やオーバーフローが現れると、主和と補正項の両方を厳密に移して `ScaledAccumulator` へ一度だけ昇格する。
+`add_value` や `add_product` で 1 項ずつ加える使い方では、昇格の前に加えた項を加え直す必要がない。
+反復子からまとめて作る `from_values` と `from_products` は、範囲を外れると複製した反復子をもう一度たどる。
+広い指数範囲を扱えるが、作業精度の補償和であり厳密累積ではない。
+
+`PromotingProduct` も同様に、途中の積が非正規化数になるかオーバーフローすると、積を `Scaled` に移して保つ。
+こちらは因子ごとに丸めるため、最後だけ丸めた厳密積とは区別する。
+どちらも固定長の値で、非有限な入力を `NonFinite`、拡張指数が `i64` を出る場合を `NumericalInstability`（`ExponentOutOfRange`）として返す。
+
+`fast_mul_add` は、対象環境で `HARDWARE_FMA` が真なら融合積和を使い、それ以外では積と和を別々に計算する。
+後者は二回丸めるので、`checked_mul_add` や誤差のない積残差の代わりにはならない。
+二回の丸めを許せる近似アルゴリズムで使う。
+
+## 検査付き算術関数の誤差の保証
+
+`checked_*` 関数は有限な入力だけを受け付け、最終結果が表現できない場合を `NumericalInstability`（`Overflow`）として返す。
+非有限な入力は `NonFinite`、0 による除算は `DomainError` になる。
+表で「一回の丸め」と書いた関数は、数学的な値を最近接偶数丸めした結果を返す（正しく丸めた値からのずれは 0 ULP で、数学的な値との差は 0.5 ULP 以下）。
+和、積、積和、商の関数は、厳密に 0 の結果を $+0$ で返し、0 でない負の値が 0 に丸められた場合は $-0$ を返す。
+
+| 関数 | 計算する値 | 誤差の仕様 |
+|---|---|---|
+| `checked_sum` | $\sum_i x_i$ | 一回の丸め |
+| `checked_sum_of_products` | $\sum_i a_i b_i$ | 一回の丸め。長さが違えば `DimensionMismatch` |
+| `checked_difference` | $a - b$ | 一回の丸め |
+| `checked_difference_of_products` | $ab - cd$ | 一回の丸め |
+| `checked_mul_add` | $ab + c$ | 一回の丸め（`std` では IEEE の融合積和、`no_std` では累積器で、結果は同じ） |
+| `checked_float_product` | $ab$ | 一回の丸め |
+| `checked_float_product_factors` | $\prod_{i=1}^{n} x_i$ | $\gamma_{n-1} \lvert P \rvert + \eta/2$。空の積は 1 |
+| `checked_float_quotient` | $a / b$ | 一回の丸め |
+| `checked_product_quotient` | $ab / c$ | 4 ULP 以内（$\gamma_2 \lvert Q \rvert + \eta/2$） |
+| `checked_midpoint` | $(a + b) / 2$ | 一回の丸め。オーバーフローしない |
+| `checked_affine` | $(1-t)a + tb$、$t \in [0, 1]$ | 一回の丸め。$t = 0, 1$ で端点そのもの。$t$ が範囲外なら `InvalidInput` |
+| `checked_affine_ratio` | $\bigl((d-n)a + nb\bigr)/d$、整数 $0 \le n \le d$ | 一回の丸め。$n = 0, d$ で端点そのもの。$d = 0$ か $n > d$ なら `InvalidInput` |
+| `checked_scalbn` | $x \cdot 2^n$ | 一回の丸め（結果が非正規化数か 0 になるときだけ丸めが起きる） |
+| `checked_next_after` | 隣接する表現可能数 | 厳密 |
+| `checked_scaled_norm` | $\lVert \mathbf{x} \rVert_2$ | [LASSQ の誤差限界](#lassq-型の尺度化ノルム) |
+| `checked_quadratic_roots` | $ax^2 + bx + c = 0$ の根 | [残差の限界](#二次方程式の根と残差の仕様) |
+
+ここで $P$ と $Q$ は厳密な積と商、$u = \varepsilon / 2$ は単位丸め、$\gamma_k = k u / (1 - k u)$（$ku < 1$）、$\eta$ は最小の正の非正規化数である。
+$\eta/2$ の項は結果が非正規化数になるときだけ現れる。
+
+`checked_float_product_factors` は各因子を仮数と指数に分け、仮数だけを入力順に掛け、指数は別に足して最後に一度だけ戻す。
+そのため途中の積はオーバーフローもアンダーフローもしない。
+仮数の積は 1 回ごとに丸めるので、$n$ 個の因子では丸めが $n - 1$ 回起き、相対誤差は $(1 + u)^{n-1} - 1 \le \gamma_{n-1}$ 以下になる。
+誤差は因子の数に比例して増える。
+`checked_product_quotient` も積 $ab$ を作らず、正規化した仮数で計算する。
+
+`ProductSum<S>` は実数と複素数の二重積・三重積の和を厳密に保持し、`finish()` で各成分を一度だけ丸める。
+複素数の積は実部と虚部に展開して累積するので、複素内積も成分ごとに一回の丸めで得られる。
+
+## 端点を保つアフィン結合
+
+区間 $[a, b]$ の中点、内分点、等間隔の格子点は、補間、二分法、求積の節点で繰り返し計算する。
+$(a + b)/2$ は $a + b$ がオーバーフローしうる。
+$a + t(b - a)$ は $b - a$ がオーバーフローしうるうえ、$t = 1$ で $b$ に戻らないことがある。
+刻み $h = (b - a)/d$ を足し続ける格子は、$h$ の丸め誤差が点の番号に比例して積もる。
+
+`checked_midpoint`、`checked_affine`、`checked_affine_ratio` は、どれも厳密な値を一度だけ丸める。
+一回の丸めは単調なので、結果は必ず二つの端点の間（端点を含む）に入り、オーバーフローしない。
+
+`checked_affine_ratio(left, right, n, d)` は、整数の重みで $\bigl((d - n)\,\mathrm{left} + n\,\mathrm{right}\bigr)/d$ を計算する。
+重み $d - n$ と $n$ は `usize` のまま厳密に使うので、仮数の桁数より多くのビットを持つ整数でも丸めない。
+比 $n/d$ を先に浮動小数点数にしないので、$1/3$ のように表現できない比でも、結果は数学的な内分点を一度丸めた値になる。
+$n = 0$ と $n = d$ は `left` と `right` をビットまで同じ値で返す。
+等間隔の格子の $i$ 番目の点は `checked_affine_ratio(left, right, i, d)` で作る。
+
+次のセルは区間 $[0, 1]$ を $d$ 等分する格子を三通りに作る。
+入力は分割数 $d$（3 から 1000 の整数）である。
+この区間では $i$ 番目の点は $i/d$ なので、倍精度の除算 1 回 `i / d` が正しく丸めた参照値になる。
+表は方法ごとに、参照値と異なる点の数、参照値との差の最大値（参照値の位置での間隔 ulp を単位とする）、終点の値から 1 を引いた差を示す。
+
+```rust
+//| id: core-affine-ratio-grid
+//| ref: core-affine-ratio-grid
+//| title: 等間隔の格子点を三通りに作る
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   divisions: {"type":"range","label":"分割数 d [-]","description":"区間 [0, 1] を d 等分し、d + 1 個の点を作る。","min":3,"max":1000,"step":1,"value":10}
+//| cases:
+//|   - {"id":"fine-grid","label":"d = 1000","description":"刻みを足し続ける格子の誤差が点の数とともに積もる。","inputs":{"divisions":1000}}
+//|   - {"id":"missed-endpoint","label":"d = 49","description":"left + i·h の終点も 1 に戻らない。","inputs":{"divisions":49}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"grid","path":"/rows/2/1","equals":0}
+//|       - {"artifact":"grid","path":"/rows/2/3","equals":0}
+//|       - {"artifact":"grid","path":"/rows/0/3","approx":{"value":-1.11e-16,"atol":1e-18}}
+//|   - case: fine-grid
+//|     expect:
+//|       - {"artifact":"grid","path":"/rows/2/1","equals":0}
+//|       - {"artifact":"grid","path":"/rows/2/2","equals":0}
+//|       - {"artifact":"grid","path":"/rows/0/2","range":{"min":1}}
+//|   - case: missed-endpoint
+//|     expect:
+//|       - {"artifact":"grid","path":"/rows/2/1","equals":0}
+//|       - {"artifact":"grid","path":"/rows/2/3","equals":0}
+//|       - {"artifact":"grid","path":"/rows/1/3","approx":{"value":-1.11e-16,"atol":1e-18}}
+use scioxide_core::{RealScalar, checked_affine_ratio};
+
+let d = divisions as usize;
+let (left, right) = (0.0_f64, 1.0_f64);
+let step = (right - left) / d as f64;
+// 行は「刻みを足し続ける」「left + i·h」「checked_affine_ratio」の順。
+let mut differing = [0_u32; 3];
+let mut worst = [0.0_f64; 3];
+let mut last = [left; 3];
+let mut running = left;
+for i in 0..=d {
+    // 参照値: [0, 1] では格子点は i/d で、IEEE の除算 1 回が正しく丸めた値を返す。
+    let reference = i as f64 / d as f64;
+    let ulp = RealScalar::next_after(reference, f64::INFINITY) - reference;
+    let ratio = checked_affine_ratio(left, right, i, d).map_err(|e| e.to_string())?;
+    last = [running, left + i as f64 * step, ratio];
+    for (method, value) in last.into_iter().enumerate() {
+        let error = (value - reference).abs() / ulp;
+        if error > 0.0 {
+            differing[method] += 1;
+        }
+        worst[method] = RealScalar::max(worst[method], error);
+    }
+    running += step;
+}
+let names = ["刻み h を足し続ける", "left + i·h", "checked_affine_ratio"];
+let rows: Vec<(&str, u32, f64, f64)> = (0..3)
+    .map(|method| {
+        (
+            names[method],
+            differing[method],
+            worst[method],
+            last[method] - right,
+        )
+    })
+    .collect();
+let fixed1 = serde_json::json!({ "fractionDigits": 1 });
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "方法" },
+    { "key": "1", "label": "参照値と異なる点 [個]", "type": "integer" },
+    { "key": "2", "label": "差の最大値 [ulp]", "type": "number", "format": fixed1 },
+    { "key": "3", "label": "終点 − 1 [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "grid" })
+);
+```
+
+既定の $d = 10$ では、刻み $h = 0.1$ を足し続けた格子は 11 点のうち 4 点が参照値と 1 ulp ずれ、終点は $1 - 1.1 \times 10^{-16}$ になって 1 に戻らない。
+`left + i·h` は 3 点が 1 ulp ずれる。
+`checked_affine_ratio` は全点が参照値と一致し、終点は 1 そのものである。
+
+$d = 1000$ では、足し続けた格子の 1001 点のうち 992 点が参照値と異なり、差は最大 7 ulp に積もる。
+`left + i·h` の差は 1 ulp のままだが、144 点でずれる。
+$d = 49$ では `left + i·h` の終点も $1 - 1.1 \times 10^{-16}$ になる。
+終点が `right` に一致することを前提にした処理（区間の端での評価や隣の区間との接続）では、この 1 ulp のずれが食い違いになる。
+`checked_affine_ratio` はどの $d$ でも全点が参照値と一致する。
+
+## LASSQ 型の尺度化ノルム
+
+$\lVert \mathbf{x} \rVert_2 = \sqrt{\sum_i x_i^2}$ をそのまま計算すると、$x_i = 10^{200}$ で $x_i^2$ が倍精度の最大値（約 $1.8 \times 10^{308}$）を超え、$x_i = 10^{-200}$ で $x_i^2$ が 0 になる。
+`ScaledNorm` と `checked_scaled_norm` は尺度 $s$ と正規化した二乗和 $q$ の組で $\lVert \mathbf{x} \rVert_2 = s \sqrt{q}$ を保持する。
+$s$ はそれまでに加えた成分の絶対値の最大で、$q \ge 1$ である（成分がすべて 0 なら $s = q = 0$）。
+新しい成分 $x \ne 0$ に対して
+
+- $|x| \le s$ なら $q \leftarrow q + (|x| / s)^2$、
+- $|x| > s$ なら $q \leftarrow 1 + q\,(s / |x|)^2$、$s \leftarrow |x|$
+
+と更新する。
+二乗する比は常に 1 以下なので、二乗でオーバーフローしない。
+比の二乗がアンダーフローしても、$q \ge 1$ に対して無視できる大きさで、下の誤差限界に含まれる。
+`finish()` は $s \sqrt{q}$ を返し、ノルムが有限の範囲を超える場合だけ `NumericalInstability`（`Overflow`）になる。
+`checked_scaled_norm` は成分数に比例する時間で `ScaledNorm` を更新する。
+
+二つの状態は `merge` でマージでき、分割番号の順にマージしればエグゼキューターによらず同じ結果になる。
+失敗した更新とマージは状態を変えない。
+
+誤差は和の順序に依存し、成分数に比例して増える。
+0 でない成分の更新と自明でないマージの回数を $m$、$k = 8m + 8$ とすると、$ku < 1$ のとき
+
+$$
+\bigl|\, \widehat{\lVert \mathbf{x} \rVert} - \lVert \mathbf{x} \rVert_2 \,\bigr| \le \gamma_k \lVert \mathbf{x} \rVert_2 + \frac{\eta}{2}
+$$
+
+が成り立つ。
+この限界は比、二乗、加算、平方根、最後の積の丸めをすべて含む。
+倍精度で $m = 10^6$ なら $\gamma_k \approx 8.9 \times 10^{-10}$ である。
+$ku \ge 1$ では有用な相対誤差の限界はない。
+
+## 二次方程式の根と残差の仕様
+
+$ax^2 + bx + c = 0$（$a \ne 0$）の根の公式
+
+$$
+x_\pm = \frac{-b \pm \sqrt{D}}{2a}, \qquad D = b^2 - 4ac
+$$
+
+は、$b^2 \gg 4|ac|$ のとき分子の一方が大きさの近い数の引き算になる。
+$\sqrt{D} \approx |b|$ の丸め誤差は $u|b|$ 程度で、引き算の結果は小さい根 $x_{\rm s} \approx -c/b$ の $2|a|$ 倍、すなわち $2|ac|/|b|$ 程度しかない。
+したがって小さい根の相対誤差は一次の見積りで $u\, b^2 / (2|ac|)$ 程度まで拡大し、$b^2 \gtrsim 2|ac|/u$ では有効数字が残らない。
+
+打ち消しを避けるには、$-b$ と $\pm\sqrt{D}$ が同じ符号になる側の根だけを公式で求め、もう一方の根を Vieta の関係 $x_1 x_2 = c/a$ から得る。
+
+$$
+q = -\frac{1}{2}\left( b + \operatorname{sign}(b)\sqrt{D} \right), \qquad x_1 = \frac{q}{a}, \qquad x_2 = \frac{c}{q}
+$$
+
+$q$ の二つの項は同じ符号を持つので $|q| \ge |b|/2$ となり、$q$ の計算に打ち消しはない。
+$x_2 = c/q$ も引き算を含まないので、根の大きさが大きく離れていても小さい根の精度は落ちない。
+$b = 0$ では二つの根は $\pm\sqrt{D}/(2a)$ で、もともと打ち消しがない。
+
+`checked_quadratic_roots(a, b, c)` は、$D > 0$ のときこの $q$ による公式で根を求める。
+$D < 0$ では実部 $-b/(2a)$ と虚部 $\pm\sqrt{-D}/(2|a|)$ の複素共役の組を返す。
+残る打ち消しは $D = b^2 - 4ac$ 自身の計算にあり、$b^2$ と $4ac$ が近いと $D$ の符号、つまり実根か複素根かの判定まで誤りうる。
+そこで $D$ の符号と誤差を次の二段階で確かめる。
+
+1. `std` で係数の絶対値がすべて $[2^{-200}, 2^{200}]$（`f32` では $[2^{-24}, 2^{24}]$）にあるとき、融合積和で得た積の丸め残差と TwoSum から $D$ を倍精度で計算する。
+   計算した誤差限界が $|D|$ に対して十分小さい場合だけ、この $D$ を使う。
+2. それ以外では $b^2$ と $-4ac$ を `RangeAccumulator` で厳密に累積して符号を決め、指数を調整した平方根を取る。
+   厳密に $D = 0$ なら重根 $-b/(2a)$ を返す。
+
+計算は定数時間・固定長のスタック領域で行い、ヒープを確保しない。
+$a = 0$ は `InvalidInput`、非有限な係数は `NonFinite`、根が有限に表せなければ `NumericalInstability`（`Overflow`）になる。
+
+成功すると二つの根を配列 `[Complex<S>; 2]` で返す。
+実根も `Complex<S>` で表し、厳密に 0 の成分は $+0$ とする（実根の虚部は $+0$）。
+0 でない成分がアンダーフローした場合は数学的な符号を保つ。
+実根は小さい順、複素共役の根は虚部が正のものを先に並べ、重根は 2 回返す。
+二つの根はどちらも有限である。
+
+重根の近くでは根の条件数が非常に大きく、前進誤差を ULP で保証することはできない。
+そこで、返される各根 $z$ について残差 $p(z) = az^2 + bz + c$ を保証する。
+$x = |\operatorname{Re} z| + |\operatorname{Im} z|$、$T = |a| x^2 + |b| x + |c|$ とすると、$p(z)$ の実部と虚部の絶対値の和は
+
+$$
+32\, \varepsilon\, T + (2|a|x + |b|)\, \eta + |a|\, \eta^2
+$$
+
+以下である。
+$\varepsilon$ は機械イプシロンで、$\eta$ の項は根の成分を非正規化数や 0 に丸めたときの誤差を表す。
+単根 $z$ の前進誤差は一次の見積りでこの残差を $|p'(z)| = |2az + b|$ で割った程度になり、重根に近いほど $p'(z)$ が 0 に近づいて大きくなる。
+
+次のセルは $a = c = 1$、$b = -10^p$ とし、根の公式をそのまま使った根と `checked_quadratic_roots` の根を比べる。
+入力は指数 $p$（2 から 16 の整数）で、$p$ が大きいほど二つの根 $x \approx 10^{-p}$ と $x \approx 10^{p}$ が離れる。
+表は小さい根と大きい根について、二つの手法オブジェクト、残差の絶対値、`checked_quadratic_roots` の根に対する残差の限界を示す。
+残差は検算のために `RangeAccumulator` で $az^2 + bz + c$ を厳密に評価し、一度だけ丸めた値である。
+
+```rust
+//| id: core-quadratic-residual-contract
+//| ref: core-quadratic-residual-contract
+//| title: 小さい根の打ち消しと残差の限界
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   b_exponent: {"type":"range","label":"係数の指数 p [-]","description":"b = −10^p。p が大きいほど二根が離れる。","min":2,"max":16,"step":1,"value":8}
+//| cases:
+//|   - {"id":"lost-root","label":"p = 16","description":"根の公式の小さい根が 0 になる。","inputs":{"b_exponent":16}}
+//|   - {"id":"close-roots","label":"p = 2","description":"二根の比が 10⁴ で、根の公式でも桁が残る。","inputs":{"b_exponent":2}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"roots","path":"/rows/0/2","approx":{"value":1e-8,"rtol":1e-14}}
+//|       - {"artifact":"roots","path":"/rows/0/1","approx":{"value":7.45e-9,"rtol":1e-2}}
+//|       - {"artifact":"roots","path":"/rows/0/4","range":{"min":0,"max":1.5e-14}}
+//|       - {"artifact":"roots","path":"/rows/1/4","range":{"min":0,"max":142}}
+//|   - case: lost-root
+//|     expect:
+//|       - {"artifact":"roots","path":"/rows/0/1","equals":0}
+//|       - {"artifact":"roots","path":"/rows/0/3","equals":1}
+//|       - {"artifact":"roots","path":"/rows/0/2","approx":{"value":1e-16,"rtol":1e-14}}
+//|       - {"artifact":"roots","path":"/rows/0/4","range":{"min":0,"max":1.5e-14}}
+//|   - case: close-roots
+//|     expect:
+//|       - {"artifact":"roots","path":"/rows/0/2","approx":{"value":0.010001000200050014,"rtol":1e-14}}
+//|       - {"artifact":"roots","path":"/rows/0/4","range":{"min":0,"max":1.5e-14}}
+use scioxide_core::{RangeAccumulator, RealScalar, checked_quadratic_roots};
+
+let (a, c) = (1.0_f64, 1.0_f64);
+let b = -RealScalar::powi(10.0_f64, b_exponent as i32);
+// 実根は小さい順に並ぶ。虚部はどちらも +0 である。
+let [small, large] = checked_quadratic_roots(a, b, c).map_err(|e| e.to_string())?;
+
+// 比較用: 根の公式をそのまま使う（f64 の固有メソッド）。小さい根で打ち消しが起きる。
+let root_disc = (b * b - 4.0 * a * c).sqrt();
+let naive_small = (-b - root_disc) / (2.0 * a);
+let naive_large = (-b + root_disc) / (2.0 * a);
+
+// 検算: a z² + b z + c を厳密に累積して一度だけ丸める（実根なので虚部は 0）。
+let residual = |z: f64| -> Result<f64, String> {
+    let mut sum = RangeAccumulator::new();
+    sum.add_triple_product(a, z, z).map_err(|e| e.to_string())?;
+    sum.add_product(b, z).map_err(|e| e.to_string())?;
+    sum.add(c).map_err(|e| e.to_string())?;
+    Ok(sum.finish().map_err(|e| e.to_string())?.abs())
+};
+// 残差の限界 32 ε T + (2|a|x + |b|) η + |a| η²。
+let bound = |z: f64| {
+    let x = z.abs();
+    let t = a.abs() * x * x + b.abs() * x + c.abs();
+    let eta = f64::from_bits(1);
+    32.0 * f64::EPSILON * t + (2.0 * a.abs() * x + b.abs()) * eta + a.abs() * eta * eta
+};
+let mut rows = Vec::new();
+for (name, naive, root) in [
+    ("小さい根", naive_small, small.re),
+    ("大きい根", naive_large, large.re),
+] {
+    rows.push((
+        name,
+        naive,
+        root,
+        residual(naive)?,
+        residual(root)?,
+        bound(root),
+    ));
+}
+let digits = serde_json::json!({ "notation": "scientific", "significantDigits": 7 });
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "根" },
+    { "key": "1", "label": "根の公式 [-]", "type": "number", "format": digits },
+    { "key": "2", "label": "checked_quadratic_roots [-]", "type": "number", "format": digits },
+    { "key": "3", "label": "根の公式の残差 [-]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "checked の残差 [-]", "type": "number", "format": sci3 },
+    { "key": "5", "label": "残差の限界 [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "roots" })
+);
+```
+
+既定の $p = 8$ では、根の公式の小さい根は $7.45 \times 10^{-9}$ で、真の根（ほぼ $10^{-8}$）から約 25 % ずれ、残差は約 0.25 になる。
+このずれは上の見積り $u\,b^2/(2|ac|) \approx 0.55$ の範囲に入る。
+`checked_quadratic_roots` の小さい根は $1.000000 \times 10^{-8}$ で、残差 $7.9 \times 10^{-17}$ は限界 $1.4 \times 10^{-14}$ より小さい。
+大きい根はどちらの方法でも $10^{8}$ で、残差 1 は限界 142 の内側にある。
+残差の限界は $T$ に比例するので、$T \approx 2 \times 10^{16}$ の大きい根では残差 1 が相対的に $5 \times 10^{-17}$ にあたる。
+
+$p \ge 9$ では $b^2 - 4$ が $b^2$ に丸められ、根の公式の小さい根は 0 になって、残差は $c = 1$ そのものになる。
+$p = 16$ でも `checked_quadratic_roots` の小さい根は $10^{-16}$ で、残差は $2.1 \times 10^{-17}$ である。
+$p = 2$ では根の公式の小さい根も 12 桁ほど合うが、その残差 $1.2 \times 10^{-13}$ は `checked_quadratic_roots` の根に対する限界 $1.4 \times 10^{-14}$ を超える。
+
+## まとめ
+
+項の大きさが大きく異なる和や、打ち消しを含む積和は `checked_sum`、`checked_sum_of_products`、`RangeAccumulator` で厳密に累積し、最後に一度だけ丸める。
+部分和を分割して計算する場合は `RangeAccumulator` の状態を `merge` すれば、分割の仕方によらず同じ結果になる。
+積の連鎖や $ab/c$ のように途中の値が範囲外になる式は `checked_float_product_factors` や `checked_product_quotient` で計算し、誤差限界は ULP 単位または $\gamma_k$ で読む。
+中点、内分点、等間隔の格子点は `checked_midpoint`、`checked_affine`、`checked_affine_ratio` で作れば、端点がそのまま返り、結果は二つの端点の間に入る。
+二次方程式の根は `checked_quadratic_roots` が桁落ちのない公式で求め、返る配列の各根に残差の限界が付く。
+重根に近い問題では根の前進誤差を別に評価する。
+
+## 次に読むページ
+
+- [拡張範囲値と対数・射影表現](../extended-range-values/)：表現範囲を超える結果を `Scaled` や `LogValue` で受け取る方法を確かめる。
+- [対数和・重み付き和・正規化](../logarithmic-reductions/)：指数の和を厳密累積と組み合わせて評価する方法を確かめる。
+- [最終値より先に中間値を守る](../../examples/range-safe-arithmetic/)：和・ノルム・途中の値が範囲を出る積を一つずつ試す例題を確かめる。
+- [共通イオン効果と難溶性塩の溶解度](../../examples/common-ion-solubility/)：二次方程式の小さい根と残差の仕様を化学平衡の問題で確かめる。
+- [算術・安定変換・対数和の API](../../api/arithmetic-and-reductions/)：`checked_*` と累積器の全項目を引く。

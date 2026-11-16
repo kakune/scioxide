@@ -1,0 +1,707 @@
+---
+title: ヘッセ行列とヘッセ行列・ベクトル積
+description: 弾性床の上の硬化ばね鎖の釣り合いを、HessianOperator を scioxide-linalg の CgSolver に渡す Newton–CG 法で求め、釣り合い点で hvp・hvp_into・HessianOperator・hessian のヘッセ行列・ベクトル積を閉形式と scioxide-differentiate の中心差分で照合する。
+sidebar:
+  order: 415
+references:
+  ad-hvp-forward-over-reverse: "前進モードを逆モードに重ねた-hvp"
+  ad-hvp-newton-cg: "newtoncg-法"
+  ad-hvp-equilibrium-check: "釣り合い点での-hvp-の照合"
+---
+
+Newton 法は反復ごとにヘッセ行列 $\mathbf{H}$ を係数とする線形方程式 $\mathbf{H}\mathbf{p} = -\nabla f$ を解く。
+未知数が $n$ 個なら $\mathbf{H}$ は $n^2$ 個の成分を持ち、自動微分で密に作るには勾配の $n$ 倍程度の計算が要る。
+共役勾配法（conjugate gradient、CG 法）のような Krylov 部分空間法は、この方程式を $\mathbf{H}$ とベクトルの積 $\mathbf{H}\mathbf{v}$（ヘッセ行列・ベクトル積、HVP）だけで解く。
+自動微分は HVP を勾配の小さな定数倍の計算コストで、打ち切り誤差なしに返す。
+
+この例題では硬化ばねでつないだ質点の鎖の釣り合いを、`HessianOperator` を scioxide-linalg の `CgSolver` に渡す Newton–CG 法で求める。
+次に、釣り合い点で `hvp`、`Tape<Dual<f64>>::hvp_into`、`HessianOperator`、`hessian` の 4 通りの HVP を閉形式と比べ、scioxide-differentiate の中心差分の誤差が刻みとともにどう変わるかを示す。
+
+## 弾性床の上の硬化ばね鎖
+
+両端を壁に固定した直線上に $n$ 個の質点を並べ、隣どうしと両端の壁を硬化ばねでつなぐ。
+ばねの伸びを $s$ [m] とすると、ばねの復元力は $\sigma(s) = k s + \alpha s^3$ [kN] である（$k$ [kN/m] は線形のばね定数、$\alpha$ [kN/m³] は硬化の係数）。
+各質点はさらに線形のばね $g$ [kN/m] で地面につながり（弾性床）、荷重の向きに同じ力 $F$ [kN] を受ける。
+質点 $j$（$j = 0, \dots, n-1$）の変位を $x_j$ [m]、ばね $i$（$i = 0, \dots, n$）の伸びを $s_i = x_i - x_{i-1}$（$x_{-1} = x_n = 0$）とすると、全ポテンシャルエネルギーは
+
+$$
+\Pi(\mathbf{x}) = \sum_{i=0}^{n} \left( \frac{k}{2} s_i^2 + \frac{\alpha}{4} s_i^4 \right) + \frac{g}{2} \sum_{j=0}^{n-1} x_j^2 - F \sum_{j=0}^{n-1} x_j \quad [\mathrm{kJ}]
+$$
+
+である。
+この例題では $k = 1$ kN/m、$\alpha = 1$ kN/m³ に固定する。
+長さの尺度 $\sqrt{k/\alpha} = 1$ m より大きく伸びたばねでは、3 次の項が線形の項より大きい。
+
+釣り合いの条件 $\nabla\Pi = \mathbf{0}$ は、質点 $j$ の力の釣り合い
+
+$$
+\frac{\partial \Pi}{\partial x_j} = \sigma(s_j) - \sigma(s_{j+1}) + g\,x_j - F = 0
+$$
+
+である。
+ヘッセ行列は、ばねの接線剛性 $c_i = \sigma'(s_i) = k + 3\alpha s_i^2$ を使って
+
+$$
+\mathbf{H} = \mathbf{D}^\mathsf{T}\mathbf{C}\,\mathbf{D} + g\,\mathbf{I}, \qquad
+(\mathbf{H}\mathbf{v})_j = c_j\,(v_j - v_{j-1}) - c_{j+1}\,(v_{j+1} - v_j) + g\,v_j
+$$
+
+と書ける（$v_{-1} = v_n = 0$）。
+$\mathbf{D}$ は伸びを作る $(n+1) \times n$ の差分行列、$\mathbf{C} = \operatorname{diag}(c_0, \dots, c_n)$ で、$\mathbf{H}$ は三重対角である。
+$c_i \ge k > 0$ なので、$g = 0$ でも $\mathbf{H}$ はどの変位でも正定値で、$\Pi$ は狭義凸であり、釣り合いはただ一つである。
+問題は $j \leftrightarrow n - 1 - j$ の入れ替えで変わらないので、釣り合いの変位は左右対称になる。
+
+$\mathbf{D}^\mathsf{T}\mathbf{D}$ の固有値は $4\sin^2(m\pi/(2(n+1)))$（$m = 1, \dots, n$）なので、$\mathbf{H}$ の固有値は区間 $[\,g + 4c_{\min}\sin^2(\pi/(2(n+1))),\ g + 4c_{\max}\,]$ にある。
+$g = 0$ では条件数 $\kappa(\mathbf{H})$ の上界が $(n+1)^2$ に比例して大きくなり、$g > 0$ では $1 + 4c_{\max}/g$ で抑えられて $n$ によらない。
+
+次のブロックは二つのセルが共有する定義である。
+`Chain` は係数 $k$、$\alpha$、$g$、$F$ を持ち、`energy` は $\Pi$ に対応する汎用関数である。
+`imbalance` は閉形式の $\nabla\Pi$、`stiffness_times` は閉形式の $\mathbf{H}\mathbf{v}$ で、どちらも独立な検算に使う。
+
+```rust
+//| id: ad-chain-model
+//| kind: definitions
+//| title: 弾性床の上の硬化ばね鎖
+//| crates: [scioxide-ad]
+use scioxide_ad::Real;
+
+/// ばね鎖の係数: 線形のばね定数 k [kN/m]、硬化の係数 α [kN/m³]、床のばね g [kN/m]、荷重 F [kN]。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Chain {
+    pub(crate) stiffness: f64,
+    pub(crate) hardening: f64,
+    pub(crate) foundation: f64,
+    pub(crate) load: f64,
+}
+
+/// 全ポテンシャル Π(x) = Σᵢ (k sᵢ²/2 + α sᵢ⁴/4) + g Σⱼ xⱼ²/2 − F Σⱼ xⱼ [kJ]（sᵢ = xᵢ − xᵢ₋₁、両端は壁）。
+pub(crate) fn energy<R: Real>(x: &[R], c: &Chain) -> R {
+    let mut total = R::zero();
+    let mut previous = R::zero();
+    for i in 0..=x.len() {
+        let current = if i < x.len() { x[i] } else { R::zero() };
+        let s = current - previous;
+        total += s * s * (0.5 * c.stiffness) + s.powi(4) * (0.25 * c.hardening);
+        previous = current;
+    }
+    for &xj in x {
+        total += xj * xj * (0.5 * c.foundation) - xj * c.load;
+    }
+    total
+}
+
+/// 伸び sᵢ（i = 0, …, n）。
+fn stretches(x: &[f64]) -> Vec<f64> {
+    (0..=x.len())
+        .map(|i| {
+            let current = if i < x.len() { x[i] } else { 0.0 };
+            let previous = if i > 0 { x[i - 1] } else { 0.0 };
+            current - previous
+        })
+        .collect()
+}
+
+/// 閉形式の力の不釣り合い ∇Π: σ(sⱼ) − σ(sⱼ₊₁) + g xⱼ − F、σ(s) = k s + α s³。
+pub(crate) fn imbalance(x: &[f64], c: &Chain) -> Vec<f64> {
+    let s = stretches(x);
+    let force = |s: f64| c.stiffness * s + c.hardening * s * s * s;
+    (0..x.len())
+        .map(|j| force(s[j]) - force(s[j + 1]) + c.foundation * x[j] - c.load)
+        .collect()
+}
+
+/// 閉形式の H v: cⱼ (vⱼ − vⱼ₋₁) − cⱼ₊₁ (vⱼ₊₁ − vⱼ) + g vⱼ、cᵢ = k + 3α sᵢ²。
+pub(crate) fn stiffness_times(x: &[f64], c: &Chain, v: &[f64]) -> Vec<f64> {
+    let s = stretches(x);
+    let tangent = |s: f64| c.stiffness + 3.0 * c.hardening * s * s;
+    let dv = stretches(v);
+    (0..x.len())
+        .map(|j| tangent(s[j]) * dv[j] - tangent(s[j + 1]) * dv[j + 1] + c.foundation * v[j])
+        .collect()
+}
+```
+
+## 前進モードを逆モードに重ねた HVP
+
+点 $\mathbf{x}$ の入力を二重数 $x_i + v_i\,\varepsilon$ にして $\Pi$ をテープに記録し、出力の随伴を 1 として逆走査すると、入力の随伴は
+
+$$
+\bar{\mathbf{x}} = \nabla\Pi(\mathbf{x} + \varepsilon\mathbf{v}) = \nabla\Pi(\mathbf{x}) + \varepsilon\,\mathbf{H}(\mathbf{x})\,\mathbf{v}
+$$
+
+になる（$\varepsilon^2 = 0$）。
+値の部分が勾配、$\varepsilon$ の係数が HVP で、1 回の記録と 1 回の逆走査で両方が得られる。
+前進モード（二重数）を逆モード（テープ）に重ねるので、forward-over-reverse と呼ぶ。
+計算コストは勾配の小さな定数倍で、テープの値と偏微分の列が二重数になるので、メモリ使用量は `f64` のテープより大きい。
+差分の打ち切り誤差はなく、残るのは各演算の丸め誤差である。
+
+`hvp(function, point, direction)` はこの計算のワンショット呼び出しで、新しいテープ `Tape<Dual<f64>>` を作り、HVP を `scioxide_linalg::Vector` で返す。
+新しいテープは空なので、呼び出しのたびに関数を 2 回実行する（1 回目で文を数え、テープを広げてから記録する）。
+同じ関数を繰り返し微分するなら、`Tape::<Dual<f64>>::new(TapeOptions::new())` のテープで `hvp_into(function, point, direction, product, cx)` を呼ぶ。
+`hvp_into` は $\Pi$ の値を返して HVP を `product` に書き、`direction` か `product` の長さが `point` と違えば `DimensionMismatch` を返す。
+記録の規則とエラーは `gradient_into` と同じで、失敗したときは `product` を書き換えない。
+`Tape<Dual<f64>>` に渡すクロージャは引数の型を `|z: &[Var<'_, Dual<f64>>]|` と書く。
+
+`hessian_operator(function, point, cx)` は、点 `point` の $\mathbf{H}$ を scioxide-core の `LinearOperator` として返す（`HessianOperator`）。
+`apply_into(v, out, workspace)` は方向 $\mathbf{v}$ をシードにして関数を記録し、逆走査を 1 回行う。
+作業領域の長さ `apply_workspace_len()` は 0 で、空のスライスを渡す。
+作用素はテープを可変で借用し、作るときに方向 0 で 1 回記録してテープの容量を決める（空のテープでは関数を 2 回実行する）。
+その後の作用は 1 回ごとに関数を 1 回記録し、メモリを確保しない。
+入力か結果に NaN や無限大があれば `NonFinite` になる。
+密な `hessian(function, point)` は単位方向ごとに記録するので、$n$ 回の記録が要る（新しいテープなので関数は $n + 1$ 回実行される）。
+二階微分の規則は[二階微分とヘッセ行列の作用素](../../algorithms/second-order-derivatives/)、疎なヘッセ行列は[構造パターンと疎な微分の復元](../../algorithms/sparse-derivatives/)で扱う。
+
+## Newton–CG 法
+
+Newton 法は現在の点 $\mathbf{x}_k$ で $\mathbf{H}(\mathbf{x}_k)\,\mathbf{p}_k = -\nabla\Pi(\mathbf{x}_k)$ を解き、$\mathbf{x}_{k+1} = \mathbf{x}_k + \mathbf{p}_k$ と進める。
+解の近くでは誤差がほぼ 2 乗ずつ減る（2 次収束）。
+
+CG 法は対称正定値な方程式 $\mathbf{A}\mathbf{p} = \mathbf{b}$ を、反復ごとに $\mathbf{A}$ とベクトルの積 1 回で解く。
+$k$ 回の反復の後の誤差の $\mathbf{A}$ ノルムは初期値の $2\bigl((\sqrt{\kappa} - 1)/(\sqrt{\kappa} + 1)\bigr)^k$ 倍以下で、丸め誤差がなければ $n$ 回以内に厳密解に達する。
+CG を残差が $\eta\,\lVert\nabla\Pi\rVert_2$ 以下になったところで止める方法を不正確 Newton 法（inexact Newton）と呼ぶ。
+$\eta$ を一定にすると収束は 1 次で、1 回あたりの縮小の比はおよそ $\eta$ 以下になり、$\eta$ を小さくすると Newton 法の 2 次収束に近づく（Dembo, Eisenstat and Steihaug, *SIAM J. Numer. Anal.* 19(2), 1982）。
+
+scioxide-linalg の `CgSolver::new(tolerance, max_iterations)` は、真の残差が $\lVert\mathbf{b} - \mathbf{A}\mathbf{x}\rVert_2 \le \mathrm{atol} + \mathrm{rtol}\,\lVert\mathbf{b}\rVert_2$ を満たすと `Converged` で止まる。
+許容誤差は `ResidualTolerance::new(atol, rtol)`、反復の上限は `Budget` で与える。
+作業領域は `IterativeWorkspaceRequest::operator(&operator)` から `solver.workspace(&request)` で作り、`solve_into(&operator, &b, Preconditioning::None, x.view_mut(), &mut workspace, cx)` で解く。
+`solve_into` は `&dyn LinearOperator<f64>` を受け取るので、`HessianOperator` をそのまま渡せる。
+CG は初期残差 $\mathbf{b} - \mathbf{A}\mathbf{x}_0$ を作用素で計算し、漸化式で更新した残差を 50 回ごとと収束を受け入れる前に真の残差で置き換える。
+そのため作用素の評価は反復の回数より 2 回以上多い。
+上限に達すると `IterationLimit` で止まる。
+検査点で検証した真の残差が許容誤差を満たさず、最良の残差も更新しないとき、その最良の残差が丸め誤差の水準 $16\varepsilon(\lVert\mathbf{b}\rVert_2 + \lVert\mathbf{A}(\mathbf{s}\circ\mathbf{x})\rVert_2)$ 以下なら `Stagnation` で止まる。
+ここで $\mathbf{x}$ は真の残差が最小の検証済みの反復、$\mathbf{s}$ は成分が $\pm 1$ の固定の符号の列で、$\lVert\mathbf{A}(\mathbf{s}\circ\mathbf{x})\rVert_2 \le \lVert\mathbf{A}\rVert_2\lVert\mathbf{x}\rVert_2$ である。
+どちらも真の残差が最小の検証済みの反復を返す。
+$\mathbf{p}^\mathsf{T}\mathbf{A}\mathbf{p} \le 0$ の方向が現れると `Breakdown(NonPositiveCurvature)` で止まるが、この問題の $\mathbf{H}$ は正定値なので起きない。
+終了状態は `report.termination()`（`LinearSolveTermination`）、成否は `report.is_success()` で読む。
+
+次のセルは質点の数 $n$（4〜200）、荷重 $F$（0.01〜1 kN）、床のばね $g$（0〜1 kN/m）、CG の相対許容誤差 $\eta$（$10^{-12}$〜$10^{-1}$）を選び、$\mathbf{x}_0 = \mathbf{0}$ から Newton–CG 法で釣り合いを求める。
+勾配は `Tape<f64>::gradient_into` で、Newton 方向は反復ごとに作り直す `HessianOperator` と `CgSolver`（$\mathrm{atol} = 0$、$\mathrm{rtol} = \eta$、上限 $4n + 50$ 回）で求め、直線探索はしない。
+$\lVert\nabla\Pi\rVert_2 \le 10^{-10} F\sqrt{n}$（外力のベクトルの大きさの $10^{-10}$ 倍）で止め、上限は 40 回とする。
+1 つ目のグラフは反復ごとの $\lVert\nabla\Pi\rVert_2$（対数軸）、2 つ目のグラフは釣り合いの変位である。
+1 つ目の表は反復ごとの CG の反復回数、その Newton 反復で $\Pi$ を実行した回数、CG の終了状態を示す。
+2 つ目の表は Newton 反復の回数、関数の実行の合計、閉形式の $\lVert\nabla\Pi\rVert_2$、左右対称からのずれ、最大変位を示す。
+outcome は、すべての CG が収束して停止の基準を満たしたとき satisfied、途中の CG が許容誤差の前に止まったか Newton 反復が上限に達したとき partial、CG が破綻したとき failed とする。
+検証するのは、閉形式の力の不釣り合いが小さいこと、変位が左右対称であることである。
+このセルは釣り合いの変位と係数を次のセルに渡す。
+
+```rust
+//| id: ad-chain-newton-cg
+//| ref: ad-chain-newton-cg
+//| title: HVP だけで解く Newton–CG 法の釣り合い
+//| run: reactive
+//| uses: [ad-chain-model]
+//| crates: [scioxide-ad, scioxide-core, scioxide-linalg]
+//| exports: [displacement, stiffness, hardening, foundation, load]
+//| inputs:
+//|   masses: {"type":"range","label":"質点の数 n","description":"未知数の個数。","min":4,"max":200,"step":1,"value":50}
+//|   load: {"type":"range","label":"荷重 F [kN]","description":"各質点にかける同じ向きの力。","min":0.01,"max":1,"step":0.01,"value":0.2}
+//|   foundation: {"type":"range","label":"床のばね g [kN/m]","description":"各質点を地面につなぐ線形のばね。","min":0,"max":1,"step":0.01,"value":0}
+//|   forcing_exponent: {"type":"range","label":"CG の相対許容誤差の指数 p（η = 10^p）","description":"Newton 方向を求める CG の停止基準。","min":-12,"max":-1,"step":1,"value":-10}
+//| cases:
+//|   - {"id":"foundation-long","label":"n = 200、g = 0.5 kN/m","description":"床のばねで条件数が n によらず抑えられ、CG の反復回数が n に比例しない。","inputs":{"masses":200,"foundation":0.5}}
+//|   - {"id":"loose-forcing","label":"η = 0.1","description":"CG を早く止めると Newton 法の収束が 1 次になり、Newton 反復が増える。","inputs":{"forcing_exponent":-1}}
+//|   - {"id":"strict-tolerance","label":"n = 200、F = 1 kN、η = 10⁻¹²","description":"条件数が約 10⁶ になり、η が丸め誤差の下で届く残差より小さいので、途中の CG が Stagnation で止まる。","inputs":{"masses":200,"load":1,"forcing_exponent":-12}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":8}
+//|       - {"artifact":"summary","path":"/rows/0/2","range":{"max":1e-12}}
+//|       - {"artifact":"summary","path":"/rows/0/3","range":{"max":1e-12}}
+//|       - {"artifact":"summary","path":"/rows/0/4","approx":{"value":26.2952472469,"rtol":1e-9}}
+//|       - {"artifact":"steps","path":"/rows/1/1","approx":{"value":47.413085,"rtol":1e-6}}
+//|       - {"path":"/outputs/4/state","equals":"satisfied"}
+//|   - case: foundation-long
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":3}
+//|       - {"artifact":"summary","path":"/rows/0/2","range":{"max":1e-10}}
+//|       - {"artifact":"steps","path":"/rows/0/2","range":{"max":40}}
+//|       - {"path":"/outputs/4/state","equals":"satisfied"}
+//|   - case: loose-forcing
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","range":{"min":10,"max":16}}
+//|       - {"artifact":"summary","path":"/rows/0/2","range":{"max":1e-10}}
+//|       - {"path":"/outputs/4/state","equals":"satisfied"}
+//|   - case: strict-tolerance
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/2","range":{"max":1e-9}}
+//|       - {"artifact":"summary","path":"/rows/0/3","range":{"max":1e-11}}
+//|       - {"path":"/outputs/4/state","equals":"partial"}
+use std::cell::Cell;
+
+use scioxide_ad::{Dual, Tape, TapeOptions, Var};
+use scioxide_core::{Budget, ExecutionContext, RealScalar, ResidualTolerance};
+use scioxide_linalg::{
+    CgSolver, IterativeWorkspaceRequest, LinearSolveTermination, Preconditioning, Vector,
+};
+
+let n = masses as usize;
+let chain = Chain {
+    stiffness: 1.0,
+    hardening: 1.0,
+    foundation,
+    load,
+};
+let eta = RealScalar::powf(10.0_f64, forcing_exponent);
+let cx = ExecutionContext::sequential();
+// records は HessianOperator に渡した Π の実行回数。
+let records = Cell::new(0_usize);
+let norm = |v: &[f64]| RealScalar::sqrt(v.iter().map(|g| g * g).sum::<f64>());
+// 停止の基準: 外力の大きさ ‖F 1‖₂ = F √n の 10⁻¹⁰ 倍。
+let target = 1e-10 * load * RealScalar::sqrt(n as f64);
+let name = |t: LinearSolveTermination| match t {
+    LinearSolveTermination::Converged => "Converged",
+    LinearSolveTermination::LeastSquaresConverged => "LeastSquaresConverged",
+    LinearSolveTermination::ConditionLimit => "ConditionLimit",
+    LinearSolveTermination::IterationLimit => "IterationLimit",
+    LinearSolveTermination::EvaluationLimit => "EvaluationLimit",
+    LinearSolveTermination::Stagnation => "Stagnation",
+    LinearSolveTermination::Breakdown(_) => "Breakdown",
+    LinearSolveTermination::ExecutionStopped(_) => "ExecutionStopped",
+};
+
+let mut x = vec![0.0; n];
+let mut gradient = vec![0.0; n];
+let mut gradient_tape = Tape::<f64>::new(TapeOptions::new());
+let mut hessian_tape = Tape::<Dual<f64>>::new(TapeOptions::new());
+let mut history = Vec::new();
+let mut steps = Vec::new();
+let mut all_success = true;
+let mut broke_down = false;
+let mut first_stop = None;
+let mut last = LinearSolveTermination::Converged;
+let mut converged = false;
+for newton in 0..=40 {
+    gradient_tape
+        .gradient_into(|z| Ok(energy(z, &chain)), &x, &mut gradient, cx)
+        .map_err(|e| e.to_string())?;
+    let size = norm(&gradient);
+    history.push([newton as f64, size]);
+    if size <= target {
+        converged = true;
+        break;
+    }
+    // H p = −∇Π を CG で解く。H は HessianOperator の作用（HVP）としてだけ使う。
+    let before = records.get();
+    let operator = hessian_tape
+        .hessian_operator(
+            |z: &[Var<'_, Dual<f64>>]| {
+                records.set(records.get() + 1);
+                Ok(energy(z, &chain))
+            },
+            &x,
+            cx,
+        )
+        .map_err(|e| e.to_string())?;
+    let solver = CgSolver::new(
+        ResidualTolerance::new(0.0, eta).map_err(|e| e.to_string())?,
+        Budget::try_from(4 * n + 50).map_err(|e| e.to_string())?,
+    );
+    let request = IterativeWorkspaceRequest::operator(&operator).map_err(|e| e.to_string())?;
+    let mut workspace = solver.workspace(&request).map_err(|e| e.to_string())?;
+    let rhs = Vector::from_vec(gradient.iter().map(|g| -g).collect());
+    let mut step = Vector::zeros(n).map_err(|e| e.to_string())?;
+    let report = solver
+        .solve_into(
+            &operator,
+            &rhs,
+            Preconditioning::None,
+            step.view_mut(),
+            &mut workspace,
+            cx,
+        )
+        .map_err(|e| e.to_string())?;
+    drop(operator);
+    last = report.termination();
+    all_success &= report.is_success();
+    broke_down |= matches!(last, LinearSolveTermination::Breakdown(_));
+    if !report.is_success() && first_stop.is_none() {
+        first_stop = Some(last);
+    }
+    steps.push((
+        newton,
+        size,
+        report.iterations(),
+        records.get() - before,
+        name(last),
+    ));
+    for (xi, pi) in x.iter_mut().zip(step.as_slice()) {
+        *xi += pi;
+    }
+}
+
+// 独立検算: 閉形式の力の不釣り合いと、対称性 xⱼ = xₙ₋₁₋ⱼ。
+let residual = norm(&imbalance(&x, &chain));
+let asymmetry = (0..n).fold(0.0_f64, |m, j| m.max((x[j] - x[n - 1 - j]).abs()));
+let largest = x.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+emit_line_chart!(
+    &vec![serde_json::json!({ "name": "‖∇Π‖₂（gradient_into）", "points": history })],
+    options = &serde_json::json!({
+        "xLabel": "Newton 反復 k [回]",
+        "yLabel": "力の不釣り合い ‖∇Π‖₂ [kN]",
+        "yType": "log",
+        "annotations": [
+            { "kind": "line", "axis": "y", "value": target, "label": "停止の基準" }
+        ]
+    })
+);
+let profile: Vec<[f64; 2]> = x.iter().enumerate().map(|(j, &v)| [j as f64, v]).collect();
+emit_line_chart!(
+    &vec![serde_json::json!({ "name": "釣り合いの変位", "points": profile })],
+    options = &serde_json::json!({
+        "xLabel": "質点の番号 j [-]",
+        "yLabel": "変位 xⱼ [m]"
+    })
+);
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let step_columns = serde_json::json!([
+    { "key": "0", "label": "Newton 反復 k", "type": "integer" },
+    { "key": "1", "label": "‖∇Π‖₂ [kN]", "type": "number", "format": sci3 },
+    { "key": "2", "label": "CG の反復 [回]", "type": "integer" },
+    { "key": "3", "label": "関数の実行 [回]", "type": "integer" },
+    { "key": "4", "label": "CG の終了状態" }
+]);
+emit_table_with_columns!(
+    step_columns,
+    steps,
+    metadata = serde_json::json!({ "id": "steps" })
+);
+let summary_columns = serde_json::json!([
+    { "key": "0", "label": "Newton 反復 [回]", "type": "integer" },
+    { "key": "1", "label": "関数の実行の合計 [回]", "type": "integer" },
+    { "key": "2", "label": "閉形式の ‖∇Π‖₂ [kN]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "非対称 max|xⱼ − xₙ₋₁₋ⱼ| [m]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "最大変位 [m]", "type": "number", "format": { "significantDigits": 6 } }
+]);
+emit_table_with_columns!(
+    summary_columns,
+    vec![(
+        history.len() - 1,
+        records.get(),
+        residual,
+        asymmetry,
+        largest
+    )],
+    metadata = serde_json::json!({ "id": "summary" })
+);
+export!(displacement, &x);
+export!(stiffness, chain.stiffness);
+export!(hardening, chain.hardening);
+export!(foundation, chain.foundation);
+export!(load, chain.load);
+
+let outcome = if broke_down {
+    Outcome::failed("CG が破綻し、Newton 方向が得られなかった")
+} else if converged && all_success {
+    Outcome::satisfied("力の不釣り合いが停止の基準を下回り、すべての CG が収束した")
+} else if converged {
+    Outcome::partial("釣り合いに達したが、途中の CG が許容誤差の前に止まった")
+        .explanation("止まった CG は検証済みの最良の反復を Newton 方向として返した。")
+} else {
+    Outcome::partial("Newton 反復の上限で止まった")
+        .explanation("最後の変位は推定値として読み、荷重か許容誤差を見直す。")
+};
+emit_outcome!(
+    outcome
+        .status(name(first_stop.unwrap_or(last)))
+        .diagnostic("Newton 反復", (history.len() - 1) as f64, None)
+        .diagnostic("関数の実行", records.get() as f64, None)
+        .diagnostic("閉形式の ‖∇Π‖₂", residual, Some("kN"))
+);
+```
+
+既定値（$n = 50$、$F = 0.2$ kN、$g = 0$、$\eta = 10^{-10}$）では、8 回の Newton 反復で停止の基準を満たし、outcome は satisfied である。
+最初の Newton 方向は $\mathbf{x} = \mathbf{0}$ の線形のばねだけの剛性で求まり、硬化の項を無視するので大きく行き過ぎて、$\lVert\nabla\Pi\rVert_2$ は 1.41 kN から 47.4 kN に増える。
+その後は硬化した剛性で戻りながら、$13.8 \to 3.86 \to 0.899 \to 0.109 \to 2.04 \times 10^{-3} \to 6.05 \times 10^{-7} \to 6.6 \times 10^{-14}$ kN と減り、最後の 3 回は指数がほぼ 2 倍ずつ下がる 2 次収束である。
+閉形式で計算し直した力の不釣り合いは $6.6 \times 10^{-14}$ kN、左右対称からのずれは $3.6 \times 10^{-15}$ m で、最大変位は鎖の中央の 26.30 m である。
+CG は Newton 反復ごとに 25〜52 回反復し、$\Pi$ は合計 308 回実行された。
+1 回の Newton 反復の実行は CG の反復より 3〜4 回多い。
+作用素を作るときの 1 回と、CG の初期残差と収束を受け入れる前の真の残差の 2 回が加わるので、多くの反復では 3 回多い。
+空のテープで始まる最初の Newton 反復（$k = 0$）では文を数える 1 回、CG が 50 回を超えた $k = 7$ では 50 回目の真の残差の 1 回がさらに加わる。
+密なヘッセ行列を毎回作ると 1 回あたり 50 回、8 回で 400 回の記録が要るので、$g = 0$ のこの問題では HVP の回数は密な行列を作る場合と同じ程度である。
+
+$n = 200$、$g = 0.5$ kN/m では条件数が $1 + 4c_{\max}/g$ 程度に抑えられ、CG の反復は 32〜33 回で、$n = 50$ のときとほぼ同じである。
+中央の変位は $F/g = 0.4$ m で非線形性が弱く、Newton 反復は 3 回、関数の実行の合計は 108 回で、密なヘッセ行列なら 1 回で 200 回の記録が要る。
+$\eta = 0.1$ では各 Newton 方向が粗くなり、収束は 1 次になる。
+$k = 6$ 以降の $\lVert\nabla\Pi\rVert_2$ は 1 回に 10〜17 分の 1 ずつ減り、Newton 反復は 13 回に増える。
+この条件の悪い問題では、残差を 10 分の 1 にするだけでも CG に 9〜39 回の反復が要るので、関数の実行の合計は 413 回でかえって増える。
+
+$n = 200$、$F = 1$ kN、$\eta = 10^{-12}$ では最大変位が約 340 m になり、壁の近くのばねの接線剛性は中央の約 64 倍になる。
+固有値の区間から見積もった条件数の上界は $10^6$ 程度である。
+$\mathbf{p} = \mathbf{H}^{-1}\mathbf{b}$ では $\lVert\mathbf{H}\rVert\,\lVert\mathbf{p}\rVert_2 \le \kappa\lVert\mathbf{b}\rVert_2$ なので、`Stagnation` の判定に使う丸め誤差の水準は相対残差で最大 $16\varepsilon(1 + \kappa)$、$\kappa = 10^6$ なら約 $3.6 \times 10^{-9}$ になり、$\eta = 10^{-12}$ より 3 桁以上大きくなりうる。
+この水準まで下がった CG は、漸化式の残差が許容誤差を満たしたのに真の残差が満たさないときか、真の残差が最良の値を更新しないときに止まる。
+13 回の Newton 反復のうち 3 回（$k = 3, 6, 9$）の CG が `Stagnation` で止まった。
+この回数は演算の丸めに敏感で、実行する環境によって変わりうる。
+`Stagnation` の CG が返した検証済みの最良の反復で Newton 法は進み、13 回で停止の基準を満たして、閉形式の不釣り合いも $9.9 \times 10^{-12}$ kN になる。
+それでもすべての CG が収束したわけではないので、outcome は partial（状態 `Stagnation`）である。
+
+## 釣り合い点での HVP の照合
+
+次のセルは、前のセルが求めた釣り合いの変位と係数を受け取り、その点の接線剛性 $\mathbf{H}$ と方向 $\mathbf{v}$ の積を 5 通りで求める。
+方向は線形のばね鎖の最低次の固有モード $v_j = \sin(\pi(j+1)/(n+1))$（なめらかな山）、最高次のモード $v_j = \sin(n\pi(j+1)/(n+1))$（ジグザグ）、中央の質点だけの単位ベクトルから選ぶ。
+どれも $\lVert\mathbf{v}\rVert_\infty \le 1$ である。
+
+自動微分の 4 通りはワンショット呼び出しの `hvp`、同じテープでの 2 回目の `hvp_into`、`HessianOperator::apply_into`、密な `hessian` と `gemv_into` による行列・ベクトル積である。
+5 通り目は独立な検算で、勾配（`Tape<f64>::gradient_into`）を scioxide-differentiate の `FiniteDifference::jvp` で中心差分し、$(\nabla\Pi(\mathbf{x} + h\mathbf{v}) - \nabla\Pi(\mathbf{x} - h\mathbf{v}))/(2h)$ を求める。
+`DifferenceStep::absolute(h)` は最も速く動く座標の変位を $h$ にするので、$\lVert\mathbf{v}\rVert_\infty = 1$ では方向に沿った刻みがちょうど $h$ になる。
+勾配 $\nabla\Pi(\mathbf{x})$ は既知の値として渡すので、1 回の差分で勾配を 2 回評価する。
+中心差分の誤差は、打ち切り誤差が $h^2$ に、丸め誤差が $\varepsilon/h$ に比例し、刻みに対して U 字形になる。
+
+グラフは $h = 1, 10^{-1/2}, \dots, 10^{-12}$ の 25 点で中心差分の相対差を両対数軸で描き、`hvp_into` の相対差を破線で示す（0 なら $\varepsilon$ の位置に引く）。
+1 つ目の表は方法ごとの $\Pi$ の実行回数と、閉形式の $\mathbf{H}\mathbf{v}$ との相対差 $\lVert\Delta\rVert_\infty/\lVert\mathbf{H}\mathbf{v}\rVert_\infty$ を示す。
+2 つ目の表は方向曲率 $\mathbf{v}^\mathsf{T}\mathbf{H}\mathbf{v}/\mathbf{v}^\mathsf{T}\mathbf{v}$（Rayleigh 商）と $\lVert\mathbf{H}\mathbf{v}\rVert_\infty$ を示す。
+検証するのは、自動微分の 4 通りが閉形式と丸め誤差の水準で一致すること、中心差分の誤差が刻みに対して U 字形になり、最良でも自動微分より桁違いに大きいことである。
+
+```rust
+//| id: ad-chain-hvp-check
+//| ref: ad-chain-hvp-check
+//| title: 釣り合い点の接線剛性で HVP を照合する
+//| run: reactive
+//| uses: [ad-chain-model]
+//| crates: [scioxide-ad, scioxide-core, scioxide-differentiate]
+//| dependsOn:
+//|   solve: ad-chain-newton-cg
+//| inputs:
+//|   direction: {"type":"select","label":"方向 v","description":"HVP を求める向き。","options":[{"label":"なめらかな山（最低次のモード）","value":"smooth"},{"label":"ジグザグ（最高次のモード）","value":"zigzag"},{"label":"中央の質点だけ","value":"point"}],"value":"smooth"}
+//| cases:
+//|   - {"id":"zigzag","label":"ジグザグの方向","description":"隣どうしが逆向きに動く硬い向きで、方向曲率が大きい。","inputs":{"direction":"zigzag"}}
+//|   - {"id":"point","label":"中央の質点だけ","description":"H v は H の 1 列で、三重対角の 3 成分だけが 0 でない。","inputs":{"direction":"point"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/0/1","equals":2}
+//|       - {"artifact":"methods","path":"/rows/1/1","equals":1}
+//|       - {"artifact":"methods","path":"/rows/2/1","equals":1}
+//|       - {"artifact":"methods","path":"/rows/3/1","equals":51}
+//|       - {"artifact":"methods","path":"/rows/0/2","range":{"max":1e-13}}
+//|       - {"artifact":"methods","path":"/rows/1/2","range":{"max":1e-13}}
+//|       - {"artifact":"methods","path":"/rows/2/2","range":{"max":1e-13}}
+//|       - {"artifact":"methods","path":"/rows/3/2","range":{"max":1e-12}}
+//|       - {"artifact":"methods","path":"/rows/4/2","range":{"min":1e-11,"max":1e-6}}
+//|       - {"artifact":"curvature","path":"/rows/0/1","approx":{"value":0.0231976802,"rtol":1e-8}}
+//|   - case: zigzag
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/1/2","range":{"max":1e-14}}
+//|       - {"artifact":"curvature","path":"/rows/0/1","approx":{"value":12.6870361613,"rtol":1e-8}}
+//|   - case: point
+//|     expect:
+//|       - {"artifact":"methods","path":"/rows/1/2","range":{"max":1e-15}}
+//|       - {"artifact":"curvature","path":"/rows/0/1","approx":{"value":2.1115501468,"rtol":1e-8}}
+use std::cell::Cell;
+
+use scioxide_ad::{Dual, Real, Tape, TapeOptions, Var, gemv_into, hessian, hvp};
+use scioxide_core::{ExecutionContext, LinearOperator, RealScalar};
+use scioxide_differentiate::{DifferenceScheme, DifferenceStep, FiniteDifference};
+
+// Π の実行回数を数える。
+fn counted<R: Real>(records: &Cell<usize>, x: &[R], chain: &Chain) -> R {
+    records.set(records.get() + 1);
+    energy(x, chain)
+}
+
+let x: Vec<f64> =
+    serde_json::from_value(solve["displacement"].clone()).map_err(|e| e.to_string())?;
+let value = |key: &str| solve[key].as_f64().ok_or(format!("{key} がない"));
+let chain = Chain {
+    stiffness: value("stiffness")?,
+    hardening: value("hardening")?,
+    foundation: value("foundation")?,
+    load: value("load")?,
+};
+let n = x.len();
+let phase = |j: usize, mode: f64| {
+    RealScalar::sin(mode * std::f64::consts::PI * (j + 1) as f64 / (n + 1) as f64)
+};
+// 方向 v（‖v‖∞ ≤ 1）。最低次と最高次は線形のばね鎖の固有モードの形。
+let v: Vec<f64> = (0..n)
+    .map(|j| match direction.as_str() {
+        "smooth" => phase(j, 1.0),
+        "zigzag" => phase(j, n as f64),
+        _ => f64::from(u8::from(j == n / 2)),
+    })
+    .collect();
+let exact = stiffness_times(&x, &chain, &v);
+let size = exact.iter().fold(0.0_f64, |m, h| m.max(h.abs()));
+let relative = |h: &[f64]| {
+    h.iter()
+        .zip(&exact)
+        .fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()))
+        / size
+};
+let cx = ExecutionContext::sequential();
+let records = Cell::new(0_usize);
+
+// 1. ワンショット呼び出しの hvp: 新しいテープで二重数をシードにして記録し、逆走査を 1 回行う。
+let one_shot = hvp(|z| Ok(counted(&records, z, &chain)), &x, &v).map_err(|e| e.to_string())?;
+let one_shot_records = records.replace(0);
+// 2. Tape<Dual<f64>>::hvp_into: 同じテープの 2 回目は関数を 1 回だけ実行する。
+let mut tape = Tape::<Dual<f64>>::new(TapeOptions::new());
+let mut product = vec![0.0; n];
+for _ in 0..2 {
+    records.set(0);
+    tape.hvp_into(
+        |z: &[Var<'_, Dual<f64>>]| Ok(counted(&records, z, &chain)),
+        &x,
+        &v,
+        &mut product,
+        cx,
+    )
+    .map_err(|e| e.to_string())?;
+}
+let warm_records = records.replace(0);
+// 3. HessianOperator: 作用 1 回ごとに関数を 1 回記録する。
+let operator = tape
+    .hessian_operator(
+        |z: &[Var<'_, Dual<f64>>]| Ok(counted(&records, z, &chain)),
+        &x,
+        cx,
+    )
+    .map_err(|e| e.to_string())?;
+records.set(0);
+let mut applied = vec![0.0; n];
+operator
+    .apply_into(&v, &mut applied, &mut [])
+    .map_err(|e| e.to_string())?;
+let operator_records = records.replace(0);
+drop(operator);
+// 4. 密なヘッセ行列（単位方向ごとに記録）と行列・ベクトル積。
+let matrix = hessian(|z| Ok(counted(&records, z, &chain)), &x).map_err(|e| e.to_string())?;
+let dense_records = records.replace(0);
+let mut dense = vec![0.0; n];
+gemv_into(matrix.as_slice(), n, n, &v, &mut dense).map_err(|e| e.to_string())?;
+
+// 5. 独立検算: 勾配（Tape<f64> の逆モード）の中心差分を scioxide-differentiate で求める。
+let mut gradient_tape = Tape::<f64>::new(TapeOptions::new());
+let mut base = vec![0.0; n];
+gradient_tape
+    .gradient_into(|z| Ok(energy(z, &chain)), &x, &mut base, cx)
+    .map_err(|e| e.to_string())?;
+let mut difference = |step: Option<f64>| -> Result<(Vec<f64>, usize), String> {
+    let mut method = FiniteDifference::default().with_scheme(DifferenceScheme::Central);
+    if let Some(h) = step {
+        method = method.with_step(DifferenceStep::absolute(h).map_err(|e| e.to_string())?);
+    }
+    let result = method
+        .jvp(
+            |point: &[f64], out: &mut [f64]| {
+                gradient_tape
+                    .gradient_into(|z| Ok(energy(z, &chain)), point, out, cx)
+                    .map(|_| ())
+            },
+            &x,
+            &v,
+            n,
+            None,
+            Some(&base),
+        )
+        .map_err(|e| e.to_string())?;
+    let values = result.values().ok_or("差分の値がない")?.to_vec();
+    Ok((values, result.report().evaluations()))
+};
+let (default_step, evaluations) = difference(None)?;
+let mut sweep = Vec::new();
+for k in 0..=24 {
+    let h = RealScalar::powf(10.0_f64, -f64::from(k) / 2.0);
+    let (estimate, _) = difference(Some(h))?;
+    sweep.push([h, relative(&estimate)]);
+}
+emit_line_chart!(
+    &vec![serde_json::json!({
+        "name": "中心差分（scioxide-differentiate）",
+        "points": sweep,
+        "style": { "symbol": "circle" }
+    })],
+    options = &serde_json::json!({
+        "xLabel": "差分の刻み h [m]",
+        "yLabel": "閉形式との相対差 [-]",
+        "xType": "log",
+        "yType": "log",
+        "annotations": [
+            {
+                "kind": "line",
+                "axis": "y",
+                "value": relative(&product).max(f64::EPSILON),
+                "label": "hvp_into の相対差（0 なら ε）",
+                "style": { "lineType": "dashed" }
+            }
+        ]
+    })
+);
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "方法" },
+    { "key": "1", "label": "Π の実行 [回]", "type": "integer" },
+    { "key": "2", "label": "閉形式との相対差 [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    vec![
+        (
+            "hvp（ワンショット呼び出し）",
+            one_shot_records,
+            relative(one_shot.as_slice())
+        ),
+        (
+            "Tape<Dual<f64>>::hvp_into（2 回目）",
+            warm_records,
+            relative(&product)
+        ),
+        (
+            "HessianOperator::apply_into",
+            operator_records,
+            relative(&applied)
+        ),
+        ("hessian と gemv_into", dense_records, relative(&dense)),
+        (
+            "中心差分（既定の刻み）",
+            evaluations,
+            relative(&default_step)
+        ),
+    ],
+    metadata = serde_json::json!({ "id": "methods" })
+);
+let quotient = |h: &[f64]| {
+    let num: f64 = v.iter().zip(h).map(|(a, b)| a * b).sum();
+    num / v.iter().map(|a| a * a).sum::<f64>()
+};
+let curvature_columns = serde_json::json!([
+    { "key": "0", "label": "質点の数 n", "type": "integer" },
+    { "key": "1", "label": "vᵀHv/vᵀv（hvp_into）[kN/m]", "type": "number", "format": sci3 },
+    { "key": "2", "label": "vᵀHv/vᵀv（閉形式）[kN/m]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "‖Hv‖∞（閉形式）[kN]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    curvature_columns,
+    vec![(n, quotient(&product), quotient(&exact), size)],
+    metadata = serde_json::json!({ "id": "curvature" })
+);
+```
+
+なめらかな山の方向では、`hvp`、`hvp_into`、`apply_into` の HVP は閉形式と $6.5 \times 10^{-15}$、`hessian` と `gemv_into` の積は $2.9 \times 10^{-14}$ の相対差で一致した。
+方向曲率は 0.0232 kN/m で、鎖全体が同じ向きに山形に動く柔らかい向きである。
+$\lVert\mathbf{H}\mathbf{v}\rVert_\infty = 0.0256$ kN は、ばねの剛性による項の打ち消しで小さくなった値なので、相対差は $\varepsilon$ の約 30 倍になる。
+$\Pi$ の実行回数は、新しいテープを使う `hvp` が 2 回（文を数える 1 回と記録の 1 回）、2 回目の `hvp_into` と `apply_into` が 1 回、`hessian` が 51 回（50 方向の記録と、最初に文を数える 1 回）である。
+
+中心差分の相対差は $h = 1$ m の $6.5 \times 10^{-4}$ から $h^2$ に比例して減り、$h = 10^{-3}$ m で最小の $1.2 \times 10^{-9}$ になる。
+それより小さい刻みでは丸め誤差が $1/h$ に比例して増え、$h = 10^{-12}$ m では 0.54 である。
+既定の刻みの相対差は $4.4 \times 10^{-9}$ で、最良の刻みでも自動微分の HVP より約 5 桁大きい。
+
+ジグザグの方向では方向曲率が 12.7 kN/m に増え、4 通りの HVP の相対差は $2.6 \times 10^{-16}$ である。
+中心差分は既定の刻みで $2.5 \times 10^{-8}$、最良の $h = 10^{-5}$ m で $1.5 \times 10^{-10}$ で、打ち切り誤差の係数が方向によって変わるので、最良の刻みも方向によって変わる。
+中央の質点だけの方向では $\mathbf{H}\mathbf{v}$ は $\mathbf{H}$ の 1 列で、0 でない成分は 3 個だけなので、4 通りとも閉形式と相対差 0 で一致した。
+
+## まとめ
+
+forward-over-reverse の HVP は、二重数をシードにした 1 回の記録と 1 回の逆走査で $\nabla\Pi$ と $\mathbf{H}\mathbf{v}$ を同時に返し、計算コストは勾配の小さな定数倍である。
+`Tape<Dual<f64>>::hessian_operator` が返す `HessianOperator` は `LinearOperator` なので、scioxide-linalg の `CgSolver` にそのまま渡して、ヘッセ行列を作らない Newton–CG 法が組める。
+CG の反復回数は条件数で決まり、ばね鎖では床のばね $g$ が条件数を抑えると、$n = 200$ でも Newton 方向 1 本あたりの HVP は 35 回程度で済む。
+CG を粗く止める（$\eta$ を大きくする）と Newton 法の収束は 1 次になるので、$\eta$ は HVP の回数と Newton 反復の回数のつり合いで選ぶ。
+$\eta$ を丸め誤差の水準 $16\varepsilon\kappa$ より小さくすると CG が `Stagnation` で止まることがあるので、条件の悪い問題では $\eta$ をその水準より大きく選ぶ。
+HVP の正しさは閉形式か勾配の差分で確かめられるが、差分の誤差は刻みに対して U 字形で、最良の刻みでも自動微分の HVP より 5 桁以上大きい。
+
+## 次に読むページ
+
+- [二階微分とヘッセ行列の作用素](../../algorithms/second-order-derivatives/)：forward-over-reverse の規則と、`HessianOperator`・`JacobianOperator` の仕様を確かめる。
+- [疎なヘッセ行列の彩色による復元](../sparse-hessian-chain/)：三重対角のヘッセ行列を、$n$ より少ない色の数の記録で復元する方法を確かめる。
+- [Rosenbrock 関数の勾配と曲率](../rosenbrock-sensitivity/)：ヘッセ行列の条件数が勾配法の遅さを決めることを確かめる。
+- [JVP と VJP の双対性](../jvp-vjp-duality/)：前進モードと逆モードの 1 階の積と、ヤコビ行列を組む走査の回数を確かめる。

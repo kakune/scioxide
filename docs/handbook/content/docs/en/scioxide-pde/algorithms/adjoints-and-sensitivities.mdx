@@ -1,0 +1,787 @@
+---
+title: "Discrete adjoints and steady-state sensitivities"
+description: "Compute objective gradients for discretized steady problems with adjoint equations. Examine parameter derivatives of Plan data, PdeEllipticAdjointPlan and PdeDiscretizationDerivatives, adjoint linear solvers, and equilibrium and linear-solution checks using the mean temperature of an internally heated steel plate."
+sidebar:
+  order: 370
+references:
+  pde-adjoint-derivation: "deriving-the-discrete-adjoint"
+  pde-adjoint-parameterization: "parameter-derivatives-of-plan-data"
+  pde-adjoint-slab: "internally-heated-steel-plate"
+  pde-adjoint-elliptic-plan: "adjoints-of-elliptic-plans"
+  pde-adjoint-general-residual: "adjoints-of-general-residuals"
+  pde-adjoint-linear-solve: "adjoint-linear-solvers"
+  pde-adjoint-checks: "equilibrium-and-linear-solution-checks"
+---
+
+Design and identification require differentiating a scalar quantity $J$ computed from a PDE solution $u$ (mean temperature, boundary heat flux, or squared observation error) with respect to parameters $p=(p_1,\ldots,p_m)$ determining coefficients, sources, and boundary data.
+Finite-difference quotients perturbing parameters individually and resolving require at least $m+1$ solves for $m$ parameters and a step-size tradeoff between rounding and truncation errors.
+The adjoint method computes the entire gradient with one transposed linear solve, regardless of parameter count.
+
+`scioxide-pde` uses discrete adjoints, differentiating the discretized equations themselves (discretize-then-differentiate).
+The result is the exact gradient of the computed discrete $J$, differing from the continuous-problem gradient by discretization error.
+This page covers steady problems; [Discrete adjoints for time-dependent problems](../transient-adjoints/) covers time evolution.
+
+## Deriving the discrete adjoint
+
+Write the discretized steady problem as a residual equation in unknowns $u\in\mathbb{R}^n$ and parameters $p\in\mathbb{R}^m$:
+
+$$
+R(u,p)=0
+$$
+
+
+If $R_u=\partial R/\partial u$ is nonsingular, the implicit function theorem gives solution $u(p)$ with $R_u\,du/dp=-R_p$.
+The total derivative of objective $J(u,p)$ is
+
+$$
+\frac{dJ}{dp}=J_p+J_u\frac{du}{dp}=J_p-J_u R_u^{-1}R_p
+$$
+
+
+The adjoint method computes $J_uR_u^{-1}$ on the right first: take adjoint variable (multiplier) $\lambda$ as the solution of
+
+$$
+R_u^{\mathsf T}\lambda=J_u^{\mathsf T}
+$$
+
+This gives
+
+$$
+\frac{dJ}{dp}=J_p-\lambda^{\mathsf T}R_p
+$$
+
+
+Forward sensitivity computes $R_u^{-1}R_p$ first, solving $R_u\,\delta u=-R_p\,\delta p$ once per parameter.
+Adjoints require one linear solve per objective and forward sensitivities one per parameter, so adjoints use fewer solves for many parameters and few objectives.
+Both still need one application of $R_p$ per parameter.
+
+For complex residuals, replace transpose by conjugate transpose $R_u^{\mathsf H}$; the real-parameter gradient is $J_p-\operatorname{Re}(R_p^{\mathsf H}\lambda)$.
+
+Another approach introduces Lagrange multipliers into the continuous PDE, derives an adjoint PDE, and discretizes it separately (differentiate-then-discretize, or continuous adjoints).
+Continuous-adjoint gradients differ from discrete $J$ gradients by discretization error, so pairing objective values and gradients in optimization can yield inconsistent line-search decisions.
+Discrete adjoints are consistent with computed $J$ within rounding error (Giles and Pierce, 2000).
+
+## Parameter derivatives of Plan data
+
+Linear spatial Plans (`StructuredFdmPlan`, `StructuredFvmPlan`, `SimplexFvmPlan`, `SimplexFemPlan`) have residuals after symmetric Dirichlet elimination of the form
+
+$$
+R(u,p,t)=A(p)\,u-b(p,t)
+$$
+
+
+Read Dirichlet rows as $u_i-g_D(t)$ (see [FDM, FEM, and FVM for elliptic problems](../elliptic-fdm-fem-fvm/) for elimination details).
+The derivative with respect to parameter $p_j$ is
+
+$$
+\frac{\partial R}{\partial p_j}=\frac{\partial A}{\partial p_j}\,\bar u-b\!\left(\frac{\partial f}{\partial p_j},\frac{\partial g}{\partial p_j},t\right)-W_j(g,t)
+$$
+
+Here $\bar u$ combines free state values with Plan Dirichlet values $g_D(t)$, and $b(\cdot)$ is the load assembled using the Plan's own weights, lifting, and Dirichlet rows.
+$W_j$ is the tangent of finite-volume boundary-data weights, absent in other families.
+FDM and FEM $A$ depend linearly on coefficients, so $\partial A/\partial p_j$ equals $A$ reassembled with coefficient derivatives.
+Finite-volume face flux laws depend nonlinearly on coefficients, so derivatives propagate in forward mode.
+
+`DifferentiableDiscretization::parameterize(values, tangents)` constructs these derivatives using the Plan's own assembly; the caller does not assemble matrices.
+`DifferentiableDiscretization` is a sealed trait with supertrait `SpatialDiscretization`, implemented by the four Plans above.
+`tangents` contains one `PdeParameterTangent` per parameter, describing dependence on $p_j$ using Plan data.
+
+- `with_coefficients(c)`: coefficient derivatives (for FDM, values such as $\partial k/\partial p_j$ supplied through `dyn StructuredFdmCoefficients`).
+  Plan assembly calls these at the same sample points; values may be negative.
+- `with_source(f)`: source derivative $\partial f/\partial p_j$.
+- `with_boundaries(list)`: one `PdeConditionTangent` per boundary condition, in binding order.
+  `PdeConditionTangent::new(data)` supplies data derivative $\partial g/\partial p_j$, and `with_robin_coefficient(a)` Robin coefficient derivative $\partial\alpha/\partial p_j$; use `PdeConditionTangent::zero()` for independent conditions.
+
+Omitted parts are treated as independent of the parameter.
+`parameterize` rejects mismatched value and tangent counts (`DimensionMismatch`), boundary lists differing from condition counts, Robin derivatives for non-Robin conditions (`InvalidInput`), and nonfinite values.
+`values` is $p$ at the gradient evaluation point; tangent data must be evaluated at the same $p$.
+No check compares this with $p$ used to construct the Plan.
+
+Returned `PdeParameterization` contains parameter values (`values`), parameter count (`len`), unknown count (`unknowns`), mesh revision (`mesh_token`), and `residual_tangent_into(j, state, time, out, scratch)` evaluating $\partial R/\partial p_j$.
+`scratch_len()` reports a workspace length of $2n$ entries.
+Constrained state components are ignored and evaluated with Plan Dirichlet values.
+Failure leaves `out` unchanged.
+Each parameter affecting coefficients or Robin coefficients holds a sparse matrix with the operator's structure, requiring roughly (number of such parameters) × (nonzero count) storage.
+Mesh coordinates are not differentiated.
+Geometry, quadrature, and boundary partitioning remain fixed; shape derivatives are not provided.
+To differentiate coordinate-dependent quantities, the caller constructs $R_p$ as an operator and passes it to [Adjoints of general residuals](#adjoints-of-general-residuals).
+
+## Internally heated steel plate
+
+Consider a stainless steel plate of thickness $L=0.05$ m with uniform electrical heating $q$ [W/m³].
+Cooling water maintains the left face $x=0$ at $T_0=300$ K; the right face $x=L$ loses heat to air at ambient temperature $T_\infty$ with transfer coefficient $h$ [W/(m²·K)].
+Steady temperature $u(x)$ [K] satisfies
+
+$$
+-k\,u''=q,\qquad u(0)=T_0,\qquad k\,u'(L)+h\,u(L)=h\,T_\infty
+$$
+
+
+The right endpoint uses a [Robin condition](oxref:pde-robin-boundary) with outward conormal flux $n\cdot k\nabla u=k\,u'(L)$, coefficient $\alpha=h$, and data $g=hT_\infty$.
+Parameters are $p=(k,q,h,T_\infty)$, with defaults $k=15$ W/(m·K), $q=2\times10^5$ W/m³, $h=50$ W/(m²·K), and $T_\infty=290$ K.
+
+The objective is the mean plate temperature
+
+$$
+J=\frac{1}{L}\int_0^L u\,dx\;\approx\;\sum_i w_i u_i,\qquad w_i=\frac{m_i}{\sum_k m_k}
+$$
+
+Here $m_i$ is the Plan's lumped mass (nodal control-volume width).
+These weights equal the trapezoidal rule.
+The continuous solution is $u=T_0+ax-qx^2/(2k)$ with $a=\bigl(h(T_\infty-T_0)+qL+hqL^2/(2k)\bigr)/(k+hL)$, giving closed forms for mean temperature and its partial derivatives.
+
+Tangents follow directly from the chain rule.
+The $k$ direction uses coefficient derivative $\partial k/\partial k=1$, and $q$ uses source derivative 1.
+The $h$ direction uses Robin coefficient derivative 1 and data derivative $\partial(hT_\infty)/\partial h=T_\infty$; $T_\infty$ uses only data derivative $h$.
+The following definitions collect the Plan, tangents, objective, and closed-form reference values.
+`MeanTemperature` implements `scioxide_ode::AdjointObjective`, writing state gradient $w$ and parameter gradient $J_p=0$.
+
+```rust
+//| id: pde-adjoint-slab-model
+//| kind: definitions
+//| title: "Heat conduction and mean temperature of an internally heated steel plate"
+//| crates: [scioxide-core, scioxide-ode, scioxide-pde, scioxide-spatial]
+use scioxide_core::{SciOxideError, ScaledNorm, SolveContext};
+use scioxide_ode::{AdjointObjective, AdjointObjectivePart, AdjointObjectiveValue};
+use scioxide_pde::{
+    BoundaryCondition, BoundaryData, FieldData, PdeConditionTangent, PdeParameterTangent,
+    SpatialDiscretization, StructuredBoundaries, StructuredFdmCoefficients, StructuredFdmPlan,
+};
+use scioxide_spatial::{AxisSide, AxisTopology, BoundarySet, CoordinateAxis, Grid1d, SegmentMesh};
+
+/// Left-face temperature T₀ [K] and plate thickness L [m].
+pub(crate) const WALL: f64 = 300.0;
+pub(crate) const THICKNESS: f64 = 0.05;
+
+/// Uniform conductivity k [W/(m·K)]. For tangents, return ∂k/∂p_j.
+pub(crate) struct Uniform(pub(crate) f64);
+
+impl StructuredFdmCoefficients<f64, f64, 1> for Uniform {
+    fn diffusion(&self, _: usize, _: usize, _: [f64; 1]) -> Result<f64, SciOxideError> {
+        Ok(self.0)
+    }
+}
+
+pub(crate) type Coefficients = dyn StructuredFdmCoefficients<f64, f64, 1>;
+pub(crate) type Plan = StructuredFdmPlan<f64, f64, 1>;
+
+/// Parameters p = (k, q, h, T∞) and grid point count N.
+#[derive(Clone, Copy)]
+pub(crate) struct Slab {
+    pub(crate) parameters: [f64; 4],
+    pub(crate) nodes: usize,
+}
+
+impl Slab {
+    /// Steel plate with heating density q = 2×10⁵ W/m³ and ambient temperature T∞ = 290 K.
+    pub(crate) fn steel(conductivity: f64, transfer: f64, nodes: usize) -> Self {
+        Self {
+            parameters: [conductivity, 2.0e5, transfer, 290.0],
+            nodes,
+        }
+    }
+
+    pub(crate) fn shifted(self, j: usize, delta: f64) -> Self {
+        let mut slab = self;
+        slab.parameters[j] += delta;
+        slab
+    }
+
+    /// Difference Plan for −k u″ = q, u(0) = T₀, k u′(L) + h u(L) = h T∞.
+    pub(crate) fn plan(&self) -> Result<Plan, SciOxideError> {
+        let [k, _, h, ambient] = self.parameters;
+        let axis = CoordinateAxis::uniform(0.0, THICKNESS, self.nodes)?;
+        let mesh = SegmentMesh::new(Grid1d::new([axis], [AxisTopology::Bounded])?)?;
+        let side = |s| BoundarySet::axis_side(&mesh, 0, s);
+        let conditions = vec![
+            BoundaryCondition::dirichlet(side(AxisSide::Start)?, BoundaryData::constant(WALL)),
+            BoundaryCondition::robin(side(AxisSide::End)?, h, BoundaryData::constant(h * ambient)),
+        ];
+        let boundaries = StructuredBoundaries::new(&mesh, 1, conditions)?;
+        StructuredFdmPlan::new(mesh, &Uniform(k), &boundaries)
+    }
+
+    pub(crate) fn source(&self) -> FieldData<f64, f64, 1> {
+        FieldData::constant(self.parameters[1])
+    }
+
+    /// Data derivatives for each p_j. Boundaries follow condition order (Dirichlet, Robin).
+    pub(crate) fn tangents<'a>(
+        &self,
+        unit: &'a Uniform,
+    ) -> Vec<PdeParameterTangent<'a, f64, f64, 1, Coefficients>> {
+        let [_, _, h, ambient] = self.parameters;
+        // Derivatives (∂α/∂p_j, ∂g/∂p_j) of Robin α = h and g = h T∞.
+        let robin = |alpha: f64, data: f64| {
+            vec![
+                PdeConditionTangent::zero(),
+                PdeConditionTangent::new(BoundaryData::constant(data))
+                    .with_robin_coefficient(alpha),
+            ]
+        };
+        vec![
+            PdeParameterTangent::new().with_coefficients(unit as &Coefficients),
+            PdeParameterTangent::new().with_source(FieldData::constant(1.0)),
+            PdeParameterTangent::new().with_boundaries(robin(1.0, ambient)),
+            PdeParameterTangent::new().with_boundaries(robin(0.0, h)),
+        ]
+    }
+
+    /// Closed-form continuous mean temperature and dJ/dp (reference using f64 arithmetic).
+    pub(crate) fn continuum(&self) -> (f64, [f64; 4]) {
+        let [k, q, h, ambient] = self.parameters;
+        let l = THICKNESS;
+        let (n, d) = (
+            h * (ambient - WALL) + q * l + h * q * l * l / (2.0 * k),
+            k + h * l,
+        );
+        let mean = WALL + n / d * l / 2.0 - q * l * l / (6.0 * k);
+        let dk = l / 2.0 * (-h * q * l * l / (2.0 * k * k) * d - n) / (d * d)
+            + q * l * l / (6.0 * k * k);
+        let dq = l / 2.0 * (l + h * l * l / (2.0 * k)) / d - l * l / (6.0 * k);
+        let dh = l / 2.0 * ((ambient - WALL + q * l * l / (2.0 * k)) * d - n * l) / (d * d);
+        (mean, [dk, dq, dh, l / 2.0 * h / d])
+    }
+
+    /// Continuous adjoint ψ: −k ψ″ = 1/L, ψ(0) = 0, k ψ′(L) + h ψ(L) = 0 (reference).
+    pub(crate) fn continuum_adjoint(&self, x: f64) -> f64 {
+        let [k, _, h, _] = self.parameters;
+        let l = THICKNESS;
+        (1.0 + h * l / (2.0 * k)) / (k + h * l) * x - x * x / (2.0 * k * l)
+    }
+}
+
+/// J(u) = Σ wᵢ uᵢ. wᵢ = mᵢ / Σ m are trapezoidal weights from lumped mass (control-volume widths).
+pub(crate) struct MeanTemperature {
+    pub(crate) weights: Vec<f64>,
+}
+
+impl MeanTemperature {
+    pub(crate) fn of(plan: &Plan) -> Self {
+        let mass = plan.lumped_mass();
+        let total: f64 = mass.iter().sum();
+        Self {
+            weights: mass.iter().map(|m| m / total).collect(),
+        }
+    }
+
+    pub(crate) fn value(&self, u: &[f64]) -> f64 {
+        self.weights.iter().zip(u).map(|(w, x)| w * x).sum()
+    }
+}
+
+impl AdjointObjective<f64> for MeanTemperature {
+    fn evaluate(
+        &self,
+        _: AdjointObjectivePart,
+        _: f64,
+        u: &[f64],
+        _: &[f64],
+        state_gradient: &mut [f64],
+        parameter_gradient: &mut [f64],
+        _: &mut [f64],
+        _: &mut SolveContext<'_, '_>,
+    ) -> Result<AdjointObjectiveValue<f64>, SciOxideError> {
+        state_gradient.copy_from_slice(&self.weights);
+        parameter_gradient.fill(0.0);
+        Ok(AdjointObjectiveValue {
+            value: self.value(u),
+            time_derivative: 0.0,
+        })
+    }
+}
+
+/// Load b (Dirichlet rows are g_D). Same units [W/m²] as equilibrium residual A u − b.
+pub(crate) fn load(plan: &Plan, source: &FieldData<f64, f64, 1>) -> Result<Vec<f64>, SciOxideError> {
+    let mut load = vec![0.0; plan.unknowns()];
+    let mut scratch = vec![0.0; plan.load_workspace_len()];
+    plan.load_into(source, 0.0, &mut load, &mut scratch)?;
+    Ok(load)
+}
+
+pub(crate) fn norm(values: &[f64]) -> Result<f64, SciOxideError> {
+    let mut norm = ScaledNorm::new();
+    for value in values {
+        norm.add(value.abs())?;
+    }
+    norm.finish()
+}
+```
+
+## Adjoints of elliptic Plans
+
+`PdeEllipticAdjointPlan` computes the $R_u=A$ case of the derivation above for `EllipticProblem` of a linear Plan.
+`new(problem, parameterization, objective, options)` assembles $A$ in CSR once, factorizes with sparse LU and fill-reducing ordering, and checks storage limits.
+It rejects Plans with known constant modes and problems with null-space bases (`InvalidInput`).
+Gradients depend on the [gauge](../compatibility-gauges-and-fluxes/) choice.
+It also rejects another Plan's parameterization, objectives with time samples (`observation_times`), invalid settings, and excessive storage; a singular operator gives sparse LU `Singular`.
+
+Each `solve(problem, parameterization, solution, objective)` call performs:
+
+1. Verify that Plan and problem match preparation, and evaluate load $b$ at time 0.
+2. Compare supplied `solution` residual $\lVert Au-b\rVert_2$ with primal tolerance to verify equilibrium.
+3. Evaluate the objective at time 0, obtaining $J$, $J_u$, and $J_p$.
+4. Solve $A^{\mathsf T}\lambda=J_u^{\mathsf T}$ using prepared LU factors and independently compute residual $\lVert A^{\mathsf T}\lambda-J_u^{\mathsf T}\rVert_2$ to compare with linear tolerance.
+5. For each parameter, construct $\partial R/\partial p_j$ using `residual_tangent_into` and compute $dJ/dp_j=J_{p_j}-\lambda^{\mathsf T}\partial R/\partial p_j$.
+
+Result `PdeSteadyAdjointResult` contains multiplier `adjoint()` (of the residual equation, not a state gradient), gradient `parameter_gradient()`, and report `report()`.
+`PdeSteadyAdjointReport` returns objective value `objective()`, primal residual `primal_residual()`, adjoint residual `derivative_residual()`, evaluation counts `counts()`, and workspace bytes `workspace_bytes()`.
+These are algebraic diagnostics of the discrete gradient, not continuous-problem accuracy measures.
+`solve_into(…, adjoint, gradient, workspace, scope)` uses caller output and `PdeEllipticAdjointWorkspace`, computing as one epoch of `scope`.
+Calls using prepared workspace allocate nothing and leave both multiplier and gradient unchanged on failure.
+`sensitivity_into(…, direction, output, workspace, scope)` solves one forward-sensitivity direction $du=-A^{-1}(\partial R/\partial p)\,\delta p$ using the same factors; report `objective()` is then `None`.
+The Plan supports only real types, `Send + Sync + Clone`.
+
+The next cell computes the mean-temperature gradient by adjoints and compares with three independent values.
+These are forward sensitivity $\sum_i w_i\,\partial u_i/\partial p_j$ using the same factors, central differences resolving equilibria with $p_j$ perturbed by $\pm10^{-4}p_j$, and the continuous closed form.
+The final column gives the first-order change in $J$ for a 1 % increase in $p_j$, comparing all four parameters in the same units [K].
+Primal residual scale is the load norm $\lVert b\rVert_2$ (see [Equilibrium and linear-solution checks](#equilibrium-and-linear-solution-checks) for the reason).
+
+```rust
+//| id: pde-adjoint-steady-slab
+//| ref: pde-adjoint-steady-slab
+//| title: "Steel-plate mean-temperature gradients by adjoints, forward sensitivities, and central differences"
+//| run: reactive
+//| uses: [pde-adjoint-slab-model]
+//| crates: [scioxide-core, scioxide-linalg, scioxide-ode, scioxide-pde, scioxide-spatial]
+//| exports: [conductivity, transfer, multipliers]
+//| inputs:
+//|   slab_conductivity: {"type":"range","label":"Conductivity k [W/(m·K)]","description":"Change the magnitude of temperature differences inside the plate.","min":5,"max":50,"step":1,"value":15}
+//|   slab_transfer: {"type":"range","label":"Heat transfer coefficient h [W/(m²·K)]","description":"Change how easily heat escapes from the right face to ambient air.","min":10,"max":500,"step":10,"value":50}
+//|   slab_nodes: {"type":"range","label":"Grid point count N [points]","description":"Change trapezoidal and difference discretization errors.","min":11,"max":161,"step":10,"value":41}
+//| cases:
+//|   - {"id":"fine-grid","label":"N = 161","description":"Δx decreases to 1/4, reducing k and q gradient relative differences from the continuous problem to 1/16. h and T∞ gradients agree with the continuous problem regardless of grid.","inputs":{"slab_nodes":161}}
+//|   - {"id":"strong-cooling","label":"h = 500 W/(m²·K)","description":"Stronger right-face heat loss increases the ambient-temperature gradient to 0.3125 and reduces the heat-transfer-coefficient gradient.","inputs":{"slab_transfer":500}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"gradients","path":"/rows/0/2","approx":{"value":-0.5524163832,"rtol":1e-9}}
+//|       - {"artifact":"gradients","path":"/rows/1/2","approx":{"value":4.959449405e-5,"rtol":1e-9}}
+//|       - {"artifact":"gradients","path":"/rows/2/2","approx":{"value":-0.03265306122,"rtol":1e-9}}
+//|       - {"artifact":"gradients","path":"/rows/3/2","approx":{"value":0.07142857143,"rtol":1e-9}}
+//|       - {"artifact":"gradients","path":"/rows/0/3","range":{"max":1e-13}}
+//|       - {"artifact":"gradients","path":"/rows/0/4","range":{"max":1e-7}}
+//|       - {"artifact":"gradients","path":"/rows/0/5","approx":{"value":2.0947e-4,"rtol":1e-3}}
+//|       - {"artifact":"gradients","path":"/rows/2/5","range":{"max":1e-10}}
+//|       - {"artifact":"report","path":"/rows/0/0","approx":{"value":309.2046130952,"rtol":1e-12}}
+//|       - {"artifact":"report","path":"/rows/0/1","approx":{"value":309.2063492063,"rtol":1e-12}}
+//|       - {"artifact":"report","path":"/rows/0/3","range":{"max":1e-12}}
+//|   - case: fine-grid
+//|     expect:
+//|       - {"artifact":"gradients","path":"/rows/0/5","approx":{"value":1.3092e-5,"rtol":1e-3}}
+//|       - {"artifact":"gradients","path":"/rows/1/5","approx":{"value":1.0937e-5,"rtol":1e-3}}
+//|       - {"artifact":"gradients","path":"/rows/0/4","range":{"max":1e-6}}
+//|   - case: strong-cooling
+//|     expect:
+//|       - {"artifact":"gradients","path":"/rows/3/2","approx":{"value":0.3125,"rtol":1e-9}}
+//|       - {"artifact":"gradients","path":"/rows/2/2","approx":{"value":-0.00625,"rtol":1e-9}}
+//|       - {"artifact":"gradients","path":"/rows/3/4","range":{"max":1e-7}}
+use scioxide_core::ExecutionContext;
+use scioxide_linalg::VectorViewMut;
+use scioxide_pde::{
+    DifferentiableDiscretization, EllipticProblem, PdeEllipticAdjointPlan,
+    PdeSteadyAdjointOptions,
+};
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let sig5 = serde_json::json!({ "significantDigits": 5 });
+let slab = Slab::steel(slab_conductivity, slab_transfer, slab_nodes as usize);
+let plan = slab.plan().map_err(|e| e.to_string())?;
+let source = slab.source();
+let problem = EllipticProblem::new(&plan, &source);
+let solution = problem.solve().map_err(|e| e.to_string())?;
+let objective = MeanTemperature::of(&plan);
+// The Plan constructs ∂R/∂p_j in four directions using its own assembly.
+let unit = Uniform(1.0);
+let parameterization = plan
+    .parameterize(&slab.parameters, &slab.tangents(&unit))
+    .map_err(|e| e.to_string())?;
+// Equilibrium residual has load units, so use ‖b‖₂ as scale.
+let scale =
+    norm(&load(&plan, &source).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+let options = PdeSteadyAdjointOptions::new().with_primal_scale(scale);
+let adjoint = PdeEllipticAdjointPlan::new(&problem, &parameterization, &objective, options)
+    .map_err(|e| e.to_string())?;
+let result = adjoint
+    .solve(&problem, &parameterization, &solution, &objective)
+    .map_err(|e| e.to_string())?;
+let gradient = result.parameter_gradient();
+let (continuum_mean, continuum_gradient) = slab.continuum();
+
+let mut workspace = adjoint.workspace().map_err(|e| e.to_string())?;
+let mut du = vec![0.0; solution.len()];
+let names = ["Conductivity k", "Heating density q", "Heat transfer coefficient h", "Ambient temperature T∞"];
+let units = ["m·K²/W", "m³·K/W", "m²·K²/W", "-"];
+let mut rows = Vec::new();
+for j in 0..4 {
+    // Forward sensitivity: solve A du = −(∂R/∂p_j) with the same LU factors and form Σ wᵢ duᵢ.
+    let mut direction = [0.0; 4];
+    direction[j] = 1.0;
+    adjoint
+        .sensitivity_into(
+            &problem,
+            &parameterization,
+            &solution,
+            &direction,
+            &mut VectorViewMut::from_slice(&mut du),
+            &mut workspace,
+            ExecutionContext::sequential_native(),
+        )
+        .map_err(|e| e.to_string())?;
+    let forward = objective.value(&du);
+    // Central differences (independent check): perturb p_j by ±10⁻⁴ p_j and resolve equilibrium.
+    let delta = 1e-4 * slab.parameters[j];
+    let mut means = [0.0; 2];
+    for (mean, sign) in means.iter_mut().zip([1.0, -1.0]) {
+        let shifted = slab.shifted(j, sign * delta);
+        let plan = shifted.plan().map_err(|e| e.to_string())?;
+        let source = shifted.source();
+        let u = EllipticProblem::new(&plan, &source)
+            .solve()
+            .map_err(|e| e.to_string())?;
+        *mean = MeanTemperature::of(&plan).value(&u);
+    }
+    let central = (means[0] - means[1]) / (2.0 * delta);
+    let relative = |reference: f64| ((gradient[j] - reference) / reference).abs();
+    rows.push((
+        names[j],
+        units[j],
+        gradient[j],
+        relative(forward),
+        relative(central),
+        relative(continuum_gradient[j]),
+        0.01 * slab.parameters[j] * gradient[j],
+    ));
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "Parameter p" },
+    { "key": "1", "label": "dJ/dp units" },
+    { "key": "2", "label": "Adjoint dJ/dp", "type": "number", "format": sig5 },
+    { "key": "3", "label": "Relative difference from forward sensitivity [-]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "Relative difference from central differences [-]", "type": "number", "format": sci3 },
+    { "key": "5", "label": "Relative difference from continuous problem [-]", "type": "number", "format": sci3 },
+    { "key": "6", "label": "Change for 1 % increase in p [K]", "type": "number", "format": sig5 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "gradients" })
+);
+
+let report = result.report();
+let columns = serde_json::json!([
+    { "key": "0", "label": "Mean temperature J [K]", "type": "number", "format": { "fractionDigits": 4 } },
+    { "key": "1", "label": "Continuous J [K]", "type": "number", "format": { "fractionDigits": 4 } },
+    { "key": "2", "label": "‖R(u)‖₂ [W/m²]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "‖Aᵀλ − ∂J/∂u‖₂ [-]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "Workspace [B]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    vec![(
+        report.objective(),
+        continuum_mean,
+        report.primal_residual(),
+        report.derivative_residual(),
+        adjoint.workspace_bytes(),
+    )],
+    metadata = serde_json::json!({ "id": "report" })
+);
+
+// Pass free-node multipliers λᵢ with position x [mm] (omit Dirichlet-row multipliers, whose units differ).
+let h = THICKNESS / (slab.nodes - 1) as f64;
+let multipliers: Vec<[f64; 2]> = (1..slab.nodes)
+    .map(|i| [1e3 * h * i as f64, result.adjoint()[i]])
+    .collect();
+export!(conductivity, slab_conductivity);
+export!(transfer, slab_transfer);
+export!(multipliers, multipliers);
+```
+
+With defaults ($N=41$), adjoint gradients are $dJ/dk=-0.55242$ m·K²/W, $dJ/dq=4.9594\times10^{-5}$ m³·K/W, $dJ/dh=-0.032653$ m²·K²/W, and $dJ/dT_\infty=0.071429$.
+Relative differences from forward sensitivity are about $10^{-15}$: the two are different orderings of the same linear algebra and agree within rounding.
+Relative differences from central differences range from $8\times10^{-12}$ to $5\times10^{-9}$, consistent with quotient truncation and rounding errors.
+For 1 % changes, ambient temperature ($+0.21$ K) and heating density ($+0.099$ K) have large effects, followed by conductivity ($-0.083$ K), while heat-transfer coefficient effects ($-0.016$ K) are small.
+
+Continuous-problem relative differences are about $2\times10^{-4}$ for $k$ and $q$, and at most $3\times10^{-13}$ for $h$ and $T_\infty$.
+The one-dimensional difference Plan gives the same nodal values as P1 finite elements; since this solution is quadratic, nodal temperatures equal the continuous solution apart from rounding.
+Only trapezoidal error $J_h-J=-\Delta x^2q/(12k)$ remains, equal to $-1.736\times10^{-3}$ K at defaults, matching the difference between table $J=309.2046$ K and continuous $309.2063$ K.
+This error is independent of $h$ and $T_\infty$, so these gradients match continuous gradients.
+With $N=161$, $\Delta x$ becomes one quarter of its previous value, reducing relative differences in $k$ and $q$ to 1/16 of their previous values, or $1.3\times10^{-5}$ and $1.1\times10^{-5}$.
+
+Reported primal residual is $2.7\times10^{-9}$ W/m², adjoint residual $1.2\times10^{-14}$, and estimated workspace 339,588 bytes (wasm).
+
+What does multiplier $\lambda$ represent?
+Mean-temperature weights $w$ integrate $1/L$ over nodal widths, so $A^{\mathsf T}\lambda=w$ discretizes the continuous adjoint equation
+
+$$
+-k\,\psi''=\frac1L,\qquad \psi(0)=0,\qquad k\,\psi'(L)+h\,\psi(L)=0
+$$
+
+
+$\psi(x)$ is the mean-temperature increase from a unit heat source at position $x$, representing influence by source location.
+The next cell receives these multipliers and overlays free-node $\lambda_i$ with closed-form $\psi(x)$.
+
+```rust
+//| id: pde-adjoint-multipliers
+//| ref: pde-adjoint-multipliers
+//| title: "Compare discrete adjoint multipliers with the continuous adjoint"
+//| run: reactive
+//| uses: [pde-adjoint-slab-model]
+//| crates: [scioxide-core, scioxide-ode, scioxide-pde, scioxide-spatial]
+//| dependsOn:
+//|   steady: pde-adjoint-steady-slab
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"comparison","path":"/rows/0/0","equals":40}
+//|       - {"artifact":"comparison","path":"/rows/0/1","approx":{"value":1.43707e-3,"rtol":1e-4}}
+//|       - {"artifact":"comparison","path":"/rows/0/2","range":{"max":1e-15}}
+let k = steady["conductivity"].as_f64().ok_or("Conductivity is missing")?;
+let h = steady["transfer"].as_f64().ok_or("Heat transfer coefficient is missing")?;
+let multipliers: Vec<[f64; 2]> =
+    serde_json::from_value(steady["multipliers"].clone()).map_err(|e| e.to_string())?;
+// Grid point count is unused by the closed-form ψ.
+let slab = Slab::steel(k, h, 2);
+let reference: Vec<[f64; 2]> = (0..=100)
+    .map(|i| THICKNESS * i as f64 / 100.0)
+    .map(|x| [1e3 * x, slab.continuum_adjoint(x)])
+    .collect();
+// Maximum nodal difference |λᵢ − ψ(xᵢ)| and maximum ψ (independent check).
+let difference = multipliers
+    .iter()
+    .map(|&[x, lambda]| (lambda - slab.continuum_adjoint(1e-3 * x)).abs())
+    .fold(0.0, f64::max);
+let peak = reference.iter().map(|p| p[1]).fold(0.0, f64::max);
+emit_chart!(
+    serde_json::json!({
+        "kind": "xy",
+        "xLabel": "Position x [mm]",
+        "yLabel": "Multiplier λ [m²·K/W]",
+        "dataZoom": true,
+        "tooltip": true,
+        "layers": [
+            {
+                "id": "continuum",
+                "kind": "line",
+                "name": "Continuous adjoint ψ(x)",
+                "points": reference,
+                "style": { "lineType": "dashed", "showSymbol": false }
+            },
+            { "id": "discrete", "kind": "scatter", "name": "Discrete adjoint λᵢ", "points": multipliers }
+        ]
+    }),
+    metadata = serde_json::json!({ "id": "multipliers" })
+);
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Free nodes [points]", "type": "integer" },
+    { "key": "1", "label": "max ψ [m²·K/W]", "type": "number", "format": sci3 },
+    { "key": "2", "label": "max |λᵢ − ψ(xᵢ)| [m²·K/W]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    vec![(multipliers.len(), peak, difference)],
+    metadata = serde_json::json!({ "id": "comparison" })
+);
+```
+
+With defaults, 40 free nodes give $\max_i|\lambda_i-\psi(x_i)|=2.1\times10^{-17}$ m²·K/W and maximum $\psi$ is $1.44\times10^{-3}$ m²·K/W: nodal multipliers agree with continuous-adjoint values.
+Since $\psi$ is also quadratic, nodal values agree for the same reason as temperature.
+Sources have small effects near cooling face $x=0$ and larger effects near the heat-loss face.
+Dirichlet-row multipliers are $\lambda_0=w_0=1/80$, omitted from the plot because row units differ (the row represents $u_0-T_0$ [K]).
+
+## Adjoints of general residuals
+
+`PdeDiscretizationDerivatives` implicitly differentiates at equilibrium a residual with caller-supplied derivatives, extending beyond Plan operators.
+Use it for nonlinear residuals or parameter dependencies unsupported by `parameterize`, such as coordinates.
+`new(solution, parameter_values, residual, state, parameters)` binds borrowed equilibrium $u$, parameter values, residual `ResidualOperator`, `AdjointOperator` representing $R_u$ ($n\times n$), and `AdjointOperator` representing $R_p$ ($n\times m$, columns are real parameter directions).
+It allocates nothing and rejects shape mismatches and nonfinite parameter values.
+Provider data must remain unchanged while bound.
+
+Compute gradients using `solve_adjoint(objective, time, solve)` (default tolerances), `solve_adjoint_with_options(…, options)`, or `solve_adjoint_into(…, options, adjoint, gradient, workspace, scope)` with caller output and `PdeSteadyAdjointWorkspace`.
+`workspace(objective, options)` allocates workspace once; later calls allocate nothing.
+`sensitivity_into(direction, solve, options, output, workspace, scope)` computes one forward-sensitivity direction.
+The objective is evaluated as a terminal term (`AdjointObjectivePart::Terminal`) at `time`; objectives with time samples are rejected.
+Equilibrium checks, adjoint residual checks, and output handling match elliptic Plans.
+
+For nonlinear steady problems, `PdeResidual` binding [`NonlinearPdeProblem`](oxref:pde-jacobian-modes) implements `ResidualOperator` and `PdeAdjointJacobian`.
+`PdeTangent::new(&residual, point)` represents the equilibrium Jacobian; for a provider implementing `PdeAdjointJacobian`, it implements `AdjointOperator` and can be passed directly as $R_u$.
+`PdeAdjointJacobian` is the trait for writing conjugate-transpose products $J(\text{point})^{\mathsf H}\,\text{seed}$ through `vjp_into`, implemented by `PdeResidual`, `HyperelasticityPlan`, and `NavierStokesPlan`.
+Dense and sparse Jacobian representations form adjoint products using the assembled matrix transpose.
+For matrix-free representations (`PdeJacobianMode::Operator`), supply `PdeAdjointCallback` (`Fn(time, state, seed, output, scratch)`) using `NonlinearPdeProblem::with_adjoint(callback, scratch)`.
+The callback represents the conjugate transpose of the same derivative as the JVP and writes every output entry using only declared workspace.
+Requesting an adjoint product without it gives `InvalidInput` (`UnsupportedConfiguration`); binding rejects callbacks supplied with assembled representations.
+The caller constructs $R_p$.
+
+## Adjoint linear solvers
+
+`PdeEllipticAdjointPlan` prepares sparse LU factors, reusing them for transposed solves in adjoints and normal solves in forward sensitivities.
+Factorization occurs only once during preparation; each call evaluates loads, performs forward/back substitution, and evaluates $\partial R/\partial p_j$ $m$ times.
+This Plan's linear solver is fixed.
+
+For `PdeDiscretizationDerivatives`, the caller supplies a linear solver as `PdeLinearSolve`.
+This is a closure of type `FnMut(&dyn LinearOperator<T>, &[T], &mut [T], &mut SolveContext) -> Result<(), SciOxideError>` solving $Ax=b$ for the supplied operator.
+The solution array is supplied initialized to zero.
+For adjoints the operator is the conjugate transpose of $R_u$; for forward sensitivity it is $R_u$ itself.
+The closure may own factors or Krylov workspace and may solve with prefactorized factors without using the operator argument.
+If $R_u$ is nonsymmetric, choose a solver supporting the transposed system, such as transposed LU solves or GMRES.
+Conjugate gradients require symmetric positive definite matrices.
+The solve counts once as a linear solve in `SolveContext`; reaching the evaluation limit gives `ConvergenceFailure` (`EvaluationLimit`).
+
+Even if the closure reports success, the library recomputes the residual itself and compares with linear tolerance.
+For iterative solvers, use a stricter stopping criterion than the linear tolerance.
+Otherwise the adjoint can fail with `InvalidInput` (argument `solve`) even when the iterative solver reports convergence.
+
+## Equilibrium and linear-solution checks
+
+`PdeSteadyAdjointOptions` contains two tolerances and one scale.
+
+- Primal tolerance (`with_primal_tolerance`, default absolute and relative both $\sqrt\varepsilon$): checks whether the supplied solution satisfies $\lVert R(u)\rVert_2\le\mathrm{atol}+\mathrm{rtol}\cdot s$.
+  $s$ is a finite nonnegative scale supplied with `with_primal_scale` (default 1).
+- Linear tolerance (`with_linear_tolerance`, same defaults): checks whether the adjoint residual satisfies $\lVert R_u^{\mathsf T}\lambda-J_u^{\mathsf T}\rVert_2\le\mathrm{atol}+\mathrm{rtol}\cdot\lVert J_u\rVert_2$.
+  Forward sensitivity uses the same form with the norm of right-hand side $-R_p\,\delta p$ as the scale.
+- `with_max_workspace_bytes`: limit on library-owned workspace (default none).
+
+The adjoint formula assumes $R(u,p)=0$, so a gradient computed at nonequilibrium $u$ is meaningless.
+Primal residual has the units of its rows: plate loads [W/m²], except Dirichlet rows [K].
+Default scale 1 means an absolute threshold $2\sqrt\varepsilon\approx3.0\times10^{-8}$ in these units.
+Even backward-stable direct solutions retain residuals of order $\varepsilon\lVert A\rVert\,\lVert u\rVert$ (Higham, 2002, Chapter 7); grid refinement increases both $\lVert A\rVert$ and $\lVert u\rVert_2$.
+The next cell refines the plate grid ($k=15$, $h=50$) from $N=41$ to 2561, comparing direct-solve equilibrium residuals and thresholds at scale 1 and scale $\lVert b\rVert_2$.
+Residual $Au-b$ is independently computed from Plan action (`LinearOperator::apply_into`) and load.
+
+```rust
+//| id: pde-adjoint-primal-check
+//| ref: pde-adjoint-primal-check
+//| title: "Equilibrium-check scales versus grid refinement"
+//| run: reactive
+//| uses: [pde-adjoint-slab-model]
+//| crates: [scioxide-core, scioxide-ode, scioxide-pde, scioxide-spatial]
+//| inputs:
+//|   primal_scale: {"type":"select","label":"Primal residual scale","description":"Select the scale in threshold √ε(1 + scale) compared with the equilibrium residual.","options":["1 (default)","Load norm ‖b‖₂"],"value":"1 (default)"}
+//| cases:
+//|   - {"id":"load-scale","label":"Scale ‖b‖₂","description":"The threshold has the same unit scale as the residual, accepting equilibrium on all four grids.","inputs":{"primal_scale":"Load norm ‖b‖₂"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"checks","path":"/rows/0/4","equals":"Accepted"}
+//|       - {"artifact":"checks","path":"/rows/0/2","range":{"max":1e-8}}
+//|       - {"artifact":"checks","path":"/rows/0/3","approx":{"value":2.98023e-8,"rtol":1e-5}}
+//|       - {"artifact":"checks","path":"/rows/2/5","equals":null}
+//|       - {"artifact":"checks","path":"/rows/3/5","equals":null}
+//|   - case: load-scale
+//|     expect:
+//|       - {"artifact":"checks","path":"/rows/2/4","equals":"Accepted"}
+//|       - {"artifact":"checks","path":"/rows/3/4","equals":"Accepted"}
+//|       - {"artifact":"checks","path":"/rows/3/5","approx":{"value":-0.5525320961,"rtol":1e-8}}
+use scioxide_core::LinearOperator;
+use scioxide_pde::{
+    DifferentiableDiscretization, EllipticProblem, PdeEllipticAdjointPlan,
+    PdeSteadyAdjointOptions,
+};
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let sig6 = serde_json::json!({ "significantDigits": 6 });
+let mut rows = Vec::new();
+for nodes in [41, 161, 641, 2561] {
+    let slab = Slab::steel(15.0, 50.0, nodes);
+    let plan = slab.plan().map_err(|e| e.to_string())?;
+    let source = slab.source();
+    let problem = EllipticProblem::new(&plan, &source);
+    let solution = problem.solve().map_err(|e| e.to_string())?;
+    let b = load(&plan, &source).map_err(|e| e.to_string())?;
+    // Independent check: form equilibrium residual R(u) = A u − b using Plan action.
+    let mut residual = vec![0.0; nodes];
+    let mut scratch = vec![0.0; plan.apply_workspace_len().map_err(|e| e.to_string())?];
+    plan.apply_into(&solution, &mut residual, &mut scratch)
+        .map_err(|e| e.to_string())?;
+    for (r, bi) in residual.iter_mut().zip(&b) {
+        *r -= bi;
+    }
+    let load_norm = norm(&b).map_err(|e| e.to_string())?;
+    let scale = if primal_scale == "1 (default)" {
+        1.0
+    } else {
+        load_norm
+    };
+    let options = PdeSteadyAdjointOptions::new().with_primal_scale(scale);
+    let threshold = options
+        .primal_tolerance()
+        .threshold(scale)
+        .map_err(|e| e.to_string())?;
+    let objective = MeanTemperature::of(&plan);
+    let unit = Uniform(1.0);
+    let parameterization = plan
+        .parameterize(&slab.parameters, &slab.tangents(&unit))
+        .map_err(|e| e.to_string())?;
+    let adjoint = PdeEllipticAdjointPlan::new(&problem, &parameterization, &objective, options)
+        .map_err(|e| e.to_string())?;
+    let (verdict, gradient) =
+        match adjoint.solve(&problem, &parameterization, &solution, &objective) {
+            Ok(result) => ("Accepted".to_string(), Some(result.parameter_gradient()[0])),
+            Err(e) => (e.to_string(), None),
+        };
+    rows.push((
+        nodes,
+        load_norm,
+        norm(&residual).map_err(|e| e.to_string())?,
+        threshold,
+        verdict,
+        gradient,
+    ));
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "Grid point count N [points]", "type": "integer" },
+    { "key": "1", "label": "‖b‖₂ [W/m²]", "type": "number", "format": sci3 },
+    { "key": "2", "label": "‖R(u)‖₂ [W/m²]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "Threshold [W/m²]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "Result" },
+    { "key": "5", "label": "dJ/dk [m·K²/W]", "type": "number", "format": sig6, "nullText": "None" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "checks" })
+);
+```
+
+At scale 1, residuals $2.7\times10^{-9}$, $2.3\times10^{-8}$, $1.9\times10^{-7}$, and $1.6\times10^{-6}$ W/m² grow about eightfold for every fourfold grid refinement, exceeding threshold $3.0\times10^{-8}$ from $N=641$ and being rejected with `InvalidInput` (argument `derivatives`).
+The solution is valid; the threshold units are mismatched.
+Using scale $\lVert b\rVert_2$ ($3.6\times10^6$ W/m² at $N=41$, mostly the first free node's lifting $kT_0/\Delta x$) changes the threshold from 0.054 to 3.4 W/m², accepting every grid.
+Accepted $dJ/dk$ approaches $-0.552532096$ m·K²/W with $N$, narrowing its difference from continuous $-0.552532124$.
+Choose a problem-scaled quantity with residual units, such as $\lVert b\rVert_2$ or $\lVert A\rVert\,\lVert u\rVert$.
+
+All failures return `SciOxideError` and leave multiplier and gradient output unchanged.
+
+| Cause | Kind and argument |
+|---|---|
+| Nonequilibrium solution | `InvalidInput` (`derivatives`, `Inconsistent`) |
+| Linear solve residual exceeds tolerance | `InvalidInput` (`solve`, `Inconsistent`) |
+| Shape or workspace differs from preparation | `InvalidInput` (such as `derivatives`), `DimensionMismatch` |
+| Nonfinite solution, parameter, or callback values | `NonFinite` (origin `Input` or `Callback`) |
+| Evaluation limit | `ConvergenceFailure` (`EvaluationLimit`) |
+| Workspace exceeds limit | `ResourceLimit` |
+
+There is no termination enum; returning a gradient indicates success.
+`counts()` records residual, objective, linear solve, and operator application counts.
+
+## Summary
+
+Discrete adjoints differentiate discretized residual $R(u,p)=0$, obtaining all parameter gradients with one transposed linear solve.
+For linear Plans, provide coefficient, source, boundary-data, and Robin coefficient derivatives with `PdeParameterTangent`; `parameterize` assembles $\partial R/\partial p$, and `PdeEllipticAdjointPlan` solves both adjoints and forward sensitivities using one sparse LU factorization.
+The result is the gradient of discrete $J$; for the plate it agrees with central differences to about $10^{-9}$ and differs from the continuous problem only by trapezoidal error.
+For nonlinear residuals or custom $R_p$, pass operators and a linear-solver closure to `PdeDiscretizationDerivatives`, setting a stricter closure stopping criterion than the linear tolerance.
+Choose an equilibrium-check scale with residual units so correct fine-grid solutions are accepted.
+
+## Further reading
+
+- [Discrete adjoints for time-dependent problems](../transient-adjoints/): differentiate method-of-lines semidiscrete systems including time steps, and examine checkpoints and field-transfer derivatives.
+- [Nonlinear steady problems](../nonlinear-steady-problems/): construct `PdeResidual` and `PdeTangent` for adjoints.
+- [Solving elliptic linear systems](../elliptic-linear-solves/): examine direct equilibrium solvers and solution acceptance checks.
+- [Discrete adjoint and sensitivity API](../../api/adjoints/): inspect specifications of each item.
+- [Adjoint gradients and checkpoints](../../../scioxide-ode/algorithms/adjoint-gradients/): examine objective `AdjointObjective` and time-adjoint mechanisms.
+
+## References
+
+- M. B. Giles and N. A. Pierce, "An introduction to the adjoint approach to design", *Flow, Turbulence and Combustion* 65, 393–415, 2000.
+- N. J. Higham, *Accuracy and Stability of Numerical Algorithms*, 2nd ed., SIAM, 2002, chapter 7.

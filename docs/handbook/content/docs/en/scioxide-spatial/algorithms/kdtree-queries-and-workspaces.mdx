@@ -1,0 +1,172 @@
+---
+title: "KD-tree queries and workspaces"
+description: "Calling individual and batch KD-tree nearest-neighbor and radius queries, workspace requirements and reservation, errors and output behavior with insufficient capacity, batch parallelism, and cancellation."
+sidebar:
+  order: 327
+references:
+  spatial-kdtree-queries-workspaces: "query-forms-and-workspaces"
+---
+
+After constructing a KD tree, the task is to supply query points and receive neighbors.
+For many repeated queries, allocating result arrays on every query is costly, so the caller prepares and reuses workspace and outputs.
+This page explains individual and batch query calls, sizing workspaces, errors and output behavior with insufficient workspace or outputs, and parallel batch queries.
+[Neighbor search with KD trees](../spatial-trees-and-distance/) covers tree construction, pruning, approximate search, and periodic boxes.
+
+## Query forms and workspaces
+
+Queries separate the tree (a prepared value), per-query workspace, and output.
+Declare workspace size with `SearchWorkspaceRequest`; `tree.workspace_requirements(request)` returns `SearchWorkspaceRequirements`.
+`tree.workspace(request)` returns a reserved `SearchWorkspace`.
+For empty workspace constructed with `SearchWorkspace::new()`, reserve with `try_reserve(&requirements)` and check sufficiency with `check`.
+`SearchWorkspaceRequest::new(neighbors, options)` declares the result count for an individual query.
+For nearest-neighbor queries this is $\min(k, n)$; for radius queries, the maximum anticipated number of matches.
+`with_batch(queries, neighbors, workers)` adds the batch query count, total result count across all queries, and worker count (up to 32).
+Requirements return worker count `workers()`, neighbor slots per worker `neighbors_per_worker()`, batch-result slots `output_len()`, per-query count slots `count_len()` (one more than the query count; 0 without batch queries), and their byte counts.
+`with_max_workspace_bytes` in `SearchOptions` limits bytes retained by workspace; excess yields `ResourceLimit`.
+
+| Query | Call | Output and insufficient-capacity behavior |
+|---|---|---|
+| Individual nearest neighbors | `tree.nearest_into(&q, k, options, &mut out, &mut ws, cx)` | Writes $\min(k, n)$ entries and returns that count. Insufficient `out` or workspace yields `DimensionMismatch` before search |
+| Individual radius | `tree.radius_into(&q, r, options, &mut out, &mut ws, cx)` | Writes points within the radius and returns the count. More matches than `out` or workspace can hold yield `ResourceLimit` |
+| Batch nearest neighbors | `tree.nearest_batch_into(&queries, k, options, &mut out, &mut ws, cx)` | Concatenates $\min(k, n)$ results per query in query order into `out` and returns the total. Insufficient `out` or workspace yields `DimensionMismatch` |
+| Batch radius | `tree.radius_batch_into(&queries, r, options, &mut out, &mut counts, &mut ws, cx)` | Concatenates all results in query order into `out`, writes query $i$'s count to `counts[i]`, and returns the total. Results exceeding `out`, `counts`, or workspace yield `DimensionMismatch` |
+
+Batch nearest-neighbor queries have a fixed per-query count $\min(k, n)$ and therefore accept no count array.
+Batch radius queries first count matches per query, derive write offsets from prefix sums, then fill and sort results in a second pass.
+Thus batch radius queries do not use per-worker neighbor slots; reserve by adding the total result count with `with_batch` to `SearchWorkspaceRequest::new(0, options)`.
+All queries stage results in workspace and copy to output only after success, leaving outputs unchanged on failure.
+For longer outputs, entries beyond the written count remain unchanged.
+Queries never grow workspace, so queries after reservation do not allocate (allocations by injected executors follow their own rules).
+`tree.nearest(&q, k)`, `tree.radius(&q, r)`, and `tree.nearest_batch(&queries, k)` are convenience functions allocating workspace and results with default `SearchOptions`.
+`radius` counts matches first, then allocates exactly that many entries.
+Use `_into` forms to specify approximation or workspace limits.
+
+`SearchOptions::new()` selects exact search, sequential execution, and no limits.
+With `with_execution_policy(ExecutionPolicy::Auto)`, batch queries run in parallel when at least 256 queries exist and work per worker reaches the executor's minimum workload.
+Work is estimated as $d\,(b(n) + \text{leaf size} + k)$ per query, with up to 32 workers.
+$b(n) = \lfloor \log_2 n \rfloor + 1$ is the bit length of $n$, used as a guide to tree depth.
+Reserve workspace for the maximum worker count the executor may use.
+Cancellation and deadlines are checked at least every 64 nodes and every 256 points in large leaves.
+Cells running in wasm are sequential and remain so even with `Auto`.
+
+The following cell tries three kinds of queries with insufficient output using a tree of four x-axis points $(0, 0), (1, 0), (2, 0), (3, 0)$.
+The query point is $(0.4, 0)$; a radius $r$ query finds one point at $r \ge 0.4$, two at $r \ge 0.6$, and three at $r \ge 1.6$.
+Each output has two slots initially filled with sentinel neighbors of index `usize::MAX`, allowing us to check whether sentinels remain after failure.
+The table shows each query's result (acceptance or error classification), written count on acceptance, and whether outputs remained unchanged.
+
+```rust
+//| id: spatial-kdtree-output-limits
+//| ref: spatial-kdtree-output-limits
+//| title: "Errors from individual and batch queries with insufficient output"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-spatial]
+//| inputs:
+//|   radius: {"type":"range","label":"Radius r [-]","min":0.2,"max":2,"step":0.2,"value":1.8}
+//| cases:
+//|   - {"id":"fits","label":"r = 1.0","description":"Two points fit in the output, so the radius query is accepted.","inputs":{"radius":1}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"limits","path":"/rows/0/1","equals":"ResourceLimit"}
+//|       - {"artifact":"limits","path":"/rows/0/2","equals":null}
+//|       - {"artifact":"limits","path":"/rows/0/3","equals":true}
+//|       - {"artifact":"limits","path":"/rows/1/1","equals":"DimensionMismatch"}
+//|       - {"artifact":"limits","path":"/rows/1/3","equals":true}
+//|       - {"artifact":"limits","path":"/rows/2/1","equals":"DimensionMismatch"}
+//|       - {"artifact":"limits","path":"/rows/2/3","equals":true}
+//|   - case: fits
+//|     expect:
+//|       - {"artifact":"limits","path":"/rows/0/1","equals":"Accepted"}
+//|       - {"artifact":"limits","path":"/rows/0/2","equals":2}
+//|       - {"artifact":"limits","path":"/rows/0/3","equals":false}
+use core::num::NonZeroUsize;
+use scioxide_core::{ExecutionContext, SciOxideError, NdView, StridedLayout};
+use scioxide_spatial::{KdTree, Neighbor, PointSet, SearchOptions, SearchWorkspaceRequest};
+
+let coordinates = [0.0_f64, 0.0, 1.0, 0.0, 2.0, 0.0, 3.0, 0.0];
+let (shape, strides) = ([4, 2], [2, 1]);
+let layout = StridedLayout::new(&shape, &strides).map_err(|e| e.to_string())?;
+let points = PointSet::new(NdView::new(&coordinates, layout).map_err(|e| e.to_string())?)
+    .map_err(|e| e.to_string())?;
+let tree = KdTree::new(&points).map_err(|e| e.to_string())?;
+let (options, context) = (SearchOptions::new(), ExecutionContext::sequential());
+let marker = Neighbor {
+    index: usize::MAX,
+    distance: -1.0,
+};
+let unchanged = |output: &[Neighbor<f64>]| output.iter().all(|v| *v == marker);
+// (Result, written count). The count is present only on acceptance.
+let classify = |result: Result<usize, SciOxideError>| match result {
+    Ok(count) => ("Accepted".to_string(), Some(count)),
+    Err(error) => (format!("{:?}", error.kind()), None),
+};
+let query = [0.4, 0.0];
+
+// Individual query: workspace and output each hold two entries.
+let request = SearchWorkspaceRequest::new(2, options);
+let mut ws = tree.workspace(request).map_err(|e| e.to_string())?;
+let mut out = [marker; 2];
+let result = tree.radius_into(&query, radius, options, &mut out, &mut ws, context);
+let single_radius = (classify(result), unchanged(&out));
+let mut out = [marker; 2];
+let result = tree.nearest_into(&query, 3, options, &mut out, &mut ws, context);
+let single_nearest = (classify(result), unchanged(&out));
+
+// Batch radius query: repeat the same point twice, with two total result slots.
+let (twice, query_shape) = ([0.4, 0.0, 0.4, 0.0], [2, 2]);
+let layout = StridedLayout::new(&query_shape, &strides).map_err(|e| e.to_string())?;
+let queries = PointSet::new(NdView::new(&twice, layout).map_err(|e| e.to_string())?)
+    .map_err(|e| e.to_string())?;
+let request = SearchWorkspaceRequest::new(0, options).with_batch(2, 2, NonZeroUsize::MIN);
+let mut batch_ws = tree.workspace(request).map_err(|e| e.to_string())?;
+let (mut out, mut counts) = ([marker; 2], [0; 2]);
+let result = tree.radius_batch_into(
+    &queries,
+    1.0,
+    options,
+    &mut out,
+    &mut counts,
+    &mut batch_ws,
+    context,
+);
+let batch_radius = (classify(result), unchanged(&out));
+let rows: Vec<(&str, String, Option<usize>, bool)> = [
+    ("radius_into (radius r)", single_radius),
+    ("nearest_into（k = 3）", single_nearest),
+    ("radius_batch_into (radius 1.0, 2 queries)", batch_radius),
+]
+.into_iter()
+.map(|(label, ((result, count), kept))| (label, result, count, kept))
+.collect();
+let columns = serde_json::json!([
+    { "key": "0", "label": "Query" },
+    { "key": "1", "label": "Result" },
+    { "key": "2", "label": "Written entries [count]", "type": "integer", "nullText": "—" },
+    { "key": "3", "label": "Output unchanged", "type": "boolean" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "limits" })
+);
+```
+
+At default $r = 1.8$, `radius_into` finds three points, exceeding output capacity, and returns `ResourceLimit` while preserving sentinels.
+At $r = 1.0$, two points fit, so the query is accepted and overwrites output.
+`nearest_into` returns `DimensionMismatch` before searching because output is too short for $k = 3$.
+`radius_batch_into` finds four total matches across two queries, exceeding its two slots; unlike an individual query, it returns `DimensionMismatch`.
+Batch queries check output length after counting matches, so insufficient output is reported as `DimensionMismatch`.
+
+## Summary
+
+For repeated queries, declare result counts through `SearchWorkspaceRequest`, reserve workspace once, and reuse outputs with `_into` forms to avoid query allocations.
+Nearest-neighbor output size is fixed at $\min(k, n)$; insufficient capacity yields `DimensionMismatch` before searching.
+Individual radius queries do not know match counts in advance and report `ResourceLimit` when capacity is exceeded.
+Batch radius queries count before writing, returning the total result count and per-query counts.
+All queries leave outputs unchanged on failure, allowing capacity to be increased after an error and the same query retried.
+
+## Further reading
+
+- [Neighbor search with KD trees](../spatial-trees-and-distance/): examine the meaning of query results, including pruning correctness, approximate-search guarantees, and periodic-box minimum images.
+- [Directed Hausdorff distance](../directed-hausdorff/): examine measuring discrepancy between point sets as the maximum of batch single-neighbor queries.
+- [Angular-distance neighbor search in a star catalog](../../examples/celestial-neighbor-search/): use radius-query outputs and workspaces in a star-catalog example.

@@ -1,0 +1,572 @@
+---
+title: "Krylov subspace methods and preconditioning"
+description: "Krylov spaces and residual polynomials, CG derivation and A-norm error bounds, true-residual replacement, scope and cost of MINRES, GMRES, and BiCGSTAB, preconditioning and scioxide-sparse Jacobi, incomplete Cholesky, and multigrid, standard/with-options/caller-provided-output solves and termination reasons, and iterates returned on stopping."
+sidebar:
+  order: 355
+references:
+  linalg-conjugate-gradient: "conjugate-gradients"
+  linalg-minres-gmres-bicgstab: "minres-gmres-and-bicgstab"
+  linalg-preconditioning: "preconditioning"
+  linalg-iterative-status: "iteration-state-and-results-on-stopping"
+---
+
+For sparse linear systems $Ax = b$ of tens of thousands to millions of unknowns from PDE discretization, factorization may greatly increase nonzero entries (fill-in), exhausting memory or computation.
+Krylov subspace methods improve approximate solutions through repeated matrix–vector products alone, also supporting problems supplying actions without forming matrices.
+This page explains major Krylov derivations and convergence bounds, preconditioning, how to call `scioxide-linalg` iterative solvers, and how to interpret stopped results.
+
+---
+
+## Krylov spaces and residual polynomials
+
+Choosing $x_k \in x_0 + \mathcal{K}_k$ from Krylov space $\mathcal{K}_k(A, r_0) = \operatorname{span}\{ r_0, A r_0, \dots, A^{k-1} r_0 \}$ constructed from initial guess $x_0$ and residual $r_0 = b - Ax_0$ gives residual $r_k = p_k(A)\, r_0$ ($p_k$ is a polynomial of degree at most $k$ satisfying $p_k(0) = 1$).
+Each method can be understood as choosing this polynomial optimally in some sense.
+For residual-2-norm minimizers (GMRES and MINRES with Hermitian $A$), diagonalizability as $A = V \Lambda V^{-1}$ gives
+
+$$
+\lVert r_k \rVert_2 \le \kappa_2(V) \min_{p_k(0) = 1} \max_{\lambda \in \Lambda(A)} \lvert p_k(\lambda) \rvert \; \lVert r_0 \rVert_2
+$$
+
+where $\Lambda(A)$ is the spectrum.
+Convergence is faster when a low-degree polynomial equals 1 at the origin and is small on the eigenvalues; nonnormal matrices also depend on $\kappa_2(V)$ (for Hermitian matrices, $V$ is unitary, with $\kappa_2(V) = 1$).
+Each iteration requires one or two matrix–vector products ($O(\mathrm{nnz})$ each for sparse matrices) and vector operations of length $n$.
+
+Iterative solvers accept scioxide-core's `LinearOperator` (`&dyn LinearOperator<S>`).
+Examples include scioxide-sparse's `CsrMatrix`, finite-checked dense view `matrix.view().try_finite()?` (`FiniteMatrixView`), views of `TridiagonalMatrix` or `BandedMatrix` (`.view()`; owned structured matrices themselves are not operators), and function-defined actions through `ClosureOperator`.
+
+## Conjugate gradients
+
+For Hermitian positive-definite $A$ with solution $x$, $\phi(y) = \tfrac12 y^{\mathsf H} A y - \operatorname{Re}(b^{\mathsf H} y)$ satisfies $\phi(y) - \phi(x) = \tfrac12 \lVert y - x \rVert_A^2$ ($\lVert e \rVert_A^2 = e^{\mathsf H} A e$).
+Conjugate gradients (CG) finds $x_k$ minimizing the error's $A$-norm over $x_0 + \mathcal{K}_k$; the condition is residual orthogonality to the subspace (Galerkin condition $r_k \perp \mathcal{K}_k$).
+Choosing mutually $A$-conjugate directions ($p_i^{\mathsf H} A p_j = 0$, $i \ne j$) splits minimization into one-dimensional directional minimizations, yielding the following short recurrences.
+
+$$
+\alpha_k = \frac{r_k^{\mathsf H} r_k}{p_k^{\mathsf H} A p_k}, \quad
+x_{k+1} = x_k + \alpha_k p_k, \quad
+r_{k+1} = r_k - \alpha_k A p_k, \quad
+\beta_k = \frac{r_{k+1}^{\mathsf H} r_{k+1}}{r_k^{\mathsf H} r_k}, \quad
+p_{k+1} = r_{k+1} + \beta_k p_k
+$$
+
+Each `CgSolver` iteration uses one product with $A$ and one preconditioner $M^{-1}$ application (discussed below); workspace is six vectors of length $n$.
+It also computes recurrence inner products ($p_k^{\mathsf H} A p_k$ and $r_{k+1}^{\mathsf H} r_{k+1}$ without preconditioning) and norms for stopping tests and rounding-error monitoring.
+Inner products use an extended exponent range, so $\lVert r \rVert_2^2$ exceeding floating-point range does not fail the solve while $x$ remains representable.
+
+Since the error is $x - x_k = p_k(A)(x - x_0)$, a Chebyshev polynomial shifted to eigenvalue interval $[\lambda_{\min}, \lambda_{\max}]$ as a candidate $p_k$ gives, for condition number $\kappa = \kappa_2(A) = \lambda_{\max}/\lambda_{\min}$,
+
+$$
+\frac{\lVert x - x_k \rVert_A}{\lVert x - x_0 \rVert_A} \le \frac{1}{T_k\!\left(\frac{\kappa + 1}{\kappa - 1}\right)} \le 2 \left( \frac{\sqrt{\kappa} - 1}{\sqrt{\kappa} + 1} \right)^{k}
+$$
+
+where $T_k$ is the degree-$k$ Chebyshev polynomial.
+This bounds relative $A$-norm error in exact arithmetic; reaching relative error $\tau$ requires approximately $\tfrac12 \sqrt{\kappa}\,\ln(2/\tau)$ iterations.
+The stopping residual is $r_k = A(x - x_k)$, so $\lVert r_k \rVert_2 / \lVert r_0 \rVert_2 \le \sqrt{\kappa}\, \lVert x - x_k \rVert_A / \lVert x - x_0 \rVert_A$; residual ratios can exceed error $A$-norm ratios by up to $\sqrt{\kappa}$ and need not decrease monotonically.
+Eigenvalue clusters can give much faster actual convergence than the bound; floating-point loss of direction conjugacy may slow convergence.
+
+Rounding gradually separates recurrence-updated residuals from true residuals $b - Ax_k$.
+`CgSolver` recomputes and replaces true residuals every 50 iterations and before accepting convergence, retaining directions and testing true-residual convergence without restarting the recurrence.
+Nonpositive curvature $p^{\mathsf H} A p$ indicates $A$ is not positive-definite and stops with `Breakdown(NonPositiveCurvature)`; nonpositive preconditioned $r^{\mathsf H} M^{-1} r$ indicates a non-positive-definite preconditioner and stops with `Breakdown(Preconditioner)`.
+Both return solutions according to [Iteration state and results on stopping](#iteration-state-and-results-on-stopping).
+
+## MINRES, GMRES, and BiCGSTAB
+
+| Solver | Matrix | Quantity minimized | Per-iteration cost | Workspace (length-$n$ vectors) | Preconditioning |
+|---|---|---|---|---|---|
+| `CgSolver` | Hermitian positive-definite | Error $A$-norm | One $A$ product, one $M^{-1}$ application | 6 | Hermitian positive-definite $M^{-1}$ (two-sided) |
+| `MinresSolver` | Hermitian, possibly indefinite | Residual 2-norm (norm determined by $M^{-1}$ with preconditioning) | One $A$ product, one $M^{-1}$ application | 17 | Hermitian positive-definite $M^{-1}$ (two-sided) |
+| `GmresSolver` | General square | Residual 2-norm within each restart cycle | One $A$ product, one $M^{-1}$ application, orthogonalization $O(jn)$ for direction $j$ of the cycle | About $3m$ | Right; may vary between iterations |
+| `BicgstabSolver` | General square | No minimization (one BiCG step combined with one-dimensional residual minimization) | Two $A$ products, two $M^{-1}$ applications | 10 | Right; fixed throughout the solve |
+
+MINRES minimizes residuals by solving small tridiagonal problems from Lanczos.
+Its three-term recurrence makes memory independent of iteration count; true residuals and $\lVert A r \rVert_2$ are recomputed every 50 iterations and before accepting convergence, using two additional $A$ products.
+Consistent singular systems converge like nonsingular systems; without preconditioning, inconsistent singular systems return least-squares solutions as `LeastSquaresConverged` using the normal-equation residual test (the same `with_normal_tolerance` as next page's LSQR).
+Detecting non-Hermitian $A$ gives an `InvalidInput` (`Inconsistent`) error.
+
+GMRES builds an orthonormal basis of $\mathcal{K}_k$ by Arnoldi and chooses residual-minimizing solution $x_k = \operatorname{arg\,min}_{y \in x_0 + \mathcal{K}_k} \lVert b - Ay \rVert_2$.
+The expanding subspace prevents residual increase and reaches the solution in at most $n$ iterations in exact arithmetic.
+Memory grows as $O(kn)$ and orthogonalization work as $O(k^2 n)$, so discard the basis and restart every $m$ iterations (GMRES($m$); default $m = 30$, changed with `with_restart`).
+Restarting slows convergence and may cause stagnation under unfavorable conditions.
+`GmresSolver` retains pairs of preconditioned directions $z_j = M_j^{-1} v_j$ and images $A z_j$, orthonormalizing images by classical Gram–Schmidt with the DGKS criterion while applying the same column operations to directions to preserve $AZ = Q$; cycle corrections are $Z Q^{\mathsf H} r$.
+Preconditioning acts on the right ($x = x_0 + Z y$); retaining actually applied directions allows it to vary between iterations (flexible GMRES).
+Directions whose norms shrink to machine-epsilon scale on orthogonalization (threshold changed with `with_rank_threshold`) are discarded as dependent; if the Krylov space stops growing before convergence, terminates with `Breakdown(ArnoldiInvariant)`.
+The minimized residual is the original-system residual $b - Ax$; true residuals are recomputed at each cycle end, every 50 iterations, and when residual estimates meet tolerance.
+Iteration limits count iterations across all cycles.
+
+BiCGSTAB combines a BiCG step with one-dimensional residual minimization (GMRES(1)) to smooth BiCG convergence without $A^{\mathsf H}$.
+It replaces recurrence residuals with true residuals every 50 iterations and before accepting convergence, retaining shadow residual $\hat r = r_0$ and the recurrence.
+Shadow-residual inner products $\hat r^{\mathsf H} r$ and $\hat r^{\mathsf H} v$ count as breakdown only for magnitudes at or below $\varepsilon_{\mathrm{mach}}^2 \lVert \hat r \rVert_2 \lVert r \rVert_2$ ($\lVert v \rVert_2$ for the latter), stopping with `Breakdown(RecurrenceDenominator)`.
+Allowing restarts through `with_breakdown_restarts` restarts from the last verified iterate, using its true residual as the new shadow residual (no restarts by default).
+
+## Preconditioning
+
+Preconditioning replaces a problem by a system with the same solution and a more favorable eigenvalue distribution.
+Left preconditioning $M^{-1}Ax = M^{-1}b$ uses preconditioned residual $M^{-1}r$; right preconditioning $AM^{-1}y = b$ ($x = M^{-1}y$) uses original residual $r$.
+CG preconditioning, with $M = LL^{\mathsf H}$, performs iterations equivalent to CG on $L^{-1}AL^{-\mathsf H}$ using only $M^{-1}$ actions without forming $L$ (two-sided preconditioning); $M$ must also be Hermitian positive-definite, and $\kappa$ in the bound becomes $\kappa(M^{-1}A)$.
+$M = A$ converges in one iteration, but applying $M^{-1}$ is as hard as the original problem; balance cheap $M^{-1}$ actions against clustering of $M^{-1}A$ eigenvalues.
+
+| Preconditioner | $M$ | Expected effect | scioxide-sparse type and explanation |
+|---|---|---|---|
+| Jacobi (diagonal) | $\operatorname{diag}(A)$ | Effective for strongly differing row/column scales. Constant diagonals give a scalar multiple of $A$ and leave iteration counts unchanged | `JacobiPreconditioner::new` ([Incomplete factorizations and iterative preconditioning](oxref:sparse-jacobi-identity)) |
+| Incomplete Cholesky or LU | Product of factors confined to $A$'s nonzero pattern (IC(0), ILU(0)) or fill levels (ILU($k$)) | For two-dimensional Poisson, even IC(0) leaves $\kappa$ at $O(h^{-2})$ in grid spacing $h$; improvement is a constant factor | `IncompleteFactor::ic0`, `IncompleteFactor::ilu0`. Select levels or thresholds with `IncompleteFactor` through `IncompleteMethod` ([Incomplete factorizations and iterative preconditioning](../../../scioxide-sparse/algorithms/incomplete-factorizations/)) |
+| Algebraic multigrid | V-cycle combining smoothing and coarse-space correction | Can make elliptic-problem iteration counts nearly independent of the grid | `AmgPreconditioner::new` ([Algebraic multigrid preconditioning](oxref:sparse-amg-smoothed-aggregation); overlapping Schwarz preconditioner `SchwarzPlan` is in [Overlapping Schwarz](../../../scioxide-sparse/algorithms/overlapping-schwarz/)) |
+
+Solvers retain no preconditioner: pass a reference to scioxide-core's `Preconditioner` supplying inverse action $M^{-1}$ as `Preconditioning::Inverse(&p)` per solve; pass `Preconditioning::None` for none.
+The same value acts symmetrically on both sides for CG/MINRES, on the right for nonsymmetric methods such as GMRES/BiCGSTAB and block variants, and on the left for Richardson.
+For BiCG and QMR, which also need adjoint action $M^{-\mathsf H}$, pass `Preconditioning::InverseAdjoint`.
+LSQR, LSMR, and entry-based Jacobi, Gauss–Seidel, and SOR have no preconditioner argument.
+GMRES, LGMRES, GCROT, and block variants retain applied directions and allow varying preconditioners per application; other methods assume the same linear $M^{-1}$ throughout a solve.
+
+## Iteration state and results on stopping
+
+The 16 single-vector methods (this page's four and BiCG, CGS, QMR, TFQMR, LSQR, LSMR, LGMRES, GCROT, Richardson, Jacobi, Gauss–Seidel, and SOR on the [next page](../advanced-krylov-and-stationary/)) offer the same three forms, named in [Workspaces, execution contexts, and attempt records](oxref:linalg-execution-forms).
+For LSQR, LSMR, Jacobi, Gauss–Seidel, and SOR, omit preconditioner `preconditioning` below; supply $A$ as `AdjointOperator` for LSQR/LSMR or `StationaryMatrix` for stationary iterations.
+
+- Standard `solver.solve(&a, &b)` solves from $x_0 = 0$ without preconditioning and returns only the solution vector.
+  Unsuccessful solves give `ConvergenceFailure` (reason `NestedSolver`; diagnostics include solver name, iteration count, and residual).
+- With-options `solver.solve_with_options(&a, &b, preconditioning, x0)` accepts preconditioning and an initial guess (zero for `None`), returning `IterativeSolveResult` with solution, report, and residual history.
+  Limits, stagnation, and breakdown still return `Ok`.
+  Standard form equals applying `into_converged_solution()` to this result; this method turns cancellation/deadlines into `ExecutionStopped` and other unsuccessful results into `ConvergenceFailure` errors.
+- Caller-provided-output `solver.solve_into(&a, &b, preconditioning, x.view_mut(), &mut ws, cx)` reads $x$ as the initial guess, writes the result to $x$, and returns report `IterativeSolveReport`.
+
+Owning-result APIs (standard and with-options forms) prepare workspace on every call.
+Construct caller-provided-output workspace `IterativeWorkspace` with `solver.workspace(&IterativeWorkspaceRequest::operator(&a)?.with_preconditioner(preconditioning)?)`, or use `IterativeRequirements` returned by `workspace_requirements` to `try_reserve` in advance.
+Request `IterativeWorkspaceRequest` holds only operator shape and auxiliary lengths; construct with `adjoint(&a)` for BiCG/QMR or, for example, `matrix(StationaryMatrix::Csr(&a))` for stationary iterations.
+One workspace supports every iterative method, allocating nothing across repeated solves in the same family and shape.
+Passing `ExecutionContext` to `cx` makes a new solve root; passing parent `&mut SolveContext` makes a child charging operator/preconditioner evaluations against the parent's computation-count limit.
+Iteration limits use the smaller of constructor `Budget` and any iteration limit in `LinalgExecutionOptions` incorporated through `with_execution_options`.
+
+Determine success solely from termination reason `LinearSolveTermination` returned by report `termination()`; `is_success()` is true for these two reasons:
+
+- `Converged`: the true residual recomputed from the returned iterate satisfies $\lVert b - Ax \rVert_2 \le \tau_{\mathrm{abs}} + \tau_{\mathrm{rel}} \lVert b \rVert_2$ (replace $\lVert b \rVert_2$ by 1 when $b = 0$).
+  Tolerances are never relaxed to the rounding level.
+- `LeastSquaresConverged`: normal-equation residual $\lVert A^{\mathsf H} r \rVert_2$ meets the least-squares tolerance relative to $\lVert A \rVert \lVert r \rVert_2$ (unpreconditioned MINRES, LSQR, and LSMR only).
+
+Nonconverged reasons are `ConditionLimit` (MINRES, LSQR, or LSMR with `with_condition_limit` when the projected reciprocal-condition estimate falls below threshold), `IterationLimit`, `EvaluationLimit` (operator/preconditioner evaluation limit), `Stagnation` (the update leaves the iterate unchanged, or the best verified true residual is below the rounding floor described next and the verification either finds apparent recurrence convergence or no improvement of that best value), `Breakdown(LinearSolveBreakdown)`, and `ExecutionStopped(ExecutionStopReason)` (cancellation or deadline).
+Handbook cell outcomes show success as “satisfied,” limits/stagnation/stops as “partial” (the returned iterate is an estimate), and breakdown as “failed.”
+
+The rounding floor used for stagnation is shared by all methods:
+
+```text
+ε c (‖b‖₂ + ‖A (s∘x)‖₂),   c = 16 (real), 32 (complex)
+```
+
+Here $\varepsilon$ is machine epsilon, $x$ is the iterate with the smallest checked true residual, $s$ is a fixed sign sequence with entries $\pm 1$, and $s \circ x$ is componentwise multiplication.
+Rounding $x$ to working precision alone changes residuals by about $\varepsilon \lVert \lvert A \rvert \lvert x \rvert \rVert_2$; computing $b - Ax$ introduces comparable error.
+Near the solution, cancellation among the products $a_{ij}x_j$ makes $\lVert Ax \rVert_2$ small, so fixed-sign $\lVert A(s \circ x) \rVert_2$ is obtained with one product with $A$ as a substitute for $\lVert \lvert A \rvert \lvert x \rvert \rVert_2$; this product also counts as an evaluation.
+Measure the floor at the minimum-residual iterate rather than the latest iterate.
+Temporary growth of recurrence residuals can move the latest iterate far from the solution.
+CG and BiCGSTAB replace recurrence residuals with true residuals at 50-iteration checkpoints, removing accumulated rounding error and allowing recurrence recovery (Sleijpen and van der Vorst, 1996).
+Verifications still reducing residuals do not compare against the floor, so a pessimistic floor never stops a progressing solve.
+Methods checking true residuals every iteration compare with the floor only at 50-iteration checkpoints; GMRES methods check stagnation only at restart-cycle ends.
+This floor only tests stagnation and never changes convergence tolerances.
+
+Even without success, with-options and caller-provided-output APIs return `Ok` and the verified iterate, including the initial guess, with smallest true residual (the later one on a tie).
+Stopping before any true-residual check preserves the initial guess and gives report residual `None`.
+However, an evaluation limit reached before computing the initial residual gives an `ConvergenceFailure` (`EvaluationLimit`) error.
+Report `true_residual()` is the returned solution's true residual scaled by $\lVert b \rVert_2$; `trust()` classifies partial-result reliability (core's `PartialResultTrust`; see [Errors and partial results](../../../concepts/errors-and-partial-results/)), giving `ResidualChecked` for successful solves and `Admissible` otherwise.
+`krylov()` contains Krylov diagnostics `KrylovDiagnostics`.
+For MINRES, LSQR, and LSMR, `KrylovDiagnostics` holds all fields: normal residual `normal_residual()`, reciprocal-condition estimate `condition_estimate()`, direction loss `rank_loss_detected()`, and restart count `restarts()`; GMRES methods, BiCGSTAB, BiCG, CGS, QMR, and TFQMR populate only the latter two (`None` for CG and stationary iterations).
+
+Residual history recorded with `with_history(true)` starts with true initial residual $\lVert b - Ax_0 \rVert_2$ and adds one entry per completed iteration.
+Between checkpoints, values are recurrence residuals or projected estimates (TFQMR uses a quasi-minimal-residual upper bound); checkpoint, convergence, and final values are true residuals.
+For caller-provided-output APIs, workspace `last_attempt()` returns the latest attempt record (result classes `Succeeded`, `Stopped`, `Failed`, `PreflightRejected` and evaluation counts); `last_accepted()` returns the iterate, residual history, and `IterativeProgress`.
+See [Cancellation, stopping at limits, and reading accepted iterates](../../examples/accepted-state-and-cancellation/) for interpreting limit/cancellation stops.
+
+The following block defines helper functions shared by the two cells on this page.
+`termination_name` returns termination variant names; `severity` returns outcome ranks (success 0, limits/stagnation/stops 1, breakdown 2).
+`relative_difference` computes relative difference $\lVert x - y \rVert_\infty / \lVert y \rVert_\infty$ from a reference solution; `relative_history` turns residual history divided by $\lVert b \rVert_2$ into plot points.
+
+```rust
+//| id: linalg-krylov-termination-names
+//| kind: definitions
+//| title: "Helpers for iterative termination reasons, relative differences, and residual histories"
+//| crates: [scioxide-linalg]
+use scioxide_linalg::{LinearSolveBreakdown, LinearSolveTermination};
+
+/// Termination-reason variant name (used in table columns and outcome status).
+pub(crate) fn termination_name(termination: LinearSolveTermination) -> &'static str {
+    match termination {
+        LinearSolveTermination::Converged => "Converged",
+        LinearSolveTermination::LeastSquaresConverged => "LeastSquaresConverged",
+        LinearSolveTermination::ConditionLimit => "ConditionLimit",
+        LinearSolveTermination::IterationLimit => "IterationLimit",
+        LinearSolveTermination::EvaluationLimit => "EvaluationLimit",
+        LinearSolveTermination::Stagnation => "Stagnation",
+        LinearSolveTermination::Breakdown(cause) => match cause {
+            LinearSolveBreakdown::RecurrenceDenominator => "Breakdown(RecurrenceDenominator)",
+            LinearSolveBreakdown::NonPositiveCurvature => "Breakdown(NonPositiveCurvature)",
+            LinearSolveBreakdown::ArnoldiInvariant => "Breakdown(ArnoldiInvariant)",
+            LinearSolveBreakdown::Preconditioner => "Breakdown(Preconditioner)",
+        },
+        LinearSolveTermination::ExecutionStopped(_) => "ExecutionStopped",
+    }
+}
+
+/// Outcome rank: success 0, limit/stagnation/stop 1 (the returned iterate is an estimate), breakdown 2.
+pub(crate) fn severity(termination: LinearSolveTermination) -> u8 {
+    match termination {
+        t if t.is_success() => 0,
+        LinearSolveTermination::Breakdown(_) => 2,
+        _ => 1,
+    }
+}
+
+/// Relative maximum-norm difference from reference solution y: ‖x − y‖∞ / ‖y‖∞.
+pub(crate) fn relative_difference(x: &[f64], reference: &[f64]) -> f64 {
+    let scale = reference.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+    let gap = x
+        .iter()
+        .zip(reference)
+        .fold(0.0_f64, |acc, (p, q)| acc.max((p - q).abs()));
+    gap / scale
+}
+
+/// Residual-history points (k, ‖r_k‖₂/‖b‖₂). Omit zeros, which cannot appear on a logarithmic axis.
+pub(crate) fn relative_history(history: Option<&[f64]>, rhs_norm: f64) -> Vec<[f64; 2]> {
+    history
+        .unwrap_or(&[])
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| **r > 0.0)
+        .map(|(k, r)| [k as f64, r / rhs_norm])
+        .collect()
+}
+```
+
+## Comparing preconditioners for two-dimensional Poisson
+
+The following cell solves five-point Poisson equation $-\Delta u = 1$ on the unit square with $N \times N$ interior points ($4u_{ij} - u_{i\pm1,j} - u_{i,j\pm1} = h^2$, $h = 1/(N+1)$, boundary $u = 0$), using with-options CG without preconditioning, with Jacobi, and with IC(0).
+Relative tolerance is $10^{-10}$ and the iteration limit 5000.
+For the 12 solves at $N = 8, 16, 24, 32$, the table shows iterations, termination reasons, true relative residuals, and maximum-norm relative differences from sparse-LU direct solutions (`scioxide_sparse::solve`).
+The plot gives relative-residual history for selected $N$.
+The five-point condition number is $\kappa \approx 4/(\pi h)^2$, so unpreconditioned iteration counts should grow proportionally to $\sqrt{\kappa} \approx 2/(\pi h) \propto 1/h$, or $N$.
+
+```rust
+//| id: linalg-cg-poisson-history
+//| ref: linalg-cg-poisson-history
+//| title: "CG and preconditioning for the two-dimensional Poisson equation"
+//| run: button
+//| uses: [linalg-krylov-termination-names]
+//| crates: [scioxide-core, scioxide-linalg, scioxide-sparse]
+//| inputs:
+//|   grid: {"type":"range","label":"Grid N for the history plot","description":"Interior points per side. Unknown count is N².","min":8,"max":32,"step":8,"value":32}
+//| cases:
+//|   - {"id":"coarse-grid","label":"History for N = 8","description":"On coarse grids, IC(0) takes more iterations than no preconditioning.","inputs":{"grid":8}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"iterations","path":"/rows/9/3","range":{"min":60,"max":72}}
+//|       - {"artifact":"iterations","path":"/rows/9/4","equals":"Converged"}
+//|       - {"artifact":"iterations","path":"/rows/10/3","range":{"min":60,"max":72}}
+//|       - {"artifact":"iterations","path":"/rows/11/3","range":{"min":30,"max":38}}
+//|       - {"artifact":"iterations","path":"/rows/11/5","range":{"max":1e-10}}
+//|       - {"artifact":"iterations","path":"/rows/11/6","range":{"max":1e-7}}
+//|   - case: coarse-grid
+//|     expect:
+//|       - {"artifact":"iterations","path":"/rows/0/3","range":{"min":8,"max":12}}
+//|       - {"artifact":"iterations","path":"/rows/2/3","range":{"min":11,"max":15}}
+//|       - {"artifact":"iterations","path":"/rows/2/6","range":{"max":1e-7}}
+use scioxide_core::{Budget, ResidualTolerance};
+use scioxide_linalg::{CgSolver, IterativeSolveResult, Preconditioning, Vector};
+use scioxide_sparse::{
+    CsrMatrix, ExplicitZeroPolicy, IncompleteFactor, JacobiPreconditioner, sparse_diagonals,
+};
+
+// Five-point matrix. Unknown index k = iN + j (row-major); neighbors k ± 1 and k ± N.
+let poisson = |n: usize| -> Result<CsrMatrix<f64>, String> {
+    let size = n * n;
+    // ±1 entries crossing row ends (j = N − 1 to j = 0 of the next row) are zero (boundary u = 0).
+    let side: Vec<f64> = (1..size)
+        .map(|k| if k % n == 0 { 0.0 } else { -1.0 })
+        .collect();
+    let vertical = vec![-1.0; size - n];
+    let offsets = [0, 1, -1, n as isize, -(n as isize)];
+    let diagonals = [&vec![4.0; size][..], &side, &side, &vertical, &vertical];
+    let a = sparse_diagonals(size, size, &offsets, &diagonals).map_err(|e| e.to_string())?;
+    // Drop zero entries so IC(0) uses the five-point nonzero pattern.
+    a.view()
+        .to_csr(ExplicitZeroPolicy::Drop)
+        .map_err(|e| e.to_string())
+};
+let tolerance = ResidualTolerance::new(0.0, 1e-10).map_err(|e| e.to_string())?;
+let budget = Budget::try_from(5000).map_err(|e| e.to_string())?;
+let solver = CgSolver::new(tolerance, budget).with_history(true);
+let names = ["None", "Jacobi", "IC(0)"];
+// Do not store preconditioners in solvers; pass per-call references as inverse actions M⁻¹.
+let solve = |a: &CsrMatrix<f64>,
+             b: &Vector<f64>,
+             kind: usize|
+ -> Result<IterativeSolveResult<f64>, String> {
+    let result = match kind {
+        1 => {
+            let jacobi = JacobiPreconditioner::new(a).map_err(|e| e.to_string())?;
+            solver.solve_with_options(a, b, Preconditioning::Inverse(&jacobi), None)
+        }
+        2 => {
+            let ic0 = IncompleteFactor::ic0(a).map_err(|e| e.to_string())?;
+            solver.solve_with_options(a, b, Preconditioning::Inverse(&ic0), None)
+        }
+        _ => solver.solve_with_options(a, b, Preconditioning::None, None),
+    };
+    result.map_err(|e| e.to_string())
+};
+let mut rows: Vec<(usize, f64, &str, usize, &str, Option<f64>, f64)> = Vec::new();
+let mut series = Vec::new();
+for n in [8_usize, 16, 24, 32] {
+    let a = poisson(n)?;
+    let h = 1.0 / (n + 1) as f64;
+    let b = Vector::from_vec(vec![h * h; n * n]);
+    // Independent reference: direct solve by sparse LU.
+    let direct = scioxide_sparse::solve(&a, b.as_slice()).map_err(|e| e.to_string())?;
+    let root_kappa = 2.0 / (std::f64::consts::PI * h);
+    for (kind, &name) in names.iter().enumerate() {
+        let result = solve(&a, &b, kind)?;
+        let report = result.report();
+        let difference = relative_difference(result.solution().as_slice(), &direct);
+        let residual = report.true_residual().map(|r| r.scaled_norm());
+        let termination = termination_name(report.termination());
+        rows.push((
+            n,
+            root_kappa,
+            name,
+            report.iterations(),
+            termination,
+            residual,
+            difference,
+        ));
+        if n == grid.round() as usize {
+            // ‖b‖₂ = h² N.
+            let points = relative_history(result.history(), h * h * n as f64);
+            series.push(serde_json::json!({ "name": name, "points": points }));
+        }
+    }
+}
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let fixed1 = serde_json::json!({ "fractionDigits": 1 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Grid N", "type": "integer" },
+    { "key": "1", "label": "√κ estimate 2/(πh) [-]", "type": "number", "format": fixed1 },
+    { "key": "2", "label": "Preconditioner" },
+    { "key": "3", "label": "Iterations [count]", "type": "integer" },
+    { "key": "4", "label": "Termination reason" },
+    { "key": "5", "label": "True relative residual [-]", "type": "number", "format": sci2, "nullText": "-" },
+    { "key": "6", "label": "Relative difference from direct solution [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "iterations" })
+);
+emit_line_chart!(
+    &series,
+    options = &serde_json::json!({
+        "xLabel": "Iteration k [count]",
+        "yLabel": "Relative residual ‖r_k‖₂/‖b‖₂ [-]",
+        "yType": "log",
+        "annotations": [{ "kind": "line", "axis": "y", "value": 1e-10, "label": "Tolerance 1e-10" }]
+    })
+);
+```
+
+All 12 solves terminate with `Converged`.
+Unpreconditioned counts for $N = 8, 16, 24, 32$ are 10, 31, 49, and 66; from $N = 16$ onward they stay about three times the $\sqrt{\kappa}$ estimate $2/(\pi h)$ and grow proportionally to $1/h$.
+Every diagonal is 4, so Jacobi only scales $A$ by 1/4; counts and residual histories match no preconditioning.
+IC(0) takes 13, 20, 27, and 34 iterations, also growing with $N$ but at about 40% of the unpreconditioned rate (fewer iterations are needed without preconditioning at $N = 8$).
+All true relative residuals are at most $10^{-10}$; the largest relative difference from a direct solution is $3.6 \times 10^{-12}$.
+
+The unpreconditioned history at $N = 32$ decreases smoothly through the iteration-50 true-residual replacement, showing the recurrence was not restarted.
+Early relative residuals exceed 1 (up to 2.7 times initially without preconditioning at $N = 32$) because CG monotonically reduces error $A$-norm rather than residual 2-norm; growth remains within the CG section's factor $\sqrt{\kappa} \approx 21$.
+In the $N = 8$ history, IC(0) relative residuals decrease monotonically from the start.
+
+## Nonsymmetric problems and restarting
+
+The following cell solves a nonsymmetric 100-unknown tridiagonal system from centered differences for one-dimensional advection–diffusion $-u'' + \mathrm{Pe}\, u' = 1$ ($u(0) = u(1) = 0$), using with-options GMRES($m$), unrestarted GMRES(100), and BiCGSTAB.
+Relative tolerance is $10^{-10}$; input selects iteration limits (all cycles combined for GMRES).
+Grid Péclet number $\mathrm{Pe}\, h / 2$ above 1 removes diagonal dominance and strengthens nonnormality.
+The reference uses standard `TridiagonalLuDecomposition` (tridiagonal LU with adjacent-row partial pivoting, rejecting only zero pivots); maximum-norm relative difference independently checks iterates.
+The final table column shows what standard `solve(&a, &b)` would return for the same solve, obtained by applying `into_converged_solution()` to the with-options result.
+The plot shows relative-residual histories; the overall outcome is “satisfied” if all three succeed, “partial” if any stops at a limit, and “failed” if any breaks down.
+
+```rust
+//| id: linalg-gmres-convection
+//| ref: linalg-gmres-convection
+//| title: "GMRES(m) and BiCGSTAB for advection–diffusion"
+//| run: reactive
+//| uses: [linalg-krylov-termination-names]
+//| crates: [scioxide-core, scioxide-linalg]
+//| inputs:
+//|   peclet: {"type":"range","label":"Péclet number Pe [-]","description":"Advection strength. Grid Péclet number is Pe h / 2.","min":0,"max":200,"step":5,"value":20}
+//|   restart: {"type":"range","label":"Restart length m","description":"Number of Krylov basis vectors retained by GMRES(m).","min":2,"max":100,"step":1,"value":20}
+//|   iteration_limit: {"type":"range","label":"Iteration limit [iterations]","description":"Each solver's Budget; all cycles combined for GMRES.","min":50,"max":3000,"step":50,"value":3000}
+//| cases:
+//|   - {"id":"short-budget","label":"Limit 200 iterations","description":"GMRES(20) stops with IterationLimit and standard form returns an error.","inputs":{"iteration_limit":200}}
+//|   - {"id":"pure-diffusion","label":"Pe = 0","description":"For symmetric diffusion alone, GMRES(20) restarts greatly slow convergence.","inputs":{"peclet":0}}
+//|   - {"id":"strong-convection","label":"Pe = 200","description":"Near grid Péclet number 1, BiCGSTAB residuals rise to 10³¹ times the initial residual before decreasing, converging in 308 iterations, more than GMRES(20).","inputs":{"peclet":200}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"runs","path":"/rows/0/1","equals":"Converged"}
+//|       - {"artifact":"runs","path":"/rows/0/2","range":{"min":330,"max":400}}
+//|       - {"artifact":"runs","path":"/rows/1/2","range":{"min":95,"max":105}}
+//|       - {"artifact":"runs","path":"/rows/2/4","range":{"max":1e-7}}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+//|   - case: short-budget
+//|     expect:
+//|       - {"artifact":"runs","path":"/rows/0/1","equals":"IterationLimit"}
+//|       - {"artifact":"runs","path":"/rows/0/5","equals":"ConvergenceFailure"}
+//|       - {"artifact":"runs","path":"/rows/0/4","range":{"min":1e-6,"max":1e-2}}
+//|       - {"path":"/outputs/2/state","equals":"partial"}
+//|   - case: pure-diffusion
+//|     expect:
+//|       - {"artifact":"runs","path":"/rows/0/2","range":{"min":2000,"max":2900}}
+//|       - {"artifact":"runs","path":"/rows/1/4","range":{"max":1e-7}}
+//|   - case: strong-convection
+//|     expect:
+//|       - {"artifact":"runs","path":"/rows/0/1","equals":"Converged"}
+//|       - {"artifact":"runs","path":"/rows/0/4","range":{"max":1e-6}}
+//|       - {"artifact":"runs","path":"/rows/0/2","range":{"min":200,"max":260}}
+//|       - {"artifact":"runs","path":"/rows/2/1","equals":"Converged"}
+//|       - {"artifact":"runs","path":"/rows/2/2","range":{"min":250,"max":400}}
+//|       - {"artifact":"runs","path":"/rows/2/3","range":{"max":1e-10}}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+use scioxide_core::{Budget, SciOxideErrorKind, ResidualTolerance};
+use scioxide_linalg::{
+    BicgstabSolver, GmresSolver, IterativeSolveResult, LinearSolveTermination, Preconditioning,
+    StructuredOperation, TridiagonalLuDecomposition, TridiagonalMatrix, Vector,
+};
+
+let (n, h) = (100_usize, 1.0 / 101.0); // Grid spacing h = 1/(n + 1)
+// (−u_{i−1} + 2u_i − u_{i+1})/h² + Pe (u_{i+1} − u_{i−1})/(2h) = 1
+let lower = vec![-1.0 / (h * h) - peclet / (2.0 * h); n - 1];
+let upper = vec![-1.0 / (h * h) + peclet / (2.0 * h); n - 1];
+let matrix =
+    TridiagonalMatrix::new(lower, vec![2.0 / (h * h); n], upper).map_err(|e| e.to_string())?;
+// Owned tridiagonal matrices are not operators; pass their views as operators.
+let a = matrix.view();
+let b = Vector::from_vec(vec![1.0; n]);
+let reference = TridiagonalLuDecomposition::factor(&matrix)
+    .and_then(|lu| lu.solve(StructuredOperation::Normal, &b))
+    .map_err(|e| e.to_string())?;
+let tolerance = ResidualTolerance::new(0.0, 1e-10).map_err(|e| e.to_string())?;
+let budget = Budget::try_from(iteration_limit.round() as usize).map_err(|e| e.to_string())?;
+let m = restart.round() as usize;
+let gmres = |m: usize| -> Result<IterativeSolveResult<f64>, String> {
+    let restart = Budget::try_from(m).map_err(|e| e.to_string())?;
+    GmresSolver::new(tolerance, budget)
+        .with_history(true)
+        .with_restart(restart)
+        .solve_with_options(&a, &b, Preconditioning::None, None)
+        .map_err(|e| e.to_string())
+};
+let bicgstab = BicgstabSolver::new(tolerance, budget)
+    .with_history(true)
+    .solve_with_options(&a, &b, Preconditioning::None, None)
+    .map_err(|e| e.to_string())?;
+let runs = [
+    (format!("GMRES({m})"), gmres(m)?),
+    (format!("GMRES({n}) (no restart)"), gmres(n)?),
+    ("BiCGSTAB".to_string(), bicgstab),
+];
+let (mut rows, mut series) = (Vec::new(), Vec::new());
+for (name, result) in &runs {
+    let report = result.report();
+    let difference = relative_difference(result.solution().as_slice(), reference.as_slice());
+    // Standard solve(&a, &b) equals applying into_converged_solution() to the with-options result.
+    let plain = match result.clone().into_converged_solution() {
+        Ok(_) => "Returns solution",
+        Err(e) if e.kind() == SciOxideErrorKind::ConvergenceFailure => "ConvergenceFailure",
+        Err(e) => return Err(e.to_string()),
+    };
+    let residual = report.true_residual().map(|r| r.scaled_norm());
+    let termination = termination_name(report.termination());
+    rows.push((
+        name.clone(),
+        termination,
+        report.iterations(),
+        residual,
+        difference,
+        plain,
+    ));
+    // ‖b‖₂ = √n.
+    let points = relative_history(result.history(), (n as f64).sqrt());
+    series.push(serde_json::json!({ "name": name, "points": points }));
+}
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Solver" },
+    { "key": "1", "label": "Termination reason" },
+    { "key": "2", "label": "Iterations [count]", "type": "integer" },
+    { "key": "3", "label": "True relative residual [-]", "type": "number", "format": sci2, "nullText": "-" },
+    { "key": "4", "label": "Relative difference from reference [-]", "type": "number", "format": sci2 },
+    { "key": "5", "label": "Standard solve result" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "runs" })
+);
+emit_line_chart!(
+    &series,
+    options = &serde_json::json!({
+        "xLabel": "Iteration k [count]",
+        "yLabel": "Relative residual ‖r_k‖₂/‖b‖₂ [-]",
+        "yType": "log",
+        "annotations": [{ "kind": "line", "axis": "y", "value": 1e-10, "label": "Tolerance 1e-10" }]
+    })
+);
+// Use the worst termination reason for the outcome (earlier table row on a tie).
+let worst = runs
+    .iter()
+    .map(|(_, result)| result.report().termination())
+    .fold(LinearSolveTermination::Converged, |acc, t| {
+        if severity(t) > severity(acc) { t } else { acc }
+    });
+let outcome = match severity(worst) {
+    0 => Outcome::satisfied("All three solvers meet tolerance"),
+    1 => Outcome::partial("A solver stopped at an iteration limit or stagnation").explanation(
+        "Stopped solvers return the verified iterate with the smallest true residual; treat it as an estimate.",
+    ),
+    _ => Outcome::failed("A solver's recurrence broke down"),
+};
+let (first, last) = (runs[0].1.report(), runs[2].1.report());
+emit_outcome!(
+    outcome
+        .status(termination_name(worst))
+        .diagnostic("GMRES(m) iterations", first.iterations() as f64, None)
+        .diagnostic("BiCGSTAB iterations", last.iterations() as f64, None)
+        .diagnostic("Grid Péclet number Pe h/2", peclet * h / 2.0, None)
+);
+```
+
+With defaults $\mathrm{Pe} = 20$ (grid Péclet number 0.099) and $m = 20$, all three terminate with `Converged`; GMRES(20) takes 362 iterations and BiCGSTAB 105.
+Unrestarted GMRES(100) converges in 100 iterations, equal to dimension $n = 100$ and consistent with exact-arithmetic termination within $n$ iterations.
+GMRES(100)'s relative difference from reference is $1.3 \times 10^{-14}$, below the other two ($3.7 \times 10^{-11}$ and $3.1 \times 10^{-11}$), which stop near tolerance.
+Restarting discards Krylov bases, trading $O(mn)$ memory for more iterations; counts need not vary monotonically with $m$.
+For example, at $\mathrm{Pe} = 20$ with $m = 5, 10, 20, 30, 50$, counts are 486, 375, 362, 386, and 617; $m = 50$ is largest.
+
+At $\mathrm{Pe} = 0$ (symmetric diffusion only), unrestarted GMRES converges in 50 iterations and BiCGSTAB in 64, while GMRES(20) takes 2445.
+At $\mathrm{Pe} = 200$ (grid Péclet number 0.99), GMRES(20) converges in 230 iterations and BiCGSTAB in 308; the latter shows highly nonmonotonic progress.
+BiCGSTAB residuals rise from iteration 1, reaching $1.3 \times 10^{31}$ times the initial residual at iteration 68 before decreasing, first falling below the initial value at iteration 230.
+After the iteration-250 checkpoint they temporarily rise to $4.5 \times 10^{5}$ times the initial value before converging at iteration 308.
+Every verified true residual at checkpoints 50–200 also exceeds the initial residual, so the minimum-residual iterate remains initial guess $x = 0$.
+The stagnation rounding floor measured at this $x = 0$ stays at $16\varepsilon \lVert b \rVert_2$, far below best relative residual 1.
+Thus growth is not classified as `Stagnation`; solving continues to `Converged` with true relative residual $9.4 \times 10^{-11}$ (relative difference from reference $1.9 \times 10^{-11}$).
+Breakdown decisions are rounding-sensitive: native execution of the same $\mathrm{Pe} = 200$ with SIMD inner products stops BiCGSTAB at iteration 43, before the first checkpoint, with `Breakdown(RecurrenceDenominator)`, returning its only iterate whose true residual was checked, $x = 0$, and a “failed” outcome.
+
+Limiting to 200 iterations stops GMRES(20) with `IterationLimit`; the with-options form returns in `Ok` an iterate with true relative residual $2.7 \times 10^{-4}$ (reference relative difference $1.0 \times 10^{-4}$), yielding a “partial” outcome.
+Standard form converts this result to an `ConvergenceFailure` error and returns no iterate.
+
+---
+
+## Summary
+
+Krylov methods improve solutions through matrix–vector products; convergence depends on eigenvalue distributions and, for nonnormal matrices, eigenvector conditioning.
+CG $A$-norm error is bounded by $2((\sqrt\kappa-1)/(\sqrt\kappa+1))^k$ in exact arithmetic, suggesting iteration counts proportional to $\sqrt\kappa$; stopping residuals can be up to $\sqrt\kappa$ times larger.
+Choose CG for Hermitian positive-definite matrices, MINRES for Hermitian indefinite, and GMRES($m$) or BiCGSTAB for general matrices; balance restart length against memory for GMRES and account for BiCGSTAB's nonmonotonicity, including residual growth many orders above the initial value before convergence.
+Pass per-call preconditioner references as `Preconditioning` rather than storing them in solvers; clustering eigenvalues of $M^{-1}A$ reduces iterations, but Jacobi on constant diagonals has no effect and IC(0) may improve only by a constant factor.
+Use standard forms when nonconvergence should be an error; use with-options or caller-provided-output APIs to inspect stopped iterates and reports, checking termination reasons and true residuals even in `Ok`.
+
+## Further reading
+
+- [Biorthogonal methods, least-squares Krylov methods, and stationary iterations](../advanced-krylov-and-stationary/): check methods omitted here, such as QMR, LSQR, recycled Krylov methods, and SOR, and their uses.
+- [A rod with nonuniform conductivity and Jacobi-preconditioned CG](../../examples/preconditioned-cg/): check how Jacobi, ineffective for this page's Poisson example, improves conditioning in systems with nonuniform scales.
+- [Cancellation, stopping at limits, and reading accepted iterates](../../examples/accepted-state-and-cancellation/): use examples to check returned solutions and attempt records after limits or cancellation.

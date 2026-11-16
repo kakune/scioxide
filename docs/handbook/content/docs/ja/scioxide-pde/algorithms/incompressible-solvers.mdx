@@ -1,0 +1,334 @@
+---
+title: 非圧縮流れの鞍点系の解法
+description: Stokes の鞍点系のブロック LDU 前処理と GMRES、速度ブロックの逆の選び方、求解の作業領域、Navier–Stokes 方程式の保存形の Newton–Krylov 法と終了理由の読み方。
+sidebar:
+  order: 362
+references:
+  pde-saddle-preconditioner: "鞍点系のブロック前処理"
+  pde-incompressible-solve-calls: "求解の呼び方と作業領域"
+  pde-navier-stokes-newton: "navierstokes-方程式の-newton-法"
+---
+
+このページは[非圧縮流れの混合有限要素](../incompressible-flow/)で組み立てた鞍点系を解く方法を扱う。
+定常 Stokes 方程式はブロック前処理付きの GMRES で、定常 Navier–Stokes 方程式は Newton–Krylov 法で解く。
+どちらも同じ `StokesPlan` の空間、境界、圧力のゲージを共有する。
+セルでは格子を細かくしたときの GMRES と Newton 法の反復回数を数える。
+速度質量の鞍点系を使う時間発展は[非圧縮流れの時間発展](../incompressible-time-stepping/)で扱う。
+
+---
+
+## 鞍点系のブロック前処理
+
+[鞍点系](oxref:pde-incompressible-weak-form) $K=\begin{pmatrix}A&B^{\mathsf T}\\B&0\end{pmatrix}$ は対称だが不定値なので、正定値の行列を要求する共役勾配法は使えない。
+$K$ はブロック LDU 分解
+
+$$
+K=\begin{pmatrix}I&0\\BA^{-1}&I\end{pmatrix}\begin{pmatrix}A&0\\0&-S\end{pmatrix}\begin{pmatrix}I&A^{-1}B^{\mathsf T}\\0&I\end{pmatrix},\qquad S=BA^{-1}B^{\mathsf T}
+$$
+
+を持ち、$S$ を Schur 補元と呼ぶ。
+右辺 $(\mathbf{f},\mathbf{g})$ に対して、この分解の逆は次の三段で作用する。
+
+1. 速度の予測 $\mathbf{u}_0=A^{-1}\mathbf{f}$。
+2. 圧力 $\mathbf{p}=-S^{-1}(\mathbf{g}-B\mathbf{u}_0)$。
+3. 速度の修正 $\mathbf{u}=\mathbf{u}_0-A^{-1}B^{\mathsf T}\mathbf{p}$。
+
+$S$ は密行列なので、`IncompressiblePreconditioner` は $S$ を近似 $\hat S$ に置き換えた逆を前処理として使う。
+定常の粘性問題では $\hat S=M_p/\mu$（$M_p$ は P1 圧力の質量行列）とする。
+inf-sup 条件が一様に成り立つと $BA^{-1}B^{\mathsf T}$ と $M_p/\mu$ はスペクトル同値になり、前処理した系の固有値は $h$ に依らない区間に入る（Elman–Silvester–Wathen 2014）。
+したがって $A^{-1}$ を正確に作用させれば、GMRES の反復回数は格子を細かくしてもほぼ一定になる。
+閉じた成分のゲージの乗数は、$\hat S^{-1}w$ を準備のときに一度計算しておき、拡大した Schur 補元として正確に扱う。
+
+この逆は一般に不定値で、非対称にもなりうるので、正定値の前処理を要求する方法ではなく GMRES と組み合わせる。
+速度ブロック $A^{-1}$ の作り方は `IncompressibleVelocityInverse` で選ぶ。
+
+- `SparseCholesky`（既定）は結合した速度ブロックを疎 Cholesky 分解し、正確に解く。
+  因子の大きさは `IncompressiblePreconditionerOptions::with_factor_limits` の上限に従う。
+- `Amg` は成分ごとの速度ブロックに代数的多重格子（AMG）の周期を作用させる。
+  成分ごとの対角ブロックの逆が、Korn の不等式によって結合した $A$ の逆とスペクトル同値になることを使い、各成分の定数（並進）を AMG の近似零空間として与える。
+
+`IncompressiblePreconditionerOptions::new()` の既定は疎 Cholesky、前後 2 回の平滑化の AMG 周期、組み立てるブロックごとに 4,000,000 要素の上限である。
+`with_velocity`、`with_amg_setup`、`with_amg_cycle`、`with_amg_limits`、`with_factor_limits`、`with_max_entries` で変える。
+Plan の行列の要素数の見積もり（`entry_bound`）が上限を超えると、準備は `ResourceLimit` を返す。
+`IncompressiblePreconditioner::new(plan, saddle, options)` は逐次に、`build(…, scope)` は呼び出し側のコンテキストのエポックとして準備する。
+準備はメモリを確保し、適用は確保せず、失敗したときは出力を変えない。
+
+`IncompressibleSaddle` は近似する鞍点系を選ぶ。
+`Viscous` は上の定常 Stokes の系で、Navier–Stokes 方程式の Newton 修正の前処理にも凍結したまま使う。
+`VelocityMass` は、[時間発展](oxref:pde-incompressible-time)で加速度を求める速度質量の鞍点系 $\begin{pmatrix}M&B^{\mathsf T}\\B&0\end{pmatrix}$ である（$M$ は密度を掛けた P2 の質量行列）。
+このとき速度ブロックは $M$ の対角で、Schur 補元は $\hat S=B\,\mathrm{diag}(M)^{-1}B^{\mathsf T}$ を組み立てて AMG で近似する。
+定数の圧力モードは一時的に一つの頂点を固定して除き、ゲージの条件を正確に戻す。
+固定は前処理だけを変え、物理の作用素は変えない。
+
+## 求解の呼び方と作業領域
+
+`StokesPlan` は三つの呼び方を持つ。
+
+- `solve()` は既定の設定でゼロから解き、速度、圧力、ゲージの乗数を未知数の並びのまま `Vec` で返す。
+  成功しなかった終了はエラーになり、取り消しと期限は `ExecutionStopped`、それ以外は `ConvergenceFailure` である。
+- `solve_with_options(&options)` はゼロから解き、未完了の終了も含めて `IterativeSolveResult` を返す。
+  結果の `report()` の `is_success()` と `termination()` を読む。
+- `workspace(&options)` が作る `StokesWorkspace` を `solve_into(solution, &mut workspace, scope)` に渡すと、`solution` を初期推定として解き、同じ作業領域を次の求解に再利用する。
+  未完了の場合も含めて、終了理由は返す `IterativeSolveReport` で読む。
+  エラーのときは `solution` を変えない。
+
+`StokesWorkspace` は解法、前処理、Krylov 法のメモリ領域を持ち、`with_linear_solver` と `with_preconditioner` で以後の求解の解法と前処理を置き換える。
+注入する解法は非対称で不定値の系を受け付けるものにする。
+`linear()` は最後の試行を含む `IterativeWorkspace` を返す。
+
+`IncompressibleSolveOptions::new()` の既定は真の残差の許容誤差 $\sqrt{\varepsilon}$（絶対・相対）、GMRES(50) の反復 1,000 回、既定の前処理、既定の Newton–Krylov の設定である。
+`with_residual`、`with_iterations`、`with_restart`、`with_preconditioner`、`with_nonlinear` で変える。
+真の残差の許容誤差、反復の上限、再開の長さは、Stokes の鞍点系と[時間発展](oxref:pde-incompressible-time)の速度質量の鞍点系の求解に使う。
+Navier–Stokes 方程式の Newton 修正は `with_nonlinear` の `NewtonKrylovOptions` に従い、これらの値を使わない。
+相対の許容誤差は右辺のノルム $\|\mathbf{b}\|_2$ に対して測るので、格子の細分で解の差を調べるときは、代数誤差が離散化の差より小さくなるまで締める（[Stokes 駆動キャビティ](../../examples/stokes-cavity/)）。
+
+`IncompressibleOperator` は、主ブロックが粘性 $A$ か速度質量 $M$ の混合作用素を借用する型で、発散、ゲージ、Dirichlet の行は共通である。
+`StokesPlan::mass_system()` が速度質量の形を返し、`LinearOperator`・`AdjointOperator` として自前の解法に渡せる。
+`assemble_csr` は CSR を組み立て、`assembly_workspace` と `assemble_csr_into(output, workspace, scope)` は同じ構造の既存の CSR に確保なしで書き直す。
+
+## Navier–Stokes 方程式の Newton 法
+
+`NavierStokesPlan::new(stokes)` は、Stokes の Plan の空間、粘性、密度、荷重、ゲージをそのまま使い、移流項を保存形の弱形式
+
+$$
+c(u;v)=-\int_\Omega\rho\,(u\otimes u):\nabla v\,dx+\int_{\partial\Omega}\rho\,(u\cdot n)(u\cdot v)\,ds
+$$
+
+で加える。
+部分積分を戻すと $c(u;v)=\int_\Omega\rho\,\nabla\cdot(u\otimes u)\cdot v\,dx$ なので、自然条件は Stokes と同じ牽引力 $\sigma n$ のままである。
+Plan は実数だけを扱い、`ResidualOperator` として残差 $\mathbf{F}(\mathbf{x})=K\mathbf{x}-\mathbf{b}+\mathbf{c}(\mathbf{x})$ を、`JacobianOperator` として解析的なヤコビ行列の積を提供する。
+方向 $w$ の微分は $-\int\rho\,(w\otimes u+u\otimes w):\nabla v\,dx+\int\rho\left((w\cdot n)(u\cdot v)+(u\cdot n)(w\cdot v)\right)ds$ である。
+
+`solve_with_options(initial, &options)` は `scioxide-rootfind` の Newton–Krylov 法で解き、`NewtonKrylovResult` を返す。
+Newton 修正の線形方程式は GMRES で近似的に解き（既定では 1 回の修正あたり GMRES(30) を 200 反復まで）、凍結した `Viscous` の Stokes 前処理を毎回使う。
+Newton 法の反復の上限は既定で 100 回である。
+大域化（直線探索）、強制項、非線形の許容誤差、終了理由は[非線形の定常問題](oxref:pde-nonlinear-residual)と同じ `NewtonKrylovOptions` の仕様に従う。
+移流の強い流れでは凍結した Stokes 前処理が接線から離れるので、Reynolds 数に依らない収束は約束されない。
+Picard 反復（Oseen 線形化）は提供しないので、高い Reynolds 数では、小さい Reynolds 数の解を初期値にして Reynolds 数を段階的に上げる（継続法）。
+既定の残差の許容誤差は相対 $\sqrt{\varepsilon}$・絶対 0 で、相対は初期点の残差に対して測る。
+良い初期値から始めるときは、`with_residual_tolerance` で絶対の閾値も与えないと、`Stagnation` で止まることがある。
+
+`solve(initial)` は既定の設定で解き、成功しなかった終了を同じ分類のエラーとして返す。
+`workspace(&options)` が作る `NavierStokesWorkspace` を `solve_into(initial, &mut output, &mut workspace, scope)` に渡すと、Newton–Krylov のメモリ領域と前処理を再利用し、エラーのときは `output` を変えない。
+`with_linear_solver` は Newton 修正を注入した反復法で解き、その許容誤差は非線形の強制項の検査を満たすように選ぶ。
+固定した状態の接線を何度も使うときは、`linearization_workspace()` が作る `NavierStokesLinearizationWorkspace` に `linearize(point, &mut workspace, scope)` で接線を一度だけ評価し、CSR として借用する（[ヤコビ行列の三つの表現](oxref:pde-jacobian-modes)）。
+
+次の定義は全境界で Poiseuille 流の速度を与えた閉じた流路 $[0,2]\times[0,1]$ m の Plan を作る（$U=1$ m/s、$\rho=1$ kg/m³）。
+
+```rust
+//| id: pde-incompressible-closed-channel
+//| kind: definitions
+//| title: 閉じた流路の Stokes の Plan
+//| crates: [scioxide-pde, scioxide-spatial, scioxide-core]
+use scioxide_pde::{
+    BoundaryData, BoundaryKind, BoundaryPoint, IncompressibleOptions, SimplexFemGeometry,
+    StokesPlan, TaggedBoundaries,
+};
+use scioxide_spatial::{Point, TriangleMesh};
+
+/// Poiseuille 流の速度 u(y) = 4U y (H − y) / H² [m/s]（U = 1 m/s、H = 1 m）。
+pub(crate) fn poiseuille(y: f64) -> f64 {
+    4.0 * y * (1.0 - y)
+}
+
+/// 流路 [0, 2]×[0, 1] [m] を 2n × n の正方形に分け、対角線で三角形にした Stokes の Plan。
+/// 壁では u(y) = 0 なので、入口・出口・壁の速度を一つの Dirichlet 条件で与えられる。
+pub(crate) fn closed_channel(
+    cells: usize,
+    viscosity: f64,
+) -> Result<StokesPlan<f64, f64, 2>, String> {
+    let (nx, ny) = (2 * cells, cells);
+    let mut points = Vec::new();
+    for j in 0..=ny {
+        for i in 0..=nx {
+            let point = [2.0 * i as f64 / nx as f64, j as f64 / ny as f64];
+            points.push(Point::new(point).map_err(|e| e.to_string())?);
+        }
+    }
+    let mut triangles = Vec::new();
+    for j in 0..ny {
+        for i in 0..nx {
+            let a = j * (nx + 1) + i;
+            triangles.push([a, a + 1, a + nx + 2]);
+            triangles.push([a, a + nx + 2, a + nx + 1]);
+        }
+    }
+    let mesh = TriangleMesh::new(points, triangles).map_err(|e| e.to_string())?;
+    let data = BoundaryData::time_invariant(|p: BoundaryPoint<f64, 2>| {
+        Ok(if p.component == 0 {
+            poiseuille(p.point[1])
+        } else {
+            0.0
+        })
+    });
+    let boundaries = TaggedBoundaries::uniform(&mesh, 2, BoundaryKind::Dirichlet, data)
+        .map_err(|e| e.to_string())?;
+    StokesPlan::with_options(
+        mesh,
+        SimplexFemGeometry::Affine,
+        1.0,
+        viscosity,
+        &boundaries,
+        &|_| Ok([0.0; 2]),
+        IncompressibleOptions::new(),
+    )
+    .map_err(|e| e.to_string())
+}
+```
+
+次のセルは $n=2,4,8$ で同じ流れを解き、反復回数と Poiseuille 流との最大節点誤差を並べる。
+Stokes では GMRES の反復回数、Navier–Stokes では Newton の反復回数を数える。
+許容誤差は既定のままなので、節点誤差は代数誤差の大きさを示す。
+
+```rust
+//| id: pde-incompressible-iterations
+//| ref: pde-incompressible-iterations
+//| title: 格子を細かくしたときの GMRES と Newton 法の反復回数を数える
+//| run: button
+//| timeoutMs: 300000
+//| uses: [pde-incompressible-closed-channel]
+//| crates: [scioxide-pde, scioxide-spatial, scioxide-core, scioxide-linalg, scioxide-rootfind]
+//| inputs:
+//|   inverse: {"type":"select","label":"速度ブロックの逆作用","description":"粘性の速度ブロック A の逆を疎 Cholesky 分解か成分ごとの AMG で作る。","options":["疎 Cholesky","AMG"],"value":"疎 Cholesky"}
+//|   equation: {"type":"select","label":"方程式","description":"Navier–Stokes は Newton–Krylov 法で解き、凍結した Stokes の前処理を各 Newton 修正に使う。","options":["Stokes","Navier–Stokes"],"value":"Stokes"}
+//|   reynolds: {"type":"range","label":"Reynolds 数 Re = ρUH/μ [-]","description":"ρ = 1 kg/m³、U = 1 m/s、H = 1 m のまま粘性 μ = 1/Re Pa·s を変える。","min":1,"max":100,"step":1,"value":10}
+//| cases:
+//|   - {"id":"amg","label":"AMG の速度の逆作用","description":"AMG は A⁻¹ を近似するだけなので、GMRES の反復は 22、30、35 回とゆっくり増える。","inputs":{"inverse":"AMG"}}
+//|   - {"id":"navier-stokes","label":"Navier–Stokes, Re = 10","description":"Newton 法はどの格子でも 6 回で ResidualTolerance に達する。","inputs":{"equation":"Navier–Stokes"}}
+//|   - {"id":"navier-stokes-re100","label":"Navier–Stokes, Re = 100","description":"ゼロから始めると Newton 修正の GMRES が反復の上限で止まり、LinearFailure(IterationLimit) になる。","inputs":{"equation":"Navier–Stokes","reynolds":100}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"iterations","path":"/rows/2/1","equals":1276}
+//|       - {"artifact":"iterations","path":"/rows/2/2","range":{"min":8,"max":16}}
+//|       - {"artifact":"iterations","path":"/rows/2/3","range":{"min":0,"max":1e-6}}
+//|       - {"artifact":"iterations","path":"/rows/2/4","equals":"Converged"}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+//|   - case: amg
+//|     expect:
+//|       - {"artifact":"iterations","path":"/rows/2/2","range":{"min":20,"max":50}}
+//|       - {"artifact":"iterations","path":"/rows/2/4","equals":"Converged"}
+//|   - case: navier-stokes
+//|     expect:
+//|       - {"artifact":"iterations","path":"/rows/2/4","equals":"ResidualTolerance"}
+//|       - {"artifact":"iterations","path":"/rows/2/3","range":{"min":0,"max":1e-8}}
+//|   - case: navier-stokes-re100
+//|     expect:
+//|       - {"artifact":"iterations","path":"/rows/2/4","equals":"LinearFailure(IterationLimit)"}
+//|       - {"path":"/outputs/1/state","equals":"failed"}
+use scioxide_linalg::LinearSolveTermination;
+use scioxide_pde::{
+    IncompressiblePreconditionerOptions, IncompressibleSolveOptions,
+    IncompressibleVelocityInverse, NavierStokesPlan,
+};
+use scioxide_rootfind::RootTermination;
+
+let velocity = if inverse == "AMG" {
+    IncompressibleVelocityInverse::Amg
+} else {
+    IncompressibleVelocityInverse::SparseCholesky
+};
+let preconditioner = IncompressiblePreconditionerOptions::new().with_velocity(velocity);
+let options = IncompressibleSolveOptions::new().with_preconditioner(preconditioner);
+let mut rows = Vec::new();
+// 最初に成功しなかった格子の (終了理由, 破綻か)。上限による停止は partial、破綻は failed。
+let mut first_failure: Option<(String, bool)> = None;
+for cells in [2_usize, 4, 8] {
+    let plan = closed_channel(cells, 1.0 / reynolds)?;
+    let unknowns = plan.unknowns();
+    let (state, iterations, status, success, broken) = if equation == "Stokes" {
+        let result = plan
+            .solve_with_options(&options)
+            .map_err(|e| e.to_string())?;
+        let report = result.report();
+        let broken = matches!(report.termination(), LinearSolveTermination::Breakdown(_));
+        let status = format!("{:?}", report.termination());
+        let state = result.solution().as_slice().to_vec();
+        (
+            state,
+            report.iterations(),
+            status,
+            report.is_success(),
+            broken,
+        )
+    } else {
+        let flow = NavierStokesPlan::new(plan.clone());
+        let initial = vec![0.0; unknowns];
+        let result = flow
+            .solve_with_options(&initial, &options)
+            .map_err(|e| e.to_string())?;
+        let broken = matches!(
+            result.termination(),
+            RootTermination::LinearFailure(_)
+                | RootTermination::GlobalizationFailure
+                | RootTermination::NumericalFailure(_)
+        );
+        let status = result.termination().to_string();
+        let success = result.is_success();
+        (
+            result.point().to_vec(),
+            result.iterations(),
+            status,
+            success,
+            broken,
+        )
+    };
+    if !success && first_failure.is_none() {
+        first_failure = Some((status.clone(), broken));
+    }
+    let mut error = 0.0_f64;
+    for i in 0..plan.velocity_nodes() {
+        let y = plan.node_point(i).map_err(|e| e.to_string())?[1];
+        error = error.max((state[i] - poiseuille(y)).abs());
+    }
+    rows.push((cells, unknowns, iterations, error, status));
+}
+let last_status = rows[rows.len() - 1].4.clone();
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "n [-]", "type": "integer" },
+    { "key": "1", "label": "未知数 [-]", "type": "integer" },
+    { "key": "2", "label": "反復回数 [-]", "type": "integer" },
+    { "key": "3", "label": "速度の最大節点誤差 [m/s]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "終了理由" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "iterations" })
+);
+let outcome = match first_failure {
+    None => Outcome::satisfied("すべての格子で反復が許容誤差に達した").status(last_status),
+    Some((status, true)) => Outcome::failed("内側の線形の求解か大域化が破綻した格子がある")
+        .explanation("Reynolds 数を段階的に上げ、前の解を初期値にする。")
+        .status(status),
+    Some((status, false)) => Outcome::partial("上限で止まった格子がある").status(status),
+};
+emit_outcome!(outcome);
+```
+
+既定（疎 Cholesky、Stokes）では、未知数が 106 個から 1,276 個に増えても GMRES の反復は 8、12、12 回で、反復回数は格子にほとんど依らない。
+最大節点誤差は $n=8$ で $3.3\times10^{-8}$ m/s で、これは既定の許容誤差 $\sqrt{\varepsilon}$ で止めた代数誤差である。
+AMG にすると $A^{-1}$ が近似になるので、反復は 22、30、35 回とゆっくり増える。
+その代わり、AMG は大きな三次元の問題で疎 Cholesky の因子のフィルを避けられる。
+
+Navier–Stokes（$\mathrm{Re}=10$）では Newton 法がどの格子でも 6 回で `ResidualTolerance` に達し、誤差は $10^{-9}$ m/s 以下になる。
+Poiseuille 流は移流項が消える厳密解なので、Newton 法はこの解に収束する。
+$\mathrm{Re}=100$ でゼロから始めると、どの格子でも Newton 修正の GMRES が 200 反復の上限で止まる。
+このとき検算した線形残差が強制項の上限 $\eta_{\max}=0.9$ も満たさないので、Newton 法は止まり、終了理由は `LinearFailure(IterationLimit)` になる。
+このとき返される点は最後に受理した反復の点で、誤差は $n=8$ でも 0.023 m/s 残る。
+凍結した Stokes 前処理が移流の強い接線を近似できなくなったためで、継続法で初期値を近づけるか、`NavierStokesWorkspace::with_preconditioner` で接線に合った前処理を与える。
+
+## まとめ
+
+Stokes の鞍点系は不定値なので、ブロック LDU の逆を近似した前処理と GMRES で解く。
+速度ブロックを疎 Cholesky で正確に解き、Schur 補元を圧力の質量行列で近似すると、反復回数は格子に依らずほぼ一定になる。
+Navier–Stokes 方程式は保存形の残差と解析的な接線を Newton–Krylov 法に渡して解くが、凍結した Stokes 前処理は高い Reynolds 数で接線を近似できなくなるので、継続法で初期値を用意する。
+Navier–Stokes 方程式の解が失敗したときは、終了理由の列で上限による停止と内側の破綻を分けて読み、初期値か前処理を見直す。
+
+## 次に読むページ
+
+- [非圧縮流れの混合有限要素](../incompressible-flow/)：弱形式、inf-sup 条件、圧力のゲージを確かめる。
+- [非圧縮流れの時間発展](../incompressible-time-stepping/)：速度質量の鞍点系で加速度と圧力を求め、拘束速度の ODE を陽的な方法で進める。
+- [Stokes 駆動キャビティ](../../examples/stokes-cavity/)：許容誤差を締めた細分で、代数誤差と離散化誤差を分けて読む。
+- [非線形の定常問題](../nonlinear-steady-problems/)：Newton–Krylov 法の終了理由とヤコビ行列の表現を調べる。

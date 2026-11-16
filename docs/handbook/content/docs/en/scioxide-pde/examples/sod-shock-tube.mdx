@@ -1,0 +1,653 @@
+---
+title: "Sod shock tube"
+description: "Find exact ideal-gas Euler Riemann solutions (Sod, Lax, and Toro double rarefaction) by pressure-function root finding, and compare HLLC/HLLE/Rusanov MUSCL finite-volume solutions using density errors, wave positions, and conservation balances."
+sidebar:
+  order: 445
+references:
+  pde-sod-exact-solution: "exact-riemann-solution"
+  pde-sod-flux-comparison: "finite-volume-solutions-and-flux-comparison"
+---
+
+A shock tube separates gases of different pressure with a diaphragm and measures the flow after its removal.
+Removing the diaphragm sends a rarefaction into the high-pressure side and a shock into the low-pressure side, with the original gas interface (contact discontinuity) moving between them.
+Initial data used by Sod (1978) to compare numerical methods have an exact solution containing a rarefaction, contact discontinuity, and shock together, making them a standard Euler-solver test.
+This example computes the exact Riemann solution by pressure-function root finding and compares finite-volume solutions from `scioxide-pde` across fluxes and reconstructions.
+
+## Euler equations in a shock tube
+
+The one-dimensional ideal-gas Euler equations along tube axis $x$ are
+
+$$
+\partial_t \begin{bmatrix} \rho \\ \rho u \\ E \end{bmatrix}
++ \partial_x \begin{bmatrix} \rho u \\ \rho u^2 + p \\ u(E + p) \end{bmatrix} = 0,\qquad
+p = (\gamma - 1)\Bigl(E - \tfrac12 \rho u^2\Bigr)
+$$
+
+
+$\rho$ is density, $u$ velocity, $p$ pressure, $E$ total energy per unit volume, and $\gamma$ the ratio of specific heats.
+All quantities are dimensionless, taking tube length as 1 and left-gas density and pressure as references.
+Initial data are constant primitive variables $(\rho, u, p)$ on either side of the diaphragm at $x_0 = 0.5$; use these three sets.
+
+| Name | Left $(\rho, u, p)$ | Right $(\rho, u, p)$ | Final time $T$ |
+|---|---|---|---|
+| Sod | $(1, 0, 1)$ | $(0.125, 0, 0.1)$ | 0.2 |
+| Lax | $(0.445, 0.698, 3.528)$ | $(0.5, 0, 0.571)$ | 0.14 |
+| Toro double rarefaction | $(1, -2, 0.4)$ | $(1, 2, 0.4)$ | 0.15 |
+
+For every set, waves do not reach tube ends before the final time.
+
+The exact solution is a self-similar three-wave solution $w((x - x_0)/t)$ ([Conservation laws and numerical fluxes](oxref:pde-conservation-riemann)).
+Intermediate pressure $p^*$ is a root of the sum $f(p) = f_L(p) + f_R(p) + u_R - u_L$ of left and right wave functions; since $f$ is monotonically increasing, construct a bracket satisfying $f(10^{-12} \min(p_L, p_R)) < 0 < f(p_{\mathrm{hi}})$ and solve with Brent's method.
+$p_{\mathrm{hi}}$ starts at $\max(p_L, p_R)$ and doubles until $f > 0$.
+If $f(0) \ge 0$, a vacuum forms between two rarefactions, so reject sets with $f(10^{-12} \min(p_L, p_R)) \ge 0$ at the lower bracket endpoint.
+Intermediate velocity is $u^* = \tfrac12(u_L + u_R) + \tfrac12\bigl(f_R(p^*) - f_L(p^*)\bigr)$; densities on either side of the contact follow Rankine–Hugoniot conditions for shocks and isentropic relation $\rho^*_K = \rho_K (p^*/p_K)^{1/\gamma}$ for rarefactions.
+The right-moving shock speed is $S = u_R + c_R\sqrt{\frac{\gamma+1}{2\gamma}\frac{p^*}{p_R} + \frac{\gamma-1}{2\gamma}}$.
+
+The following definitions block shares this exact solution between two cells.
+Since `scioxide-pde` does not provide an exact Riemann solver, this block supplies reference values for checking.
+
+```rust
+//| id: pde-sod-exact-model
+//| kind: definitions
+//| title: "Exact ideal-gas Riemann solution (Toro, Chapter 4)"
+//| crates: [scioxide-core, scioxide-rootfind]
+use scioxide_core::{Interval, RealScalar};
+use scioxide_rootfind::{Brent, ScalarFn, ScalarRootOptions, ScalarRootSolver};
+
+/// Specific-heat ratio γ, left and right primitive states (ρ, u, p), diaphragm position x₀, final time T, and
+/// intermediate pressure p* and velocity u*, root-finding termination reason, and function evaluation count.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ExactRiemann {
+    pub(crate) gamma: f64,
+    pub(crate) left: [f64; 3],
+    pub(crate) right: [f64; 3],
+    pub(crate) diaphragm: f64,
+    pub(crate) end: f64,
+    pub(crate) pressure: f64,
+    pub(crate) velocity: f64,
+    pub(crate) status: String,
+    pub(crate) evaluations: usize,
+}
+
+/// Values passed by the exact-solution cell.
+#[derive(serde::Deserialize)]
+pub(crate) struct ExactExports {
+    pub(crate) solution: ExactRiemann,
+}
+
+/// Finite-volume computation result. values is the final state with (ρ, ρu, E) per cell;
+/// before gives initial totals, boundary_flux the outward exterior-face flux at the final state.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct FiniteVolumeRun {
+    pub(crate) values: Vec<f64>,
+    pub(crate) before: [f64; 3],
+    pub(crate) boundary_flux: [f64; 3],
+}
+
+/// Values passed by the finite-volume cell.
+#[derive(serde::Deserialize)]
+pub(crate) struct RunExports {
+    pub(crate) run: FiniteVolumeRun,
+}
+
+/// Wave function f_K(p). p > p_K is a shock (Rankine–Hugoniot); p ≤ p_K a rarefaction (isentropic).
+fn wave(g: f64, state: [f64; 3], p: f64) -> f64 {
+    let [rho, _, pk] = state;
+    if p > pk {
+        let a = 2.0 / ((g + 1.0) * rho);
+        let b = (g - 1.0) / (g + 1.0) * pk;
+        (p - pk) * RealScalar::sqrt(a / (p + b))
+    } else {
+        let c = RealScalar::sqrt(g * pk / rho);
+        2.0 * c / (g - 1.0) * (RealScalar::powf(p / pk, (g - 1.0) / (2.0 * g)) - 1.0)
+    }
+}
+
+impl ExactRiemann {
+    /// Find root p* of pressure function f(p) = f_L(p) + f_R(p) + u_R − u_L with Brent's method.
+    pub(crate) fn solve(
+        gamma: f64,
+        left: [f64; 3],
+        right: [f64; 3],
+        diaphragm: f64,
+        end: f64,
+    ) -> Result<Self, String> {
+        let f = |p: f64| wave(gamma, left, p) + wave(gamma, right, p) + right[1] - left[1];
+        let lower = 1e-12 * RealScalar::min(left[2], right[2]);
+        if f(lower) >= 0.0 {
+            return Err("This state pair produces a vacuum".into());
+        }
+        let mut upper = RealScalar::max(left[2], right[2]);
+        while f(upper) <= 0.0 {
+            upper *= 2.0;
+        }
+        let bracket = Interval::new(lower, upper).map_err(|e| e.to_string())?;
+        let function = ScalarFn::new(|p: f64| Ok(f(p)));
+        let root = Brent
+            .solve(&function, bracket, &ScalarRootOptions::default())
+            .map_err(|e| e.to_string())?;
+        if !root.termination().is_success() {
+            return Err(format!("Root finding for p* stopped with {}", root.termination()));
+        }
+        let p = root.point();
+        let velocity =
+            0.5 * (left[1] + right[1]) + 0.5 * (wave(gamma, right, p) - wave(gamma, left, p));
+        let evaluations = root
+            .counts()
+            .provider(scioxide_core::EvaluationRole::Function);
+        let status = root.termination().to_string();
+        Ok(Self {
+            gamma,
+            left,
+            right,
+            diaphragm,
+            end,
+            pressure: p,
+            velocity,
+            status,
+            evaluations,
+        })
+    }
+
+    /// Right-moving shock speed. None if the right wave is a rarefaction.
+    pub(crate) fn right_shock_speed(&self) -> Option<f64> {
+        let (g, [rho, u, p]) = (self.gamma, self.right);
+        let c = RealScalar::sqrt(g * p / rho);
+        let ratio = self.pressure / p;
+        (ratio > 1.0).then(|| {
+            u + c * RealScalar::sqrt((g + 1.0) / (2.0 * g) * ratio + (g - 1.0) / (2.0 * g))
+        })
+    }
+
+    /// Densities (ρ*_L, ρ*_R) on either side of the contact.
+    pub(crate) fn star_densities(&self) -> (f64, f64) {
+        let left = self.sample(self.velocity - 1e-12);
+        let right = self.sample(self.velocity + 1e-12);
+        (left[0], right[0])
+    }
+
+    /// (ρ, u, p) at ξ = (x − x₀)/T. Use the same formulas on the right by reflection x → −x.
+    pub(crate) fn sample(&self, xi: f64) -> [f64; 3] {
+        let (g, p) = (self.gamma, self.pressure);
+        let sign = if xi <= self.velocity { 1.0 } else { -1.0 };
+        let [rho, uk, pk] = if sign > 0.0 { self.left } else { self.right };
+        let (xi, uk, us) = (sign * xi, sign * uk, sign * self.velocity);
+        let c = RealScalar::sqrt(g * pk / rho);
+        let w = if p > pk {
+            let s =
+                uk - c * RealScalar::sqrt((g + 1.0) / (2.0 * g) * p / pk + (g - 1.0) / (2.0 * g));
+            let m = (g - 1.0) / (g + 1.0);
+            if xi <= s {
+                [rho, uk, pk]
+            } else {
+                [rho * (p / pk + m) / (m * p / pk + 1.0), us, p]
+            }
+        } else if xi <= uk - c {
+            [rho, uk, pk]
+        } else if xi >= us - c * RealScalar::powf(p / pk, (g - 1.0) / (2.0 * g)) {
+            [rho * RealScalar::powf(p / pk, 1.0 / g), us, p]
+        } else {
+            // Inside a rarefaction: from Riemann invariants and characteristic slope ξ = u − c.
+            let cf = 2.0 / (g + 1.0) * (c + 0.5 * (g - 1.0) * (uk - xi));
+            let uf = 2.0 / (g + 1.0) * (c + 0.5 * (g - 1.0) * uk + xi);
+            let ratio = cf / c;
+            [
+                rho * RealScalar::powf(ratio, 2.0 / (g - 1.0)),
+                uf,
+                pk * RealScalar::powf(ratio, 2.0 * g / (g - 1.0)),
+            ]
+        };
+        [w[0], sign * w[1], w[2]]
+    }
+
+    /// Conserved quantities (ρ, ρu, E) at position x and time T.
+    pub(crate) fn conserved_at(&self, x: f64) -> [f64; 3] {
+        let [rho, u, p] = self.sample((x - self.diaphragm) / self.end);
+        [rho, rho * u, p / (self.gamma - 1.0) + 0.5 * rho * u * u]
+    }
+}
+```
+
+## Exact Riemann solution
+
+The next cell selects initial data and specific-heat ratio $\gamma$, tabulates intermediate states and right shock speed, and plots exact density, velocity, and pressure at time $T$.
+Pass the computed solution to the next cell.
+
+```rust
+//| id: pde-sod-exact
+//| ref: pde-sod-exact
+//| title: "Find shock-tube intermediate states by pressure-function root finding and plot the exact solution"
+//| run: reactive
+//| uses: [pde-sod-exact-model]
+//| crates: [scioxide-core, scioxide-rootfind]
+//| exports: [solution]
+//| inputs:
+//|   problem: {"type":"select","label":"Initial data","options":["Sod","Lax","Toro double rarefaction"],"value":"Sod"}
+//|   gamma: {"type":"range","label":"Specific-heat ratio γ [-]","description":"1.4 for diatomic gases, 5/3 for monatomic gases.","min":1.2,"max":1.7,"step":0.05,"value":1.4}
+//| cases:
+//|   - {"id":"lax","label":"Lax problem","description":"The left gas moves right with a large pressure ratio. p* and u* exceed Sod values.","inputs":{"problem":"Lax"}}
+//|   - {"id":"double-rarefaction","label":"Toro double rarefaction","description":"The two sides move apart. A low-pressure region at pressure 0.0019 forms between two rarefactions.","inputs":{"problem":"Toro double rarefaction"}}
+//|   - {"id":"monatomic","label":"Sod, γ = 1.65","description":"Moving the specific-heat ratio toward a monatomic gas changes p* and u*.","inputs":{"gamma":1.65}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"star","path":"/rows/0/0","approx":{"value":0.30313017805,"rtol":1e-9}}
+//|       - {"artifact":"star","path":"/rows/0/1","approx":{"value":0.92745262005,"rtol":1e-9}}
+//|       - {"artifact":"star","path":"/rows/0/2","approx":{"value":0.42631942818,"rtol":1e-9}}
+//|       - {"artifact":"star","path":"/rows/0/3","approx":{"value":0.26557371171,"rtol":1e-9}}
+//|       - {"artifact":"star","path":"/rows/0/4","approx":{"value":1.75215573203,"rtol":1e-9}}
+//|   - case: lax
+//|     expect:
+//|       - {"artifact":"star","path":"/rows/0/0","approx":{"value":2.46609791921,"rtol":1e-8}}
+//|       - {"artifact":"star","path":"/rows/0/1","approx":{"value":1.52872302663,"rtol":1e-8}}
+//|   - case: double-rarefaction
+//|     expect:
+//|       - {"artifact":"star","path":"/rows/0/0","approx":{"value":0.00189387342,"rtol":1e-7}}
+//|       - {"artifact":"star","path":"/rows/0/1","approx":{"value":0,"atol":1e-12}}
+//|       - {"artifact":"star","path":"/rows/0/4","equals":null}
+//|   - case: monatomic
+//|     expect:
+//|       - {"artifact":"star","path":"/rows/0/0","approx":{"value":0.29443053525,"rtol":1e-8}}
+let digits6 = serde_json::json!({ "significantDigits": 6 });
+let (left, right, end) = match problem.as_str() {
+    "Sod" => ([1.0, 0.0, 1.0], [0.125, 0.0, 0.1], 0.2),
+    "Lax" => ([0.445, 0.698, 3.528], [0.5, 0.0, 0.571], 0.14),
+    _ => ([1.0, -2.0, 0.4], [1.0, 2.0, 0.4], 0.15),
+};
+let exact = ExactRiemann::solve(gamma, left, right, 0.5, end)?;
+let (rho_left, rho_right) = exact.star_densities();
+let columns = serde_json::json!([
+    { "key": "0", "label": "p* [-]", "type": "number", "format": digits6 },
+    { "key": "1", "label": "u* [-]", "type": "number", "format": digits6 },
+    { "key": "2", "label": "ρ*_L [-]", "type": "number", "format": digits6 },
+    { "key": "3", "label": "ρ*_R [-]", "type": "number", "format": digits6 },
+    { "key": "4", "label": "Right shock speed [-]", "type": "number", "format": digits6, "nullText": "Rarefaction" },
+    { "key": "5", "label": "Root-finding termination reason" },
+    { "key": "6", "label": "Function evaluations [count]", "type": "integer" }
+]);
+let row = (
+    exact.pressure,
+    exact.velocity,
+    rho_left,
+    rho_right,
+    exact.right_shock_speed(),
+    exact.status.clone(),
+    exact.evaluations,
+);
+emit_table_with_columns!(
+    columns,
+    vec![row],
+    metadata = serde_json::json!({ "id": "star" })
+);
+// Plot the exact solution at 801 points (reference curves).
+let profile = |k: usize| {
+    let x = k as f64 / 800.0;
+    let w = exact.sample((x - 0.5) / end);
+    (x, w)
+};
+let series: Vec<serde_json::Value> = ["Density ρ", "Velocity u", "Pressure p"]
+    .iter()
+    .enumerate()
+    .map(|(j, name)| {
+        let points: Vec<[f64; 2]> = (0..=800)
+            .map(|k| profile(k))
+            .map(|(x, w)| [x, w[j]])
+            .collect();
+        serde_json::json!({ "name": name, "points": points, "style": { "showSymbol": false } })
+    })
+    .collect();
+emit_line_chart!(
+    &series,
+    options = &serde_json::json!({
+        "xLabel": "Position x [-]",
+        "yLabel": "ρ, u, p (dimensionless) [-]",
+        "link": { "group": "sod-position" }
+    })
+);
+export!(solution, &exact);
+```
+
+For Sod data ($\gamma = 1.4$), Brent reaches `BracketTolerance` in 11 evaluations, giving $p^* = 0.303130$ and $u^* = 0.927453$.
+These agree to displayed digits with $p^* = 0.30313$ and $u^* = 0.92745$ for test problem 1 in Chapter 4 of Toro (2009).
+Contact-side densities are $\rho^*_L = 0.426319$ and $\rho^*_R = 0.265574$; right shock speed is $1.752156$, placing the shock at $x = 0.5 + 0.2 \times 1.752156 = 0.85043$ at time 0.2.
+The left rarefaction extends from $\xi = u_L - c_L = -1.1832$ to $\xi = u^* - c^*_L = -0.0703$.
+For double-rarefaction data, $p^* = 0.0018939$ and $u^* = 0$; density between rarefactions falls to $0.02185$, with no shock.
+Setting $\gamma = 1.65$ changes the results to $p^* = 0.294431$ and $u^* = 0.845930$ despite unchanged initial pressure and density.
+
+## Finite-volume solutions and flux comparison
+
+The next cell receives the preceding solution and solves the same initial data to $T$ using `StructuredConservationPlan` with $N$ cells over $[0, 1]$ (both ends `Transmissive`) and `IdealGasEuler`.
+Inputs are numerical flux (`Hllc`, `Hlle`, `Rusanov`), reconstruction, and cell count.
+Time integration uses `Heun`, matching each step to its CFL limit.
+The table shows ODE termination reason, accepted/rejected counts, and `ConservationReport` values at the final state, which is passed to the next cell.
+With 800 cells, a debug Wasm build takes about 9 seconds, so run by button and reuse results for identical inputs.
+
+```rust
+//| id: pde-sod-finite-volume
+//| ref: pde-sod-finite-volume
+//| title: "Solve the shock tube with finite volumes and compare flux-dependent errors with the exact solution"
+//| run: button
+//| cache: inputs
+//| exports: [run]
+//| uses: [pde-sod-exact-model]
+//| crates: [scioxide-core, scioxide-linalg, scioxide-ode, scioxide-pde, scioxide-rootfind, scioxide-spatial]
+//| dependsOn:
+//|   exact: {cell: pde-sod-exact, type: ExactExports}
+//| inputs:
+//|   flux: {"type":"select","label":"Numerical flux","options":["HLLC","HLLE","Rusanov"],"value":"HLLC"}
+//|   reconstruction: {"type":"select","label":"Reconstruction","options":["Constant","minmod","MC"],"value":"MC"}
+//|   cells: {"type":"select","label":"Cell count N","options":["100","200","400","800"],"value":"200"}
+//| timeoutMs: 30000
+//| cases:
+//|   - {"id":"hlle","label":"HLLE","description":"Switch to HLLE flux. The next cell shows the contact spread across 5 cells.","inputs":{"flux":"HLLE"}}
+//|   - {"id":"constant","label":"Constant reconstruction","description":"Switch to first order. The next cell shows the contact spread across 17 cells.","inputs":{"reconstruction":"Constant"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"steps","path":"/rows/0/0","equals":"ReachedEnd"}
+//|       - {"artifact":"steps","path":"/rows/0/1","equals":390}
+//|       - {"artifact":"steps","path":"/rows/0/2","equals":0}
+//|       - {"artifact":"steps","path":"/rows/0/4","equals":0}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+//|   - case: hlle
+//|     expect:
+//|       - {"artifact":"steps","path":"/rows/0/1","equals":389}
+//|   - case: constant
+//|     expect:
+//|       - {"artifact":"steps","path":"/rows/0/1","equals":381}
+use scioxide_core::{ExecutionContext, SciOxideError};
+use scioxide_linalg::Vector;
+use scioxide_ode::{Heun, OdeMethod, OdeOptions, OdeProblem, OdeSolveReport, OdeState};
+use scioxide_pde::StructuredConservationPlan;
+use scioxide_pde::{ConservationBoundary, ConservationOptions, ConservationReconstruction};
+use scioxide_pde::{ConservationReport, Hllc, Hlle, IdealGasEuler, NumericalFlux, Rusanov};
+use scioxide_spatial::SegmentMesh;
+use scioxide_spatial::{AxisSide, AxisTopology, BoundarySet, CellField, CoordinateAxis, Grid1d};
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let solution = exact.solution;
+let n: usize = cells.parse().map_err(|_| "Invalid cell count")?;
+let h = 1.0 / n as f64;
+let reconstruction = match reconstruction.as_str() {
+    "Constant" => ConservationReconstruction::Constant,
+    "minmod" => ConservationReconstruction::Minmod,
+    _ => ConservationReconstruction::MonotonizedCentral,
+};
+let gas = IdealGasEuler::new(solution.gamma).map_err(|e| e.to_string())?;
+let axis = CoordinateAxis::uniform(0.0, 1.0, n + 1).map_err(|e| e.to_string())?;
+let grid = Grid1d::new([axis], [AxisTopology::Bounded]).map_err(|e| e.to_string())?;
+let mesh = SegmentMesh::new(grid).map_err(|e| e.to_string())?;
+let start = BoundarySet::axis_side(&mesh, 0, AxisSide::Start).map_err(|e| e.to_string())?;
+let finish = BoundarySet::axis_side(&mesh, 0, AxisSide::End).map_err(|e| e.to_string())?;
+let conditions = vec![
+    (start, ConservationBoundary::Transmissive),
+    (finish, ConservationBoundary::Transmissive),
+];
+let options = ConservationOptions::new().with_reconstruction(reconstruction);
+let plan = StructuredConservationPlan::with_options(mesh, conditions, options)
+    .map_err(|e| e.to_string())?;
+let values = plan
+    .centers()
+    .iter()
+    .map(|x| {
+        let [rho, u, p] = if x[0] < solution.diaphragm {
+            solution.left
+        } else {
+            solution.right
+        };
+        gas.conserved(rho, [u], p)
+    })
+    .collect::<Result<Vec<[f64; 3]>, _>>()
+    .map_err(|e| e.to_string())?;
+let initial = CellField::new(plan.mesh(), values).map_err(|e| e.to_string())?;
+let totals = |u: &[f64]| -> [f64; 3] {
+    core::array::from_fn(|j| u.as_chunks::<3>().0.iter().map(|c| c[j] * h).sum())
+};
+let vector = plan
+    .initial_state(&gas, initial.view())
+    .map_err(|e| e.to_string())?;
+let before = totals(vector.as_slice());
+// Construct a system for each flux type, advance with Heun, and return final state and report.
+fn run<F: NumericalFlux<f64, IdealGasEuler<f64>, 1, 3>>(
+    plan: &StructuredConservationPlan<f64, 1, 3>,
+    gas: &IdealGasEuler<f64>,
+    flux: &F,
+    initial: &Vector<f64>,
+    end: f64,
+) -> Result<(Vec<f64>, OdeSolveReport<f64>, ConservationReport<f64, 3>), SciOxideError> {
+    let mut workspace = plan.workspace()?;
+    let system = plan.bind(gas, flux, &mut workspace)?;
+    let problem = OdeProblem::new(&system, end);
+    // Give fixed-step Heun a large initial step so each step reaches the CFL limit.
+    let options = OdeOptions::new().with_initial_step(1.0);
+    let mut state = OdeState::new(0.0, initial.clone());
+    let method = Heun::new();
+    let mut ode_workspace = method.workspace(&problem, &options)?;
+    let execution = ExecutionContext::sequential();
+    let solve = method.advance(
+        &problem,
+        &options,
+        &mut state,
+        &mut (),
+        &mut ode_workspace,
+        execution,
+    )?;
+    let report = system.report(state.time(), state.values(), execution)?;
+    Ok((state.values().to_vec(), solve, report))
+}
+let (values, solve, report) = match flux.as_str() {
+    "HLLC" => run(&plan, &gas, &Hllc, &vector, solution.end),
+    "HLLE" => run(&plan, &gas, &Hlle, &vector, solution.end),
+    _ => run(&plan, &gas, &Rusanov, &vector, solution.end),
+}
+.map_err(|e| e.to_string())?;
+let status = solve
+    .termination()
+    .map_or("None".to_string(), |t| t.to_string());
+let columns = serde_json::json!([
+    { "key": "0", "label": "Termination reason" },
+    { "key": "1", "label": "Accepted steps [count]", "type": "integer" },
+    { "key": "2", "label": "Rejected [count]", "type": "integer" },
+    { "key": "3", "label": "Final Δt_max [-]", "type": "number", "format": sci3, "nullText": "None" },
+    { "key": "4", "label": "Faces switched to HLLE [count]", "type": "integer" }
+]);
+let row = (
+    status.clone(),
+    solve.accepted_steps(),
+    solve.rejected_steps(),
+    report.maximum_step(),
+    report.hlle_fallback_faces(),
+);
+emit_table_with_columns!(
+    columns,
+    vec![row],
+    metadata = serde_json::json!({ "id": "steps" })
+);
+let run = FiniteVolumeRun {
+    values,
+    before,
+    boundary_flux: report.boundary_flux(),
+};
+export!(run, &run);
+let outcome = if solve.is_success() {
+    Outcome::satisfied("Reached the final time")
+        .explanation("This judges the ODE termination reason; read accuracy from L¹ error against the exact solution in the next cell.")
+} else {
+    Outcome::partial("Stopped before the final time").explanation("Shows the last accepted state.")
+};
+emit_outcome!(
+    outcome
+        .status(status)
+        .diagnostic("Accepted steps", solve.accepted_steps() as f64, None)
+        .diagnostic("Rejected", solve.rejected_steps() as f64, None)
+);
+```
+
+With defaults (`Hllc`, MC, $N = 200$), 390 steps are accepted without rejection, reaching the final time with `ReachedEnd`.
+No faces switched to HLLE at the final state.
+
+The next cell compares this computation's final state with the exact solution.
+Table quantities are as follows.
+
+- $L^1$ error: $\sum_i h|\bar u_i - \bar u_i^{\mathrm{exact}}|$ for each conserved quantity $(\rho, \rho u, E)$.
+  Exact cell averages are reference values averaging the exact solution at midpoints of 16 equal subintervals per cell.
+- Contact width: number of cells within $\pm 0.1$ of the contact where density lies between 10% and 90% of the jump from $\rho^*_R$ to $\rho^*_L$.
+- Shock position: linearly interpolated first position, viewed from the right end, where density exceeds $(\rho^*_R + \rho_R)/2$.
+- Conservation residual: maximum of $|Q_j(T) - Q_j(0) + T\,F_j|$ over three components.
+  $Q_j$ is total quantity; $F_j$ is final-state `boundary_flux`, constant while end states retain their initial values.
+
+The plot shows density cell averages and the exact solution (dashed); vertical lines mark exact contact and shock positions.
+The horizontal axis links to the exact-solution cell's graph.
+
+```rust
+//| id: pde-sod-error-analysis
+//| ref: pde-sod-error-analysis
+//| title: "Compare numerical and exact shock-tube solutions, measuring errors, contact width, and conservation balances"
+//| run: reactive
+//| uses: [pde-sod-exact-model]
+//| crates: [scioxide-core, scioxide-rootfind]
+//| dependsOn:
+//|   exact: {cell: pde-sod-exact, type: ExactExports}
+//|   computed: {cell: pde-sod-finite-volume, type: RunExports}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"errors","path":"/rows/0/0","approx":{"value":0.0030196455,"rtol":1e-5}}
+//|       - {"artifact":"errors","path":"/rows/0/3","equals":4}
+//|       - {"artifact":"errors","path":"/rows/0/4","approx":{"value":0.85119,"atol":2e-4}}
+//|       - {"artifact":"errors","path":"/rows/0/5","approx":{"value":0.8504311464,"rtol":1e-9}}
+//|       - {"artifact":"errors","path":"/rows/0/6","range":{"max":1e-13}}
+use scioxide_core::{NumericScalar, RealScalar};
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed4 = serde_json::json!({ "fractionDigits": 4 });
+let (solution, run) = (exact.solution, computed.run);
+let cells = run.values.as_chunks::<3>().0;
+let h = 1.0 / cells.len() as f64;
+let centers: Vec<f64> = (0..cells.len()).map(|i| (i as f64 + 0.5) * h).collect();
+// Reference exact cell averages: average exact conserved quantities at midpoints of 16 equal subintervals per cell.
+let mut errors = [0.0; 3];
+for (i, cell) in cells.iter().enumerate() {
+    for j in 0..3 {
+        let average = (0..16)
+            .map(|k| solution.conserved_at((i as f64 + (k as f64 + 0.5) / 16.0) * h)[j])
+            .sum::<f64>()
+            / 16.0;
+        errors[j] += h * NumericScalar::abs(cell[j] - average);
+    }
+}
+// Conservation balance: total-quantity change + T × outward exterior-face flux (constant while end states retain initial values).
+let balance = (0..3)
+    .map(|j| {
+        let after: f64 = cells.iter().map(|c| c[j] * h).sum();
+        NumericScalar::abs(after - run.before[j] + solution.end * run.boundary_flux[j])
+    })
+    .fold(0.0, f64::max);
+// Contact width: cells within ±0.1 of the contact whose density lies between 10% and 90% of the intermediate-state jump.
+let (rho_left, rho_right) = solution.star_densities();
+let contact = solution.diaphragm + solution.velocity * solution.end;
+let jump = rho_left - rho_right;
+let (a, b) = (rho_right + 0.1 * jump, rho_right + 0.9 * jump);
+let (lo, hi) = (RealScalar::min(a, b), RealScalar::max(a, b));
+let width = (NumericScalar::abs(jump) > 1e-6).then(|| {
+    centers
+        .iter()
+        .zip(cells)
+        .filter(|(x, c)| NumericScalar::abs(**x - contact) < 0.1 && c[0] > lo && c[0] < hi)
+        .count()
+});
+// Shock position: first crossing of density (ρ*_R + ρ_R)/2 viewed from the right (linear interpolation).
+let shock = solution
+    .right_shock_speed()
+    .map(|s| solution.diaphragm + s * solution.end);
+let level = 0.5 * (rho_right + solution.right[0]);
+let crossing = shock.and_then(|_| {
+    (1..cells.len()).rev().find_map(|i| {
+        let (left, right) = (cells[i - 1][0], cells[i][0]);
+        (left >= level && right < level)
+            .then(|| centers[i - 1] + (left - level) / (left - right) * h)
+    })
+});
+let points: Vec<[f64; 2]> = centers.iter().zip(cells).map(|(&x, c)| [x, c[0]]).collect();
+let reference: Vec<[f64; 2]> = (0..=800)
+    .map(|k| k as f64 / 800.0)
+    .map(|x| [x, solution.conserved_at(x)[0]])
+    .collect();
+let mut annotations =
+    vec![serde_json::json!({ "kind": "line", "axis": "x", "value": contact, "label": "Contact" })];
+if let Some(x) = shock {
+    annotations.push(
+        serde_json::json!({ "kind": "line", "axis": "x", "value": x, "label": "Shock" }),
+    );
+}
+emit_chart!(
+    serde_json::json!({
+        "kind": "xy",
+        "link": { "group": "sod-position" },
+        "xLabel": "Position x [-]",
+        "yLabel": "Density ρ [-]",
+        "dataZoom": true,
+        "tooltip": true,
+        "layers": [
+            { "id": "numerical", "kind": "scatter", "name": "Cell average", "points": points },
+            {
+                "id": "exact",
+                "kind": "line",
+                "name": "Exact solution",
+                "points": reference,
+                "style": { "lineType": "dashed", "showSymbol": false }
+            }
+        ],
+        "annotations": annotations
+    }),
+    metadata = serde_json::json!({ "id": "density" })
+);
+let columns = serde_json::json!([
+    { "key": "0", "label": "L¹ error in ρ [-]", "type": "number", "format": sci3 },
+    { "key": "1", "label": "L¹ error in ρu [-]", "type": "number", "format": sci3 },
+    { "key": "2", "label": "L¹ error in E [-]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "Contact width [cells]", "type": "integer", "nullText": "No contact" },
+    { "key": "4", "label": "Shock position [-]", "type": "number", "format": fixed4, "nullText": "—" },
+    { "key": "5", "label": "Exact position [-]", "type": "number", "format": fixed4, "nullText": "No shock" },
+    { "key": "6", "label": "Conservation residual [-]", "type": "number", "format": sci3 }
+]);
+let row = (
+    errors[0], errors[1], errors[2], width, crossing, shock, balance,
+);
+emit_table_with_columns!(
+    columns,
+    vec![row],
+    metadata = serde_json::json!({ "id": "errors" })
+);
+```
+
+By default, density $L^1$ error is $3.02 \times 10^{-3}$.
+Shock position is 0.85119, differing from exact 0.85043 by 15% of cell width 0.005.
+The contact spans 4 cells; conservation residual $4.9 \times 10^{-15}$ shows mass, momentum, and energy balanced with boundary flux to rounding error.
+
+Switching flux gives density error $3.19 \times 10^{-3}$ and width 5 cells for `Hlle`, and error $3.84 \times 10^{-3}$ and width 6 cells for `Rusanov`.
+HLLC includes a contact wave in its fan, keeping the contact narrower than the other two.
+Constant reconstruction gives density error $1.32 \times 10^{-2}$ and contact width 17 cells.
+Conservation residual then increases to $2.6 \times 10^{-12}$ because first-order numerical diffusion reaches end cells and slightly changes boundary flux over time.
+
+Increasing cell count through $N = 100, 200, 400, 800$ gives HLLC/MC density errors $5.31 \times 10^{-3}$, $3.02 \times 10^{-3}$, $1.59 \times 10^{-3}$, and $8.21 \times 10^{-4}$, roughly halving with refinement (observed orders 0.8–0.96).
+Error is determined by a few cells near discontinuities, falling short of second order for smooth solutions.
+See [Convergence order of rectangular-wave advection](oxref:pde-conservation-advection-refinement) for error orders at linear discontinuities (contacts).
+Contact width grows through 4, 4, 5, and 7 cells; physical width (cell count × $h$) shrinks from 0.04 to 0.009 despite the increase in cells.
+Contact characteristics are parallel and do not steepen as shocks do, leaving numerical-diffusion spreading.
+
+Selecting double-rarefaction data in the exact-solution cell gives “No contact”, “—”, and “No shock” in contact-width and shock-position columns; HLLC density errors are $1.05 \times 10^{-2}$ at $N = 200$ and $2.8 \times 10^{-3}$ at $N = 800$.
+No faces switch to HLLE in the final state, but the initial discontinuity gives negative HLLC contact pressure and switches to HLLE ([Conservation laws and numerical fluxes](oxref:pde-conservation-interface-fluxes)).
+
+## Summary
+
+The exact Sod solution follows in closed form from pressure-function root $p^*$; Brent gives $p^* = 0.30313$ and $u^* = 0.92745$.
+Finite volumes with `IdealGasEuler` and `StructuredConservationPlan` reproduce shock position within about a cell width for every flux, preserving conservation balances to rounding error.
+Contact width is narrowest with `Hllc`, then widens with `Hlle` and `Rusanov`; choose `Hllc` and MUSCL when sharp density interfaces matter.
+For discontinuous solutions, $L^1$ error roughly halves per refinement; choose grid size for accuracy targets based on this order.
+
+## Further reading
+
+- [Conservation laws and numerical fluxes](../../algorithms/conservation-laws/) examines HLLE/HLLC derivations and conditions for switching HLLC to HLLE.
+- [CFL conditions and time integration for conservation laws](../../algorithms/conservation-time-integration/) examines the CFL limit determining steps here and rejection of inadmissible stages.
+- [Burgers shocks and Riemann solutions](../burgers-riemann/) examines shock formation and rarefactions in a scalar conservation law.

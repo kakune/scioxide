@@ -1,0 +1,512 @@
+---
+title: "Nested solves, accounting, and diagnostics"
+description: "Starting child solves through SolveScope, hierarchical accounting and shared limits, _scoped function contracts, distributing shared limits among parallel children, accounting integrity, BudgetLimit and effective_budget_report, and diagnosing inner limit exhaustion."
+sidebar:
+  order: 315
+references:
+  core-nested-diagnostics: "nested-limits-and-diagnostics"
+  core-nested-accounting: "nested-solves-and-accounting"
+  core-parallel-child-budgets: "allocating-limits-to-parallel-children"
+  core-accounting-integrity: "accounting-integrity"
+---
+
+Iterative methods often call other iterative methods internally.
+The caller wants inner function evaluations to consume outer limits without mixing inner and outer iteration counts.
+`scioxide-core` starts inner solves as children through `SolveScope`, records shared-resource consumption in all outer solves, and keeps work counts separated by level.
+This page covers child construction and accounting rules, `_scoped` contracts, allocation of shared limits to parallel children, and diagnostics when inner limits stop a solve.
+It assumes solve state `SolveState`, context `SolveContext`, and epochs from [Solve identity and epochs](oxref:core-solve-identity), and limits `Budget` and `SolveBudgets`, local versus shared limits, and admission operations from [Local and shared solve limits](oxref:core-local-and-shared-budgets).
+
+## Nested solves and accounting
+
+Composite algorithms run child solves inside parent solves, as when Newton's method for nonlinear equations invokes an iterative linear solver at every iteration.
+`SolveScope` specifies where a solve starts.
+`SolveScope::from(execution)` (from `ExecutionContext`) starts a root solve without a parent, while `SolveScope::from(&mut context)` (from `&mut SolveContext`) starts a child solve.
+`scope.run(&mut child_state, identity, allowance, |child| { ... })` starts a new epoch in `child_state` and records work under these rules.
+
+- The child's epoch, accepted state, and local limits (`allowance`) belong to its `SolveState`; they do not advance the parent's accepted state.
+- A child inherits the parent's execution context, using the same executor, cancellation, and deadline.
+  [Cancellation checks](oxref:core-cancellation-checks) explains adding a deadline only to a child.
+- When a child performs a shared-limit operation, its count is also added to every outer solve.
+  Before recording, the whole outer chain checks limits and count representability; if any level rejects, no level's recorded counts change.
+  Evaluations whose callbacks return errors also count toward outer evaluation totals.
+- The parent's `counts()` returns `SolveCounts`, retaining its own work `own()` and descendant work `nested()` without overlap.
+  Both are `EvaluationCounts`, containing counts for iterations, proposals, acceptances, rejections, cache lookups, and evaluations by role.
+  Child counts, including unshared categories such as iterations and acceptances, are added to `nested()` in every outer solve.
+  `total()?` adds both sets of counts with overflow checks.
+
+Inner computations too small to warrant child solves can be counted directly on the `nested()` side through `record_nested_iterations(amount)` and `record_nested_providers(role, amount)`.
+Their evaluations still consume shared limits, while their iterations do not count as the solve's own iterations.
+
+### Contracts of `_scoped` functions
+
+Across SciOxide crates, functions ending in `_scoped` take the caller's scope or context as their final argument and execute within it.
+For example, scioxide-rootfind's `find_bracket_scoped` takes `impl Into<SolveScope<'_, '_>>` as its final argument, accepting either `ExecutionContext` or `&mut SolveContext`.
+
+- With `&mut SolveContext`, the function runs as a child of the caller's solve.
+  It checks the caller's cancellation and deadline, and shared categories such as evaluations also add to the caller's counts.
+- With `ExecutionContext`, the function runs as a root solve using that context's executor, cancellation, and deadline.
+- The unsuffixed form performs the same computation independently.
+  `find_bracket` passes `ExecutionContext::sequential_native()` to `find_bracket_scoped`, so it has neither cancellation nor deadline and contributes nothing to the caller's accounting.
+
+When calling a SciOxide solver from your own iterative method, pass your `&mut SolveContext` to the `_scoped` form.
+The unsuffixed form omits inner evaluations from your accounting and does not propagate cancellation inward.
+
+The following cell defines `inner_scoped` as an inner solve in this form, attempting the specified number of iterations and one function evaluation.
+It creates a parent with an iteration limit of 1 and an input evaluation limit (1–3), then calls `inner_scoped` once as a child and once as a root solve.
+After the child call, the parent itself attempts one iteration and one function evaluation.
+The first table shows attempted and admitted operations, the second evaluation limit reports, and the third counts and accounting integrity for the three `SolveState` values ([accounting integrity](#accounting-integrity)).
+Check that child iterations do not enter the parent's own iterations, child evaluations consume the parent's evaluation allowance, and a root call leaves parent records unchanged.
+
+```rust
+//| id: core-nested-scope-budgets
+//| ref: core-nested-scope-budgets
+//| title: "Separating local and shared limits in nested solves"
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   child_iterations: {"type":"range","label":"Inner iteration count [iterations]","description":"Iterations attempted by the inner solve. It has no local iteration limit.","min":1,"max":5,"step":1,"value":2}
+//|   evaluation_limit: {"type":"range","label":"Parent evaluation limit [evaluations]","description":"The parent's BudgetKind::Evaluation limit, also consumed by child evaluations.","min":1,"max":3,"step":1,"value":1}
+//| cases:
+//|   - {"id":"long-child","label":"5 inner iterations","description":"The parent's iteration remains admitted even with five child iterations.","inputs":{"child_iterations":5}}
+//|   - {"id":"two-evaluations","label":"Evaluation limit 2","description":"After the child uses one evaluation, the remaining evaluation admits the parent's function call.","inputs":{"evaluation_limit":2}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"admissions","path":"/rows/0/3","equals":2}
+//|       - {"artifact":"admissions","path":"/rows/2/3","equals":1}
+//|       - {"artifact":"admissions","path":"/rows/3/3","equals":0}
+//|       - {"artifact":"budgets","path":"/rows/0/2","equals":1}
+//|       - {"artifact":"budgets","path":"/rows/1/2","equals":null}
+//|       - {"artifact":"counts","path":"/rows/0/1","equals":1}
+//|       - {"artifact":"counts","path":"/rows/0/2","equals":2}
+//|       - {"artifact":"counts","path":"/rows/0/3","equals":0}
+//|       - {"artifact":"counts","path":"/rows/0/4","equals":1}
+//|       - {"artifact":"counts","path":"/rows/0/6","equals":"Exact"}
+//|   - case: long-child
+//|     expect:
+//|       - {"artifact":"admissions","path":"/rows/0/3","equals":5}
+//|       - {"artifact":"admissions","path":"/rows/2/3","equals":1}
+//|       - {"artifact":"counts","path":"/rows/0/2","equals":5}
+//|   - case: two-evaluations
+//|     expect:
+//|       - {"artifact":"admissions","path":"/rows/3/3","equals":1}
+//|       - {"artifact":"budgets","path":"/rows/2/1","equals":2}
+//|       - {"artifact":"budgets","path":"/rows/2/2","equals":0}
+//|       - {"artifact":"counts","path":"/rows/0/5","equals":2}
+use scioxide_core::{
+    AccountingIntegrity, AlgorithmId, Budget, BudgetKind, BudgetReport, EvaluationRole,
+    ExecutionContext, SciOxideError, ProblemToken, SolveBudgets, SolveCounts, SolveIdentity,
+    SolveScope, SolveState, algorithm_id, budget,
+};
+
+const OUTER: AlgorithmId = algorithm_id!("handbook", "outer", 1);
+const INNER: AlgorithmId = algorithm_id!("handbook", "inner", 1);
+
+/// Write the inner solve in `_scoped` form, taking the caller's scope as the last argument.
+/// Attempt `iterations` iterations and one function evaluation,
+/// returning (admitted iterations, admitted evaluations, evaluation limit observed before evaluation).
+fn inner_scoped<'scope, 'capability>(
+    iterations: usize,
+    state: &mut SolveState,
+    scope: impl Into<SolveScope<'scope, 'capability>>,
+) -> Result<(usize, usize, BudgetReport), SciOxideError> {
+    let identity = SolveIdentity::new(ProblemToken::new(1), INNER, 0, 0);
+    // The inner allowance has no limits. Shared resources use the outer solve's limits.
+    let allowance = SolveBudgets::unbounded();
+    scope.into().run(state, identity, allowance, |child| {
+        let mut granted = 0;
+        for _ in 0..iterations {
+            granted += usize::from(child.record_iteration()?.is_granted());
+        }
+        let visible = child.effective_budget_report(BudgetKind::Evaluation);
+        let evaluation = child.invoke_provider(EvaluationRole::Function, || Ok(42.0))?;
+        Ok((granted, usize::from(evaluation.is_evaluated()), visible))
+    })
+}
+
+let function = EvaluationRole::Function;
+let iterations = child_iterations as usize;
+let evaluations = Budget::try_from(evaluation_limit as usize).map_err(|e| e.to_string())?;
+let mut budgets = SolveBudgets::unbounded()
+    .with_limit(BudgetKind::Iteration, budget!(1))
+    .with_limit(BudgetKind::Evaluation, evaluations);
+let mut state = SolveState::new();
+let identity = SolveIdentity::new(ProblemToken::new(1), OUTER, 0, 0);
+let mut parent = state
+    .begin_solve(ExecutionContext::sequential(), identity, &mut budgets)
+    .map_err(|e| e.to_string())?;
+
+// Call as a child: passing &mut SolveContext records shared-resource consumption in the parent too.
+let mut child_state = SolveState::new();
+let (child_granted, child_evaluated, child_visible) =
+    inner_scoped(iterations, &mut child_state, &mut parent).map_err(|e| e.to_string())?;
+
+// Parent work: its iteration uses a local limit of 1; its evaluation uses the remaining shared allowance.
+let parent_granted = usize::from(
+    parent
+        .record_iteration()
+        .map_err(|e| e.to_string())?
+        .is_granted(),
+);
+let parent_evaluated = usize::from(
+    parent
+        .invoke_provider(function, || Ok(0.0))
+        .map_err(|e| e.to_string())?
+        .is_evaluated(),
+);
+
+// Call as a root: passing ExecutionContext creates an independent solve, leaving parent records unchanged.
+let mut root_state = SolveState::new();
+let (root_granted, root_evaluated, root_visible) =
+    inner_scoped(iterations, &mut root_state, ExecutionContext::sequential())
+        .map_err(|e| e.to_string())?;
+let parent_budget = parent.budget_report(BudgetKind::Evaluation);
+let parent_counts = parent.counts();
+
+let admission_columns = serde_json::json!([
+    { "key": "0", "label": "Solve" },
+    { "key": "1", "label": "Operation" },
+    { "key": "2", "label": "Attempts [count]", "type": "integer" },
+    { "key": "3", "label": "Admitted [count]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    admission_columns,
+    vec![
+        ("Inner (child of parent)", "Iterations", iterations, child_granted),
+        ("Inner (child of parent)", "Function evaluations", 1, child_evaluated),
+        ("Parent", "Iterations", 1, parent_granted),
+        ("Parent", "Function evaluations", 1, parent_evaluated),
+        ("Inner (root)", "Iterations", iterations, root_granted),
+        ("Inner (root)", "Function evaluations", 1, root_evaluated),
+    ],
+    metadata = serde_json::json!({ "id": "admissions", "title": "Attempts and admissions" })
+);
+
+let budget_columns = serde_json::json!([
+    { "key": "0", "label": "Evaluation limit report" },
+    { "key": "1", "label": "Consumed consumed() [count]", "type": "integer" },
+    { "key": "2", "label": "Remaining remaining() [count]", "type": "integer", "nullText": "Unlimited" }
+]);
+let budget_row =
+    |label: &'static str, report: BudgetReport| (label, report.consumed(), report.remaining());
+emit_table_with_columns!(
+    budget_columns,
+    vec![
+        budget_row(
+            "Inner (child): effective_budget_report before evaluation",
+            child_visible
+        ),
+        budget_row(
+            "Inner (root): effective_budget_report before evaluation",
+            root_visible
+        ),
+        budget_row("Parent: final budget_report", parent_budget),
+    ],
+    metadata = serde_json::json!({ "id": "budgets", "title": "Evaluation limits" })
+);
+
+let count_columns = serde_json::json!([
+    { "key": "0", "label": "SolveState" },
+    { "key": "1", "label": "Iterations own [count]", "type": "integer" },
+    { "key": "2", "label": "Iterations nested [count]", "type": "integer" },
+    { "key": "3", "label": "Function evaluations own [count]", "type": "integer" },
+    { "key": "4", "label": "Function evaluations nested [count]", "type": "integer" },
+    { "key": "5", "label": "Function evaluations total [count]", "type": "integer" },
+    { "key": "6", "label": "Accounting integrity integrity()" }
+]);
+let count_row = |label: &'static str, counts: SolveCounts| {
+    let total = counts.total()?;
+    let integrity = match counts.integrity() {
+        AccountingIntegrity::Exact => "Exact",
+        AccountingIntegrity::Invalid => "Invalid",
+    };
+    Ok::<_, SciOxideError>((
+        label,
+        counts.own().iterations(),
+        counts.nested().iterations(),
+        counts.own().provider(function),
+        counts.nested().provider(function),
+        total.provider(function),
+        integrity,
+    ))
+};
+emit_table_with_columns!(
+    count_columns,
+    vec![
+        count_row("Parent", parent_counts).map_err(|e| e.to_string())?,
+        count_row("Inner (child of parent)", child_state.counts()).map_err(|e| e.to_string())?,
+        count_row("Inner (root)", root_state.counts()).map_err(|e| e.to_string())?,
+    ],
+    metadata = serde_json::json!({ "id": "counts", "title": "Recorded counts" })
+);
+```
+
+At the defaults (2 inner iterations, evaluation limit 1), both child iterations and its function evaluation are admitted.
+Because the child has no evaluation limit of its own, it observes the parent's limit, with one evaluation remaining.
+The child evaluation exhausts the shared allowance, so the parent's function evaluation is rejected, while its iteration is admitted under the local limit of 1.
+Parent records show 1 `own` and 2 `nested` iterations, with 0 `own` and 1 `nested` function evaluations.
+The inner solve called as a root has no evaluation limit (remaining is "Unlimited"), and its work is absent from parent records.
+
+Increasing inner iterations to 5 still admits the parent's iteration; only `nested` iterations increase to 5.
+At evaluation limit 2, the parent evaluation is admitted with the one allowance remaining after the child; `total` evaluations become 2 and the parent's remaining allowance becomes 0.
+
+### Allocating limits to parallel children
+
+A `SolveScope::run` child mutably borrows its parent for accounting, so only one can run at a time.
+In `backend::with_partitioned_solves`, which runs children in parallel per executor partition, children cannot borrow the parent; shared remaining allowances are therefore distributed before execution.
+For each shared category, let $R$ be the smallest remaining allowance among the parent and outer solves, and $c$ the child count.
+Child index $i$ ($0 \le i < c$) receives the limit
+
+$$
+R_i = \lfloor R / c \rfloor + [\, i < R \bmod c \,], \qquad \sum_{i=0}^{c-1} R_i = R
+$$
+
+so the first $R \bmod c$ children receive one extra unit each.
+Square brackets denote 1 when their enclosed condition holds and 0 otherwise.
+If `allowance` has a smaller resource limit than $R_i$, the smaller value limits the child.
+A resource unlimited in every outer solve, including the parent, is not divided; the `allowance` limit applies unchanged.
+Remaining representable counts in `usize` are distributed by the same formula.
+Unused allowances are not transferred to siblings, so each child's limit is independent of execution order or speed.
+When all children finish, their records, including those ending in errors, merge into the parent in index order.
+Preparation and merging take time proportional to the child count.
+
+### Accounting integrity
+
+`SolveCounts::integrity()` indicates through `AccountingIntegrity` whether records cover all work in the epoch.
+Normally this is `Exact`; if a parallel child's record cannot merge, its parent and all outer solves become `Invalid`.
+Other children that merge successfully still contribute records; the error reports the smallest index among failed children.
+In a `Invalid` epoch, `total()`, checkpoint construction, and further resource admission produce `AccountingInvariant` errors, remaining so until a new epoch starts.
+`own()` and `nested()` remain readable for diagnostics but cannot represent total work.
+
+## Nested limits and diagnostics
+
+Configuration uses positive integers `Budget`, while reporting uses `BudgetLimit`, which can also represent zero.
+`BudgetLimit::Finite(n)` is a finite limit; when distributing parallel allowances with $R < c$, it becomes zero for children indexed at least $R$.
+`BudgetLimit::Unbounded` indicates that no limit is configured.
+`BudgetReport::remaining()` returns `None` for `Unbounded`, and `exhausted()` is true only when a finite limit has been reached.
+
+A child context's `budget_report(kind)` reports its own limit and consumption.
+For shared resources, `effective_budget_report(kind)` reports the limit with the least remaining allowance among itself and outer solves (the nearest on a tie); for local resources it reports its own limit.
+Use the latter method to read how many evaluations the child can still perform.
+The `BudgetReport` returned on rejection reports the rejecting limit: if an outer solve rejects a child evaluation, it shows that outer solve's consumption and limit.
+
+If an inner limit stops a solve and prevents the outer solve from continuing, the outer solve returns a `ConvergenceFailure` error containing diagnostics from each level.
+`ConvergenceDiagnostics` contains the algorithm, counts, limiting resource report, residual, and last accepted state.
+`with_nested(algorithm, inner)` adds inner diagnostics and their descendants as a flat sequence ordered from outer to inner.
+Readers obtain reason `ConvergenceReason` and `ConvergenceDiagnosticsView` from the `SciOxideErrorView::ConvergenceFailure` of `error.view()`, then read `NestedLevel` from outer to inner through `nested_levels()`.
+Each `NestedLevel` contains algorithm `algorithm()`, counts `counts()`, limiting resource report `budget()`, residual `residual()`, and last accepted state `partial_result()`, allowing a single loop to inspect all levels even with deep nesting.
+
+The following cell considers an inner solve that cannot return partial results.
+It attempts three units, each containing one iteration and one function evaluation, converting rejection to an error through `.require()?`.
+Inputs are the inner iteration limit (1–4, local to the inner solve) and a shared evaluation limit configured in the parent (1–4).
+On receiving an inner error, the outer solve returns `ConvergenceFailure` (reason `NestedSolver`) containing its own counts and the inner diagnostics.
+The table shows each level's algorithm, counts, and limiting resource report read from the error's `view()`.
+Check that the limiting category and consumption match the values determined by the input limits.
+If the inner solve completes three units, no table is emitted; only the outcome is shown.
+
+```rust
+//| id: core-nested-failure-diagnostics
+//| ref: core-nested-failure-diagnostics
+//| title: "Reading diagnostics when an inner limit stops a solve"
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   inner_iteration_limit: {"type":"range","label":"Inner iteration limit [iterations]","description":"A local limit for the inner solve. Below 3, its iteration limit stops it.","min":1,"max":4,"step":1,"value":2}
+//|   evaluation_limit: {"type":"range","label":"Shared evaluation limit [evaluations]","description":"The parent's evaluation limit. Below 3, the parent's limit stops the inner solve.","min":1,"max":4,"step":1,"value":4}
+//| cases:
+//|   - {"id":"shared-evaluation-limit","label":"Evaluation limit 1","description":"The parent's limit rejects the inner solve's second evaluation.","inputs":{"inner_iteration_limit":4,"evaluation_limit":1}}
+//|   - {"id":"within-limits","label":"Both limits 4","description":"The inner solve finishes three units and returns no error.","inputs":{"inner_iteration_limit":4,"evaluation_limit":4}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"levels","path":"/rows/0/1","equals":"handbook/outer@1"}
+//|       - {"artifact":"levels","path":"/rows/0/2","equals":1}
+//|       - {"artifact":"levels","path":"/rows/0/4","equals":null}
+//|       - {"artifact":"levels","path":"/rows/1/1","equals":"handbook/inner@1"}
+//|       - {"artifact":"levels","path":"/rows/1/2","equals":2}
+//|       - {"artifact":"levels","path":"/rows/1/3","equals":2}
+//|       - {"artifact":"levels","path":"/rows/1/4","equals":"iteration"}
+//|       - {"artifact":"levels","path":"/rows/1/5","equals":2}
+//|       - {"artifact":"levels","path":"/rows/1/6","equals":2}
+//|       - {"path":"/outputs/1/state","equals":"failed"}
+//|   - case: shared-evaluation-limit
+//|     expect:
+//|       - {"artifact":"levels","path":"/rows/1/2","equals":2}
+//|       - {"artifact":"levels","path":"/rows/1/3","equals":1}
+//|       - {"artifact":"levels","path":"/rows/1/4","equals":"evaluation"}
+//|       - {"artifact":"levels","path":"/rows/1/5","equals":1}
+//|       - {"artifact":"levels","path":"/rows/1/6","equals":1}
+//|       - {"path":"/outputs/1/state","equals":"failed"}
+//|   - case: within-limits
+//|     expect:
+//|       - {"path":"/outputs/0/state","equals":"satisfied"}
+//|       - {"path":"/outputs/0/diagnostics/0/value","approx":{"value":3,"atol":1e-12}}
+use scioxide_core::{
+    AlgorithmId, Budget, BudgetKind, BudgetLimit, BudgetReport, ConvergenceDiagnostics,
+    ConvergenceReason, EvaluationRole, ExecutionContext, SciOxideError, SciOxideErrorView,
+    ProblemToken, SolveBudgets, SolveContext, SolveCounts, SolveIdentity, SolveScope,
+    SolveState, algorithm_id,
+};
+
+const OUTER: AlgorithmId = algorithm_id!("handbook", "outer", 1);
+const INNER: AlgorithmId = algorithm_id!("handbook", "inner", 1);
+/// Number of units performed by the inner solve (one iteration and one evaluation each).
+const UNITS: usize = 3;
+
+/// The inner solve returns no partial results, so require() converts rejection to ConvergenceFailure.
+fn inner(child: &mut SolveContext<'_, '_>) -> Result<(), SciOxideError> {
+    for _ in 0..UNITS {
+        child.record_iteration()?.require()?;
+        child
+            .invoke_provider(EvaluationRole::Function, || Ok(()))?
+            .require()?;
+    }
+    Ok(())
+}
+
+/// The outer solve counts one iteration, calls the inner solve, and attaches each level's diagnostics to the inner ConvergenceFailure.
+fn outer(
+    parent: &mut SolveContext<'_, '_>,
+    child_state: &mut SolveState,
+    inner_limit: Budget,
+) -> Result<(), SciOxideError> {
+    parent.record_iteration()?.require()?;
+    let identity = SolveIdentity::new(ProblemToken::new(1), INNER, 0, 0);
+    let allowance = SolveBudgets::unbounded().with_limit(BudgetKind::Iteration, inner_limit);
+    let result = SolveScope::from(&mut *parent).run(child_state, identity, allowance, inner);
+    let Err(error) = result else {
+        return Ok(());
+    };
+    let stopped_by = match error.view() {
+        SciOxideErrorView::ConvergenceFailure { diagnostics, .. } => diagnostics.budget(),
+        // Propagate errors other than convergence failures unchanged.
+        _ => return Err(error),
+    };
+    // Inner level: counts from the inner SolveState and the resource limit report that stopped it.
+    let mut nested = ConvergenceDiagnostics::new().with_counts(child_state.counts());
+    if let Some(report) = stopped_by {
+        nested = nested.with_budget(report);
+    }
+    let diagnostics = ConvergenceDiagnostics::new()
+        .with_algorithm(OUTER)
+        .with_counts(parent.counts())
+        .with_nested(INNER, nested);
+    Err(SciOxideError::convergence_failure(
+        ConvergenceReason::NestedSolver,
+        diagnostics,
+        "inner solve did not converge",
+    ))
+}
+
+let limit = |count: f64| Budget::try_from(count as usize).map_err(|e| e.to_string());
+let mut budgets =
+    SolveBudgets::unbounded().with_limit(BudgetKind::Evaluation, limit(evaluation_limit)?);
+let mut state = SolveState::new();
+let mut child_state = SolveState::new();
+let identity = SolveIdentity::new(ProblemToken::new(1), OUTER, 0, 0);
+let mut parent = state
+    .begin_solve(ExecutionContext::sequential(), identity, &mut budgets)
+    .map_err(|e| e.to_string())?;
+let result = outer(&mut parent, &mut child_state, limit(inner_iteration_limit)?);
+let nested_evaluations = parent.counts().nested().provider(EvaluationRole::Function);
+
+let outcome = match result {
+    Ok(()) => Outcome::satisfied("The inner solve completed three units within its limits").status("Ok"),
+    Err(error) => {
+        let SciOxideErrorView::ConvergenceFailure {
+            reason,
+            diagnostics,
+            ..
+        } = error.view()
+        else {
+            return Err(error.to_string());
+        };
+        // Row 0 is the outer level; subsequent rows are inner levels returned by nested_levels() from outer to inner.
+        let finite = |limit: BudgetLimit| match limit {
+            BudgetLimit::Finite(count) => Some(count),
+            BudgetLimit::Unbounded => None,
+        };
+        let row =
+            |depth: usize, algorithm: Option<AlgorithmId>, counts: SolveCounts, budget| {
+                let budget: Option<BudgetReport> = budget;
+                (
+                    depth,
+                    algorithm.map(|id| id.to_string()),
+                    counts.own().iterations(),
+                    counts.own().provider(EvaluationRole::Function),
+                    budget.map(|report| report.kind().name()),
+                    budget.map(|report| report.consumed()),
+                    budget.and_then(|report| finite(report.limit())),
+                )
+            };
+        let mut rows = vec![row(
+            0,
+            diagnostics.algorithm(),
+            diagnostics.counts(),
+            diagnostics.budget(),
+        )];
+        rows.extend(
+            diagnostics
+                .nested_levels()
+                .enumerate()
+                .map(|(index, nested)| {
+                    row(
+                        index + 1,
+                        Some(nested.algorithm()),
+                        nested.counts(),
+                        nested.budget(),
+                    )
+                }),
+        );
+        let columns = serde_json::json!([
+            { "key": "0", "label": "Level (0 is outer)", "type": "integer" },
+            { "key": "1", "label": "Algorithm algorithm()", "nullText": "None" },
+            { "key": "2", "label": "Iterations own [count]", "type": "integer" },
+            { "key": "3", "label": "Function evaluations own [count]", "type": "integer" },
+            { "key": "4", "label": "Limiting resource kind budget().kind()", "nullText": "None" },
+            { "key": "5", "label": "Consumption [count]", "type": "integer", "nullText": "None" },
+            { "key": "6", "label": "Limit [count]", "type": "integer", "nullText": "None" }
+        ]);
+        emit_table_with_columns!(
+            columns,
+            rows,
+            metadata = serde_json::json!({ "id": "levels", "title": "Error diagnostic levels" })
+        );
+        Outcome::failed("An inner limit stopped the solve; the outer solve cannot return a result")
+            .status(format!("ConvergenceFailure: {reason}"))
+            .explanation("The limiting resource is recorded in the inner level of the table.")
+    }
+};
+emit_outcome!(outcome.diagnostic(
+    "Inner function evaluations (parent's nested)",
+    nested_evaluations as f64,
+    None
+));
+```
+
+At the defaults (inner iteration limit 2, evaluation limit 4), the inner solve completes two units before its third iteration is rejected.
+The inner level records two iterations and two evaluations; its own `iteration` stops it, with consumption 2 and limit 2.
+Outer level `handbook/outer@1` contains only its own single iteration and has no limiting resource report.
+The displayed error reason is `nested solver failure` (`ConvergenceReason::NestedSolver`).
+
+With evaluation limit 1 and inner iteration limit 4, the inner solve counts its second iteration before its evaluation is rejected.
+The limiting category is `evaluation`, with consumption 1 and limit 1 belonging to the parent's evaluation allowance, not the child's.
+The inner solve records two iterations and one evaluation: only the iteration remains recorded for the second unit, whose evaluation was rejected afterward.
+With both limits 4, the inner solve completes three units without error, and the parent's `nested` records three function evaluations.
+
+## Summary
+
+Use `SolveScope::from(&mut context)` to start another solve inside your method; when calling a SciOxide solver, pass your `&mut SolveContext` to its `_scoped` form.
+Inner evaluations then count toward your solve and outer solves, while inner iterations are limited only by the inner `allowance`.
+Read the parent's `counts()` with `own()` and `nested()` separately to determine work at each level.
+Read remaining child evaluations through `effective_budget_report` and inspect the `BudgetReport` returned on rejection to identify which level's limit stopped execution.
+When returning nested failures, attach inner diagnostics with `with_nested`; recipients read levels from outer to inner through `nested_levels()`.
+Do not use records with `integrity()` equal to `Invalid` as total work; start a new epoch.
+
+## Further reading
+
+- [Solve lifecycle and computation count management](../solve-lifecycle-and-accounting/): Check cancellation at iteration boundaries and reliability categories of truncated results.
+- [Kepler's equation and solve accounting](../../examples/kepler-solve-accounting/): Read parent/child counts and shared evaluation limits through fixed-point iteration calling Newton's method as a child.
+- [Operator protocols and closure operators](../operator-protocols-and-structure/): Check how operator methods with `_scoped` borrow `SolveContext` through `OperatorContext`.
+- [Error categories and detailed views](../errors-and-diagnostic-views/): Check categories other than `ConvergenceFailure` and details available through `view()`.
+- [Solve accounting and execution APIs](../../api/solve-and-execution/): Look up all `SolveScope` and `SolveCounts` methods and their error conditions.

@@ -1,0 +1,480 @@
+---
+title: "Differentiating normalization and matrix products"
+description: "Differentiate structured operations taking arrays: maximum shifts and −∞ masks in logsumexp and softmax, the softmax Jacobian and error bounds, dot- and matrix-product JVPs and VJPs, the adjoint identity under the Frobenius inner product, and tape statement, word and partial-derivative counts."
+sidebar:
+  order: 330
+references:
+  ad-logsumexp-softmax: "logsumexp-and-softmax"
+  ad-matrix-products: "dot-products-and-matrix-products"
+---
+
+Classification probabilities and log-likelihoods use the logarithmic sum $\ln \sum_j e^{x_j}$ and softmax; linear layers and linear maps use dot products and matrix products.
+Computing the logarithmic sum directly from its formula overflows the exponentials for large elements.
+`scioxide-ad` provides these as structured operations available to every number type: array-taking functions whose computation order and tape-recording form are determined by the crate.
+This page derives and demonstrates value algorithms, derivatives and Jacobians, tape recordings and error bounds for `logsumexp`, `softmax_into`, `log_softmax_into`, `dot`, `gemv_into` and `gemm_into`.
+[Elementary-function derivatives and accuracy](../elementary-functions/) covers individual partial derivatives and accuracy; [Reverse mode and tapes](../reverse-mode-and-replay/) covers tape recording and sweeps.
+
+## logsumexp and softmax
+
+Computing the logarithmic sum $\operatorname{lse}(x) = \ln \sum_j e^{x_j}$ of $x \in \mathbb{R}^n$ directly overflows $e^{x_j}$ at $x_j > 709.78$ for `f64`, while the sum becomes 0 when all $x_j < -745.13$.
+`logsumexp` shifts by the maximum $m = \max_j x_j$ of base values (innermost values such as `f64` in nested number types), computing
+
+$$
+\operatorname{lse}(x) = m + \ln \sum_{j=1}^{n} e^{x_j - m}
+$$
+
+
+Every exponent is nonpositive and the largest term is 1, so the sum lies in $[1, n]$ and does not overflow.
+
+The gradient is the softmax
+
+$$
+\frac{\partial \operatorname{lse}}{\partial x_i} = p_i = \frac{e^{x_i - m}}{\sum_j e^{x_j - m}}, \qquad
+\frac{\partial p_i}{\partial x_j} = p_i(\delta_{ij} - p_j), \qquad
+\frac{\partial \ln p_i}{\partial x_j} = \delta_{ij} - p_j
+$$
+
+and the softmax Jacobian is $\operatorname{diag}(p) - p p^{\mathsf T}$.
+Shift $m$ is obtained from base values per lane (one SIMD element of `Lanes`) and treated as an undifferentiated value (an input-independent constant).
+The identity above holds for any constant $m$, so differentiating its right-hand side with $m$ fixed equals the derivative of the unshifted function.
+Since $m$ is not differentiated, ties for the maximum do not count as kinks (points with unequal one-sided derivatives).
+
+`softmax_into` writes $p_i$ to the output; `log_softmax_into` writes $\ln p_i = (x_i - m) - \ln \sum_j e^{x_j - m}$.
+Elements with value $-\infty$ are masks (excluded elements), and $e^{-\infty - m}$ is exactly 0.
+Masked element $x_j$ has softmax $p_j = +0$ and log-softmax $-\infty$.
+Since $p_j = 0$, the partial derivative of $\operatorname{lse}$ with respect to $x_j$ and row $j$ and column $j$ of the softmax Jacobian are all 0.
+In log-softmax Jacobian $\delta_{ij} - p_j$, column $j$ components with $i \ne j$ are 0, but the masked element's own row $\delta_{jk} - p_k$ is not zero (its $x_j$ component is 1).
+
+| Input | `logsumexp` | `softmax_into`, `log_softmax_into` |
+|---|---|---|
+| Empty array | $-\infty$ | `DomainError` (argument `values`, reason `Undefined`) |
+| All elements are $-\infty$ (in a lane) | $-\infty$ | `DomainError` (argument `values`, reason `Undefined`) |
+| Contains an element $+\infty$ | $+\infty$ (derivative 0) | — |
+| Contains a NaN element (in a lane) | NaN | All outputs in that lane are NaN |
+| Length differs from output | — | `DimensionMismatch` |
+
+`logsumexp` currently returns no errors; `Result` is retained for a checked form.
+`softmax_into` and `log_softmax_into` leave outputs unchanged when checks fail.
+
+Accuracy follows the analysis of Blanchard, Higham and Higham (*IMA J. Numer. Anal.* 41, 2021).
+With machine epsilon $\varepsilon$, a first-order approximation bounds the absolute error of result $y$ from `logsumexp` by about $\varepsilon(|y| + 5n)$, assuming `exp` error within 2 ulp.
+Each softmax component's relative error is bounded by about $\varepsilon(4n + |x_i - m|)$, arising from summation $(n - 1)\varepsilon$ and the rounded shift $x_i - m$ entering the exponentials.
+Each log-softmax component's absolute error is bounded by about $\varepsilon(|x_i - m| + |\ln p_i| + 5n)$.
+All three are generic functions composed of elementwise subtraction, exponentials, sums, logarithms and division; tapes record elementwise statements (one tape record each), with statement count proportional to $n$.
+See [Logarithmic sums, weighted sums and normalization](../../../scioxide-core/algorithms/logarithmic-reductions/) for accuracy guarantees of `scioxide_core`'s `logsumexp` and softmax.
+
+For $x_j = c + v_j$ and $v = (0.25, -1.5, 2, 0.5, -0.75)$, the next cell obtains values of `logsumexp`, `softmax_into` and `log_softmax_into`, the gradient of $\operatorname{lse}$ through `grad`, and the softmax Jacobian through `jacobian`.
+Inputs are shift $c$ (a dimensionless constant) and whether to mask $x_1$ by setting it to $-\infty$.
+Since $v_j$ is a multiple of $1/4$, adding integer $c$ causes no rounding.
+References are $p_j = e^{v_j}/\sum_k e^{v_k}$ and $c + \ln \sum_k e^{v_k}$ constructed from unshifted $v_j$ with f64's inherent methods.
+The first table shows each element's softmax $p_j$, tape gradient $\partial \operatorname{lse}/\partial x_j$ and log-softmax $\ln p_j$.
+The second shows `logsumexp` and direct $\ln \sum_j e^{x_j}$ (shown as $+\infty$ on overflow), the reference, and error divided by bound $\varepsilon(|y| + 5n)$ above.
+The third shows maximum gradient and Jacobian differences from references divided by $\varepsilon$, and the count of remaining nonzero components in masked rows and columns.
+
+```rust
+//| id: ad-softmax-jacobian
+//| ref: ad-softmax-jacobian
+//| title: "logsumexp gradient and softmax Jacobian"
+//| run: reactive
+//| crates: [scioxide-ad, scioxide-core]
+//| inputs:
+//|   shift: {"type":"range","label":"Shift c","description":"Constant added to every element (dimensionless). For c ≥ 708, e^{x_j} overflows in f64.","min":0,"max":1000,"step":50,"value":800}
+//|   mask: {"type":"checkbox","label":"Set x₁ to −∞ (mask)","description":"The masked element's probability and derivatives become 0.","value":false}
+//| cases:
+//|   - {"id":"no-shift","label":"c = 0","description":"The direct logarithmic sum also avoids overflow.","inputs":{"shift":0}}
+//|   - {"id":"masked","label":"Mask x₁","description":"The masked element's Jacobian row and column become 0.","inputs":{"mask":true}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"entries","path":"/rows/2/2","approx":{"value":0.6706776101949348,"rtol":1e-14}}
+//|       - {"artifact":"values","path":"/rows/0/0","approx":{"value":802.3994667191756,"rtol":1e-15}}
+//|       - {"artifact":"values","path":"/rows/0/1","equals":null}
+//|       - {"artifact":"values","path":"/rows/0/3","range":{"max":1}}
+//|       - {"artifact":"checks","path":"/rows/0/0","range":{"max":4}}
+//|       - {"artifact":"checks","path":"/rows/0/1","range":{"max":4}}
+//|   - case: no-shift
+//|     expect:
+//|       - {"artifact":"values","path":"/rows/0/1","approx":{"value":2.3994667191756704,"rtol":1e-14}}
+//|       - {"artifact":"entries","path":"/rows/2/2","approx":{"value":0.6706776101949348,"rtol":1e-14}}
+//|       - {"artifact":"checks","path":"/rows/0/1","range":{"max":4}}
+//|   - case: masked
+//|     expect:
+//|       - {"artifact":"entries","path":"/rows/1/2","equals":0}
+//|       - {"artifact":"entries","path":"/rows/1/3","equals":0}
+//|       - {"artifact":"entries","path":"/rows/1/4","equals":null}
+//|       - {"artifact":"entries","path":"/rows/2/2","approx":{"value":0.6845414285092583,"rtol":1e-14}}
+//|       - {"artifact":"checks","path":"/rows/0/1","range":{"max":4}}
+//|       - {"artifact":"checks","path":"/rows/0/2","equals":0}
+use scioxide_ad::{Real, Var, grad, jacobian, log_softmax_into, logsumexp, softmax_into};
+use scioxide_core::RealScalar;
+
+// x_j = c + v_j. Since v_j is a multiple of 1/4, adding integer c causes no rounding.
+let offsets = [0.25, -1.5, 2.0, 0.5, -0.75];
+let n = offsets.len();
+let masked = |j: usize| mask && j == 1;
+let x: Vec<f64> = (0..n)
+    .map(|j| {
+        if masked(j) {
+            f64::NEG_INFINITY
+        } else {
+            shift + offsets[j]
+        }
+    })
+    .collect();
+
+// SciOxide computation: values, tape lse gradient and softmax Jacobian.
+let lse = logsumexp(&x).map_err(|e| e.to_string())?;
+let mut p = vec![0.0; n];
+softmax_into(&x, &mut p).map_err(|e| e.to_string())?;
+let mut log_p = vec![0.0; n];
+log_softmax_into(&x, &mut log_p).map_err(|e| e.to_string())?;
+let gradient = grad(|v| logsumexp(v), &x).map_err(|e| e.to_string())?;
+let jac = jacobian(
+    |v, out| {
+        let mut probabilities = vec![Var::constant(0.0); v.len()];
+        softmax_into(v, &mut probabilities)?;
+        out.extend(probabilities);
+        Ok(())
+    },
+    &x,
+)
+.map_err(|e| e.to_string())?;
+let entries: Vec<_> = (0..n)
+    .map(|j| {
+        let offset = (!masked(j)).then_some(offsets[j]);
+        let log_value = log_p[j].is_finite().then_some(log_p[j]);
+        (j, offset, p[j], gradient.as_slice()[j], log_value)
+    })
+    .collect();
+
+// Reference (f64's inherent methods): construct e^{v_j} from unshifted v_j.
+let weights: Vec<f64> = (0..n)
+    .map(|j| if masked(j) { 0.0 } else { offsets[j].exp() })
+    .collect();
+let total: f64 = weights.iter().sum();
+let reference: Vec<f64> = weights.iter().map(|w| w / total).collect();
+// Check: divide lse error by bound ε(|y| + 5n). Direct ln Σ e^{x_j} may overflow.
+let reference_lse = shift + total.ln();
+let bound = f64::EPSILON * (lse.abs() + 5.0 * n as f64);
+let naive = RealScalar::ln(x.iter().map(|&v| RealScalar::exp(v)).sum::<f64>());
+let values = vec![(
+    lse,
+    naive.is_finite().then_some(naive),
+    reference_lse,
+    (lse - reference_lse).abs() / bound,
+)];
+// Check: gradient versus p, Jacobian versus diag(p) − ppᵀ, and nonzero masked-row and masked-column components.
+let mut jacobian_gap = 0.0_f64;
+let mut masked_nonzeros = 0_u32;
+for i in 0..n {
+    for j in 0..n {
+        let diagonal = if i == j { reference[i] } else { 0.0 };
+        let entry = jac.as_slice()[i * n + j];
+        let gap = (entry - (diagonal - reference[i] * reference[j])).abs();
+        jacobian_gap = jacobian_gap.max(gap);
+        masked_nonzeros += u32::from((masked(i) || masked(j)) && entry != 0.0);
+    }
+}
+let gradient_gap = (0..n)
+    .map(|j| (gradient.as_slice()[j] - reference[j]).abs())
+    .fold(0.0, f64::max);
+let checks = vec![(
+    gradient_gap / f64::EPSILON,
+    jacobian_gap / f64::EPSILON,
+    mask.then_some(masked_nonzeros),
+)];
+
+let digits = serde_json::json!({ "significantDigits": 16 });
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let entry_columns = serde_json::json!([
+    { "key": "0", "label": "j", "type": "integer" },
+    { "key": "1", "label": "x_j − c [-]", "type": "number", "nullText": "−∞ (masked)" },
+    { "key": "2", "label": "p_j [-]", "type": "number", "format": digits },
+    { "key": "3", "label": "∂lse/∂x_j [-]", "type": "number", "format": digits },
+    { "key": "4", "label": "ln p_j [-]", "type": "number", "format": digits, "nullText": "−∞" }
+]);
+emit_table_with_columns!(
+    entry_columns,
+    entries,
+    metadata = serde_json::json!({ "id": "entries" })
+);
+let value_columns = serde_json::json!([
+    { "key": "0", "label": "logsumexp [-]", "type": "number", "format": digits },
+    { "key": "1", "label": "ln Σ e^x [-]", "type": "number", "format": digits, "nullText": "+∞" },
+    { "key": "2", "label": "Reference [-]", "type": "number", "format": digits },
+    { "key": "3", "label": "Error / ε(|y| + 5n) [-]", "type": "number", "format": fixed2 }
+]);
+emit_table_with_columns!(
+    value_columns,
+    values,
+    metadata = serde_json::json!({ "id": "values" })
+);
+let check_columns = serde_json::json!([
+    { "key": "0", "label": "max |∂lse/∂x_j − p_j| / ε [-]", "type": "number", "format": fixed2 },
+    { "key": "1", "label": "max |J − (diag p − ppᵀ)| / ε [-]", "type": "number", "format": fixed2 },
+    { "key": "2", "label": "Nonzero masked-row and masked-column components [count]", "type": "integer", "nullText": "Unmasked" }
+]);
+emit_table_with_columns!(
+    check_columns,
+    checks,
+    metadata = serde_json::json!({ "id": "checks" })
+);
+```
+
+## Dot products and matrix products
+
+`dot(left, right)` sums the dot product $\sum_k l_k r_k$ in index order.
+A tape records one statement with $2n$ arguments regardless of vector length $n$, storing $r_k$ values as partial derivatives for $l_k$ and $l_k$ values for $r_k$.
+The value is a recursive sum of products, so with unit roundoff $u$ ($2^{-53}$ for `f64`) and $\gamma_n = nu/(1 - nu)$, the error is bounded by
+
+$$
+\Bigl|\widehat{\textstyle\sum_k l_k r_k} - \textstyle\sum_k l_k r_k\Bigr| \le \gamma_n \sum_k |l_k r_k|
+$$
+
+(Higham, *Accuracy and Stability of Numerical Algorithms*, §3.1).
+Derivatives are sums of the same form and have bounds of the same form.
+Unequal lengths return `DimensionMismatch`.
+
+`gemv_into(matrix, rows, cols, vector, out)` writes the product of a row-major $\text{rows} \times \text{cols}$ matrix and length-$\text{cols}$ vector to `out` as a `dot` per row.
+If `cols` is 0, it fills `out` with 0.
+`gemm_into(left, rows, inner, right, cols, out)` writes the product of row-major $\text{rows} \times \text{inner}$ and $\text{inner} \times \text{cols}$ matrices as a `dot` per component.
+Componentwise accuracy matches `dot` of $n = \text{cols}$ (`gemv_into`) and $n = \text{inner}$ (`gemm_into`).
+Both return `DimensionMismatch` for mismatched slice lengths and `SizeOverflow` when a row-column dimension product exceeds `usize`.
+
+Set $A \in \mathbb{R}^{m \times k}$, $B \in \mathbb{R}^{k \times n}$, and $C = AB$.
+Since $C$ is bilinear in $(A, B)$, the product rule gives its derivative in direction (input tangent) $(\dot A, \dot B)$ as
+
+$$
+\dot C = \dot A\,B + A\,\dot B
+$$
+
+
+This product mapping a direction to $\dot C$ is the forward-mode Jacobian-vector product (JVP).
+The reverse-mode vector-Jacobian product (VJP) applies the transpose of this linear map to output cotangent $W = \bar C \in \mathbb{R}^{m \times n}$.
+Using the Frobenius inner product $\langle X, Y \rangle = \operatorname{tr}(X^{\mathsf T} Y) = \sum_{i,j} X_{ij} Y_{ij}$ for matrices and cyclicity of the trace $\operatorname{tr}(XY) = \operatorname{tr}(YX)$ gives, for every direction,
+
+$$
+\begin{aligned}
+\langle \dot A B, W \rangle &= \operatorname{tr}(B^{\mathsf T} \dot A^{\mathsf T} W) = \operatorname{tr}(\dot A^{\mathsf T} W B^{\mathsf T}) = \langle \dot A, W B^{\mathsf T} \rangle, \\
+\langle A \dot B, W \rangle &= \operatorname{tr}(\dot B^{\mathsf T} A^{\mathsf T} W) = \langle \dot B, A^{\mathsf T} W \rangle
+\end{aligned}
+$$
+
+
+The adjoints are therefore $\bar A = W B^{\mathsf T}$ and $\bar B = A^{\mathsf T} W$, giving
+
+$$
+\langle \dot C, W \rangle = \langle \dot A, \bar A \rangle + \langle \dot B, \bar B \rangle
+$$
+
+
+This identity is the definition of the transpose itself and checks consistency between JVPs and VJPs.
+`gemv_into` ($n = 1$) and `dot` ($m = n = 1$) are special cases of the same rule.
+
+Recording `gemm_into` on a tape makes each $C$ component one `dot` statement.
+The tape represents statements as sequences of 64-bit statement words; multi-argument statements use two header words and one word per argument.
+The reverse sweep, traversing the recording backward and adding adjoints, adds $\bar A_{ik} \mathrel{+}= \bar C_{ij} B_{kj}$ and $\bar B_{kj} \mathrel{+}= A_{ik} \bar C_{ij}$ from each statement, obtaining $\bar A = W B^{\mathsf T}$ and $\bar B = A^{\mathsf T} W$ without writing matrix-form expressions.
+The recording consists of $mn$ statements, $1 + mk + kn + mn(2k + 2)$ statement words (one constant slot, $mk + kn$ inputs, two header words and $2k$ argument words per statement), and $2mnk$ partial derivatives.
+Partial derivatives copy $A$ and $B$ components, so their memory use is $2mnk/(mk + kn)$ times that of $A$ and $B$ themselves ($mk + kn$ values).
+JVPs and VJPs each perform $2mnk$ products in one sweep.
+
+The next cell constructs components of $A$, $B$, directions $\dot A$, $\dot B$ and cotangent $W$ using $[-1, 1)$ pseudorandom numbers, records $C = AB$ with `Tape::linearize`, obtains $\dot C$ with `jvp_into`, and $(\bar A, \bar B)$ with `vjp_into`.
+The inputs are $m$, $k$ and $n$.
+The first table shows recorded word count and its formula above, both sides of the identity, and their difference divided by $u S$.
+The inner products on both sides use correctly rounded dot product `scioxide_core::checked_sum_of_products`.
+For $\dot C$, $\bar A$ and $\bar B$, the second table shows the maximum ratio of a componentwise difference from its `checked_sum_of_products` reference to the corresponding bound $\gamma_N \sum|\text{term}|$ ($N$ is the number of summands).
+$S = \sum_{i,j,k} |W_{ij}|(|\dot A_{ik} B_{kj}| + |A_{ik} \dot B_{kj}|)$ is the sum of absolute terms in the left-hand triple sum; the difference between the two sides should be at most on the order of $(\gamma_{2k} + \gamma_{\max(m, n)}) S$.
+
+```rust
+//| id: ad-gemm-adjoint
+//| ref: ad-gemm-adjoint
+//| title: "Matrix-product JVPs, VJPs and the adjoint identity"
+//| run: reactive
+//| crates: [scioxide-ad, scioxide-core]
+//| inputs:
+//|   m_rows: {"type":"range","label":"Rows m of A","min":1,"max":8,"step":1,"value":3}
+//|   k_inner: {"type":"range","label":"Inner dimension k","min":1,"max":32,"step":1,"value":8}
+//|   n_cols: {"type":"range","label":"Columns n of B","min":1,"max":8,"step":1,"value":2}
+//| cases:
+//|   - {"id":"long-inner","label":"k = 32","description":"Longer dot products increase summation bound γ_N.","inputs":{"k_inner":32}}
+//|   - {"id":"matrix-vector","label":"m = 8, n = 1","description":"n = 1 is a matrix-vector product with the same rule as gemv_into.","inputs":{"m_rows":8,"n_cols":1}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":149}
+//|       - {"artifact":"summary","path":"/rows/0/1","equals":149}
+//|       - {"artifact":"errors","path":"/rows/0/2","range":{"max":1}}
+//|       - {"artifact":"errors","path":"/rows/1/2","range":{"max":1}}
+//|       - {"artifact":"errors","path":"/rows/2/2","range":{"max":1}}
+//|       - {"artifact":"summary","path":"/rows/0/2","approx":{"value":-2.554543701983218,"rtol":1e-14}}
+//|       - {"artifact":"summary","path":"/rows/0/4","range":{"max":19}}
+//|   - case: long-inner
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":557}
+//|       - {"artifact":"errors","path":"/rows/0/2","range":{"max":1}}
+//|       - {"artifact":"summary","path":"/rows/0/4","range":{"max":67}}
+//|   - case: matrix-vector
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":217}
+//|       - {"artifact":"errors","path":"/rows/1/2","equals":0}
+//|       - {"artifact":"errors","path":"/rows/2/2","range":{"max":1}}
+use scioxide_ad::{Real, Tape, TapeOptions, Var, gemm_into};
+use scioxide_core::{ExecutionContext, checked_sum_of_products};
+
+let (m, k, n) = (m_rows as usize, k_inner as usize, n_cols as usize);
+// Linear congruential generator used only to generate inputs. Components lie in [−1, 1).
+let mut state = 0x2545_f491_4f6c_dd1d_u64;
+let mut fill = |len: usize| -> Vec<f64> {
+    (0..len)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 11) as f64 / (1_u64 << 52) as f64 - 1.0
+        })
+        .collect()
+};
+let (a, b) = (fill(m * k), fill(k * n));
+let (da, db, w) = (fill(m * k), fill(k * n), fill(m * n));
+let point = [a.as_slice(), &b].concat();
+let direction = [da.as_slice(), &db].concat();
+
+// Record C = A·B on a tape; obtain dC with a JVP and (Ā, B̄) with a VJP.
+let cx = ExecutionContext::sequential();
+let mut tape = Tape::<f64>::new(TapeOptions::new());
+let mut dc = vec![0.0; m * n];
+let mut bars = vec![0.0; m * k + k * n];
+{
+    let mut linear = tape
+        .linearize(
+            |x, out| {
+                let (left, right) = x.split_at(m * k);
+                let mut c = vec![Var::constant(0.0); m * n];
+                gemm_into(left, m, k, right, n, &mut c)?;
+                out.extend(c);
+                Ok(())
+            },
+            &point,
+            cx,
+        )
+        .map_err(|e| e.to_string())?;
+    linear
+        .jvp_into(&direction, &mut dc, cx)
+        .map_err(|e| e.to_string())?;
+    linear
+        .vjp_into(&w, &mut bars, cx)
+        .map_err(|e| e.to_string())?;
+}
+let words = tape.report().words();
+
+// Check: compute correctly rounded dot products and sums of absolute terms Σ|term|.
+let exact = |l: &[f64], r: &[f64]| -> Result<(f64, f64), String> {
+    let value = checked_sum_of_products(l, r).map_err(|e| e.to_string())?;
+    let size: f64 = l.iter().zip(r).map(|(p, q)| (p * q).abs()).sum();
+    Ok((value, size))
+};
+let u = f64::EPSILON / 2.0;
+let gamma = |terms: usize| terms as f64 * u / (1.0 - terms as f64 * u);
+let row = |x: &[f64], cols: usize, i: usize| x[i * cols..(i + 1) * cols].to_vec();
+let col = |x: &[f64], cols: usize, j: usize| -> Vec<f64> {
+    x.iter().skip(j).step_by(cols).copied().collect()
+};
+let mut worst = [0.0_f64; 3];
+for i in 0..m {
+    for j in 0..n {
+        // dC_ij = Σ_k (dA_ik B_kj + A_ik dB_kj), 2k terms.
+        let left = [row(&da, k, i), row(&a, k, i)].concat();
+        let right = [col(&b, n, j), col(&db, n, j)].concat();
+        let (value, size) = exact(&left, &right)?;
+        worst[0] = worst[0].max((dc[i * n + j] - value).abs() / (gamma(2 * k) * size));
+    }
+    for p in 0..k {
+        // Ā_ip = Σ_j W_ij B_pj, n terms.
+        let (value, size) = exact(&row(&w, n, i), &row(&b, n, p))?;
+        worst[1] = worst[1].max((bars[i * k + p] - value).abs() / (gamma(n) * size));
+    }
+}
+for p in 0..k {
+    for j in 0..n {
+        // B̄_pj = Σ_i A_ip W_ij, m terms.
+        let (value, size) = exact(&col(&a, k, p), &col(&w, n, j))?;
+        let ad = bars[m * k + p * n + j];
+        worst[2] = worst[2].max((ad - value).abs() / (gamma(m) * size));
+    }
+}
+let errors = vec![
+    ("dC = dA·B + A·dB", 2 * k, worst[0]),
+    ("Ā = W·Bᵀ", n, worst[1]),
+    ("B̄ = Aᵀ·W", m, worst[2]),
+];
+
+// Identity ⟨dC, W⟩ = ⟨dA, Ā⟩ + ⟨dB, B̄⟩ and sum S of absolute terms in the triple sum.
+let lhs = checked_sum_of_products(&dc, &w).map_err(|e| e.to_string())?;
+let rhs = checked_sum_of_products(&direction, &bars).map_err(|e| e.to_string())?;
+let mut scale = 0.0;
+for i in 0..m {
+    for j in 0..n {
+        for p in 0..k {
+            let terms =
+                (da[i * k + p] * b[p * n + j]).abs() + (a[i * k + p] * db[p * n + j]).abs();
+            scale += w[i * n + j].abs() * terms;
+        }
+    }
+}
+let summary = vec![(
+    words,
+    1 + m * k + k * n + m * n * (2 * k + 2),
+    lhs,
+    rhs,
+    (lhs - rhs).abs() / (u * scale),
+)];
+
+let digits = serde_json::json!({ "significantDigits": 16 });
+let fixed3 = serde_json::json!({ "fractionDigits": 3 });
+let summary_columns = serde_json::json!([
+    { "key": "0", "label": "Recorded words [words]", "type": "integer" },
+    { "key": "1", "label": "1 + mk + kn + mn(2k + 2) [words]", "type": "integer" },
+    { "key": "2", "label": "⟨dC, W⟩ [-]", "type": "number", "format": digits },
+    { "key": "3", "label": "⟨dA, Ā⟩ + ⟨dB, B̄⟩ [-]", "type": "number", "format": digits },
+    { "key": "4", "label": "|Difference between sides| / (u S) [-]", "type": "number", "format": fixed3 }
+]);
+emit_table_with_columns!(
+    summary_columns,
+    summary,
+    metadata = serde_json::json!({ "id": "summary" })
+);
+let error_columns = serde_json::json!([
+    { "key": "0", "label": "Quantity" },
+    { "key": "1", "label": "Summand count N", "type": "integer" },
+    { "key": "2", "label": "max |AD − reference| / (γ_N Σ|term|) [-]", "type": "number", "format": fixed3 }
+]);
+emit_table_with_columns!(
+    error_columns,
+    errors,
+    metadata = serde_json::json!({ "id": "errors" })
+);
+```
+
+With defaults $m = 3$, $k = 8$ and $n = 2$, recorded word count is 149, matching formula $1 + mk + kn + mn(2k + 2)$.
+This shows that the six $C$ components each recorded one `dot` statement.
+Error ratios are 0.032 for $\dot C$, 0.79 for $\bar A$ and 0.56 for $\bar B$, all within bound $\gamma_N \sum|\text{term}|$.
+Each $\bar A$ component sums two terms, with few roundings and no opportunity for cancellation, so the ratio is close to 1.
+For $\dot C$, a 16-term sum, bound $\gamma_N$ grows with term count, but actual rounding errors cancel each other, giving a ratio far below the bound.
+The two sides of the identity are $-2.554543701983218$ and $-2.5545437019832185$, differing by $0.30\,uS$.
+
+At $k = 32$, word count grows to 557 and the $\dot C$ sum contains 64 terms, but the error ratio remains 0.017 and the identity's two sides agree bit for bit.
+At $m = 8$ and $n = 1$, this is a matrix-vector product; $\bar A_{ip} = W_i B_p$ is a single product and therefore correctly rounded, giving ratio 0.
+
+## Summary
+
+Writing logarithmic sums and normalization with `logsumexp`, `softmax_into` and `log_softmax_into` shifts by the maximum base value to avoid overflow; the shift is undifferentiated, so derivatives equal those of the unshifted function.
+Setting excluded elements to $-\infty$ masks them, making their probabilities and the derivatives of `logsumexp` and softmax with respect to them 0.
+All-masked `softmax_into` and `log_softmax_into` return `DomainError`, so branch beforehand for inputs where every element may be masked.
+Writing matrix products with `dot`, `gemv_into` and `gemm_into` records one statement per component; a tape recording only $C = AB$ consists of $1 + mk + kn + mn(2k + 2)$ words and $2mnk$ partial derivatives.
+The adjoints are $\bar A = W B^{\mathsf T}$ and $\bar B = A^{\mathsf T} W$; computing $\langle \dot C, W \rangle = \langle \dot A, \bar A \rangle + \langle \dot B, \bar B \rangle$ checks JVP/VJP consistency.
+
+## Further reading
+
+- [Second derivatives and Hessian operators](../second-order-derivatives/): examine passing JVPs and VJPs to iterative solvers as matrix-free operators.
+- [Differentiating linear solves and factorizations](../linear-solutions/): examine linear-solve and factorization adjoints using the same reasoning as matrix products.
+- [JVP and VJP duality](../../examples/jvp-vjp-duality/): examine an example applying the adjoint identity to general functions.

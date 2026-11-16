@@ -1,0 +1,405 @@
+---
+title: エンタルピー表から熱容量を求める
+description: 窒素の Shomate 式から作った不等間隔のエンタルピー表を FiniteDifferenceStencil で微分し、定圧熱容量 Cp とその温度微分 dCp/dT を求めて、Shomate 式の解析的な導関数と表の丸めによる誤差の上界で検算する。
+sidebar:
+  order: 405
+---
+
+熱力学の物性値は、不等間隔の温度で求めた値の表として与えられることが多い。
+定圧でのエンタルピー $H(T)$ の温度についての一階導関数は定圧熱容量 $C_p = (\partial H / \partial T)_p$ で、二階導関数はその温度変化 $\mathrm{d}C_p / \mathrm{d}T$ である。
+この例題では関数を呼べず表の値しかない状況を想定し、`FiniteDifferenceStencil` に表の節点を渡して二つの導関数を求める。
+表を作った式の解析的な導関数を独立な検算に使い、使う節点の数と表の丸めの幅が誤差にどう効くかを確かめる。
+
+## 窒素の Shomate 式とエンタルピー表
+
+NIST Chemistry WebBook は、理想気体の窒素 $\mathrm{N_2}$ の 100–500 K の熱力学関数を Shomate 式で与えている（係数の出典は NIST-JANAF 熱化学表、Chase 1998）。
+$t = T / 1000$（$T$ は K）とおくと、定圧熱容量とエンタルピーは次の式になる。
+
+$$
+C_p = A + B t + C t^2 + D t^3 + \frac{E}{t^2} \quad [\mathrm{J/(mol \cdot K)}],
+$$
+
+$$
+H - H_{298.15} = A t + \frac{B}{2} t^2 + \frac{C}{3} t^3 + \frac{D}{4} t^4 - \frac{E}{t} + F - H_0 \quad [\mathrm{kJ/mol}].
+$$
+
+$H_{298.15}$ は 298.15 K のエンタルピー、$H_0$ は NIST の表で $H$ と書かれる定数である。
+係数は $A = 28.98641$、$B = 1.853978$、$C = -9.647459$、$D = 16.63537$、$E = 0.000117$、$F = -8.671914$、$H_0 = 0$ である。
+この係数では $C_p(298.15\,\mathrm{K}) = 29.124\,\mathrm{J/(mol \cdot K)}$、$H(500\,\mathrm{K}) - H_{298.15} = 5.911\,\mathrm{kJ/mol}$ になる。
+$C_p$ を $T$ で微分すると、$\mathrm{d}t/\mathrm{d}T = 1/1000$ から次の式が得られる。
+
+$$
+\frac{\mathrm{d}C_p}{\mathrm{d}T} = \frac{1}{1000} \left( B + 2 C t + 3 D t^2 - \frac{2E}{t^3} \right) \quad [\mathrm{J/(mol \cdot K^2)}].
+$$
+
+この $C_p$ と $\mathrm{d}C_p/\mathrm{d}T$ は、差分とは独立に導いた検算用の値である。
+
+表の温度は 298.15 K の標準温度を含む次の 9 点の不等間隔とする。
+
+$$
+T = 200,\ 250,\ 280,\ 298.15,\ 300,\ 350,\ 400,\ 450,\ 500 \ \mathrm{K}.
+$$
+
+298.15 K と 300 K の 2 点は 1.85 K しか離れておらず、ほかの間隔は 18.15–50 K である。
+表の値は Shomate 式のエンタルピーを幅 $\delta$ の格子に丸めたもので、$\delta$ は 0（丸めない）、0.001 kJ/mol、0.01 kJ/mol から選ぶ。
+$\delta = 0.001\,\mathrm{kJ/mol}$ は小数点以下 3 桁の kJ/mol の表にあたる。
+$H$ の単位は kJ/mol、$C_p$ の単位は J/(mol·K) なので、差分の結果に 1000 を掛けて単位をそろえる。
+
+次のブロックは二つのセルが共有する定義である。
+`enthalpy` が表を作る $H - H_{298.15}$、`heat_capacity` と `heat_capacity_slope` が検算用の $C_p$ と $\mathrm{d}C_p/\mathrm{d}T$、`tabulated_enthalpy` が幅 $\delta$ で丸めた表の値に対応する。
+`nearest_nodes` は評価温度 $T_0$ に近い順に $k$ 点を選び、温度の昇順に並べた表の添字を返す。
+どれも f64 の四則演算と固有メソッドだけで書いた、表の値と参照値を作るための関数である。
+
+```rust
+//| id: differentiate-heat-capacity-model
+//| kind: definitions
+//| title: 窒素の Shomate 式と不等間隔のエンタルピー表
+/// NIST Chemistry WebBook の N₂（気体、100–500 K）の Shomate 係数 A, B, C, D, E, F。H₀ = 0。
+const SHOMATE: [f64; 6] = [28.98641, 1.853978, -9.647459, 16.63537, 0.000117, -8.671914];
+
+/// 表の温度 [K]。298.15 K と 300 K の間隔だけが 1.85 K と狭い。
+pub(crate) const TABLE_TEMPERATURES: [f64; 9] = [
+    200.0, 250.0, 280.0, 298.15, 300.0, 350.0, 400.0, 450.0, 500.0,
+];
+
+/// H(T) − H(298.15 K) [kJ/mol]。表の値を作る式。
+pub(crate) fn enthalpy(temperature: f64) -> f64 {
+    let [a, b, c, d, e, f] = SHOMATE;
+    let t = temperature / 1000.0;
+    a * t + b / 2.0 * t * t + c / 3.0 * t.powi(3) + d / 4.0 * t.powi(4) - e / t + f
+}
+
+/// 検算用の Cp(T) [J/(mol·K)]。
+pub(crate) fn heat_capacity(temperature: f64) -> f64 {
+    let [a, b, c, d, e, _] = SHOMATE;
+    let t = temperature / 1000.0;
+    a + b * t + c * t * t + d * t.powi(3) + e / (t * t)
+}
+
+/// 検算用の dCp/dT [J/(mol·K²)]。
+pub(crate) fn heat_capacity_slope(temperature: f64) -> f64 {
+    let [_, b, c, d, e, _] = SHOMATE;
+    let t = temperature / 1000.0;
+    (b + 2.0 * c * t + 3.0 * d * t * t - 2.0 * e / t.powi(3)) / 1000.0
+}
+
+/// 幅 δ [kJ/mol] の格子に丸めた表の値。δ = 0 なら丸めない。
+pub(crate) fn tabulated_enthalpy(rounding: f64) -> Vec<f64> {
+    TABLE_TEMPERATURES
+        .iter()
+        .map(|&temperature| {
+            let value = enthalpy(temperature);
+            if rounding > 0.0 {
+                (value / rounding).round() * rounding
+            } else {
+                value
+            }
+        })
+        .collect()
+}
+
+/// T0 に近い順に k 点を選び、温度の昇順に並べた表の添字。距離が等しければ低温側を先に選ぶ。
+pub(crate) fn nearest_nodes(t0: f64, count: usize) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..TABLE_TEMPERATURES.len()).collect();
+    order.sort_by(|&i, &j| {
+        let (left, right) = (TABLE_TEMPERATURES[i] - t0, TABLE_TEMPERATURES[j] - t0);
+        left.abs().total_cmp(&right.abs())
+    });
+    let mut chosen = order[..count.min(order.len())].to_vec();
+    chosen.sort_unstable();
+    chosen
+}
+```
+
+## 節点の選び方と誤差の上界
+
+[`FiniteDifferenceStencil`](https://docs.rs/scioxide-differentiate/0.1.0/scioxide_differentiate/struct.FiniteDifferenceStencil.html)`::new(T0, nodes, m)` は、節点 $T_j$ での値から $T_0$ での $m$ 階導関数を近似する重みを Fornberg の漸化式で作る。
+近似は次の形の重み付き和である。
+
+$$
+H^{(m)}(T_0) \approx \sum_j w_j H(T_j), \qquad w_j = \frac{\hat w_j}{s^m}, \qquad s = \max_j \lvert T_j - T_0 \rvert .
+$$
+
+$\hat w_j$ は正規化した変位 $(T_j - T_0)/s$ に対する重み、$w_j$ は物理単位（K⁻ᵐ）の重みである。
+$k$ 点の公式は次数 $k - 1$ 以下の多項式で厳密で、打ち切り誤差は節点の広がりを $\Delta$ として $O(\Delta^{k - m})$ になる。
+重みの計算は $O(k^2(m + 1))$ 回、`apply` による和は $O(k)$ 回の演算である。
+$m$ が節点の数 $k$ 以上なら `InvalidInput`（`OutOfRange`）、同じ節点が 2 つあれば `InvalidInput`（`Inconsistent`）を返す。
+
+`FiniteDifferenceStencil` は渡された節点をそのまま使い、節点を選び直さない。
+この例題では、呼び出し側が評価温度 $T_0$ に近い順に $k$ 点を選ぶ。
+$T_0 = 500\,\mathrm{K}$ のように表の端では、選んだ節点はすべて $T_0$ 以下にあり、片側の公式になる。
+
+表の値の丸め誤差は 1 点あたり $\delta/2$ 以下なので、導関数の誤差のうち丸めによる部分は次のように抑えられる（[重みの絶対値の和とノイズの拡大](oxref:differentiate-noise-amplification)）。
+
+$$
+\Bigl\lvert \sum_j w_j e_j \Bigr\rvert \le \frac{\delta}{2} \sum_j \lvert w_j \rvert = \frac{\delta}{2} \cdot \frac{A_w}{s^m}, \qquad \lvert e_j \rvert \le \frac{\delta}{2} .
+$$
+
+$A_w = \sum_j \lvert \hat w_j \rvert$ は `weight_amplification()`、$s$ は `scale()` が返す。
+全体の誤差は打ち切り誤差とこの丸めの上界の和を超えない。
+近い 2 点 298.15 K と 300 K を両方含むと、その 2 点の差を 1.85 K で割る形の大きな重みが現れ、丸めの影響が強まる。
+
+## 評価温度での熱容量とその温度微分
+
+次のセルは評価温度 $T_0$、節点の数 $k$、丸めの幅 $\delta$ を選び、同じ節点で一階と二階のステンシルを作って $C_p$ と $\mathrm{d}C_p/\mathrm{d}T$ を求める。
+1 つ目の表は選んだ節点、表の値、物理単位の重み $w_j$ を示す。
+重みは $\mathrm{d}H/\mathrm{d}T$ と $\mathrm{d}^2H/\mathrm{d}T^2$ に対するもので、J/(mol·K) への換算の係数 1000 は含まない。
+2 つ目の表は二つの量のステンシルの値を Shomate 式の解析値と比べ、丸めによる誤差の上界 $1000 \cdot (\delta/2) \sum_j \lvert w_j \rvert$ と、誤差と上界の比を示す。
+丸めない表では上界が 0 なので、比は示さない。
+
+```rust
+//| id: differentiate-heat-capacity-stencil
+//| ref: differentiate-heat-capacity-stencil
+//| title: 不等間隔のエンタルピー表からの熱容量と熱容量の温度微分
+//| run: reactive
+//| uses: [differentiate-heat-capacity-model]
+//| crates: [scioxide-core, scioxide-differentiate]
+//| inputs:
+//|   t0: {"type":"range","label":"評価温度 T0 [K]","description":"導関数を求める温度。表の端の 500 K では片側の公式になる。","min":220,"max":500,"step":20,"value":300}
+//|   node_count: {"type":"range","label":"使う節点の数 k","description":"T0 に近い順に選ぶ表の点の数。","min":3,"max":7,"step":1,"value":5}
+//|   rounding: {"type":"select","label":"表の丸めの幅 δ [kJ/mol]","options":["なし","0.001","0.01"],"value":"なし"}
+//| cases:
+//|   - {"id":"table-end","label":"T0 = 500 K","description":"節点がすべて低温側にある片側の公式になり、丸めなしでも誤差が増える。","inputs":{"t0":500}}
+//|   - {"id":"coarse-rounding","label":"δ = 0.01 kJ/mol","description":"丸めの誤差が打ち切り誤差を上回り、dCp/dT の符号まで変わる。誤差は丸めの上界の内側にある。","inputs":{"rounding":"0.01"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"nodes","path":"/rows/2/0","approx":{"value":298.15,"atol":1e-9}}
+//|       - {"artifact":"summary","path":"/rows/0/1","approx":{"value":29.12478708,"atol":1e-6}}
+//|       - {"artifact":"summary","path":"/rows/0/3","range":{"max":1e-7}}
+//|       - {"artifact":"summary","path":"/rows/1/1","approx":{"value":5.48386e-4,"rtol":1e-4}}
+//|       - {"artifact":"summary","path":"/rows/0/5","equals":null}
+//|   - case: table-end
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/1","approx":{"value":29.5814235,"atol":1e-4}}
+//|       - {"artifact":"summary","path":"/rows/0/3","range":{"min":1e-7,"max":1e-4}}
+//|   - case: coarse-rounding
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/3","range":{"min":0.5}}
+//|       - {"artifact":"summary","path":"/rows/0/5","range":{"max":1}}
+//|       - {"artifact":"summary","path":"/rows/1/1","range":{"max":0}}
+//|       - {"artifact":"summary","path":"/rows/1/5","range":{"max":1}}
+use scioxide_differentiate::FiniteDifferenceStencil;
+
+let delta: f64 = if rounding == "なし" {
+    0.0
+} else {
+    rounding.parse().map_err(|_| "丸めの幅を読めない")?
+};
+let chosen = nearest_nodes(t0, node_count as usize);
+let table = tabulated_enthalpy(delta);
+let nodes: Vec<f64> = chosen.iter().map(|&i| TABLE_TEMPERATURES[i]).collect();
+let values: Vec<f64> = chosen.iter().map(|&i| table[i]).collect();
+// 同じ節点で一階（dH/dT）と二階（d²H/dT²）の重みを作る。
+let first = FiniteDifferenceStencil::new(t0, &nodes, 1).map_err(|e| e.to_string())?;
+let second = FiniteDifferenceStencil::new(t0, &nodes, 2).map_err(|e| e.to_string())?;
+let first_weights = first.weights().map_err(|e| e.to_string())?;
+let second_weights = second.weights().map_err(|e| e.to_string())?;
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let sci7 = serde_json::json!({ "notation": "scientific", "significantDigits": 7 });
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let fixed6 = serde_json::json!({ "fractionDigits": 6 });
+let node_columns = serde_json::json!([
+    { "key": "0", "label": "節点 T_j [K]", "type": "number", "format": fixed2 },
+    { "key": "1", "label": "表の値 H_j [kJ/mol]", "type": "number", "format": fixed6 },
+    { "key": "2", "label": "dH/dT の重み w_j [K⁻¹]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "d²H/dT² の重み w_j [K⁻²]", "type": "number", "format": sci3 }
+]);
+let node_rows: Vec<(f64, f64, f64, f64)> = (0..nodes.len())
+    .map(|j| (nodes[j], values[j], first_weights[j], second_weights[j]))
+    .collect();
+emit_table_with_columns!(
+    node_columns,
+    node_rows,
+    metadata = serde_json::json!({ "id": "nodes" })
+);
+
+let mut rows: Vec<(&str, f64, f64, f64, f64, Option<f64>)> = Vec::new();
+for (name, stencil, exact) in [
+    ("Cp [J/(mol·K)]", &first, heat_capacity(t0)),
+    ("dCp/dT [J/(mol·K²)]", &second, heat_capacity_slope(t0)),
+] {
+    // kJ/mol の表から求めた導関数を J/mol の単位に直す。
+    let value = 1000.0 * stencil.apply(&values).map_err(|e| e.to_string())?;
+    let order = stencil.derivative_order() as i32;
+    // 丸めの上界 1000 (δ/2) Σ|w_j|、Σ|w_j| = A_w / s^m。
+    let bound =
+        1000.0 * delta / 2.0 * stencil.weight_amplification() / stencil.scale().powi(order);
+    let error = (value - exact).abs();
+    rows.push((
+        name,
+        value,
+        exact,
+        error,
+        bound,
+        (bound > 0.0).then(|| error / bound),
+    ));
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "量 [単位]" },
+    { "key": "1", "label": "ステンシルの値", "type": "number", "format": sci7 },
+    { "key": "2", "label": "Shomate 式の値", "type": "number", "format": sci7 },
+    { "key": "3", "label": "誤差", "type": "number", "format": sci3 },
+    { "key": "4", "label": "丸めによる誤差の上界", "type": "number", "format": sci3 },
+    { "key": "5", "label": "誤差 / 上界 [-]", "type": "number", "format": sci3, "nullText": "上界 0" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "summary" })
+);
+```
+
+既定の $T_0 = 300\,\mathrm{K}$、$k = 5$、丸めなしでは、節点は 250、280、298.15、300、350 K になる。
+$C_p$ の誤差は $1.6 \times 10^{-8}\,\mathrm{J/(mol \cdot K)}$、$\mathrm{d}C_p/\mathrm{d}T$ の誤差は $1.9 \times 10^{-8}\,\mathrm{J/(mol \cdot K^2)}$ である。
+誤差の絶対値は同じ程度だが、$\mathrm{d}C_p/\mathrm{d}T = 5.48 \times 10^{-4}$ は小さいので、相対誤差は $C_p$ の $5.7 \times 10^{-10}$ に対して $3.5 \times 10^{-5}$ と大きい。
+重みの表では、$\mathrm{d}H/\mathrm{d}T$ に対する 298.15 K と 300 K の重みが $-0.596$ と $0.591\,\mathrm{K^{-1}}$ で、ほかの節点の重み（絶対値 $0.007\,\mathrm{K^{-1}}$ 以下）より 2 桁大きい。
+
+$\delta = 0.01\,\mathrm{kJ/mol}$ に丸めると、$C_p$ は 2.30 J/(mol·K) ずれ、$\mathrm{d}C_p/\mathrm{d}T$ は $-0.216\,\mathrm{J/(mol \cdot K^2)}$ と符号まで逆になる。
+どちらの誤差も丸めの上界の内側にあり、誤差と上界の比は 0.39 と 0.36 である。
+$T_0 = 500\,\mathrm{K}$ では節点がすべて低温側に並ぶ片側の公式になり、丸めなしでも $C_p$ の誤差は $10^{-6}$ の大きさに増える。
+
+## 評価温度による誤差の変化
+
+次のセルは $T_0$ を 210 K から 490 K まで 10 K ごとに動かし、$k = 3, 5, 7$ のステンシルで求めた $C_p$ の誤差を描く。
+近い順に選ぶ節点の組は $T_0$ とともに切り替わるので、誤差は $T_0$ に対して滑らかには変わらない。
+縦の点線は表の温度である。
+近い順に選ぶ $k$ 点の組は、$T_0$ が 2 つの表の温度の中点を越えるところで切り替わる。
+表は $k$ ごとの最大の誤差とその評価温度、誤差を誤差の上界で割った比の最大値を示す。
+ここでの誤差の上界は丸めない表での誤差（打ち切り誤差）と丸めの上界 $1000 \cdot (\delta/2) \sum_j \lvert w_j \rvert$ の和で、比は 1 を超えないはずである。
+誤差がちょうど 0 になった点は対数軸に描けないので除き、件数を表に示す。
+
+```rust
+//| id: differentiate-heat-capacity-sweep
+//| ref: differentiate-heat-capacity-sweep
+//| title: 評価温度と節点の数による熱容量の誤差の変化
+//| run: reactive
+//| uses: [differentiate-heat-capacity-model]
+//| crates: [scioxide-core, scioxide-differentiate]
+//| inputs:
+//|   rounding: {"type":"select","label":"表の丸めの幅 δ [kJ/mol]","options":["なし","0.001","0.01"],"value":"0.001"}
+//| cases:
+//|   - {"id":"exact-table","label":"丸めなし","description":"打ち切り誤差だけが残り、節点を増やすほど誤差が小さくなる。","inputs":{"rounding":"なし"}}
+//|   - {"id":"coarse-rounding","label":"δ = 0.01 kJ/mol","description":"丸めの誤差が支配し、どの k でも誤差は熱容量の 1 割を超える。","inputs":{"rounding":"0.01"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"worst","path":"/rows/2/1","range":{"min":0.3,"max":1}}
+//|       - {"artifact":"worst","path":"/rows/2/2","approx":{"value":230,"atol":1e-9}}
+//|       - {"artifact":"worst","path":"/rows/0/3","range":{"max":1}}
+//|       - {"artifact":"worst","path":"/rows/2/3","range":{"max":1}}
+//|   - case: exact-table
+//|     expect:
+//|       - {"artifact":"worst","path":"/rows/2/1","range":{"max":1e-5}}
+//|       - {"artifact":"worst","path":"/rows/0/3","equals":null}
+//|   - case: coarse-rounding
+//|     expect:
+//|       - {"artifact":"worst","path":"/rows/0/1","range":{"min":2.9}}
+//|       - {"artifact":"worst","path":"/rows/2/3","range":{"max":1}}
+use scioxide_differentiate::FiniteDifferenceStencil;
+
+let delta: f64 = if rounding == "なし" {
+    0.0
+} else {
+    rounding.parse().map_err(|_| "丸めの幅を読めない")?
+};
+let table = tabulated_enthalpy(delta);
+let exact_table = tabulated_enthalpy(0.0);
+let mut series = Vec::new();
+let mut rows: Vec<(String, f64, f64, Option<f64>, usize)> = Vec::new();
+for k in [3_usize, 5, 7] {
+    let mut points = Vec::new();
+    let (mut worst, mut worst_t0, mut ratio, mut skipped) = (0.0_f64, 0.0, 0.0_f64, 0);
+    for step in 0..=28 {
+        let t0 = 210.0 + 10.0 * f64::from(step);
+        let chosen = nearest_nodes(t0, k);
+        let nodes: Vec<f64> = chosen.iter().map(|&i| TABLE_TEMPERATURES[i]).collect();
+        let stencil = FiniteDifferenceStencil::new(t0, &nodes, 1).map_err(|e| e.to_string())?;
+        let derivative = |source: &[f64]| {
+            let values: Vec<f64> = chosen.iter().map(|&i| source[i]).collect();
+            stencil.apply(&values).map(|v| 1000.0 * v)
+        };
+        let error = (derivative(&table).map_err(|e| e.to_string())? - heat_capacity(t0)).abs();
+        // 丸めない表での誤差が打ち切り誤差。全体の誤差はこれと丸めの上界の和を超えない。
+        let truncation =
+            (derivative(&exact_table).map_err(|e| e.to_string())? - heat_capacity(t0)).abs();
+        let bound = 1000.0 * delta / 2.0 * stencil.weight_amplification() / stencil.scale();
+        if bound > 0.0 {
+            ratio = ratio.max(error / (truncation + bound));
+        }
+        if error > worst {
+            (worst, worst_t0) = (error, t0);
+        }
+        if error > 0.0 {
+            points.push([t0, error]);
+        } else {
+            skipped += 1;
+        }
+    }
+    let ratio = (delta > 0.0).then_some(ratio);
+    rows.push((format!("k = {k}"), worst, worst_t0, ratio, skipped));
+    series.push(serde_json::json!({
+        "name": format!("k = {k}"),
+        "points": points,
+        "style": { "showSymbol": true }
+    }));
+}
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed3 = serde_json::json!({ "fractionDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "節点の数" },
+    { "key": "1", "label": "最大の誤差 [J/(mol·K)]", "type": "number", "format": sci3 },
+    { "key": "2", "label": "最大の誤差の T0 [K]", "type": "number", "format": { "fractionDigits": 0 } },
+    { "key": "3", "label": "誤差 / 上界の最大 [-]", "type": "number", "format": fixed3, "nullText": "丸めなし" },
+    { "key": "4", "label": "誤差 0 で除いた点 [点]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "worst" })
+);
+// 表の温度を縦の点線で示す。
+let annotations: Vec<_> = TABLE_TEMPERATURES
+    .iter()
+    .map(|&t| {
+        serde_json::json!({
+            "kind": "line",
+            "axis": "x",
+            "value": t,
+            "style": { "lineType": "dotted" }
+        })
+    })
+    .collect();
+emit_line_chart!(
+    &series,
+    options = &serde_json::json!({
+        "xLabel": "評価温度 T0 [K]",
+        "yLabel": "Cp の絶対誤差 [J/(mol·K)]",
+        "yType": "log",
+        "xMin": 200.0,
+        "xMax": 500.0,
+        "annotations": annotations
+    })
+);
+```
+
+既定の $\delta = 0.001\,\mathrm{kJ/mol}$ では、どの $k$ でも最大の誤差は 298.15 K と 300 K の近い 2 点を含む節点の組で生じる。
+$k = 3$ では 310 K で 0.17 J/(mol·K)、$k = 7$ では 230 K で 0.61 J/(mol·K) に達し、節点を増やしても誤差は小さくならない。
+誤差を誤差の上界で割った比は最大でも 0.79 で、全体の誤差は打ち切り誤差と丸めの上界の和の内側にある。
+丸めなしにすると打ち切り誤差だけが残り、最大の誤差は $k = 3$ の $1.1 \times 10^{-2}$ から $k = 7$ の $7.1 \times 10^{-7}\,\mathrm{J/(mol \cdot K)}$ まで、$k$ とともに小さくなる。
+$\delta = 0.01\,\mathrm{kJ/mol}$ にすると、最大の誤差は 4.3–12 J/(mol·K) に達し、熱容量そのものの 1 割を超える。
+表の値を微分するときは、表の有効数字から丸めの上界を見積もり、近すぎる節点の組は片方を外して重みを小さくする。
+
+## まとめ
+
+不等間隔の表の値の導関数は、呼び出し側が選んだ節点で `FiniteDifferenceStencil` を作り、`apply` に表の値を渡して求める。
+熱容量 $C_p$ は一階、その温度微分 $\mathrm{d}C_p/\mathrm{d}T$ は二階のステンシルで求まり、kJ/mol の表から J/(mol·K) の値を得るには 1000 を掛ける。
+表の丸めによる誤差は `weight_amplification()` と `scale()` から求めた $(\delta/2) \sum_j \lvert w_j \rvert$ で上から抑えられ、近すぎる節点を含むと重みが大きくなって丸めの影響が強まる。
+節点を増やすと打ち切り誤差は減るが、丸めた表では重みの大きい組を含みやすくなり、表の端では片側の公式になるので、誤差が小さくなるとは限らない。
+節点の数は打ち切り誤差の次数と丸めの上界を比べて決め、丸めの上界は表の有効数字から見積もる。
+
+## 次に読むページ
+
+- [差分ステンシルの重みと任意の節点](../../algorithms/stencil-weights/)：不等間隔の節点の重みの作り方と、重みの絶対値の和の意味を確かめる。
+- [丸め誤差・ノイズと最適な刻み幅](oxref:differentiate-table-derivatives)：丸めた表の値から導関数を求めるときに、節点の間隔をどう選ぶかを確かめる。
+- [Arrhenius 式の温度感度を複素ステップで求める](../arrhenius-complex-step/)：関数を呼べる場合に、桁の大きく変わる量を複素ステップ法で微分する例題に進む。

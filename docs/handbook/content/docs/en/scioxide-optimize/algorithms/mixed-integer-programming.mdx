@@ -1,0 +1,337 @@
+---
+title: "Mixed-integer programming and branch and cut"
+description: "Interpret the gap between integer solutions and lower bounds using LP relaxations, branching rules, cutting planes, presolve and search limits."
+sidebar:
+  order: 370
+references:
+  optimize-branch-and-bound-steps: "branchandbound-procedure"
+  optimize-mip-cutting-planes: "cutting-planes"
+---
+
+Integrality conditions turn a continuous feasible region into a discrete set of points.
+Simply rounding a continuous optimum yields neither a feasible integer solution nor the optimal value.
+This page derives branch and cut, which obtains lower bounds from LP relaxation and narrows the gap to integer solutions through branching and cutting planes, and explains the `BranchAndBound` implementation and its results.
+
+## LP relaxation and branch and bound
+
+A linear program with integrality conditions $x_j \in \mathbb{Z}$ ($j\in\mathcal{I}$) on some variables is a mixed-integer linear program (MILP, hereafter MIP).
+MIP is NP-hard in general.
+Removing integrality conditions gives the LP relaxation.
+The relaxed feasible region contains the original region, so for minimization its optimum $z_{\mathrm{LP}}$ is a lower bound on the integer optimum $z_{\mathrm{IP}}$ ($z_{\mathrm{LP}}\le z_{\mathrm{IP}}$).
+Conversely, any feasible integer solution's objective is an upper bound on $z_{\mathrm{IP}}$.
+Branch and bound narrows this difference between lower and upper bounds by subdividing the region (Land and Doig, 1960).
+
+When integer variable $x_i$ takes fractional value $v$ in the relaxation, split the problem into child problems (child nodes) $x_i \le \lfloor v \rfloor$ and $x_i \ge \lceil v \rceil$.
+The children exclude only the strip $\lfloor v\rfloor<x_i<\lceil v\rceil$, eliminating the parent's LP solution without losing any integer solution.
+A child's feasible region is contained in its parent's, so relaxed values cannot decrease down the tree.
+If a node's relaxed value is at least the value of the best integer solution so far (the incumbent), its subtree has no better integer solution and can be pruned.
+
+With incumbent objective $U$ (upper bound) and minimum unprocessed-node relaxation value $L$ (lower bound), the absolute optimality gap is
+
+$$
+\mathrm{Gap} = U - L
+$$
+
+.
+Both good integer solutions lowering $U$ and strong relaxations raising $L$ shorten the search.
+
+## BranchAndBound procedure
+
+The `BranchAndBound` method solves an LP relaxation at each node; because it adds cutting planes, it is also called branch and cut.
+At each node it performs the following steps.
+
+1. Solve the node's LP relaxation by revised simplex.
+   Only variable bounds differ from the parent, so reoptimize from the retained matrix and most recent basis, obtaining the node lower bound from verified dual information.
+2. Prune the node if the relaxation is infeasible or the lower bound is not below the incumbent within tolerance.
+3. If the relaxed solution is nearly integral, independently check the rounded point against original constraints, variable bounds and objective, and accept it as incumbent only if it passes.
+   Also try a round-and-fix repair once per node.
+4. Find valid cutting planes violated by the current relaxed solution, add those passing checks, and reoptimize (see below).
+5. Select a fractional variable by the `MipBranching` rule and create two children.
+
+Process unhandled nodes in increasing lower-bound order (best-bound search).
+Tied nodes follow creation order and tied branching variables use the smallest index, producing the same search tree for the same input.
+Tree search is sequential even if the execution context has a parallel executor.
+
+## Branching rules
+
+The `MipBranching` type chooses the branching variable and is configured with `with_branching`.
+
+- `MostFractional`: select the variable whose fractional part is closest to $1/2$.
+- `Pseudocost`: select the variable with the largest pseudocost score.
+- `Reliability` (default): use strong-branching trial solves for candidates with insufficient pseudocost history, then select by pseudocost score.
+
+For branching variable $x_j$ down (up), pseudocost $\psi_j^-$ ($\psi_j^+$) is the average of the relaxed-value increase divided by displacement $f_j^-=v-\lfloor v\rfloor$ ($f_j^+=\lceil v\rceil-v$).
+The score is $\min(\psi_j^-f_j^-,\ \psi_j^+f_j^+)$, with an unrecorded directional average treated as 1.
+Variables without records therefore score $\min(f_j^-,f_j^+)$, selecting the variable whose fractional part is nearest $1/2$.
+Selecting variables with large degradation in both directions tends to allow early pruning of both children (Achterberg, Koch and Martin, 2005).
+The `Reliability` rule considers up to four candidates in order of proximity of their fractional parts to $1/2$; if either direction has fewer than two records, trial-solve child LPs with at most 32 pivots (strong branching), supplementing records before applying the same score.
+Change candidate count, pivot limit and record count with `strong_candidates`, `strong_iterations` and `reliability` in `MipLimits`; a zero pivot limit disables trial solves.
+
+## Cutting planes
+
+A cutting plane is a linear inequality satisfied by all feasible integer solutions but violated by the current LP relaxation solution.
+Tightening the relaxation raises the lower bound and can reduce node counts compared with branching alone.
+The `MipCutKind` type describes the cutting plane kinds generated by `BranchAndBound`.
+
+- `MipCutKind::IntegerRow` rounds the right-hand side of a row $\sum_ja_jx_j\le b$ containing only integer variables with integer coefficients to $\lfloor b\rfloor$ (reverse the sign of $\ge$ rows before rounding).
+  Since integer solutions have integral left-hand sides, rounding excludes none of them (Chvátal–Gomory rounding).
+- `MipCutKind::BinaryCover` uses a row $\sum_ja_jx_j\le b$ with all binary variables and positive coefficients (sign-reversed for $\ge$ rows) to construct $\sum_{j\in C}x_j\le|C|-1$ from a cover $C$ satisfying $\sum_{j\in C}a_j>b$.
+  Setting all of $C$ to 1 violates the row, so an integer solution must set at least one of $C$ to zero.
+  Build the cover greedily from variables with large relaxed values, then remove redundant variables to make it minimal.
+
+Retain only candidates violating the relaxed solution by more than tolerance and independently check derivation assumptions against original rows before addition.
+Limits are two rounds per node (`cut_rounds`), 128 cuts per solve (`max_cuts`) and 8192 nonzero coefficients in total (`max_cut_nonzeros`).
+Cuts remain only at the node where they were added and its descendants.
+Add only inequalities whose derivation establishes validity for every integer solution, rather than inequalities convenient for a found candidate.
+
+## Presolve and implied bounds
+
+Perform conservative presolve at the root.
+Convert singleton rows to variable bounds, round integer-variable bounds to integers, and eliminate fixed variables.
+Every step is an exact transformation; `MipPresolveMap` retains the map to original coordinates (`reconstruct`, `active_variables`, `original_rows` and `objective_offset`).
+Disable presolve with `with_presolve(false)`.
+
+Before searching, also add outward-rounded implied bounds on unbounded columns from rows where the other terms have finite ranges.
+Node lower bounds come from verified dual certificates, requiring finite bounds on the side determined by reduced-cost signs.
+If a column has no obtainable implied bound, its node lower bound cannot be verified and search may stop with `Stagnation`.
+Supply bounds for variables with known physical limits.
+
+## Interpreting gaps and termination
+
+The `MipResult` result returns `absolute_gap()`, `relative_gap()` and `global_lower_bound()`, plus integrality and feasibility violations (`integrality_violation()`, `primal_feasibility()` and `bound_violation()`).
+The relative gap is $\mathrm{Gap}/\max(1,|U|,|L|)$.
+Node pruning and overall termination use absolute gap tolerance $a$ and relative part $r$ in the test
+
+$$
+U-L\le a+r\max(1,|U|,|L|)
+$$
+
+with `with_relaxation_tolerances`, defaulting to $a=r=10^{-8}$.
+Bounds of nodes pruned by tolerance remain in the global lower bound, so a successful result need not report an exactly zero gap.
+Node bounds are estimates from floating-point-verified dual information, not interval-arithmetic enclosures.
+The `certified_optimality_gap()` field denotes exact-arithmetic proof, so floating-point branch and bound always returns `None`.
+
+Read success using `is_success()`.
+Searches stopped by node, depth or memory limits (`NodeLimit`, `DepthLimit` and `MemoryLimit`), or by `Stagnation`, are unsuccessful.
+In such cases, inspect incumbent availability (`has_incumbent()`) and the gap, then decide whether that gap is acceptable for the application.
+Do not use `x()` as an integer solution when no incumbent exists.
+
+## Controlling the search
+
+The `MipProblem::new(relaxation, integer_variables)` type combines an LP relaxation and integer-variable indices.
+The one-shot `MipProblem::solve()` method uses default `BranchAndBound` (1000 processed nodes, 1000 pivots per relaxation, `Reliability` and presolve enabled); limit-stopped searches return `ConvergenceFailure` errors even if an incumbent exists.
+To inspect incumbent and lower bound after a limit stop, solve with a method object as in `BranchAndBound::default().solve(&problem)`.
+Search limits, workspace, unprocessed nodes, computation counts and replacement relaxation solvers are covered in [Branch-and-cut search state and limits](../branch-and-cut-search/).
+
+## Integrality gap experiment for a knapsack problem
+
+Maximize profit $11 x_A + 18 x_B$ under weight constraint $7 x_A + 11 x_B \le C$ and integer $x_A, x_B \ge 0$ by reversing the objective sign for minimization.
+Weight is measured in kg and profit in points.
+For each capacity $C$, solve the LP relaxation with `SimplexSolver` and the integer problem with `BranchAndBound`, comparing the integer result with an independent exhaustive optimum.
+Profit per weight is $18/11\approx1.636$ for $B$ and $11/7\approx1.571$ for $A$, so the relaxed optimum is $18C/11$, filling only with $B$.
+No variable upper bounds are supplied, but `BranchAndBound` adds implied bounds $x_A\le C/7$ and $x_B\le C/11$ from the weight constraint before search.
+The input is capacity $C$ shown in the detailed table; the plot solves all capacities from $C=0$ to 70.
+The cell stops with an error if any of these 71 cases terminates unsuccessfully.
+
+```rust
+//| id: optimize-knapsack-integrality-gap
+//| ref: optimize-knapsack-integrality-gap
+//| title: "Vary capacity to examine the gap between LP relaxation and integer optimum"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-linalg, scioxide-optimize]
+//| inputs:
+//|   capacity: {"type":"range","label":"Resource capacity C [kg]","description":"Vary the integer-problem capacity shown in detail.","min":5,"max":60,"step":1,"value":35}
+//| cases:
+//|   - {"id":"capacity-60","label":"C = 60 kg","description":"The integer optimum is 95 (x_A = 7, x_B = 1), with integrality gap 3.18 from LP upper bound 98.18; 17 nodes are processed.","inputs":{"capacity":60}}
+//|   - {"id":"capacity-5","label":"C = 5 kg","description":"Neither item fits, giving integer optimum 0 and LP upper bound 8.18. Presolve fixes both variables to zero, so no nodes are processed.","inputs":{"capacity":5}}
+//|   - {"id":"capacity-22","label":"C = 22 kg","description":"The LP solution x_B = 2 is already integral, giving zero gap and termination after one node.","inputs":{"capacity":22}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"selected","path":"/rows/0/1","approx":{"value":57.27272727272727,"atol":1e-9}}
+//|       - {"artifact":"selected","path":"/rows/0/2","approx":{"value":55,"atol":1e-9}}
+//|       - {"artifact":"selected","path":"/rows/0/3","approx":{"value":5,"atol":1e-9}}
+//|       - {"artifact":"selected","path":"/rows/0/4","approx":{"value":0,"atol":1e-9}}
+//|       - {"artifact":"selected","path":"/rows/0/5","equals":55}
+//|       - {"artifact":"selected","path":"/rows/0/8","equals":"Converged"}
+//|       - {"artifact":"selected","path":"/rows/0/9","equals":0}
+//|       - {"artifact":"statistics","path":"/rows/0/0","range":{"min":5,"max":40}}
+//|       - {"path":"/outputs/3/state","equals":"satisfied"}
+//|   - case: capacity-60
+//|     expect:
+//|       - {"artifact":"selected","path":"/rows/0/2","approx":{"value":95,"atol":1e-9}}
+//|       - {"artifact":"selected","path":"/rows/0/6","approx":{"value":3.1818181818181817,"atol":1e-9}}
+//|       - {"artifact":"selected","path":"/rows/0/8","equals":"Converged"}
+//|   - case: capacity-5
+//|     expect:
+//|       - {"artifact":"selected","path":"/rows/0/2","approx":{"value":0,"atol":1e-12}}
+//|       - {"artifact":"selected","path":"/rows/0/6","approx":{"value":8.181818181818182,"atol":1e-9}}
+//|       - {"artifact":"statistics","path":"/rows/0/0","equals":0}
+//|   - case: capacity-22
+//|     expect:
+//|       - {"artifact":"selected","path":"/rows/0/2","approx":{"value":36,"atol":1e-9}}
+//|       - {"artifact":"selected","path":"/rows/0/6","approx":{"value":0,"atol":1e-9}}
+use scioxide_core::Bounds;
+use scioxide_linalg::Matrix;
+use scioxide_optimize::{
+    BranchAndBound, LinearConstraintSense, LinearConstraints, LpProblem, MipProblem,
+    SimplexSolver,
+};
+
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+// Convert profit maximization to minimization: min −11 x_A − 18 x_B, 7 x_A + 11 x_B ≤ C, x ≥ 0.
+let build = |limit: f64| -> Result<LpProblem<f64>, String> {
+    let rows = LinearConstraints::new(
+        Matrix::from_vec(1, 2, vec![7.0, 11.0]).map_err(|e| e.to_string())?,
+        vec![limit],
+        vec![LinearConstraintSense::LessEqual],
+    )
+    .map_err(|e| e.to_string())?;
+    LpProblem::new(vec![-11.0, -18.0])
+        .map_err(|e| e.to_string())?
+        .with_constraints(rows)
+        .map_err(|e| e.to_string())?
+        .with_bounds(Bounds::new(vec![(Some(0.0), None); 2]).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())
+};
+// Independent check: exhaustive integer optimum.
+let enumerate = |limit: i32| -> i32 {
+    (0..=limit / 7)
+        .flat_map(|a| (0..=limit / 11).map(move |b| (a, b)))
+        .filter(|&(a, b)| 7 * a + 11 * b <= limit)
+        .map(|(a, b)| 11 * a + 18 * b)
+        .max()
+        .unwrap_or(0)
+};
+let solve = |limit: i32| -> Result<(f64, scioxide_optimize::MipResult<f64>), String> {
+    let lp = SimplexSolver::<f64>::default()
+        .solve(&build(limit as f64)?)
+        .map_err(|e| e.to_string())?;
+    let mip = BranchAndBound::<f64>::default()
+        .solve(&MipProblem::new(build(limit as f64)?, vec![0, 1]).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    // Do not treat non-convergence as success.
+    if !lp.is_success() || !mip.is_success() {
+        return Err(format!(
+            "C = {limit}: LP {}, MIP {}",
+            lp.termination(),
+            mip.termination()
+        ));
+    }
+    Ok((-lp.fun(), mip))
+};
+let (mut relaxation, mut integer, mut mismatches) = (Vec::new(), Vec::new(), 0_usize);
+for limit in 0..=70 {
+    let (bound, mip) = solve(limit)?;
+    relaxation.push([limit as f64, bound]);
+    integer.push([limit as f64, -mip.fun()]);
+    if (-mip.fun() - enumerate(limit) as f64).abs() > 1.0e-9 {
+        mismatches += 1;
+    }
+}
+emit_line_chart!(
+    &vec![
+        serde_json::json!({
+            "name": "LP relaxation upper bound",
+            "points": relaxation,
+            "style": {"lineType": "dashed"}
+        }),
+        serde_json::json!({
+            "name": "Integer optimum (BranchAndBound)",
+            "points": integer,
+            "style": {"step": "end"}
+        }),
+    ],
+    options = &serde_json::json!({
+        "xLabel": "Resource capacity C [kg]",
+        "yLabel": "Maximum profit [points]",
+        "annotations": [{"kind": "line", "axis": "x", "value": capacity.round(), "label": "Selected C"}]
+    })
+);
+let c = capacity.round() as i32;
+let (bound, mip) = solve(c)?;
+// Add 0.0 to avoid displaying negative zero.
+let selected = vec![(
+    c,
+    bound,
+    0.0 - mip.fun(),
+    mip.x()[0] + 0.0,
+    mip.x()[1] + 0.0,
+    enumerate(c),
+    bound + mip.fun(),
+    mip.absolute_gap(),
+    mip.termination().to_string(),
+    mismatches,
+)];
+let columns = serde_json::json!([
+    { "key": "0", "label": "C [kg]", "type": "integer" },
+    { "key": "1", "label": "LP upper bound [points]", "type": "number", "format": fixed2 },
+    { "key": "2", "label": "Integer optimum [points]", "type": "number", "format": fixed2 },
+    { "key": "3", "label": "x_A [items]", "type": "number", "format": fixed2 },
+    { "key": "4", "label": "x_B [items]", "type": "number", "format": fixed2 },
+    { "key": "5", "label": "Exhaustive optimum [points]", "type": "integer" },
+    { "key": "6", "label": "Integrality gap [points]", "type": "number", "format": fixed2 },
+    { "key": "7", "label": "Reported absolute gap [points]", "type": "number", "format": fixed2, "nullText": "None" },
+    { "key": "8", "label": "Termination reason" },
+    { "key": "9", "label": "Disagreements with enumeration over 0–70 [count]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    selected,
+    metadata = serde_json::json!({ "id": "selected" })
+);
+let stats = mip.statistics();
+let statistics_columns = serde_json::json!([
+    { "key": "0", "label": "Processed nodes [count]", "type": "integer" },
+    { "key": "1", "label": "LP relaxation solves [count]", "type": "integer" },
+    { "key": "2", "label": "Strong-branching probes [count]", "type": "integer" },
+    { "key": "3", "label": "Added cuts [count]", "type": "integer" },
+    { "key": "4", "label": "Round-and-fix repairs [count]", "type": "integer" },
+    { "key": "5", "label": "Simplex iterations [count]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    statistics_columns,
+    vec![(
+        stats.nodes(),
+        stats.relaxations(),
+        stats.probes(),
+        stats.cuts(),
+        stats.repairs(),
+        stats.iterations()
+    )],
+    metadata = serde_json::json!({ "id": "statistics" })
+);
+// The sweep above turns unsuccessful termination into an error, so the selected C search is Converged.
+emit_outcome!(
+    Outcome::satisfied("Branch and bound stopped within the gap tolerance")
+        .status(mip.termination().to_string())
+        .diagnostic("Processed nodes", stats.nodes() as f64, None)
+        .diagnostic("Integrality gap", bound + mip.fun(), None)
+);
+```
+
+At the default $C = 35$ kg, the LP relaxation upper bound is 57.27 and the integer optimum is 55 ($x_A = 5, x_B = 0$), giving integrality gap 2.27.
+The `BranchAndBound` method processes 13 nodes before `Converged`, reports zero absolute gap, and matches the exhaustive optimum.
+It solves 25 LP relaxations, including six strong-branching trials and six round-and-fix repairs.
+No cutting planes are added for this problem.
+At $C = 60$, it reaches 95 ($x_A = 7, x_B = 1$) in 17 nodes, with integrality gap 3.18.
+At $C = 5$, no item fits; the integer optimum is 0 while the LP upper bound is 8.18.
+Implied upper bounds $x_A\le5/7$ and $x_B\le5/11$ round to zero in presolve, fixing both variables, so no nodes are processed.
+For all 71 capacities from $C = 0$ to 70, the `BranchAndBound` optimum matches exhaustive enumeration.
+
+The dashed LP relaxation is linear, the integer optimum is a staircase as capacity increases, and their difference varies in a sawtooth pattern.
+Rounding an LP value does not produce the integer optimum.
+For example, rounding down LP solution $x_B=35/11\approx3.18$ at $C=35$ to $x_B=3$ gives profit 54; the integer optimum 55 instead chooses item $A$.
+
+## Summary
+
+Branch and cut obtains lower bounds from LP relaxation and upper bounds from checked integer solutions, narrowing their difference through branching and cutting planes.
+The default branching rule `Reliability` supplements pseudocosts with strong branching; `MostFractional` and `Pseudocost` perform no trial solves.
+Inspect `is_success()`, `has_incumbent()`, `absolute_gap()` and `relative_gap()` separately; after stops such as `NodeLimit`, judge whether the gap meets application needs.
+Reported gaps are floating-point estimates, and `certified_optimality_gap()` is always `None`.
+Unbounded integer variables may yield `Stagnation` if implied bounds cannot be derived, so provide known physical upper bounds.
+
+## Further reading
+
+Continue to [Branch-and-cut search state and limits](../branch-and-cut-search/) to interpret node-limit stops, or [Selecting finished-product lots with mixed-integer programming](../../examples/integer-production/) to vary resources and node-processing limits in production planning.
+Read [Mixed-integer facility location](../../examples/facility-location/) for binary opening decisions, and [Linear programming and duality](../linear-programming/) for the simplex relaxation solver and dual certificates.

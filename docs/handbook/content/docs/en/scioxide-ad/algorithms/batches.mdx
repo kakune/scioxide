@@ -1,0 +1,919 @@
+---
+title: "Batch evaluation of many items"
+description: "BatchPlan evaluates sums and means of independent items packed into lanes; contracts of BatchFunction and BatchData (tables and BatchDataFn); blocks and groups; deterministic results and error bounds from pairwise summation; choosing value, forward, and reverse modes; standard errors and batch means; one-shot batch_mean and batch_mean_and_grad; jvp_into and hvp_into; workspace and parallel execution."
+sidebar:
+  order: 390
+references:
+  ad-batch-function-and-data: "batchfunction-and-batchdata"
+  ad-batch-plan-blocks: "batchplan-and-blocks"
+  ad-batch-modes: "value-forward-and-reverse-modes"
+  ad-batch-outputs: "outputs-and-estimates"
+  ad-batch-one-shot: "one-shot-means-and-function-providers"
+  ad-batch-directional-products: "directional-derivatives-and-hessianvector-products"
+  ad-batch-workspace: "workspace-and-parallel-execution"
+---
+
+Many computations evaluate the same expression repeatedly from shared parameters $\theta$ and per-item values to obtain a sum or mean and its gradient, including Monte Carlo expectations, mean per-sample losses, and sums of partially separable functions.
+`BatchPlan` packs many independent items into lanes (one SIMD element) in groups of `W`, chooses a numeric type according to whether gradients are requested, and returns bitwise identical results regardless of worker count.
+This page covers writing evaluation functions and data, blocks and summation order, mode selection, standard errors, directional derivatives, and workspace.
+
+## Derivatives of sums and means
+
+For items $i = 0, \dots, n - 1$, evaluate $y_i = f(\theta, a_i, d_i)$ from shared parameters $\theta$, active inputs $a_i$ (per-item values to differentiate), and passive data $d_i$ (values not differentiated), and compute the sum $F = \sum_i y_i$ or mean $\bar F = F/n$.
+Differentiation is linear, so
+
+$$
+\nabla_\theta F = \sum_{i} \nabla_\theta f(\theta, a_i, d_i), \qquad
+\nabla_{a_i} F = \nabla_{a_i} f(\theta, a_i, d_i)
+$$
+
+and the parameter gradient is the sum of per-item gradients, while input gradients are independent for each item.
+
+Suppose there is an intermediate quantity $q$ depending only on parameters, as in $f(\theta, a, d) = h(q(\theta), a, d)$.
+The chain rule gives $\nabla_\theta F = J_q(\theta)^\top \sum_i \bigl(\partial h / \partial q\bigr)^{\!\top}$, so evaluate $q(\theta)$ once, stop per-item reverse sweeps at $q$ and accumulate adjoints, then perform just one final reverse sweep from $q$ to $\theta$.
+
+If $d_i$ are independent samples of a random variable $Z$, $\bar F$ is a Monte Carlo estimator of the expectation $\mathbb{E}[f(\theta, Z)]$, with standard error $s/\sqrt{n}$ using the sample standard deviation $s$.
+$\nabla_\theta \bar F$ is the mean of pathwise derivatives and is an unbiased estimator of $\nabla_\theta \mathbb{E}[f]$ when differentiation and expectation can be interchanged.
+A sufficient condition for interchange is that $f$ is almost surely differentiable in $\theta$ and Lipschitz continuous with an integrable Lipschitz constant.
+Functions such as $\max(S - K, 0)$ whose kinks occur only on a probability-zero set satisfy this condition.
+For discontinuous functions such as $\mathbf{1}\{S > K\}$, the pathwise derivative is zero almost everywhere and cannot estimate the derivative of the expectation.
+
+## `BatchFunction` and `BatchData`
+
+`BatchFunction<S>` is a trait for writing the evaluation function once for numeric types `R: Real<S>`; it requires `Sync` because workers share it.
+
+- `type Shared<R: Real<S>>` is the type of the item-independent intermediate quantity $q(\theta)$.
+- `prepare(parameters)` constructs `Shared<R>` from parameters and is called once per block (defined below).
+- `item(shared, inputs, data)` is called once per group (`W` items), evaluating one item per lane.
+  `inputs` contains active inputs of type `R`; `data` contains passive data of type `R::Base` (`Lanes<S, W>`).
+  Bring data into arithmetic with `R::passive(d)`.
+
+Both methods are generic over numeric types, so the same implementation supports value evaluation (`Lanes`), forward mode (`MultiDual<Lanes, N>`), reverse mode (`Var<Lanes>`), and directional derivatives (`Dual<Lanes>`).
+In unit tests, `prepare` and `item` can be called directly with `f64`.
+Returning an error stops batch evaluation.
+`item` operates on types with lanes, so write value-dependent branches with `select` rather than `if` ([Branches, masks, and table lookup](../control-flow/)).
+
+`BatchData<S>` provides per-item values (active inputs, directions, and passive data) and also requires `Sync`.
+Each item has `width` values; `fill(first, width, column, lanes)` writes value `column` of items `first..first + lanes.len()` into `lanes`.
+Batch evaluation calls it once per value per group, with `column < width` and at most `W` lanes.
+Providers whose same-valued columns for consecutive items are adjacent (overlapping windows of one array or arrays per value) can copy without rearrangement.
+
+Slices `[S]`, `Vec<S>`, and arrays `[S; N]` implement `BatchData` as row-major tables (items × `width`); value `column` of item `i` is element `i·width + column`.
+`column ≥ width` returns `OutOfBounds` (quantity `batch_columns`); insufficient rows return `OutOfBounds` (quantity `batch_rows`).
+When there are no active inputs or data, pass the zero-element array `&[]`.
+`BatchDataFn::new(|first, width, column, lanes| …)` wraps a closure with the same arguments as `fill` as a provider, without performing checks or allocations itself.
+Providers able to generate values from item and column indices, such as random values, can be passed this way without constructing tables ([One-shot means and function providers](#one-shot-means-and-function-providers)).
+
+## `BatchPlan` and blocks
+
+`BatchPlan::<W>::new(items, parameters, inputs, data, reduction, options)` constructs a plan with `items` items, `parameters` shared parameters, and `inputs` active inputs and `data` passive values per item.
+`W` (default 8) is the number of items packed into one `Lanes`.
+`W = 0` returns `InvalidInput` (argument `lanes`, `OutOfRange`); `BatchReduction::Mean` with `items = 0` returns `InvalidInput` (argument `items`, `Empty`).
+
+`BatchReduction` has two forms: `Sum` (default, giving $+0$ for no items) and `Mean`.
+
+Items are partitioned into consecutive blocks, and blocks into groups of `W` items.
+Block size `block()` is the value from `BatchOptions::with_block` (default 256) rounded up to a multiple of `W`; the block count is `blocks()` $= \lceil n / \text{block} \rceil$.
+Missing lanes in the last group repeat the final item and are excluded from all outputs.
+Reverse mode seeds missing lanes with zero.
+
+Each block sums item values in item order; for `Mean` it also computes the mean and sum of squared deviations.
+The calling thread combines block results by block index with pairwise summation (adding neighboring blocks, then adding pairs of those results).
+The summation tree depends only on the block count, not on how blocks are assigned to workers, so estimates, gradients, and errors have the same bits regardless of execution policy or worker count.
+Means and sums of squared deviations are combined with the formulas of Chan, Golub, and LeVeque.
+
+Let block size be $b$ and block count $B$.
+Summing in item order within a block adds at most $b - 1$ roundings, and pairwise block summation adds $\lceil \log_2 B \rceil$ levels; error bounds for sequential and pairwise summation (Higham, §4.2) therefore bound the summation rounding error by
+
+$$
+\Bigl| \widehat{F} - F \Bigr| \le \gamma_k \sum_i |y_i|, \qquad k = b + \lceil \log_2 B \rceil, \qquad \gamma_k = \frac{k\varepsilon}{1 - k\varepsilon}
+$$
+
+where $\varepsilon$ is unit roundoff ([Floating-point numbers and conditioning](../../../concepts/floating-point-and-conditioning/)).
+$k$ is one greater than the number of rounding levels $b - 1 + \lceil \log_2 B \rceil$, so even including rounding from division by $n$ in `Mean`, the mean's error is at most $\gamma_k \sum_i |y_i| / n$.
+Forward-mode gradients sum per-item tangents in the same order and have a bound of the same form.
+Reverse-mode gradients accumulate group adjoints per lane before reversing the shared part, then sum over lanes, so summation order differs from forward mode.
+Per-item values and derivatives themselves have the accuracy of the numeric type.
+
+## Value, forward, and reverse modes
+
+Batch evaluation chooses a numeric type according to whether gradients are requested and the number $m$ of active values (parameters plus inputs).
+Conditions are checked from the top row of the table downward.
+
+| Condition | Item numeric type | `BatchMode` |
+|---|---|---|
+| No gradient requested, or $m = 0$ | `Lanes<S, W>` | `Value` |
+| `KinkPolicy::Error`, `DerivativeMode::Reverse`, or `Auto` with $m > 4$ | `Var<Lanes<S, W>>` | `Reverse` |
+| Either `Auto` or `DerivativeMode::Forward`, with $m \le 4$ | `MultiDual<Lanes<S, W>, m>` | `Forward { tangents: m }` |
+
+`DerivativeMode::Forward` with $m > 4$ returns `InvalidInput` (argument `options.derivative_mode`, `UnsupportedConfiguration`).
+However, `KinkPolicy::Error` selects reverse mode first, avoiding this error.
+Forward mode attaches $m$ tangents to every value and updates them all at each operation, so per-item cost grows with $m$, but no tape is used.
+Reverse-mode cost is a constant multiple of value evaluation independent of $m$, with tape recording and sweeps added.
+
+Reverse mode uses one tape per worker.
+For each block it records parameters and `prepare` once and remembers the recording length.
+For each group it records `item`, reverses to the remembered position to read input adjoints, and rewinds the tape to that position.
+Finally, it reverses the shared part with accumulated adjoints from all groups once and sums parameter gradients over lanes.
+Tape length need only cover the shared part and one group.
+
+In every mode wrappers take their values from primal values, so the estimate `value()` is bitwise identical across value, forward, and reverse modes.
+Gradient summation order differs by mode, giving agreement within rounding.
+In reverse mode, `BatchEstimate::kinks()` returns the count of operations whose active arguments hit kinks, counting once per item lane (once per block for `prepare`).
+Forward mode uses only the kink convention (midpoint) and does not count occurrences.
+
+`KinkPolicy::Error` forces reverse mode.
+The evaluating plan applies its kink policy and byte limit to worker tapes.
+Thus under `KinkPolicy::Error`, active arguments hitting kinks cause `evaluate_into` and `hvp_into` to return `DomainError`.
+`jvp_into` evaluates with dual numbers, uses no tape, and counts no kinks, so this policy has no effect.
+
+Under `NonFinitePolicy::Error`, parameters and directions are checked before evaluation and active inputs when loaded; nonfinite values return `NonFinite` (`Input`).
+Passive data are not checked.
+Estimates, per-item values, gradients, and requested input gradients are checked before writing; nonfinite values return `NonFinite` (`Output`).
+The default `Propagate` writes computed values directly ([Kinks and nonfinite-value policies](../nonsmooth-and-nonfinite-policies/)).
+
+## Outputs and estimates
+
+`evaluate_into(function, parameters, inputs, data, outputs, workspace, context)` writes outputs requested through `BatchOutputs` and returns a `BatchEstimate`.
+Only whether gradients are requested determines whether automatic differentiation is used.
+
+- `with_values(values)` writes per-item $y_i$ (length `items`).
+  The aggregation scale ($1/n$ for the mean) is not applied.
+- `with_parameter_gradient(gradient)` writes the gradient of the reduced value with respect to parameters (length `parameters`).
+- `with_parameter_gradient_error(error)` writes standard errors of gradient components using block batch means (below).
+- `with_input_gradient(gradient)` writes per-item input gradients (row-major `items × inputs`) without applying the aggregation scale.
+
+Inconsistent output lengths return `DimensionMismatch`.
+Outputs are accumulated in workspace and written only after every block succeeds, so errors leave all outputs unchanged.
+Function and data-provider errors are returned unchanged; cancellation of `context` returns `ExecutionStopped`.
+A workspace size or number of active values (parameters plus inputs) not fitting in `usize` returns `SizeOverflow`; failure to grow workspace returns `AllocationFailure`.
+
+`BatchEstimate` contains the following values.
+
+- `value()` is the sum or mean.
+- `standard_error()` is the mean's standard error $s/\sqrt{n}$ ($s^2 = \sum_i (y_i - \bar y)^2/(n - 1)$) for `Mean` with at least two items, and `None` otherwise.
+- `derivative()` is the reduced directional derivative from `jvp_into` and is `None` for `evaluate_into`.
+- `items()` and `blocks()` are item and block counts; `mode()` is the mode used (`BatchMode`).
+- `kinks()` is the reverse-mode kink count, or `None` for value and forward modes.
+
+Per-item parameter gradients are not stored, so gradient standard errors are estimated from block means (batch means).
+Let block $j$ have $n_j$ items and mean gradient $\bar g_j$, with overall mean $\bar g$; the standard error of the mean gradient is
+
+$$
+\mathrm{SE}(\bar g) = \sqrt{\frac{\sum_j n_j (\bar g_j - \bar g)^2}{(B - 1)\,n}}
+$$
+
+and is multiplied by $n$ for `Sum`.
+This assumes block means are approximately independent and identically distributed; the estimator itself varies with $B - 1$ degrees of freedom, so few blocks give a rough standard-error estimate.
+Fewer than two blocks returns `InvalidInput` (argument `outputs.parameter_gradient_error`, `OutOfRange`).
+
+The next two cells evaluate the expectation of the terminal value of geometric Brownian motion at maturity $T$,
+
+$$
+S_T = S_0 \exp\Bigl( \bigl(r - \tfrac{1}{2}\sigma^2\bigr) T + \sigma \sqrt{T}\, Z \Bigr), \qquad Z \sim N(0, 1)
+$$
+
+using standard normal samples $z_i$ in batch evaluation.
+Parameters are $\theta = (S_0, \sigma, r)$ ($S_0$ [JPY], $\sigma$ [1/√year], $r$ [1/year]), with $T = 1$ year.
+`prepare` constructs drift $(r - \sigma^2/2)T$ and diffusion $\sigma\sqrt{T}$; `item` returns $S_0 \exp(\text{drift} + \text{diffusion} \cdot z_i)$.
+The closed form is $\mathbb{E}[S_T] = S_0 e^{rT}$, with $\partial/\partial S_0 = e^{rT}$, $\partial/\partial \sigma = 0$, and $\partial/\partial r = T S_0 e^{rT}$.
+Samples are generated from a seed with `Normal` and `Xoshiro256StarStar` from scioxide-random ([scioxide-random chapter](../../../scioxide-random/)).
+
+```rust
+//| id: ad-batch-forward-model
+//| kind: definitions
+//| title: "Geometric Brownian terminal values and standard normal samples"
+//| crates: [scioxide-ad, scioxide-core, scioxide-random]
+use scioxide_ad::{BatchFunction, Real};
+use scioxide_core::SciOxideError;
+use scioxide_random::{Distribution, Normal, SeedableRng, Xoshiro256StarStar};
+
+/// Terminal value S_T at maturity T [year]. Parameters: [S₀, σ, r]; data: standard normal z.
+pub(crate) struct Terminal {
+    pub(crate) maturity: f64,
+}
+
+/// Path-independent quantities: S₀, drift (r − σ²/2)T, and diffusion σ√T.
+pub(crate) struct Market<R> {
+    spot: R,
+    drift: R,
+    diffusion: R,
+}
+
+impl BatchFunction for Terminal {
+    type Shared<R: Real> = Market<R>;
+    fn prepare<R: Real>(&self, p: &[R]) -> Result<Market<R>, SciOxideError> {
+        let (spot, sigma, rate) = (p[0], p[1], p[2]);
+        Ok(Market {
+            spot,
+            drift: (rate - sigma * sigma * 0.5) * self.maturity,
+            diffusion: sigma * Real::sqrt(self.maturity),
+        })
+    }
+    fn item<R: Real>(&self, m: &Market<R>, _: &[R], z: &[R::Base]) -> Result<R, SciOxideError> {
+        Ok(m.spot * (m.drift + m.diffusion * R::passive(z[0])).exp())
+    }
+}
+
+/// Generate n standard normal samples from seed.
+pub(crate) fn normals(n: usize, seed: u64) -> Result<Vec<f64>, SciOxideError> {
+    let law = Normal::new(0.0, 1.0)?;
+    let mut rng = Xoshiro256StarStar::from_seed(seed);
+    law.sample_n(&mut rng, n)
+}
+```
+
+The first cell evaluates the same plan without gradients, with `DerivativeMode::Auto`, and with `DerivativeMode::Reverse`.
+The first table shows mode, estimate, whether estimate bits match value mode, gradients, and kink count.
+The second compares estimates and gradients with closed forms, showing differences divided by standard errors.
+The estimate's standard error is `standard_error()`; gradient standard errors use batch means (blocks of 256 items).
+As an independent check, it also shows $s/\sqrt{n}$ computed from $S_T$ in `f64` using the same samples.
+
+```rust
+//| id: ad-batch-mean-gradient
+//| ref: ad-batch-mean-gradient
+//| title: "Batch-evaluate terminal-value expectations and gradients in value, forward, and reverse modes"
+//| run: reactive
+//| uses: [ad-batch-forward-model]
+//| crates: [scioxide-ad, scioxide-core, scioxide-random]
+//| inputs:
+//|   paths: {"type":"range","label":"Path count n","description":"Number of standard normal samples z_i.","min":512,"max":16384,"step":512,"value":4096}
+//|   volatility: {"type":"range","label":"Volatility σ [1/√year]","description":"Larger values give heavier S_T tails and larger standard errors.","min":0.1,"max":1,"step":0.05,"value":0.2}
+//|   seed: {"type":"range","label":"Random seed","description":"Xoshiro256StarStar seed.","min":0,"max":99,"step":1,"value":42}
+//| cases:
+//|   - {"id":"other-seed","label":"Seed 7","description":"With different samples, differences still stay within a few standard errors.","inputs":{"seed":7}}
+//|   - {"id":"volatile","label":"σ = 1, n = 16384","description":"Heavier tails increase the standard errors of the estimate and ∂/∂σ.","inputs":{"volatility":1,"paths":16384}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"modes","path":"/rows/1/2","equals":"Match"}
+//|       - {"artifact":"modes","path":"/rows/2/2","equals":"Match"}
+//|       - {"artifact":"modes","path":"/rows/1/0","equals":"Forward (tangent count: 3)"}
+//|       - {"artifact":"modes","path":"/rows/2/6","equals":0}
+//|       - {"artifact":"modes","path":"/rows/0/3","equals":null}
+//|       - {"artifact":"estimates","path":"/rows/0/2","approx":{"value":0.32701484276112736,"rtol":1e-9}}
+//|       - {"artifact":"estimates","path":"/rows/0/5","approx":{"value":0.32701484276112736,"rtol":1e-9}}
+//|       - {"artifact":"estimates","path":"/rows/0/4","range":{"min":-4,"max":4}}
+//|       - {"artifact":"estimates","path":"/rows/2/4","range":{"min":-4,"max":4}}
+//|   - case: other-seed
+//|     expect:
+//|       - {"artifact":"modes","path":"/rows/2/2","equals":"Match"}
+//|       - {"artifact":"estimates","path":"/rows/0/4","range":{"min":-4,"max":4}}
+//|       - {"artifact":"estimates","path":"/rows/2/4","range":{"min":-4,"max":4}}
+//|   - case: volatile
+//|     expect:
+//|       - {"artifact":"estimates","path":"/rows/0/2","range":{"min":0.5,"max":2}}
+//|       - {"artifact":"estimates","path":"/rows/0/4","range":{"min":-4,"max":4}}
+//|       - {"artifact":"estimates","path":"/rows/2/4","range":{"min":-4,"max":4}}
+use scioxide_ad::{
+    BatchMode, BatchOptions, BatchOutputs, BatchPlan, BatchReduction, DerivativeMode,
+};
+use scioxide_core::ExecutionContext;
+
+let n = paths as usize;
+let z = normals(n, seed as u64).map_err(|e| e.to_string())?;
+let (spot, rate, maturity) = (100.0, 0.03, 1.0);
+let model = Terminal { maturity };
+let theta = [spot, volatility, rate];
+let cx = ExecutionContext::sequential();
+let runs = [
+    (false, DerivativeMode::Auto),
+    (true, DerivativeMode::Auto),
+    (true, DerivativeMode::Reverse),
+];
+let (mut rows, mut reference_bits, mut results) = (Vec::new(), None, Vec::new());
+for (wanted, mode) in runs {
+    let options = BatchOptions::new().with_derivative_mode(mode);
+    let plan = BatchPlan::<8>::new(n, 3, 0, 1, BatchReduction::Mean, options)
+        .map_err(|e| e.to_string())?;
+    let mut workspace = plan.workspace(1).map_err(|e| e.to_string())?;
+    let (mut gradient, mut error) = ([0.0; 3], [0.0; 3]);
+    let outputs = if wanted {
+        BatchOutputs::new()
+            .with_parameter_gradient(&mut gradient)
+            .with_parameter_gradient_error(&mut error)
+    } else {
+        BatchOutputs::new()
+    };
+    let estimate = plan
+        .evaluate_into(&model, &theta, &[], &z, outputs, &mut workspace, cx)
+        .map_err(|e| e.to_string())?;
+    let name = match estimate.mode() {
+        BatchMode::Value => "Value only (Lanes<f64, 8>)".to_string(),
+        BatchMode::Forward { tangents } => format!("Forward (tangent count: {tangents})"),
+        BatchMode::Reverse => "Reverse (Var<Lanes<f64, 8>>)".to_string(),
+    };
+    let bits = estimate.value().to_bits();
+    let same = if *reference_bits.get_or_insert(bits) == bits {
+        "Match"
+    } else {
+        "Mismatch"
+    };
+    let g = wanted.then_some(gradient);
+    rows.push((
+        name,
+        estimate.value(),
+        same,
+        g.map(|g| g[0]),
+        g.map(|g| g[1]),
+        g.map(|g| g[2]),
+        estimate.kinks(),
+    ));
+    results.push((estimate, gradient, error));
+}
+let digits = serde_json::json!({ "significantDigits": 10 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Mode" },
+    { "key": "1", "label": "Estimate E[S_T] [JPY]", "type": "number", "format": digits },
+    { "key": "2", "label": "Bits versus value mode" },
+    { "key": "3", "label": "∂/∂S₀ [-]", "type": "number", "format": digits, "nullText": "Not requested" },
+    { "key": "4", "label": "∂/∂σ [JPY·√year]", "type": "number", "format": digits, "nullText": "Not requested" },
+    { "key": "5", "label": "∂/∂r [JPY·year]", "type": "number", "format": digits, "nullText": "Not requested" },
+    { "key": "6", "label": "Kink count [count]", "type": "integer", "nullText": "Not counted" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "modes" })
+);
+
+// Estimate, gradient, and gradient standard errors from the second evaluation (forward mode selected by Auto).
+let (estimate, gradient, error) = results[1];
+// Independent check: s/√n from S_T computed with f64 on the same samples (inherent f64 methods for reference values).
+let drift = (rate - 0.5 * volatility * volatility) * maturity;
+let values: Vec<f64> = z
+    .iter()
+    .map(|&zi| spot * (drift + volatility * maturity.sqrt() * zi).exp())
+    .collect();
+let mean = values.iter().sum::<f64>() / n as f64;
+let variance = values.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / (n - 1) as f64;
+let by_hand = (variance / n as f64).sqrt();
+// Closed forms (references): E[S_T] = S₀e^{rT}, ∂/∂S₀ = e^{rT}, ∂/∂σ = 0, ∂/∂r = T S₀ e^{rT}.
+let growth = (rate * maturity).exp();
+let se = estimate.standard_error().unwrap_or(f64::NAN);
+let quantities = [
+    (
+        "E[S_T] [JPY]",
+        estimate.value(),
+        se,
+        spot * growth,
+        Some(by_hand),
+    ),
+    ("∂/∂S₀ [-]", gradient[0], error[0], growth, None),
+    ("∂/∂σ [JPY·√year]", gradient[1], error[1], 0.0, None),
+    (
+        "∂/∂r [JPY·year]",
+        gradient[2],
+        error[2],
+        maturity * spot * growth,
+        None,
+    ),
+];
+let rows: Vec<_> = quantities
+    .iter()
+    .map(|&(name, value, se, exact, hand)| (name, value, se, exact, (value - exact) / se, hand))
+    .collect();
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let estimate_columns = serde_json::json!([
+    { "key": "0", "label": "Quantity" },
+    { "key": "1", "label": "Estimate", "type": "number", "format": digits },
+    { "key": "2", "label": "Standard error", "type": "number", "format": sci3 },
+    { "key": "3", "label": "Closed form", "type": "number", "format": digits },
+    { "key": "4", "label": "(Estimate − closed form) / standard error [-]", "type": "number", "format": fixed2 },
+    { "key": "5", "label": "s/√n computed with f64", "type": "number", "format": sci3, "nullText": "−" }
+]);
+emit_table_with_columns!(
+    estimate_columns,
+    rows,
+    metadata = serde_json::json!({ "id": "estimates" })
+);
+```
+
+At the defaults $n = 4096$ and $\sigma = 0.2$ with seed 42, all three modes give the bitwise identical estimate $102.95621368850519$ JPY.
+With three active values, `Auto` selects forward mode (three tangents); specifying `Reverse` selects reverse mode.
+Forward and reverse gradients differ in the last digit and agree within rounding due to different summation orders.
+The reverse-mode kink count is zero; this model uses no functions with kinks.
+
+The estimate's standard error is 0.327 JPY, matching $s/\sqrt{n}$ computed with `f64`.
+The difference from the closed form $S_0 e^{rT} = 103.045$ JPY is $-0.27$ standard errors; differences for the three gradients also lie between $-0.34$ and $-0.28$ standard errors.
+The closed form for $\partial/\partial \sigma$ is zero; the estimate $-0.35$ lies within its standard error of 1.25.
+The pathwise derivative $S_T(-\sigma T + \sqrt{T} z)$ has large variance despite its zero mean, so estimating zero requires many paths.
+$\partial/\partial S_0 = \bar S / S_0$ and $\partial/\partial r = T \bar S$ are proportional to the estimate for every sample, so differences from their closed forms share the sign of the estimate's difference.
+The magnitudes of their standardized differences differ from the estimate's because its standard error uses per-item values, whereas gradient standard errors use batch means of 16 blocks.
+
+With seed 7, standardized differences are $+1.6$ and $+1.5$; shifts of one or two standard errors with the seed are natural sampling-error magnitudes.
+At $\sigma = 1$ and $n = 16384$, heavier tails raise the estimate's standard error to 1.03 JPY, three times that at $\sigma = 0.2$ despite quadrupling paths.
+
+## One-shot means and function providers
+
+`batch_mean(function, parameters, data, items)` treats rows of the row-major table `data` (`items` rows × `data.len() / items` columns) as passive data and returns the mean $\bar F$; `batch_mean_and_grad` returns a pair of $\bar F$ and its parameter gradient (a scioxide-linalg `Vector`).
+Internally this evaluates `BatchPlan::<8>` with `BatchOptions::new()`, no active inputs, `BatchReduction::Mean`, and one worker; estimates and gradients have the same bits as `evaluate_into` in this configuration.
+Every call allocates one workspace (and a tape and gradient if gradients are requested).
+`items = 0` returns `InvalidInput` (argument `items`, `Empty`); `data.len()` not divisible by `items` returns `DimensionMismatch`.
+Use `BatchPlan` for sums, per-item inputs or values, gradient standard errors, or different lane or worker counts.
+
+The next cell uses the same terminal-value model and constructs standard normal values $z_i$ from item indices $i$.
+To construct $z_i$, turn two words of the Philox4x64-10 block function (seed as key, $(i, \text{column})$ as counter) into uniform random values $u_1 \in (0, 1]$ and $u_2 \in [0, 1)$ and apply the Box–Muller transform $z = \sqrt{-2\ln u_1}\cos(2\pi u_2)$.
+A counter-based generator constructs values independently for each item, giving the same values regardless of the order of `fill` calls.
+The table compares estimates and gradients from `batch_mean_and_grad` and `batch_mean` (no gradient) given a `Vec` table, `evaluate_into` on `BatchPlan::<8>` with the same `Vec` provider, and `evaluate_into` with a `BatchDataFn` provider generating values on demand, showing whether bits match the first row.
+
+```rust
+//| id: ad-batch-one-shot-source
+//| ref: ad-batch-one-shot-source
+//| title: "Compare one-shot means and an on-demand provider with BatchPlan"
+//| run: reactive
+//| uses: [ad-batch-forward-model]
+//| crates: [scioxide-ad, scioxide-core, scioxide-random]
+//| inputs:
+//|   paths: {"type":"range","label":"Path count n","description":"When n is not a multiple of 8, the last group has missing lanes.","min":1,"max":10000,"step":1,"value":4096}
+//|   seed: {"type":"range","label":"Random seed","description":"Philox4x64-10 key.","min":0,"max":99,"step":1,"value":42}
+//| cases:
+//|   - {"id":"ragged","label":"n = 1001, seed 5","description":"The last group contains one item; the seven missing lanes are excluded from output.","inputs":{"paths":1001,"seed":5}}
+//|   - {"id":"single","label":"n = 1","description":"Even one item gives identical bits.","inputs":{"paths":1}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"sources","path":"/rows/1/6","equals":"Match"}
+//|       - {"artifact":"sources","path":"/rows/2/6","equals":"Match"}
+//|       - {"artifact":"sources","path":"/rows/3/6","equals":"Match"}
+//|       - {"artifact":"sources","path":"/rows/0/5","equals":3}
+//|       - {"artifact":"sources","path":"/rows/0/1","range":{"min":101,"max":105}}
+//|   - case: ragged
+//|     expect:
+//|       - {"artifact":"sources","path":"/rows/1/6","equals":"Match"}
+//|       - {"artifact":"sources","path":"/rows/2/6","equals":"Match"}
+//|       - {"artifact":"sources","path":"/rows/3/6","equals":"Match"}
+//|   - case: single
+//|     expect:
+//|       - {"artifact":"sources","path":"/rows/1/6","equals":"Match"}
+//|       - {"artifact":"sources","path":"/rows/3/6","equals":"Match"}
+use scioxide_ad::{
+    BatchDataFn, BatchMode, BatchOptions, BatchOutputs, BatchPlan, BatchReduction, batch_mean,
+    batch_mean_and_grad,
+};
+use scioxide_core::{ExecutionContext, RealScalar};
+use scioxide_random::{decode_u64, philox4x64_block};
+
+/// Standard normal value at item and column. Convert two Philox4x64-10 words (key seed, counter (item, column))
+/// to u₁ ∈ (0, 1] and u₂ ∈ [0, 1), then apply Box–Muller.
+fn draw(seed: u64, item: usize, column: usize) -> f64 {
+    let [a, b, _, _] = philox4x64_block([item as u64, column as u64, 0, 0], [seed, 0]);
+    let (u1, u2) = (1.0 - decode_u64::<f64>(a), decode_u64::<f64>(b));
+    let radius = RealScalar::sqrt(-2.0 * RealScalar::ln(u1));
+    radius * RealScalar::cos(core::f64::consts::TAU * u2)
+}
+
+let (n, key) = (paths as usize, seed as u64);
+let model = Terminal { maturity: 1.0 };
+let theta = [100.0, 0.2, 0.03];
+// Store the same values in a row-major Vec table (n rows × 1 column).
+let table: Vec<f64> = (0..n).map(|i| draw(key, i, 0)).collect();
+// Provider generating requested item and column values on demand without a table.
+let source = BatchDataFn::new(move |first, _, column, lanes: &mut [f64]| {
+    for (k, lane) in lanes.iter_mut().enumerate() {
+        *lane = draw(key, first + k, column);
+    }
+    Ok(())
+});
+let (estimate, gradient) =
+    batch_mean_and_grad(&model, &theta, &table, n).map_err(|e| e.to_string())?;
+let mut runs = vec![(
+    "batch_mean_and_grad",
+    estimate,
+    Some(gradient.as_slice().to_vec()),
+)];
+// The one-shot call without gradients evaluates in value mode.
+let value = batch_mean(&model, &theta, &table, n).map_err(|e| e.to_string())?;
+runs.push(("batch_mean", value, None));
+// Pass the Vec table and BatchDataFn separately as providers to BatchPlan in the same configuration.
+let plan = BatchPlan::<8>::new(n, 3, 0, 1, BatchReduction::Mean, BatchOptions::new())
+    .map_err(|e| e.to_string())?;
+let mut workspace = plan.workspace(1).map_err(|e| e.to_string())?;
+let cx = ExecutionContext::sequential();
+for (name, on_demand) in [
+    ("evaluate_into（Vec）", false),
+    ("evaluate_into（BatchDataFn）", true),
+] {
+    let mut g = vec![0.0; 3];
+    let outputs = BatchOutputs::new().with_parameter_gradient(&mut g);
+    let estimate = if on_demand {
+        plan.evaluate_into(&model, &theta, &[], &source, outputs, &mut workspace, cx)
+    } else {
+        plan.evaluate_into(&model, &theta, &[], &table, outputs, &mut workspace, cx)
+    }
+    .map_err(|e| e.to_string())?;
+    runs.push((name, estimate, Some(g)));
+}
+// Compare estimate and, when requested, gradient bits with the first row.
+let reference = &runs[0];
+let rows: Vec<_> = runs
+    .iter()
+    .map(|(name, estimate, g)| {
+        let tangents = match estimate.mode() {
+            BatchMode::Forward { tangents } => Some(tangents),
+            _ => None,
+        };
+        let same_value = estimate.value().to_bits() == reference.1.value().to_bits();
+        let same_gradient = g.as_ref().is_none_or(|g| {
+            let r = reference.2.as_deref().unwrap_or(&[]);
+            g.iter().zip(r).all(|(a, b)| a.to_bits() == b.to_bits())
+        });
+        let same = if same_value && same_gradient {
+            "Match"
+        } else {
+            "Mismatch"
+        };
+        let part = |k: usize| g.as_ref().map(|g| g[k]);
+        (
+            *name,
+            estimate.value(),
+            part(0),
+            part(1),
+            part(2),
+            tangents,
+            same,
+        )
+    })
+    .collect();
+let digits = serde_json::json!({ "significantDigits": 17 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Evaluation" },
+    { "key": "1", "label": "Estimate E[S_T] [JPY]", "type": "number", "format": digits },
+    { "key": "2", "label": "∂/∂S₀ [-]", "type": "number", "format": digits, "nullText": "Not requested" },
+    { "key": "3", "label": "∂/∂σ [JPY·√year]", "type": "number", "format": digits, "nullText": "Not requested" },
+    { "key": "4", "label": "∂/∂r [JPY·year]", "type": "number", "format": digits, "nullText": "Not requested" },
+    { "key": "5", "label": "Forward-mode tangents [count]", "type": "integer", "nullText": "Not forward mode" },
+    { "key": "6", "label": "Bits versus first row" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "sources" })
+);
+```
+
+At the default $n = 4096$ with seed 42, all four evaluations give the estimate $103.25921929197078$ JPY; the three requesting gradients also have identical gradient bits.
+With three parameters, `batch_mean_and_grad` selects forward mode (three tangents) like `BatchPlan`, while `batch_mean` returns the bitwise identical estimate in value mode.
+The `BatchDataFn` provider recomputes values on each call but writes the same values as the table, so results have the same bits as when passing `Vec`.
+All four evaluations also have identical bits for $n = 1001$, whose last group has one item, and $n = 1$, with only one item.
+
+## Directional derivatives and Hessian–vector products
+
+`jvp_into(function, parameters, inputs, data, parameter_direction, input_direction, derivatives, workspace, context)` computes the directional derivative with respect to $\varepsilon$ at $(\theta + \varepsilon u, a_i + \varepsilon w_i)$ using `Dual<Lanes<S, W>>`.
+$u$ is the parameter direction and $w_i$ the per-item input direction, passed with a provider of the same type as the inputs.
+It writes per-item directional derivatives to `derivatives` (length `items`, without the aggregation scale) and returns the reduced directional derivative in `BatchEstimate::derivative()`.
+The mode is `Forward { tangents: 1 }`.
+
+`hvp_into(function, parameters, inputs, data, parameter_direction, input_direction, parameter_product, input_product, workspace, context)` writes derivatives with respect to $\varepsilon$ in the same direction of the reduced value's parameter gradient and the per-item input gradients.
+`parameter_product` (length `parameters`) is the derivative of the reduced value's parameter gradient, the parameter part of the reduced value's Hessian–vector product.
+`input_product` (`items × inputs`) contains derivatives of per-item input gradients without the aggregation scale, as with `with_input_gradient`.
+For mean reduction, dividing `input_product` by $n$ gives the input part of the reduced value's Hessian–vector product.
+Under conditions where `evaluate_into` selects forward mode, each value is represented by `Dual<MultiDual<Lanes<S, W>, N>>` ($N = m$), using forward-over-forward.
+The inner `MultiDual` value and $N$ tangents hold the value and derivatives in unit directions of active values (gradient components), as in `evaluate_into`.
+The derivative component of the outer `Dual` is also a `MultiDual`: its value holds the directional derivative in direction $(u, w)$, and its $N$ tangents hold derivatives of gradient components with respect to $\varepsilon$ (Hessian–vector product components).
+`BatchMode::Forward { tangents }` counts these two sets of tangents and returns $2N$ (8 for four active values).
+Otherwise items are evaluated with `Var<Dual<Lanes<S, W>>>` (forward-over-reverse), and the mode is `Reverse`.
+
+Both return `DimensionMismatch` for slices of inconsistent lengths; other errors match `evaluate_into`.
+
+## Workspace and parallel execution
+
+`workspace_requirements(workers)` returns the storage needed by `workers` workers as `BatchRequirements`.
+It comprises per-worker lane storage, per-block results, and per-item accumulated values; read `workers()`, `blocks()`, `items()`, and the byte count `bytes::<S>()` per scalar type (excluding tape contents).
+Worker counts must be from 1 to 64; other values return `InvalidInput` (argument `workers`, `OutOfRange`).
+`workspace::<S>(workers)` returns a `BatchWorkspace` allocated to the requirements, or `AllocationFailure` on allocation failure.
+
+`try_reserve(requirements)` on `BatchWorkspace` grows storage; `check(requirements)` returns whether retained storage suffices as a `Capacity`.
+`evaluate_into` grows it automatically if insufficient.
+Requirements exclude tapes.
+A worker holds two tapes, one for gradients and one for Hessian–vector products; each grows on first use within the evaluating plan's `BatchOptions::with_byte_limit` limit.
+Growth exceeding the limit gives `ResourceLimit` ([Tape lifecycle and reuse](../tape-lifecycle/)).
+The limit applies only to growth during that plan's evaluation; a tape grown under a larger limit retains its storage.
+In sequential execution, evaluation with workspace warmed by the same plan performs no allocations.
+
+`BatchOptions` has the following settings; `BatchOptions::new()` returns defaults.
+
+| Method | Default | Meaning |
+|---|---|---|
+| `with_execution_policy` | `ExecutionPolicy::Sequential` | Policy for assigning blocks to workers |
+| `with_block` | 256 | Items per block (rounded up to a multiple of `W`) |
+| `with_derivative_mode` | `DerivativeMode::Auto` | Gradient mode |
+| `with_non_finite_policy` | `NonFinitePolicy::Propagate` | Nonfinite-value policy |
+| `with_kink_policy` | `KinkPolicy::Midpoint` | Kink policy (`Error` selects reverse mode and returns `DomainError` at kinks) |
+| `with_byte_limit` | None | Bytes each worker's individual tapes can preallocate |
+
+Parallel execution assigns consecutive block ranges to workers according to the execution policy and workers of `ExecutionContext`.
+Each worker uses its own lane storage and tape and places block results in workspace.
+The calling thread combines them using the pairwise summation above, giving bitwise identical results to sequential execution.
+`context.check()` is called before execution, once per block, and before output writing; output is therefore not written even for zero-item evaluations or a stop requested during the last block.
+Browser cells cannot use threads in Wasm, so the following cells demonstrate only sequential execution.
+
+The next two cells use the same terminal-value model to examine block size and directional derivatives.
+For requested block sizes 5, 60, 250, 1000, and 5000, the first cell tabulates rounded sizes, block counts, estimates of $\partial \mathbb{E}[S_T]/\partial r$, batch-mean standard errors (“None” for one block) and their ratios to a reference standard error, and workspace requirement bytes (`BatchRequirements::bytes::<f64>()`).
+Since $\partial S_T / \partial r = T S_T$, the per-item $s/\sqrt{n}$ of $\partial S_T / \partial r$ equals $T$ times the estimate's standard error `standard_error()`; this is the reference standard error.
+The second cell checks this identity from per-item directional derivatives of `jvp_into`.
+
+```rust
+//| id: ad-batch-block-size
+//| ref: ad-batch-block-size
+//| title: "Examine block size and batch-mean standard errors"
+//| run: reactive
+//| uses: [ad-batch-forward-model]
+//| crates: [scioxide-ad, scioxide-core, scioxide-random]
+//| inputs:
+//|   paths: {"type":"range","label":"Path count n","description":"Number of standard normal samples z_i.","min":512,"max":16384,"step":512,"value":4096}
+//|   seed: {"type":"range","label":"Random seed","description":"Xoshiro256StarStar seed.","min":0,"max":99,"step":1,"value":42}
+//| cases:
+//|   - {"id":"few","label":"n = 512","description":"With few blocks, batch means for large blocks are unavailable or rough.","inputs":{"paths":512}}
+//|   - {"id":"many","label":"n = 16384, seed 3","description":"More blocks bring the batch-mean standard error closer to the reference.","inputs":{"paths":16384,"seed":3}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"blocks","path":"/rows/0/1","equals":8}
+//|       - {"artifact":"blocks","path":"/rows/1/1","equals":64}
+//|       - {"artifact":"blocks","path":"/rows/2/1","equals":256}
+//|       - {"artifact":"blocks","path":"/rows/2/2","equals":16}
+//|       - {"artifact":"blocks","path":"/rows/4/4","equals":null}
+//|       - {"artifact":"blocks","path":"/rows/0/5","range":{"min":0.8,"max":1.25}}
+//|       - {"artifact":"blocks","path":"/rows/0/6","range":{"min":110000,"max":120000}}
+//|       - {"artifact":"blocks","path":"/rows/4/6","range":{"min":64000,"max":70000}}
+//|   - case: few
+//|     expect:
+//|       - {"artifact":"blocks","path":"/rows/2/2","equals":2}
+//|       - {"artifact":"blocks","path":"/rows/3/4","equals":null}
+//|   - case: many
+//|     expect:
+//|       - {"artifact":"blocks","path":"/rows/0/2","equals":2048}
+//|       - {"artifact":"blocks","path":"/rows/0/5","range":{"min":0.9,"max":1.1}}
+use core::num::NonZeroUsize;
+use scioxide_ad::{BatchOptions, BatchOutputs, BatchPlan, BatchReduction};
+use scioxide_core::ExecutionContext;
+
+let n = paths as usize;
+let z = normals(n, seed as u64).map_err(|e| e.to_string())?;
+let (spot, rate, maturity) = (100.0, 0.03, 1.0);
+let model = Terminal { maturity };
+let theta = [spot, 0.2, rate];
+let cx = ExecutionContext::sequential();
+
+// Reference: ∂S_T/∂r = T·S_T, so s/√n of per-item ∂S_T/∂r equals T·standard_error().
+let plan = BatchPlan::<8>::new(n, 3, 0, 1, BatchReduction::Mean, BatchOptions::new())
+    .map_err(|e| e.to_string())?;
+let mut workspace = plan.workspace(1).map_err(|e| e.to_string())?;
+let value = plan
+    .evaluate_into(
+        &model,
+        &theta,
+        &[],
+        &z[..],
+        BatchOutputs::new(),
+        &mut workspace,
+        cx,
+    )
+    .map_err(|e| e.to_string())?;
+let item_se = maturity * value.standard_error().unwrap_or(f64::NAN);
+
+let mut rows = Vec::new();
+for requested in [5, 60, 250, 1000, 5000] {
+    let block = NonZeroUsize::new(requested).ok_or("Block size is positive".to_string())?;
+    let options = BatchOptions::new().with_block(block);
+    let plan = BatchPlan::<8>::new(n, 3, 0, 1, BatchReduction::Mean, options)
+        .map_err(|e| e.to_string())?;
+    let bytes = plan
+        .workspace_requirements(1)
+        .and_then(|r| r.bytes::<f64>())
+        .map_err(|e| e.to_string())?;
+    let mut workspace = plan.workspace(1).map_err(|e| e.to_string())?;
+    let (mut gradient, mut error) = ([0.0; 3], [0.0; 3]);
+    // Batch means require at least two blocks.
+    let outputs = if plan.blocks() >= 2 {
+        BatchOutputs::new()
+            .with_parameter_gradient(&mut gradient)
+            .with_parameter_gradient_error(&mut error)
+    } else {
+        BatchOutputs::new().with_parameter_gradient(&mut gradient)
+    };
+    let estimate = plan
+        .evaluate_into(&model, &theta, &[], &z, outputs, &mut workspace, cx)
+        .map_err(|e| e.to_string())?;
+    let batch_se = (estimate.blocks() >= 2).then_some(error[2]);
+    let ratio = batch_se.map(|se| se / item_se);
+    rows.push((
+        requested,
+        plan.block(),
+        estimate.blocks(),
+        gradient[2],
+        batch_se,
+        ratio,
+        bytes,
+    ));
+}
+let digits = serde_json::json!({ "significantDigits": 10 });
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Requested block [items]", "type": "integer" },
+    { "key": "1", "label": "block() [items]", "type": "integer" },
+    { "key": "2", "label": "Block count", "type": "integer" },
+    { "key": "3", "label": "∂E[S_T]/∂r [JPY·year]", "type": "number", "format": digits },
+    { "key": "4", "label": "Batch-mean standard error [JPY·year]", "type": "number", "format": sci3, "nullText": "None" },
+    { "key": "5", "label": "Ratio to reference standard error [-]", "type": "number", "format": fixed2, "nullText": "−" },
+    { "key": "6", "label": "Workspace requirement [B]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "blocks" })
+);
+```
+
+At the default $n = 4096$, requested block sizes 5, 60, and 250 round up to 8, 64, and 256; 1000 and 5000 remain unchanged as multiples of 8.
+Changing block size changes summation order, so the $\partial \mathbb{E}[S_T]/\partial r$ estimate changes in its last digit ($102.95621368850519$ and $102.95621368850503$).
+Workspace stores per-block results and decreases from 115880 B for 512 blocks to 66824 B for one block.
+
+Against reference standard error 0.327 JPY·year, batch-mean standard-error ratios are 1.02 for 512 blocks, 0.96 for 64, 0.81 for 16, and 0.55 for 5.
+Fewer blocks make the batch-mean estimate rougher through its $B - 1$ degrees of freedom.
+Size 5000 leaves only one block, so batch means cannot be computed.
+At $n = 16384$ with seed 3, ratios are 1.02 for 2048 blocks and 1.51 for 4; at $n = 512$, the two-block ratio falls to 0.42.
+
+The second cell compares directional derivatives and Hessian–vector products with identities holding for the same samples.
+Since $\partial S_T / \partial r = T S_T$, the directional derivative in direction $r$ ($u = e_r$) equals $T \bar S$, $\partial^2/\partial r^2$ equals $T^2 \bar S$, and $\partial^2/\partial S_0 \partial r$ equals $T \bar S / S_0$ ($\bar S$ is the batch estimate).
+The standard error of per-item directional derivatives equals $T$ times the estimate's standard error.
+For each quantity, the table shows mode, batch value, identity value, and relative difference.
+
+```rust
+//| id: ad-batch-jvp-hvp
+//| ref: ad-batch-jvp-hvp
+//| title: "Compare batch directional derivatives and Hessian–vector products with identities"
+//| run: reactive
+//| uses: [ad-batch-forward-model]
+//| crates: [scioxide-ad, scioxide-core, scioxide-random]
+//| inputs:
+//|   paths: {"type":"range","label":"Path count n","description":"Number of standard normal samples z_i.","min":512,"max":16384,"step":512,"value":4096}
+//|   seed: {"type":"range","label":"Random seed","description":"Xoshiro256StarStar seed.","min":0,"max":99,"step":1,"value":42}
+//| cases:
+//|   - {"id":"few","label":"n = 512","description":"The identities hold within rounding even for few paths.","inputs":{"paths":512}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"products","path":"/rows/0/4","range":{"max":1e-13}}
+//|       - {"artifact":"products","path":"/rows/2/4","range":{"max":1e-13}}
+//|       - {"artifact":"products","path":"/rows/3/4","range":{"max":1e-13}}
+//|       - {"artifact":"products","path":"/rows/4/4","range":{"max":1e-13}}
+//|       - {"artifact":"products","path":"/rows/0/1","equals":"Forward (tangent count: 1)"}
+//|       - {"artifact":"products","path":"/rows/3/1","equals":"Forward (tangent count: 6)"}
+//|   - case: few
+//|     expect:
+//|       - {"artifact":"products","path":"/rows/2/4","range":{"max":1e-13}}
+//|       - {"artifact":"products","path":"/rows/3/4","range":{"max":1e-13}}
+use scioxide_ad::{BatchMode, BatchOptions, BatchOutputs, BatchPlan, BatchReduction};
+use scioxide_core::ExecutionContext;
+
+let n = paths as usize;
+let z = normals(n, seed as u64).map_err(|e| e.to_string())?;
+let (spot, rate, maturity) = (100.0, 0.03, 1.0);
+let model = Terminal { maturity };
+let theta = [spot, 0.2, rate];
+let cx = ExecutionContext::sequential();
+let mode_name = |mode: BatchMode| match mode {
+    BatchMode::Value => "Value only".to_string(),
+    BatchMode::Forward { tangents } => format!("Forward (tangent count: {tangents})"),
+    BatchMode::Reverse => "Reverse".to_string(),
+};
+let plan = BatchPlan::<8>::new(n, 3, 0, 1, BatchReduction::Mean, BatchOptions::new())
+    .map_err(|e| e.to_string())?;
+let mut workspace = plan.workspace(1).map_err(|e| e.to_string())?;
+
+// Directional derivative in direction r. Also write per-item values T·S_i.
+let direction = [0.0, 0.0, 1.0];
+let mut per_item = vec![0.0; n];
+let jvp = plan
+    .jvp_into(
+        &model,
+        &theta,
+        &[],
+        &z[..],
+        &direction,
+        &[],
+        &mut per_item,
+        &mut workspace,
+        cx,
+    )
+    .map_err(|e| e.to_string())?;
+let mean = per_item.iter().sum::<f64>() / n as f64;
+let spread = per_item
+    .iter()
+    .map(|d| (d - mean) * (d - mean))
+    .sum::<f64>()
+    / (n - 1) as f64;
+let item_se = (spread / n as f64).sqrt();
+
+// Gradient and Hessian–vector product in direction r.
+let mut gradient = [0.0; 3];
+let estimate = plan
+    .evaluate_into(
+        &model,
+        &theta,
+        &[],
+        &z[..],
+        BatchOutputs::new().with_parameter_gradient(&mut gradient),
+        &mut workspace,
+        cx,
+    )
+    .map_err(|e| e.to_string())?;
+let mut product = [0.0; 3];
+let hvp = plan
+    .hvp_into(
+        &model,
+        &theta,
+        &[],
+        &z[..],
+        &direction,
+        &[],
+        &mut product,
+        &mut [],
+        &mut workspace,
+        cx,
+    )
+    .map_err(|e| e.to_string())?;
+let average = estimate.value();
+let se = estimate.standard_error().unwrap_or(f64::NAN);
+let derivative = jvp.derivative().unwrap_or(f64::NAN);
+let relative = |a: f64, b: f64| (a - b).abs() / b.abs();
+let checks = vec![
+    (
+        "∂E/∂r（jvp_into）",
+        mode_name(jvp.mode()),
+        derivative,
+        maturity * average,
+    ),
+    (
+        "∂E/∂r（evaluate_into）",
+        mode_name(estimate.mode()),
+        gradient[2],
+        maturity * average,
+    ),
+    (
+        "s/√n of per-item directional derivatives",
+        mode_name(jvp.mode()),
+        item_se,
+        maturity * se,
+    ),
+    (
+        "∂²E/∂r²（hvp_into）",
+        mode_name(hvp.mode()),
+        product[2],
+        maturity * maturity * average,
+    ),
+    (
+        "∂²E/∂S₀∂r（hvp_into）",
+        mode_name(hvp.mode()),
+        product[0],
+        maturity * average / spot,
+    ),
+];
+let rows: Vec<_> = checks
+    .into_iter()
+    .map(|(name, mode, value, identity)| {
+        (name, mode, value, identity, relative(value, identity))
+    })
+    .collect();
+let digits = serde_json::json!({ "significantDigits": 10 });
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let check_columns = serde_json::json!([
+    { "key": "0", "label": "Quantity" },
+    { "key": "1", "label": "Mode" },
+    { "key": "2", "label": "Batch evaluation", "type": "number", "format": digits },
+    { "key": "3", "label": "Value from identity", "type": "number", "format": digits },
+    { "key": "4", "label": "Relative difference [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    check_columns,
+    rows,
+    metadata = serde_json::json!({ "id": "products" })
+);
+```
+
+The directional derivative from `jvp_into`, gradient from `evaluate_into`, and two components from `hvp_into` agree with same-sample identities within relative difference $2.2 \times 10^{-16}$.
+`jvp_into` propagates one tangent; `hvp_into` uses forward-over-forward and propagates $2N = 6$ tangents.
+The $s/\sqrt{n}$ formed from per-item directional derivatives equals $T$ times the estimate's standard error, confirming the identity used as the first cell's reference and showing that `jvp_into` writes per-item directional derivatives directly.
+Even at $n = 512$, relative differences are below $10^{-15}$.
+
+## Summary
+
+For sums or means of many independent items, write `BatchFunction` once generically over numeric types and evaluate with `BatchPlan`; value, forward, or reverse mode is selected according to gradient requests, and estimates have the same bits in every mode.
+The default is forward mode for at most four active values and reverse mode for more; reverse mode records and sweeps the parameter-only `prepare` part just once per block.
+Results follow pairwise summation by block index, preserving bits when worker count changes; summation rounding error is at most $\gamma_{b + \lceil \log_2 B \rceil} \sum_i |y_i|$.
+When comparing Monte Carlo estimates with closed forms or other estimates, use `standard_error()` and batch means `with_parameter_gradient_error` with sufficiently many blocks, interpreting differences in standard-error units.
+Directional derivatives and Hessian–vector products use `jvp_into` and `hvp_into` with the same plan and workspace.
+If only a table's mean and gradient are needed in the default configuration, `batch_mean_and_grad` returns identical bits in one call; values generated on demand without a table can be provided with `BatchDataFn`.
+
+## Further reading
+
+- [Monte Carlo Greeks with pathwise differentiation](../../examples/black-scholes-monte-carlo/): batch-evaluate the expectation and gradient of discounted call payoffs with kinks, compare them with closed forms using batch-mean standard errors, and examine the bias of zero pathwise Γ with `hvp_into`.
+- [Backpropagation and gradient checking for a one-layer neural network](../../examples/neural-network-backprop/): obtain gradients of mean per-sample losses with batch evaluation and tapes and verify agreement at the rounding level.
+- [Branches, masks, and table lookup](../control-flow/): examine writing branches in `item` with `select` for types with lanes.
+- [Kinks and nonfinite-value policies](../nonsmooth-and-nonfinite-policies/): examine how `KinkPolicy` and `NonFinitePolicy` affect batch results.
+- [Tape lifecycle and reuse](../tape-lifecycle/): examine tape capacities and byte limits for reverse-mode workers.
+- [Second derivatives and Hessian operators](../second-order-derivatives/): examine the cost of Hessian–vector products with forward-over-forward and forward-over-reverse.

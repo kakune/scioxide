@@ -1,0 +1,460 @@
+---
+title: 代数的多重格子による前処理
+description: 格子の細かさと条件数、減衰 Jacobi の平滑化と最適な減衰係数、二格子補正と Galerkin の粗い演算子、平滑化集約による代数的多重格子（AMG）、V・W サイクルと演算子複雑度、階層の終了理由、サイクルを前処理として使う条件。
+sidebar:
+  order: 340
+references:
+  sparse-amg-smoothed-aggregation: "平滑化集約による代数的多重格子"
+  sparse-amg-as-preconditioner: "前処理としての使い方"
+  sparse-amg-hierarchy-experiment: "amg-の階層と-galerkin-の粗い演算子"
+  sparse-amg-two-grid: "二格子補正と-galerkin-の粗い演算子"
+---
+
+$d$ 次元の 2 階楕円型方程式を格子幅 $h$ で離散化した行列の条件数は $\kappa = O(h^{-2})$ で、CG の反復回数は $\sqrt{\kappa} = O(h^{-1})$ に比例して増える。
+格子を 2 倍に細かくすると、未知数は $2^d$ 倍、反復回数は約 2 倍になるので、全体の手間は未知数の数より速く増える。
+[不完全分解と反復法の前処理](../incomplete-factorizations/) の方法は反復回数を減らすが、この $h^{-1}$ の増え方は変えない。
+多重格子法は誤差を周波数で分けて扱い、反復回数を格子の細かさにほとんどよらない程度に抑えることを目指す。
+このページでは平滑化と粗い格子の補正の役割、行列だけから粗い格子を作る代数的多重格子（AMG）、そのサイクルを前処理として使う方法を説明する。
+領域を重なりのある部分に分けて局所的に解く前処理は、[重なりのある Schwarz 法](../overlapping-schwarz/)で扱う。
+
+## 平滑化と高周波の誤差
+
+Jacobi 法に減衰係数 $\omega$ を付けた反復 $\mathbf{x} \leftarrow \mathbf{x} + \omega\,\mathbf{D}^{-1}(\mathbf{b} - \mathbf{A}\mathbf{x})$（$\mathbf{D}$ は $\mathbf{A}$ の対角）では、誤差 $\mathbf{e} = \mathbf{x} - \mathbf{x}^\ast$ が
+
+$$
+\mathbf{e} \leftarrow \mathbf{S}\,\mathbf{e}, \qquad \mathbf{S} = \mathbf{I} - \omega\,\mathbf{D}^{-1}\mathbf{A}
+$$
+
+と変わる。
+1 次元の $\mathbf{A} = \mathrm{tridiag}(-1, 2, -1)$（$n$ 点）では、固有ベクトルは成分が $\sin(j\pi i/(n+1))$ の正弦波で、固有値は $\lambda_j = 2 - 2\cos\theta_j$、$\theta_j = j\pi/(n+1)$ である。
+$\mathbf{D} = 2\mathbf{I}$ なので、第 $j$ モードの誤差は一回の反復で
+
+$$
+\mu_j = 1 - \omega\,(1 - \cos\theta_j)
+$$
+
+倍になる。
+最も低いモードでは $1 - \cos\theta_1 = O(h^2)$ なので $\mu_1 = 1 - O(h^2)$ で、どの $\omega$ でもほとんど減らない。
+周波数の高い半分のモード（$\theta_j \ge \pi/2$）では、$1 - \cos\theta_j$ が 1 以上 2 未満なので、$\lvert \mu_j \rvert$ の最大は両端の $\lvert 1 - \omega \rvert$ と $\lvert 1 - 2\omega \rvert$ の大きい方で決まる。
+二つが等しくなる $1 - \omega = 2\omega - 1$、つまり $\omega = 2/3$ で最大は最も小さい $1/3$ になり、高周波のモードはどれも一回で $1/3$ 倍以下に減る。
+減衰 Jacobi のように高周波の誤差を速く減らす反復を**平滑化**と呼ぶ。
+平滑化のあとに残る誤差はなめらかなので、粗い格子でも表せる。
+
+### 減衰 Jacobi の平滑化の効き方
+
+次のセルは $n = 63$ 点の $\mathrm{tridiag}(-1, 2, -1)$ について、第 $j$ モードの正弦波（$j = 1, \dots, 63$）を初期誤差とし、`JacobiPreconditioner` と CSR の積で減衰 Jacobi を $\nu$ 回適用して、誤差のノルムが何倍になったかを測る。
+入力は減衰係数 $\omega$（0.2〜1.0）と回数 $\nu$（1〜4）である。
+表は最低のモードの比と、高周波（$j \ge 32$、$\theta_j \ge \pi/2$）の比の最大を、理論値 $\lvert \mu_j \rvert^\nu$ と並べる。
+最後の行は高周波の半分全体での上限 $\max(\lvert 1 - \omega \rvert, \lvert 1 - 2\omega \rvert)^\nu$ である。
+グラフは測った比を記号、理論値を破線で縦軸を対数にして描き、$\theta = \pi/2$ の位置に縦線を引く。
+
+```rust
+//| id: sparse-amg-smoothing
+//| ref: sparse-amg-smoothing
+//| title: 減衰 Jacobi による誤差のモードごとの減衰
+//| run: reactive
+//| crates: [scioxide-core, scioxide-sparse]
+//| inputs:
+//|   omega: {"type":"range","label":"減衰係数 ω","description":"1 回の更新に掛ける係数。ω = 1 は減衰なしの Jacobi。","min":0.2,"max":1.0,"step":0.1,"value":0.7}
+//|   sweeps: {"type":"range","label":"平滑化の回数 ν","description":"減衰 Jacobi を続けて当てる回数。","min":1,"max":4,"step":1,"value":2}
+//| cases:
+//|   - {"id":"undamped","label":"ω = 1（減衰なし）","description":"最高周波のモードの μ が −1 に近づき、高周波の誤差もほとんど減らない。","inputs":{"omega":1.0}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"ratios","path":"/rows/0/1","approx":{"value":0.998314,"atol":1e-6}}
+//|       - {"artifact":"ratios","path":"/rows/0/2","approx":{"value":0.998314,"atol":1e-6}}
+//|       - {"artifact":"ratios","path":"/rows/1/1","approx":{"value":0.159326,"atol":1e-6}}
+//|       - {"artifact":"ratios","path":"/rows/1/2","approx":{"value":0.159326,"atol":1e-6}}
+//|       - {"artifact":"ratios","path":"/rows/2/2","approx":{"value":0.16,"atol":1e-12}}
+//|   - case: undamped
+//|     expect:
+//|       - {"artifact":"ratios","path":"/rows/1/1","approx":{"value":0.997592,"atol":1e-6}}
+//|       - {"artifact":"ratios","path":"/rows/2/2","approx":{"value":1.0,"atol":1e-12}}
+use scioxide_core::{ExecutionContext, LinearOperator, RealScalar};
+use scioxide_sparse::{JacobiPreconditioner, SparseSolveOptions, sparse_diagonals};
+
+let n = 63;
+let (main, off) = (vec![2.0_f64; n], vec![-1.0_f64; n - 1]);
+let a = sparse_diagonals(n, n, &[-1, 0, 1], &[&off[..], &main[..], &off[..]])
+    .map_err(|e| e.to_string())?;
+let jacobi = JacobiPreconditioner::new(&a).map_err(|e| e.to_string())?;
+let (options, scope) = (SparseSolveOptions::new(), ExecutionContext::sequential());
+let mut work = jacobi.workspace(1).map_err(|e| e.to_string())?;
+let mut scratch = vec![0.0_f64; a.apply_workspace_len().map_err(|e| e.to_string())?];
+let norm = |v: &[f64]| RealScalar::sqrt(v.iter().fold(0.0_f64, |s, x| s + x * x));
+let (mut measured, mut theory) = (Vec::new(), Vec::new());
+for j in 1..=n {
+    let theta = j as f64 * core::f64::consts::PI / (n + 1) as f64;
+    let mut e: Vec<f64> = (1..=n).map(|i| RealScalar::sin(theta * i as f64)).collect();
+    let start = norm(&e);
+    let (mut ae, mut z) = (vec![0.0_f64; n], vec![0.0_f64; n]);
+    for _ in 0..sweeps as usize {
+        // e ← e − ω D⁻¹ A e（b = 0 の減衰 Jacobi の一回）。
+        a.apply_into(&e, &mut ae, &mut scratch)
+            .map_err(|e| e.to_string())?;
+        jacobi
+            .apply_into(&ae, options, &mut z, &mut work, scope)
+            .map_err(|e| e.to_string())?;
+        e.iter_mut().zip(&z).for_each(|(ei, zi)| *ei -= omega * zi);
+    }
+    measured.push([j as f64, norm(&e) / start]);
+    // 理論値 |1 − ω(1 − cos θ)|^ν（abs と powi は f64 の固有メソッド）。
+    let mu = (1.0 - omega * (1.0 - RealScalar::cos(theta))).abs();
+    theory.push([j as f64, mu.powi(sweeps as i32)]);
+}
+// 高周波は θ_j ≥ π/2、つまり j ≥ (n + 1)/2 = 32。
+let high = |points: &[[f64; 2]]| {
+    points
+        .iter()
+        .filter(|p| p[0] >= 32.0)
+        .fold(0.0_f64, |m, p| m.max(p[1]))
+};
+let bound = (1.0 - omega).abs().max((1.0 - 2.0 * omega).abs());
+let rows = vec![
+    (
+        "最低のモード j = 1 の比",
+        Some(measured[0][1]),
+        theory[0][1],
+    ),
+    (
+        "高周波（j ≥ 32）の比の最大",
+        Some(high(&measured)),
+        high(&theory),
+    ),
+    ("高周波の半分での上限", None, bound.powi(sweeps as i32)),
+];
+let fixed4 = serde_json::json!({ "fractionDigits": 4 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "量" },
+    { "key": "1", "label": "測った比 [-]", "type": "number", "format": fixed4, "nullText": "なし" },
+    { "key": "2", "label": "理論値 [-]", "type": "number", "format": fixed4 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "ratios" })
+);
+emit_chart!(serde_json::json!({
+    "kind": "xy",
+    "xLabel": "モードの番号 j [-]",
+    "yLabel": "ν 回後の誤差の比 [-]",
+    "yType": "log",
+    "dataZoom": true,
+    "tooltip": true,
+    "annotations": [
+        { "kind": "line", "axis": "x", "value": 32.0, "label": "θ = π/2" }
+    ],
+    "layers": [
+        {
+            "id": "theory",
+            "kind": "line",
+            "name": "理論値 |μⱼ|^ν",
+            "points": theory,
+            "style": { "lineType": "dashed" }
+        },
+        {
+            "id": "measured",
+            "kind": "scatter",
+            "name": "測った比",
+            "points": measured,
+            "style": { "symbol": "circle" }
+        }
+    ]
+}));
+```
+
+既定の $\omega = 0.7$、$\nu = 2$ では、最低のモードの比は 0.9983 でほとんど減らず、高周波のモードの比の最大は 0.1593 になる。
+測った比は理論値と丸め誤差の範囲で一致し、グラフでは記号が破線の上に並ぶ。
+高周波の最大は最高周波のモード $j = 63$ で生じ、上限 $\max(0.3, 0.4)^2 = 0.16$ をわずかに下回る。
+$\omega = 1$（減衰なしの Jacobi）では最高周波のモードの $\mu_{63}$ が $-1$ に近づき、高周波の比の最大は最低のモードと同じ 0.9976 で、ほとんど減らない。
+このとき $j = 32$ では $\mu_{32} = 0$ だが、初期の正弦波の丸め誤差が残るので、測った比は $1.7 \times 10^{-15}$ にとどまり、グラフの記号は破線から離れる。
+$\omega = 0.2$ では高周波の比の最大が $j = 32$ の 0.64 にとどまり、$\omega$ が小さすぎても高周波の誤差は速く減らない。
+
+## 二格子補正と Galerkin の粗い演算子
+
+粗い格子の未知数から細かい格子の未知数を作る補間を $\mathbf{P} \in \mathbb{R}^{n \times n_c}$（$n_c < n$）とし、粗い格子の演算子を
+
+$$
+\mathbf{A}_c = \mathbf{P}^{\mathsf{H}}\mathbf{A}\mathbf{P}
+$$
+
+と定める（Galerkin の粗い演算子）。
+二格子法の一回は、平滑化を $\nu_1$ 回、粗い格子での補正、平滑化を $\nu_2$ 回の順に行い、誤差は
+
+$$
+\mathbf{e} \leftarrow \mathbf{S}^{\nu_2}\bigl(\mathbf{I} - \mathbf{P}\mathbf{A}_c^{-1}\mathbf{P}^{\mathsf{H}}\mathbf{A}\bigr)\mathbf{S}^{\nu_1}\,\mathbf{e}
+$$
+
+と変わる。
+$\mathbf{A}$ が Hermitian 正定値なら、中央の因子はエネルギーの内積 $\langle \mathbf{u}, \mathbf{v} \rangle_{\mathbf{A}} = \mathbf{v}^{\mathsf{H}}\mathbf{A}\mathbf{u}$ について $\mathrm{range}(\mathbf{P})$ と直交する部分空間への直交射影である。
+したがって粗い格子の補正は、補間で表せる誤差の成分を、エネルギーノルム $\lVert \mathbf{e} \rVert_{\mathbf{A}} = \sqrt{\langle \mathbf{e}, \mathbf{e} \rangle_{\mathbf{A}}}$ の意味で最もよく取り除く。
+平滑化が取り除けないなめらかな誤差が $\mathbf{P}$ で表せれば、二つの操作が補い合って、どの周波数の誤差も一定の割合で減る。
+粗い格子の系 $\mathbf{A}_c$ にも同じ二格子法を再帰的に当てれば多重格子法になる。
+
+各段で次の粗い段の補正を 1 回呼ぶのが **V サイクル**、2 回呼ぶ（2 回目は 1 回目の結果から始める）のが **W サイクル**である。
+粗い格子の未知数が一段ごとに $1/c$（$c > 1$）になるなら、第 $\ell$ 段の手間は細かい段の $c^{-\ell}$ 倍程度である。
+V サイクルは各段を 1 回訪れるので、全体の手間は細かい段の $\sum_\ell c^{-\ell} < c/(c-1)$ 倍に収まる。
+W サイクルは第 $\ell$ 段を $2^\ell$ 回訪れるので $\sum_\ell (2/c)^\ell$ 倍になり、$c > 2$ のときだけ細かい段の定数倍に収まる。
+各段の行列の大きさの目安が**演算子複雑度**
+
+$$
+C_{\mathrm{op}} = \frac{\sum_{\ell} \mathrm{nnz}(\mathbf{A}_\ell)}{\mathrm{nnz}(\mathbf{A}_0)}
+$$
+
+である。
+V サイクルで各段の行列との積を同じ回数だけ行うなら、その手間は細かい段だけの場合のおよそ $C_{\mathrm{op}}$ 倍になる（補間と制限の積は別に加わる）。
+
+## 平滑化集約による代数的多重格子
+
+幾何的な多重格子は格子の階層から $\mathbf{P}$ を作るが、AMG は行列の成分だけから作る。
+`AmgHierarchy::build(matrix, modes, setup, limits, options, scope)` は、各段で次の手順を行う。
+
+1. 強い結合：$a_{ij} \ne 0$ かつ $\lvert a_{ij} \rvert / \sqrt{a_{ii}a_{jj}} \ge \theta$ のとき、$i$ と $j$ は強く結合しているとする（$\theta$ は `with_strength` で 0 以上 1 以下、既定は $1/16$）。
+2. 集約：強い結合のグラフを行の番号の順に 3 回走査して、頂点を集約（aggregate）にまとめる。
+   1 回目は強く結合した隣接頂点を持ち、自身も隣接頂点もまだ集約に入っていない頂点を選び、その頂点と隣接頂点で集約を作る。
+   2 回目は残った頂点を、強い隣接頂点のうち 1 回目で集約に入った最初のものの集約に加える。
+   3 回目はそれでも残った頂点を、まだ集約に入っていない強い隣接頂点とまとめ、強い結合を持たない頂点は 1 個だけの集約にする。
+   既定の強さでは、$n$ 点の 1 次元のラプラシアンは $\lceil n/3 \rceil$ 個の集約になる。
+3. 仮の補間：近零空間のモード（`modes`、列優先の `BlockVectorView`）を各集約に制限し、修正 Gram–Schmidt 法を 2 回当てて正規直交化し、仮の補間 $\mathbf{T}$ を作る。
+   集約の上で一次従属になったモードは除くので、モードが $m$ 本なら、一つの集約から生まれる粗い未知数は高々 $m$ 個である。
+   次の段のモードは正規直交化の係数から作る。
+   近零空間のモードは $\lVert \mathbf{A}\mathbf{x} \rVert$ が $\lVert \mathbf{A} \rVert\,\lVert \mathbf{x} \rVert$ に比べて小さく、平滑化で減りにくいベクトルで、$\mathbf{T}$ はこれを各集約の上で表す（次の段のモードを $\mathbf{B}_c$ とすると、$\mathbf{T}\mathbf{B}_c$ は丸めを除いて元のモードに等しい）。
+   ラプラシアンなら定数ベクトル 1 本、弾性体なら剛体運動のベクトルを与える。
+4. 補間の平滑化：$\mathbf{P} = (\mathbf{I} - \omega\,\mathbf{D}^{-1}\mathbf{A})\,\mathbf{T}$ とする。
+   $\omega = 4/(3\hat\rho)$ で、$\hat\rho = \max(1, \max_i \sum_j \lvert a_{ij} \rvert/a_{ii})$（和は $j = i$ を含む）は $\rho(\mathbf{D}^{-1}\mathbf{A})$ の Gershgorin の上界である。
+   $\mathbf{A}$ が Hermitian 正定値なら、この $\omega$ は $0 < \omega < 2/\rho(\mathbf{D}^{-1}\mathbf{A})$ を満たす。
+   5 点差分のラプラシアンでは $\hat\rho = 2$ で、$\omega = 2/3$ になる。
+5. 粗い演算子：制限 $\mathbf{R} = \mathbf{P}^{\mathsf{H}}$ を作り、$\mathbf{A}_c = \mathbf{R}(\mathbf{A}\mathbf{P})$ を疎行列の積で計算する。
+   二つの積の丸めで崩れた Hermitian 性は、対になる成分を平均し、対角は実部だけを残して戻す。
+
+段ごとに、まず行数が `with_coarse_size`（既定 16）以下なら `CoarseSize` で止まる。
+次に、段の数が `AmgLimits` の `max_levels` に達していれば `LevelLimit` で止まる。
+どちらでもなければ集約と $\mathbf{T}$ を作り、粗い未知数が細かい未知数より少なくならなければ `Stagnation` で止まる。
+`AmgDiagnostics::termination()` はこの理由を `AmgSetupTermination` で返す。
+`CoarseSize` 以外の終わり方では最も粗い行列が大きいことがあるので、粗い行列を分解する前に大きさを確かめる。
+自動の階層の平滑化は上の $\omega$ を使う減衰 Jacobi である。
+
+`build` は行列が厳密に Hermitian で対角が正の実数であることを確かめるが、正定値性は呼び出し側の前提で、確かめない。
+正方でないか `modes` の行の数が合わなければ `DimensionMismatch`、モードが 0 本、`coarse_size` が 0、$\theta$ が範囲外、`max_levels` が 1 以上 64 以下でない、Hermitian でない、対角が正の実数でない、ある集約の上でモードがすべて 0 になる場合は `InvalidInput`、モードに NaN か無限大があれば `NonFinite` を返す。
+上限 `AmgLimits::new(max_levels, max_entries, max_setup_bytes)` の `max_levels` は、最も細かい段と最も粗い段を含めた段の数の上限で、達すると上の `LevelLimit` で止まる。
+`max_entries` は細かい行列、各段の仮の補間（行数 × モード数）と補間の要素数、各積 $\mathbf{A}\mathbf{B}$ の $\mathrm{nnz}(\mathbf{A}) + \mathrm{nnz}(\mathbf{B})$ と和を取る前の積の項の数の合計を制限し、`max_setup_bytes` は一時的なものを含む構築の論理バイト数を制限する。
+この二つを超えると `ResourceLimit` を返す。
+`AmgLimits::default()` は 64 段で、要素数とバイト数の上限を持たない。
+`SparseSolveOptions` の反復回数の上限では、開始と終了に 1 回ずつと、各段の対角の準備に行ごとに 1 回を数える。
+粗くする段ではさらに、集約の 4 回の走査（対角の平方根と 3 回の集約）と $\mathbf{T}$ の平滑化に行ごとに 1 回、$\mathbf{T}$ の作成に集約ごとに 1 回、積 $\mathbf{A}\mathbf{T}$、$\mathbf{A}\mathbf{P}$、$\mathbf{R}(\mathbf{A}\mathbf{P})$ のそれぞれに出力の行ごとに 1 回と最後に 1 回を数え、上限に達すると `ConvergenceFailure` を返す。
+
+`AmgDiagnostics` の `levels()`、`total_rows()`、`operator_entries()`、`transfer_entries()`、`operator_complexity()`、`coarsening_ratio()`、`setup_bytes_bound()` は観測した量である。
+`coarsening_ratio()` は細かい段と 2 段目の行数の比である。
+これらの量はサイクルの手間を表すが、収束の速さは予測しない。
+階層の各段は `matrix(level)`、`aggregates(level)`（最も粗い段では空）、`tentative(level)`、`prolongation(level)`、`modes(level)`、`coarse_matrix()` で読め、`level(level)` は減衰 Jacobi の平滑化を付けた借用の `AmgLevelView` を返す。
+
+### 前処理としての使い方
+
+- 準備を一括して行うコンストラクター `AmgPreconditioner::new(&a)` は、定数ベクトルをモードとし、`AmgSetupOptions::new()` と `AmgLimits::default()` で階層を作る。
+  最も粗い行列を `SparseCholesky::new` で分解し、`AmgCycleOptions::new()` のサイクルを前処理にする。
+- `AmgPreconditioner::build(hierarchy, cycle, limits, options, scope)` は階層を所有し、最も粗い行列を AMD の順序の `SparseCholesky` で分解して、サイクルを前処理として使える形にする。
+  `limits`（`SparseSymmetricLimits`）は粗い行列の分解だけに使い、粗い行列が正定値でなければ `NumericalInstability` を返す。
+- `AmgHierarchy::cycle(coarse, options)` は、呼び出し側が用意した最も粗い行列の逆の作用 `coarse` で、階層を借用した `AmgCycle` を作る。
+- `AmgCycle::new(levels, coarse, options)` は、呼び出し側が作った `AmgLevelView` の列（作用素、補間、制限、平滑化）からサイクルを作る。
+  段は細かい順に 1〜64 段で、各段の行数は次の段より大きく、最も粗い段だけが補間と制限を持たない。
+  制限は $\mathbf{P}^{\mathsf{H}}$ から作らず、渡したものをそのまま使う。
+  平滑化 `AmgSmootherView` は `Jacobi { inverse_diagonal, weight }`、`GaussSeidel { matrix }`（前の平滑化は前進、後の平滑化は後退）、`Injected { pre, post }` から選べる。
+  `AmgCycle::new` は形と平滑化のデータだけを確かめ、Galerkin の関係、対称性、収束は確かめない。
+- `AmgCycleOptions::new()` は V サイクル、前後 1 回ずつの平滑化で、`with_kind(AmgCycleKind::W)`、`with_pre_sweeps`、`with_post_sweeps` で変える。
+
+どの形も scioxide-core の `Preconditioner` を実装し、一回の作用は初期値 0 からサイクルを 1 回行う。
+CG に使うには、サイクルが Hermitian 正定値でなければならない。
+$\mathbf{A}$ が Hermitian 正定値で、前と後の平滑化が互いに随伴であること（Jacobi どうし、または前進と後退の Gauss–Seidel）、前後の回数が等しいこと、各段で $\mathbf{R} = \mathbf{P}^{\mathsf{H}}$ であること、粗い解法が Hermitian 正定値であることがそろえば、サイクルは Hermitian になる。
+さらに各段の平滑化 $\mathbf{x} \leftarrow \mathbf{x} + \mathbf{M}\mathbf{r}$ がエネルギーノルムで縮小（$\lVert \mathbf{I} - \mathbf{M}\mathbf{A} \rVert_{\mathbf{A}} < 1$）なら、サイクルは正定値にもなる。
+減衰 Jacobi では $0 < \omega < 2/\rho(\mathbf{D}^{-1}\mathbf{A})$ がこの条件で、Gauss–Seidel は `matrix` がその段の作用素と同じなら、$\mathbf{A}$ が Hermitian 正定値のとき常に満たす。
+`Injected` の平滑化は固定の線形写像でなければならない。
+`AmgPreconditioner` は $\omega = 4/(3\hat\rho)$ の減衰 Jacobi、$\mathbf{R} = \mathbf{P}^{\mathsf{H}}$、Cholesky の粗い解法を使うので、$\mathbf{A}$ が Hermitian 正定値なら、前後の回数を等しくすればこれらを満たす。
+どの形も、サイクルが Hermitian 正定値であることは確かめない。
+
+### AMG の階層と Galerkin の粗い演算子
+
+次のセルは $k \times k$ 格子の 5 点差分ラプラシアン（$N = k^2$、対角 4、隣接 $-1$）に定数ベクトルを近零空間のモードとして与え、`AmgHierarchy` を作る。
+入力は格子の辺の点の数 $k$（8〜32）、粗い格子の大きさの目標 `coarse_size`（4〜64）、段の数の上限 `max_levels`（1〜8）、強い結合の閾値 $\theta$ である。
+表は各段の行数、非零の数、その段までの非零の数の和を $\mathrm{nnz}(\mathbf{A}_0)$ で割った値、集約の数を示す。
+最後の段の和の比が演算子複雑度で、判定の診断値 `operator_complexity()` と独立に比べられる。
+検算として、1 段上の行列 $\mathbf{A}_{\ell-1}$ と補間 $\mathbf{P}$ から $\mathbf{P}^{\mathsf{T}}\mathbf{A}_{\ell-1}\mathbf{P}$ を確保を伴う積 `multiply` で計算し直し、各段の行列との差の最大も示す。
+最後の判定は、`AmgSetupTermination` が `CoarseSize` なら満たした、`LevelLimit` か `Stagnation` なら途中で止まったと示し、段の数、最も粗い行列の行数、`operator_complexity()`、`coarsening_ratio()` を診断値に含める。
+
+```rust
+//| id: sparse-amg-hierarchy
+//| ref: sparse-amg-hierarchy
+//| title: 平滑化集約 AMG の階層と Galerkin の粗い演算子の照合
+//| run: reactive
+//| crates: [scioxide-core, scioxide-sparse]
+//| inputs:
+//|   grid: {"type":"range","label":"格子の辺の点の数 k","description":"未知数は N = k² 個。","min":8,"max":32,"step":4,"value":16}
+//|   coarse_limit: {"type":"range","label":"粗い格子の大きさの目標 coarse_size","description":"行数がこれ以下の段で粗くするのを止める。","min":4,"max":64,"step":4,"value":16}
+//|   level_limit: {"type":"range","label":"段の数の上限 max_levels","description":"最も細かい段と最も粗い段を含む段の数の上限。","min":1,"max":8,"step":1,"value":8}
+//|   strength: {"type":"select","label":"強い結合の閾値 θ","description":"5 点差分の隣接の強さは |a_ij|/√(a_ii a_jj) = 1/4。","options":[{"label":"θ = 1/16（既定）","value":"0.0625"},{"label":"θ = 1/4","value":"0.25"},{"label":"θ = 1/2","value":"0.5"}],"value":"0.0625"}
+//| cases:
+//|   - {"id":"level-limit","label":"max_levels = 2","description":"段の数の上限で止まり、最も粗い行列は目標の 16 行より大きい 48 行のまま残る。","inputs":{"level_limit":2}}
+//|   - {"id":"weak","label":"θ = 1/4","description":"細かい段の隣接はちょうど閾値で強い結合になるが、2 段目の結合は 1/4 より弱く、集約で次元が減らずに Stagnation で止まる。","inputs":{"strength":"0.25"}}
+//|   - {"id":"fine-grid","label":"k = 32、coarse_size 4","description":"格子を細かくして段を増やしても、演算子複雑度はほとんど変わらない。","inputs":{"grid":32,"coarse_limit":4}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"levels","path":"/rows/0/1","equals":256}
+//|       - {"artifact":"levels","path":"/rows/1/1","equals":48}
+//|       - {"artifact":"levels","path":"/rows/2/1","equals":9}
+//|       - {"artifact":"levels","path":"/rows/0/4","equals":48}
+//|       - {"artifact":"levels","path":"/rows/2/3","approx":{"value":1.359375,"rtol":1e-12}}
+//|       - {"artifact":"levels","path":"/rows/1/5","range":{"max":1e-14}}
+//|       - {"artifact":"levels","path":"/rows/2/5","range":{"max":1e-14}}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+//|       - {"path":"/outputs/1/diagnostics/2/value","approx":{"value":1.359375,"rtol":1e-12}}
+//|   - case: level-limit
+//|     expect:
+//|       - {"artifact":"levels","path":"/rows/1/1","equals":48}
+//|       - {"path":"/outputs/1/state","equals":"partial"}
+//|       - {"path":"/outputs/1/status","equals":"LevelLimit"}
+//|   - case: weak
+//|     expect:
+//|       - {"artifact":"levels","path":"/rows/0/4","equals":48}
+//|       - {"artifact":"levels","path":"/rows/1/1","equals":48}
+//|       - {"path":"/outputs/1/state","equals":"partial"}
+//|       - {"path":"/outputs/1/status","equals":"Stagnation"}
+//|   - case: fine-grid
+//|     expect:
+//|       - {"artifact":"levels","path":"/rows/0/1","equals":1024}
+//|       - {"artifact":"levels","path":"/rows/4/1","equals":4}
+//|       - {"artifact":"levels","path":"/rows/4/3","range":{"min":1.3,"max":1.4}}
+//|       - {"artifact":"levels","path":"/rows/4/5","range":{"max":1e-13}}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+use scioxide_core::{BlockVectorView, ExecutionContext};
+use scioxide_sparse::{
+    AmgHierarchy, AmgLimits, AmgSetupOptions, AmgSetupTermination, DuplicatePolicy,
+    ExplicitZeroPolicy, SparseBuilder, SparseSolveOptions,
+};
+
+let k = grid as usize;
+let n = k * k;
+let mut builder = SparseBuilder::new(n, n);
+for p in 0..n {
+    builder.push(p, p, 4.0_f64).map_err(|e| e.to_string())?;
+    for q in [p.wrapping_sub(1), p + 1, p.wrapping_sub(k), p + k] {
+        if q < n && (q / k == p / k || q % k == p % k) {
+            builder.push(p, q, -1.0).map_err(|e| e.to_string())?;
+        }
+    }
+}
+let a = builder
+    .finish_csr(DuplicatePolicy::Reject, ExplicitZeroPolicy::Drop)
+    .map_err(|e| e.to_string())?;
+let theta: f64 = strength.parse().map_err(|_| "θ を数として読めない")?;
+let ones = vec![1.0_f64; n];
+let modes = BlockVectorView::new(&ones, n, 1).map_err(|e| e.to_string())?;
+let setup = AmgSetupOptions::new()
+    .with_coarse_size(coarse_limit as usize)
+    .with_strength(theta);
+let limits = AmgLimits::new(level_limit as usize, 64 * n, 1 << 26);
+let (options, scope) = (SparseSolveOptions::new(), ExecutionContext::sequential());
+let hierarchy = AmgHierarchy::build(a.view(), modes, setup, limits, options, scope)
+    .map_err(|e| e.to_string())?;
+let d = hierarchy.diagnostics();
+
+let (mut rows, mut cumulative) = (Vec::new(), 0usize);
+for level in 0..d.levels() {
+    let matrix = hierarchy.matrix(level).ok_or("段がない")?;
+    // 独立検算 1: 各段の非零の数を足し合わせ、最後の段で演算子複雑度になる。
+    cumulative += matrix.nnz();
+    // 集約の番号は 0 から連続するので、最大 + 1 が集約の数（最も粗い段は空）。
+    let aggregates = hierarchy
+        .aggregates(level)
+        .and_then(|ids| ids.iter().max())
+        .map(|m| m + 1);
+    // 独立検算 2: 1 段上の A と P から PᵀAP を確保を伴う積で計算し直し、この段の行列と比べる。
+    let mut gap = None;
+    if let Some(up) = level.checked_sub(1) {
+        let fine = hierarchy.matrix(up).ok_or("段がない")?;
+        let p = hierarchy.prolongation(up).ok_or("補間がない")?;
+        let ap = fine.multiply(p).map_err(|e| e.to_string())?;
+        let transposed = p.transpose().map_err(|e| e.to_string())?;
+        let pap = transposed
+            .to_csr()
+            .map_err(|e| e.to_string())?
+            .multiply(&ap)
+            .map_err(|e| e.to_string())?;
+        let mut max = 0.0_f64;
+        for (i, j, v) in matrix.iter() {
+            max = max.max((v - pap.get(i, j).map_err(|e| e.to_string())?).abs());
+        }
+        gap = Some(max);
+    }
+    let ratio = cumulative as f64 / a.nnz() as f64;
+    rows.push((level, matrix.rows(), matrix.nnz(), ratio, aggregates, gap));
+}
+let (fixed4, sci2) = (
+    serde_json::json!({ "fractionDigits": 4 }),
+    serde_json::json!({ "notation": "scientific", "significantDigits": 2 }),
+);
+let columns = serde_json::json!([
+    { "key": "0", "label": "段 ℓ", "type": "integer" },
+    { "key": "1", "label": "行数 [行]", "type": "integer" },
+    { "key": "2", "label": "nnz(A_ℓ) [個]", "type": "integer" },
+    { "key": "3", "label": "ℓ 段までの nnz の和 / nnz(A₀) [-]", "type": "number", "format": fixed4 },
+    { "key": "4", "label": "集約の数 [個]", "type": "integer", "nullText": "最も粗い段" },
+    { "key": "5", "label": "max |A_ℓ − PᵀA_(ℓ−1)P| [-]", "type": "number", "format": sci2, "nullText": "最も細かい段" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "levels" })
+);
+let (outcome, status) = match d.termination() {
+    AmgSetupTermination::CoarseSize => (
+        Outcome::satisfied("最も粗い行列が目標の大きさ以下"),
+        "CoarseSize",
+    ),
+    AmgSetupTermination::LevelLimit => {
+        (Outcome::partial("段の数の上限で止まった"), "LevelLimit")
+    }
+    AmgSetupTermination::Stagnation => {
+        (Outcome::partial("集約で次元が減らなくなった"), "Stagnation")
+    }
+};
+let coarse_rows = hierarchy.coarse_matrix().rows() as f64;
+let mut outcome = outcome
+    .status(status)
+    .diagnostic("段の数", d.levels() as f64, None)
+    .diagnostic("最も粗い行列の行数", coarse_rows, None);
+if let Some(complexity) = d.operator_complexity() {
+    outcome = outcome.diagnostic("operator_complexity()", complexity, None);
+}
+if let Some(ratio) = d.coarsening_ratio() {
+    outcome = outcome.diagnostic("coarsening_ratio()", ratio, None);
+}
+emit_outcome!(outcome);
+```
+
+既定の $k = 16$（$N = 256$）、`coarse_size` 16 では、階層は 256、48、9 行の 3 段になり、粗い格子の大きさが目標以下になったので、終了理由は `CoarseSize` で、判定は満たしたことを示す。
+各段の集約の数は行数の約 1/5 で、`coarsening_ratio()` は $256/48 = 5.33$ である。
+演算子複雑度は各段の非零の数 1216、368、69 の和を 1216 で割った 1.3594 で、`operator_complexity()` と一致する。
+確保を伴う積で計算し直した $\mathbf{P}^{\mathsf{T}}\mathbf{A}_{\ell-1}\mathbf{P}$ と各段の行列の差は $2.8 \times 10^{-17}$ 以下で、階層の粗い演算子が Galerkin の積であることを確かめられる。
+$k = 32$、`coarse_size` 4 では 1024、176、27、8、4 行の 5 段になり、演算子複雑度は 1.36 のまま変わらない。
+$k = 8$、`coarse_size` 64 では細かい格子がすでに目標以下なので、粗い段を作らずに 1 段で終わる。
+
+`max_levels` を 2 にすると、2 段目の 48 行で `LevelLimit` になり、判定は途中で止まったことを示す。
+$\theta = 1/4$ では、細かい段の隣接の強さがちょうど $1/4$ なので強い結合のまま 48 個の集約ができる。
+しかし 2 段目の行列では、どの結合も $1/4$ より弱く、次の集約で次元が減らずに `Stagnation` で止まる。
+$\theta = 1/2$ では細かい段にも強い結合がなく、1 段だけで `Stagnation` になる。
+これらの場合は最も粗い行列が目標の 16 行より大きいので、`AmgPreconditioner::build` で使うと、その大きな行列を Cholesky 分解することになる。
+
+## まとめ
+
+減衰 Jacobi などの平滑化は高周波の誤差を速く減らし、1 次元では $\omega = 2/3$ で高周波のモードを一回で $1/3$ 倍以下にする。
+残るなめらかな誤差は Galerkin の粗い演算子 $\mathbf{P}^{\mathsf{H}}\mathbf{A}\mathbf{P}$ による補正で取り除き、V サイクルの手間は演算子複雑度でおよそ見積もれる。
+`AmgHierarchy` は行列の成分と近零空間のモードだけから集約と平滑化した補間を作るので、ラプラシアンには定数ベクトル、弾性体には剛体運動を与える。
+前処理に使う前に `AmgDiagnostics` で終了理由が `CoarseSize` であることと演算子複雑度を確かめ、`LevelLimit` か `Stagnation` なら最も粗い行列の大きさを確かめて $\theta$ や `max_levels` を見直す。
+CG と組み合わせるときは、前後の平滑化の回数をそろえ、自分で組む段では $\mathbf{R} = \mathbf{P}^{\mathsf{H}}$ と縮小する平滑化を選んで、サイクルを Hermitian 正定値に保つ。
+
+## 次に読むページ
+
+- [代数的多重格子の格子非依存な収束](../../examples/amg-grid-independence/)：2 次元 Poisson 方程式で、格子を細かくしたときの Jacobi・IC(0)・AMG の CG の反復回数を比べる。
+- [重なりのある Schwarz 法](../overlapping-schwarz/)：部分領域の局所の解を組み合わせる領域分割の前処理と、粗い補正を持たない一段の方法の限界を確かめる。
+- [前処理](../../api/preconditioners/)：AMG の階層・サイクル・前処理の全項目の仕様を引く。

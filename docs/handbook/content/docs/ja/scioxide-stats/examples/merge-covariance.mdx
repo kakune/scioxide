@@ -1,0 +1,500 @@
+---
+title: 分割集計を一括集計と照合する
+description: 温度と消費電力の二変量統計を区画ごとに OnlineCovariance で集計して結合し、一括の集計、結合の順序の入れ替え、大きな共通の基準値、最小二乗の傾きの解析値と比べる。区画の数と結合の形を変えたときの末尾の桁の変化と、一括の集約 reduce_covariance_with_options の結合方針を確かめる。
+sidebar:
+  order: 415
+references:
+  stats-merge-covariance-order-reproducibility: "結合の順序と再現性"
+  stats-merge-covariance-partition-experiment: "区画ごとの集計と結合の実験"
+  stats-merge-covariance-regression-slope: "共分散の結合と回帰の傾き"
+---
+
+分散した収集系や並列の処理では、区画ごとに集計した統計量を後から一つにまとめる。
+区画の平均と分散をそのまま平均すると、区画の平均どうしの違いによる変動が抜け、全体の分散や共分散を誤る。
+このページは温度 $T$ と消費電力 $P$ の観測を区画に分けて `OnlineCovariance` で集計し、`merge` で結合した結果を一括の集計と比べる。
+結合の公式の導出は[逐次平均・分散・高次モーメント・共分散の数理](oxref:stats-online-merging-partials)にある。
+
+## 共分散の結合と回帰の傾き
+
+二つの区画 $A$、$B$ の大きさを $n_A$、$n_B$（$n = n_A + n_B$）、平均を $(\bar T_A, \bar P_A)$、$(\bar T_B, \bar P_B)$ とする。
+共偏差積和 $C = \sum_i (T_i - \bar T)(P_i - \bar P)$ は
+
+$$
+C_{AB} = C_A + C_B + \frac{n_A n_B}{n}\,(\bar T_B - \bar T_A)(\bar P_B - \bar P_A)
+$$
+
+で結合する。
+最後の項は区画の平均どうしの違いによる共変動で、区画の共分散を重み付き平均しただけではこれが抜ける。
+温度が時間とともに上がる列を時間で区切ると、区画の平均温度と平均電力がそろって上がるので、この項が共分散の大部分を占める。
+
+`OnlineCovariance` は $T$ と $P$ それぞれの `OnlineMoments` と同じ状態と、共モーメント $C/n$ を持つ。
+`observe(x, y)` は 1 組を大きさ 1 の区画として結合し、`merge` は別の区画の累積器を結合する。
+どちらも $O(1)$ の計算で、標本を保持しない。
+保持する次数（`MomentOrder`）が違う累積器の結合は `InvalidInput` になり、空の累積器との結合は何も変えない。
+`snapshot` が返す `CovarianceSnapshot` は、`sample_covariance`（$C/(n-1)$）、`population_covariance`（$C/n$）、`correlation`、`mean_x`、`mean_y` と、各座標の `MomentsSnapshot`（`marginal_x`、`marginal_y`）を持ち、2 組未満では標本共分散を `None` で返す。
+
+最小二乗の直線 $P = \alpha + \beta T$ の傾きと切片は、集計した統計量から
+
+$$
+\hat\beta = \frac{C}{\sum_i (T_i - \bar T)^2} = \frac{s_{TP}}{s_T^2}, \qquad \hat\alpha = \bar P - \hat\beta\,\bar T
+$$
+
+で求まる。
+共分散の単位は °C·W、傾きは W/°C で、相関係数は無次元である。
+scioxide-stats は `CovarianceSnapshot` から傾きを返す公開関数を持たないので、このページでは `sample_covariance` を `marginal_x().sample_variance()` で割って求める。
+回帰の推定と区間が必要なら `linear_regression` を使う。
+
+## 観測のモデルと傾きの解析値
+
+$N = 240$ 個の観測で、温度は 12 °C から 30 °C まで等間隔に上がり、電力は
+
+$$
+P_i = O + 38 + \beta\,T_i + 3\sin\!\left(\frac{2\pi i}{24}\right)\ \text{W}, \qquad T_i = 12 + \frac{18\,i}{N-1}\ \text{°C}
+$$
+
+とする。
+$O = 10^p$ W は共分散に関係しない共通の基準値で、建物全体の基礎負荷のような大きな一定の成分を表す。
+$\beta$ は設定した温度係数、±3 W の正弦は 24 標本周期の確定的な変動である。
+
+周期成分は温度と無相関に見えるが、有限の標本では温度との標本共分散が厳密には 0 にならない。
+$N$ が 24 の倍数なら $\sum_i (i - (N-1)/2)\sin(2\pi i/24) = -(N/2)\cot(\pi/24)$、$\sum_i (i - (N-1)/2)^2 = N(N^2-1)/12$ なので、最小二乗の傾きは
+
+$$
+\hat\beta = \beta - \frac{\cot(\pi/24)}{N+1}
+$$
+
+となる。
+$N = 240$ では $\cot(\pi/24)/241 \approx 0.0315$ W/°C で、このずれは $\beta$ によらない。
+これは計算の誤差ではなく、この標本の性質である。
+セルではこの解析値を独立な検算に使う。
+
+次の定義のブロックは、このページの二つのセルが使う観測を作る。
+`observations` は基準値を除いた組 $(T_i, P_i - O)$ と、$O$ を加えて `f64` に丸めた観測の組 $(T_i, P_i)$ を返す。
+
+```rust
+//| id: stats-merge-covariance-model
+//| kind: definitions
+//| title: 温度と消費電力の観測のモデル
+//| crates: [scioxide-core]
+use scioxide_core::RealScalar;
+
+/// 観測の組の数 N。
+pub(crate) const PAIRS: usize = 240;
+
+/// 基準値 O [W]、基準値を除いた組 (T [°C], P − O [W])、観測の組 (T [°C], P [W])。
+pub(crate) struct PowerData {
+    pub(crate) offset: f64,
+    pub(crate) model: Vec<(f64, f64)>,
+    pub(crate) observed: Vec<(f64, f64)>,
+}
+
+/// Tᵢ = 12 + 18 i/(N − 1)、Pᵢ = O + 38 + β Tᵢ + 3 sin(2πi/24)、O = 10ᵖ。
+pub(crate) fn observations(offset_exponent: f64, coefficient: f64) -> PowerData {
+    let offset = RealScalar::powf(10.0_f64, offset_exponent);
+    let last = (PAIRS - 1) as f64;
+    let model: Vec<(f64, f64)> = (0..PAIRS)
+        .map(|i| {
+            let t = 12.0 + 18.0 * i as f64 / last;
+            let phase = 2.0 * std::f64::consts::PI * i as f64 / 24.0;
+            (t, 38.0 + coefficient * t + 3.0 * RealScalar::sin(phase))
+        })
+        .collect();
+    let observed = model.iter().map(|&(t, p)| (t, offset + p)).collect();
+    PowerData {
+        offset,
+        model,
+        observed,
+    }
+}
+```
+
+## 区画ごとの集計と結合の実験
+
+次のセルは観測を指定した数の区画に分けて区画ごとに集計し、順方向と逆方向に結合して、一括の集計と比べる。
+区画の大きさは $\lceil N/k \rceil$ で、最後の区画だけ小さくなることがある。
+表の各行は経路ごとの平均電力（基準値を除く）、標本共分散、傾き、傾きの解析値との差、相関係数である。
+もう一つの検算として、基準値を加える前の電力の偏差から 2 パスで最小二乗の傾きを直接求める（`f64` の算術で書いた比較用の経路）。
+図は基準値を除いた観測、集計から求めた回帰直線、設定した直線 $38 + \beta T$（破線）を描く。
+
+```rust
+//| id: stats-merge-covariance
+//| ref: stats-merge-covariance
+//| title: 温度・電力統計の分割数、基準値、傾きを動かして結合する
+//| run: reactive
+//| uses: [stats-merge-covariance-model]
+//| crates: [scioxide-core, scioxide-stats]
+//| exports: [power_offset_exponent, temperature_coefficient]
+//| inputs:
+//|   partition_count: {"type":"range","label":"区画の数 k [個]","description":"区画の大きさと結合の回数を変える。","min":2,"max":16,"step":1,"value":4}
+//|   power_offset_exponent: {"type":"range","label":"電力の基準値の指数 p（O = 10ᵖ W）","description":"共分散に関係しない大きな共通成分を加える。","min":0,"max":13,"step":1,"value":6}
+//|   temperature_coefficient: {"type":"range","label":"設定した傾き β [W/°C]","description":"温度と電力の線形関係を変える。","min":0.5,"max":5,"step":0.05,"value":2.4}
+//| cases:
+//|   - {"id":"sixteen-partitions","label":"k = 16","description":"区画を増やしても表示した桁は変わらない。","inputs":{"partition_count":16}}
+//|   - {"id":"small-offset","label":"p = 0","description":"基準値がないと解析値との差は丸めの単位の程度になる。","inputs":{"power_offset_exponent":0}}
+//|   - {"id":"large-offset","label":"p = 13","description":"測定値そのものが 2⁻⁹ W の間隔に丸められ、傾きが経路によらず同じだけずれる。","inputs":{"power_offset_exponent":13}}
+//|   - {"id":"steep","label":"β = 5","description":"傾きの解析値からのずれ 0.0315 W/°C は β によらない。","inputs":{"temperature_coefficient":5}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"paths","path":"/rows/0/3","approx":{"value":2.36848234808,"rtol":1e-10}}
+//|       - {"artifact":"paths","path":"/rows/1/4","range":{"min":-1e-12,"max":1e-12}}
+//|       - {"artifact":"paths","path":"/rows/2/4","range":{"min":-1e-12,"max":1e-12}}
+//|       - {"artifact":"paths","path":"/rows/0/5","approx":{"value":0.98567061,"rtol":1e-08}}
+//|       - {"artifact":"setup","path":"/rows/0/1","equals":4}
+//|       - {"artifact":"setup","path":"/rows/3/1","range":{"min":-1e-13,"max":1e-13}}
+//|   - case: sixteen-partitions
+//|     expect:
+//|       - {"artifact":"setup","path":"/rows/0/1","equals":16}
+//|       - {"artifact":"setup","path":"/rows/1/1","equals":15}
+//|       - {"artifact":"paths","path":"/rows/1/4","range":{"min":-1e-12,"max":1e-12}}
+//|   - case: small-offset
+//|     expect:
+//|       - {"artifact":"paths","path":"/rows/1/4","range":{"min":-1e-14,"max":1e-14}}
+//|   - case: large-offset
+//|     expect:
+//|       - {"artifact":"paths","path":"/rows/0/1","equals":88.400390625}
+//|       - {"artifact":"paths","path":"/rows/1/4","approx":{"value":7.7643e-06,"rtol":0.001}}
+//|       - {"artifact":"setup","path":"/rows/4/1","equals":0.001953125}
+//|   - case: steep
+//|     expect:
+//|       - {"artifact":"paths","path":"/rows/0/3","approx":{"value":4.96848234808,"rtol":1e-10}}
+//|       - {"artifact":"paths","path":"/rows/1/4","range":{"min":-1e-12,"max":1e-12}}
+use scioxide_core::RealScalar;
+use scioxide_stats::{CovarianceSnapshot, MomentOrder, OnlineCovariance};
+
+let n = PAIRS as f64;
+let PowerData {
+    offset,
+    model,
+    observed,
+} = observations(power_offset_exponent, temperature_coefficient);
+let summarize = |rows: &[(f64, f64)]| -> Result<OnlineCovariance<f64>, String> {
+    let mut acc = OnlineCovariance::new(MomentOrder::Second);
+    for &(t, p) in rows {
+        acc.observe(t, p).map_err(|e| e.to_string())?;
+    }
+    Ok(acc)
+};
+let size = PAIRS.div_ceil(partition_count as usize);
+let chunks = observed
+    .chunks(size)
+    .map(summarize)
+    .collect::<Result<Vec<_>, _>>()?;
+let merged = |order: Vec<&OnlineCovariance<f64>>| -> Result<CovarianceSnapshot<f64>, String> {
+    let mut acc = OnlineCovariance::new(MomentOrder::Second);
+    for part in order {
+        acc.merge(part).map_err(|e| e.to_string())?;
+    }
+    Ok(acc.snapshot())
+};
+let paths = [
+    ("一括の集計", summarize(&observed)?.snapshot()),
+    ("区画を順方向に結合", merged(chunks.iter().collect())?),
+    ("区画を逆方向に結合", merged(chunks.iter().rev().collect())?),
+];
+// 検算 1: 傾きの解析値 β − cot(π/24)/(N + 1)。
+let analytic =
+    temperature_coefficient - 1.0 / RealScalar::tan(std::f64::consts::PI / 24.0) / (n + 1.0);
+// 検算 2: 基準値を加える前の偏差から 2 パスで傾きを求める（f64 の算術）。
+let mt = model.iter().map(|r| r.0).sum::<f64>() / n;
+let mp = model.iter().map(|r| r.1).sum::<f64>() / n;
+let sxy: f64 = model.iter().map(|&(t, p)| (t - mt) * (p - mp)).sum();
+let sxx: f64 = model.iter().map(|&(t, _)| (t - mt) * (t - mt)).sum();
+// 各量は Result<Option<f64>, _>: Err は表現できない値、None は未定義を表す。
+fn need<E: std::fmt::Display>(value: Result<Option<f64>, E>) -> Result<f64, String> {
+    value
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "統計量が未定義".to_string())
+}
+let mut rows = Vec::new();
+let mut line = Vec::new();
+for (name, s) in &paths {
+    let cov = need(s.sample_covariance())?;
+    let slope = cov / need(s.marginal_x().sample_variance())?;
+    let mean_power = need(s.mean_y())? - offset;
+    if line.is_empty() {
+        let intercept = mean_power - slope * need(s.mean_x())?;
+        line = vec![
+            [12.0, intercept + slope * 12.0],
+            [30.0, intercept + slope * 30.0],
+        ];
+    }
+    let correlation = need(s.correlation())?;
+    rows.push((*name, mean_power, cov, slope, slope - analytic, correlation));
+}
+let points: Vec<[f64; 2]> = model.iter().map(|&(t, p)| [t, p]).collect();
+let truth = vec![
+    [12.0, 38.0 + temperature_coefficient * 12.0],
+    [30.0, 38.0 + temperature_coefficient * 30.0],
+];
+emit_line_chart!(
+    &vec![
+        serde_json::json!({
+            "name": "観測（基準値を除く）",
+            "points": points,
+            "style": { "symbol": "circle", "lineType": "dotted" }
+        }),
+        serde_json::json!({ "name": "集計から求めた回帰直線", "points": line }),
+        serde_json::json!({
+            "name": "設定した直線 38 + βT",
+            "points": truth,
+            "style": { "lineType": "dashed" }
+        })
+    ],
+    options = &serde_json::json!({
+        "xLabel": "温度 T [°C]",
+        "yLabel": "基準値を除いた電力 P − O [W]"
+    })
+);
+let fixed6 = serde_json::json!({ "fractionDigits": 6 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "経路" },
+    { "key": "1", "label": "平均電力 − O [W]", "type": "number", "format": fixed6 },
+    { "key": "2", "label": "標本共分散 [°C·W]", "type": "number", "format": fixed6 },
+    { "key": "3", "label": "傾き [W/°C]", "type": "number", "format": fixed6 },
+    { "key": "4", "label": "解析値との差 [W/°C]", "type": "number", "format": sci2 },
+    { "key": "5", "label": "相関 [-]", "type": "number", "format": fixed6 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "paths" })
+);
+let setup_columns = serde_json::json!([
+    { "key": "0", "label": "量" },
+    { "key": "1", "label": "値", "type": "number", "format": { "significantDigits": 8 } }
+]);
+let setup = vec![
+    ("区画の数 [個]", chunks.len() as f64),
+    ("区画の大きさ ⌈N/k⌉ [組]", size as f64),
+    ("傾きの解析値 [W/°C]", analytic),
+    ("偏差の 2 パスの傾き − 解析値 [W/°C]", sxy / sxx - analytic),
+    (
+        "基準値の近くの浮動小数点の間隔 [W]",
+        RealScalar::next_after(offset, f64::INFINITY) - offset,
+    ),
+];
+emit_table_with_columns!(
+    setup_columns,
+    setup,
+    metadata = serde_json::json!({ "id": "setup" })
+);
+export!(power_offset_exponent, power_offset_exponent);
+export!(temperature_coefficient, temperature_coefficient);
+```
+
+既定の 4 区画、基準値 $10^6$ W、$\beta = 2.4$ W/°C では、三つの経路の平均電力（基準値を除く）は 88.400000 W、標本共分散は 64.753970 °C·W、傾きは 2.368482 W/°C、相関は 0.985671 で、表示した桁はすべて一致する。
+傾きの解析値 2.3684823 W/°C との差は三つの経路とも $3 \times 10^{-14}$ W/°C の程度である。
+基準値を加える前の偏差の 2 パスは解析値と $10^{-15}$ W/°C の程度で一致するので、残りの差は測定値が基準値 $10^6$ W の近くの間隔 $1.2 \times 10^{-10}$ W に丸められたことによる。
+区画の数を 2 や 16 にしても、表示した桁は変わらない。
+
+集計した傾き 2.3685 W/°C は設定した 2.4 W/°C より 0.0315 小さく、$\beta = 5$ にしても 4.9685 W/°C と同じだけ小さい。
+これは周期成分と温度の標本共分散が 0 でないことによる有限標本のずれで、解析値 $\beta - \cot(\pi/24)/(N+1)$ と一致する。
+図の回帰直線は、設定した直線（破線）よりわずかに傾きが小さい。
+
+基準値を $10^0$ にすると、解析値との差は $10^{-15}$ W/°C 以下になる。
+$10^{13}$ W では測定値そのものが $2^{-9} \approx 0.002$ W の間隔に丸められ、基準値を引いた平均電力は 88.4 W に最も近い $2^{-9}$ の倍数 88.400391 W、傾きの差は三つの経路とも $7.8 \times 10^{-6}$ W/°C になる。
+これは丸めた測定値そのものの最小二乗の傾きと丸める前の傾きの差で、集計の経路によらない。
+`OnlineCovariance` は平均を補償付きの和で保持し、区画の平均の差も共通の基準値を先に打ち消してから求めるので、逐次の更新と区画の結合のどちらでも丸めの蓄積は表示した桁に現れない。
+
+## 結合の順序と再現性
+
+浮動小数点の加算は結合律を満たさないので、区画の分け方や結合の順序を変えると、数学的に同じ統計量でも末尾の桁が変わりうる。
+並列の集約では、各ワーカーが区画を集計し、その部分集計を 2 分木の形や完了した順に結合する。
+完了した順に結合すると、同じ入力でも実行のたびに末尾の桁が変わり、結果をビット単位で再現できない。
+
+scioxide-stats の一括の集約 `reduce_covariance` と `reduce_moments` は、`BatchView` の各バッチを一つの標本として集計し、バッチごとに `CovarianceSnapshot` や `MomentsSnapshot` を返す。
+`StatisticsOptions::with_merge_policy` で結合の方針を選ぶ。
+`MergePolicy::InputOrder`（既定）は各バッチの観測を入力の順に 1 回たどり、`MergePolicy::StablePartitions` は実行 Plan が決めた区画ごとに集計して、部分集計を区画の番号の順に結合する。
+後者の結果はスレッドの完了順によらないが、区画の数は `StatisticsOptions` の実行の方針と、実行コンテキストが使えるワーカーの数で決まるので、ワーカーの数が違う環境どうしではビット単位で一致するとは限らない。
+`reduce_covariance_with_options` と `reduce_covariance` は現在のスレッドで動くコンテキスト（`ExecutionContext::sequential_native`）を使うので、区画は 1 個になる。
+複数のワーカーで区画に分けるには、作業領域と実行コンテキストを渡す `reduce_covariance_into` を使う。
+1 回で全体を受け取れるなら、`OnlineCovariance::from_slices` が補償付きの 2 パスで集計する。
+これも 1 組ずつ `observe` した結果と末尾の桁が違うことがある。
+
+次のセルは前のセルの基準値の指数 $p$ と傾き $\beta$ を受け取って同じ観測（基準値を含む電力）を作り、区画の数を 1 から $k_{\max}$ まで変えて結合した標本共分散を、1 組ずつ `observe` した一括の集計と比べる。
+結合の形は区画を左から順に結合する逐次の形と、隣どうしを対にして結合を繰り返す 2 分木の形から選ぶ。
+差は一括の集計の値の 1 ulp（その値の近くの浮動小数点の間隔）を単位にして描く。
+表には `from_slices` と、二つの結合方針の `reduce_covariance_with_options` の値も出す。
+
+```rust
+//| id: stats-merge-covariance-api-2
+//| ref: stats-merge-covariance-api-2
+//| title: 区画の数と結合の形による末尾の桁の変化を数える
+//| run: reactive
+//| uses: [stats-merge-covariance-model]
+//| crates: [scioxide-core, scioxide-stats]
+//| dependsOn:
+//|   data: stats-merge-covariance
+//| inputs:
+//|   largest_partition_count: {"type":"range","label":"区画の数の上限 kₘₐₓ [個]","description":"描く区画の数の範囲を変える。","min":8,"max":60,"step":4,"value":32}
+//|   merge_shape: {"type":"select","label":"結合の形","options":[{"label":"逐次（左から順に）","value":"sequential"},{"label":"2 分木（隣どうしを対に）","value":"tree"}],"value":"sequential"}
+//| cases:
+//|   - {"id":"tree","label":"2 分木","description":"並列の集約と同じ形で結合する。","inputs":{"merge_shape":"tree"}}
+//|   - {"id":"few","label":"kₘₐₓ = 8","description":"区画の数が少ない範囲だけを描く。","inputs":{"largest_partition_count":8}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"drift","path":"/spec/series/0/points/0/1","equals":0}
+//|       - {"artifact":"drift","path":"/spec/series/0/points/31/0","equals":32}
+//|       - {"artifact":"routes","path":"/rows/2/2","equals":0}
+//|       - {"artifact":"routes","path":"/rows/3/2","equals":0}
+//|   - case: tree
+//|     expect:
+//|       - {"artifact":"drift","path":"/spec/series/0/points/0/1","equals":0}
+//|       - {"artifact":"drift","path":"/spec/series/0/points/8/1","range":{"min":-4,"max":4}}
+//|   - case: few
+//|     expect:
+//|       - {"artifact":"drift","path":"/spec/series/0/points/7/0","equals":8}
+use scioxide_core::{RealScalar, StridedLayout};
+use scioxide_stats::{
+    Axis, BatchView, MergePolicy, MomentOrder, OnlineCovariance, StatisticsOptions,
+    reduce_covariance_with_options,
+};
+
+// 前のセルの入力を受け取り、同じ観測を作る。
+let exponent = data["power_offset_exponent"]
+    .as_f64()
+    .ok_or("基準値の指数がない")?;
+let coefficient = data["temperature_coefficient"]
+    .as_f64()
+    .ok_or("傾きがない")?;
+let observed = observations(exponent, coefficient).observed;
+let temperatures: Vec<f64> = observed.iter().map(|r| r.0).collect();
+let powers: Vec<f64> = observed.iter().map(|r| r.1).collect();
+let pairs = PAIRS;
+let covariance = |acc: &OnlineCovariance<f64>| -> Result<f64, String> {
+    let value = acc
+        .snapshot()
+        .sample_covariance()
+        .map_err(|e| e.to_string())?;
+    value.ok_or_else(|| "標本共分散が未定義".to_string())
+};
+// 1 組ずつ observe して集計する。区画の数 1 の結果が基準になる。
+let summarize = |ts: &[f64], ps: &[f64]| -> Result<OnlineCovariance<f64>, String> {
+    let mut acc = OnlineCovariance::new(MomentOrder::Second);
+    for (&t, &p) in ts.iter().zip(ps) {
+        acc.observe(t, p).map_err(|e| e.to_string())?;
+    }
+    Ok(acc)
+};
+let reference = covariance(&summarize(&temperatures, &powers)?)?;
+let ulp = RealScalar::next_after(reference, f64::INFINITY) - reference;
+let mut drift = Vec::new();
+for k in 1..=largest_partition_count as usize {
+    // 区画ごとに集計する。
+    let mut level = Vec::new();
+    let size = pairs.div_ceil(k);
+    for (ts, ps) in temperatures.chunks(size).zip(powers.chunks(size)) {
+        level.push(summarize(ts, ps)?);
+    }
+    // 逐次の形は左から順に、2 分木の形は隣どうしを対にして結合する。
+    while level.len() > 1 {
+        let width = if merge_shape == "tree" {
+            2
+        } else {
+            level.len()
+        };
+        let mut next = Vec::new();
+        for group in level.chunks(width) {
+            let mut acc = group[0];
+            for part in &group[1..] {
+                acc.merge(part).map_err(|e| e.to_string())?;
+            }
+            next.push(acc);
+        }
+        level = next;
+    }
+    drift.push([k as f64, (covariance(&level[0])? - reference) / ulp]);
+}
+emit_chart!(
+    serde_json::json!({
+        "kind": "line",
+        "dataZoom": true,
+        "tooltip": true,
+        "series": [{
+            "name": "結合した標本共分散 − 一括の集計",
+            "points": drift,
+            "style": { "symbol": "circle" }
+        }],
+        "xLabel": "区画の数 k [個]",
+        "yLabel": "一括の集計との差 [ulp]",
+        "annotations": [{ "kind": "line", "axis": "y", "value": 0.0, "label": "一括の集計" }]
+    }),
+    metadata = serde_json::json!({ "id": "drift" })
+);
+// 一括の集約: 1 本のバッチとして 2 つの結合方針で集計する。
+let (shape, strides) = ([pairs], [1_usize]);
+let layout = StridedLayout::new(&shape, &strides).map_err(|e| e.to_string())?;
+let x = BatchView::new(&temperatures, layout, Axis::Index(0)).map_err(|e| e.to_string())?;
+let y = BatchView::new(&powers, layout, Axis::Index(0)).map_err(|e| e.to_string())?;
+let reduce = |policy| -> Result<f64, String> {
+    let options = StatisticsOptions::default().with_merge_policy(policy);
+    let snapshots = reduce_covariance_with_options(x, y, options).map_err(|e| e.to_string())?;
+    let value = snapshots[0]
+        .sample_covariance()
+        .map_err(|e| e.to_string())?;
+    value.ok_or_else(|| "標本共分散が未定義".to_string())
+};
+let sliced = OnlineCovariance::from_slices(&temperatures, &powers, MomentOrder::Second);
+let routes = [
+    ("1 組ずつ observe（基準）", reference),
+    (
+        "from_slices（補償付きの 2 パス）",
+        covariance(&sliced.map_err(|e| e.to_string())?)?,
+    ),
+    (
+        "reduce_covariance_with_options（InputOrder）",
+        reduce(MergePolicy::InputOrder)?,
+    ),
+    (
+        "reduce_covariance_with_options（StablePartitions）",
+        reduce(MergePolicy::StablePartitions)?,
+    ),
+];
+let rows: Vec<(&str, f64, f64)> = routes
+    .iter()
+    .map(|&(name, value)| (name, value, (value - reference) / ulp))
+    .collect();
+let digits17 = serde_json::json!({ "significantDigits": 17 });
+let whole = serde_json::json!({ "fractionDigits": 0 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "経路" },
+    { "key": "1", "label": "標本共分散 [°C·W]", "type": "number", "format": digits17 },
+    { "key": "2", "label": "基準との差 [ulp]", "type": "number", "format": whole }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "routes" })
+);
+```
+
+既定の入力（$p = 6$、$\beta = 2.4$ W/°C、$k_{\max} = 32$、逐次の形）では、区画に分けて結合した標本共分散は、一括の集計と $-2$ から 0 ulp（1 ulp は $1.4 \times 10^{-14}$ °C·W）違う。
+差は区画の数に対して規則なく $-2$、$-1$、0 ulp の間を行き来し、$k_{\max} = 60$ まで広げても差は 3 ulp 以内にとどまる。
+2 分木の形でも $-2$ から 0 ulp で、結合の形を変えると、どの区画の数で差が出るかが入れ替わる。
+数学的には同じ統計量なので、この差は丸めの順序の違いだけによる。
+
+`from_slices` は一括の集計と 1 ulp 違い、二つの結合方針の `reduce_covariance_with_options` は一括の集計とビット単位で一致する。
+このセルは現在のスレッドだけで動くので、`StablePartitions` でも区画は 1 個になり、1 組ずつ `observe` する経路と同じ計算になる。
+差は相対誤差で $10^{-16}$ の程度で、表示した 6 桁には現れないが、結果をビット単位で比べる用途では区別される。
+
+## 独立性の仮定と区間
+
+この測定列は温度が単調に上がり、電力に周期成分を含む確定的な系列で、観測は独立な標本ではない。
+`MomentsSnapshot::confidence_interval_of_mean` のような独立な正規標本を仮定した平均の区間をこの系列に使うと、推定の精度を過大に見積もる。
+自己相関がある系列で被覆率がどれだけ下がるかは[信頼区間の被覆率を反復実験で確かめる](../confidence-coverage/)で確かめる。
+
+## まとめ
+
+区画ごとの集計は、区画の平均どうしの違いの項を含む結合公式で一括の集計と同じ統計量になり、大きな共通の基準値があっても共分散と回帰の傾きを保つ。
+集計から求めた傾きが設定した傾きからずれるのは有限の標本の周期成分によるもので、解析値 $\beta - \cot(\pi/24)/(N+1)$ と偏差の 2 パスの計算に一致することから、アルゴリズムの誤差ではないと分かる。
+区画の数や結合の形を変えると末尾の桁は変わりうるので、ビット単位の再現性が必要なら結合の順序を固定し、一括の集約では `MergePolicy::StablePartitions` を選んだうえでワーカーの数も固定する。
+観測が独立でない系列では、集計した分散から作る平均の標準誤差と区間は精度を過大に見積もる。
+
+## 次に読むページ
+
+- [逐次平均・分散・高次モーメント・共分散の数理](../../algorithms/online-moments-and-covariance/)：結合の公式と、結合の順序による丸めの扱いを確かめる。
+- [逐次集計するセンサー列と大きな基準値](../online-sensor/)：1 変数の逐次集計で、基準値が大きいときに 1 パスの公式が失う桁と量子化の限界を確かめる。
+- [信頼区間の被覆率を反復実験で確かめる](../confidence-coverage/)：独立性の仮定が破れたときの区間の被覆率を確かめる。

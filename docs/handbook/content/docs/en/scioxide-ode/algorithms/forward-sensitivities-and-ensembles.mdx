@@ -1,0 +1,522 @@
+---
+title: "Forward sensitivities and ensembles"
+description: "Coupled variational equations for forward sensitivities, ForwardSensitivitySystem augmentation and error control, terminal-event time sensitivities, and execution and work-limit allocation for many parameter or initial-value variants with solve_ensemble_into."
+sidebar:
+  order: 360
+references:
+  ode-forward-sensitivity-equations: "variational-equations-and-augmented-systems"
+  ode-event-sensitivities: "event-time-sensitivities"
+  ode-ensembles: "ensembles"
+  ode-forward-sensitivity-construction: "constructing-sensitivity-systems"
+---
+
+Parameter estimation, experimental design, and uncertainty propagation require how solution $y(t; p)$ changes with parameters $p$ or initial values $y_0$.
+For few parameters, forward sensitivity straightforwardly integrates derivatives alongside the solution.
+Solving many parameter or initial-value variants (an ensemble) also examines finite-change sensitivity or propagates uncertainty by Monte Carlo.
+This page explains forward-sensitivity equations, using `ForwardSensitivitySystem`, terminal-event sensitivities, and executing many problems through `solve_ensemble_into`.
+For many parameters and only a scalar-objective gradient, [Adjoints](../adjoint-gradients/) cost less.
+
+## Variational equations and augmented systems
+
+Differentiating the solution of $y' = f(t, y, p)$, $y(t_0) = y_0(p)$ in parameter direction $d \in \mathbb R^m$ gives $s(t) = \partial y(t)/\partial p \cdot d$, satisfying the variational equation obtained by differentiating with respect to $p$:
+
+$$
+s' = f_y(t, y, p)\, s + f_p(t, y, p)\, d, \qquad s(t_0) = \frac{\partial y_0}{\partial p}\, d
+$$
+
+
+Here $f_y$ is the state Jacobian of $n \times n$, and $f_p$ the parameter Jacobian of $n \times m$.
+Sensitivities to initial value $y_{0,i}$ follow from the same equation with $d = 0$ and $s(t_0) = e_i$ (a unit vector).
+Since variational equations depend on $y$, integrate sensitivities for $k$ directions together with $y$ in the dimension-$N = n(k + 1)$ augmented system
+
+$$
+\frac{d}{dt}\begin{bmatrix} y \\ s_1 \\ \vdots \\ s_k \end{bmatrix}
+= \begin{bmatrix} f(t, y, p) \\ f_y s_1 + f_p d_1 \\ \vdots \\ f_y s_k + f_p d_k \end{bmatrix}
+$$
+
+
+This is an ordinary ODE, solvable by any method.
+Sensitivity components enter error control, so steps depend on accuracy of both $y$ and sensitivities (coupled control).
+
+One augmented right-hand-side evaluation calls $f$ once and directional derivative $f_y s_j + f_p d_j$ $k$ times.
+For explicit methods, cost grows approximately with direction count.
+Implicit methods (BDF, Radau IIA, backward Euler) form augmented Jacobians by forward differences; dense solvers require about $N$ augmented right-hand-side evaluations and store $N^2$ entries per Jacobian.
+Krylov solvers use directional differences without forming matrices ([Jacobians and linear stage equations](../jacobians-and-linear-stages/)).
+
+## Constructing sensitivity systems
+
+The trait `OdeSensitivitySystem` supplies state dimension $n$ (`dimension`), real parameter count $m$ (`parameter_dimension`), right-hand side $f(t, y, p)$ (`rhs`), and directional derivative $f_y\,\delta y + f_p\,\delta p$ (`tangent_rhs`).
+Directional derivatives may use dense or sparse Jacobians, matrix-free actions, or forward-mode automatic differentiation.
+States may be real or complex; parameters are real.
+Directions follow real paths, so nonholomorphic right-hand sides can return real-linear products.
+Return callback workspace scalar count through `workspace_len`.
+
+The constructor `ForwardSensitivitySystem::bind(provider, parameters, parameter_directions, workspace)` accepts parameter values and a $k \times m$ matrix with one direction per row, returning augmented `OdeSystem`.
+Direction values are copied into `ForwardSensitivityWorkspace` in $O(km)$ work, growing workspace only as needed.
+The constructor `ForwardSensitivityRequirements::new(provider, directions)` returns the direction-value count $mk$ (`packed_directions`) and workspace scalar count (`provider_scratch`), permitting preallocation through workspace `check` and `try_reserve`.
+The bound system borrows workspace, making it unavailable for other use until the system is released.
+
+Build augmented initial values through `initialize_into(state, tangents, output)`.
+The input `tangents` is a $n \times k$ matrix whose column $j$ is $s_j(t_0)$; zero columns give parameter sensitivities and unit-vector columns initial-value sensitivities.
+After integration, separate state and sensitivities through `extract_into(augmented, state, tangents)`.
+The constructor `error_tolerance(primal_absolute, sensitivity_absolute, relative, norm)` creates augmented-system tolerances with separate absolute tolerances for $y$ and sensitivities, supplied to `OdeOptions::with_error_tolerance`.
+If sensitivity and state magnitudes differ greatly, match sensitivity absolute tolerance to its scale.
+
+## Event-time sensitivities
+
+Stopping at event $g(t, y, p) = 0$ makes stopping time $t^*$ itself parameter-dependent.
+The augmented $s_j(t^*)$ is a fixed-time sensitivity, excluding event-time changes.
+Differentiating $g(t^*(p), y(t^*(p); p), p) = 0$ in direction $j$ gives event-time and event-state sensitivities
+
+$$
+\tau_j = \frac{\partial t^*}{\partial p}\, d_j = -\frac{g_y s_j + g_p d_j}{g_t + g_y f}, \qquad
+\sigma_j = s_j + f\, \tau_j
+$$
+
+
+Denominator $g_t + g_y f$ is the event function's total derivative ($dg/dt$); near zero (a tangency), sensitivities become ill-conditioned and are undefined at zero.
+Condition numbers grow as $1/|dg/dt|$.
+
+The function `ForwardSensitivitySystem::event_sensitivities_into(input, time_output, state_output)` performs this conversion in $O(nk)$ work.
+Supply `EventSensitivityInput` with fixed-time sensitivity matrix (`fixed_time`), event-state slope $f$ (`state_slope`), per-direction numerator $g_y s_j + g_p d_j$ (`numerators`), total derivative $dg/dt$ (`event_slope`), transversality threshold (`minimum_slope`), and root-isolation statement (`isolation`).
+The caller computes these from event-function derivatives.
+For `EventIsolation::Ambiguous` or $|dg/dt| \le$ `minimum_slope`, it writes nothing and returns `EventSensitivityStatus::Ambiguous` or `NonTransverse`, respectively; otherwise it returns `Available`.
+This status describes only sensitivity-conversion availability; read integration success separately through `OdeTermination`.
+Sensitivity corrections for state jumps at events are unavailable; the caller must apply the jump-map derivative.
+
+## Forward-sensitivity experiment
+
+Logistic growth,
+
+$$
+y' = r\, y \left(1 - \frac{y}{K}\right), \qquad y(0) = y_0
+$$
+
+has solution $y(t) = K/D$, $D = 1 + A e^{-rt}$, and $A = (K - y_0)/y_0$, with closed forms for all three sensitivities.
+
+$$
+\frac{\partial y}{\partial r} = \frac{K A t\, e^{-rt}}{D^2}, \qquad
+\frac{\partial y}{\partial K} = \frac{1}{D} - \frac{K e^{-rt}}{y_0 D^2}, \qquad
+\frac{\partial y}{\partial y_0} = \frac{K^2 e^{-rt}}{y_0^2 D^2}
+$$
+
+Directional derivatives come from $f_y = r(1 - 2y/K)$, $f_r = y(1 - y/K)$, and $f_K = r y^2/K^2$.
+
+The following block supplies a model shared by two cells.
+The function `logistic_rhs` is right-hand side $f$; `Logistic` implements `OdeSensitivitySystem` (parameters $p = (r, K)$); `logistic_exact` gives closed forms for solution and three sensitivities.
+
+```rust
+//| id: ode-logistic-sensitivity-model
+//| kind: definitions
+//| title: "Logistic-growth right-hand side, directional derivatives, and closed forms"
+//| crates: [scioxide-core, scioxide-ode]
+use scioxide_core::{SciOxideError, SolveContext};
+use scioxide_ode::OdeSensitivitySystem;
+
+/// f(y; r, K) = r y (1 − y/K).
+pub(crate) fn logistic_rhs(r: f64, k: f64, y: f64) -> f64 {
+    r * y * (1.0 - y / k)
+}
+
+/// Logistic growth with parameters p = (r, K).
+pub(crate) struct Logistic;
+
+impl OdeSensitivitySystem<f64> for Logistic {
+    fn dimension(&self) -> usize {
+        1
+    }
+
+    fn parameter_dimension(&self) -> usize {
+        2
+    }
+
+    fn rhs(
+        &self,
+        _: f64,
+        y: &[f64],
+        p: &[f64],
+        out: &mut [f64],
+        _: &mut [f64],
+        _: &mut SolveContext<'_, '_>,
+    ) -> Result<(), SciOxideError> {
+        out[0] = logistic_rhs(p[0], p[1], y[0]);
+        Ok(())
+    }
+
+    // f_y δy + f_r δr + f_K δK. f_y = r(1 − 2y/K), f_r = y(1 − y/K), f_K = r y²/K².
+    fn tangent_rhs(
+        &self,
+        _: f64,
+        y: &[f64],
+        p: &[f64],
+        dy: &[f64],
+        dp: &[f64],
+        out: &mut [f64],
+        _: &mut [f64],
+        _: &mut SolveContext<'_, '_>,
+    ) -> Result<(), SciOxideError> {
+        let (r, k, y) = (p[0], p[1], y[0]);
+        let f_y = r * (1.0 - 2.0 * y / k);
+        out[0] = f_y * dy[0] + y * (1.0 - y / k) * dp[0] + r * y * y / (k * k) * dp[1];
+        Ok(())
+    }
+}
+
+/// Closed forms [y, ∂y/∂r, ∂y/∂K, ∂y/∂y₀] (references from f64 standard functions).
+pub(crate) fn logistic_exact(r: f64, k: f64, y0: f64, t: f64) -> [f64; 4] {
+    let (a, e) = ((k - y0) / y0, (-r * t).exp());
+    let d = 1.0 + a * e;
+    [
+        k / d,
+        k * a * t * e / (d * d),
+        1.0 / d - k * e / (y0 * d * d),
+        k * k * e / (y0 * y0 * d * d),
+    ]
+}
+```
+
+The next cell models cultured bacteria, with $K = 100$ ($10^6$ cells/mL), $y_0 = 2$, $t \in [0, 20]$ h, and input growth rate $r$.
+Solve three augmented directions with `DormandPrince5`: parameter directions $(1, 0)$ and $(0, 1)$, plus an initial-value direction (parameter direction 0, initial tangent 1).
+The plot expresses three sensitivities as elasticities $(p/y)\,\partial y/\partial p$ (relative solution changes per relative parameter change), with numerical symbols and dashed closed forms.
+The table shows terminal sensitivities and differences from closed forms.
+
+```rust
+//| id: ode-forward-sensitivity
+//| ref: ode-forward-sensitivity
+//| title: "Compare logistic-growth sensitivities from forward sensitivity and closed form"
+//| run: reactive
+//| uses: [ode-logistic-sensitivity-model]
+//| crates: [scioxide-core, scioxide-linalg, scioxide-ode]
+//| inputs:
+//|   rate: {"type":"range","label":"Growth rate r [1/h]","min":0.2,"max":2,"step":0.05,"value":0.6}
+//|   tolerance_exponent: {"type":"range","label":"Tolerance exponent p (ε = 10^p)","description":"Absolute and relative tolerances for state and sensitivities.","min":-12,"max":-4,"step":1,"value":-9}
+//| cases:
+//|   - {"id":"fast","label":"r = 2 h⁻¹","description":"Earlier saturation makes terminal r and y₀ sensitivities nearly zero.","inputs":{"rate":2}}
+//|   - {"id":"loose","label":"ε = 10⁻⁴","description":"Fewer steps increase sensitivity error.","inputs":{"tolerance_exponent":-4}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"sensitivities","path":"/rows/0/3","range":{"max":1e-5}}
+//|       - {"artifact":"sensitivities","path":"/rows/1/3","range":{"max":1e-7}}
+//|       - {"artifact":"sensitivities","path":"/rows/2/3","range":{"max":1e-7}}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+//|   - case: loose
+//|     expect:
+//|       - {"artifact":"sensitivities","path":"/rows/0/3","range":{"max":1e-1}}
+use scioxide_core::{EvaluationRole, NormSelection};
+use scioxide_linalg::{MatrixView, MatrixViewMut, Vector};
+use scioxide_ode::{
+    DormandPrince5, ForwardSensitivitySystem, ForwardSensitivityWorkspace, OdeMethod,
+    OdeOptions, OdeOutputSchedule, OdeProblem, OdeState,
+};
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let digits10 = serde_json::json!({ "significantDigits": 10 });
+let (capacity, start, horizon) = (100.0_f64, 2.0_f64, 20.0_f64);
+let parameters = [rate, capacity];
+// Direction rows: ∂/∂r, ∂/∂K, and initial-value direction (parameter direction 0).
+let directions = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+let directions = MatrixView::from_slice(3, 2, &directions).map_err(|e| e.to_string())?;
+let mut sensitivity_workspace = ForwardSensitivityWorkspace::new();
+let system = ForwardSensitivitySystem::bind(
+    &Logistic,
+    &parameters,
+    directions,
+    &mut sensitivity_workspace,
+)
+.map_err(|e| e.to_string())?;
+// Initial tangents s(0) = (0, 0, 1): only the initial-value direction is 1.
+let tangents = MatrixView::from_slice(1, 3, &[0.0, 0.0, 1.0]).map_err(|e| e.to_string())?;
+let mut initial = vec![0.0; system.augmented_dimension()];
+system
+    .initialize_into(&[start], tangents, &mut initial)
+    .map_err(|e| e.to_string())?;
+let epsilon = 10.0_f64.powf(tolerance_exponent);
+let tolerance = system
+    .error_tolerance(epsilon, epsilon, epsilon, NormSelection::RootMeanSquare)
+    .map_err(|e| e.to_string())?;
+let times: Vec<f64> = (0..=80).map(|i| horizon * f64::from(i) / 80.0).collect();
+let options = OdeOptions::new()
+    .with_error_tolerance(tolerance)
+    .with_output_schedule(OdeOutputSchedule::times(times));
+let solution = DormandPrince5::new()
+    .solve(
+        &OdeProblem::new(&system, horizon),
+        &options,
+        OdeState::new(0.0, Vector::from_vec(initial)),
+    )
+    .map_err(|e| e.error().to_string())?;
+let exact = |t: f64| logistic_exact(rate, capacity, start, t);
+let scales = [rate, capacity, start];
+let names = ["r", "K", "y₀"];
+let units = ["[10⁶ h/mL]", "[-]", "[-]"];
+let mut layers = Vec::new();
+for j in 0..3 {
+    let numeric: Vec<[f64; 2]> = solution
+        .trajectory()
+        .times()
+        .iter()
+        .zip(solution.trajectory().states())
+        .map(|(&t, s)| [t, scales[j] * s.as_slice()[j + 1] / s.as_slice()[0]])
+        .collect();
+    let reference: Vec<[f64; 2]> = (0..=200)
+        .map(|i| horizon * f64::from(i) / 200.0)
+        .map(|t| [t, scales[j] * exact(t)[j + 1] / exact(t)[0]])
+        .collect();
+    layers.push(serde_json::json!({
+        "id": format!("n{j}"),
+        "kind": "scatter",
+        "name": format!("{} (forward sensitivity)", names[j]),
+        "points": numeric
+    }));
+    layers.push(serde_json::json!({
+        "id": format!("e{j}"),
+        "kind": "line",
+        "name": format!("{} (closed form)", names[j]),
+        "points": reference,
+        "style": { "lineType": "dashed", "showSymbol": false }
+    }));
+}
+emit_chart!(serde_json::json!({
+    "kind": "xy",
+    "xLabel": "Time t [h]",
+    "yLabel": "Elasticity (p/y) ∂y/∂p [-]",
+    "dataZoom": true,
+    "tooltip": true,
+    "layers": layers
+}));
+// Separate terminal augmented state into state and sensitivities.
+let mut state = [0.0];
+let mut sensitivities = [0.0; 3];
+system
+    .extract_into(
+        solution.state().values(),
+        &mut state,
+        MatrixViewMut::from_slice(1, 3, &mut sensitivities).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+let reference = exact(horizon);
+let rows: Vec<(String, f64, f64, f64)> = (0..3)
+    .map(|j| {
+        (
+            format!("∂y/∂{} {}", names[j], units[j]),
+            sensitivities[j],
+            reference[j + 1],
+            (sensitivities[j] - reference[j + 1]).abs(),
+        )
+    })
+    .collect();
+let columns = serde_json::json!([
+    { "key": "0", "label": "Sensitivity" },
+    { "key": "1", "label": "Forward sensitivity", "type": "number", "format": digits10 },
+    { "key": "2", "label": "Closed form", "type": "number", "format": digits10 },
+    { "key": "3", "label": "Absolute difference", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "sensitivities" })
+);
+let report = solution.report();
+let counts = report.counts();
+let outcome = if report.is_success() {
+    Outcome::satisfied("Integrated to the endpoint (assess accuracy from closed-form differences)")
+} else {
+    Outcome::partial("Stopped before the endpoint")
+};
+emit_outcome!(
+    outcome
+        .status(format!("{:?}", report.termination()))
+        .diagnostic("Accepted steps", report.accepted_steps() as f64, None)
+        .diagnostic(
+            "Right-hand-side evaluations",
+            counts.provider(EvaluationRole::RightHandSide) as f64,
+            None
+        )
+        .diagnostic(
+            "Directional-derivative evaluations",
+            counts.provider(EvaluationRole::LinearOperator) as f64,
+            None
+        )
+);
+```
+
+With defaults ($r = 0.6$ h⁻¹, $\varepsilon = 10^{-9}$), 153 steps reach `ReachedEnd`; at $t = 20$ h, the three sensitivities agree with closed forms to differences $1.5 \times 10^{-9}$ ($\partial y/\partial r$), $3.7 \times 10^{-12}$ ($\partial y/\partial K$), and $7.7 \times 10^{-11}$ ($\partial y/\partial y_0$).
+There are 926 right-hand-side evaluations and 2778 directional-derivative evaluations, three times as many for three directions.
+In the elasticity plot, elasticity with respect to $y_0$ decreases from 1, elasticity with respect to $r$ peaks during growth, and after saturation elasticity with respect to $K$ approaches 1 while the other two approach zero.
+Saturated solutions depend only on $K$ and lose initial-value and growth-rate information; the plot shows why observations only at $t = 20$ h poorly identify $r$.
+At $\varepsilon = 10^{-4}$, only 18 steps are taken and the $\partial y/\partial r$ difference grows to $8.6 \times 10^{-5}$.
+At $r = 2$ h⁻¹, numerical $\partial y/\partial r$ is $6.0 \times 10^{-10}$ versus true $4.2 \times 10^{-13}$, with difference remaining of the order of absolute sensitivity tolerance $10^{-9}$.
+Relative errors of near-zero sensitivities are not meaningful; assess them using absolute tolerances.
+
+## Ensembles
+
+The function `solve_ensemble_into(parameters, run, policy, members, outcomes, workspace, scope)` calls `run(i, parameters_i, member_i, cx)` for each member $i = 0, 1, \dots$, stores results in `outcomes[i]`, and returns `EnsembleReport`.
+The `cx` passed to `run` is that member's nested-solve context; pass it directly to the member solver's `advance`.
+The input `members` holds per-member mutable state (workspace or result storage); members own numerical memory.
+
+The type `EnsembleParameters` selects parameter delivery.
+The variant `Shared(values)` supplies the same sequence to all members without copying; `Independent(matrix)` supplies row $i$ of the $M \times m$ matrix to member $i$.
+Contiguous rows are borrowed directly; other layouts are copied into workspace per execution.
+Nonfinite parameters return `NonFinite` without running any member.
+The method `EnsembleRequirements::new(members, parameters)` returns member and copied-parameter counts, allocatable through `check` and `try_reserve` of `EnsembleWorkspace`.
+With sufficient workspace, the function itself does not allocate.
+
+The trait `EnsembleOutcome` returns whether a member succeeded; ODE, SDE, DDE, DAE, dynamical-system, BVP, and adjoint reports implement it.
+Custom types pairing reports with solution-derived values can implement it too.
+Member errors remain in their results (`Some(Err(e))`), without stopping other members.
+The report `EnsembleReport` gives executed members (`completed`), successful members (`successful`), and total work (`accounting`); `is_success` is true only if every member ran and succeeded.
+If execution itself stops, for example by cancellation, completed results remain, others stay `None`, and the report remains in `EnsembleWorkspace::last_attempt`.
+
+Under `ExecutionPolicy::Sequential`, members run in index order.
+Other policies distribute members across execution-context executor workers, with at most 64 partitions.
+Parallel execution requires `run` to be `Sync` and members and results to be `Send`.
+Outer solve work limits (such as shared evaluation limits) are allocated among members in index order before execution; unused allowances are not redistributed.
+There are no separate per-member iteration or proposal limits; member solver settings determine them.
+Wasm cells use sequential execution contexts, so every policy runs members in index order on one worker.
+
+## Growth-rate ensembles and stiffness
+
+The next cell solves the same logistic equation ($K = 100$, $y_0 = 2$, $T = 20$ h) for nine members with growth rates $r = 0.1, 0.3, 1, 3, \dots, 1000$ h⁻¹.
+Parameters are supplied as a $9 \times 1$ matrix of `Independent`; each member solves by passing `cx` to `advance` of `DormandPrince5`.
+All members receive the same step limit $N_{\max}$.
+Large $r$ makes the problem stiff through equilibrium $y = K$ Jacobian $f_y = -r$, restricting explicit steps to approximately $3.3/r$ for stability ([Error, order, and stability](../error-order-and-stability/)).
+The table gives each member's terminal value, closed-form difference, accepted steps, and termination status.
+
+```rust
+//| id: ode-ensemble-growth-rates
+//| ref: ode-ensemble-growth-rates
+//| title: "Observe step-limit termination in an ensemble of growth rates"
+//| run: reactive
+//| uses: [ode-logistic-sensitivity-model]
+//| crates: [scioxide-core, scioxide-linalg, scioxide-ode]
+//| inputs:
+//|   step_limit: {"type":"range","label":"Step limit N_max [count]","description":"Attempted-step limit per member.","min":500,"max":20000,"step":500,"value":2000}
+//| cases:
+//|   - {"id":"generous","label":"N_max = 20000","description":"Every member reaches the endpoint.","inputs":{"step_limit":20000}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"members","path":"/rows/0/3","range":{"max":1e-2}}
+//|       - {"artifact":"members","path":"/rows/8/5","equals":"Some(BudgetLimit(Proposal))"}
+//|       - {"path":"/outputs/1/state","equals":"partial"}
+//|   - case: generous
+//|     expect:
+//|       - {"artifact":"members","path":"/rows/8/5","equals":"Some(ReachedEnd)"}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+use scioxide_core::{Budget, ExecutionContext, ExecutionPolicy, SciOxideError, SolveContext};
+use scioxide_linalg::{MatrixView, Vector};
+use scioxide_ode::{
+    DormandPrince5, EnsembleParameters, EnsembleWorkspace, OdeFn, OdeMethod, OdeOptions,
+    OdeProblem, OdeSolveReport, OdeState, solve_ensemble_into,
+};
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let digits3 = serde_json::json!({ "significantDigits": 3 });
+let digits4 = serde_json::json!({ "significantDigits": 4 });
+let digits8 = serde_json::json!({ "significantDigits": 8 });
+let (capacity, start, horizon) = (100.0_f64, 2.0_f64, 20.0_f64);
+let rates = [0.1, 0.3, 1.0, 3.0, 10.0, 30.0, 100.0, 300.0, 1000.0];
+let parameters = MatrixView::from_slice(rates.len(), 1, &rates).map_err(|e| e.to_string())?;
+let budget = Budget::try_from(step_limit.round() as usize).map_err(|e| e.to_string())?;
+let options = OdeOptions::new().with_max_steps(budget);
+// Member i solves for growth rate p[0], writing its terminal value to member.
+let run = |_: usize, p: &[f64], member: &mut f64, cx: &mut SolveContext<'_, '_>| {
+    let r = p[0];
+    let system = OdeFn::new(1, move |_: f64, y: &[f64], out: &mut [f64]| {
+        out[0] = logistic_rhs(r, capacity, y[0]);
+        Ok(())
+    })?;
+    let problem = OdeProblem::new(&system, horizon);
+    let plan = DormandPrince5::new();
+    let mut workspace = plan.workspace(&problem, &options)?;
+    let mut state = OdeState::new(0.0, Vector::from_vec(vec![start]));
+    let report = plan.advance(&problem, &options, &mut state, &mut (), &mut workspace, cx)?;
+    *member = state.values()[0];
+    Ok(report)
+};
+let mut members = vec![0.0_f64; rates.len()];
+let mut outcomes: Vec<Option<Result<OdeSolveReport<f64>, SciOxideError>>> =
+    (0..rates.len()).map(|_| None).collect();
+let mut workspace = EnsembleWorkspace::new();
+let ensemble = solve_ensemble_into(
+    EnsembleParameters::Independent(parameters),
+    &run,
+    ExecutionPolicy::Sequential,
+    &mut members,
+    &mut outcomes,
+    &mut workspace,
+    ExecutionContext::sequential(),
+)
+.map_err(|e| e.to_string())?;
+// Closed-form y(T) (reference).
+let exact = |r: f64| logistic_exact(r, capacity, start, horizon)[0];
+let mut rows = Vec::new();
+for (i, outcome) in outcomes.iter().enumerate() {
+    let report = match outcome {
+        Some(Ok(report)) => report,
+        Some(Err(error)) => return Err(error.to_string()),
+        None => return Err("Some members were not executed".to_string()),
+    };
+    let finished = report.is_success();
+    rows.push((
+        rates[i],
+        report.final_time(),
+        members[i],
+        finished.then(|| (members[i] - exact(rates[i])).abs()),
+        report.accepted_steps(),
+        format!("{:?}", report.termination()),
+    ));
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "Growth rate r [1/h]", "type": "number", "format": digits3 },
+    { "key": "1", "label": "Last time [h]", "type": "number", "format": digits4 },
+    { "key": "2", "label": "Last y [10⁶/mL]", "type": "number", "format": digits8 },
+    { "key": "3", "label": "Terminal error [10⁶/mL]", "type": "number", "format": sci3, "nullText": "Not reached" },
+    { "key": "4", "label": "Accepted steps [count]", "type": "integer" },
+    { "key": "5", "label": "Termination status" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "members" })
+);
+let outcome = if ensemble.is_success() {
+    Outcome::satisfied("All members reached the endpoint")
+} else {
+    Outcome::partial("Some members stopped at the step limit")
+        .explanation("Stopped members' values are at their last accepted points, not the endpoint.")
+};
+emit_outcome!(
+    outcome
+        .status(format!(
+            "Successful {} / executed {}",
+            ensemble.successful(),
+            ensemble.completed()
+        ))
+        .diagnostic("Successful members", ensemble.successful() as f64, None)
+        .diagnostic("Executed members", ensemble.completed() as f64, None)
+);
+```
+
+At the default $N_{\max} = 2000$, seven members $r \le 100$ reach the endpoint; the two with $r = 300$ and $1000$ stop with `BudgetLimit(Proposal)`.
+The ensemble report gives “successful 7, executed 9”; stopped members still have results and do not prevent others from running.
+For $r \ge 10$, accepted steps are approximately proportional to $r$; reaching the endpoint for $r = 1000$ needs 6066 steps ($h \approx 3.3/r$).
+Steps increase despite nearly constant post-equilibrium solutions because stability rather than accuracy determines step size; choose [Implicit methods](../implicit-runge-kutta-and-mass-matrices/) or stiffness-detecting [Automatic switching](../rosenbrock-and-stiffness-switching/) for stiff problems.
+The two stopped members have different last times, 18.0 h and 5.41 h, but identical last y and accepted-step counts.
+The logistic equation with growth rate $r$ becomes the $r = 1$ equation in time $rt$; under absolute tolerance, `DormandPrince5` selects the same steps with rescaled time, giving identical values after equal step counts.
+
+## Summary
+
+Forward sensitivity couples variational equations $s' = f_y s + f_p d$ with the solution in dimension $n(k + 1)$; `ForwardSensitivitySystem::bind` constructs an ordinary `OdeSystem` from `OdeSensitivitySystem`, solvable by any method.
+Sensitivity components enter error control; use `error_tolerance` to match their absolute tolerances to their scales.
+Cost grows approximately with direction count, with extra augmented-Jacobian difference costs for implicit methods; choose adjoints for many parameters and only gradients.
+At terminal events, use `event_sensitivities_into` to convert fixed-time to event-time sensitivities, avoiding conversion when $|dg/dt|$ is small.
+The function `solve_ensemble_into` solves many problems while retaining per-member results; assess success from `EnsembleReport` and each member's termination status.
+
+## Further reading
+
+- [Adjoint gradients and checkpoints](../adjoint-gradients/): compute gradients for many parameters by backward integration.
+- [Initial-condition sensitivity and Lyapunov exponents of the Lorenz system](../../examples/lorenz-lyapunov/): estimate Lyapunov exponents with initial-value sensitivities.
+- [Stochastic differential equation interpretations and solvers](../stochastic-equations/): estimate SDE expectations with ensembles.
+- [Dense output and events](../dense-output-and-events/): examine event detection and localization.

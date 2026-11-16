@@ -1,0 +1,244 @@
+---
+title: エラー仕様と部分結果
+description: Errと未収束などの結果を含む Okを区別し、終了理由、受理済み状態、信頼区分を読む。
+sidebar:
+  order: 50
+---
+
+反復回数の上限に達しても、それまでに得た近似解が役立つ場合がある。
+一方、入力が不正だった場合や計算が破綻した場合には、値を使う前に原因を確認する必要がある。
+SciOxide はこの違いをエラー、終了理由、部分結果の診断で表す。
+
+## `Err` と未収束などの結果を含む `Ok`
+
+`Result<T, SciOxideError>` の `Ok` は、結果を返せたことを示す。
+それだけで許容誤差の達成を意味するわけではない。
+反復型の API では、結果やレポートの終了理由も確認する。
+
+`Err` なら原因を調べ、`Ok` なら成功条件と部分結果を確認する。
+
+
+### `Err(SciOxideError)` が表すもの
+
+`Err` は、入力違反、定義域外の評価、非有限値、数値的破綻などを表す。
+リソース不足や外部プロバイダーの失敗も含むため、数学的な原因とは限らない。
+途中まで進んでいた場合の出力の扱いは、各 API の仕様を確認する。
+
+### 不成功の `Ok(Result)` が表すもの
+
+部分結果を返す反復ソルバーでは、上限到達や停滞を終了理由として記録し、近似解や診断を `Ok` に含める。
+利用者は、残差、実行可能性、計算量を見て、その値を使うか、条件を変えて再試行するかを決める。
+終了型や取得メソッドは分野によって異なる。
+[結果の読み方](../../getting-started/reading-results/)に代表例をまとめている。
+
+`Admission::require` は、回数制限によって実行が認められなかった場合に `ConvergenceFailure` を返す境界である。
+収束を検査する機能そのものではない。
+部分結果を返せるか、エラーにするかは、呼び出す API の仕様による。
+
+## `SciOxideError` の構造化分類
+
+`SciOxideError` は内部構造を公開しない構造体で、列挙子に直接パターンマッチする型ではない。
+`kind()` は 20 種類の `SciOxideErrorKind`、`view()` は原因や診断を含む `SciOxideErrorView` を返す。
+エラーは分類、引数・数量の識別子（`Argument` / `Quantity`）、詳細で失敗内容を表す。
+呼び出し元の演算識別子は保持せず、検査付き算術や `Admission::require()` にも渡さない。
+代表的な分類を次に示す。
+
+| 分類 | 例 |
+|---|---|
+| `InvalidInput` | 区間の端点が逆順 |
+| `DimensionMismatch` | 行列とベクトルの形状が不一致 |
+| `DomainError` | 非正定値行列に対するCholesky分解 |
+| `NonFinite` | 入力・コールバック・演算から生じたNaNや無限大 |
+| `Singular` | 分解のピボットが特異性の判定基準に達した |
+| `ConvergenceFailure` | 部分結果を返さない境界での未収束や回数制限による実行の拒否 |
+| `NumericalInstability` | 反復の不変条件が崩れるなどの数値的破綻 |
+
+Cholesky分解の非正定値入力は `DomainReason::OutsideDomain`、数値的破綻の理由には `NumericalIssue::Breakdown` がある。
+ただし、これらを収束条件を満たさない終了理由として返す API もある。
+エラー文字列を解析せず、その API の結果型と分類情報を使う。
+20 分類それぞれの詳細ビュー、理由の列挙、次元や微分の失敗位置の読み方は、[エラーの分類と詳細ビュー](../../scioxide-core/algorithms/errors-and-diagnostic-views/)で実例とともに説明する。
+
+## 候補の評価と状態の受理
+
+反復中の候補をそのまま出力に反映すると、失敗した試行の途中状態が外へ漏れてしまう。
+そこで、候補の評価と、受理した状態の確定を分ける。
+これをトランザクションとして捉える。
+
+
+受理が確定した状態が、次の試行の出発点になる。
+棄却した候補を受理済み状態として扱わない。
+この仕組みは利用者のコールバックが起こした外部の副作用まで巻き戻すものではない。
+
+### トランザクションの 6 相
+
+1. **事前検証**：形状、識別子、リソースなどを検査する。
+   ユーザーコールバックや可視状態の変更を始める前に行う。
+2. **候補生成**：現在の受理済み状態から、次の候補を作る。
+3. **評価観測**：関数や作用素を評価し、実際に行った評価を数える。
+   再試行の評価も数え、キャッシュの参照は評価と区別する。
+4. **受理判定**：残差、誤差推定、制約などから候補を判定する。
+5. **受理確定**：採用する数値状態と、その診断を更新する。
+6. **巻き戻し**：不採用の候補を破棄し、最後に受理した状態を保つ。
+
+`SolveState` は求解の識別子、実行を区別するエポック、回数、受理状態のメタデータを持つ。
+解ベクトルそのものは保持しない。
+数値状態は、その API の結果や作業領域が所有する。
+関連する型は[求解の識別と状態の一覧](oxref:core-api-solve-state)から確認できる。
+
+## 試行の記録と進捗の救出：`AttemptRecord` と `PartialFailure`
+
+`AttemptRecord<P>` は、1回の呼び出しや再開試行の記録である。
+`kind()` で新規呼び出しか再開か、`outcome()` で事前検証棄却・失敗・停止・成功を区別する。
+`counts()` は計算量、`progress()` は保存された進捗への参照を返す。
+
+`PartialFailure<P>` は、主エラーと、取得できた進捗を一緒に届けるための型である。
+`with_progress(error, capture)` は進捗の捕捉を試み、捕捉に失敗しても主エラーを保持する。
+`error()` と `progress()` で参照し、`into_parts()` でエラーと任意の進捗に分解できる。
+
+## 部分結果の信頼区分（`PartialResultTrust`）
+
+信頼区分は、どの検査を通った状態かを表す。
+区分だけで用途への適合性が決まるわけではない。
+
+| 区分 | 主張できること |
+|---|---|
+| `DiagnosticOnly` | 有限の診断用状態。実行可能性や残差の達成は主張しない |
+| `Admissible` | そのアルゴリズムの受理・実行可能性規則を満たした |
+| `ResidualChecked` | 独立に確認した残差が、設定された閾値を満たした |
+| `CertificateVerified` | 独立に検証された証明用データに裏付けられている |
+
+例えば、小さい残差だけでは悪条件な問題の前進誤差を保証できない。
+また、`CertificateVerified` の主張の範囲は、検証した証明用データの内容による。
+
+## 回数上限への到達の 2 つの経路：不成功の Ok と境界 Err（対話型実験）
+
+次のセルは `SolveContext` の反復回数の上限を使い、$x\leftarrow\cos x$ を計算する小さな実装例である。
+入力は反復回数の上限、無次元の初期値、残差閾値である。
+候補点の残差を別に評価してから状態を受理する。
+同じ停止に対して、部分結果を `Ok` に含める場合と、回数制限による実行の拒否を `Admission::require` でエラーにする場合を比較する。
+表には返却点の残差と、既知の固定点 $0.7390851332151607$ に対する前進誤差を示す。
+
+```rust
+//| id: concept-budget-exhaustion-paths
+//| title: Dottie数探索における回数上限への到達の2経路（不成功Okと境界Err）
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   iteration_budget: {"type":"range","label":"反復回数の上限 [回]","description":"求解に割り当てる最大反復回数。","min":1,"max":40,"step":1,"value":10}
+//|   initial_guess: {"type":"range","label":"初期値 x₀ [-]","description":"反復の開始点。","min":0.0,"max":2.0,"step":0.1,"value":0.2}
+//|   tolerance_exponent: {"type":"range","label":"要求残差の指数 p（10ᵖ）","description":"収束判定基準の閾値。","min":-14,"max":-2,"step":1,"value":-8}
+use scioxide_core::{
+    Admission, Budget, BudgetKind, ExecutionContext, PartialResultTrust, ProblemToken,
+    RealScalar, ResidualTolerance, SolveBudgets, SolveIdentity, SolveState, algorithm_id,
+};
+
+let limit = Budget::try_from(iteration_budget as usize).map_err(|e| e.to_string())?;
+let threshold = 10.0_f64.powf(tolerance_exponent);
+let tolerance = ResidualTolerance::new(threshold, 0.0).map_err(|e| e.to_string())?;
+let mut budgets = SolveBudgets::unbounded().with_limit(BudgetKind::Iteration, limit);
+let mut state = SolveState::new();
+let identity = SolveIdentity::new(
+    ProblemToken::new(1),
+    algorithm_id!("dottie", "picard", 1),
+    0,
+    0,
+);
+let mut context = state
+    .begin_solve(ExecutionContext::sequential(), identity, &mut budgets)
+    .map_err(|e| e.to_string())?;
+let mut x = initial_guess;
+let mut residual = (RealScalar::cos(x) - x).abs();
+let mut success = tolerance
+    .is_satisfied(residual, x.abs())
+    .map_err(|e| e.to_string())?;
+let mut final_admission = Admission::Granted(());
+while !success {
+    let admission = context.record_iteration().map_err(|e| e.to_string())?;
+    if !admission.is_granted() {
+        final_admission = admission;
+        break;
+    }
+    let candidate = RealScalar::cos(x);
+    residual = (RealScalar::cos(candidate) - candidate).abs();
+    success = tolerance
+        .is_satisfied(residual, candidate.abs())
+        .map_err(|e| e.to_string())?;
+    let trust = if success {
+        PartialResultTrust::ResidualChecked
+    } else {
+        PartialResultTrust::DiagnosticOnly
+    };
+    context.commit_accepted(trust).map_err(|e| e.to_string())?;
+    x = candidate;
+}
+let trust = if success {
+    PartialResultTrust::ResidualChecked
+} else {
+    PartialResultTrust::DiagnosticOnly
+};
+let iterations = context.counts().own().iterations();
+// 同じ停止を「部分結果を返す境界」と「回数制限による実行の拒否をエラーにする境界」で扱う。
+let partial: Result<_, scioxide_core::SciOxideError> = Ok((x, residual, trust));
+let strict = final_admission.require();
+let (point, checked_residual, checked_trust) = partial.map_err(|e| e.to_string())?;
+let termination = if success {
+    "残差許容誤差を達成"
+} else {
+    "反復回数の上限"
+};
+emit_table_with_columns!(
+    serde_json::json!([
+    {"key":"0","label":"終了理由","type":"string","nullText":"未定義"},
+    {"key":"1","label":"反復数","type":"number","format":{"significantDigits":6},"nullText":"未定義"},
+    {"key":"2","label":"返却点 x","type":"number","format":{"significantDigits":6},"nullText":"未定義"},
+    {"key":"3","label":"残差","type":"number","format":{"significantDigits":6},"nullText":"未定義"},
+    {"key":"4","label":"閾値","type":"number","format":{"significantDigits":6},"nullText":"未定義"},
+    {"key":"5","label":"前進誤差","type":"number","format":{"significantDigits":6},"nullText":"未定義"},
+    {"key":"6","label":"信頼区分","type":"string","nullText":"未定義"}
+    ]),
+    vec![(
+        termination,
+        iterations,
+        point,
+        checked_residual,
+        threshold,
+        (point - 0.7390851332151607_f64).abs(),
+        format!("{checked_trust:?}")
+    )]
+);
+match strict {
+    Ok(()) => emit_text!("厳格な境界も Ok：残差許容誤差を達成した。"),
+    Err(error) => {
+        emit_text!("厳格な境界は Err。上の表の部分結果を使うかは呼び出し側で判断する。");
+        emit_table_with_columns!(
+            serde_json::json!([
+            {"key":"0","label":"エラー分類","type":"string","nullText":"未定義"},
+            {"key":"1","label":"詳細","type":"string","nullText":"未定義"}
+            ]),
+            vec![(format!("{:?}", error.kind()), format!("{:?}", error.view()))]
+        );
+    }
+}
+let outcome = if success {
+    Outcome::satisfied("残差の条件を満たした")
+} else {
+    Outcome::partial("反復回数の上限で停止した")
+};
+emit_outcome!(
+    outcome
+        .status(termination)
+        .diagnostic("残差", checked_residual, None)
+        .diagnostic("反復回数", iterations as f64, None)
+);
+```
+
+小さい上限では未収束の状態が残り、十分な上限では残差条件を満たす。
+この例では実行可能性の独立した検査を設けていないため、未収束の状態は `DiagnosticOnly` とする。
+計算量として記録するのは反復数であり、関数評価の回数の集計まで実装した例ではない。
+
+## まとめと次のステップ
+
+`Ok` かどうかと、求めた精度に達したかどうかは別に確認する。
+部分結果は、終了理由と信頼区分を見て利用方法を決める。
+受理済み状態をどこが所有するかを確認すると、再試行時に何を引き継げるかも分かる。
+次は[実行形式・作業領域・再現性](../workspaces-and-reproducibility/)で、準備と実行の分け方を扱う。

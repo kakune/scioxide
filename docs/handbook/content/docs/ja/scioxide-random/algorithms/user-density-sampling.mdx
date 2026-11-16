@@ -1,0 +1,247 @@
+---
+title: 利用者の密度からの標本化
+description: UserDensity と凹性・有界性の保証、適応棄却法と変換密度棄却法の包絡と squeeze、一様比法、数値逆算による汎用の標本化器、クロージャの包み、UniversalSamplingOptions の上限と SamplingDiagnostics、対数凹な密度の標本の点検。
+sidebar:
+  order: 317
+references:
+  random-laws-user-density: "標本化器と利用者の保証"
+  random-user-density-envelopes: "包絡による棄却法"
+---
+
+組み込みにない分布でも、密度か裾を式で書ければ `scioxide-random` の汎用の標本化器で標本を作れる。
+標本化器は密度の形についての数学的な性質（凹性、有界性、正規化）を利用者の保証として受け取り、その性質を使って正しい標本を作る。
+有限個の点の検査では性質を確かめられないので、保証が誤っていれば標本は誤った分布に従う。
+このページは四つの標本化器と保証の対応、包絡による棄却法の導出、作業量の上限と診断を説明し、対数凹な密度の標本を閉形式のモーメントと照合する。
+組み込みの分布が持つ機能と数値逆算は[分布の機能・裾確率・数値逆算](../laws-tails-and-multivariate-models/)、組み込みの連続分布の生成法は[連続分布の変換・棄却・裾野制御](../continuous-distributions/)にある。
+
+## 標本化器と利用者の保証
+
+利用者は `UserDensity` を実装して、対数密度 `log_pdf`、台、`validate_density` を与える。
+`validate_density` は密度の全質量が正で有限であることと、台が区間であることを表明する。
+密度は正規化していなくてよく、`log_pdf` は台の内部で有限、密度が 0 になる端点では $-\infty$ でよく、同じ引数には同じ値を返す。
+四つの標本化器はそれぞれ次の保証を受け取る。
+
+| 標本化器 | 利用者の保証 | 方法 |
+|---|---|---|
+| `AdaptiveRejectionSampler::new(density, &knots)` | `ConcaveDensity`：$\ln f$ が台の全体で凹で、$(\ln f)'$ を返せる | $\ln f$ の接線で上から抑える適応棄却法（Gilks–Wild 1992） |
+| `TransformedDensitySampler::new(density, &knots)` | $-1/\sqrt{f}$ が凹（対数凹ならこれも満たす） | 変換 $T(f) = -1/\sqrt{f}$ に同じ方法を使う変換密度棄却法（Hörmann 1995） |
+| `RatioUniformsSampler::new(density)` | `BoundedDensity`：一様比法の領域を囲む長方形 `RatioUniformsBounds` | 一様比法（Kinderman–Monahan 1977） |
+| `InversionSampler::new(provider)` | `LogCdf` と `LogSurvival` が同じ正規化した分布を表し、台が区間である | 上限付きの数値逆算 |
+
+`DensityTransform` は凹性を保証する変換を表す列挙型で、`Log`（$\ln f$ が凹）と `NegativeInverseSqrt`（$-1/\sqrt{f}$ が凹）の二つの値を持つ。
+`AdaptiveRejectionSampler::new` は準備のときに `validate_concavity(DensityTransform::Log)` を、`TransformedDensitySampler::new` は `validate_concavity(DensityTransform::NegativeInverseSqrt)` を呼び、エラーなら準備を中止する。
+利用者は保証できる変換にだけ `Ok(())` を返し、凹性が分からないか成り立たない変換にはエラーを返す。
+対数凹な密度は $-1/\sqrt{f}$ も凹なので両方に `Ok(())` を返せるが、逆は成り立たない。
+たとえば Cauchy 型の $f(x) \propto 1/(1 + x^2)$ では $-1/\sqrt{f} = -\sqrt{1 + x^2}$ は凹だが、$\ln f$ は $\lvert x \rvert > 1$ で凸なので、使えるのは `TransformedDensitySampler` だけである。
+
+密度や裾が閉形式で書けるなら、トレイトを実装する代わりにクロージャをラップする型を使える。
+
+| 型 | 受け取るもの | 実装するトレイト | 渡せる先 |
+|---|---|---|---|
+| `ConcaveDensityFn::new(log_pdf, derivative, transform, support)` | $\ln f$ と $(\ln f)'$ のクロージャ、凹性を保証する変換、台 | `Support`、`LogDensity`、`UserDensity`、`ConcaveDensity` | `transform` が `Log` なら二つの適応的な標本化器、`NegativeInverseSqrt` なら `TransformedDensitySampler` だけ |
+| `BoundedDensityFn::new(log_pdf, bounds, support)` | $\ln f$ のクロージャ、受理域を包む長方形 `RatioUniformsBounds`、台 | `Support`、`LogDensity`、`UserDensity`、`BoundedDensity` | `RatioUniformsSampler` |
+| `LogTailsFn::new(log_cdf, log_sf, support)` | $\ln F$ と $\ln S$ のクロージャ、台 | `LogCdf`、`LogSurvival`、`Support` | `InversionSampler`、`invert_log_probability`、`log_interval_probability` |
+
+包みは各問い合わせをクロージャの 1 回の呼び出しに渡し、メモリ領域を確保しない。
+凹性、有界性、正規化の保証は利用者が与え、標本化器は評価した点でしか確かめない。
+評価した点で密度が包絡を超えたり、NaN や $+\infty$ になったりすれば、保証が偽だと分かるので `InvalidInput` を返す。
+
+## 包絡による棄却法
+
+棄却法は密度 $f$（正規化していなくてよい）を上から抑える関数 $g \ge f$ から候補 $X$ を作り、一様乱数 $W$ に対して $W\,g(X) \le f(X)$ なら受理する。
+受理した $X$ は $f$ に比例する密度に従い、1 標本あたりの提案数の期待値は $\int g / \int f$ である。
+
+適応棄却法は $h = \ln f$ が凹であることを使って $g$ を作る。
+節点 $x_1 < \dots < x_m$ での接線 $\ell_i(x) = h(x_i) + h'(x_i)(x - x_i)$ は凹関数の上にあるので、$u(x) = \min_i \ell_i(x) \ge h(x)$ である。
+$e^{u}$ は隣り合う接線の交点で区切られた区分的な指数関数で、各区間の質量を閉形式で求めて区間を選び、区間の中を逆関数法で正確に標本化できる。
+隣り合う節点を結ぶ弦 $s(x)$ は凹関数の下にあるので、$\ln W + u(X) \le s(X)$ なら $f$ を評価せずに受理できる（squeeze）。
+squeeze で決まらない候補だけ $h(X)$ を評価し、$\ln W + u(X) \le h(X)$ で受理を決める。
+1 回の提案の計算コストは区間の探索の $O(\log m)$ と、高々 1 回の密度と 1 回の導関数の評価である。
+
+作業領域 `AdaptiveSamplingWorkspace` を渡す `sample_adaptive` は密度を評価した候補の点に接線を足して包絡を細かくする。
+接線は受理・棄却によらず足し、表が `table_nodes` 個に達したとき、既存の節点に近すぎるとき、足すと包絡が不正になるときは足さない。
+変換密度棄却法では、新しい点の $\ln f$ が既存のどの節点の値とも $\ln(1/\varepsilon) \approx 36$ より大きく離れているときも、交点の計算が悪条件になるので足さない。
+節点が増えると $\int e^{u} / \int f$ が 1 に近づき、squeeze で受理する割合も増えるので、後の標本ほど密度の評価が減る。
+1 回の細分の計算コストは $O(m)$ である。
+`sample_report` は準備のときの包絡のまま、細分せずに標本を作る。
+
+変換密度棄却法は $h = \ln f$ の代わりに $T(f) = -1/\sqrt{f}$ の接線を使う。
+接線 $a + bx$ を逆変換すると $1/(a + bx)^2$ に比例する区分的な包絡になり、これも逆関数法で正確に標本化できる。
+$-1/\sqrt{f}$ が凹であるという条件は対数凹より弱く、自由度 $\nu \ge 1$ の Student t や Cauchy のように冪で減る裾も含む。
+
+一様比法は、$(u, v)$ が領域 $\{0 < u \le \sqrt{f(c + v/u)}\}$ の上で一様なら $x = c + v/u$ が $f$ に比例する密度に従うことを使う。
+`RatioUniformsBounds` はこの領域を囲む長方形 $(0, u_{\max}] \times [v_{\min}, v_{\max}]$ を与える。
+条件は $u_{\max} \ge \sup \sqrt{f(x)}$、$v_{\min} \le \inf (x - c)\sqrt{f(x)}$、$v_{\max} \ge \sup (x - c)\sqrt{f(x)}$（上限と下限は台の全体でとる）で、ずらし $c$ を最頻値の近くに置くと長方形が小さくなる。
+長方形から一様に $(u, v)$ を選び、$2\ln u \le \ln f(x)$ なら受理する。
+提案 1 回の計算コストは一様乱数 2 個と高々 1 回の密度の評価で、提案数の期待値は長方形の面積 $u_{\max}(v_{\max} - v_{\min})$ を $f$ の全質量の半分で割った値である。
+
+`InversionSampler` は密度を評価しない。
+開区間の一様乱数 $u$ に対し、$u \le 1/2$ なら $\ln F(x) = \ln u$ を、$u > 1/2$ なら $\ln S(x) = \ln(1 - u)$ を `invert_log_probability_with_options` で解く。
+小さい側の裾で解くので、両方の裾で相対精度を保つ。
+`transport(u)` は与えた $u$ を写すので、準乱数の座標を分布に写すのにも使える。
+
+## 作業量と診断
+
+どの標本化器も `new` は既定の `UniversalSamplingOptions` を使い、`with_options` が最後の引数で上限を取る。
+
+| 上限 | 既定値 |
+|---|---|
+| 準備のときの密度と導関数の評価 | 65,536 回 |
+| 1 標本の密度・導関数・裾の評価（細分を含む） | 4,096 回 |
+| 1 標本の一様乱数の呼び出し（0 を引き直した分を含む） | 65,536 回 |
+| 適応的な包絡の節点数 `table_nodes` | 128 個（2 以上） |
+| 1 回の操作のメモリ領域（標本化器と一時領域） | 64 MiB |
+
+評価回数か乱数を呼び出す回数の上限に達すると `ConvergenceFailure`、メモリ領域の上限を超えると `ResourceLimit` を返す。
+棄却の繰り返しは上限とは別に 1 標本あたり提案 1,024 回で打ち切る。
+各標本の作業は `UniversalSample` の `diagnostics` に、`SamplingDiagnostics`（提案、棄却、評価、乱数を呼び出した回数）として返る。
+適応棄却法は節点を利用者が持つ作業領域に保持し、作業領域は準備のときの容量（`table_nodes` 個）より大きくならない。
+作業領域は作った標本化器でだけ使え、エラーの前に行った細分は作業領域に残る。
+
+## 対数凹な密度の標本化
+
+次のセルは対数凹な密度 $f(x) \propto \exp(-\lvert x \rvert^\beta)$（$\beta \ge 1$）を `AdaptiveRejectionSampler` で標本化する。
+密度は `ConcaveDensityFn` で、$\ln f$ とその導関数のクロージャ、変換 `DensityTransform::Log`、実数全体の台から作る。
+初期の節点は $-1, 0, 1$ の 3 個である。
+1 つ目の表は $n$ 標本を作るのに要した提案、棄却、評価の回数と、受理率（標本数を提案の総数で割った値）、最後の包絡の節点数である。
+2 つ目の表は標本の $\mathrm{E}[\lvert X \rvert]$ と $\mathrm{E}[X^2]$ を閉形式 $\mathrm{E}[\lvert X \rvert^r] = \Gamma((r + 1)/\beta)/\Gamma(1/\beta)$（独立検算）と比べ、標本の $2r$ 次モーメントから求めた標準誤差で割った $z$ を出す。
+
+```rust
+//| id: random-adaptive-rejection
+//| ref: random-adaptive-rejection
+//| title: 利用者の対数凹な密度を適応棄却法で標本化する
+//| run: reactive
+//| crates: [scioxide-random, scioxide-core, scioxide-special]
+//| inputs:
+//|   beta: {"type":"range","label":"指数 β（密度 ∝ exp(−|x|^β)）","description":"β = 1 は Laplace、β = 2 は分散 1/2 の正規。","min":1.25,"max":4,"step":0.25,"value":2}
+//|   sample_count: {"type":"range","label":"標本数 n [個]","min":1000,"max":20000,"step":1000,"value":5000}
+//|   seed: {"type":"range","label":"乱数のシード","min":1,"max":1000,"step":1,"value":9}
+//| cases:
+//|   - {"id":"flat-top","label":"β = 4","description":"頂上が平らで裾の短い密度。E[X²] = Γ(3/4)/Γ(1/4) = 0.338。","inputs":{"beta":4}}
+//|   - {"id":"near-laplace","label":"β = 1.25、n = 20000","description":"Laplace に近い尖った密度。包絡の節点が増える。","inputs":{"beta":1.25,"sample_count":20000}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"work","path":"/rows/0/3","range":{"min":0.9,"max":1}}
+//|       - {"artifact":"work","path":"/rows/0/4","range":{"min":4,"max":128}}
+//|       - {"artifact":"moments","path":"/rows/0/3","range":{"min":-4,"max":4}}
+//|       - {"artifact":"moments","path":"/rows/1/3","range":{"min":-4,"max":4}}
+//|   - case: flat-top
+//|     expect:
+//|       - {"artifact":"moments","path":"/rows/1/1","approx":{"value":0.337989,"atol":1e-5}}
+//|       - {"artifact":"moments","path":"/rows/1/3","range":{"min":-4,"max":4}}
+//|   - case: near-laplace
+//|     expect:
+//|       - {"artifact":"work","path":"/rows/0/4","range":{"min":4,"max":128}}
+//|       - {"artifact":"moments","path":"/rows/0/3","range":{"min":-4,"max":4}}
+use scioxide_core::{ExtendedInterval, NumericScalar, RealScalar};
+use scioxide_random::{
+    AdaptiveRejectionSampler, ConcaveDensityFn, DensityTransform, SeedableRng, SplitMix64,
+};
+
+let fixed4 = serde_json::json!({ "fractionDigits": 4 });
+let sig5 = serde_json::json!({ "significantDigits": 5 });
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+// 正規化していない密度 exp(−|x|^β) の ln f と (ln f)′。β ≥ 1 なので ln f は凹である。
+// 質量 2Γ(1 + 1/β) は正で有限、台は実数全体で連結（UserDensity の保証）。
+let density = ConcaveDensityFn::new(
+    |x: f64| {
+        let magnitude: f64 = NumericScalar::abs(x);
+        Ok(-RealScalar::powf(magnitude, beta))
+    },
+    |x: f64| {
+        let magnitude: f64 = NumericScalar::abs(x);
+        Ok(-beta * RealScalar::signum(x) * RealScalar::powf(magnitude, beta - 1.0))
+    },
+    DensityTransform::Log,
+    ExtendedInterval::new(None, None).map_err(|e| e.to_string())?,
+);
+let n = sample_count as usize;
+let sampler =
+    AdaptiveRejectionSampler::new(density, &[-1.0, 0.0, 1.0]).map_err(|e| e.to_string())?;
+let mut adaptive = sampler.workspace().map_err(|e| e.to_string())?;
+let mut rng = SplitMix64::from_seed(seed as u64);
+let mut samples = Vec::with_capacity(n);
+let (mut proposals, mut rejections, mut evaluations) = (0_usize, 0_usize, 0_usize);
+for _ in 0..n {
+    let draw = sampler
+        .sample_adaptive(&mut rng, &mut adaptive)
+        .map_err(|e| e.to_string())?;
+    proposals += draw.diagnostics.proposals;
+    rejections += draw.diagnostics.rejections;
+    evaluations += draw.diagnostics.evaluations;
+    samples.push(draw.value);
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "提案数", "type": "integer" },
+    { "key": "1", "label": "棄却数", "type": "integer" },
+    { "key": "2", "label": "密度と導関数の評価回数", "type": "integer" },
+    { "key": "3", "label": "受理率 n/提案数 [-]", "type": "number", "format": fixed4 },
+    { "key": "4", "label": "包絡の節点数", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    vec![(
+        proposals,
+        rejections,
+        evaluations,
+        n as f64 / proposals as f64,
+        adaptive.nodes()
+    )],
+    metadata = serde_json::json!({ "id": "work" })
+);
+// 独立検算: E[|X|^r] = Γ((r + 1)/β)/Γ(1/β)。標準誤差は標本の 2r 次モーメントから。
+let gamma = |x: f64| scioxide_special::gamma(x).map_err(|e| e.to_string());
+let nf = n as f64;
+let moment = |r: i32| {
+    samples
+        .iter()
+        .map(|&x| RealScalar::powi(NumericScalar::abs(x), r))
+        .sum::<f64>()
+        / nf
+};
+let (m1, m2, m4) = (moment(1), moment(2), moment(4));
+let row = |name: &'static str, r: f64, est: f64, se: f64| -> Result<_, String> {
+    let exact = gamma((r + 1.0) / beta)? / gamma(1.0 / beta)?;
+    Ok((name, exact, est, (est - exact) / se))
+};
+let columns = serde_json::json!([
+    { "key": "0", "label": "量" },
+    { "key": "1", "label": "閉形式", "type": "number", "format": sig5 },
+    { "key": "2", "label": "標本推定", "type": "number", "format": sig5 },
+    { "key": "3", "label": "z [-]", "type": "number", "format": fixed2 }
+]);
+emit_table_with_columns!(
+    columns,
+    vec![
+        row("E[|X|]", 1.0, m1, RealScalar::sqrt((m2 - m1 * m1) / nf))?,
+        row("E[X²]", 2.0, m2, RealScalar::sqrt((m4 - m2 * m2) / nf))?,
+    ],
+    metadata = serde_json::json!({ "id": "moments" })
+);
+```
+
+既定の入力（$\beta = 2$、$n = 5\,000$、シード 9）では、提案 5,012 回のうち棄却は 12 回で、受理率は $0.9976$ である。
+節点は初期の 3 個から 44 個に増え、評価 82 回は密度 41 回と、41 本の接線を足すための導関数 41 回に分かれる。
+密度を評価した 41 個の候補のうち 29 個は受理されたので、接線は棄却された候補だけでなく、評価した候補ごとに足されたことが分かる。
+残りの 4,971 回の提案は squeeze で受理され、密度を評価していない。
+
+$\mathrm{E}[\lvert X \rvert]$ は閉形式 $1/\sqrt{\pi} = 0.56419$ に対して標本 $0.57542$（$z = 1.85$）、$\mathrm{E}[X^2]$ は $0.5$ に対して $0.51596$（$z = 1.58$）である。
+二つの $z$ は同じ標本から求めるので正に相関し、同時に同じ向きへずれやすい。
+正しい標本化器でも、1 つの $z$ が $\pm 1.96$ の外に出る確率は約 5% あるので、シードや $n$ を変えて $z$ が 0 の周りに散らばることを確かめる。
+$\beta = 4$ では $\mathrm{E}[X^2]$ の閉形式 $0.33799$ に対して $0.34693$（$z = 1.70$）である。
+$\beta = 1.25$、$n = 20\,000$ では節点が 68 個まで増え、$\mathrm{E}[X^2]$ の $z = -0.97$ である。
+
+## まとめ
+
+組み込みにない分布は `UserDensity` に凹性（`ConcaveDensity`）か有界性（`BoundedDensity`）の保証を加えるか、対数の裾 `LogCdf` と `LogSurvival` を与えれば、汎用の標本化器で標本化できる。
+対数凹な密度には `AdaptiveRejectionSampler`、冪で減る裾を持つ $-1/\sqrt{f}$ 凹の密度には `TransformedDensitySampler` を使い、閉形式で書ける密度は `ConcaveDensityFn` などの包みで渡す。
+保証は評価した点でしか確かめられないので、保証できない変換には `validate_concavity` でエラーを返す。
+適応的な標本化では作業領域を使い回し、`SamplingDiagnostics` の提案と評価の回数で包絡の効き方を確かめる。
+標本の正しさは閉形式のモーメントや分位点と標準誤差で照合し、一つのシードの $z$ だけで判断しない。
+
+## 次に読むページ
+
+- [連続分布の変換・棄却・裾野制御](../continuous-distributions/)：組み込みの分布が使う逆関数法、Ziggurat 法、変量の組合せと比べる。
+- [分布の機能・裾確率・数値逆算](../laws-tails-and-multivariate-models/)：`InversionSampler` が使う `invert_log_probability_with_options` の終了と作業量を確かめる。
+- [分布の機能と合成](../../api/law-protocols-and-combinators/)：汎用の標本化器、包み、`UniversalSamplingOptions` の仕様を API の表で引く。

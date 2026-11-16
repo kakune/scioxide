@@ -1,0 +1,345 @@
+---
+title: "Time-dependent outputs, restart, and termination reasons"
+description: "Advancing ParabolicProblem and HyperbolicProblem, output schedules and sinks, restarting from states and checkpoints, and interpreting termination reasons, partial results, and diagnostics."
+sidebar:
+  order: 324
+references:
+  pde-transient-advance-flow: "from-preparation-to-the-endpoint"
+  pde-overview-time: "from-preparation-to-the-endpoint"
+  pde-transient-output-schedules: "output-schedules-and-sinks"
+  pde-transient-checkpoints: "states-and-checkpoints"
+  pde-transient-terminations: "termination-reasons-and-partial-results"
+---
+
+Parabolic and hyperbolic time evolution can be solved to the endpoint in one call, but long calculations need intermediate fields and ways to continue stopped computations.
+This page explains the common advancement workflow of `ParabolicProblem` and `HyperbolicProblem`, output schedules and sinks, restarting from states and checkpoints, and interpreting termination reasons and partial results.
+Time integration methods and stability are covered in [Time integration of parabolic equations](../parabolic-time-integration/) and [Wave equation and the CFL condition](../hyperbolic-waves-and-cfl/).
+
+## From preparation to the endpoint
+
+A time-dependent calculation consists of four parts with different owners and lifetimes.
+
+| Part | Construction | Contents |
+|---|---|---|
+| Problem `ParabolicProblem`, `HyperbolicProblem` | `new(discretization, source, end)` | Borrowed spatial discretization and source, endpoint time, semidiscrete system excluding Dirichlet degrees of freedom |
+| Options `ParabolicOptions`, `HyperbolicOptions` | `new()` and `with_*` | Time integration method, tolerances, step-size limit, output schedule, attempt limit |
+| State `PdeState` | `initial_state` | Time, free-unknown coordinates, remaining Rannacher startup, mesh revision, and degree-of-freedom ordering |
+| Workspace `PdeWorkspace` | `workspace()` or `PdeWorkspace::new()` | ODE and method-of-lines storage, last attempt record |
+
+`new` assembles the semidiscrete system (lumped mass, Jacobian among free degrees of freedom, and its sparsity pattern) once in work proportional to the nonzero count and reuses it in all subsequent calls.
+A non-finite endpoint time returns a non-finite-value error; a nonpositive endpoint returns `InvalidInput`.
+Coefficients are time independent; sources and boundary data may depend on time.
+
+`initial_state` creates the state by sampling the initial `FieldData` at free-unknown locations at time 0.
+For parabolic problems, use `initial_state(initial, options)`; the Rannacher startup interval end is determined by these options.
+For hyperbolic problems, use `initial_state(displacement, velocity)`, ordering coordinates as free displacements followed by free velocities.
+To construct from a sequence of all unknown values, use `initial_state_from_values`; values at Dirichlet locations are ignored.
+
+`PdeWorkspace::new()` allocates nothing.
+`advance` enlarges insufficient storage during preflight, so passing the same workspace to subsequent calls avoids repeated allocation.
+One workspace can serve both parabolic and hyperbolic problems, but its storage is sized for the most recent problem.
+
+The central call has the following form.
+
+```text
+problem.advance(&options, &mut state, &mut sink, &mut workspace, scope) -> Result<PdeSolveReport, SciOxideError>
+```
+
+`advance` advances `state` to the endpoint, sends intermediate fields to `sink`, and returns termination and diagnostics in a `PdeSolveReport`.
+Pass an execution context such as `ExecutionContext::sequential()` as `scope`.
+Field values are absent from the report; assemble the endpoint field into the full unknown sequence, restoring Dirichlet values, with `values(&state)` or the nonallocating `values_into(&state, &mut out)`.
+For hyperbolic problems, `values` returns displacement only.
+
+For a single solve, use the two functions returning owned results.
+`solve(initial)` solves with defaults and returns the endpoint field, treating every termination other than `Completed` as an error.
+`solve_with_options(initial, options)` returns a `PdeSolution` (state, endpoint field, report, and output record), also returning limit stops with their reports.
+If either fails during calculation, it returns any accepted state in `PartialFailure<PdeProgress>`.
+
+## Output schedules and sinks
+
+Select intermediate field times with the `PdeOutputSchedule` passed to the options' `with_output_schedule`.
+
+| Schedule | Fields delivered to the sink | Constraints |
+|---|---|---|
+| `FinalOnly` (default) | Last accepted state of each call | A call stopped at a limit still delivers the field at its stopping time |
+| `TimeSteps` | Initial state and the state at the end of every accepted step | Fields are delivered for each step |
+| `Times(times)` | Fields at every requested time (including duplicates, in requested order) | Times must be finite, nonnegative, nondecreasing, and within $[0,\,\text{end time}]$. The integrator must provide dense output (interpolation within a step) |
+
+`Times` times are interpolated from the integrator's dense output and do not increase the step count.
+Built-in backward Euler, Crank–Nicolson, and Rannacher startup have no dense output, so combining them with `Times` when free unknowns exist is rejected at preflight with `InvalidInput` (`UnsupportedConfiguration`).
+The default Radau IIA and explicit Dormand–Prince 5(4) provide dense output.
+
+A sink implements the `PdeOutputSink` trait; `observe(&mut self, observation)` receives `PdeObservation` values one at a time in integration order.
+`PdeObservation` holds time `time()`, field `values()` in the full unknown ordering, and `request_index()` giving the request index within `Times`.
+`values()` is the physical field with Dirichlet values restored, or displacement for hyperbolic problems.
+Fields are borrowed, so the sink copies them if it needs to retain them.
+Convert to typed fields with `SpatialDiscretization::field`.
+`request_index()` is the index in the full request sequence and is `None` for `FinalOnly` and `TimeSteps` fields.
+
+`PdeOutputSink` is implemented for three kinds of types.
+`()` discards all observations.
+A closure of type `FnMut(PdeObservation) -> Result<(), SciOxideError>` serves directly as a sink.
+`PdeTrajectory` copies and retains times and fields, returning them through `times()`, `states()`, and `into_parts()`.
+If a sink returns an error, `advance` stops immediately and propagates the error to the caller.
+The state then holds the last accepted time's values, and previously delivered observations are not undone.
+
+## States and checkpoints
+
+`PdeState` holds time `time()`, free-unknown coordinates `coordinates()`, the end of unfinished Rannacher startup `startup_end()`, mesh revision `mesh_token()`, and equation order `order()`.
+Before numerical work, `advance` checks that the state has the same mesh revision, degree-of-freedom ordering, and equation order; that its time lies in $[0,\,\text{end time}]$; that coordinates are finite; and that its startup phase matches the options.
+Matching startup phase means the state has the same startup end while its time is in the configured startup interval, and no startup end after that interval ([Rannacher startup](oxref:pde-crank-nicolson-rannacher)).
+A call rejected at preflight leaves the state unchanged.
+A call stopped after accepting at least one step leaves the last accepted point in the state.
+
+There are two ways to continue a stopped calculation.
+Passing the same state to `advance` again advances from its time to the endpoint.
+Requests in `Times` before the state's time are skipped, and delivered request indices retain their positions in the original sequence.
+Alternatively, copy the state with `PdeCheckpoint::new(&state)` and restore it with `resume(options, &checkpoint, &mut state, sink, workspace, scope)`.
+`resume` checks the checkpoint's mesh revision, degree-of-freedom ordering, equation order, time, and startup phase, restores it into the state, then advances using the new call's work limits (attempt limit and `SolveBudgets`).
+Rejection during checking leaves both state and checkpoint unchanged.
+A checkpoint is a state copy, so it can be restored into another state variable and rerun repeatedly from the same point with different options.
+
+## Termination reasons and partial results
+
+Return values from `advance` and `resume` have two layers.
+When numerical computation finishes according to its rules, it returns `Ok(PdeSolveReport)`, with the stop reason in the `PdeTermination` from `termination()`.
+Invalid inputs, callback and sink errors, and numerical failures such as failed implicit-stage Newton iterations return `Err(SciOxideError)`.
+
+The following five `PdeTermination` variants occur in time-dependent problems.
+Variants starting with `Linear`, such as `LinearIterationLimit`, are used only for elliptic solves.
+
+| Termination reason | Meaning | State interpretation | outcome |
+|---|---|---|---|
+| `Completed` | Reached the endpoint time | Endpoint solution | satisfied |
+| `TimeStepLimit` | Attempted steps in one call reached the `with_step_budget` limit (default 100,000, combining startup and main integration) | Solution at the last accepted time `final_time()` | partial |
+| `TimeStepSizeLimit` | Cannot advance even with the smallest representable allowed step | Same as above | partial |
+| `EvaluationLimit` | Reached a work limit such as evaluation counts in `with_budgets` | Same as above | partial |
+| `ExecutionStopped(reason)` | Stopped by cancellation or a deadline | Same as above | partial |
+
+Determine success with `PdeSolveReport::is_success()` (equivalent to `PdeTermination::is_success()`), rather than enumerating variants yourself.
+`Display` shows the method name and termination reason, as in `RadauIia: TimeStepLimit`.
+The `PdeDiagnostics` in `diagnostics()` holds attempted, accepted, rejected, and failed step counts; factorization and linear-solve counts; right-hand-side and Jacobian evaluation counts; and the last step's normalized error estimate.
+Attempted steps equal the sum of accepted, rejected, and failed steps.
+`trust()` gives the trust level of the committed output state (`PartialResultTrust`).
+
+`PdeWorkspace::last_attempt()` returns the last call's `AttemptRecord<PdeProgress>`.
+Its `outcome()` is `PreflightRejected` for preflight rejection, `Failed` for an error, `Stopped` for an unsuccessful stop, and `Succeeded` for success.
+The `PdeProgress` in `progress()` holds the last accepted state `state()`, time `time()`, step counts `steps()`, last error estimate `last_step_error_estimate()`, and trust level `trust()` for that call; `into_state()` yields a state for the next `advance`.
+Read partial results of calls ending in `Err` here.
+The owned-result functions `solve` and `solve_with_options` return the same `PdeProgress` inside `PartialFailure`.
+
+## Resuming a calculation stopped at the attempt limit
+
+The following cell checks this workflow in a heat-conduction calculation.
+Discretize $u_t=u_{xx}$ on $[0,1]$ with both ends held at 0 using a uniform 41-point grid (`StructuredFdmPlan::dirichlet_laplacian`), and advance from initial values $\sin\pi x$ to time 0.1 with default Radau IIA and tolerance $10^{-8}$.
+Output uses equally spaced `Times` times up to the endpoint; a `Recorder` implementing `PdeOutputSink` records values at $x=0.5$.
+
+The first `advance` restricts the attempt limit to the input value and stops with `TimeStepLimit`.
+Copy the stopped state into a `PdeCheckpoint`, restore it into a new state with `resume`, and advance to the endpoint with default limits.
+The independent check uses the exact semidiscrete solution $u(0.5,t)=e^{-\lambda_h t}$, $\lambda_h=(4/h^2)\sin^2(\pi h/2)$.
+The first table lists each observation's request index, time, originating call, value, and difference from the exact solution; the second lists each call's termination reason, step and factorization counts, and attempt record retained in the workspace.
+
+```rust
+//| id: pde-transient-checkpoint-resume
+//| ref: pde-transient-checkpoint-resume
+//| title: "Resume heat conduction stopped at an attempt limit from a checkpoint"
+//| run: reactive
+//| crates: [scioxide-pde, scioxide-core]
+//| inputs:
+//|   first_budget: {"type":"range","label":"First-call attempt limit [count]","description":"Vary how many steps the first advance can attempt.","min":1,"max":40,"step":1,"value":8}
+//|   requests: {"type":"range","label":"Requested times [-]","description":"Vary the number of equally spaced output times up to the endpoint 0.1.","min":1,"max":20,"step":1,"value":10}
+//| cases:
+//|   - {"id":"enough-budget","label":"Limit 40 applications","description":"The first call reaches the endpoint; resuming returns Completed without advancing any steps.","inputs":{"first_budget":40}}
+//|   - {"id":"one-step","label":"Limit of 1 attempt","description":"The first call stops after one step, and the resumed call outputs every requested time.","inputs":{"first_budget":1}}
+//|   - {"id":"many-requests","label":"20 requested times","description":"Producing 20 times through dense output does not change the step count.","inputs":{"requests":20}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"calls","path":"/rows/0/1","equals":"TimeStepLimit"}
+//|       - {"artifact":"calls","path":"/rows/0/3","equals":8}
+//|       - {"artifact":"calls","path":"/rows/0/6","equals":"Stopped"}
+//|       - {"artifact":"calls","path":"/rows/1/1","equals":"Completed"}
+//|       - {"artifact":"calls","path":"/rows/1/2","approx":{"value":0.1,"rtol":1e-12}}
+//|       - {"artifact":"samples","path":"/rows/2/2","equals":"First call"}
+//|       - {"artifact":"samples","path":"/rows/3/2","equals":"Resumed"}
+//|       - {"artifact":"samples","path":"/rows/9/0","equals":9}
+//|       - {"artifact":"samples","path":"/rows/9/5","range":{"max":1e-7}}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+//|   - case: enough-budget
+//|     expect:
+//|       - {"artifact":"calls","path":"/rows/0/1","equals":"Completed"}
+//|       - {"artifact":"calls","path":"/rows/1/3","equals":0}
+//|   - case: one-step
+//|     expect:
+//|       - {"artifact":"samples","path":"/rows/0/2","equals":"Resumed"}
+//|       - {"artifact":"samples","path":"/rows/9/5","range":{"max":1e-7}}
+//|   - case: many-requests
+//|     expect:
+//|       - {"artifact":"calls","path":"/rows/0/3","equals":8}
+//|       - {"artifact":"samples","path":"/rows/19/0","equals":19}
+use scioxide_core::{Budget, ExecutionContext, SciOxideError, RealScalar};
+use scioxide_pde::{
+    FieldData, FieldPoint, ParabolicOptions, ParabolicProblem, PdeCheckpoint, PdeObservation,
+    PdeOutputSchedule, PdeOutputSink, PdeSolveReport, PdeWorkspace, StructuredFdmPlan,
+};
+
+// Sink: record (request index, time, value at x = 0.5) for each observation.
+struct Recorder {
+    middle: usize,
+    samples: Vec<(Option<usize>, f64, f64)>,
+}
+impl PdeOutputSink<f64> for Recorder {
+    fn observe(
+        &mut self,
+        observation: PdeObservation<'_, f64, f64>,
+    ) -> Result<(), SciOxideError> {
+        let value = observation.values()[self.middle];
+        self.samples
+            .push((observation.request_index(), observation.time(), value));
+        Ok(())
+    }
+}
+let nodes = 41_usize;
+let h = 1.0 / (nodes - 1) as f64;
+let end = 0.1;
+let count = requests.round() as usize;
+let plan =
+    StructuredFdmPlan::dirichlet_laplacian([0.0], [1.0], [nodes]).map_err(|e| e.to_string())?;
+let source = FieldData::zero();
+let problem = ParabolicProblem::new(&plan, &source, end).map_err(|e| e.to_string())?;
+let times = (1..=count)
+    .map(|k| end * k as f64 / count as f64)
+    .collect::<Vec<_>>();
+let rest = ParabolicOptions::new().with_output_schedule(PdeOutputSchedule::Times(times));
+let budget = Budget::try_from(first_budget.round() as usize).map_err(|e| e.to_string())?;
+let first = rest.clone().with_step_budget(budget);
+let pi = core::f64::consts::PI;
+let initial = FieldData::time_invariant(move |p: FieldPoint<f64, 1>| {
+    Ok(RealScalar::sin(pi * p.point[0]))
+});
+let mut sink = Recorder {
+    middle: nodes / 2,
+    samples: Vec::new(),
+};
+let mut workspace = problem.workspace().map_err(|e| e.to_string())?;
+let mut state = problem
+    .initial_state(&initial, &first)
+    .map_err(|e| e.to_string())?;
+let sequential = ExecutionContext::sequential;
+let stopped = problem
+    .advance(&first, &mut state, &mut sink, &mut workspace, sequential())
+    .map_err(|e| e.to_string())?;
+let split = sink.samples.len();
+// Summarize each call's termination reason, step counts, and workspace attempt record in one row.
+let summary = |call: &'static str, report: &PdeSolveReport<f64>, work: &PdeWorkspace<f64>| {
+    let d = report.diagnostics();
+    let record = work.last_attempt();
+    (
+        call,
+        report.termination().to_string(),
+        report.final_time(),
+        d.num_time_steps(),
+        d.num_accepted_steps(),
+        d.num_factorizations(),
+        record.map(|r| format!("{:?}", r.outcome())),
+        record.and_then(|r| r.progress()).map(|p| p.time()),
+    )
+};
+let mut calls = vec![summary("First call", &stopped, &workspace)];
+// Copy the last accepted state, restore it into a new state, and resume.
+let checkpoint = PdeCheckpoint::new(&state).map_err(|e| e.to_string())?;
+let mut resumed = problem
+    .initial_state(&initial, &rest)
+    .map_err(|e| e.to_string())?;
+let finished = problem
+    .resume(
+        &rest,
+        &checkpoint,
+        &mut resumed,
+        &mut sink,
+        &mut workspace,
+        sequential(),
+    )
+    .map_err(|e| e.to_string())?;
+// Exact semidiscrete solution u(0.5, t) = exp(−λ_h t), λ_h = (4/h²) sin²(πh/2) (independent check).
+let lambda = 4.0 / (h * h) * RealScalar::powi(RealScalar::sin(pi * h / 2.0), 2);
+let rows = sink
+    .samples
+    .iter()
+    .enumerate()
+    .map(|(k, &(index, t, u))| {
+        let call = if k < split { "First call" } else { "Resumed" };
+        let exact = RealScalar::exp(-lambda * t);
+        (index, t, call, u, exact, (u - exact).abs())
+    })
+    .collect::<Vec<_>>();
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed6 = serde_json::json!({ "fractionDigits": 6 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Request index", "type": "integer", "nullText": "None" },
+    { "key": "1", "label": "Time t [-]", "type": "number", "format": fixed6 },
+    { "key": "2", "label": "Call" },
+    { "key": "3", "label": "u(0.5, t) [-]", "type": "number", "format": fixed6 },
+    { "key": "4", "label": "Exact semidiscrete solution [-]", "type": "number", "format": fixed6 },
+    { "key": "5", "label": "Difference [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "samples" })
+);
+let call_columns = serde_json::json!([
+    { "key": "0", "label": "Call" },
+    { "key": "1", "label": "Termination reason" },
+    { "key": "2", "label": "Reached time [-]", "type": "number", "format": fixed6 },
+    { "key": "3", "label": "Attempted steps [count]", "type": "integer" },
+    { "key": "4", "label": "Accepted [count]", "type": "integer" },
+    { "key": "5", "label": "Factorizations [count]", "type": "integer" },
+    { "key": "6", "label": "Attempt record", "nullText": "None" },
+    { "key": "7", "label": "PdeProgress time [-]", "type": "number", "format": fixed6, "nullText": "None" }
+]);
+calls.push(summary("Resumed", &finished, &workspace));
+emit_table_with_columns!(
+    call_columns,
+    calls,
+    metadata = serde_json::json!({ "id": "calls" })
+);
+let worst = rows.iter().map(|row| row.5).fold(0.0, f64::max);
+let outcome = if finished.is_success() {
+    Outcome::satisfied("Resumed integration reached the endpoint and produced every requested time")
+} else {
+    Outcome::partial("Resumed integration stopped before the endpoint")
+        .explanation("The state holds values at the last accepted time; raise the attempt limit and resume again.")
+};
+emit_outcome!(
+    outcome
+        .status(finished.termination().to_string())
+        .diagnostic("Reached time", finished.final_time(), None)
+        .diagnostic("Observations", rows.len() as f64, None)
+        .diagnostic("Maximum difference from the exact semidiscrete solution", worst, None)
+);
+```
+
+With the default limit of 8 attempts, the first call stopped with `TimeStepLimit` at $t=0.0304$, producing requests 0–2 ($t=0.01,0.02,0.03$).
+The workspace record is `Stopped`, and the `PdeProgress` time equals the state's time.
+Resuming produces the remaining requests 3–9 with their indices unchanged and reaches `Completed` in 17 steps.
+Differences from the exact semidiscrete solution are at most $2.6\times10^{-9}$ for every observation, within tolerance $10^{-8}$.
+With a limit of 40 attempts, the first call reaches the endpoint in 25 steps, and resuming returns `Completed` without advancing any steps.
+Splitting the solve gives nearly the same total steps as the 25-step single solve (1 + 25 steps for a limit of one attempt).
+Resumed integration reestimates its initial step, so step sequences and intermediate values differ from a single solve at the tolerance level rather than the roundoff level.
+With 20 requested times, step counts remain 8 and 17, showing that `Times` interpolates values from dense output.
+
+## Summary
+
+Time-dependent computation separates the problem (semidiscrete system), options, caller-owned state, and workspace; `advance` advances the state and returns a report.
+Select intermediate field times with `PdeOutputSchedule` and receive them in a sink implementing `PdeOutputSink` (a closure, `PdeTrajectory`, or a custom type).
+`Times` is available only with integrators providing dense output and cannot be combined with backward Euler, Crank–Nicolson, or Rannacher startup.
+Continue limit-stopped calculations by calling `advance` with the same state or using `resume` from a `PdeCheckpoint`.
+Determine termination success with `is_success()`; interpret the state left by a termination other than `Completed` as values at time `final_time()`.
+
+## Further reading
+
+- [Time integration of parabolic equations](../parabolic-time-integration/): examine how `ParabolicScheme` and step selection affect semidiscrete diffusion stability and accuracy.
+- [Wave equation and the CFL condition](../hyperbolic-waves-and-cfl/): examine instability while termination remains `Completed` when changing `CflPolicy` in `HyperbolicProblem`.
+- [Heat diffusion in a rod](../../examples/heat-crank-nicolson/): examine `TimeSteps` output and compare backward Euler and Crank–Nicolson for a step initial condition.
+- [Method of lines and semidiscrete systems](../method-of-lines-and-nonlinear/): pass a semidiscrete system directly to an integrator in `scioxide-ode` without using `ParabolicProblem`.

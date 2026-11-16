@@ -1,0 +1,466 @@
+---
+title: "Memory layout, views, dense matrix kernels, and accuracy tiers"
+description: "Row-major storage and matrix construction, strided views, borrowing transposes, adjoints, and blocks, finite views, dense kernels corresponding to BLAS levels 1–3 and their call forms, matrix norms, packed GEMM tiles, and error bounds for Standard and Exact."
+sidebar:
+  order: 305
+references:
+  linalg-row-major-storage: "row-major-storage-and-strides"
+  linalg-dense-kernels: "dense-kernel-operations-and-operation-counts"
+  linalg-accuracy-levels: "accuracy-tiers-standard-and-exact"
+  linalg-view-borrowing: "view-transformations-and-borrowing-rules"
+  linalg-finite-views: "finite-views"
+---
+
+A mathematical matrix $A = (a_{ij}) \in \mathbb{K}^{m \times n}$ ($\mathbb{K}$ is $\mathbb{R}$ or $\mathbb{C}$) is represented on a computer by $mn$ numbers in a one-dimensional array.
+This page explains how `scioxide-linalg` interprets that array, handles submatrices and transposes without copying, and chooses the accuracy of products and inner products.
+The factorizations and iterative methods on subsequent pages use the views and kernels described here.
+Call forms such as the standard form, form with options, API with caller-provided output, and scoped API are defined in [Workspaces, execution contexts, and attempt records](oxref:linalg-execution-forms).
+
+---
+
+## Row-major storage and strides
+
+`Matrix<S>` owns contiguous row-major entries, placing entry $(i, j)$ at `data[i * cols + j]` (indices start at 0).
+Construct matrices with the following functions.
+
+| Function | Matrix constructed | Failure |
+|---|---|---|
+| `Matrix::zeros(m, n)` | An $m \times n$ zero matrix | `SizeOverflow` if $mn$ does not fit in `usize`; `AllocationFailure` if allocation fails |
+| `Matrix::from_rows(&[[a, b, c], [d, e, f]])` | A matrix whose row $i$ is array element $i$; $0 \times C$ for an empty slice | `AllocationFailure` if allocation fails |
+| `Matrix::from_vec(m, n, data)` | A matrix taking ownership of the row-major `Vec` directly | `DimensionMismatch` if its length is not $mn$; `SizeOverflow` if $mn$ does not fit in `usize` |
+| `Matrix::identity(n)` | An $n \times n$ identity matrix | Same as `zeros` |
+
+None of these functions checks entry finiteness.
+Before computation, each operation using the matrix checks the entries it reads and rejects NaNs or infinities with `NonFinite` (for example, a product with $\alpha = 0$ reads neither $A$ nor $B$, and an update with $\beta = 0$ does not read old output values).
+Construct vectors with `Vector::from_vec(data)` and `Vector::zeros(n)`.
+
+A view has a base offset $b$ and two strides $s_r, s_c$, mapping logical position $(i, j)$ to the storage offset
+
+$$
+\operatorname{offset}(i, j) = b + i\, s_r + j\, s_c
+$$
+
+
+A view of an owned matrix has $s_r = n$ and $s_c = 1$, so adjacent entries in a row are also adjacent in memory.
+A column-major array can be read without copying through a view with $s_r = 1$ and $s_c = m$.
+
+| Operation | Rows and columns | Strides $(s_r, s_c)$ | Base offset |
+|---|---|---|---|
+| `Matrix::view()` | $m \times n$ | $(n, 1)$ | $0$ |
+| `block(r0, c0, p, q)` | $p \times q$ | Unchanged | $b + r_0 s_r + c_0 s_c$ |
+| `transpose()` | $n \times m$ | $(s_c, s_r)$ | Unchanged |
+| `adjoint()` | $n \times m$ | $(s_c, s_r)$, toggles conjugation flag | Unchanged |
+| `row(i)`, `col(j)` | `VectorView` of lengths $n$ and $m$ | $s_c$, $s_r$ | $b + i s_r$, $b + j s_c$ |
+| `try_diag()` | `VectorView` of length $\min(m, n)$ | $s_r + s_c$ | $b$ |
+
+All these operations finish in constant time without copying entries.
+Transpose and adjoint only exchange the roles of the indices, so traversing a transposed view by rows reads nonadjacent positions in the original array.
+Kernels handle this difference in traversal order through the packing described below.
+
+`MatrixView::from_slice_with_strides` creates a view from an arbitrary slice and strides.
+It rejects a last reachable position outside the slice with `DimensionMismatch` and a size product or final position not fitting in `usize` with `SizeOverflow`.
+In an immutable view, distinct logical positions may refer to the same storage location, and the slice may extend beyond the last reachable position.
+
+The following cell constructs a $4 \times 5$ matrix with $a_{ij} = 10 i + j$ using `Matrix::from_rows` and borrows a $2 \times 3$ block in two ways, `block` and `from_slice_with_strides`.
+Inputs are the block's first row $r_0$ and column $c_0$ (0–2), and the view to tabulate (the block, its transpose, or the original matrix's diagonal); selecting the diagonal leaves $r_0$ and $c_0$ unused.
+For each entry of the selected view, the first table lists logical position, value, storage offset from $b + i s_r + j s_c$, and row-major offset inferred from the value.
+The value $10 i' + j'$ reveals the original indices $(i', j')$, independently checking that the formula's storage offset agrees with the row-major offset $5 i' + j'$.
+The second table shows strides, base offset, the difference between the two borrowing methods, and the count of entries with mismatched storage offsets.
+Tests compare offsets and strides with manually counted values.
+
+```rust
+//| id: linalg-view-strides
+//| ref: linalg-view-strides
+//| title: "Block, transpose, and diagonal views and storage offsets"
+//| run: reactive
+//| crates: [scioxide-linalg]
+//| inputs:
+//|   first_row: {"type":"range","label":"Block first row r₀","description":"First row of a 2×3 block extracted from the 4×5 matrix.","min":0,"max":2,"step":1,"value":1}
+//|   first_col: {"type":"range","label":"Block first column c₀","description":"First column of the block.","min":0,"max":2,"step":1,"value":1}
+//|   view_kind: {"type":"select","label":"View","description":"The block itself, its transpose, or the original matrix's diagonal.","options":["Block","Block transpose","Original matrix diagonal"],"value":"Block"}
+//| cases:
+//|   - {"id":"transposed","label":"Block transpose","description":"Swaps the strides to (1, 5), reading the same 6 positions in column order.","inputs":{"view_kind":"Block transpose"}}
+//|   - {"id":"diagonal","label":"Original matrix diagonal","description":"Gives a vector of length 4 with stride 6.","inputs":{"view_kind":"Original matrix diagonal"}}
+//|   - {"id":"corner","label":"r₀ = 2, c₀ = 2","description":"The bottom-right block starts at storage offset 12.","inputs":{"first_row":2,"first_col":2}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"entries","path":"/rows/0/2","equals":11}
+//|       - {"artifact":"entries","path":"/rows/0/3","equals":6}
+//|       - {"artifact":"entries","path":"/rows/5/3","equals":13}
+//|       - {"artifact":"entries","path":"/rows/5/4","equals":13}
+//|       - {"artifact":"layout","path":"/rows/0/0","equals":5}
+//|       - {"artifact":"layout","path":"/rows/0/1","equals":1}
+//|       - {"artifact":"layout","path":"/rows/0/4","equals":0}
+//|       - {"artifact":"layout","path":"/rows/0/5","equals":0}
+//|   - case: transposed
+//|     expect:
+//|       - {"artifact":"layout","path":"/rows/0/0","equals":1}
+//|       - {"artifact":"layout","path":"/rows/0/1","equals":5}
+//|       - {"artifact":"entries","path":"/rows/1/3","equals":11}
+//|       - {"artifact":"layout","path":"/rows/0/5","equals":0}
+//|   - case: diagonal
+//|     expect:
+//|       - {"artifact":"layout","path":"/rows/0/2","equals":6}
+//|       - {"artifact":"layout","path":"/rows/0/0","equals":null}
+//|       - {"artifact":"entries","path":"/rows/3/2","equals":33}
+//|       - {"artifact":"entries","path":"/rows/3/3","equals":18}
+//|       - {"artifact":"layout","path":"/rows/0/5","equals":0}
+//|   - case: corner
+//|     expect:
+//|       - {"artifact":"layout","path":"/rows/0/3","equals":12}
+//|       - {"artifact":"entries","path":"/rows/5/2","equals":34}
+//|       - {"artifact":"layout","path":"/rows/0/5","equals":0}
+use scioxide_linalg::{Matrix, MatrixView};
+
+// A 4×5 matrix with a_ij = 10 i + j. Row-major storage places (i, j) at offset 5 i + j.
+let a = Matrix::from_rows(&[
+    [0.0_f64, 1.0, 2.0, 3.0, 4.0],
+    [10.0, 11.0, 12.0, 13.0, 14.0],
+    [20.0, 21.0, 22.0, 23.0, 24.0],
+    [30.0, 31.0, 32.0, 33.0, 34.0],
+])
+.map_err(|e| e.to_string())?;
+let cols = a.cols();
+let (r0, c0) = (first_row.round() as usize, first_col.round() as usize);
+let block = a.view().block(r0, c0, 2, 3).map_err(|e| e.to_string())?;
+// Borrow the same block directly from base offset r₀ n + c₀ and original row stride n.
+let tail = &a.as_slice()[r0 * cols + c0..];
+let direct =
+    MatrixView::from_slice_with_strides(2, 3, tail, cols, 1).map_err(|e| e.to_string())?;
+let mut gap = 0.0_f64;
+for (i, j) in (0..2).flat_map(|i| (0..3).map(move |j| (i, j))) {
+    let left = block.get(i, j).map_err(|e| e.to_string())?;
+    gap = gap.max((left - direct.get(i, j).map_err(|e| e.to_string())?).abs());
+}
+// Row-major offset 5 i′ + j′ inferred from value 10 i′ + j′ (independent verification).
+let from_value = |value: f64| value as usize / 10 * cols + value as usize % 10;
+// (i, j, value, b + i s_r + j s_c, 5 i′ + j′). A vector view has no j.
+let mut rows: Vec<(usize, Option<usize>, f64, usize, usize)> = Vec::new();
+// (Row stride, column stride, vector stride, base offset).
+let (row_stride, col_stride, vector_stride, base) = if view_kind == "Original matrix diagonal" {
+    let diag = a.view().try_diag().map_err(|e| e.to_string())?;
+    for k in 0..diag.len() {
+        let value = diag.get(k).map_err(|e| e.to_string())?;
+        rows.push((k, None, value, k * diag.stride(), from_value(value)));
+    }
+    (None, None, Some(diag.stride()), 0)
+} else {
+    let view = if view_kind == "Block transpose" {
+        block.transpose()
+    } else {
+        block
+    };
+    let (rs, cs, base) = (view.row_stride(), view.col_stride(), r0 * cols + c0);
+    for (i, j) in (0..view.rows()).flat_map(|i| (0..view.cols()).map(move |j| (i, j))) {
+        let value = view.get(i, j).map_err(|e| e.to_string())?;
+        rows.push((i, Some(j), value, base + i * rs + j * cs, from_value(value)));
+    }
+    (Some(rs), Some(cs), None, base)
+};
+let mismatches = rows.iter().filter(|r| r.3 != r.4).count();
+let whole = serde_json::json!({ "fractionDigits": 0 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "View index i", "type": "integer" },
+    { "key": "1", "label": "View index j", "type": "integer", "nullText": "(vector)" },
+    { "key": "2", "label": "Value a", "type": "number", "format": whole },
+    { "key": "3", "label": "Storage offset b + i s_r + j s_c", "type": "integer" },
+    { "key": "4", "label": "Offset 5 i′ + j′ inferred from value", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "entries" })
+);
+let layout = serde_json::json!([
+    { "key": "0", "label": "Row stride s_r", "type": "integer", "nullText": "(vector)" },
+    { "key": "1", "label": "Column stride s_c", "type": "integer", "nullText": "(vector)" },
+    { "key": "2", "label": "Vector stride", "type": "integer", "nullText": "(matrix)" },
+    { "key": "3", "label": "Base offset b", "type": "integer" },
+    { "key": "4", "label": "Difference between borrowing methods", "type": "number" },
+    { "key": "5", "label": "Storage-offset mismatches [count]", "type": "integer" }
+]);
+let summary = vec![(row_stride, col_stride, vector_stride, base, gap, mismatches)];
+emit_table_with_columns!(
+    layout,
+    summary,
+    metadata = serde_json::json!({ "id": "layout" })
+);
+```
+
+With the default $(r_0, c_0) = (1, 1)$, the block starts at storage offset 6; row stride 5 and column stride 1 select 6, 7, 8, 11, 12, and 13.
+Both the difference between borrowing methods and the storage-offset mismatch count are 0, showing that `block` preserves base offset $b + r_0 s_r + c_0 s_c$ and the strides.
+Selecting transpose only swaps strides to $(1, 5)$ and reads the same six positions in column order.
+The diagonal is a vector of length 4 and stride $5 + 1 = 6$, selecting entries 0, 11, 22, and 33 at offsets 0, 6, 12, and 18.
+With $(r_0, c_0) = (2, 2)$, the base offset is $2 \cdot 5 + 2 = 12$ and the last entry is $a_{34} = 34$ at offset $12 + 5 + 2 = 19$.
+
+## View transformations and borrowing rules
+
+Mutable views `MatrixViewMut` and `VectorViewMut` receive output; Rust's borrowing rules prevent their coexistence with immutable views of the same storage.
+Input/output overlap such as `a.view().mul_mat_into(&b, …, a.view_mut(), …)` is therefore excluded at compile time; shape, finiteness, and workspace size are checked at runtime.
+Mutable views have no conjugation flag.
+Their constructors reject strides mapping two logical positions to one storage location (stride 0 for a vector of length at least 2) with `InvalidInput`.
+Functions writing output do so after all checks and computation finish, leaving it unchanged on failure.
+Many input arguments use `impl Into<MatrixView>`, allowing `&Matrix` or a view to be passed directly.
+
+## Finite views
+
+`try_finite()` checks every logical entry once, returning `NonFinite` for any NaN or infinity, or otherwise a `FiniteMatrixView` recording the largest absolute component (real and imaginary parts for complex scalars).
+Transposes, conjugates, adjoints, and blocks of finite views do not repeat the check.
+Finite views implement `LinearOperator` and `AdjointOperator` from `scioxide_core`, so use them when passing dense matrices as operators to iterative methods to avoid rereading the matrix for finiteness on every iteration ([Krylov subspace methods](../krylov-and-preconditioning/)).
+`copy_into` copies a view's logical entries to another output, with finiteness handling explicitly selected by `CopyPolicy`.
+`RequireFinite` checks all entries before copying and rejects NaNs or infinities; `Preserve` copies without checking, including non-finite values.
+Selecting a transpose or adjoint before the call places the transformed values in the output.
+Matrix `copy_into(policy, &options, output, cx)` takes no workspace; vector `copy_into` also accepts workspace used when a BLAS provider performs the copy.
+
+## Dense kernel operations and operation counts
+
+View-type functions correspond to BLAS levels 1–3 (see [External BLAS provider contract](../blas-provider/) for dispatch to an external BLAS library).
+The levels differ in the ratio of operations to data (arithmetic intensity); only level 3 can reuse loaded entries repeatedly, so blocking reduces most factorization work to level-3 products.
+
+| Level | Main functions | Operations | Data |
+|---|---|---|---|
+| 1 (vector) | `dotu`, `dotc_left`, `norm2`, `asum`, `iamax`, `axpy_in_place`, `axpby_in_place`, `scale_in_place`, `swap_in_place`, `rotate_in_place`, `modified_rotate_in_place` | $O(n)$ | $O(n)$ |
+| 2 (matrix–vector) | `mul_vec`, `symmetric_mul_vec`, `hermitian_mul_vec`, `mul_vec` for banded and packed matrices, `rank_one_update_in_place`, and others | $O(mn)$ | $O(mn)$ |
+| 3 (matrix–matrix) | `mul_mat`, `symmetric_mul_mat`, `hermitian_mul_mat`, `triangular_mul_mat`, `triangular_solve_mat`, `symmetric_rank_k_in_place`, `hermitian_rank_two_k_in_place`, and others | $O(mkn)$ | $O(mk + kn + mn)$ |
+
+Each entry of the matrix product $C = AB$ ($A \in \mathbb{K}^{m \times k}$, $B \in \mathbb{K}^{k \times n}$) takes $k$ multiplications and $k - 1$ additions, giving $mn(2k - 1)$ real operations, conventionally counted as $2mkn$.
+
+Array-returning `mul_vec` and `mul_mat` provide a standard form, forms with options (such as `mul_vec_with_options`), and APIs with caller-provided output (such as `mul_vec_into`).
+Value-returning `dotu`, `dotc_left`, `norm2`, `asum`, and `iamax` for inner products and norms provide a standard form and scoped APIs (such as `dotu_scoped(&y, &options, cx)`).
+The standard form always uses the default `Standard`; to select an accuracy tier or byte limit, or use context cancellation or a BLAS provider, choose another form accepting `LinalgExecutionOptions`.
+Functions named `_in_place` (such as `VectorViewMut::axpy_in_place` and `MatrixView::symmetric_mul_vec_in_place`) update values using the mutable view's current contents as input too (for example, $y \leftarrow \alpha x + \beta y$), accepting a workspace and context like APIs with caller-provided output.
+`f32` vectors also provide `dot_wide`, accumulating products in `f64` and returning `f64`, and `dot_plus`, adding a constant and returning `f32`, together with their scoped APIs.
+
+`givens_rotation(a, b)` constructs plane-rotation coefficients.
+Its `GivensRotationResult` provides `rotation()`, mapping $(a, b)$ to $(r, 0)$ (a `GivensRotation` with cosine `cosine()` and sine `sine()`), `r()` returning $r$, and `z()` returning the same auxiliary value as BLAS ROTG; the sign of $r$ also follows ROTG conventions.
+`modified_givens_rotation(d1, d2, x1, y1)` constructs a modified Givens transformation without square roots (Gentleman's method, BLAS ROTMG) and returns updated weights `d1()` and `d2()`, coordinate `x1()`, and transformation `ModifiedRotation` (with form `ModifiedRotationFlag`) in a `ModifiedRotationResult`.
+Both are constant-cost kernels, but a BLAS provider on the context may compute ROTG or ROTMG, so they provide scoped APIs `givens_rotation_scoped(a, b, &options, cx)` and `modified_givens_rotation_scoped(d1, d2, x1, y1, &options, cx)` that also check context cancellation.
+Apply the constructed rotations to vector pairs with `VectorViewMut::rotate_in_place` and `modified_rotate_in_place`.
+
+There are two ways to compute matrix norms.
+`MatrixView::norm(MatrixNorm::One)` computes the maximum column sum $\lVert A \rVert_1$, `MatrixNorm::Infinity` the maximum row sum $\lVert A \rVert_\infty$, and `MatrixNorm::Frobenius` the norm $\lVert A \rVert_F = (\sum_{ij} \lvert a_{ij} \rvert^2)^{1/2}$, by reading entries in $O(mn)$ work ($O(1)$ for an empty view), with no allocation.
+Errors in the 1-norm and ∞-norm come only from rounding sums of $m$ or $n$ nonnegative terms.
+For contiguous storage, the Frobenius norm uses one overflow-safe 2-norm of all entries; otherwise it combines overflow-safe norms of rows or columns, whichever are fewer, using a scaled sum.
+When combining $k$ vectors of $p$ real components, relative error, excluding subnormal rounding, is at most $\gamma_{2p+5} + \gamma_{8k+8} + \gamma_{2p+5}\gamma_{8k+8}$ ($\gamma_j = ju/(1 - ju)$ follows the [chapter notation](../#notation)).
+`operator_norm(op, kind)` applies the matrix-free $m \times n$ operator `op` to unit vectors $e_j$ $n$ times to compute the same norm exactly up to rounding error.
+The form with options `operator_norm_with_options(op, kind, &options)` selects byte or iteration limits; the scoped API `operator_norm_scoped(op, kind, &options, &mut ws, cx)` uses the caller's workspace and context.
+Each form counts one iteration per column.
+To estimate the 1-norm with a few products, use `OneNormEstimator` ([Estimating the 1-norm and exact operator norms](../norm-estimation/)).
+
+The Khatri–Rao product `khatri_rao(a, b)`, a columnwise Kronecker product, takes $m \times n$ $A$ and $p \times n$ $B$ and returns an $mp \times n$ matrix whose column $j$ is $a_{:,j} \otimes b_{:,j}$.
+The form with options `khatri_rao_with_options(a, b, &options)` applies the byte limit to the result size and returns `ResourceLimit` before allocation if it is exceeded.
+The API `khatri_rao_into(a, b, out, cx)` writes to caller-provided output.
+`MatrixSide`, passed to symmetric, Hermitian, and triangular products and triangular solves, specifies whether the structured matrix multiplies from the left or right.
+
+## Packing and tiles for matrix multiplication
+
+The matrix-product kernel follows Goto and van de Geijn (the same organization as BLIS), repacking $m_c \times k_c$ blocks of $A$ and $k_c \times n_c$ blocks of $B$ into contiguous workspace and computing $m_r \times n_r$ register tiles with a small kernel.
+Packing permits unit-stride reads regardless of original strides or transposition, and packed blocks are reused while resident in cache.
+
+| Execution environment | Scalars | $m_r \times n_r$ | $m_c$ | $k_c$ | $n_c$ |
+|---|---|---|---|---|---|
+| Scalar (including Wasm) | `f64` / `f32` | $4 \times 4$ | 64 | 128 | 128 |
+| x86-64 AVX2+FMA | `f64` / `f32` | $6 \times 8$ / $4 \times 16$ | 120 | 256 | 256 |
+| x86-64 AVX-512 | `f64` / `f32` | $4 \times 16$ / $4 \times 32$ | 128 | 256 | 256 |
+| AArch64 NEON | `f64` / `f32` | $4 \times 4$ / $4 \times 8$ | 96 | 256 | 256 |
+
+Tile dimensions are fixed for each instruction set; they do not change by inspecting cache size at runtime.
+Complex products pack real and imaginary parts together and use the same real tiles for a real product with doubled depth (the 1m method).
+Thus $n_r$, $k_c$, and $n_c$ measured in complex entries are half the tabulated values, and error bounds count each component as a real product with $2k$ terms.
+The instruction set is determined once from the context's processor capabilities.
+APIs returning owned values use verified native instructions through `ExecutionContext::sequential_native()`; passing `ExecutionContext::sequential()` to APIs with caller-provided output uses portable scalar tiles.
+This handbook's Wasm cells use scalar tiles with either context.
+
+## Accuracy tiers Standard and Exact
+
+Choose product and reduction accuracy with `scioxide_core::Accuracy`; the default is `Standard`.
+The standard form always uses `Standard`; select `Exact` by passing `LinalgExecutionOptions::new().with_accuracy(Accuracy::Exact)` to a form with options, an API with caller-provided output, or a scoped API.
+
+The scioxide-core documentation for `Accuracy` expresses the `Standard` bound as $k\varepsilon/(1 - k\varepsilon)$ using machine epsilon $\varepsilon$.
+In the chapter's notation $\gamma_k = ku/(1 - ku)$ ($u = \varepsilon/2$), this is $\gamma_{2k}$, the form used below.
+For a real product with inner dimension $k$, `Standard` satisfies the componentwise bound
+
+$$
+\lvert \hat c_{ij} - c_{ij} \rvert \le \gamma_{2k} \,(\lvert A \rvert \lvert B \rvert)_{ij} + k\, u_{\mathrm{sub}}, \qquad \gamma_{2k} = \frac{k \varepsilon}{1 - k \varepsilon}
+$$
+
+
+$u_{\mathrm{sub}}$ is the smallest subnormal of the output type multiplied by a power-of-two scale; this bound is meaningful when $k \varepsilon < 1$.
+An inner product of length $k$ has the same form, with right-hand side $\gamma_{2k} \sum_i \lvert x_i y_i \rvert + k u_{\mathrm{sub}}$.
+Because the right-hand side uses $\lvert A \rvert \lvert B \rvert$, it gives no relative-error guarantee for inner products with cancellation.
+When intermediate overflow threatens, computation scales components by powers of two.
+Triangular solves satisfy the componentwise backward-error bound $\lvert r \rvert \le \gamma_{2n+2} (\lvert T \rvert \lvert X \rvert + \lvert \alpha B \rvert)$; forward error is additionally proportional to the condition number.
+If nonzero entries of $T$, $B$, and $\alpha$ have magnitudes in $[2^{-e_{\max}/4}, 2^{e_{\max}/4}]$ ($2^{e_{\max}}$ is the smallest power of two above the largest finite number), `Standard` performs blocked substitution with ordinary arithmetic; `Exact` accumulates each residual $\alpha b_i - \sum_j t_{ij} x_j$ exactly, rounds once, then divides by the diagonal, giving the same `Exact` result in every environment.
+Outside that range, both use unblocked substitution with power-of-two scaling for each row; if intermediate growth exceeds the floating-point range, they also restart from $B$, rejecting only solutions that do not fit in `S`.
+`Exact` accumulates products exactly and rounds only once at the end, giving a correctly rounded result with error at most $u \lvert c_{ij} \rvert$ when the result is normal.
+For real values needing no scaling, `Standard` computes `norm2` from blockwise sums of squares; for complex or extreme-range values it uses Blue's three-range scaled sum of squares, with relative-error bound $\gamma_{4n+10}$ excluding subnormal rounding ($n$ is the number of real components).
+The `Exact` norm uses a scaled sum-of-squares recurrence.
+Neither promises correct rounding of the square root.
+
+Reproducibility also differs by tier.
+`Standard` gives bitwise identical results for the same options and instruction set regardless of worker (thread) count; different instruction sets can give different results within the same error bound.
+`Exact` is also independent of the instruction set ([Reproducibility in shared concepts](../../../concepts/workspaces-and-reproducibility/#floating-point-non-associativity-and-three-levels-of-reproducibility)).
+
+The following cell computes the inner product of a vector repeating $x = (1, 10^{e}, 1, -10^{e})$ $p$ times with $y = (1, \dots, 1)$.
+Inputs are large-term exponent $e$ (0–20) and repetition count $p$ (1–64); the inner-product length is $k = 4p$ and its exact value is $2p$.
+When $10^{e}$ exceeds $2^{53} \approx 9.0 \times 10^{15}$, adjacent floating-point numbers are at least 2 apart, so ordinary summation absorbs each 1 into a large term and loses it.
+The table shows computed values, errors $\lvert \hat s - 2p \rvert$, error bounds, and error-to-bound ratios for the standard form `dotu`, a `Standard` scoped API (portable context `ExecutionContext::sequential()`), and an `Exact` scoped API.
+The bounds are $\gamma_{2k} \sum_i \lvert x_i y_i \rvert$ for `Standard` (the subnormal term $k u_{\mathrm{sub}}$ is negligible here and omitted) and $u \cdot 2p$ for `Exact`; a ratio at most 1 satisfies the bound.
+The chart shows `Standard` error and bound for $e = 0, \dots, 20$ on a logarithmic axis, with a vertical line at $10^e = 2^{53}$.
+Tests compare computed values with exact $2p$ and bounds with values obtained from the formulas.
+
+```rust
+//| id: linalg-accuracy-tiers
+//| ref: linalg-accuracy-tiers
+//| title: "Inner-product errors and bounds for Standard and Exact"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-linalg]
+//| inputs:
+//|   magnitude_exponent: {"type":"range","label":"Large-term exponent e","description":"Repeat x = (1, 10^e, 1, −10^e).","min":0,"max":20,"step":1,"value":17}
+//|   pairs: {"type":"range","label":"Repetitions p","description":"Inner-product length is 4p. The exact value is 2p.","min":1,"max":64,"step":1,"value":4}
+//| cases:
+//|   - {"id":"no-absorption","label":"e = 15","description":"10^15 is below 2^53, so Standard also returns exact 2p.","inputs":{"magnitude_exponent":15}}
+//|   - {"id":"long","label":"e = 20, p = 64","description":"Even at length 256, Exact returns 2p = 128.","inputs":{"magnitude_exponent":20,"pairs":64}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"dots","path":"/rows/1/1","equals":0}
+//|       - {"artifact":"dots","path":"/rows/1/2","equals":8}
+//|       - {"artifact":"dots","path":"/rows/1/3","approx":{"value":2842.170943040401,"rtol":1e-12}}
+//|       - {"artifact":"dots","path":"/rows/2/1","equals":8}
+//|       - {"artifact":"dots","path":"/rows/0/4","range":{"max":1}}
+//|   - case: no-absorption
+//|     expect:
+//|       - {"artifact":"dots","path":"/rows/1/1","equals":8}
+//|       - {"artifact":"dots","path":"/rows/2/2","equals":0}
+//|       - {"artifact":"dots","path":"/rows/0/4","range":{"max":1}}
+//|   - case: long
+//|     expect:
+//|       - {"artifact":"dots","path":"/rows/2/1","equals":128}
+//|       - {"artifact":"dots","path":"/rows/1/4","range":{"max":1}}
+//|       - {"artifact":"dots","path":"/rows/0/4","range":{"max":1}}
+use scioxide_core::{Accuracy, ExecutionContext};
+use scioxide_linalg::{LinalgExecutionOptions, VectorView};
+
+let p = pairs.round() as usize;
+let exact = 2.0 * p as f64;
+// Repeat x = (1, 10^e, 1, −10^e) p times. y = (1, …, 1).
+let operands = |exponent: i32| -> (Vec<f64>, Vec<f64>) {
+    let big = 10.0_f64.powi(exponent);
+    let x = (0..p).flat_map(|_| [1.0, big, 1.0, -big]).collect();
+    (x, vec![1.0_f64; 4 * p])
+};
+// Standard bound γ_2k Σ|x_i y_i| = kε/(1 − kε) Σ|x_i y_i| (k = 4p). Reference value computed with f64 arithmetic.
+let standard_bound = |x: &[f64]| {
+    let k = x.len() as f64;
+    k * f64::EPSILON / (1.0 - k * f64::EPSILON) * x.iter().map(|v| v.abs()).sum::<f64>()
+};
+// Scoped API: select the accuracy tier with options and use a portable sequential context.
+let scoped = |exponent: i32, accuracy: Accuracy| -> Result<f64, String> {
+    let (x, y) = operands(exponent);
+    let options = LinalgExecutionOptions::new().with_accuracy(accuracy);
+    let cx = ExecutionContext::sequential();
+    let y = VectorView::from_slice(&y);
+    VectorView::from_slice(&x)
+        .dotu_scoped(y, &options, cx)
+        .map_err(|e| e.to_string())
+};
+let e = magnitude_exponent.round() as i32;
+let (x, y) = operands(e);
+// Standard form: compute Standard with sequential_native().
+let plain = VectorView::from_slice(&x)
+    .dotu(VectorView::from_slice(&y))
+    .map_err(|e| e.to_string())?;
+let limit = standard_bound(&x);
+// Error of the correctly rounded value is at most u |2p| (u = ε/2).
+let rounding = f64::EPSILON / 2.0 * exact;
+let row = |name: &'static str, value: f64, bound: f64| {
+    let error = (value - exact).abs();
+    (name, value, error, bound, error / bound)
+};
+let rows = vec![
+    row("dotu (standard form, Standard)", plain, limit),
+    row(
+        "dotu_scoped (Standard, portable)",
+        scoped(e, Accuracy::Standard)?,
+        limit,
+    ),
+    row(
+        "dotu_scoped（Exact）",
+        scoped(e, Accuracy::Exact)?,
+        rounding,
+    ),
+];
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let sig6 = serde_json::json!({ "significantDigits": 6 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Call form and accuracy tier" },
+    { "key": "1", "label": "Computed [-]", "type": "number", "format": sig6 },
+    { "key": "2", "label": "Error |computed value − 2p| [-]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "Error bound [-]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "Error / bound [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "dots" })
+);
+// Omit points with exactly zero error from the series because a logarithmic axis cannot display them.
+let mut error_points = Vec::new();
+let mut bound_points = Vec::new();
+for exponent in 0..=20 {
+    let error = (scoped(exponent, Accuracy::Standard)? - exact).abs();
+    if error > 0.0 {
+        error_points.push([f64::from(exponent), error]);
+    }
+    bound_points.push([f64::from(exponent), standard_bound(&operands(exponent).0)]);
+}
+let threshold = 53.0 * 2.0_f64.log10();
+emit_line_chart!(
+    &vec![
+        serde_json::json!({
+            "name": "Standard error",
+            "points": error_points,
+            "style": { "showSymbol": true }
+        }),
+        serde_json::json!({
+            "name": "Bound γ₂ₖ Σ|xᵢ yᵢ|",
+            "points": bound_points,
+            "style": { "lineType": "dashed" }
+        }),
+    ],
+    options = &serde_json::json!({
+        "xLabel": "Large-term exponent e [-]",
+        "yLabel": "Error |computed value − 2p| [-]",
+        "yType": "log",
+        "annotations": [{ "kind": "line", "axis": "x", "value": threshold, "label": "10^e = 2⁵³" }]
+    })
+);
+```
+
+At $e \le 15$, `Standard` also returns exact $2p$, so the error series has no points (zero errors are omitted from the logarithmic axis).
+At $e = 16$, the spacing next to $10^{16}$ is 2, so $10^{16} + 1$ rounds to $10^{16}$ and every 1 is lost.
+With defaults $e = 17$ and $p = 4$, `Standard` returns 0; the error $2p = 8$ is within the bound $2.8 \times 10^{3}$.
+The bound is proportional to $\sum_i \lvert x_i y_i \rvert$ and grows with $e$, so it guarantees nothing about relative error for heavily cancelling inner products.
+Increasing $p$ grows the error in proportion to $2p$, while the bound grows with both $k = 4p$ and $\sum_i \lvert x_i y_i \rvert$ (error 128 and bound $7.3 \times 10^{8}$ for $e = 20$ and $p = 64$).
+`Exact` returns $2p$ for every $e$ and $p$, with zero error.
+The `Standard` scoped API uses portable scalar kernels and gives the documented values in both native and Wasm execution.
+In native environments, standard-form `dotu` uses vector instructions that change summation order and can yield different values within the same bound.
+This handbook's Wasm cells also use scalar kernels for the standard form, so the table's first and second rows agree.
+
+---
+
+## Summary
+
+`Matrix` is a contiguous row-major array, constructed with `zeros`, `from_rows`, `from_vec`, or `identity`; operations check entry finiteness before computation.
+Blocks, transposes, adjoints, and diagonals are constant-time views without copying, so submatrices and column-major arrays can be passed to kernels directly.
+Array-returning kernels provide a standard form, forms with options, and APIs with caller-provided output; value-returning kernels provide a standard form and scoped APIs; choose another form when using an accuracy tier, byte limit, context cancellation, or a BLAS provider.
+Compute matrix norms with `MatrixView::norm` and matrix-free operator norms with `operator_norm`; use `OneNormEstimator` for a 1-norm estimate from a few products.
+The `Standard` bound has the form $\gamma_{2k} \lvert A \rvert \lvert B \rvert$ and does not guarantee relative error in cancelling entries, so pass `with_accuracy(Accuracy::Exact)` through a form with options or a scoped API when heavily cancelling inner products or products matter.
+
+## Further reading
+
+- [Workspaces, execution contexts, and attempt records](../workspaces-and-execution/): examine call-form definitions, workspace sizing for caller-provided output, cancellation, and attempt records.
+- [LU, Cholesky, and LDL factorizations and direct-solution acceptance](../direct-and-structured-solvers/): examine how blocked factorizations use the level-3 products described here.
+- [External BLAS provider contract](../blas-provider/): examine which operations dispatch to external BLAS through contexts passed to scoped APIs and APIs with caller-provided output.

@@ -1,0 +1,698 @@
+---
+title: "Discrete adjoints for time-dependent problems"
+description: "Discrete adjoints that differentiate an objective including the fixed-step time discretization of a parabolic problem. Check semidiscrete pullbacks, backward Euler and Crank–Nicolson adjoint recurrences, checkpoints, transpose-system residuals, failure and progress interpretation, and field-transfer derivatives using a steel plate as heating begins."
+sidebar:
+  order: 375
+references:
+  pde-transient-adjoint-recursion: "adjoint-of-the-time-discretization"
+  pde-semidiscrete-pullback: "semidiscrete-pullbacks"
+  pde-transient-adjoint-plan: "time-dependent-adjoint-plans"
+  pde-transient-adjoint-check: "gradient-checks-and-transpose-system-residuals"
+  pde-initial-condition-sensitivity: "sensitivity-to-initial-temperature"
+  pde-transfer-derivatives: "field-transfer-derivatives"
+---
+
+[Discrete adjoints and steady-problem sensitivities](../adjoints-and-sensitivities/) differentiated equilibria $R(u,p)=0$.
+For time-dependent problems, compute how the endpoint solution or a time-integrated quantity depends on parameters and initial values.
+`PdeTransientAdjointPlan` differentiates the fixed-step time discretization integrated by `ParabolicProblem` itself and returns parameter and initial-value gradients in one backward traversal from the endpoint to the initial time.
+Adjoint plans in `scioxide-ode` handle recording in time and the reverse sweep, while `scioxide-pde` supplies spatial derivatives.
+
+## Semidiscrete pullbacks
+
+A parabolic problem is converted to the semidiscrete system of free unknowns $u_f$, excluding Dirichlet unknowns,
+
+$$
+M\,u_f'=f(t,u_f,p)=b_f(t,p)-\bigl(A(p)\,u\bigr)_f
+$$
+
+and integrated in time ([Method of lines](../method-of-lines-and-nonlinear/)).
+$M$ is the diagonal matrix of the plan's lumped mass and is independent of parameters.
+The spatial derivatives needed for the adjoint calculation are only products with a vector $s$ (pullbacks).
+
+$$
+f_u^{\mathsf T}s=-A_{ff}^{\mathsf T}s,\qquad
+\bigl(f_p^{\mathsf T}s\bigr)_j=-\sum_{f}s_f\left(\frac{\partial R}{\partial p_j}\right)_f
+$$
+
+`SemidiscreteSystem::adjoint(parameterization)` returns a `SemidiscreteAdjointSystem` supplying these two products.
+It implements `scioxide_ode::OdeAdjointSystem` and returns `PdeParameterization::values()` as the parameter values.
+Parameter products call `residual_tangent_into` at time $t$ once per parameter, so the cost of one pullback is proportional to the parameter count.
+Parameterizations with a different mesh revision or unknown count are rejected.
+Data callbacks must return the same values for the same inputs (be replayable).
+`MethodOfLinesPlan::bind_adjoint` binds this system with mass normalization and accepts only first-order dynamics.
+An adjoint for the second-order wave equation in `HyperbolicProblem` is therefore not provided.
+To differentiate the wave equation, write a first-order system with velocity added to the unknowns as an `OdeAdjointSystem` and use the adjoint in `scioxide-ode` directly.
+
+## Adjoint of the time discretization
+
+Advancing $N_t$ stages of size $\Delta t$ with backward Euler makes each stage satisfy
+
+$$
+M\,(u_{n+1}-u_n)-\Delta t\,f(t_{n+1},u_{n+1},p)=0,\qquad n=0,\ldots,N_t-1
+$$
+
+
+Differentiating the Lagrangian formed from the terminal objective $J=\Phi(u_{N_t})$ and stage multipliers $\mu_n$ with respect to $u_n$ and $p$ gives the reverse recurrence for the multipliers,
+
+$$
+(M-\Delta t\,f_u)^{\mathsf T}\mu_{N_t-1}=\Phi_u^{\mathsf T},\qquad
+(M-\Delta t\,f_u)^{\mathsf T}\mu_{n}=M\,\mu_{n+1}
+$$
+
+and the gradients are
+
+$$
+\frac{dJ}{dp}=\Delta t\sum_{n=0}^{N_t-1}\mu_n^{\mathsf T}f_p(t_{n+1},u_{n+1},p),\qquad
+\frac{dJ}{du_0}=M\,\mu_0
+$$
+
+
+Each reverse stage solves one system with the transpose $(M+\Delta t\,A_{ff})^{\mathsf T}$ of the forward matrix and uses one pullback each for $f_u^{\mathsf T}$ and $f_p^{\mathsf T}$.
+For Crank–Nicolson (the implicit trapezoidal rule), the matrix becomes $M+\tfrac{\Delta t}{2}A_{ff}$, and a term involving $f_u^{\mathsf T}$ is added to the right-hand side.
+These recurrences require the forward stage states $u_{n+1}$ in reverse order.
+
+Storing every forward state makes memory proportional to the number of stages.
+Adjoints in `scioxide-ode` can also store only selected stage states (checkpoints) and recompute the intervening forward calculations.
+Select storage policy through `CheckpointPolicy` in `scioxide_ode::AdjointOptions::with_checkpoint_policy`; the default `StoreAll` stores every stage without recomputation.
+`MemoryBudget` selects binomial checkpointing (Griewank, 1992) that fits within the workspace limit `AdjointOptions::with_max_workspace_bytes`.
+If everything fits within the limit, all stages are stored.
+Agreement between replayed and stored states is checked by `replay_error` (bitwise agreement by default).
+See [adjoints in `scioxide-ode`](../../../scioxide-ode/algorithms/adjoint-gradients/#checkpoints-and-recomputation) for details.
+
+## Time-dependent adjoint plans
+
+`PdeTransientAdjointPlan` has three preparation functions for the different time discretizations.
+
+| Preparation | `ParabolicScheme` | Plan in `scioxide-ode` | Steps |
+|---|---|---|---|
+| `backward_euler(problem, parameterization, objective, backend, options)` | `BackwardEuler` | `DaeAdjointSolver::backward_euler` | Fixed |
+| `crank_nicolson(…)` (same arguments) | `CrankNicolson` | `DaeAdjointSolver::trapezoid` | Fixed |
+| `dopri5(problem, parameterization, objective, cfl, options)` | `ExplicitDopri5` | `OdeAdjointSolver` (seven-stage DP5) | Adaptive, capped by `cfl` |
+
+The two implicit methods take `scioxide_ode::DaeAdjointOptions` and require `AdjointOptions::with_fixed_step(true)` and `DaeInitialization::Project`.
+Without the former, they return `InvalidInput` for argument `options.fixed_step`; without the latter, for `options.initialization`.
+The initial rate $u_f'(0)$ is obtained by projection from the semidiscrete equation, so the caller supplies only the initial state.
+Setting `backend` to `None` uses sparse LU matched to the semidiscrete Jacobian pattern for stage linear systems, as in `ParabolicProblem`.
+`dopri5` takes settings convertible to `OdeAdjointOptions` and an explicit step-size limit `CflPolicy`, and differentiates the discrete map with the accepted step sequence fixed.
+To reproduce the step sequence, specify a fixed cap with `CflPolicy::MaximumStep`.
+Every preparation accepts only `AdjointMode::Discrete` as the adjoint mode; continuous adjoints are rejected with `InvalidInput` for `options.mode`.
+The interval is $[0,\text{end}]$ (`problem.end()`); Rannacher startup is not differentiated, so disable it when comparing with forward calculations.
+
+Specify the objective through `scioxide_ode::AdjointObjective`; its state argument contains free unknowns $u_f$ (in `problem.system().free_indices()` order).
+Dirichlet node values are absent from the state, so the caller adds terms depending on them as constants.
+`workspace()` returns a `PdeTransientAdjointWorkspace` allocating the adapter, initial rate, and reverse tape and checkpoint storage for `scioxide-ode` together.
+`workspace_bytes()` estimates this size, including a part proportional to the number of recordable stages set by `AdjointOptions::with_tape_capacity` (default 1024).
+The limit `AdjointOptions::with_max_workspace_bytes` applies to the whole plan.
+The plan first subtracts method-of-lines storage and fits the `scioxide-ode` plan (including `MemoryBudget` checkpoints) in the remainder.
+`solve_into(problem, parameterization, objective, initial, initial_gradient, parameter_gradient, workspace, scope)` writes the initial-value gradient $dJ/du_f(0)$ and parameter gradient $dJ/dp$ into caller-owned arrays and returns an `scioxide_ode::AdjointReport`.
+On failure it leaves both outputs unchanged; failures in `scioxide-ode` after preflight leave an attempt record in the workspace's `last_attempt()`.
+`solve(problem, parameterization, objective, initial)` allocates storage, performs the calculation, and returns `Result<AdjointResult, PartialFailure<AdjointReport>>`.
+A failed `PartialFailure` holds the error and a report of progress so far (such as forward and reverse stage counts).
+The report's `termination()` is `ReachedEnd` on success; failures due to limits, step reduction, execution stops, or replay mismatches report that reason, while other errors such as linear-solve failures give `None`.
+Use the report's `is_success()` for the decision.
+The plan is `Send + Sync + Clone`.
+
+## A steel plate as heating begins
+
+Begin heating the [steel plate from the steady-problem page](oxref:pde-adjoint-slab) at time 0 from uniform temperature $T_0=300$ K.
+With volumetric heat capacity $\rho c=3.95\times10^6$ J/(m³·K) (steel with $\rho=7900$ kg/m³ and $c=500$ J/(kg·K)), temperature obeys
+
+$$
+\rho c\,u_t=k\,u_{xx}+q,\qquad u(0,t)=T_0,\qquad k\,u_x(L,t)+h\,u(L,t)=h\,T_\infty
+$$
+
+
+The mass in `ParabolicProblem` is the plan's lumped mass (control-volume widths), so divide the equation by $\rho c$ and construct a plan with coefficient $k/\rho c$, source $q/\rho c$, Robin coefficient $h/\rho c$, and data $hT_\infty/\rho c$.
+Keep the parameters as physical quantities $p=(k,q,h,T_\infty)$ and supply tangents through the chain rule, such as $\partial(k/\rho c)/\partial k=1/\rho c$.
+The objective is the mean temperature $J=\sum_i w_iu_i(T)$ at $T=600$ s, a time comparable to the diffusion timescale $L^2/\kappa\approx660$ s for thermal diffusivity $\kappa=k/\rho c=3.8\times10^{-6}$ m²/s.
+The free-node weights $w_f$ give the state gradient; the Dirichlet-node contribution $w_0T_0$ is added as a constant.
+
+The following definitions block collects the plan, tangents, objective, adjoint-plan preparation, and forward calculation for independent checking.
+The adjoint plan matches tape capacity to the step count and accepts an optional workspace limit.
+Supplying a limit selects the checkpoint policy `MemoryBudget`.
+
+```rust
+//| id: pde-adjoint-transient-model
+//| kind: definitions
+//| title: "Mean temperature and time discretization of a steel plate as heating begins"
+//| crates: [scioxide-core, scioxide-ode, scioxide-pde, scioxide-spatial]
+use scioxide_core::{SciOxideError, SolveContext};
+use scioxide_ode::{
+    AdjointMode, AdjointObjective, AdjointObjectivePart, AdjointObjectiveValue, AdjointOptions,
+    CheckpointPolicy, DaeAdjointOptions, DaeInitialization, DaeNumericalOptions,
+};
+use scioxide_pde::{
+    BoundaryCondition, BoundaryData, FieldData, ParabolicOptions, ParabolicProblem,
+    ParabolicScheme, PdeConditionTangent, PdeParameterTangent, PdeParameterization,
+    PdeTransientAdjointPlan, SpatialDiscretization, StructuredBoundaries,
+    StructuredFdmCoefficients, StructuredFdmPlan,
+};
+use scioxide_spatial::{AxisSide, AxisTopology, BoundarySet, CoordinateAxis, Grid1d, SegmentMesh};
+
+/// Left-face temperature T₀ [K], plate thickness L [m], volumetric heat capacity ρc [J/(m³·K)], and end time T [s].
+pub(crate) const WALL: f64 = 300.0;
+pub(crate) const THICKNESS: f64 = 0.05;
+pub(crate) const CAPACITY: f64 = 3.95e6;
+pub(crate) const END: f64 = 600.0;
+
+/// Uniform coefficients. Return k/ρc for the model and ∂(k/ρc)/∂k = 1/ρc for its tangent.
+pub(crate) struct Uniform(pub(crate) f64);
+
+impl StructuredFdmCoefficients<f64, f64, 1> for Uniform {
+    fn diffusion(&self, _: usize, _: usize, _: [f64; 1]) -> Result<f64, SciOxideError> {
+        Ok(self.0)
+    }
+}
+
+pub(crate) type Coefficients = dyn StructuredFdmCoefficients<f64, f64, 1>;
+pub(crate) type Plan = StructuredFdmPlan<f64, f64, 1>;
+
+/// p = (k, q, h, T∞) = (15 W/(m·K), 2×10⁵ W/m³, 50 W/(m²·K), 290 K).
+#[derive(Clone, Copy)]
+pub(crate) struct Slab {
+    pub(crate) parameters: [f64; 4],
+    pub(crate) nodes: usize,
+}
+
+impl Slab {
+    pub(crate) fn steel(nodes: usize) -> Self {
+        Self {
+            parameters: [15.0, 2.0e5, 50.0, 290.0],
+            nodes,
+        }
+    }
+
+    pub(crate) fn shifted(self, j: usize, delta: f64) -> Self {
+        let mut slab = self;
+        slab.parameters[j] += delta;
+        slab
+    }
+
+    /// Finite-difference plan for u_t = (k/ρc) u″ + q/ρc, u(0, t) = T₀,
+    /// and (k/ρc) u_x + (h/ρc) u = (h/ρc) T∞ (x = L), after division by ρc.
+    pub(crate) fn plan(&self) -> Result<Plan, SciOxideError> {
+        let [k, _, h, ambient] = self.parameters;
+        let axis = CoordinateAxis::uniform(0.0, THICKNESS, self.nodes)?;
+        let mesh = SegmentMesh::new(Grid1d::new([axis], [AxisTopology::Bounded])?)?;
+        let side = |s| BoundarySet::axis_side(&mesh, 0, s);
+        let robin = BoundaryData::constant(h * ambient / CAPACITY);
+        let conditions = vec![
+            BoundaryCondition::dirichlet(side(AxisSide::Start)?, BoundaryData::constant(WALL)),
+            BoundaryCondition::robin(side(AxisSide::End)?, h / CAPACITY, robin),
+        ];
+        let boundaries = StructuredBoundaries::new(&mesh, 1, conditions)?;
+        StructuredFdmPlan::new(mesh, &Uniform(k / CAPACITY), &boundaries)
+    }
+
+    pub(crate) fn source(&self) -> FieldData<f64, f64, 1> {
+        FieldData::constant(self.parameters[1] / CAPACITY)
+    }
+
+    /// Chain rule for physical parameter p_j: ∂(k/ρc)/∂k = 1/ρc, and so on.
+    pub(crate) fn tangents<'a>(
+        &self,
+        unit: &'a Uniform,
+    ) -> Vec<PdeParameterTangent<'a, f64, f64, 1, Coefficients>> {
+        let [_, _, h, ambient] = self.parameters;
+        let robin = |alpha: f64, data: f64| {
+            vec![
+                PdeConditionTangent::zero(),
+                PdeConditionTangent::new(BoundaryData::constant(data / CAPACITY))
+                    .with_robin_coefficient(alpha / CAPACITY),
+            ]
+        };
+        vec![
+            PdeParameterTangent::new().with_coefficients(unit as &Coefficients),
+            PdeParameterTangent::new().with_source(FieldData::constant(1.0 / CAPACITY)),
+            PdeParameterTangent::new().with_boundaries(robin(1.0, ambient)),
+            PdeParameterTangent::new().with_boundaries(robin(0.0, h)),
+        ]
+    }
+}
+
+/// Terminal mean temperature J = Σ wᵢ uᵢ(T). The adjoint state contains only free unknowns,
+/// so add the Dirichlet-node contribution w₀ T₀ as a constant.
+pub(crate) struct FinalMean {
+    pub(crate) weights: Vec<f64>,
+    pub(crate) offset: f64,
+}
+
+impl FinalMean {
+    pub(crate) fn of(plan: &Plan, free: &[usize]) -> Self {
+        let mass = plan.lumped_mass();
+        let total: f64 = mass.iter().sum();
+        Self {
+            weights: free.iter().map(|&i| mass[i] / total).collect(),
+            offset: mass[0] / total * WALL,
+        }
+    }
+}
+
+impl AdjointObjective<f64> for FinalMean {
+    fn evaluate(
+        &self,
+        part: AdjointObjectivePart,
+        _: f64,
+        u: &[f64],
+        _: &[f64],
+        state_gradient: &mut [f64],
+        parameter_gradient: &mut [f64],
+        _: &mut [f64],
+        _: &mut SolveContext<'_, '_>,
+    ) -> Result<AdjointObjectiveValue<f64>, SciOxideError> {
+        parameter_gradient.fill(0.0);
+        // There is no running term L, so Running returns both value and gradients as 0.
+        if part == AdjointObjectivePart::Running {
+            state_gradient.fill(0.0);
+            return Ok(AdjointObjectiveValue {
+                value: 0.0,
+                time_derivative: 0.0,
+            });
+        }
+        state_gradient.copy_from_slice(&self.weights);
+        let value = self.offset + self.weights.iter().zip(u).map(|(w, x)| w * x).sum::<f64>();
+        Ok(AdjointObjectiveValue {
+            value,
+            time_derivative: 0.0,
+        })
+    }
+}
+
+/// Discrete adjoint plan for backward Euler or Crank–Nicolson with fixed step END/steps.
+/// Supplying `max_bytes` selects checkpoints that fit the entire plan's workspace within that limit.
+pub(crate) fn adjoint_plan(
+    problem: &ParabolicProblem<'_, f64, Plan, 1>,
+    parameterization: &PdeParameterization<f64, f64, 1>,
+    objective: &FinalMean,
+    crank_nicolson: bool,
+    steps: usize,
+    max_bytes: Option<usize>,
+) -> Result<PdeTransientAdjointPlan<f64>, SciOxideError> {
+    let mut common = AdjointOptions::new(AdjointMode::Discrete, END / steps as f64)?
+        .with_fixed_step(true)
+        .with_tape_capacity(steps);
+    if let Some(bytes) = max_bytes {
+        common = common
+            .with_checkpoint_policy(CheckpointPolicy::MemoryBudget)
+            .with_max_workspace_bytes(bytes);
+    }
+    let numerics = DaeNumericalOptions::new().with_initialization(DaeInitialization::Project);
+    let options = DaeAdjointOptions::new(common, numerics)?;
+    if crank_nicolson {
+        PdeTransientAdjointPlan::crank_nicolson(problem, parameterization, objective, None, options)
+    } else {
+        PdeTransientAdjointPlan::backward_euler(problem, parameterization, objective, None, options)
+    }
+}
+
+/// Forward calculation for an independent check: terminal mean temperature solved with the same fixed step.
+pub(crate) fn forward_mean(
+    slab: &Slab,
+    crank_nicolson: bool,
+    steps: usize,
+    initial: f64,
+) -> Result<f64, SciOxideError> {
+    let plan = slab.plan()?;
+    let source = slab.source();
+    let problem = ParabolicProblem::new(&plan, &source, END)?;
+    let scheme = if crank_nicolson {
+        ParabolicScheme::CrankNicolson
+    } else {
+        ParabolicScheme::BackwardEuler
+    };
+    let options = ParabolicOptions::new()
+        .with_scheme(scheme)
+        .with_step(END / steps as f64);
+    let solution = problem
+        .solve_with_options(&FieldData::constant(initial), &options)
+        .map_err(SciOxideError::from)?;
+    let mass = plan.lumped_mass();
+    let total: f64 = mass.iter().sum();
+    Ok(mass
+        .iter()
+        .zip(solution.values())
+        .map(|(m, u)| m * u)
+        .sum::<f64>()
+        / total)
+}
+```
+
+## Gradient checks and transpose-system residuals
+
+The following cell computes the terminal mean-temperature gradient with respect to $p$ by discrete adjoints and compares it with centered differences of forward calculations using the same time discretization and steps, perturbing by $\pm10^{-4}p_j$.
+Inputs are the time discretization, step count, grid-point count, and workspace cap as a fraction of the plan that stores every stage.
+If the adjoint succeeds, the outcome is `satisfied` and gives the termination reason, forward/replayed/reverse stage counts, workspace, and maximum transpose-system backward error.
+When a limit is supplied, it also solves with the plan storing every stage and adds the maximum difference between the two gradients.
+If the adjoint fails, there is no gradient; the outcome is `failed` and shows progress held by `PartialFailure`.
+
+```rust
+//| id: pde-adjoint-transient-slab
+//| ref: pde-adjoint-transient-slab
+//| title: "Compute gradients of mean temperature 600 s after heating begins by discrete adjoints and centered differences"
+//| run: reactive
+//| uses: [pde-adjoint-transient-model]
+//| crates: [scioxide-core, scioxide-ode, scioxide-pde, scioxide-spatial]
+//| inputs:
+//|   transient_scheme: {"type":"select","label":"Time discretization","options":["Crank–Nicolson","Backward Euler"],"value":"Crank–Nicolson"}
+//|   transient_steps: {"type":"range","label":"Time steps [count]","description":"Vary the fixed step Δt = 600 s / step count.","min":20,"max":120,"step":10,"value":60}
+//|   transient_nodes: {"type":"range","label":"Grid point count N [points]","description":"Vary the spatial grid and semidiscrete stiffness.","min":21,"max":161,"step":20,"value":41}
+//|   transient_memory: {"type":"select","label":"Workspace limit","description":"Fraction of the workspace of a plan storing every stage. With a limit, MemoryBudget selects checkpoints.","options":["None (StoreAll)","95 %","90 %"],"value":"None (StoreAll)"}
+//| cases:
+//|   - {"id":"backward-euler","label":"Backward Euler","description":"Differentiate the backward Euler discrete map with the same step, matching centered differences for gradients that differ from Crank–Nicolson by about 1 %.","inputs":{"transient_scheme":"Backward Euler"}}
+//|   - {"id":"fine-grid","label":"N = 161","description":"Even with a stiffer semidiscrete system, the direct transpose solve's backward error stays well below 64ε, and gradients match centered differences.","inputs":{"transient_nodes":161}}
+//|   - {"id":"memory-budget","label":"90 % limit","description":"MemoryBudget selects binomial checkpoints, replays forward stages, and returns the same gradients as storing every stage.","inputs":{"transient_memory":"90 %"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"gradients","path":"/rows/0/1","approx":{"value":-0.4027647645,"rtol":1e-8}}
+//|       - {"artifact":"gradients","path":"/rows/3/1","approx":{"value":0.06561724588,"rtol":1e-8}}
+//|       - {"artifact":"gradients","path":"/rows/0/3","range":{"max":1e-7}}
+//|       - {"artifact":"gradients","path":"/rows/1/3","range":{"max":1e-7}}
+//|       - {"artifact":"gradients","path":"/rows/2/3","range":{"max":1e-7}}
+//|       - {"artifact":"gradients","path":"/rows/3/3","range":{"max":1e-7}}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+//|   - case: backward-euler
+//|     expect:
+//|       - {"artifact":"gradients","path":"/rows/0/1","approx":{"value":-0.3992907691,"rtol":1e-8}}
+//|       - {"artifact":"gradients","path":"/rows/0/3","range":{"max":1e-7}}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+//|   - case: fine-grid
+//|     expect:
+//|       - {"artifact":"gradients","path":"/rows/0/3","range":{"max":1e-7}}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+//|   - case: memory-budget
+//|     expect:
+//|       - {"artifact":"gradients","path":"/rows/0/1","approx":{"value":-0.4027647645,"rtol":1e-8}}
+//|       - {"artifact":"gradients","path":"/rows/0/3","range":{"max":1e-7}}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+//|       - {"path":"/outputs/1/diagnostics/2/value","range":{"min":1}}
+//|       - {"path":"/outputs/1/diagnostics/6/value","equals":0}
+use scioxide_core::SciOxideError;
+use scioxide_pde::{DifferentiableDiscretization, ParabolicProblem};
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let sig5 = serde_json::json!({ "significantDigits": 5 });
+let crank = transient_scheme == "Crank–Nicolson";
+let steps = transient_steps as usize;
+let slab = Slab::steel(transient_nodes as usize);
+let plan = slab.plan().map_err(|e| e.to_string())?;
+let source = slab.source();
+let problem = ParabolicProblem::new(&plan, &source, END).map_err(|e| e.to_string())?;
+let free = problem.system().free_indices().to_vec();
+let objective = FinalMean::of(&plan, &free);
+let unit = Uniform(1.0 / CAPACITY);
+let parameterization = plan
+    .parameterize(&slab.parameters, &slab.tangents(&unit))
+    .map_err(|e| e.to_string())?;
+// The initial temperature is uniformly T₀ at free nodes.
+let initial = vec![WALL; free.len()];
+// Set the limit as a fraction of the workspace of the plan storing every stage.
+let store_all = adjoint_plan(&problem, &parameterization, &objective, crank, steps, None)
+    .map_err(|e| e.to_string())?;
+let percent = match transient_memory.as_str() {
+    "95 %" => Some(95),
+    "90 %" => Some(90),
+    _ => None,
+};
+let (adjoint, reference) = match percent {
+    Some(percent) => {
+        let limit = store_all.workspace_bytes() * percent / 100;
+        let budget = adjoint_plan(
+            &problem,
+            &parameterization,
+            &objective,
+            crank,
+            steps,
+            Some(limit),
+        )
+        .map_err(|e| e.to_string())?;
+        // For comparison: gradients from the plan storing every stage.
+        let stored = store_all
+            .solve(&problem, &parameterization, &objective, &initial)
+            .map_err(|e| SciOxideError::from(e).to_string())?;
+        (budget, Some(stored.parameter_gradient().to_vec()))
+    }
+    None => (store_all, None),
+};
+match adjoint.solve(&problem, &parameterization, &objective, &initial) {
+    Ok(result) => {
+        let names = ["Conductivity k", "Heating density q", "Heat transfer coefficient h", "Ambient temperature T∞"];
+        let mut rows = Vec::new();
+        for j in 0..4 {
+            // Centered differences (independent check): perform two forward solves with the same fixed step at ±10⁻⁴ p_j.
+            let delta = 1e-4 * slab.parameters[j];
+            let plus = forward_mean(&slab.shifted(j, delta), crank, steps, WALL)
+                .map_err(|e| e.to_string())?;
+            let minus = forward_mean(&slab.shifted(j, -delta), crank, steps, WALL)
+                .map_err(|e| e.to_string())?;
+            let central = (plus - minus) / (2.0 * delta);
+            let gradient = result.parameter_gradient()[j];
+            rows.push((
+                names[j],
+                gradient,
+                central,
+                ((gradient - central) / central).abs(),
+            ));
+        }
+        let columns = serde_json::json!([
+            { "key": "0", "label": "Parameter p" },
+            { "key": "1", "label": "Adjoint dJ/dp", "type": "number", "format": sig5 },
+            { "key": "2", "label": "Centered-difference dJ/dp", "type": "number", "format": sig5 },
+            { "key": "3", "label": "Relative difference [-]", "type": "number", "format": sci3 }
+        ]);
+        emit_table_with_columns!(
+            columns,
+            rows,
+            metadata = serde_json::json!({ "id": "gradients" })
+        );
+        let report = result.report();
+        let termination = report.termination().ok_or("Missing termination reason")?;
+        let mut outcome =
+            Outcome::satisfied("Forward and reverse sweeps reached the endpoint and computed gradients")
+                .status(format!("{termination:?}"))
+                .diagnostic(
+                    "Mean temperature J",
+                    report.objective().ok_or("Missing objective value")?,
+                    Some("K"),
+                )
+                .diagnostic("Forward steps", report.accepted_steps() as f64, None)
+                .diagnostic("Replayed steps", report.replayed_steps() as f64, None)
+                .diagnostic("Reverse steps", report.reverse_steps() as f64, None)
+                .diagnostic("Workspaces", adjoint.workspace_bytes() as f64, Some("B"));
+        if let Some(residual) = report.errors().linear_residual() {
+            outcome = outcome.diagnostic("Maximum transpose-system backward error", residual, None);
+        }
+        if let Some(reference) = &reference {
+            let difference = reference
+                .iter()
+                .zip(result.parameter_gradient())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f64::max);
+            outcome = outcome.diagnostic("Maximum gradient difference from StoreAll", difference, None);
+        }
+        emit_outcome!(outcome);
+    }
+    Err(failure) => {
+        // PartialFailure returns progress of the failed attempt (gradients are not written to output).
+        let mut outcome = Outcome::failed("The reverse sweep failed; no gradients are available")
+            .explanation(failure.error().to_string());
+        if let Some(progress) = failure.progress() {
+            outcome = outcome
+                .diagnostic("Forward steps", progress.accepted_steps() as f64, None)
+                .diagnostic("Reverse steps", progress.reverse_steps() as f64, None);
+            // A termination reason is present only for limit or replay failures. Linear-solver failures give None.
+            if let Some(termination) = progress.termination() {
+                outcome = outcome.status(format!("{termination:?}"));
+            }
+        }
+        emit_outcome!(outcome);
+    }
+}
+```
+
+With the defaults (Crank–Nicolson, 60 stages, $N=41$), gradients were $dJ/dk=-0.40276$ m·K²/W, $dJ/dq=4.5751\times10^{-5}$ m³·K/W, $dJ/dh=-0.026032$ m²·K²/W, and $dJ/dT_\infty=0.065617$; all relative differences from centered differences were at most $10^{-9}$.
+They are smaller than the steady gradients for the same plate (such as $dJ/dk=-0.55242$) because temperature has not reached steady state at 600 s.
+Backward Euler changes the gradients by about 1 %, for example to $dJ/dk=-0.39929$ m·K²/W, but still matches centered differences to relative differences of at most $2\times10^{-9}$.
+The discrete adjoint differentiates the chosen time-discretization map, so its gradients include the time-discretization error.
+
+By default, `DaeAdjointOptions` requires the solution of the transpose system $A^{\mathsf T}\lambda=c$ in the reverse sweep to have a linear residual at most $64\varepsilon\approx1.4\times10^{-14}$.
+The measure of linear residual depends on the stage solver.
+Dense and sparse direct methods (including sparse LU when `backend` is `None`) measure normalized backward error $\lVert c-A^{\mathsf T}\lambda\rVert_\infty/(\lVert A^{\mathsf T}\rVert_\infty\lVert\lambda\rVert_\infty+\lVert c\rVert_\infty)$, while Krylov methods measure relative residual $\lVert c-A^{\mathsf T}\lambda\rVert_2/\lVert c\rVert_2$.
+The report's `errors().linear_residual()` is its maximum value, which was $9.9\times10^{-17}$ with the defaults.
+
+Refining the grid increases $\Delta t\,M^{-1}A_{ff}$ in inverse proportion to $\Delta x^2$, also increasing the condition number of the stage matrix.
+The relative residual can grow to the order of condition number times $\varepsilon$, but the backward error of pivoted LU remains of order $\varepsilon$ regardless of condition number if the growth factor is small (Higham, 2002, chapter 9).
+Even in the `N = 161` case, the maximum backward error was $1.1\times10^{-16}$; with the default tolerance, gradients matched centered differences to relative differences of at most $10^{-8}$.
+Change the tolerance with `DaeAdjointOptions::with_linear_residual`.
+A transpose system that does not meet it produces a `ConvergenceFailure` (`NestedSolver`) failure, with `None` in the report's `termination()`.
+
+In the workspace-limited `90 % limit` case, `MemoryBudget` selected binomial checkpoints and reduced workspace from 477,624 B to 429,384 B (Wasm values).
+In exchange, it recomputed 163 forward stages during the reverse sweep.
+The gradients agreed bitwise with `StoreAll` (maximum difference 0).
+The default `replay_error` requires bitwise agreement of replayed states, and the differentiated time-discretization map is independent of the storage policy.
+A 95 % limit gives 453,464 B of workspace and 128 replayed stages.
+Lower limits store fewer states and require more recomputation.
+Below roughly 88 %, no schedule fits, and preparation is rejected with `InvalidInput` (argument `options.max_workspace_bytes`).
+For this problem size, reducing state storage cuts workspace by only about 12 %.
+
+## Sensitivity to initial temperature
+
+$dJ/du_f(0)=M\mu_0$ measures how much the terminal mean temperature changes when each node's initial temperature is perturbed slightly.
+The following cell plots $dJ/du_f(0)$ against position for backward Euler and Crank–Nicolson while varying the step count (and thus the grid Fourier number $r=\kappa\Delta t/\Delta x^2$).
+The table compares the directional derivative $\sum_f\partial J/\partial u_f(0)$ for a uniform initial-temperature increase of $\delta$ with centered differences of forward solves initialized at $T_0\pm0.01$ K, and counts gradient sign changes between adjacent nodes.
+
+```rust
+//| id: pde-adjoint-initial-sensitivity
+//| ref: pde-adjoint-initial-sensitivity
+//| title: "Compare terminal mean-temperature gradients with respect to initial temperature for backward Euler and Crank–Nicolson"
+//| run: reactive
+//| uses: [pde-adjoint-transient-model]
+//| crates: [scioxide-core, scioxide-ode, scioxide-pde, scioxide-spatial]
+//| inputs:
+//|   initial_steps: {"type":"range","label":"Time steps [count]","description":"Vary Δt and the grid Fourier number r = κΔt/Δx².","min":10,"max":200,"step":10,"value":20}
+//| cases:
+//|   - {"id":"small-step","label":"100 steps (r = 14.6)","description":"Crank–Nicolson gradient sign changes disappear, and the difference between the sums for the two schemes shrinks to 3 %.","inputs":{"initial_steps":100}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"initial","path":"/rows/0/1","approx":{"value":72.91,"rtol":1e-3}}
+//|       - {"artifact":"initial","path":"/rows/0/2","approx":{"value":0.07469160194,"rtol":1e-8}}
+//|       - {"artifact":"initial","path":"/rows/1/2","approx":{"value":0.06862109243,"rtol":1e-8}}
+//|       - {"artifact":"initial","path":"/rows/0/3","range":{"max":1e-7}}
+//|       - {"artifact":"initial","path":"/rows/1/3","range":{"max":1e-7}}
+//|       - {"artifact":"initial","path":"/rows/0/4","equals":0}
+//|       - {"artifact":"initial","path":"/rows/1/4","equals":2}
+//|   - case: small-step
+//|     expect:
+//|       - {"artifact":"initial","path":"/rows/1/4","equals":0}
+//|       - {"artifact":"initial","path":"/rows/1/2","approx":{"value":0.06433874913,"rtol":1e-8}}
+use scioxide_core::SciOxideError;
+use scioxide_pde::{DifferentiableDiscretization, ParabolicProblem};
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let sig5 = serde_json::json!({ "significantDigits": 5 });
+let steps = initial_steps as usize;
+let slab = Slab::steel(41);
+let plan = slab.plan().map_err(|e| e.to_string())?;
+let source = slab.source();
+let problem = ParabolicProblem::new(&plan, &source, END).map_err(|e| e.to_string())?;
+let free = problem.system().free_indices().to_vec();
+let objective = FinalMean::of(&plan, &free);
+let unit = Uniform(1.0 / CAPACITY);
+let parameterization = plan
+    .parameterize(&slab.parameters, &slab.tangents(&unit))
+    .map_err(|e| e.to_string())?;
+let initial = vec![WALL; free.len()];
+let h = THICKNESS / (slab.nodes - 1) as f64;
+// Grid Fourier number r = κΔt/Δx² (κ = k/ρc).
+let r = slab.parameters[0] / CAPACITY * (END / steps as f64) / (h * h);
+let mut layers = Vec::new();
+let mut rows = Vec::new();
+for (crank, name) in [(false, "Backward Euler"), (true, "Crank–Nicolson")] {
+    let adjoint = adjoint_plan(&problem, &parameterization, &objective, crank, steps, None)
+        .map_err(|e| e.to_string())?;
+    let result = adjoint
+        .solve(&problem, &parameterization, &objective, &initial)
+        .map_err(|e| SciOxideError::from(e).to_string())?;
+    let gradient = result.initial_gradient();
+    // Directional derivative Σ ∂J/∂uᵢ(0) for uniformly increasing initial temperature by δ and its centered difference (independent check).
+    let total: f64 = gradient.iter().sum();
+    let delta = 0.01;
+    let plus = forward_mean(&slab, crank, steps, WALL + delta).map_err(|e| e.to_string())?;
+    let minus = forward_mean(&slab, crank, steps, WALL - delta).map_err(|e| e.to_string())?;
+    let central = (plus - minus) / (2.0 * delta);
+    let sign_changes = gradient.windows(2).filter(|w| w[0] * w[1] < 0.0).count();
+    rows.push((
+        name,
+        r,
+        total,
+        ((total - central) / central).abs(),
+        sign_changes,
+    ));
+    let points: Vec<[f64; 2]> = free
+        .iter()
+        .zip(gradient)
+        .map(|(&i, &g)| [1e3 * h * i as f64, g])
+        .collect();
+    layers.push(
+        serde_json::json!({ "id": name, "kind": "line", "name": name, "points": points }),
+    );
+}
+emit_chart!(
+    serde_json::json!({
+        "kind": "xy",
+        "xLabel": "Position x [mm]",
+        "yLabel": "∂J/∂uᵢ(0) [-]",
+        "dataZoom": true,
+        "tooltip": true,
+        "layers": layers
+    }),
+    metadata = serde_json::json!({ "id": "initial-gradient" })
+);
+let columns = serde_json::json!([
+    { "key": "0", "label": "Time discretization" },
+    { "key": "1", "label": "Fourier number r [-]", "type": "number", "format": { "fractionDigits": 1 } },
+    { "key": "2", "label": "Σ ∂J/∂uᵢ(0) [-]", "type": "number", "format": sig5 },
+    { "key": "3", "label": "Relative difference from central differences [-]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "Adjacent sign changes [count]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "initial" })
+);
+```
+
+With the defaults (20 stages, $r=72.9$), the sums were $0.074692$ for backward Euler and $0.068621$ for Crank–Nicolson, both matching centered differences to relative differences at most $2\times10^{-10}$.
+Uniformly raising the initial temperature by 1 K increases the mean temperature after 600 s by only about 0.07 K.
+The initial difference is lost through the cooled and heat-dissipating faces.
+The backward Euler gradient is smooth in position, while near the cooled face the Crank–Nicolson gradient swings from $6.6\times10^{-3}$ to negative values, changing sign twice.
+
+This results from the adjoint inheriting the time-discretization properties.
+The reverse recurrence is the transpose of the forward stage map, so it has the same amplification factors as the forward calculation.
+Crank–Nicolson amplification approaches $-1$ as $r\to\infty$ ([Amplification factors and stability of the θ method](oxref:pde-explicit-implicit-stability)), leaving undamped high-wavenumber components from the jump in weights from 0 to $w_f$ near the Dirichlet boundary.
+Backward Euler amplification approaches 0, removing these components.
+In the `100 steps (r = 14.6)` case, sign changes disappear, and the two sums become 0.06643 and 0.06434.
+Compared with a finer-step value ($0.06435$ for 200-stage Crank–Nicolson), the 20-stage sum has a smaller error for Crank–Nicolson than backward Euler; smooth quantities such as sums are less affected by oscillation even when nodal values oscillate.
+
+## Field-transfer derivatives
+
+Adaptive refinement transfers fields between meshes of different revisions ([Field transfer between revisions](oxref:pde-amr-transfer)).
+Computing gradients across a refinement also requires traversing the derivative of the transfer map $v=T(p)\,u$ in reverse.
+`PdeTransferDerivatives::new(source, destination, state, parameters, parameter_count)` borrows and binds source and destination `MeshToken` values, an `AdjointOperator` for the state derivative (the transfer map itself, including constraints), an optional parameter-derivative operator, and the parameter count.
+The `AmrMap` returned by methods such as `AmrCellTransfer::operator()` implements `AdjointOperator`, so it can be passed directly as the state operator.
+Supply a parameter operator when composing transfers with parameter-dependent weights or parameter-dependent initial-value or reconstruction maps; incompatible row and column counts (`parameter_count`) are rejected.
+
+`workspace()` allocates a `PdeTransferWorkspace` whose size remains fixed.
+`jvp_into(source, destination, state_direction, parameter_direction, output, workspace, scope)` writes the forward product $\delta v=T\,\delta u+T_p\,\delta p$, with a real parameter direction.
+`pullback_into(source, destination, seed, state_output, parameter_output, workspace, scope)` writes both $T^{\mathsf H}\bar v$ and $\operatorname{Re}(T_p^{\mathsf H}\bar v)$ from the post-transfer cotangent $\bar v$.
+The parameter output is a contribution for the caller to add to gradients across adjacent revisions; the library does not accumulate gradients across revisions.
+Both functions check on each call that the supplied revisions match the bound revisions and leave outputs unchanged for revision, product, evaluation-limit, or non-finite-value errors.
+
+This derivative holds the refinement result (which cells were subdivided) fixed.
+Marking is a discrete selection based on thresholds of error-estimator values and is therefore not differentiable with respect to parameters.
+Mesh coordinates are not differentiated either.
+
+## Summary
+
+`PdeTransientAdjointPlan` differentiates the same fixed-step backward Euler and Crank–Nicolson methods as `ParabolicProblem`, or DP5 with a step-size cap, returning parameter and initial-value gradients in one reverse sweep.
+Tangents use the same `PdeParameterTangent` as steady problems; supply the relation between physical parameters and plan coefficients through the chain rule.
+Gradients differentiate the chosen time-discretization map and can be checked against centered differences of forward calculations with the same steps; they also inherit properties such as Crank–Nicolson high-wavenumber oscillations.
+If storage is insufficient, supplying `MemoryBudget` and a workspace limit reduces memory through forward-stage recomputation while yielding the same gradients as storing every stage.
+Pull gradients across refinements back revision by revision with `pullback_into` of `PdeTransferDerivatives`, adding parameter contributions in the caller.
+
+## Further reading
+
+- [Discrete adjoints and steady-problem sensitivities](../adjoints-and-sensitivities/): review tangent specification and the adjoint derivation.
+- [Time integration of parabolic equations](../parabolic-time-integration/): examine backward Euler and Crank–Nicolson amplification factors.
+- [Crank–Nicolson oscillations and Rannacher startup](../crank-nicolson-and-rannacher/): examine Rannacher startup in forward calculations; the adjoint does not differentiate it.
+- [Method of lines and semidiscrete systems](../method-of-lines-and-nonlinear/): review the semidiscrete system and normalization by `MethodOfLinesPlan`.
+- [Field transfer between adaptive-refinement revisions](../adaptive-field-transfer/): examine `AmrCellTransfer` and `AmrNodalTransfer` for constructing transfer maps.
+- [Adjoint gradients and checkpoints](../../../scioxide-ode/algorithms/adjoint-gradients/): examine checkpoint policies, termination reasons, and the running term of `AdjointObjective`.
+
+## References
+
+- A. Griewank, "Achieving logarithmic growth of temporal and spatial complexity in reverse automatic differentiation", *Optimization Methods and Software* 1(1), 35–54, 1992.
+- A. Griewank and A. Walther, *Evaluating Derivatives*, 2nd ed., SIAM, 2008, chapter 12.
+- N. J. Higham, *Accuracy and Stability of Numerical Algorithms*, 2nd ed., SIAM, 2002, chapter 9.
+- Y. Cao, S. Li, L. Petzold and R. Serban, "Adjoint sensitivity analysis for differential-algebraic equations: the adjoint DAE system and its numerical solution", *SIAM Journal on Scientific Computing* 24(3), 1076–1089, 2003.

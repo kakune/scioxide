@@ -1,0 +1,500 @@
+---
+title: "Compare partitioned and whole-sample aggregation"
+description: "Aggregate bivariate temperature and power statistics in partitions with OnlineCovariance, merge them, and compare with whole-sample aggregation, reversed merge order, large common offsets, and an analytical least-squares slope. Examine changes in the last digits with partition count and merge shape, and the merge policies of reduce_covariance_with_options."
+sidebar:
+  order: 415
+references:
+  stats-merge-covariance-order-reproducibility: "merge-order-and-reproducibility"
+  stats-merge-covariance-partition-experiment: "partition-aggregation-and-merging-experiment"
+  stats-merge-covariance-regression-slope: "merging-covariance-and-computing-a-regression-slope"
+---
+
+Distributed collection systems and parallel processing combine statistics accumulated separately in partitions.
+Simply averaging partition means and variances omits variation from differences between partition means, giving incorrect overall variance or covariance.
+This page partitions observations of temperature $T$ and power $P$, aggregates them with `OnlineCovariance`, merges with `merge`, and compares the result with whole-sample aggregation.
+The merge formulas are derived in [Online means, variances, higher moments, and covariance](oxref:stats-online-merging-partials).
+
+## Merging covariance and computing a regression slope
+
+Let two partitions $A$ and $B$ have sizes $n_A$ and $n_B$ ($n = n_A + n_B$) and means $(\bar T_A, \bar P_A)$ and $(\bar T_B, \bar P_B)$.
+The sum of cross-deviation products $C = \sum_i (T_i - \bar T)(P_i - \bar P)$ merges as
+
+$$
+C_{AB} = C_A + C_B + \frac{n_A n_B}{n}\,(\bar T_B - \bar T_A)(\bar P_B - \bar P_A)
+$$
+
+
+The final term is covariation from differences between partition means; a weighted average of partition covariances omits it.
+When a series with increasing temperature is partitioned by time, the partition mean temperatures and powers rise together, so this term accounts for most of the covariance.
+
+`OnlineCovariance` contains the same state as `OnlineMoments` for each of $T$ and $P$, together with the co-moment $C/n$.
+`observe(x, y)` merges one pair as a size-1 partition; `merge` merges another partition's accumulator.
+Both cost $O(1)$ and do not retain the sample.
+Merging accumulators with different retained orders (`MomentOrder`) returns `InvalidInput`; merging an empty accumulator changes nothing.
+The `CovarianceSnapshot` returned by `snapshot` contains `sample_covariance` ($C/(n-1)$), `population_covariance` ($C/n$), `correlation`, `mean_x`, `mean_y`, and a `MomentsSnapshot` for each coordinate (`marginal_x`, `marginal_y`); with fewer than two pairs, sample covariance is `None`.
+
+The least-squares line $P = \alpha + \beta T$ has slope and intercept computed from the aggregated statistics as
+
+$$
+\hat\beta = \frac{C}{\sum_i (T_i - \bar T)^2} = \frac{s_{TP}}{s_T^2}, \qquad \hat\alpha = \bar P - \hat\beta\,\bar T
+$$
+
+
+Covariance has units °C·W, slope has units W/°C, and correlation is dimensionless.
+scioxide-stats has no public function returning a slope from `CovarianceSnapshot`, so this page divides `sample_covariance` by `marginal_x().sample_variance()`.
+Use `linear_regression` when you need regression estimates and intervals.
+
+## Observation model and analytical slope
+
+For $N = 240$ observations, temperature increases uniformly from 12 °C to 30 °C, and power is
+
+$$
+P_i = O + 38 + \beta\,T_i + 3\sin\!\left(\frac{2\pi i}{24}\right)\ \text{W}, \qquad T_i = 12 + \frac{18\,i}{N-1}\ \text{°C}
+$$
+
+
+$O = 10^p$ W is a common offset unrelated to covariance, representing a large constant component such as a building's base load.
+$\beta$ is the specified temperature coefficient; the ±3 W sinusoid is deterministic variation with a period of 24 samples.
+
+The periodic component appears uncorrelated with temperature, but in a finite sample its sample covariance with temperature is not exactly 0.
+When $N$ is a multiple of 24, $\sum_i (i - (N-1)/2)\sin(2\pi i/24) = -(N/2)\cot(\pi/24)$ and $\sum_i (i - (N-1)/2)^2 = N(N^2-1)/12$, so the least-squares slope is
+
+$$
+\hat\beta = \beta - \frac{\cot(\pi/24)}{N+1}
+$$
+
+
+For $N = 240$, $\cot(\pi/24)/241 \approx 0.0315$ W/°C; this shift does not depend on $\beta$.
+This is a property of the sample rather than a computational error.
+The cell uses this analytical value as an independent check.
+
+The following definitions block generates observations for the page's two cells.
+`observations` returns offset-free pairs $(T_i, P_i - O)$ and observed pairs $(T_i, P_i)$ after adding $O$ and rounding to `f64`.
+
+```rust
+//| id: stats-merge-covariance-model
+//| kind: definitions
+//| title: "Observation model for temperature and power"
+//| crates: [scioxide-core]
+use scioxide_core::RealScalar;
+
+/// Number of observation pairs N.
+pub(crate) const PAIRS: usize = 240;
+
+/// Offset O [W], offset-free pairs (T [°C], P − O [W]), and observed pairs (T [°C], P [W]).
+pub(crate) struct PowerData {
+    pub(crate) offset: f64,
+    pub(crate) model: Vec<(f64, f64)>,
+    pub(crate) observed: Vec<(f64, f64)>,
+}
+
+/// Tᵢ = 12 + 18 i/(N − 1), Pᵢ = O + 38 + β Tᵢ + 3 sin(2πi/24), O = 10ᵖ.
+pub(crate) fn observations(offset_exponent: f64, coefficient: f64) -> PowerData {
+    let offset = RealScalar::powf(10.0_f64, offset_exponent);
+    let last = (PAIRS - 1) as f64;
+    let model: Vec<(f64, f64)> = (0..PAIRS)
+        .map(|i| {
+            let t = 12.0 + 18.0 * i as f64 / last;
+            let phase = 2.0 * std::f64::consts::PI * i as f64 / 24.0;
+            (t, 38.0 + coefficient * t + 3.0 * RealScalar::sin(phase))
+        })
+        .collect();
+    let observed = model.iter().map(|&(t, p)| (t, offset + p)).collect();
+    PowerData {
+        offset,
+        model,
+        observed,
+    }
+}
+```
+
+## Partition aggregation and merging experiment
+
+The following cell divides observations into the specified number of partitions, aggregates each partition, and compares forward and reverse merges with whole-sample aggregation.
+Partition size is $\lceil N/k \rceil$; only the final partition may be smaller.
+Each row shows one path's mean power excluding the offset, sample covariance, slope, difference from the analytical slope, and correlation.
+As another check, compute the least-squares slope directly with two passes over power deviations before adding the offset (a comparison path using `f64` arithmetic).
+The plot shows offset-free observations, the regression line computed from aggregated statistics, and the specified line $38 + \beta T$ (dashed).
+
+```rust
+//| id: stats-merge-covariance
+//| ref: stats-merge-covariance
+//| title: "Vary partition count, offset, and slope when merging temperature and power statistics"
+//| run: reactive
+//| uses: [stats-merge-covariance-model]
+//| crates: [scioxide-core, scioxide-stats]
+//| exports: [power_offset_exponent, temperature_coefficient]
+//| inputs:
+//|   partition_count: {"type":"range","label":"Partition count k [count]","description":"Changes partition sizes and the number of merges.","min":2,"max":16,"step":1,"value":4}
+//|   power_offset_exponent: {"type":"range","label":"Power offset exponent p (O = 10ᵖ W)","description":"Adds a large common component unrelated to covariance.","min":0,"max":13,"step":1,"value":6}
+//|   temperature_coefficient: {"type":"range","label":"Specified slope β [W/°C]","description":"Changes the linear relationship between temperature and power.","min":0.5,"max":5,"step":0.05,"value":2.4}
+//| cases:
+//|   - {"id":"sixteen-partitions","label":"k = 16","description":"Increasing partition count leaves the displayed digits unchanged.","inputs":{"partition_count":16}}
+//|   - {"id":"small-offset","label":"p = 0","description":"With no substantial offset, differences from the analytical value are at the scale of rounding error.","inputs":{"power_offset_exponent":0}}
+//|   - {"id":"large-offset","label":"p = 13","description":"Measurements themselves round to a spacing of 2⁻⁹ W, shifting the slope by the same amount in every path.","inputs":{"power_offset_exponent":13}}
+//|   - {"id":"steep","label":"β = 5","description":"The slope's shift of 0.0315 W/°C from the analytical value does not depend on β.","inputs":{"temperature_coefficient":5}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"paths","path":"/rows/0/3","approx":{"value":2.36848234808,"rtol":1e-10}}
+//|       - {"artifact":"paths","path":"/rows/1/4","range":{"min":-1e-12,"max":1e-12}}
+//|       - {"artifact":"paths","path":"/rows/2/4","range":{"min":-1e-12,"max":1e-12}}
+//|       - {"artifact":"paths","path":"/rows/0/5","approx":{"value":0.98567061,"rtol":1e-08}}
+//|       - {"artifact":"setup","path":"/rows/0/1","equals":4}
+//|       - {"artifact":"setup","path":"/rows/3/1","range":{"min":-1e-13,"max":1e-13}}
+//|   - case: sixteen-partitions
+//|     expect:
+//|       - {"artifact":"setup","path":"/rows/0/1","equals":16}
+//|       - {"artifact":"setup","path":"/rows/1/1","equals":15}
+//|       - {"artifact":"paths","path":"/rows/1/4","range":{"min":-1e-12,"max":1e-12}}
+//|   - case: small-offset
+//|     expect:
+//|       - {"artifact":"paths","path":"/rows/1/4","range":{"min":-1e-14,"max":1e-14}}
+//|   - case: large-offset
+//|     expect:
+//|       - {"artifact":"paths","path":"/rows/0/1","equals":88.400390625}
+//|       - {"artifact":"paths","path":"/rows/1/4","approx":{"value":7.7643e-06,"rtol":0.001}}
+//|       - {"artifact":"setup","path":"/rows/4/1","equals":0.001953125}
+//|   - case: steep
+//|     expect:
+//|       - {"artifact":"paths","path":"/rows/0/3","approx":{"value":4.96848234808,"rtol":1e-10}}
+//|       - {"artifact":"paths","path":"/rows/1/4","range":{"min":-1e-12,"max":1e-12}}
+use scioxide_core::RealScalar;
+use scioxide_stats::{CovarianceSnapshot, MomentOrder, OnlineCovariance};
+
+let n = PAIRS as f64;
+let PowerData {
+    offset,
+    model,
+    observed,
+} = observations(power_offset_exponent, temperature_coefficient);
+let summarize = |rows: &[(f64, f64)]| -> Result<OnlineCovariance<f64>, String> {
+    let mut acc = OnlineCovariance::new(MomentOrder::Second);
+    for &(t, p) in rows {
+        acc.observe(t, p).map_err(|e| e.to_string())?;
+    }
+    Ok(acc)
+};
+let size = PAIRS.div_ceil(partition_count as usize);
+let chunks = observed
+    .chunks(size)
+    .map(summarize)
+    .collect::<Result<Vec<_>, _>>()?;
+let merged = |order: Vec<&OnlineCovariance<f64>>| -> Result<CovarianceSnapshot<f64>, String> {
+    let mut acc = OnlineCovariance::new(MomentOrder::Second);
+    for part in order {
+        acc.merge(part).map_err(|e| e.to_string())?;
+    }
+    Ok(acc.snapshot())
+};
+let paths = [
+    ("Whole-sample aggregation", summarize(&observed)?.snapshot()),
+    ("Merge partitions in forward order", merged(chunks.iter().collect())?),
+    ("Merge partitions in reverse order", merged(chunks.iter().rev().collect())?),
+];
+// Check 1: analytical slope β − cot(π/24)/(N + 1).
+let analytic =
+    temperature_coefficient - 1.0 / RealScalar::tan(std::f64::consts::PI / 24.0) / (n + 1.0);
+// Check 2: compute the slope with two passes over deviations before adding the offset (f64 arithmetic).
+let mt = model.iter().map(|r| r.0).sum::<f64>() / n;
+let mp = model.iter().map(|r| r.1).sum::<f64>() / n;
+let sxy: f64 = model.iter().map(|&(t, p)| (t - mt) * (p - mp)).sum();
+let sxx: f64 = model.iter().map(|&(t, _)| (t - mt) * (t - mt)).sum();
+// Each quantity is Result<Option<f64>, _>: Err indicates an unrepresentable value; None indicates an undefined value.
+fn need<E: std::fmt::Display>(value: Result<Option<f64>, E>) -> Result<f64, String> {
+    value
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Undefined statistic".to_string())
+}
+let mut rows = Vec::new();
+let mut line = Vec::new();
+for (name, s) in &paths {
+    let cov = need(s.sample_covariance())?;
+    let slope = cov / need(s.marginal_x().sample_variance())?;
+    let mean_power = need(s.mean_y())? - offset;
+    if line.is_empty() {
+        let intercept = mean_power - slope * need(s.mean_x())?;
+        line = vec![
+            [12.0, intercept + slope * 12.0],
+            [30.0, intercept + slope * 30.0],
+        ];
+    }
+    let correlation = need(s.correlation())?;
+    rows.push((*name, mean_power, cov, slope, slope - analytic, correlation));
+}
+let points: Vec<[f64; 2]> = model.iter().map(|&(t, p)| [t, p]).collect();
+let truth = vec![
+    [12.0, 38.0 + temperature_coefficient * 12.0],
+    [30.0, 38.0 + temperature_coefficient * 30.0],
+];
+emit_line_chart!(
+    &vec![
+        serde_json::json!({
+            "name": "Observations (offset removed)",
+            "points": points,
+            "style": { "symbol": "circle", "lineType": "dotted" }
+        }),
+        serde_json::json!({ "name": "Regression line from aggregated statistics", "points": line }),
+        serde_json::json!({
+            "name": "Specified line 38 + βT",
+            "points": truth,
+            "style": { "lineType": "dashed" }
+        })
+    ],
+    options = &serde_json::json!({
+        "xLabel": "Temperature T [°C]",
+        "yLabel": "Power with offset removed P − O [W]"
+    })
+);
+let fixed6 = serde_json::json!({ "fractionDigits": 6 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Path" },
+    { "key": "1", "label": "Mean power − O [W]", "type": "number", "format": fixed6 },
+    { "key": "2", "label": "Sample covariance [°C·W]", "type": "number", "format": fixed6 },
+    { "key": "3", "label": "Slope [W/°C]", "type": "number", "format": fixed6 },
+    { "key": "4", "label": "Difference from analytical value [W/°C]", "type": "number", "format": sci2 },
+    { "key": "5", "label": "Correlation [-]", "type": "number", "format": fixed6 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "paths" })
+);
+let setup_columns = serde_json::json!([
+    { "key": "0", "label": "Quantity" },
+    { "key": "1", "label": "Value", "type": "number", "format": { "significantDigits": 8 } }
+]);
+let setup = vec![
+    ("Partition count [count]", chunks.len() as f64),
+    ("Partition size ⌈N/k⌉ [pairs]", size as f64),
+    ("Analytical slope [W/°C]", analytic),
+    ("Two-pass deviation slope − analytical value [W/°C]", sxy / sxx - analytic),
+    (
+        "Floating-point spacing near the offset [W]",
+        RealScalar::next_after(offset, f64::INFINITY) - offset,
+    ),
+];
+emit_table_with_columns!(
+    setup_columns,
+    setup,
+    metadata = serde_json::json!({ "id": "setup" })
+);
+export!(power_offset_exponent, power_offset_exponent);
+export!(temperature_coefficient, temperature_coefficient);
+```
+
+With the defaults of four partitions, offset $10^6$ W, and $\beta = 2.4$ W/°C, all three paths give mean power excluding the offset 88.400000 W, sample covariance 64.753970 °C·W, slope 2.368482 W/°C, and correlation 0.985671, agreeing in every displayed digit.
+All three slopes differ from the analytical value 2.3684823 W/°C by about $3 \times 10^{-14}$ W/°C.
+The two-pass calculation on deviations before adding the offset agrees with the analytical value to about $10^{-15}$ W/°C; the remaining difference comes from rounding measurements to spacing $1.2 \times 10^{-10}$ W near the offset $10^6$ W.
+Setting the partition count to 2 or 16 leaves the displayed digits unchanged.
+
+The aggregated slope 2.3685 W/°C is 0.0315 below the specified 2.4 W/°C; at $\beta = 5$ it becomes 4.9685 W/°C, lower by the same amount.
+This finite-sample shift comes from the nonzero sample covariance between the periodic component and temperature, and agrees with the analytical value $\beta - \cot(\pi/24)/(N+1)$.
+The plotted regression line has a slightly smaller slope than the specified dashed line.
+
+With offset $10^0$, the difference from the analytical value falls to at most $10^{-15}$ W/°C.
+At $10^{13}$ W, the measurements themselves round to spacing $2^{-9} \approx 0.002$ W; offset-subtracted mean power is 88.400391 W, the multiple of $2^{-9}$ nearest 88.4 W, and every path's slope difference is $7.8 \times 10^{-6}$ W/°C.
+This is the difference between the least-squares slopes of the rounded measurements and the original values, independent of the aggregation path.
+`OnlineCovariance` stores means with compensated sums and cancels common offsets before computing differences between partition means, so rounding accumulation from either online updates or partition merges does not affect the displayed digits.
+
+## Merge order and reproducibility
+
+Floating-point addition is not associative, so changing partitions or merge order can change the last digits of mathematically identical statistics.
+In parallel aggregation, each worker aggregates a partition, and partial results are merged in a binary tree or in completion order.
+Merging in completion order can change the last digits between runs on the same input, preventing bitwise reproducibility.
+
+The scioxide-stats bulk reductions `reduce_covariance` and `reduce_moments` treat each batch of `BatchView` as one sample and return `CovarianceSnapshot` or `MomentsSnapshot` per batch.
+Choose the merge policy with `StatisticsOptions::with_merge_policy`.
+`MergePolicy::InputOrder` (the default) traverses observations in each batch once in input order; `MergePolicy::StablePartitions` aggregates partitions chosen by the execution plan and merges partial results in partition-index order.
+The latter result does not depend on thread completion order, but the partition count depends on the `StatisticsOptions` execution policy and the workers available to the execution context, so environments with different worker counts need not agree bit for bit.
+`reduce_covariance_with_options` and `reduce_covariance` use a current-thread context (`ExecutionContext::sequential_native`), resulting in one partition.
+To partition across multiple workers, use `reduce_covariance_into` with workspace and an execution context.
+If the entire sample is available at once, `OnlineCovariance::from_slices` aggregates it with a compensated two-pass calculation.
+Its last digits can also differ from calling `observe` one pair at a time.
+
+The following cell receives offset exponent $p$ and slope $\beta$, generates the same observations with offset included in power, varies partition count from 1 to $k_{\max}$, and compares merged sample covariances with whole-sample aggregation using `observe` one pair at a time.
+Choose between sequential merging from the left and a binary tree that repeatedly merges adjacent pairs.
+Plot differences in ulps of the whole-sample value, where one ulp is the floating-point spacing near that value.
+The table also shows `from_slices` and `reduce_covariance_with_options` with both merge policies.
+
+```rust
+//| id: stats-merge-covariance-api-2
+//| ref: stats-merge-covariance-api-2
+//| title: "Count changes in the last digits with partition count and merge shape"
+//| run: reactive
+//| uses: [stats-merge-covariance-model]
+//| crates: [scioxide-core, scioxide-stats]
+//| dependsOn:
+//|   data: stats-merge-covariance
+//| inputs:
+//|   largest_partition_count: {"type":"range","label":"Maximum partition count kₘₐₓ [count]","description":"Changes the range of plotted partition counts.","min":8,"max":60,"step":4,"value":32}
+//|   merge_shape: {"type":"select","label":"Merge shape","options":[{"label":"Sequential (left to right)","value":"sequential"},{"label":"Binary tree (adjacent pairs)","value":"tree"}],"value":"sequential"}
+//| cases:
+//|   - {"id":"tree","label":"Binary tree","description":"Merges in the same shape as parallel aggregation.","inputs":{"merge_shape":"tree"}}
+//|   - {"id":"few","label":"kₘₐₓ = 8","description":"Plot only a range with fewer partitions.","inputs":{"largest_partition_count":8}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"drift","path":"/spec/series/0/points/0/1","equals":0}
+//|       - {"artifact":"drift","path":"/spec/series/0/points/31/0","equals":32}
+//|       - {"artifact":"routes","path":"/rows/2/2","equals":0}
+//|       - {"artifact":"routes","path":"/rows/3/2","equals":0}
+//|   - case: tree
+//|     expect:
+//|       - {"artifact":"drift","path":"/spec/series/0/points/0/1","equals":0}
+//|       - {"artifact":"drift","path":"/spec/series/0/points/8/1","range":{"min":-4,"max":4}}
+//|   - case: few
+//|     expect:
+//|       - {"artifact":"drift","path":"/spec/series/0/points/7/0","equals":8}
+use scioxide_core::{RealScalar, StridedLayout};
+use scioxide_stats::{
+    Axis, BatchView, MergePolicy, MomentOrder, OnlineCovariance, StatisticsOptions,
+    reduce_covariance_with_options,
+};
+
+// Receive the preceding cell's inputs and generate the same observations.
+let exponent = data["power_offset_exponent"]
+    .as_f64()
+    .ok_or("Missing baseline exponent")?;
+let coefficient = data["temperature_coefficient"]
+    .as_f64()
+    .ok_or("Missing slope")?;
+let observed = observations(exponent, coefficient).observed;
+let temperatures: Vec<f64> = observed.iter().map(|r| r.0).collect();
+let powers: Vec<f64> = observed.iter().map(|r| r.1).collect();
+let pairs = PAIRS;
+let covariance = |acc: &OnlineCovariance<f64>| -> Result<f64, String> {
+    let value = acc
+        .snapshot()
+        .sample_covariance()
+        .map_err(|e| e.to_string())?;
+    value.ok_or_else(|| "Undefined sample covariance".to_string())
+};
+// Aggregate with observe one pair at a time. The result with one partition is the reference.
+let summarize = |ts: &[f64], ps: &[f64]| -> Result<OnlineCovariance<f64>, String> {
+    let mut acc = OnlineCovariance::new(MomentOrder::Second);
+    for (&t, &p) in ts.iter().zip(ps) {
+        acc.observe(t, p).map_err(|e| e.to_string())?;
+    }
+    Ok(acc)
+};
+let reference = covariance(&summarize(&temperatures, &powers)?)?;
+let ulp = RealScalar::next_after(reference, f64::INFINITY) - reference;
+let mut drift = Vec::new();
+for k in 1..=largest_partition_count as usize {
+    // Aggregate each partition.
+    let mut level = Vec::new();
+    let size = pairs.div_ceil(k);
+    for (ts, ps) in temperatures.chunks(size).zip(powers.chunks(size)) {
+        level.push(summarize(ts, ps)?);
+    }
+    // Sequential merging proceeds left to right; binary-tree merging combines adjacent pairs.
+    while level.len() > 1 {
+        let width = if merge_shape == "tree" {
+            2
+        } else {
+            level.len()
+        };
+        let mut next = Vec::new();
+        for group in level.chunks(width) {
+            let mut acc = group[0];
+            for part in &group[1..] {
+                acc.merge(part).map_err(|e| e.to_string())?;
+            }
+            next.push(acc);
+        }
+        level = next;
+    }
+    drift.push([k as f64, (covariance(&level[0])? - reference) / ulp]);
+}
+emit_chart!(
+    serde_json::json!({
+        "kind": "line",
+        "dataZoom": true,
+        "tooltip": true,
+        "series": [{
+            "name": "Merged sample covariance − whole-sample aggregation",
+            "points": drift,
+            "style": { "symbol": "circle" }
+        }],
+        "xLabel": "Partition count k [count]",
+        "yLabel": "Difference from whole-sample aggregation [ulp]",
+        "annotations": [{ "kind": "line", "axis": "y", "value": 0.0, "label": "Whole-sample aggregation" }]
+    }),
+    metadata = serde_json::json!({ "id": "drift" })
+);
+// Bulk reduction: aggregate as one batch with two merge policies.
+let (shape, strides) = ([pairs], [1_usize]);
+let layout = StridedLayout::new(&shape, &strides).map_err(|e| e.to_string())?;
+let x = BatchView::new(&temperatures, layout, Axis::Index(0)).map_err(|e| e.to_string())?;
+let y = BatchView::new(&powers, layout, Axis::Index(0)).map_err(|e| e.to_string())?;
+let reduce = |policy| -> Result<f64, String> {
+    let options = StatisticsOptions::default().with_merge_policy(policy);
+    let snapshots = reduce_covariance_with_options(x, y, options).map_err(|e| e.to_string())?;
+    let value = snapshots[0]
+        .sample_covariance()
+        .map_err(|e| e.to_string())?;
+    value.ok_or_else(|| "Undefined sample covariance".to_string())
+};
+let sliced = OnlineCovariance::from_slices(&temperatures, &powers, MomentOrder::Second);
+let routes = [
+    ("observe one pair at a time (reference)", reference),
+    (
+        "from_slices (compensated two-pass)",
+        covariance(&sliced.map_err(|e| e.to_string())?)?,
+    ),
+    (
+        "reduce_covariance_with_options (InputOrder)",
+        reduce(MergePolicy::InputOrder)?,
+    ),
+    (
+        "reduce_covariance_with_options (StablePartitions)",
+        reduce(MergePolicy::StablePartitions)?,
+    ),
+];
+let rows: Vec<(&str, f64, f64)> = routes
+    .iter()
+    .map(|&(name, value)| (name, value, (value - reference) / ulp))
+    .collect();
+let digits17 = serde_json::json!({ "significantDigits": 17 });
+let whole = serde_json::json!({ "fractionDigits": 0 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Path" },
+    { "key": "1", "label": "Sample covariance [°C·W]", "type": "number", "format": digits17 },
+    { "key": "2", "label": "Difference from reference [ulp]", "type": "number", "format": whole }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "routes" })
+);
+```
+
+With the default inputs ($p = 6$, $\beta = 2.4$ W/°C, $k_{\max} = 32$, sequential merging), partitioned and merged sample covariances differ from whole-sample aggregation by $-2$ to 0 ulp (1 ulp is $1.4 \times 10^{-14}$ °C·W).
+As partition count changes, the difference moves irregularly among $-2$, $-1$, and 0 ulp; even extending to $k_{\max} = 60$ keeps it within 3 ulp.
+Binary-tree merging also gives $-2$ to 0 ulp, but changing the merge shape changes which partition counts produce differences.
+The statistic is mathematically identical, so the difference arises solely from rounding order.
+
+`from_slices` differs from whole-sample aggregation by 1 ulp, while `reduce_covariance_with_options` with both merge policies agrees bit for bit.
+Because this cell runs only on the current thread, `StablePartitions` also uses one partition and performs the same calculation as the path using `observe` one pair at a time.
+These differences are relative errors of about $10^{-16}$, invisible in the six displayed digits but distinguishable in uses that compare results bit for bit.
+
+## Independence assumptions and intervals
+
+This measurement sequence has monotonically increasing temperature and a deterministic periodic power component; the observations are not an independent sample.
+Applying mean intervals such as `MomentsSnapshot::confidence_interval_of_mean`, which assume independent normal samples, overstates estimation precision for this series.
+[Checking confidence interval coverage with repeated experiments](../confidence-coverage/) examines how much autocorrelation reduces coverage.
+
+## Summary
+
+Partitioned aggregation computes the same statistic as whole-sample aggregation through merge formulas that include differences between partition means, retaining covariance and regression slope even with a large common offset.
+The aggregated slope differs from the specified slope because of the finite-sample periodic component; agreement with the analytical value $\beta - \cot(\pi/24)/(N+1)$ and the two-pass deviation calculation shows this is not algorithmic error.
+Partition count and merge shape can change the last digits; for bitwise reproducibility, fix merge order, select `MergePolicy::StablePartitions` for bulk reductions, and also fix worker count.
+For series with dependent observations, mean standard errors and intervals constructed from the aggregated variance overstate precision.
+
+## Further reading
+
+- [Online means, variances, higher moments, and covariance](../../algorithms/online-moments-and-covariance/): examine merge formulas and rounding effects of merge order.
+- [Online aggregation of sensor streams with large offsets](../online-sensor/): examine digits lost by one-pass formulas and quantization limits in univariate online aggregation with a large offset.
+- [Check confidence-interval coverage through repeated experiments](../confidence-coverage/): check coverage when independence assumptions fail.

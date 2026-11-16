@@ -1,0 +1,483 @@
+---
+title: "Compute high-dimensional reliability by Monte Carlo integration"
+description: "Compute the probability that the mean of independent component performances exceeds a threshold as an indicator integral over the unit hypercube, and compare Monte Carlo results with exact Irwin–Hall probabilities, standard errors, and coverage across independent replicates."
+sidebar:
+  order: 420
+---
+
+Product reliability and structural safety-factor analyses often require the probability that performance combining many uncertain factors exceeds a criterion.
+The integral's dimension equals the number of factors, so grid quadrature becomes impractical as its evaluation count grows exponentially with dimension.
+This example uses Monte Carlo integration to estimate the probability that mean independent component performance exceeds a threshold, checking it against exact Irwin–Hall probabilities, standard errors, confidence intervals, and independent replicates.
+
+## Exceedance probability as an indicator integral
+
+Assume the performances $U_1, \ldots, U_d$ of $d$ components are independent and uniform on $[0, 1]$.
+Performance is dimensionless, mapping its specification range to 0 through 1; probability is dimensionless as well.
+Since the joint density is 1 on the unit hypercube, the probability that mean performance $\bar{U} = \frac{1}{d}\sum_j U_j$ reaches or exceeds threshold $q$ is the indicator integral
+
+$$
+p = \Pr(\bar{U} \ge q) = \int_{[0, 1]^d} \mathbf{1}\left\{\sum_{j=1}^{d} u_j \ge d q\right\} du_1 \cdots du_d
+$$
+
+
+The integrand jumps from 0 to 1 across the hyperplane $\sum_j u_j = dq$, making high-order rules that assume smoothness ineffective.
+
+## Exact probability from the Irwin–Hall distribution
+
+The sum $S_d = \sum_j U_j$ has the Irwin–Hall distribution; inclusion–exclusion gives its distribution function as
+
+$$
+F_d(s) = \Pr(S_d \le s) = \frac{1}{d!}\sum_{k=0}^{\lfloor s \rfloor} (-1)^k \binom{d}{k} (s - k)^d \qquad (0 \le s \le d)
+$$
+
+
+For $q > 1/2$, directly computing $1 - F_d(dq)$ loses digits by subtracting numbers close to 1.
+Using the fact that $1 - U_j$ is also uniform on $[0, 1]$ gives
+
+$$
+p = \Pr\left(\sum_j U_j \ge dq\right) = \Pr\left(\sum_j (1 - U_j) \le d(1 - q)\right) = F_d\bigl(d(1 - q)\bigr)
+$$
+
+allowing direct evaluation of the lower-tail sum.
+For $d \le 10$, binomial coefficients and factorials are exactly representable integers, and each summand requires only arithmetic.
+
+## Monte Carlo estimator and standard error
+
+The mean $\hat{p} = \frac{1}{N}\sum_i Y_i$ of indicator values $Y_i \in \{0, 1\}$ at $N$ uniform points $\boldsymbol{u}_i$ is an unbiased estimator of $p$, with
+
+$$
+\operatorname{SE}(\hat{p}) = \sqrt{\frac{p(1 - p)}{N}}, \qquad \frac{\operatorname{SE}(\hat{p})}{p} = \sqrt{\frac{1 - p}{Np}} \approx \frac{1}{\sqrt{Np}} \quad (p \ll 1)
+$$
+
+
+Here $Np$ is the expected count of event points among $N$ points; relative precision depends only on this count, not directly on dimension $d$.
+However, as $d$ increases, the central limit theorem concentrates $\bar{U}$ around $1/2$ with variance $1/(12d)$, so $p$ for $q > 1/2$ decreases rapidly, reducing $Np$ even at fixed $N$.
+
+`MonteCarloIntegrator` derives estimator variance $s^2/N$ from the observations' sample variance $s^2$.
+`MonteCarloStatistics` returns this variance through `estimator_variance()`, takes its square root as standard error, and by default constructs a 95 % confidence interval using Student's t distribution with $N - 1$ degrees of freedom.
+These are statistical statements assuming finite variance.
+If no event is observed ($K = \sum_i Y_i = 0$), both estimate and sample variance are 0 and the interval has zero width.
+This indicates insufficient samples for the event's rarity, rather than zero probability.
+Then use binomial intervals or bounds such as $p \lesssim 3/N$ (the 95 % one-sided upper bound called the rule of three) or a Clopper–Pearson interval.
+
+## Random streams and replicates
+
+`RandomStreams::new(&root, stream)` draws uniform values from stream number `stream` of splittable generator `root`.
+Samples are divided into blocks of 1024, and block $b$ draws from substream $(\text{stream}, b)$ of `root`, so results are independent of execution parallelism.
+Setting `MonteCarloOptions::with_replicates(R)` computes $R$ independent replicates, each using $N$ points, in one call.
+Replicates use nonoverlapping blocks, and workspace `children` returns each replicate's estimate and statistics based on its observations.
+The overall estimate is the mean of $R$ estimates; overall `statistics` derives standard error from replicate variability (`VarianceBasis::Replicates`, $R - 1$ degrees of freedom).
+
+The following block provides definitions shared by three cells.
+`exceedance` gives exact probability $F_d(d(1 - q))$, and `estimate_exceedance` implements indicator integration with `MonteCarloIntegrator`.
+Random seed, sample count, and replicate count are inputs to each cell.
+
+```rust
+//| id: integrate-reliability-model
+//| kind: definitions
+//| title: "Exact Irwin–Hall probabilities and Monte Carlo procedure"
+//| crates: [scioxide-core, scioxide-integrate, scioxide-random]
+use scioxide_core::{
+    ExecutionContext, SciOxideError, Interval, RealScalar, checked_binomial, checked_factorial,
+};
+use scioxide_integrate::{
+    IntegrationReport, MonteCarloIntegrator, MonteCarloOptions, MonteCarloWorkspace, RandomStreams,
+};
+use scioxide_random::Philox4x64;
+
+/// p = Pr(Σ U_j ≥ dq) = F_d(d(1 − q)) (inclusion–exclusion, arithmetic only).
+pub(crate) fn exceedance(d: usize, q: f64) -> Result<f64, SciOxideError> {
+    let s = d as f64 * (1.0 - q);
+    let mut sum = 0.0;
+    for k in 0..=(RealScalar::floor(s) as usize).min(d) {
+        let term = checked_binomial(d, k)? as f64 * RealScalar::powi(s - k as f64, d as i32);
+        sum += if k % 2 == 0 { term } else { -term };
+    }
+    Ok(sum / checked_factorial(d)? as f64)
+}
+
+/// Integrate indicator 1{Σ u_j ≥ dq} over [0, 1]^d using stream 0 of root.
+pub(crate) fn estimate_exceedance(
+    d: usize,
+    q: f64,
+    options: MonteCarloOptions,
+    root: &Philox4x64,
+) -> Result<(f64, IntegrationReport<f64>, MonteCarloWorkspace<f64>), SciOxideError> {
+    let bounds = vec![Interval::new(0.0, 1.0)?; d];
+    let plan = MonteCarloIntegrator::new(&bounds, options)?;
+    let mut workspace = plan.workspace(1, ExecutionContext::sequential())?;
+    let threshold = d as f64 * q;
+    let event = |u: &[f64]| {
+        Ok(if u.iter().sum::<f64>() >= threshold {
+            1.0
+        } else {
+            0.0
+        })
+    };
+    let mut value = 0.0;
+    let report = plan.integrate_into(
+        &event,
+        RandomStreams::new(root, 0),
+        &mut value,
+        &mut workspace,
+        ExecutionContext::sequential(),
+    )?;
+    Ok((value, report, workspace))
+}
+```
+
+## A single estimate and theory
+
+The next cell selects component count $d$, sample count $N = 2^m$, threshold $q$, and random seed and estimates exceedance probability once.
+The table gives estimate, exact value, reported and theoretical standard errors, 95 % confidence interval, standardized difference $z$ (the difference between estimate and exact value, divided by reported standard error), event count $K$, and expectation $Np$.
+The outcome indicates whether events were observed and standard error could be defined.
+The next cell receives $d$, $N$, and $q$.
+
+```rust
+//| id: integrate-high-dimensional-reliability
+//| ref: integrate-high-dimensional-reliability
+//| title: "Estimate mean-performance exceedance probability once"
+//| run: reactive
+//| uses: [integrate-reliability-model]
+//| crates: [scioxide-core, scioxide-integrate, scioxide-random]
+//| exports: [dimension, samples, threshold]
+//| inputs:
+//|   component_count: {"type":"range","label":"Component count d","description":"Integral dimension. Change the concentration of mean performance.","min":2,"max":10,"step":1,"value":6}
+//|   sample_exponent: {"type":"range","label":"Sample-count exponent m (N = 2^m)","description":"Change statistical error and evaluation count.","min":8,"max":16,"step":1,"value":13}
+//|   threshold: {"type":"range","label":"Mean-performance threshold q [-]","description":"Move toward rarer events.","min":0.52,"max":0.88,"step":0.01,"value":0.7}
+//|   seed: {"type":"range","label":"Random seed","description":"Philox generator seed.","min":1,"max":1000,"step":1,"value":42}
+//| cases:
+//|   - {"id":"rare","label":"q = 0.86, N = 2^8","description":"Expected event count Np is below 1; observing no events gives outcome failed.","inputs":{"threshold":0.86,"sample_exponent":8}}
+//|   - {"id":"other-seed","label":"Seed 7","description":"With another sample, the estimate differs from the exact value by only a few reported standard errors.","inputs":{"seed":7}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/1","approx":{"value":0.0450546666666667,"rtol":1e-12}}
+//|       - {"artifact":"summary","path":"/rows/0/7","equals":397}
+//|       - {"artifact":"summary","path":"/rows/0/6","range":{"min":-4,"max":4}}
+//|       - {"artifact":"summary","path":"/rows/0/9","equals":"SampleBudgetCompleted"}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+//|   - case: rare
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/7","equals":0}
+//|       - {"artifact":"summary","path":"/rows/0/6","equals":null}
+//|       - {"path":"/outputs/1/state","equals":"failed"}
+//|   - case: other-seed
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/6","range":{"min":-4,"max":4}}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+use scioxide_core::{Budget, RealScalar};
+use scioxide_integrate::MonteCarloOptions;
+use scioxide_random::{Philox4x64, SeedableRng};
+
+let d = component_count as usize;
+let samples = 1_usize << (sample_exponent as u32);
+let q = threshold;
+let root = Philox4x64::from_seed(seed as u64);
+let options = MonteCarloOptions::default()
+    .with_samples(Budget::try_from(samples).map_err(|e| e.to_string())?);
+let (estimate, report, workspace) =
+    estimate_exceedance(d, q, options, &root).map_err(|e| e.to_string())?;
+let exact = exceedance(d, q).map_err(|e| e.to_string())?;
+let mut statistics = workspace.statistics()[0]
+    .clone()
+    .ok_or("Missing sample statistics")?;
+let interval = statistics
+    .confidence_interval()
+    .map_err(|e| e.to_string())?;
+let standard_error = statistics.standard_error();
+let passes = RealScalar::round(estimate * samples as f64) as usize;
+
+let sig4 = serde_json::json!({ "significantDigits": 4 });
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Estimate p̂ [-]", "type": "number", "format": sig4 },
+    { "key": "1", "label": "Exact p [-]", "type": "number", "format": sig4 },
+    { "key": "2", "label": "Reported standard error [-]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "Theoretical standard error [-]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "95 % interval lower endpoint [-]", "type": "number", "format": sig4 },
+    { "key": "5", "label": "95 % interval upper endpoint [-]", "type": "number", "format": sig4 },
+    { "key": "6", "label": "z [-]", "type": "number", "format": fixed2, "nullText": "Undefined (SE = 0)" },
+    { "key": "7", "label": "Event count K", "type": "integer" },
+    { "key": "8", "label": "Expected count Np", "type": "number", "format": { "fractionDigits": 1 } },
+    { "key": "9", "label": "Termination status" }
+]);
+emit_table_with_columns!(
+    columns,
+    vec![(
+        estimate,
+        exact,
+        standard_error,
+        RealScalar::sqrt(exact * (1.0 - exact) / samples as f64),
+        interval.lower(),
+        interval.upper(),
+        (standard_error > 0.0).then(|| (estimate - exact) / standard_error),
+        passes,
+        samples as f64 * exact,
+        report.termination().to_string(),
+    )],
+    metadata = serde_json::json!({ "id": "summary" })
+);
+export!(dimension, d);
+export!(samples, samples);
+export!(threshold, q);
+
+let outcome = if passes > 0 {
+    Outcome::satisfied("Sample budget completed; standard error and confidence interval are defined")
+        .explanation("No accuracy is claimed; the interval represents sampling error only.")
+} else {
+    Outcome::failed("No events observed; standard error and interval do not represent the probability's magnitude")
+        .explanation("Use a binomial upper bound such as p ≲ 3/N or increase the sample count.")
+};
+emit_outcome!(
+    outcome
+        .status(report.termination().to_string())
+        .diagnostic("Evaluations", report.evaluations() as f64, None)
+        .diagnostic("Event count", passes as f64, None)
+        .diagnostic("Reported standard error", standard_error, None)
+);
+```
+
+At the defaults ($d = 6$, $N = 2^{13} = 8192$, $q = 0.7$, seed 42), the exact probability is $p = 0.04505$ and the observed event count is $K = 397$ (expectation $Np = 369.1$).
+The estimate $\hat{p} = 0.04846$ has reported standard error $2.37 \times 10^{-3}$, close to theoretical value $2.29 \times 10^{-3}$.
+The standardized difference is $z = 1.44$, or 1.4 standard errors; the 95 % interval $[0.0438, 0.0531]$ contains the exact value.
+Seed 7 gives $\hat{p} = 0.04456$ and $z = -0.22$.
+Estimates vary across seeds on the standard-error scale, and about one seed in 20 has $|z|$ above 2.
+
+At $q = 0.86$ and $N = 2^8$, $Np = 0.12$, and this seed observes no events.
+Estimate, standard error, and interval are all 0, and the outcome is failed.
+The rule-of-three bound $3/N = 0.012$ includes exact value $4.9 \times 10^{-4}$ but is a coarse estimate.
+
+The next cell receives $d$, $N$, and $q$ from the previous cell and plots exact probability $p(q)$ against threshold $q$ together with theoretical relative standard error $\sqrt{(1 - p)/(Np)}$ at that $N$.
+The charts have linked horizontal $q$ axes, with a vertical line marking selected $q$.
+Thresholds with $p = 0$ cannot appear on the logarithmic axis and are omitted; their count appears in the table.
+
+```rust
+//| id: integrate-reliability-threshold-curves
+//| ref: integrate-reliability-threshold-curves
+//| title: "Exact probabilities and theoretical relative standard errors versus threshold"
+//| run: reactive
+//| uses: [integrate-reliability-model]
+//| crates: [scioxide-core, scioxide-integrate, scioxide-random]
+//| dependsOn:
+//|   estimate: integrate-high-dimensional-reliability
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"probability","path":"/spec/series/0/points/0/1","approx":{"value":0.5,"rtol":1e-12}}
+//|       - {"artifact":"probability","path":"/spec/series/0/points/80/1","approx":{"value":6.48e-5,"rtol":1e-3}}
+//|       - {"artifact":"dropped","path":"/rows/0/1","equals":0}
+use scioxide_core::RealScalar;
+
+let number = |key: &str| estimate[key].as_f64().ok_or(format!("Missing {key}"));
+let d = number("dimension")? as usize;
+let (samples, q) = (number("samples")?, number("threshold")?);
+// Exact probability and theoretical relative standard error at each threshold; omit p = 0 points from logarithmic axes.
+let (mut probability, mut relative_error, mut dropped) = (Vec::new(), Vec::new(), 0_usize);
+for k in 0..=80 {
+    let qq = 0.5 + 0.005 * f64::from(k);
+    let p = exceedance(d, qq).map_err(|e| e.to_string())?;
+    if p > 0.0 {
+        probability.push([qq, p]);
+        relative_error.push([qq, RealScalar::sqrt((1.0 - p) / (samples * p))]);
+    } else {
+        dropped += 1;
+    }
+}
+let marker =
+    serde_json::json!([{ "kind": "line", "axis": "x", "value": q, "label": "Selected q" }]);
+emit_chart!(
+    serde_json::json!({
+        "kind": "line",
+        "series": [{ "name": "Exact p(q)", "points": probability }],
+        "link": { "group": "threshold" },
+        "xLabel": "Threshold q [-]",
+        "yLabel": "Exceedance probability p [-]",
+        "yType": "log",
+        "xMin": 0.5,
+        "xMax": 0.9,
+        "annotations": marker,
+        "dataZoom": true,
+        "tooltip": true
+    }),
+    metadata = serde_json::json!({ "id": "probability" })
+);
+emit_line_chart!(
+    &vec![serde_json::json!({ "name": "√((1 − p)/(Np))", "points": relative_error })],
+    options = &serde_json::json!({
+        "link": { "group": "threshold" },
+        "xLabel": "Threshold q [-]",
+        "yLabel": "Theoretical relative standard error [-]",
+        "yType": "log",
+        "xMin": 0.5,
+        "xMax": 0.9,
+        "annotations": marker
+    })
+);
+emit_table_with_columns!(
+    serde_json::json!([
+        { "key": "0", "label": "Quantity" },
+        { "key": "1", "label": "Value", "type": "integer" }
+    ]),
+    vec![("Number of p = 0 thresholds omitted from the chart", dropped)],
+    metadata = serde_json::json!({ "id": "dropped" })
+);
+```
+
+In the upper chart, $p(q)$ for $d = 6$ decreases from $0.5$ at $q = 0.5$ to $6.5 \times 10^{-5}$ at $q = 0.9$.
+The lower chart's relative standard error rises from $10^{-2}$ to above 1 over the same range, showing rapidly worsening precision as the threshold rises at fixed $N$.
+
+## Independent replicates and interval coverage
+
+Whether one estimate's interval contains the exact value depends on chance; repeated replicates check the meaning of the interval.
+The next cell computes $R$ replicates in one call with the same $d$, $N$, and $q$.
+The chart gives each replicate's estimate and observation-based 95 % interval as an error bar, with the exact value as a horizontal line and exact value $\pm 2$ theoretical standard errors as a band.
+The table gives replicate mean and its replicate-based standard error, standardized mean-minus-exact difference $z$, replicate standard deviation and theoretical value $\sqrt{p(1 - p)/N}$, and the fraction of intervals containing the exact value (coverage).
+Coverage itself varies with binomial standard error $\sqrt{0.95 \times 0.05/R}$.
+
+```rust
+//| id: integrate-reliability-replicates
+//| ref: integrate-reliability-replicates
+//| title: "Examine estimator distributions and interval coverage with independent replicates"
+//| run: reactive
+//| uses: [integrate-reliability-model]
+//| crates: [scioxide-core, scioxide-integrate, scioxide-random]
+//| inputs:
+//|   replicate_components: {"type":"range","label":"Component count d","description":"Integral dimension.","min":2,"max":10,"step":1,"value":6}
+//|   replicate_sample_exponent: {"type":"range","label":"Samples-per-replicate exponent m (N = 2^m)","description":"Samples in each replicate.","min":7,"max":13,"step":1,"value":11}
+//|   replicate_threshold: {"type":"range","label":"Mean-performance threshold q [-]","description":"Change event rarity.","min":0.55,"max":0.86,"step":0.01,"value":0.68}
+//|   replicate_count: {"type":"range","label":"Replicate count R","description":"Number of replicates for examining estimator distribution and coverage.","min":8,"max":40,"step":1,"value":20}
+//|   replicate_seed: {"type":"range","label":"Random seed","description":"Philox generator seed.","min":1,"max":1000,"step":1,"value":1}
+//| cases:
+//|   - {"id":"rare","label":"q = 0.84","description":"Np is about 2; some replicates observe no events and produce zero-width intervals.","inputs":{"replicate_threshold":0.84}}
+//|   - {"id":"more-replicates","label":"R = 40","description":"More replicates reduce the standard error of coverage.","inputs":{"replicate_count":40}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"replicates","path":"/rows/0/2","approx":{"value":0.0645255118506666,"rtol":1e-12}}
+//|       - {"artifact":"replicates","path":"/rows/0/4","range":{"min":-4,"max":4}}
+//|       - {"artifact":"replicates","path":"/rows/0/5","range":{"min":0.0027,"max":0.0082}}
+//|       - {"artifact":"replicates","path":"/rows/0/7","range":{"min":0.75,"max":1}}
+//|   - case: rare
+//|     expect:
+//|       - {"artifact":"replicates","path":"/rows/0/9","range":{"min":1}}
+//|       - {"artifact":"replicates","path":"/rows/0/4","range":{"min":-4,"max":4}}
+//|   - case: more-replicates
+//|     expect:
+//|       - {"artifact":"replicates","path":"/rows/0/8","approx":{"value":0.03446,"atol":1e-4}}
+//|       - {"artifact":"replicates","path":"/rows/0/7","range":{"min":0.8,"max":1}}
+use scioxide_core::{Budget, RealScalar};
+use scioxide_integrate::MonteCarloOptions;
+use scioxide_random::{Philox4x64, SeedableRng};
+
+let d = replicate_components as usize;
+let samples = 1_usize << (replicate_sample_exponent as u32);
+let replicates = replicate_count as usize;
+let q = replicate_threshold;
+let exact = exceedance(d, q).map_err(|e| e.to_string())?;
+let predicted = RealScalar::sqrt(exact * (1.0 - exact) / samples as f64);
+let root = Philox4x64::from_seed(replicate_seed as u64);
+let options = MonteCarloOptions::default()
+    .with_samples(Budget::try_from(samples).map_err(|e| e.to_string())?)
+    .with_replicates(replicates);
+let (mean, _, workspace) =
+    estimate_exceedance(d, q, options, &root).map_err(|e| e.to_string())?;
+
+// Each replicate's estimate and 95 % interval from its observations.
+let (mut bars, mut estimates) = (Vec::new(), Vec::new());
+let (mut covered, mut empty) = (0_usize, 0_usize);
+for (r, child) in workspace.children().enumerate() {
+    let value = child.values().ok_or("Missing replicate estimate")?[0];
+    let mut statistics = child.statistics()[0].clone().ok_or("Missing replicate statistics")?;
+    let interval = statistics
+        .confidence_interval()
+        .map_err(|e| e.to_string())?;
+    covered += usize::from(interval.lower() <= exact && exact <= interval.upper());
+    empty += usize::from(value == 0.0);
+    bars.push([r as f64 + 1.0, value, interval.lower(), interval.upper()]);
+    estimates.push(value);
+}
+let squares: f64 = estimates.iter().map(|e| (e - mean) * (e - mean)).sum();
+let spread = RealScalar::sqrt(squares / (replicates - 1) as f64);
+let aggregate = workspace.statistics()[0]
+    .clone()
+    .ok_or("Missing aggregate replicate statistics")?;
+let standard_error = aggregate.standard_error();
+
+emit_chart!(serde_json::json!({
+    "kind": "errorbar",
+    "xLabel": "Replicate number",
+    "yLabel": "Estimated exceedance probability [-]",
+    "series": [{ "name": "Estimate and 95 % interval", "points": bars }],
+    "annotations": [
+        { "kind": "line", "axis": "y", "value": exact, "label": "Exact p" },
+        {
+            "kind": "range",
+            "axis": "y",
+            "from": exact - 2.0 * predicted,
+            "to": exact + 2.0 * predicted,
+            "label": "p ± 2 SE (theoretical)"
+        }
+    ]
+}));
+let sig4 = serde_json::json!({ "significantDigits": 4 });
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let fixed3 = serde_json::json!({ "fractionDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Expected count Np", "type": "number", "format": { "fractionDigits": 1 } },
+    { "key": "1", "label": "Replicate mean [-]", "type": "number", "format": sig4 },
+    { "key": "2", "label": "Exact p [-]", "type": "number", "format": sig4 },
+    { "key": "3", "label": "Standard error of mean [-]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "z for mean [-]", "type": "number", "format": fixed2, "nullText": "Undefined" },
+    { "key": "5", "label": "Replicate standard deviation [-]", "type": "number", "format": sci3 },
+    { "key": "6", "label": "Theoretical standard deviation [-]", "type": "number", "format": sci3 },
+    { "key": "7", "label": "Coverage [-]", "type": "number", "format": fixed3 },
+    { "key": "8", "label": "Standard error of coverage [-]", "type": "number", "format": fixed3 },
+    { "key": "9", "label": "Replicates with zero events", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    vec![(
+        samples as f64 * exact,
+        mean,
+        exact,
+        standard_error,
+        (standard_error > 0.0).then(|| (mean - exact) / standard_error),
+        spread,
+        predicted,
+        covered as f64 / replicates as f64,
+        RealScalar::sqrt(0.95 * 0.05 / replicates as f64),
+        empty,
+    )],
+    metadata = serde_json::json!({ "id": "replicates" })
+);
+```
+
+At the defaults ($d = 6$, $N = 2^{11}$, $q = 0.68$, $R = 20$, seed 1), the exact value is $p = 0.06453$ and $Np = 132$.
+The mean of 20 replicates is $0.06387$; with replicate-based standard error $1.01 \times 10^{-3}$, this gives $z = -0.65$.
+Replicate standard deviation $4.5 \times 10^{-3}$ is 17 % below theoretical value $5.4 \times 10^{-3}$, comparable to the relative variability $1/\sqrt{2(R - 1)} \approx 0.16$ of a standard deviation estimated from 20 values.
+Coverage is 1.0; its difference from nominal 0.95 is comparable to coverage standard error 0.049.
+For $R = 40$, coverage is 0.95 and the mean's $z$ is $-1.31$.
+
+Setting $q = 0.84$ gives $Np \approx 2.2$, and 3 of the 20 replicates observe no events.
+Their intervals are the zero-width $[0, 0]$ and exclude the exact value.
+Coverage is 0.85, about two coverage standard errors below nominal 0.95.
+For few events, the normal approximation behind observation-variance intervals breaks down, and they no longer contain the exact value at the nominal frequency.
+For rare events, use binomial intervals or importance sampling that concentrates points where events are likely ([adaptive Monte Carlo: VEGAS and MISER](../../algorithms/adaptive-monte-carlo/)).
+
+## Summary
+
+Mean-performance exceedance probability is an indicator integral over the unit hypercube and can be checked against exact Irwin–Hall probabilities.
+The Monte Carlo estimator's standard error is $\sqrt{p(1 - p)/N}$; relative precision depends on expected event count $Np$.
+Read the estimate-minus-exact difference through $z$, standardized by reported standard error, and check interval meaning through coverage across independent replicates made with `with_replicates`.
+If no events are observed, standard error and interval are both 0; treat this as failure and switch to binomial upper bounds, more samples, or importance sampling.
+Fix the seed as an input and interpret statistical variability together with results from other seeds.
+
+## Further reading
+
+- [Monte Carlo estimators and statistics](../../algorithms/monte-carlo-integration/): check standard-error derivation, Student-t intervals, random streams, and replicate specifications.
+- [Adaptive Monte Carlo (VEGAS and MISER)](../../algorithms/adaptive-monte-carlo/): examine importance sampling and stratification for rare events.
+- [Sparse grids and randomized quasi-Monte Carlo](../../algorithms/sparse-grids-and-qmc/): examine randomized quasi-Monte Carlo for smaller standard errors at the same evaluation count.
+- [Compare sparse grids, QMC, and MC with Genz test functions](../genz-high-dimensional-benchmark/): compare errors against dimension and evaluation count for smooth integrands.

@@ -1,0 +1,352 @@
+---
+title: Thiessen 領域の格子点での照合
+description: 半平面の交差で切り取った 6 か所の観測所の Thiessen 領域が、最も近い観測所の領域になっていることを流域の格子点で確かめる。総当たりの最近傍を参照にして、KD 木の nearest_into、多角形への所属、格子点の数による面積の見積もりを照合する。
+sidebar:
+  order: 412
+---
+
+[観測所の Thiessen 領域と面積重み雨量](../voronoi-territory/)では、Voronoi の稜で隣り合う観測所の二等分線と流域の矩形を `HalfspaceIntersection` に渡し、各観測所の領域を凸多角形として切り取った。
+この切り取りが正しければ、流域の各点は最も近い観測所の多角形にだけ含まれる。
+この例題では、流域を覆う格子点で最も近い観測所を総当たりで求め、それを参照にして `KdTree` の最近傍と多角形への所属を照合する。
+流域は前のページの既定の矩形（幅 $W = 50$ km、高さ $H = 60$ km）に固定する。
+
+## 格子点と総当たりの参照
+
+格子点は $((k + \tfrac12)h, (l + \tfrac12)h)$（$k = 0, \ldots, W/h - 1$、$l = 0, \ldots, H/h - 1$）で、間隔 $h$ は 5 km を割り切る 0.25、0.5、1、2.5 km から選ぶ。
+各格子点で全観測所との 2 乗距離を求め、最小を与える観測所の集合を参照にする。
+観測所の座標は整数 [km] で、格子点の座標は 1/8 km の倍数なので、2 乗距離は `f64` で丸めなしに求まる。
+そのため、2 つ以上の観測所から等距離の点、つまり Voronoi の境界の上の点を厳密に判定できる。
+
+切り取りの多角形を、格子点の数で測った面積とも比べる。
+観測所 $i$ に最も近い格子点の数を $m_i$ とすると、$m_i h^2$ は Thiessen 領域の面積 $A_i$ の見積もりになる。
+境界の上の格子点は等距離の観測所に等分して数える。
+見積もりの誤差は、領域の境界を横切る格子の正方形からだけ生じる。
+そのような正方形は周の長さ $L_i$ に対して $L_i/h$ 個程度なので、相対誤差は $O(L_i h / A_i)$ で抑えられ、実際には正負が打ち消し合ってこれより小さくなる。
+
+次のブロックは 2 つのセルが共有する定義である。
+`STATIONS` は前のページと同じ観測所の座標、`BASIN` は流域の幅と高さである。
+`grid_points` は格子点の列を返し、`closest_stations` は総当たりで最小の 2 乗距離とそれを与える観測所の集合を返す。
+`thiessen_polygons` は前のページの 2 つのセルの手順を 1 つにまとめたもので、`Voronoi` の稜から隣接観測所を求め、二等分線と矩形の 4 辺の半平面の交差で各観測所の多角形を切り取る。
+多角形の頂点は `neighbors` で辺の隣をたどって周の順に並べ、反時計回りにそろえる。
+
+```rust
+//| id: spatial-thiessen-grid-model
+//| kind: definitions
+//| title: 観測所、格子点と Thiessen 領域
+//| crates: [scioxide-spatial]
+use scioxide_spatial::{HalfspaceIntersection, IntersectionKind, PointSet, Voronoi};
+
+/// 観測所 0〜5 の座標 (x, y) [km]。流域の南西の角を原点とする仮想の配置。
+pub(crate) const STATIONS: [[f64; 2]; 6] = [
+    [10.0, 10.0],
+    [30.0, 15.0],
+    [15.0, 35.0],
+    [40.0, 40.0],
+    [5.0, 50.0],
+    [25.0, 25.0],
+];
+
+/// 流域の幅 W と高さ H [km]。
+pub(crate) const BASIN: [f64; 2] = [50.0, 60.0];
+
+/// 格子点 ((k + ½)h, (l + ½)h) の列。
+pub(crate) fn grid_points(spacing: f64) -> Vec<[f64; 2]> {
+    let columns = (BASIN[0] / spacing).round() as usize;
+    let rows = (BASIN[1] / spacing).round() as usize;
+    let mut points = Vec::with_capacity(columns * rows);
+    for k in 0..columns {
+        for l in 0..rows {
+            points.push([(k as f64 + 0.5) * spacing, (l as f64 + 0.5) * spacing]);
+        }
+    }
+    points
+}
+
+/// 総当たりで求めた最小の 2 乗距離と、それを与える観測所の集合。
+pub(crate) fn closest_stations(p: &[f64; 2]) -> (f64, Vec<usize>) {
+    let squared = STATIONS.map(|s| {
+        let (dx, dy) = (p[0] - s[0], p[1] - s[1]);
+        dx * dx + dy * dy
+    });
+    let least = squared.iter().copied().fold(f64::INFINITY, f64::min);
+    let closest = (0..STATIONS.len())
+        .filter(|&i| squared[i] == least)
+        .collect();
+    (least, closest)
+}
+
+/// 各観測所の Thiessen 領域を、反時計回りの頂点の列で返す。
+pub(crate) fn thiessen_polygons() -> Result<Vec<Vec<[f64; 2]>>, String> {
+    let sites = PointSet::from_points(&STATIONS).map_err(|e| e.to_string())?;
+    let voronoi = Voronoi::new(&sites).map_err(|e| e.to_string())?;
+    // 稜の sites() は正準添字。representatives() で観測所の番号に戻す。
+    let station_of = voronoi.delaunay().representatives();
+    let mut neighbors = vec![Vec::new(); STATIONS.len()];
+    for ridge in voronoi.ridges() {
+        let [a, b] = ridge.sites();
+        neighbors[station_of[a]].push(station_of[b]);
+        neighbors[station_of[b]].push(station_of[a]);
+    }
+    let [width, height] = BASIN;
+    let mut polygons = Vec::with_capacity(STATIONS.len());
+    for (i, si) in STATIONS.iter().enumerate() {
+        // 二等分線 2(s_j − s_i)·x + |s_i|² − |s_j|² ≤ 0 と矩形の 4 辺（行 [a₁, a₂, b]）。
+        let mut planes = Vec::new();
+        for &j in &neighbors[i] {
+            let sj = STATIONS[j];
+            let b = si[0] * si[0] + si[1] * si[1] - sj[0] * sj[0] - sj[1] * sj[1];
+            planes.extend([2.0 * (sj[0] - si[0]), 2.0 * (sj[1] - si[1]), b]);
+        }
+        planes.extend([
+            -1.0, 0.0, 0.0, 1.0, 0.0, -width, 0.0, -1.0, 0.0, 0.0, 1.0, -height,
+        ]);
+        let halfspaces = PointSet::from_rows(&planes, 3).map_err(|e| e.to_string())?;
+        // 観測所は矩形と自分の二等分線の厳密な内部にあるので、そのまま内点にする。
+        let cell = HalfspaceIntersection::new(&halfspaces, si).map_err(|e| e.to_string())?;
+        if cell.kind() != IntersectionKind::Bounded {
+            return Err(format!("観測所 {i} の領域が有界でない"));
+        }
+        let count = cell.vertices().len() / 2;
+        let mut order = vec![0];
+        while order.len() < count {
+            let last = order[order.len() - 1];
+            let next = cell
+                .neighbors(last)
+                .map_err(|e| e.to_string())?
+                .find(|v| !order.contains(v))
+                .ok_or("多角形の周をたどれない")?;
+            order.push(next);
+        }
+        let mut ring: Vec<[f64; 2]> = order
+            .iter()
+            .map(|&v| [cell.vertices()[2 * v], cell.vertices()[2 * v + 1]])
+            .collect();
+        let twice_area: f64 = (0..count)
+            .map(|k| {
+                let (p, q) = (ring[k], ring[(k + 1) % count]);
+                p[0] * q[1] - q[0] * p[1]
+            })
+            .sum();
+        if twice_area < 0.0 {
+            ring.reverse();
+        }
+        polygons.push(ring);
+    }
+    Ok(polygons)
+}
+```
+
+## KD 木の最近傍
+
+次のセルは、格子の間隔 $h$ を選び、観測所に作った `KdTree` で各格子点の最近傍を `nearest_into` で求めて参照と比べる。
+KD 木の `Neighbor::index` は点集合の行番号なので、Voronoi と違って正準添字を経由せずに観測所の番号になる。
+`nearest_into` は出力と作業領域をあらかじめ受け取り、照会のたびに割り当てない。
+等距離の格子点では、KD 木はどちらか 1 つの観測所を返すので、その観測所が参照の集合に入っていれば一致とみなす。
+表は格子点の数、等距離の格子点の数、最近傍が参照の集合に入らない点の数と、KD 木の距離 `Neighbor::distance` と総当たりの距離の差の最大値を示す。
+
+```rust
+//| id: spatial-thiessen-kdtree-check
+//| ref: spatial-thiessen-kdtree-check
+//| title: 格子点で KD 木の最近傍を総当たりと照合する
+//| run: reactive
+//| uses: [spatial-thiessen-grid-model]
+//| crates: [scioxide-core, scioxide-spatial]
+//| inputs:
+//|   grid_spacing: {"type":"select","label":"格子の間隔 h [km]","description":"5 km を割り切る間隔から選ぶ。","options":["0.25","0.5","1","2.5"],"value":"0.5"}
+//| cases:
+//|   - {"id":"fine","label":"h = 0.25 km","description":"48000 点で照合し、等距離の格子点は 156 点になる。","inputs":{"grid_spacing":"0.25"}}
+//|   - {"id":"coarse","label":"h = 2.5 km","description":"480 点の粗い格子でも、KD 木の最近傍は参照と一致する。","inputs":{"grid_spacing":"2.5"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"kdtree","path":"/rows/0/0","equals":12000}
+//|       - {"artifact":"kdtree","path":"/rows/0/1","equals":77}
+//|       - {"artifact":"kdtree","path":"/rows/0/2","equals":0}
+//|       - {"artifact":"kdtree","path":"/rows/0/3","range":{"max":1e-13}}
+//|   - case: fine
+//|     expect:
+//|       - {"artifact":"kdtree","path":"/rows/0/1","equals":156}
+//|       - {"artifact":"kdtree","path":"/rows/0/2","equals":0}
+//|   - case: coarse
+//|     expect:
+//|       - {"artifact":"kdtree","path":"/rows/0/0","equals":480}
+//|       - {"artifact":"kdtree","path":"/rows/0/2","equals":0}
+use scioxide_core::{ExecutionContext, RealScalar};
+use scioxide_spatial::{KdTree, Neighbor, PointSet, SearchOptions, SearchWorkspaceRequest};
+
+let spacing: f64 = grid_spacing.parse().map_err(|_| "格子の間隔が数でない")?;
+// KD 木の Neighbor::index は点集合の行番号で、そのまま観測所の番号になる。
+let sites = PointSet::from_points(&STATIONS).map_err(|e| e.to_string())?;
+let tree = KdTree::new(&sites).map_err(|e| e.to_string())?;
+let options = SearchOptions::new();
+let mut workspace = tree
+    .workspace(SearchWorkspaceRequest::new(1, options))
+    .map_err(|e| e.to_string())?;
+let mut nearest = [Neighbor::default()];
+
+let grid = grid_points(spacing);
+let (mut ties, mut misses, mut distance_gap) = (0_usize, 0_usize, 0.0_f64);
+for p in &grid {
+    let (least, closest) = closest_stations(p);
+    tree.nearest_into(
+        p,
+        1,
+        options,
+        &mut nearest,
+        &mut workspace,
+        ExecutionContext::sequential(),
+    )
+    .map_err(|e| e.to_string())?;
+    ties += usize::from(closest.len() > 1);
+    misses += usize::from(!closest.contains(&nearest[0].index));
+    distance_gap = distance_gap.max((nearest[0].distance - RealScalar::sqrt(least)).abs());
+}
+
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "格子点 [個]", "type": "integer" },
+    { "key": "1", "label": "等距離の格子点 [個]", "type": "integer" },
+    { "key": "2", "label": "最近傍が参照と異なる [個]", "type": "integer" },
+    { "key": "3", "label": "距離の最大差 [km]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    columns,
+    vec![(grid.len(), ties, misses, distance_gap)],
+    metadata = serde_json::json!({ "id": "kdtree" })
+);
+```
+
+既定の $h = 0.5$ km では 12000 点のうち 77 点が等距離で、KD 木の最近傍は全点で参照の集合に入った。
+KD 木の距離と総当たりの距離 $\sqrt{\text{最小の 2 乗距離}}$ の差も、全点で 0 である。
+「h = 0.25 km」では 48000 点のうち 156 点、「h = 2.5 km」では 480 点のうち 16 点が等距離で、どちらも不一致は 0 である。
+
+## 多角形への所属と面積
+
+次のセルは、`thiessen_polygons` で切り取った多角形について、各格子点を含む多角形の集合を求めて参照と比べる。
+点が反時計回りの凸多角形に含まれる（周の上を含む）ことは、周のどの辺に対しても点が右側にない、つまり `orient2d` が負にならないことで判定する。
+比較は、参照の観測所が 1 つの点（境界の内部）と、2 つ以上の点（境界の上）に分けて数える。
+1 つ目の表は観測所ごとに、多角形の面積と格子点による見積もり $m_i h^2$ とその相対差を示す。
+2 つ目の表は、所属が参照と異なる点の数を、境界の内部と境界の上に分けて示す。
+
+```rust
+//| id: spatial-thiessen-membership-check
+//| ref: spatial-thiessen-membership-check
+//| title: 格子点で Thiessen 領域への所属と面積を照合する
+//| run: reactive
+//| uses: [spatial-thiessen-grid-model]
+//| crates: [scioxide-core, scioxide-spatial]
+//| inputs:
+//|   grid_spacing: {"type":"select","label":"格子の間隔 h [km]","description":"5 km を割り切る間隔から選ぶ。","options":["0.25","0.5","1","2.5"],"value":"0.5"}
+//| cases:
+//|   - {"id":"fine","label":"h = 0.25 km","description":"面積の見積もりの相対差が 10⁻⁴ を下回る。","inputs":{"grid_spacing":"0.25"}}
+//|   - {"id":"coarse","label":"h = 2.5 km","description":"粗い格子では面積の相対差が 10⁻³ の桁に広がるが、境界の内部の所属は一致する。","inputs":{"grid_spacing":"2.5"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"membership","path":"/rows/0/0","equals":0}
+//|       - {"artifact":"grid-areas","path":"/rows/3/3","range":{"min":-1e-3,"max":1e-3}}
+//|       - {"artifact":"grid-areas","path":"/rows/5/2","approx":{"value":275,"atol":1e-9}}
+//|   - case: fine
+//|     expect:
+//|       - {"artifact":"membership","path":"/rows/0/0","equals":0}
+//|       - {"artifact":"grid-areas","path":"/rows/3/3","range":{"min":-1e-4,"max":1e-4}}
+//|   - case: coarse
+//|     expect:
+//|       - {"artifact":"membership","path":"/rows/0/0","equals":0}
+//|       - {"artifact":"grid-areas","path":"/rows/2/3","range":{"min":1e-3,"max":1e-2}}
+use scioxide_core::SciOxideError;
+use scioxide_spatial::{PredicateSign, orient2d};
+
+// 反時計回りの凸多角形が点を含む（周上を含む）か: 全辺で orient2d が負でない。
+fn contains(ring: &[[f64; 2]], p: &[f64; 2]) -> Result<bool, SciOxideError> {
+    for k in 0..ring.len() {
+        let next = ring[(k + 1) % ring.len()];
+        if orient2d(&ring[k], &next, p)? == PredicateSign::Negative {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+let spacing: f64 = grid_spacing.parse().map_err(|_| "格子の間隔が数でない")?;
+let polygons = thiessen_polygons()?;
+let n = STATIONS.len();
+let mut weights = vec![0.0_f64; n];
+let (mut interior_misses, mut boundary_misses) = (0_usize, 0_usize);
+for p in grid_points(spacing) {
+    let (_, closest) = closest_stations(&p);
+    let mut inside = Vec::new();
+    for (i, ring) in polygons.iter().enumerate() {
+        if contains(ring, &p).map_err(|e| e.to_string())? {
+            inside.push(i);
+        }
+    }
+    // 境界上の点は、等距離の観測所に等分して面積の見積もりに数える。
+    for &i in &closest {
+        weights[i] += 1.0 / closest.len() as f64;
+    }
+    if closest.len() > 1 {
+        boundary_misses += usize::from(inside != closest);
+    } else {
+        interior_misses += usize::from(inside != closest);
+    }
+}
+
+// 多角形の面積は靴紐公式 ½ Σ (x_k y_{k+1} − x_{k+1} y_k) で求める。
+let area = |ring: &[[f64; 2]]| -> f64 {
+    let count = ring.len();
+    let twice: f64 = (0..count)
+        .map(|k| ring[k][0] * ring[(k + 1) % count][1] - ring[(k + 1) % count][0] * ring[k][1])
+        .sum();
+    0.5 * twice
+};
+let cell_area = spacing * spacing;
+let rows: Vec<(usize, f64, f64, f64)> = (0..n)
+    .map(|i| {
+        let (exact, estimate) = (area(&polygons[i]), weights[i] * cell_area);
+        (i, exact, estimate, (estimate - exact) / exact)
+    })
+    .collect();
+let fixed1 = serde_json::json!({ "fractionDigits": 1 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let area_columns = serde_json::json!([
+    { "key": "0", "label": "観測所", "type": "integer" },
+    { "key": "1", "label": "多角形の面積 [km²]", "type": "number", "format": fixed1 },
+    { "key": "2", "label": "格子点による見積もり [km²]", "type": "number", "format": fixed1 },
+    { "key": "3", "label": "相対差 [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    area_columns,
+    rows,
+    metadata = serde_json::json!({ "id": "grid-areas" })
+);
+let tally_columns = serde_json::json!([
+    { "key": "0", "label": "所属の不一致（境界の内部）[個]", "type": "integer" },
+    { "key": "1", "label": "所属の不一致（境界の上）[個]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    tally_columns,
+    vec![(interior_misses, boundary_misses)],
+    metadata = serde_json::json!({ "id": "membership" })
+);
+```
+
+既定の $h = 0.5$ km では、境界の内部の 11923 点のどれも参照の観測所の多角形だけに含まれ、所属の不一致は 0 である。
+境界の上の 77 点のうち 48 点では、点を含む多角形が等距離の 2 観測所の両方にはならなかった。
+多角形の頂点は丸めた座標なので、辺は二等分線から $10^{-15}$ km 程度ずれ、二等分線のちょうど上の点は辺のわずかに内側か外側に入る。
+`orient2d` の符号は与えた頂点に対しては厳密だが、丸めた頂点は二等分線そのものではないので、境界の上の点の所属は決まらない。
+面積の見積もりの相対差は最大 $3.4\times10^{-4}$ で、「h = 0.25 km」では $4.9\times10^{-5}$、「h = 2.5 km」では $5.7\times10^{-3}$ になり、格子を細かくすると多角形の面積に近づく。
+
+## まとめ
+
+Thiessen 領域の検算には、格子点で総当たりに求めた最も近い観測所が使え、座標を 1/8 km の倍数にとれば等距離の点も厳密に判定できる。
+`KdTree` の `nearest_into` は全格子点で参照の観測所の 1 つを返し、`Neighbor::index` は点集合の行番号なので観測所の番号にそのまま使える。
+切り取った多角形は境界の内部の全格子点で参照と同じ観測所に属し、所属が食い違うのは二等分線のちょうど上の点だけだった。
+頂点が丸めた値なので、境界の上の点をどちらの領域に入れるかは多角形からは決まらず、等距離の判定は観測所の座標で行う。
+格子点の数による面積の見積もりは $h$ とともに多角形の面積に近づき、切り取りの面積を独立に確かめられる。
+
+## 次に読むページ
+
+- [観測所の Thiessen 領域と面積重み雨量](../voronoi-territory/)：同じ観測所の Thiessen 領域を切り取り、面積で重み付けした流域平均雨量を求める。
+- [KD 木による近傍探索](../../algorithms/spatial-trees-and-distance/)：KD 木の最近傍探索、作業領域、距離の定義を確かめる。
+- [厳密な幾何述語](../../algorithms/exact-predicates/)：`orient2d` の符号が与えた座標に対して厳密であることと、その評価の方法を確かめる。

@@ -1,0 +1,407 @@
+---
+title: "Fast products, composition, and Taylor shifts"
+description: "Direct coefficient convolution and FFT rounding and selection, product condition estimates, Plans declaring input shapes and workspaces, and divide-and-conquer composition and Taylor shifts, extended-exponent retries, and cancellation conditioning."
+sidebar:
+  order: 355
+references:
+  poly-composition-taylor-shift: "composition-and-taylor-shifts"
+  poly-direct-convolution-fft: "direct-convolution-and-fft"
+  poly-product-paths-error: "checking-product-paths-and-errors"
+  poly-product-shapes-workspace: "input-shapes-and-storage"
+---
+
+Polynomial coefficient operations include products, composition $p(q(x))$, Taylor shifts $p(x+s)$, and division.
+For floating-point coefficients, direct sums and FFT give different rounding behavior for the same product; coefficient cancellation determines accuracy in composition and Taylor shifts.
+Repeated same-shape operations can prepare transform tables and workspace once to avoid allocation on every execution.
+This page derives their costs and rounding behavior and explains which algorithms `scioxide-poly` selects under which conditions.
+Exact-coefficient Karatsuba and product-tree multipoint evaluation and interpolation are covered in [Exact-coefficient operations and product trees](../exact-arithmetic-and-product-trees/).
+
+Coefficients use ascending powers; $a=(a_0,\ldots,a_{m-1})$ denotes $a(x)=\sum_ia_ix^i$.
+Let $M(n)$ count coefficient multiplications for a product of two polynomials each with $n$ coefficients.
+Here $u$ is unit roundoff and $\varepsilon=2u$ machine epsilon (`EPSILON`); other notation follows [Shared conventions](oxref:poly-notation).
+
+## Direct convolution and FFT
+
+A product $c=ab$ of polynomials with $m$ and $n$ coefficients is coefficient convolution,
+
+$$
+c_k=\sum_{i+j=k}a_ib_j,\qquad k=0,\ldots,m+n-2
+$$
+
+with $m+n-1$ coefficients.
+Direct schoolbook summation needs $mn$ multiplications.
+
+The discrete Fourier transform converts circular convolution into componentwise products.
+Padding both coefficient sequences with zeros to length $N\ge m+n-1$ makes circular convolution equal the desired linear convolution, costing $O(N\log N)$.
+Insufficient padding wraps high-order coefficients into low orders, producing a different polynomial product.
+`scioxide-poly` chooses $N$ as the smallest power of 2 at least $m+n-1$, using real transforms for real coefficients and complex transforms for complex coefficients.
+
+The methods differ in rounding behavior.
+For direct sums, each coefficient satisfies
+
+$$
+|\hat c_k-c_k|\le\gamma_L\,(|a|*|b|)_k,\qquad \gamma_L=\frac{Lu}{1-Lu}
+$$
+
+where $L\le\min(m,n)$ counts summands and $|a|*|b|$ convolves absolute coefficients (a dot-product error bound; Higham, *Accuracy and Stability of Numerical Algorithms*, 2nd ed., §3.1).
+SciOxide combines four partial sums; changing summation order retains the same bound.
+Error scales with each coefficient's sum $(|a|*|b|)_k$, allowing relative accuracy even for small coefficients.
+FFT error depends on the norm of the entire transform; each coefficient's absolute error is roughly $u\,\|a\|_2\|b\|_2$ times a factor of order $\log_2N$ (ibid., §24.1).
+Coefficients many orders of magnitude smaller than others thus lose relative accuracy under the same absolute error magnitude.
+
+`PolynomialOperationPlan` uses FFT only when both conditions below hold; otherwise it uses direct sums.
+
+- The shorter factor has at least 32 real or 16 complex coefficients.
+- Every nonzero coefficient (each nonzero real and imaginary component for complex coefficients) has magnitude at least $\sqrt\varepsilon$ times its factor's largest magnitude.
+
+The first condition is an implementation crossover, neither a mathematical threshold nor a speed guarantee.
+The second depends on coefficient values, so the path may change per call even for the same shape.
+An all-zero factor fails the second condition and uses direct sums.
+Each factor is power-of-two scaled before FFT and the result restored; scaling itself introduces no rounding within representable range.
+Direct sums use ordinary floating-point arithmetic, retrying only coefficients with intermediate range loss in extended exponent range.
+The actual path is returned as `Schoolbook` or `Fft` of `PolynomialProductAlgorithm`.
+
+`polynomial_product_condition` computes $\kappa=\max(1,\|a\|_1\|b\|_1/\|ab\|_1)$ from the completed product to indicate cancellation.
+Since $\||a|*|b|\|_1=\|a\|_1\|b\|_1$, $\kappa$ also measures the 1-norm ratio of the direct-sum error bound to result magnitude.
+Reported backward error replaces $u$ in $\gamma_L$ with machine epsilon $\varepsilon$ and $L$ with product coefficient count, giving $\gamma_{m+n-1}=(m+n-1)\varepsilon/(1-(m+n-1)\varepsilon)$; forward-error estimates multiply this by $\kappa$.
+If all coefficients cancel to a zero product, $\kappa$ is positive infinity (a zero factor also makes the product zero, but gives $\kappa=1$).
+Empty factors give `InvalidInput` (`Empty`), product length other than $m+n-1$ gives `InvalidInput` (`Inconsistent`), and non-finite coefficients give `NonFinite`.
+Cost is proportional to coefficient count, without allocation.
+Both estimates are first-order rounding-model indicators, not upper bounds on computed-product forward error.
+
+## Input shapes and storage
+
+`PolynomialOperationRequest` declares exact input lengths per operation.
+
+- `Multiply { left_len, right_len }` declares products, treating exchanged factors as the same shape.
+- `Compose { outer_len, inner_len }` declares composition $p(q(x))$.
+- `TaylorShift { len }` declares Taylor shifts.
+- `Divide { dividend_len, divisor_len }` declares division `div_rem_into`; quotient and remainder conventions appear in [Long-division backward error](oxref:poly-division-reconstruction-residual).
+
+All lengths must be positive; 0 gives `InvalidInput` (`Empty`) at preparation.
+A larger declared shape does not prepare smaller shapes; declare every shape used.
+`PolynomialOperationPlan::new(&requests)` deduplicates shapes and builds FFT tables only for lengths reachable from declarations.
+`build(&requests, options, context)` prepares while retaining `PolynomialExecutionOptions` with execution policy and worker limit.
+Defaults are sequential execution and limit 64; a larger limit gives `InvalidInput` during preparation.
+The preparation `ExecutionContext` is not retained; pass `ExecutionContext` last on every execution.
+
+`workspace_requirements(&requests)` returns memory requirements for a subset of declared shapes in `PolynomialWorkspaceRequirements`.
+It counts coefficients `coefficient_len()`, FFT complex values `fft_len()`, real samples `real_len()`, and extended-exponent values `scaled_len()`; `required_bytes()` returns total bytes.
+`scaled_len()` is dividend plus divisor lengths for division, twice output length for composition and Taylor-shift [retries below](#composition-and-taylor-shifts), and 0 for products.
+Operations execute individually, so requirements across shapes use per-kind maxima rather than sums.
+Querying undeclared shapes gives `InvalidInput` (`Inconsistent`).
+
+Workspace `PolynomialWorkspace` is caller-owned.
+`PolynomialWorkspace::new()` allocates nothing; `try_reserve(&requirements)` grows only insufficient storage; `check(&requirements)` returns `Sufficient` or `NeedsGrowth` without allocation.
+Reservations never shrink, so workspace for the largest Plan directly serves smaller Plans.
+`plan.workspace(&requests)` creates and reserves a new workspace.
+
+Execution methods `multiply_into`, `compose_into`, `taylor_shift_into`, and `div_rem_into` do not grow workspace.
+Insufficient workspace or wrong output length gives `DimensionMismatch`; undeclared shapes `InvalidInput` (`Inconsistent`); non-finite coefficients `NonFinite`; result coefficient overflow `NumericalInstability`; cancellation or deadline `ExecutionStopped`.
+Results are built in workspace and copied only after every check passes, preserving output on failure.
+Workspace contents may change on success or failure.
+
+## Checking product paths and errors
+
+The next cell multiplies two factors with coefficient counts $n=16,31,32,64$ using one `PolynomialOperationPlan`, tabulating actual paths and coefficientwise errors.
+It declares four shapes in one Plan and reuses one workspace reserved to their maximum requirements.
+Coefficients are nonzero integers from $-8$ to $8$; direct integer convolution in `i64` gives exact products.
+Replacing $a_0$ by $2^{-k}$ through the control makes $c_0=2^{-k}b_0$ a coefficient consisting only of a small product.
+$2^{-k}$ times integers is exact in `f64`, allowing independent exact products after replacement as well.
+The table's coefficientwise relative error is the maximum $|\hat c_k-c_k|/(|a|*|b|)_k$, compared with direct-sum error bound $\gamma_L$.
+
+```rust
+//| id: poly-prepared-product-tree
+//| ref: poly-prepared-product-tree
+//| title: "Product-path selection and coefficientwise error"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-poly]
+//| inputs:
+//|   tiny_exponent: {"type":"select","label":"Exponent k in a₀ = 2⁻ᵏ","options":["No replacement","20","30"],"value":"No replacement"}
+//| cases:
+//|   - {"id":"tiny-20","label":"a₀ = 2⁻²⁰","description":"The largest-coefficient ratio 2⁻²³ is at least √ε, retaining FFT and increasing relative error in c₀.","inputs":{"tiny_exponent":"20"}}
+//|   - {"id":"tiny-30","label":"a₀ = 2⁻³⁰","description":"Ratio 2⁻³³ is below √ε, switching back to direct sums even for n ≥ 32.","inputs":{"tiny_exponent":"30"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"paths","path":"/rows/1/1","equals":"Schoolbook"}
+//|       - {"artifact":"paths","path":"/rows/2/1","equals":"Fft"}
+//|       - {"artifact":"paths","path":"/rows/1/2","range":{"max":1e-16}}
+//|       - {"artifact":"paths","path":"/rows/3/2","range":{"max":1e-13}}
+//|       - {"artifact":"paths","path":"/rows/3/4","range":{"min":1,"max":2}}
+//|   - case: tiny-20
+//|     expect:
+//|       - {"artifact":"paths","path":"/rows/2/1","equals":"Fft"}
+//|       - {"artifact":"paths","path":"/rows/2/3","range":{"min":1e-10,"max":1e-6}}
+//|   - case: tiny-30
+//|     expect:
+//|       - {"artifact":"paths","path":"/rows/3/1","equals":"Schoolbook"}
+//|       - {"artifact":"paths","path":"/rows/3/3","range":{"max":1e-16}}
+use scioxide_core::ExecutionContext;
+use scioxide_poly::{
+    PolynomialOperationPlan, PolynomialOperationRequest, PolynomialProductAlgorithm,
+    PolynomialWorkspaceRequirements, polynomial_product_condition,
+};
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed3 = serde_json::json!({ "fractionDigits": 3 });
+
+// Prepare lengths on both sides of the FFT crossover (shorter side 32) in one Plan.
+let lengths = [16_usize, 31, 32, 64];
+let requests = lengths.map(|n| PolynomialOperationRequest::Multiply {
+    left_len: n,
+    right_len: n,
+});
+let plan = PolynomialOperationPlan::<f64>::new(&requests).map_err(|e| e.to_string())?;
+let requirements: PolynomialWorkspaceRequirements<f64> = plan
+    .workspace_requirements(plan.requests())
+    .map_err(|e| e.to_string())?;
+// One workspace meets the maximum requirements of all four shapes.
+let mut workspace = plan.workspace(plan.requests()).map_err(|e| e.to_string())?;
+let tiny = match tiny_exponent.as_str() {
+    "No replacement" => None,
+    k => Some(1.0 / (1_u64 << k.parse::<u32>().map_err(|e| e.to_string())?) as f64),
+};
+// Deterministically construct nonzero integer coefficients in -8..=8.
+let integer = |i: usize, salt: usize| {
+    let value = ((i * 37 + salt * 11 + 5) % 16) as i64 - 8;
+    if value == 0 { 1 } else { value }
+};
+let mut rows = Vec::new();
+for n in lengths {
+    let mut a_int: Vec<i64> = (0..n).map(|i| integer(i, 1)).collect();
+    let b_int: Vec<i64> = (0..n).map(|i| integer(i, 2)).collect();
+    let mut a: Vec<f64> = a_int.iter().map(|&v| v as f64).collect();
+    let b: Vec<f64> = b_int.iter().map(|&v| v as f64).collect();
+    if let Some(t) = tiny {
+        // Replace a₀ by 2⁻ᵏ and omit it from integer-part convolution.
+        a[0] = t;
+        a_int[0] = 0;
+    }
+    let mut product = vec![0.0; 2 * n - 1];
+    let algorithm: PolynomialProductAlgorithm = plan
+        .multiply_into(
+            &a,
+            &b,
+            &mut product,
+            &mut workspace,
+            ExecutionContext::sequential(),
+        )
+        .map_err(|e| e.to_string())?;
+    // Independent check: integer-part direct convolution in i64 and contribution 2⁻ᵏ b_k from a₀ = 2⁻ᵏ (both exact in f64).
+    let (mut worst, mut first) = (0.0_f64, 0.0_f64);
+    for k in 0..2 * n - 1 {
+        let (mut exact, mut magnitude) = (0_i64, 0_i64);
+        for i in k.saturating_sub(n - 1)..=k.min(n - 1) {
+            exact += a_int[i] * b_int[k - i];
+            magnitude += (a_int[i] * b_int[k - i]).abs();
+        }
+        let small = tiny.map_or(0.0, |t| if k < n { t * b[k] } else { 0.0 });
+        let error =
+            (product[k] - (exact as f64 + small)).abs() / (magnitude as f64 + small.abs());
+        worst = worst.max(error);
+        if k == 0 {
+            first = error;
+        }
+    }
+    let report = polynomial_product_condition(&a, &b, &product).map_err(|e| e.to_string())?;
+    rows.push((
+        n,
+        format!("{algorithm:?}"),
+        worst,
+        first,
+        report.condition_estimate(),
+    ));
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "Coefficient count n [-]", "type": "integer" },
+    { "key": "1", "label": "Actual path" },
+    { "key": "2", "label": "Maximum coefficientwise relative error [-]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "Relative error in c₀ [-]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "Condition estimate κ [-]", "type": "number", "format": fixed3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "paths" })
+);
+emit_text!(&format!(
+    "Workspace requirements: {} coefficients, {} FFT complex values, {} real values.",
+    requirements.coefficient_len(),
+    requirements.fft_len(),
+    requirements.real_len()
+));
+```
+
+With default inputs, $n=16,31$ uses direct sums with zero error; $n=32,64$ uses FFT with maximum coefficientwise relative errors $1.4\times10^{-14}$ and $4.7\times10^{-15}$.
+Direct-sum error is 0 because every integer product and sum is exact in `f64`; general coefficients retain error around $\gamma_L$.
+At $k=20$, ratio $2^{-23}$ to largest coefficient 8 is at least $\sqrt\varepsilon=2^{-26}$, using FFT; relative error in $c_0$ rises to $2.5\times10^{-9}$ ($n=32$) and $1.5\times10^{-8}$ ($n=64$).
+At $k=30$, ratio $2^{-33}$ falls below $\sqrt\varepsilon$, returning to direct sums even for $n\ge32$ and restoring zero error.
+The condition estimate $\kappa$ stays below 2 in all cases, indicating little cancellation.
+The increased error at $k=20$ comes from normwise FFT error large relative to small coefficient $c_0$, rather than cancellation.
+Workspace requirements are $2\cdot64-1=127$ coefficients for the largest shape and a length-128 transform (259 complex and 128 real values), not a sum over four shapes.
+
+## Composition and Taylor shifts
+
+For $p$ of degree $d$ and $q$ of degree $e$, composition $p(q(x))$ has degree at most $de$ and output includes $de+1$ coefficients, retaining high-order zeros.
+Direct polynomial Horner $p(q)=(\cdots(p_dq+p_{d-1})q+\cdots)q+p_0$ repeats products of growing polynomials with $q$ $d$ times, requiring $O(d^2e^2)$ multiplications.
+
+Divide-and-conquer splits $p=p_{\mathrm{low}}+x^mp_{\mathrm{high}}$ and computes
+
+$$
+p(q)=p_{\mathrm{low}}(q)+q^m\,p_{\mathrm{high}}(q)
+$$
+
+recursively.
+Approximate Plans choose $m$ as the largest power of 2 below the coefficient count of $p$, preparing $q^2,q^4,q^8,\ldots$ once and sharing them throughout recursion.
+Fast products give cost $O(M(de)\log d)$.
+`compose_into` chooses the [product path above](#direct-convolution-and-fft) (direct sums or FFT) for powers of $q$ and products at each recursive node.
+
+When intermediate product coefficients become 0, subnormal, or out of range within product support (degrees where nonzero coefficients can occur), `compose_into` retries the entire composition.
+A structural zero cannot be distinguished from a term lost to rounding, and later products could amplify that lost term.
+Inner polynomials such as $q=x^2+1$ with zero coefficients within the support of $q^2$ always trigger this retry.
+The retry performs coefficient Horner $c\leftarrow c\,q+p_i$ in extended exponent range and rounds final coefficients only once.
+This path costs $O(d\,N\,(e+1))$ time ($N=de+1$ is output coefficient count) and twice output length in extended-exponent values.
+That memory is included in Plan requirements `scaled_len()`, so workspace need not grow.
+The return value does not identify which path was taken.
+
+Taylor shift $p(x+s)$ is composition with $q(x)=s+x$.
+The textbook expression $p(x+s)=\sum_kp^{(k)}(s)x^k/k!$ overflows factorials at high order ($171!$ exceeds `f64` range) and incurs cancellation in derivative sums.
+`taylor_shift_into` computes composition without factorials.
+Taylor shifting translates the variable within the same monomial basis; it is not basis conversion.
+
+`polynomial_composition_condition` returns the ratio of $\sum_i|p_i|\,\|q\|_1^i$, Horner evaluation of absolute coefficients at $\|q\|_1$, to the composed result's 1-norm as $\kappa$ (raised to 1 if smaller).
+Since $\|q^i\|_1\le\|q\|_1^i$, the sum of $\|q\|_1^i$ bounds the uncancelled result's 1-norm, making the ratio an indicator of shrinkage through cancellation.
+Relative coefficient perturbations of $p$ at most $u$ change resulting coefficients by at most $u\sum_i|p_i|\,\|q\|_1^i$ in 1-norm, so $u\kappa$ also bounds relative result changes.
+For Taylor shifts, $\|q\|_1=1+|s|$, giving indicator $\sum_i|p_i|(1+|s|)^i/\|p(x+s)\|_1$, which grows with $|s|$.
+The forward-error estimate is $\gamma_N\kappa$ ($N$ is composed coefficient count).
+This ratio is also a first-order indicator, not an error guarantee.
+Cost is proportional to coefficient count, without allocation.
+
+The next cell Taylor-shifts $(x-3)^n/3$ and $(x+3)^n/3$ by $s=3$ and compares coefficient errors with $\kappa$ ($n=4,8,\ldots,24$).
+Inputs round coefficients $\binom{n}{i}(\mp3)^{n-i}/3$ to `f64`; the reference is the shift of those rounded inputs themselves.
+The first shift is close to $x^n/3$; terms of magnitude about $\binom{n}{i}3^{n-i}4^i/3$ cancel to a small result, giving $\kappa\approx\sum_i\binom{n}{i}3^{n-i}4^i=7^n$.
+The second is close to $(x+6)^n/3$ with no cancellation, giving $\kappa=1$.
+The independent check uses that every input coefficient is at least $1/3$ and becomes an integer when multiplied by $2^{54}$.
+Compute shifted coefficients $c_k=\sum_{i\ge k}p_i\binom{i}{k}3^{i-k}$ exactly in `i128` as integers scaled by $2^{54}$, then round to `f64` once.
+Observed error is $\|\hat c-c\|_1/\|c\|_1$; because the reference is rounded once, differences around $u$ lie within the check's resolution.
+One Plan declares six degree shapes, computing them sequentially with one workspace.
+
+```rust
+//| id: poly-taylor-shift-condition
+//| ref: poly-taylor-shift-condition
+//| title: "Cancellation and condition estimates in Taylor shifts"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-poly]
+//| inputs:
+//|   polynomial: {"type":"select","label":"Polynomial to shift (s = 3)","options":["(x − 3)ⁿ/3 (result ≈ xⁿ/3)","(x + 3)ⁿ/3 (result ≈ (x + 6)ⁿ/3)"],"value":"(x − 3)ⁿ/3 (result ≈ xⁿ/3)"}
+//| cases:
+//|   - {"id":"no-cancellation","label":"(x + 3)ⁿ/3","description":"No cancellation gives κ = 1, keeping error at unit-roundoff level.","inputs":{"polynomial":"(x + 3)ⁿ/3 (result ≈ (x + 6)ⁿ/3)"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"shift","path":"/rows/0/1","approx":{"value":2401,"rtol":1e-6}}
+//|       - {"artifact":"shift","path":"/rows/0/3","range":{"max":1e-13}}
+//|       - {"artifact":"shift","path":"/rows/5/3","range":{"min":1e-12}}
+//|   - case: no-cancellation
+//|     expect:
+//|       - {"artifact":"shift","path":"/rows/5/1","approx":{"value":1,"rtol":1e-12}}
+//|       - {"artifact":"shift","path":"/rows/5/3","range":{"max":1e-15}}
+use scioxide_core::ExecutionContext;
+use scioxide_poly::{
+    PolynomialOperationPlan, PolynomialOperationRequest, polynomial_composition_condition,
+};
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let sign: i128 = if polynomial.starts_with("(x − 3)") {
+    -1
+} else {
+    1
+};
+let degrees = [4_usize, 8, 12, 16, 20, 24];
+let requests = degrees.map(|n| PolynomialOperationRequest::TaylorShift { len: n + 1 });
+let plan = PolynomialOperationPlan::<f64>::new(&requests).map_err(|e| e.to_string())?;
+let mut workspace = plan.workspace(plan.requests()).map_err(|e| e.to_string())?;
+// Construct Pascal's triangle C(i, k) (i ≤ 24) with integers.
+let mut binomial: Vec<Vec<i128>> = vec![vec![1]];
+for i in 1..=24 {
+    let previous = &binomial[i - 1];
+    let row = (0..=i)
+        .map(|k| {
+            if k == 0 || k == i {
+                1
+            } else {
+                previous[k - 1] + previous[k]
+            }
+        })
+        .collect();
+    binomial.push(row);
+}
+// Multiplying by 2⁵⁴ makes every f64 of magnitude at least 1/4 an integer.
+let frame = (1_i128 << 54) as f64;
+let mut rows = Vec::new();
+for n in degrees {
+    // Use coefficients C(n, i)(∓3)ⁿ⁻ⁱ/3 rounded to f64 as input (all at least 1/3).
+    let p: Vec<f64> = (0..=n)
+        .map(|i| (binomial[n][i] * (3 * sign).pow((n - i) as u32)) as f64 / 3.0)
+        .collect();
+    let mut shifted = vec![0.0; n + 1];
+    let context = ExecutionContext::sequential();
+    plan.taylor_shift_into(&p, 3.0, &mut shifted, &mut workspace, context)
+        .map_err(|e| e.to_string())?;
+    let report = polynomial_composition_condition(&p, &[3.0, 1.0], &shifted)
+        .map_err(|e| e.to_string())?;
+    // Independent check: compute shifted rounded inputs pᵢ, cₖ = Σᵢ pᵢ C(i, k) 3ⁱ⁻ᵏ,
+    // exactly in i128 as integers scaled by 2⁵⁴, then round to f64 once.
+    let scaled: Vec<i128> = p.iter().map(|&c| (c * frame) as i128).collect();
+    let exact: Vec<f64> = (0..=n)
+        .map(|k| {
+            let sum: i128 = (k..=n)
+                .map(|i| scaled[i] * binomial[i][k] * 3_i128.pow((i - k) as u32))
+                .sum();
+            sum as f64 / frame
+        })
+        .collect();
+    let error: f64 = shifted.iter().zip(&exact).map(|(c, e)| (c - e).abs()).sum();
+    let norm: f64 = exact.iter().map(|e| e.abs()).sum();
+    rows.push((
+        n,
+        report.condition_estimate(),
+        report.forward_error_estimate(),
+        error / norm,
+    ));
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "Degree n [-]", "type": "integer" },
+    { "key": "1", "label": "Condition estimate κ [-]", "type": "number", "format": sci3 },
+    { "key": "2", "label": "Forward-error estimate γκ [-]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "Observed relative error [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "shift" })
+);
+```
+
+For default $(x-3)^n/3$, $\kappa$ matches $7^n$ (2401 at $n=4$, $1.9\times10^{20}$ at $n=24$); forward estimate $\gamma_{n+1}\kappa$ is $0.13$ at $n=16$ and $1.1\times10^{6}$ at $n=24$.
+Observed relative error also grows with $n$, reaching $2.4\times10^{-7}$ at $n=16$ and $1.5\times10^{-2}$ at $n=24$.
+At every $n$, observed error is roughly $u\,4^n/2$, many orders of magnitude below the estimate.
+$u\kappa$ is worst-case amplification of input coefficient perturbations; actual rounding errors need not align in that worst direction.
+Even so, at $n=24$ only about two significant digits remain in result coefficients.
+For $(x+3)^n/3$, $\kappa=1$; observed error is 0 for $n\le20$ and only $4\times10^{-18}$ at $n=24$.
+When $\kappa u$ is near 1, evaluate $p(x+s)$ directly without forming shifted coefficients, or use coefficients expressed in powers of $x-s$ from the start.
+
+## Summary
+
+`PolynomialOperationPlan` uses FFT only for products with at least 32 real (16 complex) coefficients on the shorter side and every nonzero coefficient at least $\sqrt\varepsilon$ times its factor's largest; returns the path through `PolynomialProductAlgorithm`.
+Products needing coefficientwise relative accuracy switch to direct sums when small coefficients are present; read the path alongside `polynomial_product_condition` estimates.
+For composition and Taylor shifts, assess cancellation through $\kappa$ of `polynomial_composition_condition`; do not trust result coefficients when $\kappa u$ approaches 1.
+Declare every repeated-operation shape in `PolynomialOperationRequest` and reuse `PolynomialWorkspace` preallocated for maximum requirements to avoid execution allocation (including extended-exponent composition retries).
+
+## Further reading
+
+- [Exact-coefficient operations and product trees](../exact-arithmetic-and-product-trees/): examine exact Karatsuba and product-tree multipoint multiplication counts.
+- [Sparse multivariate polynomials](../sparse-multivariate/): examine sparse evaluation Plans and intermediate term growth during substitution.
+- [Tensor-product Bernstein and range estimates](../tensor-bernstein-bounds/): examine control-point range estimates and subdivision tightening.
+- [Exact arithmetic, fast operations, and multivariate polynomial APIs](../../api/exact-and-fast/): look up all Plan and workspace items and contracts.

@@ -1,0 +1,581 @@
+---
+title: 逐次平均・分散・高次モーメント・共分散の数理
+description: 素朴な分散公式の桁落ちと条件数、Welford の漸化式、Chan–Golub–LeVeque と Pébay の結合公式、高次の中心モーメントと歪度・尖度の補正、二変量の共分散と相関、累積器と行列ビューの一括集約の使い方。
+sidebar:
+  order: 305
+references:
+  stats-online-accumulator-state-api: "累積器の状態と-api"
+  stats-online-bivariate-covariance-correlation: "二変量の共分散と相関"
+  stats-online-higher-moments-skew-kurtosis: "高次の中心モーメントと歪度尖度"
+  stats-online-matrix-view-reduction: "行列ビューの一括集約"
+  stats-online-merging-partials: "部分集計の結合"
+  stats-online-variance-large-offset: "基準値を大きくしたときの分散"
+---
+
+標本を一つずつ受け取りながら平均と分散を更新する計算を**逐次集計**（online aggregation）と呼ぶ。
+逐次集計は標本を保持しないので、メモリ使用量は標本数によらず一定である。
+別々に集計した結果を後から結合することもできる。
+このページは、教科書の分散公式が浮動小数点で失敗する理由を示し、Welford の漸化式とその結合への一般化、3 次・4 次の中心モーメント、二変量の共分散を導く。
+そのうえで、`OnlineMoments`・`OnlineCovariance` の累積器と、行列ビューを一括で集約する `reduce_*` 関数の使い方を説明する。
+
+## 素朴な分散公式の桁落ち
+
+標本 $x_1, \dots, x_n$ の平均を $\bar x$、偏差平方和を $S = \sum_i (x_i - \bar x)^2$ とすると、標本分散は $s^2 = S/(n-1)$ である。
+$S$ を展開すると、データを 1 回たどるだけで計算できる次の公式（1 パスの公式）を得る。
+
+$$
+S = \sum_{i=1}^n x_i^2 - \frac{1}{n}\Bigl(\sum_{i=1}^n x_i\Bigr)^2
+$$
+
+この公式は二つの大きな数の差を取る。
+平均 $\mu$ が標準偏差 $\sigma$ より桁違いに大きいと両項はほぼ等しく、差を取ると上位の桁が打ち消し合う。
+これを**桁落ち**（cancellation）と呼ぶ。
+
+Chan・Golub・LeVeque（1983）は、データの摂動に対する $S$ の条件数を
+
+$$
+\kappa = \frac{\lVert x \rVert_2}{\sqrt S} = \sqrt{1 + \frac{\mu^2}{\sigma^2}}, \qquad \sigma^2 = \frac{S}{n}
+$$
+
+で表した。
+ここで $\mu$ は標本平均、$\lVert x \rVert_2$ はデータを並べたベクトルの 2 ノルムである。
+単位丸め $u = 2^{-53} \approx 1.1 \times 10^{-16}$ に対して、各アルゴリズムの相対誤差の上限の目安は次のとおりである。
+
+| アルゴリズム | 相対誤差の上限の目安 |
+|---|---|
+| 1 パスの公式（平方和の差） | $n \kappa^2 u$ |
+| 2 パス（平均を求めてから偏差を足す） | $n u + n^2 \kappa^2 u^2$ |
+| 逐次更新（Welford） | $n \kappa u$ |
+| 部分集計の対ごとの結合 | $\kappa u \log_2 n$ |
+
+1 パスの公式の上限は $\kappa^2$ に比例するので、$\mu/\sigma \approx 10^8$ で上限の目安が 1 を超え、結果の桁がすべて失われうる。
+負の分散が出ることもある。
+これらは最悪の場合の上限であり、実際の誤差はデータによってずっと小さいこともある。
+2 パスのアルゴリズムは $\kappa$ が大きくても正確だが、データを 2 回読むので、ストリームには使えない。
+
+## Welford の漸化式
+
+$n-1$ 個目までの平均を $\bar x_{n-1}$、偏差平方和を $M_{2,n-1}$ とし、新しい観測 $x_n$ との差を $\delta_n = x_n - \bar x_{n-1}$ と置く。
+平均は次の式で更新できる。
+
+$$
+\bar x_n = \bar x_{n-1} + \frac{\delta_n}{n}
+$$
+
+偏差 $x_i - \bar x_n = (x_i - \bar x_{n-1}) - \delta_n/n$ を $i < n$ について 2 乗して足す。
+$\sum_{i<n} (x_i - \bar x_{n-1}) = 0$ により交差項が消え、$\sum_{i<n}(x_i - \bar x_n)^2 = M_{2,n-1} + (n-1)\delta_n^2/n^2$ となる。
+これに $x_n$ の寄与 $((n-1)\delta_n/n)^2$ を足すと、次の漸化式を得る（Welford, 1962）。
+
+$$
+M_{2,n} = M_{2,n-1} + \frac{n-1}{n}\delta_n^2 = M_{2,n-1} + (x_n - \bar x_{n-1})(x_n - \bar x_n)
+$$
+
+足し込むのは偏差の積だけで、大きな平方和どうしの差を取らない。
+次節の結合公式に $n_B = 1$、$M_{2,B} = 0$ を代入すると、この漸化式になる。
+
+## 部分集計の結合
+
+二つの部分集合 $A$、$B$ の大きさを $n_A$、$n_B$、平均を $\bar x_A$、$\bar x_B$、偏差平方和を $M_{2,A}$、$M_{2,B}$ とし、$n = n_A + n_B$、$\Delta = \bar x_B - \bar x_A$ と置く。
+各群の偏差を全体の平均からの偏差に書き直し、群内の偏差の和が 0 であることを使うと、次の式を得る（Chan, Golub, LeVeque, 1979）。
+
+$$
+\bar x_{AB} = \bar x_A + \frac{n_B}{n}\Delta, \qquad
+M_{2,AB} = M_{2,A} + M_{2,B} + \frac{n_A n_B}{n}\Delta^2
+$$
+
+最後の項は群の平均どうしの違いによる変動である。
+群の分散を重み付き平均しただけではこの項が抜け、全体の分散を過小に見積もる。
+並列計算やストリーム処理では、各区画で求めた部分集計 $(n_k, \bar x_k, M_{2,k})$ を対ごとに結合して、最終的な統計量にまとめる。
+2 分木の形に結合すると、前節の表の最後の行のとおり、誤差の目安が $n$ ではなく $\log_2 n$ に比例する。
+
+結合は数学的には結合律を満たすが、浮動小数点では結合の順序で丸めが変わる。
+そのため、同じデータでも区画の分け方と結合の順序が違えば、結果の末尾の桁が変わりうる。
+[結合の順序と丸め](#結合の順序と丸め)の節のセルで、この違いの大きさを測る。
+
+## 累積器の状態と API
+
+`OnlineMoments::new(order)` は空の累積器を作り、`observe(x)` は観測 1 個を大きさ 1 の集計とみなして、上の結合公式で現在の状態と結合する。
+`merge(&other)` は互いに素な区画の累積器を結合する。
+どちらも 1 回あたり $O(1)$ の演算で、確保をしない。
+`from_slice(values, order)` はスライス全体から累積器を作る。
+値がすべて f64 の通常の範囲にあれば、基準点をずらした平均を求める補償付きの 1 回目の走査と、中心化した冪を足す 2 回目の走査を行う。
+このため、同じ値を `observe` で 1 個ずつ足した結果とは末尾の桁が違いうる。
+
+内部の状態は件数、平均、最小値・最大値、中心モーメントを件数で割った値 $M_k/n$ である。
+平均は上位と下位の二つの部分からなる補償付きの和で持ち、観測の追加と結合のあいだ下位の部分を捨てない。
+結合に使う平均の差 $\Delta$ も上位どうし・下位どうしを引いてから一つにまとめるので、大きな共通の基準値が先に打ち消し合う。
+値が f64 の通常の範囲を外れると、状態は 2 進の指数を別に持つ拡張範囲の表現（`scioxide_core::Scaled`）に切り替わり、あふれずに集計を続ける。
+
+`observe` は非有限値を `NonFinite`、件数のあふれを `SizeOverflow` で拒む。
+`merge` は保持する次数が違う累積器を `InvalidInput` で拒み、空の累積器との結合は何も変えない。
+結合の結果、偶数次の $M_2$ か $M_4$ が負になったときは、桁落ちとして `NumericalInstability` を返す。
+どの失敗でも、累積器の状態は呼び出しの前のままである。
+
+`snapshot()` は状態を複製した `MomentsSnapshot` を返すだけで、失敗しない。
+各推定値は照会のたびに `S` に丸めて `Result<Option<S>, SciOxideError>` で返る。
+定義されない推定値（空の標本の平均、1 点の標本の標本分散など）は `Ok(None)` になり、`S` で表せない値はその照会だけが `Err` になる。
+たとえば $\pm 10^{154}$ の 2 点では、標本分散 $2 \times 10^{308}$ は f64 であふれて `Err` になるが、平均 0 と標準誤差 $10^{154}$ は返る。
+主な照会は `mean`、`population_variance`（除数 $n$）、`sample_variance`（除数 $n-1$）、`variance(ddof)`、`variance_of_sample_mean`（$s^2/n$）、`standard_error_of_sample_mean`（$s/\sqrt n$）、`minimum`、`maximum` である。
+平均の分散を `S` に丸めずに読む `scaled_variance_of_sample_mean` と、それを使う区間の作り方は、[重み付き推定・標準誤差・信頼区間の数理](oxref:stats-weighted-mean-confidence-interval)で説明する。
+
+## 高次の中心モーメントと歪度・尖度
+
+3 次と 4 次の中心モーメントの和 $M_3 = \sum (x_i - \bar x)^3$、$M_4 = \sum (x_i - \bar x)^4$ も、二項展開で同じように結合できる（Pébay, 2008; Pébay ら, 2016）。
+
+$$
+M_{3,AB} = M_{3,A} + M_{3,B} + \Delta^3 \frac{n_A n_B (n_A - n_B)}{n^2} + 3\Delta \frac{n_A M_{2,B} - n_B M_{2,A}}{n}
+$$
+
+$$
+\begin{aligned}
+M_{4,AB} ={}& M_{4,A} + M_{4,B} + \Delta^4 \frac{n_A n_B (n_A^2 - n_A n_B + n_B^2)}{n^3} \\
+&+ 6\Delta^2 \frac{n_A^2 M_{2,B} + n_B^2 M_{2,A}}{n^2} + 4\Delta \frac{n_A M_{3,B} - n_B M_{3,A}}{n}
+\end{aligned}
+$$
+
+高次の項ほど 1 回の更新の演算が増えるので、`MomentOrder` で累積器が保持する最高次数（`Second`・`Third`・`Fourth`）を先に決める。
+保持していない次数を照会すると `NotImplemented` になる。
+`central_moment(k)` は母集団の中心モーメント $m_k = M_k / n$ を返す（$m_0 = 1$、$m_1 = 0$）。
+
+$m_k$ から、標本歪度 $g_1 = m_3 / m_2^{3/2}$ と超過尖度 $g_2 = m_4/m_2^2 - 3$ を求める。
+`skewness(BiasCorrection::None)` と `kurtosis(BiasCorrection::None, …)` はこの $g_1$、$g_2$ を返す。
+`BiasCorrection::Corrected` は、独立標本の補正（Joanes と Gill, 1998 の $G_1$、$G_2$）を適用する。
+
+$$
+G_1 = \frac{\sqrt{n(n-1)}}{n-2}\, g_1 \quad (n \ge 3), \qquad
+G_2 = \frac{n-1}{(n-2)(n-3)}\bigl((n+1) g_2 + 6\bigr) \quad (n \ge 4)
+$$
+
+$G_1$ と $G_2$ は k 統計量の比である。
+k 統計量 $k_r$ は $r$ 次のキュムラント $\kappa_r$ の不偏推定量だが、その比は一般には不偏ではない。
+`k_statistic(r)`（$r = 1, \dots, 4$）は $k_r$ そのものを、`k_statistic_variance(r)`（$r = 1, 2$）はその分散の不偏推定値を返す。
+$r = 2$ の分散の推定値は標本によっては負になる。
+`KurtosisConvention::Fisher` は超過尖度（正規分布で 0）、`Pearson` はそれに 3 を足した値を返す。
+空の標本、定数の標本、補正に必要な件数に足りない標本では `None` を返す。
+
+## 二変量の共分散と相関
+
+組 $(x_i, y_i)$ の共偏差積和 $C = \sum (x_i - \bar x)(y_i - \bar y)$ も、$\delta_{x,n} = x_n - \bar x_{n-1}$ と $\Delta_x = \bar x_B - \bar x_A$、$\Delta_y = \bar y_B - \bar y_A$ を使って、次のように更新・結合できる。
+
+$$
+C_n = C_{n-1} + \delta_{x,n}\,(y_n - \bar y_n), \qquad
+C_{AB} = C_A + C_B + \frac{n_A n_B}{n}\Delta_x \Delta_y
+$$
+
+標本共分散は $C/(n-1)$、Pearson の相関は $r = C/\sqrt{M_{2,x} M_{2,y}}$ である。
+
+`OnlineCovariance` は 1 組を独立な推定の単位として扱い、両座標の周辺モーメントと共偏差積和を同じ組から更新する。
+`from_slices(x, y, order)` は長さの違う入力を `DimensionMismatch` で拒み、共偏差積和がひどい桁落ちを起こした場合は正確な積で計算し直す。
+`CovarianceSnapshot` は `population_covariance`、`sample_covariance`、平均どうしの共分散 `covariance_of_sample_means`（$C/(n(n-1))$）と、周辺の `marginal_x`・`marginal_y` を返す。
+`correlation` は周辺の分散を丸める前の値から相関を計算し、$[-1, 1]$ に切り詰める。
+切り詰める前の $|r|$ が $1 + 128\varepsilon$ を超えたときは、共偏差積和が桁落ちで精度を失ったとみなして `NumericalInstability` を返す。
+
+共分散と相関が定義されるかどうかは別々に返す。
+`validity()` が返す `CovarianceValidity` は、組がない（`Empty`）、母共分散だけが定義される（`PopulationOnly`）、標本共分散も定義される（`SampleDefined`）を区別する。
+`correlation_validity()` が返す `CorrelationValidity` は、定義される（`Defined`）、組の不足（`InsufficientPairs`）、どちらの座標が定数か（`ConstantX`・`ConstantY`・`ConstantBoth`）を区別する。
+相関が定義されないとき、`correlation` は `Ok(None)` を返す。
+
+2 列より多い変数の共分散行列は行列を受け取る `sample_covariance` などで求める（[多変量統計](../multivariate-statistics/)）。
+各行が整数の度数を持つ度数分布表なら、`frequency_covariance` に度数を `Weights::<_, Frequency>` で渡すと、行を展開せずに平均と共分散行列が求まる。
+
+## 行列ビューの一括集約
+
+多次元配列の各行や各列を別々の標本として集約するときは、配列を `BatchView` で包み、`reduce_*` 関数に渡す。
+`BatchView::new(&values, layout, axis)` の `axis` が標本の軸で、残りの軸の各位置が一つの**バッチ**（独立な標本。
+API ガイドでは一括処理の単位と呼ぶ）になる。
+出力はバッチごとに一つのスナップショットで、各スナップショットは同じバッチを累積器に 1 個ずつ与えたときの状態と同じ量を持つ。
+
+| 既定の設定の形 | 設定を受け取る形 | 作業領域を使う形 | 出力（バッチごと） | 用途 |
+|---|---|---|---|---|
+| `reduce_moments` | `reduce_moments_with_options` | `reduce_moments_into` | `MomentsSnapshot` | 平均・分散・高次モーメント |
+| `reduce_trimmed_moments` | `reduce_trimmed_moments_with_options` | `reduce_trimmed_moments_into` | `MomentsSnapshot` | `TrimLimits` の値の範囲内の観測だけのモーメント |
+| `reduce_weighted_moments` | `reduce_weighted_moments_with_options` | `reduce_weighted_moments_into` | `WeightedMomentsSnapshot` | ビューに付けた重み（頻度・信頼度・解析的）でのモーメント |
+| `reduce_covariance` | `reduce_covariance_with_options` | `reduce_covariance_into` | `CovarianceSnapshot` | 同じ形の 2 つのビューの対ごとの共分散 |
+| `reduce_weighted_covariance` | `reduce_weighted_covariance_with_options` | `reduce_weighted_covariance_into` | `WeightedCovarianceSnapshot` | 重み付きの対ごとの共分散 |
+| `reduce_moment` | `reduce_moment_with_options` | `reduce_moment_into` | `Option<S>` | 任意の次数 $k$ の、指定した中心のまわりのモーメント |
+
+表のとおり、各関数には三つの形がある。
+接尾辞のない形（`reduce_moments(view)` など）は既定の設定を使い、`_with_options` の形は `StatisticsOptions` を受け取る。
+どちらも呼び出しごとに作業領域と出力を確保し、現在のスレッドで逐次に実行する。
+`_into` の形（`reduce_moments_into(view, options, output, workspace, context)` など）は、呼び出し側が用意した出力のスライスと作業領域に書き込み、実行コンテキスト `ExecutionContext` を受け取る。
+作業領域は `ReductionWorkspace::workspace_requirements(view, options, context)` で大きさを問い合わせる。
+返る `ReductionRequirements` は、バッチ数 `batches()`、バッチあたりの区画数 `workers()`、作業領域のバイト数 `required_bytes::<S>()` を持つ。
+`ReductionWorkspace::workspace(&req)` で作るか、既存の作業領域に `try_reserve(&req)` で追加し、`check(&req)` で足りるかを確かめる。
+同じ形のビューを繰り返し集約するときは、`_into` の形と作業領域を使い回すと、2 回目以降は確保をしない。
+
+`StatisticsOptions` は欠測と非有限値の扱い、結合の順序、保持する次数を決める。
+既定では、検証用の配列（`BatchView::with_validity`）で欠測とされた観測（`MissingPolicy::Reject`）と NaN・無限大（`NonFinitePolicy::Reject`）をエラーにし、`Skip` を選ぶと推定から除く。
+`with_moment_order` は `reduce_moments` などが保持する次数（既定は `MomentOrder::Second`）、`with_max_bytes` は作業領域の上限を決める。
+`MergePolicy::InputOrder`（既定）は各バッチを入力の順に 1 回たどる。
+`MergePolicy::StablePartitions` は各バッチを実行 Plan の区画に分け、区画を並列に処理してから、決まった区画の順に結合する。
+どちらの順序でも結果はスレッドの完了順によらないが、二つの順序どうしでは丸めの分だけ違いうる。
+scioxide-stats の試験は、区画の結合と 1 回の走査の差を $128\,\varepsilon\,(\text{木の深さ}+1)$ に尺度（平均では値の大きさ、分散では範囲の 2 乗、共分散では両座標の範囲の積）を掛けた範囲で確かめている。
+有理数の厳密計算による参照値とは、ばらつきの対応する冪で正規化した差を $512\,\varepsilon$（と出力の非正規化数の 1 単位）の範囲で比べている。
+これらは試験で確かめた範囲であり、悪条件のデータすべてに対する前進誤差の保証ではない。
+
+`reduce_moment(view, k, center)` は、各バッチについて次の量を返す。
+
+$$
+\mu_k = \frac{1}{n}\sum_{i=1}^n (x_i - c)^k
+$$
+
+`center` が `Some(c)` なら $c$ のまわり、`None` ならバッチの平均のまわりのモーメントである。
+原点のまわりのモーメント（生のモーメント）は `Some(0.0)` で求まる。
+平均のまわりでは平均を求める走査と冪を足す走査の 2 回をたどる。
+空のバッチは `None`、$k = 0$ は正確に 1、平均のまわりの $k = 1$ は正確に 0 になる。
+`reduce_trimmed_moments(view, limits)` は、まず欠測と非有限値の方針で観測を検査し、そのあと `TrimLimits` の範囲外の観測を除いてモーメントを求める。
+`TrimLimits` は値の範囲であり、割合で両端を除くトリム平均とは別のものである（[順序統計・極値・ロバスト位置推定量](oxref:stats-robust-breakdown-trimmed-mean)）。
+
+## 基準値を大きくしたときの分散
+
+偏差 $[-2, -1, 0, 1, 2]$ に基準値 $10^p$ を加えた 5 個の値の標本分散は、基準値によらず正確に 2.5 である。
+$10^{15.5} < 2^{52}$ なので値 $10^p + d$ は f64 で正確に表せ、計算した分散と 2.5 の差はすべてアルゴリズムの丸めによる。
+次のセルは、基準値を $10^0$ から $10^{15.5}$ まで動かし、`OnlineMoments` の標本分散と、比較のために書いた 1 パスの公式の値の、2.5 からの差を両対数のグラフに描く。
+選んだ指数 $p$ の基準値を縦線で示し、その点の値を表に出す。
+差がちょうど 0 の点は対数軸に描けないので、その件数を表に数える。
+
+```rust
+//| id: stats-offset-variance
+//| ref: stats-offset-variance
+//| title: 基準値を大きくして素朴な分散公式と逐次更新を比べる
+//| run: reactive
+//| crates: [scioxide-stats, scioxide-core]
+//| inputs:
+//|   offset_exponent: {"type":"range","label":"基準値の指数 p（基準値 10^p）","description":"同じ偏差 −2…2 に加える基準値の大きさを変える。","min":0,"max":15,"step":1,"value":10}
+//| cases:
+//|   - {"id":"small-offset","label":"p = 3","description":"κ² u がまだ小さく、1 パスの公式も 2.5 に近い値を返す。","inputs":{"offset_exponent":3}}
+//|   - {"id":"huge-offset","label":"p = 15","description":"1 パスの公式は意味のない値を返し、逐次更新は 2.5 を保つ。","inputs":{"offset_exponent":15}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"variance","path":"/rows/1/1","approx":{"value":2.5,"atol":1e-14}}
+//|       - {"artifact":"variance","path":"/rows/0/2","approx":{"value":-2.5,"atol":1e-12}}
+//|       - {"artifact":"variance","path":"/rows/1/3","equals":61}
+//|       - {"artifact":"variance","path":"/rows/0/3","equals":17}
+//|   - case: small-offset
+//|     expect:
+//|       - {"artifact":"variance","path":"/rows/0/2","range":{"min":-1e-9,"max":1e-9}}
+//|       - {"artifact":"variance","path":"/rows/1/1","approx":{"value":2.5,"atol":1e-14}}
+//|   - case: huge-offset
+//|     expect:
+//|       - {"artifact":"variance","path":"/rows/0/2","range":{"max":-1e10}}
+//|       - {"artifact":"variance","path":"/rows/1/1","approx":{"value":2.5,"atol":1e-14}}
+use scioxide_core::RealScalar;
+use scioxide_stats::{MomentOrder, OnlineMoments};
+
+// 偏差 [-2, -1, 0, 1, 2] の標本分散は基準値によらず正確に 2.5。
+let deviations = [-2.0_f64, -1.0, 0.0, 1.0, 2.0];
+let exact = 2.5_f64;
+let evaluate = |offset: f64| -> Result<(f64, f64), String> {
+    let values: Vec<f64> = deviations.iter().map(|&d| offset + d).collect();
+    // 主計算: scioxide-stats の逐次更新。
+    let mut moments = OnlineMoments::new(MomentOrder::Second);
+    for &v in &values {
+        moments.observe(v).map_err(|e| e.to_string())?;
+    }
+    let stable = moments
+        .snapshot()
+        .sample_variance()
+        .map_err(|e| e.to_string())?
+        .ok_or("標本分散が未定義")?;
+    // 比較用: 平方和の差による 1 パスの公式（scioxide-stats の計算ではない）。
+    let n = values.len() as f64;
+    let sum: f64 = values.iter().sum();
+    let squares: f64 = values.iter().map(|v| v * v).sum();
+    Ok(((squares - sum * sum / n) / (n - 1.0), stable))
+};
+
+// 横軸を 10^0 から 10^15.5 に固定して差を描く。差 0 の点は対数軸に描けないので数える。
+let (mut naive_curve, mut stable_curve) = (Vec::new(), Vec::new());
+let (mut naive_zero, mut stable_zero) = (0_u32, 0_u32);
+for i in 0..=62 {
+    let offset = RealScalar::powf(10.0_f64, 15.5 * f64::from(i) / 62.0);
+    let (naive, stable) = evaluate(offset)?;
+    let (dn, ds) = ((naive - exact).abs(), (stable - exact).abs());
+    if dn > 0.0 {
+        naive_curve.push([offset, dn]);
+    } else {
+        naive_zero += 1;
+    }
+    if ds > 0.0 {
+        stable_curve.push([offset, ds]);
+    } else {
+        stable_zero += 1;
+    }
+}
+let offset = RealScalar::powf(10.0_f64, offset_exponent);
+let (naive, stable) = evaluate(offset)?;
+
+emit_line_chart!(
+    &vec![
+        serde_json::json!({
+            "name": "1 パスの公式（平方和の差）",
+            "points": naive_curve,
+            "style": {"showSymbol": true}
+        }),
+        serde_json::json!({
+            "name": "OnlineMoments（逐次更新）",
+            "points": stable_curve,
+            "style": {"showSymbol": true, "symbol": "diamond"}
+        }),
+    ],
+    options = &serde_json::json!({
+        "xLabel": "基準値 [-]",
+        "yLabel": "標本分散の厳密値 2.5 との差 [-]",
+        "xType": "log",
+        "yType": "log",
+        "xMin": 1.0,
+        "xMax": 4.0e15,
+        "link": {"group": "stats-offset"},
+        "annotations": [{"kind": "line", "axis": "x", "value": offset, "label": "選んだ基準値"}]
+    })
+);
+let sci4 = serde_json::json!({ "notation": "scientific", "significantDigits": 4 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "アルゴリズム", "type": "string" },
+    { "key": "1", "label": "標本分散 [-]", "type": "number", "format": sci4 },
+    { "key": "2", "label": "厳密値 2.5 との差 [-]", "type": "number", "format": sci2 },
+    { "key": "3", "label": "差が 0 の点 [個/63]", "type": "integer" }
+]);
+let rows = vec![
+    ("1 パスの公式", naive, naive - exact, naive_zero),
+    ("OnlineMoments", stable, stable - exact, stable_zero),
+];
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "variance" })
+);
+```
+
+1 パスの公式の差は基準値の 2 乗に比例して増え、基準値 5.6 で $7.1 \times 10^{-15}$、$1.8 \times 10^7$ で $6.2 \times 10^{-2}$ になる。
+この標本の母分散は $\sigma^2 = 2$ なので $\kappa \approx 10^p/\sqrt 2$ で、差の増え方は前節の上限の目安 $n\kappa^2 u$ の $\kappa^2$ への比例と一致する。
+基準値 $10^8$ で差が 2.5 に達し（分散が 0 になる）、それより大きい基準値では 0 か、$10^{15}$ での差 $-1.4 \times 10^{14}$ のような意味のない値を返す。
+表は、既定の $p = 10$ で 1 パスの公式が 0 を返すことを示す。
+
+`OnlineMoments` の差が 0 でなかったのは、63 点のうち基準値 3.2 と 32 の 2 点だけで、大きさは $5.3 \times 10^{-15}$ 以下である。
+残りの 61 点では 2.5 を正確に返した。
+偏差が小さな整数なので更新の積が正確に表せることも効いており、一般のデータで差が 0 になることを意味しない。
+次の節で、偏差に端数を持たせたデータで誤差の大きさを測る。
+
+## 結合の順序と丸め
+
+部分集計の結合が丸めにどう影響するかを、正確な参照値を持つデータで測る。
+次のセルは、乱数のシードから $1/64$ の整数倍の偏差 $d_i \in [-8, 8]$ を $n = 4096$ 個作り、基準値 $10^p$ を加える。
+$10^{13} \cdot 64 < 2^{53}$ なので、値 $10^p + d_i$（$p \le 13$）は f64 で正確に表せる。
+偏差の和 $\sum d_i$ と平方和 $\sum d_i^2$ は f64 で正確に求まり、標本分散の厳密値は
+
+$$
+s^2 = \frac{n\sum d_i^2 - \bigl(\sum d_i\bigr)^2}{n(n-1)}
+$$
+
+の分子を正確に、割り算を 1 回の丸めで計算できる（独立な検算）。
+このデータで、四つの計算順序の標本分散の相対誤差を比べる。
+`observe` で 1 個ずつ足す順序、`from_slice` の 2 回の走査、区画ごとの累積器を左から順に `merge` する順序、区画の累積器を 2 分木の形に対ごとに `merge` する順序である。
+区画の数 $k$ は入力で変える。
+比較のため、1 パスの公式の相対誤差も描く。
+横軸は前のセルと同じ基準値なので、二つのグラフの拡大・移動は連動する。
+
+```rust
+//| id: stats-merge-order
+//| ref: stats-merge-order
+//| title: 区画の数と結合の順序を変えて標本分散の相対誤差を測る
+//| run: reactive
+//| crates: [scioxide-stats, scioxide-core]
+//| inputs:
+//|   sampling_seed: {"type":"integer","label":"乱数のシード","min":0,"max":100000,"value":2024}
+//|   partition_exponent: {"type":"range","label":"区画の数 k = 2^j の指数 j","description":"4096 個の観測を等しい大きさの k 個の区画に分ける。","min":0,"max":8,"step":1,"value":4}
+//|   offset_exponent: {"type":"range","label":"表に出す基準値の指数 p","description":"表の行を計算する基準値 10^p を選ぶ。","min":0,"max":13,"step":1,"value":10}
+//| cases:
+//|   - {"id":"one-partition","label":"k = 1","description":"区画が一つなら左からの結合と木の結合は observe と同じ順序になる。","inputs":{"partition_exponent":0}}
+//|   - {"id":"many-partitions","label":"k = 256","description":"16 個ずつの区画を結合する。","inputs":{"partition_exponent":8}}
+//|   - {"id":"small-offset","label":"p = 0","description":"条件数が 1 に近いデータでも、累積器の誤差は基準値 10^10 のときと同じ。","inputs":{"offset_exponent":0}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"orders","path":"/rows/0/2","approx":{"value":24.2515,"rtol":1e-4}}
+//|       - {"artifact":"orders","path":"/rows/1/1","range":{"max":4e-16}}
+//|       - {"artifact":"orders","path":"/rows/2/2","approx":{"value":6.0629,"rtol":1e-4}}
+//|       - {"artifact":"orders","path":"/rows/3/2","approx":{"value":3.0314,"rtol":1e-4}}
+//|       - {"artifact":"orders","path":"/rows/4/1","range":{"min":100}}
+//|   - case: one-partition
+//|     expect:
+//|       - {"artifact":"orders","path":"/rows/2/2","approx":{"value":24.2515,"rtol":1e-4}}
+//|       - {"artifact":"orders","path":"/rows/3/2","approx":{"value":24.2515,"rtol":1e-4}}
+//|   - case: many-partitions
+//|     expect:
+//|       - {"artifact":"orders","path":"/rows/3/1","range":{"max":4e-16}}
+//|   - case: small-offset
+//|     expect:
+//|       - {"artifact":"orders","path":"/rows/0/2","approx":{"value":24.2515,"rtol":1e-4}}
+//|       - {"artifact":"orders","path":"/rows/4/1","range":{"max":1e-13}}
+use scioxide_core::RealScalar;
+use scioxide_stats::{MomentOrder, OnlineMoments};
+
+const N: usize = 4096;
+// 線形合同法で 1/64 刻みの偏差 d ∈ [-8, 8] を作る（入力の生成）。
+let mut state = sampling_seed as u64;
+let deviations: Vec<f64> = (0..N)
+    .map(|_| {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((state >> 40) % 1025) as f64 / 64.0 - 8.0
+    })
+    .collect();
+// 独立な検算: 偏差の和と平方和は f64 で正確なので、分子は正確、割り算だけを丸める。
+let n = N as f64;
+let sum: f64 = deviations.iter().sum();
+let squares: f64 = deviations.iter().map(|d| d * d).sum();
+let exact = (n * squares - sum * sum) / (n * (n - 1.0));
+let parts = 1_usize << (partition_exponent as u32);
+
+let variance = |m: &OnlineMoments<f64>| -> Result<f64, String> {
+    let s2 = m.snapshot().sample_variance().map_err(|e| e.to_string())?;
+    Ok(s2.ok_or("標本分散が未定義")?)
+};
+let evaluate = |offset: f64| -> Result<[f64; 5], String> {
+    let values: Vec<f64> = deviations.iter().map(|&d| offset + d).collect();
+    let mut sequential = OnlineMoments::new(MomentOrder::Second);
+    for &v in &values {
+        sequential.observe(v).map_err(|e| e.to_string())?;
+    }
+    let slice =
+        OnlineMoments::from_slice(&values, MomentOrder::Second).map_err(|e| e.to_string())?;
+    // 区画ごとに observe した累積器を作る。
+    let mut chunks = Vec::with_capacity(parts);
+    for chunk in values.chunks(N / parts) {
+        let mut m = OnlineMoments::new(MomentOrder::Second);
+        for &v in chunk {
+            m.observe(v).map_err(|e| e.to_string())?;
+        }
+        chunks.push(m);
+    }
+    let mut left = OnlineMoments::new(MomentOrder::Second);
+    for m in &chunks {
+        left.merge(m).map_err(|e| e.to_string())?;
+    }
+    // 2 分木: 隣り合う対を結合して数を半分にすることを繰り返す。
+    while chunks.len() > 1 {
+        let mut next = Vec::with_capacity(chunks.len() / 2);
+        for pair in chunks.chunks(2) {
+            let mut m = pair[0];
+            m.merge(&pair[1]).map_err(|e| e.to_string())?;
+            next.push(m);
+        }
+        chunks = next;
+    }
+    // 比較用: 1 パスの公式（scioxide-stats の計算ではない）。
+    let (s, q) = values
+        .iter()
+        .fold((0.0, 0.0), |(s, q), v| (s + v, q + v * v));
+    let naive = (q - s * s / n) / (n - 1.0);
+    let out = [
+        variance(&sequential)?,
+        variance(&slice)?,
+        variance(&left)?,
+        variance(&chunks[0])?,
+        naive,
+    ];
+    Ok(out.map(|v| (v - exact).abs() / exact))
+};
+
+let names = [
+    "observe（1 個ずつ）",
+    "from_slice（2 回の走査）",
+    "左からの merge",
+    "2 分木の merge",
+    "1 パスの公式",
+];
+let mut curves: Vec<Vec<[f64; 2]>> = vec![Vec::new(); 5];
+let mut zeros = [0_u32; 5];
+for p in 0..=26 {
+    let offset = RealScalar::powf(10.0_f64, 0.5 * f64::from(p));
+    for (j, e) in evaluate(offset)?.into_iter().enumerate() {
+        if e > 0.0 {
+            curves[j].push([offset, e]);
+        } else {
+            zeros[j] += 1;
+        }
+    }
+}
+let series: Vec<_> = names
+    .iter()
+    .zip(curves)
+    .map(|(name, points)| {
+        serde_json::json!({
+            "name": name,
+            "points": points,
+            "style": {"showSymbol": true}
+        })
+    })
+    .collect();
+let chosen = RealScalar::powf(10.0_f64, offset_exponent);
+emit_line_chart!(
+    &series,
+    options = &serde_json::json!({
+        "xLabel": "基準値 [-]",
+        "yLabel": "標本分散の相対誤差 [-]",
+        "xType": "log",
+        "yType": "log",
+        "xMin": 1.0,
+        "xMax": 4.0e15,
+        "link": {"group": "stats-offset"},
+        "annotations": [
+            {"kind": "line", "axis": "x", "value": chosen, "label": "表の基準値"},
+            {"kind": "line", "axis": "y", "value": f64::EPSILON / 2.0, "label": "単位丸め u"}
+        ]
+    })
+);
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let fixed1 = serde_json::json!({ "fractionDigits": 1 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "計算の順序", "type": "string" },
+    { "key": "1", "label": "相対誤差 [-]", "type": "number", "format": sci2 },
+    { "key": "2", "label": "相対誤差 / u [-]", "type": "number", "format": fixed1 },
+    { "key": "3", "label": "誤差 0 の基準値 [個/27]", "type": "integer" }
+]);
+let errors = evaluate(chosen)?;
+let rows: Vec<_> = (0..5)
+    .map(|j| {
+        (
+            names[j],
+            errors[j],
+            errors[j] / (f64::EPSILON / 2.0),
+            zeros[j],
+        )
+    })
+    .collect();
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "orders" })
+);
+```
+
+既定のシード 2024、$k = 16$ では、相対誤差は `observe` が $2.7 \times 10^{-15}$（約 $24u$）、左からの `merge` が $6.7 \times 10^{-16}$（約 $6u$）、2 分木の `merge` が $3.4 \times 10^{-16}$（約 $3u$）で、`from_slice` は 0 である。
+四つの順序の相対誤差は、基準値 $10^0$ から $10^{13}$ まで同じ値をとる。
+平均を補償付きの二つの部分で持ち、平均の差を部分ごとに引くので、基準値が先に打ち消し合い、偏差の部分だけが丸められるからである。
+同じ範囲で、1 パスの公式の相対誤差は $p = 0$ の 0 から $p = 10$ の $1.6 \times 10^3$、$p = 13$ の $6.5 \times 10^9$ まで増える。
+
+$k = 1$ では、区画が一つなので左からの結合と 2 分木の結合は `observe` と同じ順序になり、誤差も同じ $24u$ になる。
+$k = 256$ では 2 分木の誤差は 0、左からの結合は約 $3u$ である。
+シードを 1 に変えると、`observe` は約 $33u$、左からの結合は約 $4.5u$、2 分木は約 $6.0u$ になる。
+順序の優劣は一つのデータでは決まらないが、どの順序の誤差も $u$ の数十倍以内で、前節の上限の目安 $n\kappa u$（$p = 10$ で $10^{10}$ 倍の桁）よりはるかに小さい。
+結合の順序で結果の末尾の桁が変わることは、並列に集計した結果を照合するときの許容範囲を決める根拠になる。
+
+## まとめ
+
+1 パスの分散公式の誤差は条件数の 2 乗 $\kappa^2 \approx (\mu/\sigma)^2$ に比例して増え、平均が標準偏差より 8 桁ほど大きいと意味のある桁が残らない。
+Welford の漸化式とその一般化である結合公式は偏差だけを足し込むので、誤差の目安は $\kappa$ に比例する。
+`OnlineMoments` と `OnlineCovariance` は観測の追加も部分集計の結合も同じ結合公式で行い、補償付きの平均を持つので、大きな基準値を持つデータでも分散の桁を保つ。
+結合の順序で末尾の桁は変わるので、結果の再現が必要なときは `MergePolicy` で順序を固定する。
+保持する次数は `MomentOrder` で先に決め、歪度・尖度の補正と規約は `BiasCorrection` と `KurtosisConvention` で明示する。
+定義されない統計量は `Ok(None)`、表現できない値や桁落ちの検出は `Err` で返るので、二つを区別して扱う。
+
+## 次に読むページ
+
+- [重み付き推定・標準誤差・信頼区間の数理](../weighted-estimation-and-confidence/)：重みの意味によって分散の除数と自由度がどう変わるか、平均の区間をどう作るかを確かめる。
+- [逐次集計するセンサー列と大きな基準値](../../examples/online-sensor/)：ドリフトと周期成分を含む測定列で、逐次平均と分散の読み方を確かめる。
+- [分割集計を一括集計と照合する](../../examples/merge-covariance/)：区画の数と結合の順序が共分散に与える影響を、行列ビューの一括集約と照合して確かめる。

@@ -1,0 +1,435 @@
+---
+title: 通信遅延のテールリスクと裾平均
+description: 少数の混雑で遅れた要求を含む応答遅延の標本について、型 1 と型 7 の分位点と上側の裾平均を比べ、裾の質量が数件しかないときの推定の限界を手計算と照らして確かめる。遅延のバケットに集約した度数から、頻度の重みの分位点と質量の重みの裾平均を求める。
+sidebar:
+  order: 410
+references:
+  stats-latency-bucketed-tail-mean: "バケットに集約した遅延の裾平均"
+  stats-latency-quantile-and-tail-mean: "分位点と裾平均"
+---
+
+サービスの応答遅延では、多くの要求が短い時間で終わる一方で、少数の要求がガベージコレクションや待ち行列の混雑で大きく遅れる。
+平均だけでは少数の遅い要求が見えず、P95 や P99 のような分位点だけでは、その先の裾にどれだけ遅い要求があるかが見えない。
+このページは混雑の強さと観測数を変えた遅延の標本について、分位点と上側の裾平均（expected shortfall）を `EmpiricalDistribution` で求め、裾の質量が 1 件に満たない水準での推定の限界を確かめる。
+後半では遅延をバケットごとの件数に集約した場合に、頻度の重みと質量の重みで何が求まるかを確かめる。
+
+## 分位点と裾平均
+
+観測数 $n$ の遅延の標本で、水準 $p$ の分位点 $q_p$ は、要求の割合 $p$ 以上がこの時間以内に終わる境界である。
+有限の標本では分位点の定義が一つに決まらず、Hyndman と Fan（1996）が整理した 9 通りの定義がある。
+型 1（`QuantileMethod::NearestRank`）は順位 $\lceil np \rceil$ の観測そのものを返す階段関数で、型 7（`QuantileMethod::Linear`）は 0 始まりの位置 $h = (n-1)p$ の両側の順序統計量を線形補間する。
+二つの型は、隣り合う順序統計量が大きく離れた裾で値が分かれる。
+
+分位点関数を $Q(u)$ とすると、上側の裾平均は
+
+$$
+\mathrm{ES}_p = \frac{1}{1-p}\int_p^1 Q(u)\,du
+$$
+
+で、その先の割合 $1-p$ の要求の平均の遅延である。
+分位点が同じでも、裾に極端に遅い要求があれば $\mathrm{ES}_p$ は大きくなる。
+有限の標本では、上側の質量 $m = n(1-p)$ が整数とは限らない。
+`EmpiricalDistribution::tail_mean` は経験分布の分位点関数で上の積分を正確に評価するので、上位 $\lfloor m \rfloor$ 個の観測をすべて含め、次の観測を端数 $m - \lfloor m \rfloor$ の分だけ含める（[境界の質量の按分](oxref:stats-tail-boundary-mass-apportioning)）。
+そのため、裾平均は $p$ について連続に変わる。
+境界の値に同じ値の観測が重なるときは、それらをまとめて一つの境界として扱い、必要な質量だけを取る。
+
+`tail_mean` は `TailMeanResult` を返し、平均 `mean` のほかに、裾の質量 `tail_mass`、境界の値 `boundary_value`、境界から取った質量 `boundary_mass` を持つ。
+上側の裾で $p = 1$ を求めると裾が空になるので `InvalidInput` を返す。
+`EmpiricalDistribution::new` は標本を複製して $O(n \log n)$ で整列し、その後の分位点は $O(1)$、裾平均は $O(n)$ で求まる。
+
+## 遅延の標本と実験
+
+24 ms を中心に周期 17 の正弦で ±4 ms 変わる通常の応答に、4 か所の混雑を加えた標本を作る。
+混雑の遅れは強さ `congestion_scale_ms` の 0.55、1.35、0.75、2.0 倍で、位置は観測数 $n$ に比例させて $n/6$、$5n/12$、$3n/4$、$n-3$ 番目に置く。
+乱数を使わない決定論的な標本なので、結果は入力だけで決まる。
+
+次のセルは型 1 と型 7 の分位点曲線を描き、選んだ水準の上側の裾を網掛けで示す。
+表の上段は代表的な水準の分位点と裾平均、下段は選んだ水準の裾の情報である。
+独立な検算として、整列した標本から上位 $\lfloor m \rfloor$ 個と端数の観測の平均を手で計算し、`tail_mean` との差を出す。
+型 7 の分位点も整列した標本で位置 $h$ の両側を線形補間して手で求め、差を出す。
+
+```rust
+//| id: stats-latency-tail
+//| ref: stats-latency-tail
+//| title: 通信遅延の混雑強度と裾確率を動かす
+//| run: reactive
+//| crates: [scioxide-core, scioxide-stats]
+//| inputs:
+//|   congestion_scale_ms: {"type":"range","label":"混雑の強さ [ms]","description":"少数の遅い要求が裾へ及ぼす強さを変える。","min":0,"max":240,"step":10,"value":120}
+//|   latency_sample_count: {"type":"range","label":"観測数 n [件]","description":"順序統計量の刻みと裾に入る件数を変える。","min":32,"max":256,"step":32,"value":64}
+//|   tail_probability: {"type":"range","label":"裾の水準 p [-]","description":"上側の質量 1−p の始まりを変える。","min":0.8,"max":0.99,"step":0.01,"value":0.95}
+//| cases:
+//|   - {"id":"no-congestion","label":"混雑なし","description":"裾が同じ値の最大値で埋まり、境界の質量が裾の質量全体になる。","inputs":{"congestion_scale_ms":0}}
+//|   - {"id":"strong-congestion","label":"混雑 240 ms","description":"裾平均と最大値が混雑の強さに比例して伸びる。","inputs":{"congestion_scale_ms":240}}
+//|   - {"id":"many-requests","label":"n = 256","description":"混雑の割合が下がり、P95 の型 1 が通常の応答の範囲に戻る。","inputs":{"latency_sample_count":256}}
+//|   - {"id":"few-requests","label":"n = 32","description":"P95 の裾に 1.6 件しか入らない。","inputs":{"latency_sample_count":32}}
+//|   - {"id":"p99","label":"p = 0.99","description":"裾の質量が 1 件に満たず、裾平均が最大値そのものになる。","inputs":{"tail_probability":0.99}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"levels","path":"/rows/2/2","approx":{"value":87.8942713484906,"rtol":1e-09}}
+//|       - {"artifact":"levels","path":"/rows/2/3","approx":{"value":78.9075711519938,"rtol":1e-09}}
+//|       - {"artifact":"levels","path":"/rows/2/4","approx":{"value":179.736710744219,"rtol":1e-09}}
+//|       - {"artifact":"levels","path":"/rows/1/4","approx":{"value":111.348740555114,"rtol":1e-09}}
+//|       - {"artifact":"tail","path":"/rows/2/1","approx":{"value":0.2,"atol":1e-09}}
+//|       - {"artifact":"check","path":"/rows/0/2","range":{"min":-1e-10,"max":1e-10}}
+//|       - {"artifact":"check","path":"/rows/1/2","range":{"min":-1e-10,"max":1e-10}}
+//|   - case: no-congestion
+//|     expect:
+//|       - {"artifact":"tail","path":"/rows/2/1","approx":{"value":3.2,"atol":1e-09}}
+//|       - {"artifact":"levels","path":"/rows/2/4","approx":{"value":27.9829367051801,"rtol":1e-09}}
+//|   - case: strong-congestion
+//|     expect:
+//|       - {"artifact":"levels","path":"/rows/2/4","approx":{"value":337.611710744219,"rtol":1e-09}}
+//|       - {"artifact":"tail","path":"/rows/3/1","approx":{"value":501.894271348491,"rtol":1e-09}}
+//|   - case: many-requests
+//|     expect:
+//|       - {"artifact":"levels","path":"/rows/2/2","approx":{"value":27.9829367051801,"rtol":1e-09}}
+//|       - {"artifact":"levels","path":"/rows/2/4","approx":{"value":70.7906482640731,"rtol":1e-09}}
+//|       - {"artifact":"tail","path":"/rows/2/1","approx":{"value":6.8,"atol":1e-09}}
+//|   - case: few-requests
+//|     expect:
+//|       - {"artifact":"levels","path":"/rows/2/4","approx":{"value":230.851834627625,"rtol":1e-09}}
+//|       - {"artifact":"tail","path":"/rows/2/1","approx":{"value":0.6,"atol":1e-09}}
+//|   - case: p99
+//|     expect:
+//|       - {"artifact":"tail","path":"/rows/2/1","approx":{"value":0.64,"atol":1e-09}}
+//|       - {"artifact":"levels","path":"/rows/4/4","approx":{"value":261.894271348491,"rtol":1e-09}}
+//|       - {"artifact":"check","path":"/rows/0/2","range":{"min":-1e-10,"max":1e-10}}
+use scioxide_core::RealScalar;
+use scioxide_stats::{
+    EmpiricalDistribution, QuantileMethod, QuantileProbability, QuantileRule, TailSide,
+    Unweighted,
+};
+
+let n = latency_sample_count as usize;
+// (位置, 混雑の強さに掛ける倍率)
+let spikes = [
+    (n / 6, 0.55_f64),
+    (5 * n / 12, 1.35),
+    (3 * n / 4, 0.75),
+    (n - 3, 2.0),
+];
+let samples: Vec<f64> = (0..n)
+    .map(|i| {
+        let phase = 2.0 * std::f64::consts::PI * i as f64 / 17.0;
+        let spike = spikes.iter().find(|s| s.0 == i).map_or(0.0, |s| s.1);
+        24.0 + 4.0 * RealScalar::sin(phase) + congestion_scale_ms * spike
+    })
+    .collect();
+let law = EmpiricalDistribution::new(&samples, Unweighted).map_err(|e| e.to_string())?;
+let prob = |p: f64| QuantileProbability::new(p).map_err(|e| e.to_string());
+let quantile = |p: f64, method| -> Result<f64, String> {
+    let q = law.quantile(prob(p)?, QuantileRule::new(method));
+    Ok(q.map_err(|e| e.to_string())?.value())
+};
+let (mut first, mut seventh) = (Vec::new(), Vec::new());
+for i in 0..=200 {
+    let p = f64::from(i) / 200.0;
+    first.push([p, quantile(p, QuantileMethod::NearestRank)?]);
+    seventh.push([p, quantile(p, QuantileMethod::Linear)?]);
+}
+emit_line_chart!(
+    &vec![
+        serde_json::json!({
+            "name": "型 1（NearestRank）",
+            "points": first,
+            "style": { "step": "end" }
+        }),
+        serde_json::json!({ "name": "型 7（Linear）", "points": seventh })
+    ],
+    options = &serde_json::json!({
+        "xLabel": "累積確率 p [-]",
+        "yLabel": "遅延の分位点 [ms]",
+        "yType": "log",
+        "annotations": [
+            { "kind": "line", "axis": "x", "value": tail_probability, "label": "選んだ p" },
+            {
+                "kind": "range",
+                "axis": "x",
+                "from": tail_probability,
+                "to": 1.0,
+                "label": "上側の裾"
+            }
+        ]
+    })
+);
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "水準 p [-]", "type": "number", "format": fixed2 },
+    { "key": "1", "label": "裾の質量 n(1−p) [件]", "type": "number", "format": fixed2 },
+    { "key": "2", "label": "型 1 [ms]", "type": "number", "format": fixed2 },
+    { "key": "3", "label": "型 7 [ms]", "type": "number", "format": fixed2 },
+    { "key": "4", "label": "上側の裾平均 [ms]", "type": "number", "format": fixed2 }
+]);
+let mut rows = Vec::new();
+for p in [0.5_f64, 0.9, 0.95, 0.99, tail_probability] {
+    let tail = law.tail_mean(prob(p)?, TailSide::Upper);
+    let tail = tail.map_err(|e| e.to_string())?;
+    let q1 = quantile(p, QuantileMethod::NearestRank)?;
+    let q7 = quantile(p, QuantileMethod::Linear)?;
+    rows.push((p, n as f64 * (1.0 - p), q1, q7, tail.mean()));
+}
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "levels" })
+);
+// 独立な検算: 整列した標本で、上位 floor(m) 個と次の観測の端数（m = n(1−p)）を平均する。
+let mut sorted = samples.clone();
+sorted.sort_by(f64::total_cmp);
+let m = n as f64 * (1.0 - tail_probability);
+let whole = RealScalar::floor(m) as usize;
+let edge = if whole < n {
+    (m - whole as f64) * sorted[n - 1 - whole]
+} else {
+    0.0
+};
+let by_hand = (sorted.iter().rev().take(whole).sum::<f64>() + edge) / m;
+// 型 7 の手計算: 0 始まりの位置 h = (n − 1)p の両側を線形補間する。
+let h = (n - 1) as f64 * tail_probability;
+let low = RealScalar::floor(h) as usize;
+let high = (low + 1).min(n - 1);
+let type7_by_hand = sorted[low] + (h - low as f64) * (sorted[high] - sorted[low]);
+let tail = law.tail_mean(prob(tail_probability)?, TailSide::Upper);
+let tail = tail.map_err(|e| e.to_string())?;
+let type7 = quantile(tail_probability, QuantileMethod::Linear)?;
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let detail_columns = serde_json::json!([
+    { "key": "0", "label": "選んだ水準の量" },
+    { "key": "1", "label": "値", "type": "number", "format": fixed2, "nullText": "なし" }
+]);
+let detail = vec![
+    ("裾の質量 tail_mass [件]", tail.tail_mass()),
+    (
+        "裾の境界の値 boundary_value [ms]",
+        Some(tail.boundary_value()),
+    ),
+    (
+        "境界から取った質量 boundary_mass [件]",
+        tail.boundary_mass(),
+    ),
+    ("標本の最大値 [ms]", Some(sorted[n - 1])),
+];
+emit_table_with_columns!(
+    detail_columns,
+    detail,
+    metadata = serde_json::json!({ "id": "tail" })
+);
+let check_columns = serde_json::json!([
+    { "key": "0", "label": "検算" },
+    { "key": "1", "label": "API の値 [ms]", "type": "number", "format": fixed2 },
+    { "key": "2", "label": "手計算との差 [ms]", "type": "number", "format": sci2 }
+]);
+let checks = vec![
+    ("上側の裾平均", tail.mean(), tail.mean() - by_hand),
+    ("型 7 の分位点", type7, type7 - type7_by_hand),
+];
+emit_table_with_columns!(
+    check_columns,
+    checks,
+    metadata = serde_json::json!({ "id": "check" })
+);
+```
+
+既定の混雑の強さ 120 ms、$n = 64$ では、P90 は型 1、型 7 とも 27.98 ms で通常の応答の範囲にあるが、上側 10% の裾平均は 111.35 ms になる。
+4 件の混雑の遅延はどれも通常の応答より大きく、裾の 6.4 件にすべて入るからである。
+P95 では型 1 が 4 番目に遅い要求の 87.89 ms、型 7 が通常の応答との間を補間した 78.91 ms と分かれ、裾平均は 179.74 ms である。
+$p = 0.95$ の裾に入れる質量は $64 \times 0.05 = 3.2$ 件で、上位 3 件と境界 87.89 ms の 0.2 件分の平均になる。
+手計算との差は 0、型 7 の手計算との差は $2 \times 10^{-13}$ ms で、どちらも丸めの程度である。
+
+$p = 0.99$ にすると、裾の質量は 0.64 件しかなく、裾平均は最大値 261.89 ms そのもので、型 1 の分位点とも一致する。
+境界から取った質量も 0.64 件で、この水準の推定値は最も遅い 1 件の値だけで決まる。
+型 7 は最大値と 2 番目の値の間を補間して 213.62 ms を返す。
+
+混雑を 0 にすると、分位点も裾平均も 28 ms 以下に収まる。
+周期 17 の正弦は同じ値を繰り返すので、$p = 0.95$ の裾の 3.2 件はすべて同値の最大値 27.98 ms から取られ、境界の質量が裾の質量全体の 3.2 件になる。
+混雑を 240 ms にすると、P95 の裾平均は 337.61 ms、最大値は 501.89 ms になり、混雑の強さにほぼ比例して伸びる。
+
+観測数を 256 にすると、4 件の混雑の割合が下がるので、P95 の型 1 は 27.98 ms に戻り、裾の 12.8 件のうち 6.8 件を同値の境界から取って裾平均は 70.79 ms になる。
+分位点は通常の応答の範囲に戻っても、裾平均には混雑の 4 件がそのまま残る。
+観測数 32 では P95 の裾に 1.6 件しか入らず、裾平均 230.85 ms は最大値と 2 番目の値（182.02 ms の 0.6 件分）だけで決まる。
+
+## バケットに集約した遅延の裾平均
+
+可観測性の基盤ではすべての要求の遅延を個別に保存せず、遅延のバケットごとの件数に集約して保管することが多い。
+件数をそのまま重みにした標本は、各バケットの代表値を件数だけ並べた標本と同じ経験分布を持つ。
+scioxide-stats の重みの型は、この標本の意味を二通りに区別する。
+
+- `Frequency`（`Weights::<_, Frequency>::new(&counts)`、`u64` の件数）は、件数を観測の独立反復数とみなす。
+  分位点は複製した標本に対する Hyndman–Fan の 9 通りの定義をすべて受け付ける。
+  一方、`tail_mean` は `TailWeights`（`Unweighted` と `Mass`）にしか定義されておらず、`Frequency` の分布では呼べない。
+- `Mass`（`Weights::<_, Mass>::new(&masses)`、`f64` の質量）は、重みを確率質量の相対値とみなす。
+  分位点は重み付き経験分布の逆関数（`QuantileRule::<Mass>::inverse_ecdf()`、型 1 に当たる）だけを受け付け、`tail_mean` は上と同じ按分で求まる。
+
+したがって、件数から裾平均を求めるには、件数を `f64` の質量に変換して `Mass` の分布を作る。
+整数の件数を質量にしても経験分布は変わらないので、裾平均は複製した標本の値と一致する。
+構築はバケット数 $K$ について $O(K \log K)$ の整列で、裾平均は $O(K)$ で求まり、要求の件数 $W$ には依存しない。
+
+次のセルは 5 個のバケット（代表値 12、25、48、120、350 ms、件数 8500、1200、250、45、5、合計 $W = 10000$ 件）について、選んだ水準の分位点と上側の裾平均を三つの経路で求める。
+件数を複製した 10000 件の標本を `Unweighted` で扱う経路は、重みの扱いを別の方法で確かめる検算である。
+さらに、上側の質量 $(1-p)W$ を最も遅いバケットから順に取る計算を手で書き、裾平均と比べる。
+`Frequency` の行の裾平均と `Mass` の行の型 7 は、API が提供しないので未定義として表示する。
+
+```rust
+//| id: stats-latency-tail-api-2
+//| ref: stats-latency-tail-api-2
+//| title: バケットの件数から分位点と裾平均を求める
+//| run: reactive
+//| crates: [scioxide-stats]
+//| inputs:
+//|   bucket_tail_probability: {"type":"range","label":"裾の水準 p [-]","description":"上側の質量 (1−p)W の大きさを変える。","min":0.8,"max":0.999,"step":0.001,"value":0.99}
+//| cases:
+//|   - {"id":"p999","label":"p = 0.999","description":"裾の 10 件が最も遅い二つのバケットから取られる。","inputs":{"bucket_tail_probability":0.999}}
+//|   - {"id":"p90","label":"p = 0.9","description":"裾の 1000 件が 25 ms のバケットまで及ぶ。","inputs":{"bucket_tail_probability":0.9}}
+//|   - {"id":"p85","label":"p = 0.85","description":"型 7 の位置が二つのバケットの境目に入り、型 1 と値が分かれる。","inputs":{"bucket_tail_probability":0.85}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"buckets","path":"/rows/1/3","approx":{"value":95.5,"rtol":1e-12}}
+//|       - {"artifact":"buckets","path":"/rows/2/3","approx":{"value":95.5,"rtol":1e-12}}
+//|       - {"artifact":"buckets","path":"/rows/3/3","approx":{"value":95.5,"rtol":1e-12}}
+//|       - {"artifact":"buckets","path":"/rows/1/5","approx":{"value":50.0,"rtol":1e-09}}
+//|       - {"artifact":"buckets","path":"/rows/0/1","equals":48}
+//|       - {"artifact":"buckets","path":"/rows/0/3","equals":null}
+//|   - case: p999
+//|     expect:
+//|       - {"artifact":"buckets","path":"/rows/1/3","approx":{"value":235.0,"rtol":1e-12}}
+//|       - {"artifact":"buckets","path":"/rows/0/1","equals":120}
+//|   - case: p90
+//|     expect:
+//|       - {"artifact":"buckets","path":"/rows/1/3","approx":{"value":36.65,"rtol":1e-12}}
+//|       - {"artifact":"buckets","path":"/rows/1/5","approx":{"value":700.0,"rtol":1e-09}}
+//|   - case: p85
+//|     expect:
+//|       - {"artifact":"buckets","path":"/rows/0/1","equals":12}
+//|       - {"artifact":"buckets","path":"/rows/0/2","approx":{"value":13.95,"rtol":1e-09}}
+//|       - {"artifact":"buckets","path":"/rows/1/5","range":{"min":0,"max":1e-09}}
+use scioxide_stats::{
+    EmpiricalDistribution, Frequency, Mass, QuantileMethod, QuantileProbability, QuantileRule,
+    TailSide, Unweighted, Weights,
+};
+
+// 遅延のバケットの代表値 [ms] と、各バケットの要求の件数。
+let latencies = [12.0_f64, 25.0, 48.0, 120.0, 350.0];
+let counts = [8500_u64, 1200, 250, 45, 5];
+let p = QuantileProbability::new(bucket_tail_probability).map_err(|e| e.to_string())?;
+let (first, seventh) = (QuantileMethod::NearestRank, QuantileMethod::Linear);
+// 頻度の重み: 分位点は 9 通りの定義を受け付けるが、裾平均は定義されていない。
+let by_count =
+    EmpiricalDistribution::new(&latencies, Weights::<_, Frequency>::new(&counts[..]))
+        .map_err(|e| e.to_string())?;
+let count_q1 = by_count.quantile(p, QuantileRule::new(first));
+let count_q1 = count_q1.map_err(|e| e.to_string())?.value();
+let count_q7 = by_count.quantile(p, QuantileRule::new(seventh));
+let count_q7 = count_q7.map_err(|e| e.to_string())?.value();
+// 質量の重み: 件数を f64 の質量にすると裾平均が求まる。
+let masses: Vec<f64> = counts.iter().map(|&c| c as f64).collect();
+let by_mass = EmpiricalDistribution::new(&latencies, Weights::<_, Mass>::new(&masses[..]))
+    .map_err(|e| e.to_string())?;
+let mass_q = by_mass.quantile(p, QuantileRule::<Mass>::inverse_ecdf());
+let mass_q = mass_q.map_err(|e| e.to_string())?.value();
+let mass_tail = by_mass
+    .tail_mean(p, TailSide::Upper)
+    .map_err(|e| e.to_string())?;
+// 検算 1: 件数だけ複製した標本を重みなしで扱う。
+let expanded: Vec<f64> = latencies
+    .iter()
+    .zip(counts)
+    .flat_map(|(&x, c)| std::iter::repeat_n(x, c as usize))
+    .collect();
+let plain = EmpiricalDistribution::new(&expanded, Unweighted).map_err(|e| e.to_string())?;
+let plain_q1 = plain.quantile(p, QuantileRule::new(first));
+let plain_q1 = plain_q1.map_err(|e| e.to_string())?.value();
+let plain_q7 = plain.quantile(p, QuantileRule::new(seventh));
+let plain_q7 = plain_q7.map_err(|e| e.to_string())?.value();
+let plain_tail = plain
+    .tail_mean(p, TailSide::Upper)
+    .map_err(|e| e.to_string())?;
+// 検算 2: 上側の質量 (1 − p)W を最も遅いバケットから順に取る。
+let mut remaining = (1.0 - bucket_tail_probability) * masses.iter().sum::<f64>();
+let tail_weight = remaining;
+let mut tail_sum = 0.0;
+for (&x, &w) in latencies.iter().zip(&masses).rev() {
+    let take = w.min(remaining);
+    tail_sum += take * x;
+    remaining -= take;
+}
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "経路" },
+    { "key": "1", "label": "型 1 [ms]", "type": "number", "format": fixed2, "nullText": "—" },
+    { "key": "2", "label": "型 7 [ms]", "type": "number", "format": fixed2, "nullText": "—" },
+    { "key": "3", "label": "裾平均 [ms]", "type": "number", "format": fixed2, "nullText": "—" },
+    { "key": "4", "label": "境界の値 [ms]", "type": "number", "format": fixed2, "nullText": "—" },
+    { "key": "5", "label": "境界の質量 [件]", "type": "number", "format": fixed2, "nullText": "—" }
+]);
+let rows = vec![
+    (
+        "Frequency（件数）",
+        Some(count_q1),
+        Some(count_q7),
+        None,
+        None,
+        None,
+    ),
+    (
+        "Mass（件数を質量に変換）",
+        Some(mass_q),
+        None,
+        Some(mass_tail.mean()),
+        Some(mass_tail.boundary_value()),
+        mass_tail.boundary_mass(),
+    ),
+    (
+        "複製した標本（Unweighted）",
+        Some(plain_q1),
+        Some(plain_q7),
+        Some(plain_tail.mean()),
+        Some(plain_tail.boundary_value()),
+        plain_tail.boundary_mass(),
+    ),
+    (
+        "手計算（遅いバケットから）",
+        None,
+        None,
+        Some(tail_sum / tail_weight),
+        None,
+        None,
+    ),
+];
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "buckets" })
+);
+```
+
+既定の $p = 0.99$ では、裾は $(1-p)W = 100$ 件で、350 ms の 5 件、120 ms の 45 件、48 ms のバケットの 50 件から成る。
+裾平均は $(5 \times 350 + 45 \times 120 + 50 \times 48)/100 = 95.50$ ms で、`Mass` の経路、複製した 10000 件の標本、手計算の三つが表示した桁で一致する。
+P99 は型 1、型 7 とも 48 ms で、一つのバケットの中に分位点の位置が入るので二つの型は分かれない。
+
+$p = 0.999$ では裾が 10 件になり、350 ms の 5 件と 120 ms の 5 件の平均 235.00 ms、P99.9 は 120 ms になる。
+$p = 0.9$ では裾の 1000 件が 25 ms のバケットの 700 件まで及び、裾平均は 36.65 ms である。
+
+$p = 0.85$ では、型 7 の位置 $h = 9999 \times 0.85 = 8499.15$ が 12 ms のバケットの最後の観測と 25 ms のバケットの最初の観測の間に入り、型 7 は 13.95 ms、型 1 は 12 ms と分かれる。
+このとき `Mass` の経路の境界は 12 ms で、境界の質量は $2.2 \times 10^{-13}$ 件になる。
+$1 - 0.85$ は 2 進の浮動小数点で $0.15000000000000002$ に丸められ、裾の質量が 1500 件をわずかに超えるので、その超過分を 12 ms のバケットから取っている。
+裾平均 32.77 ms への影響は丸めの程度である。
+
+バケットの代表値は、本来はバケットの区間に広がる遅延を一つの値に置き換えたものである。
+代表値に区間の上端を使えば各遅延を大きめに、下端を使えば小さめに置き換えるので、裾平均はその向きに偏る。
+バケットの幅が裾の値に比べて広いときは、代表値の選び方による違いも併せて返す。
+
+## まとめ
+
+分位点は裾の始まりの位置、裾平均はその先の平均の大きさを表し、少数の極端に遅い要求は分位点より裾平均に強く現れる。
+返す分位点には型の番号を添え、型 1 と型 7 で値が大きく違う水準では、観測の間を補間しているかどうかを確かめる。
+裾に入る質量 $n(1-p)$ が数件しかない水準では、裾平均は最大値付近の少数の観測で決まり、標本ごとのばらつきが大きいので、その水準で十分な件数が裾に入るだけの観測数を集める。
+バケットに集約した件数から裾平均を求めるときは、件数を `Mass` の質量に変換し、結果がバケットの代表値の選び方に依存することを添えて返す。
+
+## 次に読むページ
+
+- [重み付き経験分布と裾平均の数理](../../algorithms/tail-means-and-weighted-empirical/)：裾平均の連続性と劣加法性、重み付きの場合の按分を確かめる。
+- [経験分布・標本分位点・補間規約の数理](../../algorithms/empirical-quantiles/)：九つの分位点の定義と、裾の分位点の漸近分散を確かめる。
+- [同値と範囲外を含む標本の分布関数とビン集計](../ecdf-and-bins/)：同じ値が重なった標本で、分布関数と分位点の境界の扱いを数え上げで確かめる。

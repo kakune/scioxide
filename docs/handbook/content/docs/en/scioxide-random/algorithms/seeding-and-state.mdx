@@ -1,0 +1,255 @@
+---
+title: "Seeds, state storage, and state after failure"
+description: "Seed-to-root-state rules and seed collisions, entropy sources and seed_sequence, GRN2 state storage and restoration, snapshots, and StatePolicy for failed batch generation."
+sidebar:
+  order: 307
+references:
+  random-prng-seeding: "seeds-and-initial-states"
+  random-prng-save-restore: "saving-and-restoring-state"
+  random-prng-batch-state-policy: "batch-generation-state-policies"
+---
+
+Reproducing a generator sequence requires knowing its starting state and how far it has advanced.
+This page explains how seeds create initial root states, how to save and restore state in bytes or memory, and where a generator remains after a batch fails partway through.
+Generator recurrences are in [Generator families](oxref:random-prng-families), and the extent of reproducibility is in [Scope of reproducibility](oxref:random-algorithms-reproducibility).
+
+## Seeds and initial states
+
+`SeedableRng` constructs generators from seeds through two functions.
+`from_seed(seed: u64)` determines root state from a 64-bit seed and returns a generator at position 0.
+The same seed for the same type produces the same word sequence from the same root.
+`seed_from_entropy(source)` reads 8 bytes from the caller's `scioxide_core::EntropySource` and passes them to `from_seed` as a little-endian `u64`.
+If the entropy source cannot fill 8 bytes, it returns `CapabilityFailure` without falling back to OS or global entropy.
+SciOxide reads entropy only through this argument.
+
+The seed-to-root-state mapping differs by generator.
+
+| Generator | Seed use |
+|---|---|
+| `SplitMix64`, `Lcg64` | Use the seed directly as state |
+| `Pcg64` | Following the reference implementation's `pcg_setseq`, add the seed to the default increment and advance once |
+| `Xoshiro256StarStar`, `Xoshiro128StarStar` | Use four outputs of `SplitMix64` initialized with the seed (for `Xoshiro128StarStar`, split two words into 32-bit halves). Replace the all-zero state |
+| `Mrg32k3a` | Use `SplitMix64` outputs modulo each component's modulus, avoiding all-zero components. Supply six words directly with `from_state_words` |
+| `Philox4x64`, `Threefry4x64` | Use `SplitMix64` outputs as keys (two words for Philox, four for Threefry). Supply keys directly with `from_key` |
+| `Mt19937` | Expand the low 32 bits into 624 words with mt19937ar's `init_genrand`. Supply array keys with `from_seed_words` |
+| `Taus2`, `Taus113`, `Mrg`, `Cmrg` | Expand low 32 bits (0 becomes 1) with multiplier-69069 congruential method $x \leftarrow 69069\,x \bmod 2^{32}$, discarding several outputs before setting the root (six for `Taus2` and `Mrg`, seven for `Cmrg`, ten for `Taus113`). `Taus2` and `Taus113` raise registers below their minima |
+| `Gfsr4` | Generate 16,384 words from high bits of a multiplier-69069 congruential method seeded with the low 32 bits (0 becomes 4357), incorporate linearly independent words, and retain the 9,689 recurrence-referenced words in the ring |
+| `Ranlux` | Take the seed modulo $2\,147\,483\,563$ (0 becomes 314159265), then generate 24 words with James' method ($x \leftarrow 40014\,x \bmod 2\,147\,483\,563$) |
+| `Ranlxs`, `Ranlxd` | Generate twelve words with a 31-bit shift register from the low 31 bits (0 becomes 1) |
+
+Classical generators reduce seeds to at most 32 bits, so different `u64` seeds may produce identical sequences.
+For example, $s$ and $s + 2^{32}$ produce the same state for `Mt19937`; `Ranlxs` and `Ranlxd` produce identical states for seeds sharing their low 31 bits.
+`Ranlux` uses all 64 bits in its remainder calculation, but seeds congruent modulo $2\,147\,483\,563$ give identical states.
+All 64 seed bits are used by `SplitMix64`, `Lcg64`, `Pcg64`, and generators constructing state from `SplitMix64` outputs.
+
+A generator constructed by `seed_from_entropy` does not return its seed.
+To reproduce a run later, construct and record `u64` from entropy yourself before passing it to `from_seed`, or save the newly constructed state with `export_state`.
+
+`seed_sequence(seed, n)` returns the first $n$ outputs of `SplitMix64` initialized with `seed` as seeds.
+These seeds are distinct and reproducible but contain no more entropy than the original seed.
+$n = 0$ is `InvalidInput`.
+Different seeds alone do not guarantee nonoverlapping generator streams.
+For parallel streams, use `split` or `substream` on a generator supporting splitting ([Stream advancement, jumps, and splits](oxref:random-prng-advance-jump-split)).
+
+## Saving and restoring state
+
+`SerializableState` converts state to portable bytes.
+`export_state` serializes state in the `GRN2` format (version 1) without advancing the generator.
+`import_state` constructs a new generator from bytes; `restore_state` writes that state back to a generator of the same stream.
+`export_state_into` writes to caller storage of length `STATE_BYTES`; mismatched lengths give `DimensionMismatch` without changing storage.
+`export_state_into` and `import_state` allocate no storage.
+
+The bytes comprise a 16-byte header (four bytes `GRN2`, format version, algorithm tag, algorithm version, little-endian marker, flags, two reserved bytes, payload length), root state, current state (including increment for `Pcg64`), stream selector, position (key, selector, path, and position for counter-based generators), and a trailing CRC-32C.
+All values use fixed-width little-endian encoding, making bytes independent of platform, pointer width, and sample floating-point type.
+Generators without position tracking record this in a flag instead of a position.
+
+`import_state` rejects the following bytes with `InvalidInput`.
+
+- Incorrect length, leading `GRN2`, CRC-32C, flags or reserved bytes, or state-value ranges (reason `Malformed`).
+- Unsupported format or algorithm versions, or unknown tags (reason `UnsupportedConfiguration`).
+- A different algorithm's tag (reason `Inconsistent`).
+
+CRC-32C is checked before flags and state values, so accidental corruption is reported as a CRC mismatch (`Malformed`) rather than a semantic error.
+However, leading `GRN2`, format version, algorithm tag, and payload length are checked before CRC.
+CRC does not authenticate against tampering.
+
+`restore_state` rejects bytes whose stream identity `StreamIdentity` (algorithm, root state, selector) differs with `Inconsistent` and leaves the generator unchanged on failure.
+Identity excludes position, allowing restoration to earlier or later positions in the same stream.
+Use `import_state` to switch to another stream.
+
+For temporary restoration within one process, a `SnapshotGenerator` snapshot suffices.
+`snapshot` copies state without advancing; `restore_snapshot` writes it back.
+Built-in generators, `BoundedSubstream`, and QMC cursor `QmcSequence` implement `SnapshotGenerator`.
+Built-in snapshots clone state; taking and restoring them cannot fail and allocates no storage.
+
+## Batch-generation state policies
+
+A batch failing partway through has already consumed generator words.
+State policy determines whether to retain or undo that consumption.
+`StatePolicy` is a sealed trait unavailable for external implementation, with only `AdvanceOnError` and `Rollback` implementations.
+`SamplingPolicy::advance_on_error` and `SamplingPolicy::rollback` pair it with output policy `OutputPolicy`; `latin_hypercube_into` and `PoissonDisk::generate_into` take the state-policy type directly.
+Owned-output forms (such as `sample_n`, `sample_indices`, and `QuasiRng::points`) accept no state policy and leave the generator advanced on failure.
+
+`AdvanceOnError` saves nothing and retains words consumed before failure.
+After failure, the generator is advanced by words consumed by successful samples and the failed sample.
+`Rollback` copies state with `SnapshotGenerator::snapshot` before the batch and restores it with `restore_snapshot` on failure.
+After failure, the generator is at its pre-call position, and the next read returns the same word it would have before the call.
+To restore a generator after owned-form failure, the caller takes a snapshot beforehand and restores it on failure.
+
+State and output policies are independent; choosing `Rollback` still leaves samples written by `Incremental` in output.
+Empty batches neither capture snapshots nor consume words.
+Panics are not caught, so state policy applies only to failures returned as errors.
+Output-policy details are in [Batch sampling and state handling](oxref:random-algorithms-batches-and-state).
+
+The following cell requests $n$ uniform samples from a `BoundedSubstream` with $L$ transitions remaining, comparing four output/state-policy combinations for `sample_n_into` and owned-output `sample_n`.
+`BoundedSubstream` rejects reads beyond a fixed transition count with `OutOfBounds`, ensuring failure for this experiment ([Bounded streams](oxref:random-prng-bounded-partitions)).
+For `sample_n`, both a direct call and restoration from a pre-call snapshot after failure are shown.
+Inputs are $L$ (1–12), $n$ (1–12), and seed.
+If $n > L$, sample $L + 1$ causes an out-of-range read and the batch fails.
+The table shows result classification, changed output count, and post-call position.
+Output is initially filled with $-1$; count entries changed to values in $[0, 1)$.
+
+```rust
+//| id: random-batch-state-policy
+//| ref: random-batch-state-policy
+//| title: "Compare policy-dependent output and generator state after failed batches"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-random]
+//| inputs:
+//|   available: {"type":"range","label":"Remaining stream transitions L [transitions]","description":"Transitions BoundedSubstream permits reading.","min":1,"max":12,"step":1,"value":5}
+//|   requested: {"type":"range","label":"Batch sample count n [count]","description":"If n > L, sample L + 1 fails.","min":1,"max":12,"step":1,"value":8}
+//|   seed: {"type":"range","label":"Random seed [-]","min":1,"max":1000,"step":1,"value":3}
+//| cases:
+//|   - {"id":"enough-words","label":"L = 8, n = 8","description":"With sufficient range, every policy writes 8 samples and reaches position 8.","inputs":{"available":8,"requested":8}}
+//|   - {"id":"one-word","label":"L = 1, n = 12","description":"Only the first sample is generated; the second fails.","inputs":{"available":1,"requested":12}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"policies","path":"/rows/0/2","equals":"OutOfBounds"}
+//|       - {"artifact":"policies","path":"/rows/0/3","equals":0}
+//|       - {"artifact":"policies","path":"/rows/0/4","equals":0}
+//|       - {"artifact":"policies","path":"/rows/1/3","equals":0}
+//|       - {"artifact":"policies","path":"/rows/1/4","equals":5}
+//|       - {"artifact":"policies","path":"/rows/2/3","equals":5}
+//|       - {"artifact":"policies","path":"/rows/2/4","equals":0}
+//|       - {"artifact":"policies","path":"/rows/3/3","equals":5}
+//|       - {"artifact":"policies","path":"/rows/3/4","equals":5}
+//|       - {"artifact":"policies","path":"/rows/4/3","equals":0}
+//|       - {"artifact":"policies","path":"/rows/4/4","equals":5}
+//|       - {"artifact":"policies","path":"/rows/5/4","equals":0}
+//|   - case: enough-words
+//|     expect:
+//|       - {"artifact":"policies","path":"/rows/0/2","equals":"Success"}
+//|       - {"artifact":"policies","path":"/rows/0/3","equals":8}
+//|       - {"artifact":"policies","path":"/rows/1/4","equals":8}
+//|       - {"artifact":"policies","path":"/rows/4/3","equals":8}
+//|   - case: one-word
+//|     expect:
+//|       - {"artifact":"policies","path":"/rows/2/3","equals":1}
+//|       - {"artifact":"policies","path":"/rows/3/4","equals":1}
+use scioxide_random::{
+    BitGenerator, BoundedSubstream, Distribution, OutputPolicy, Pcg64, SamplingPolicy,
+    SamplingRequest, SeedableRng, SnapshotGenerator, StatePolicy, Uniform,
+};
+
+type Stream = BoundedSubstream<Pcg64>;
+// (call, state policy, result, changed outputs [count], post-call position [transitions])
+type Row = (String, String, String, usize, u64);
+
+fn outcome<T>(result: &Result<T, scioxide_core::SciOxideError>) -> String {
+    match result {
+        Ok(_) => "Success".to_string(),
+        Err(e) => format!("{:?}", e.kind()),
+    }
+}
+
+fn position(stream: &Stream) -> Result<u64, String> {
+    let tracked = stream.position().ok_or("Position is untracked")?;
+    u64::try_from(tracked).map_err(|e| e.to_string())
+}
+
+// Caller-owned output form. Count entries of initially −1 output changed to [0, 1).
+fn into_caller<P: StatePolicy<Stream>>(
+    stream: &mut Stream,
+    n: usize,
+    policy: SamplingPolicy<P>,
+) -> Result<(String, usize), String> {
+    let law = Uniform::new(0.0_f64, 1.0).map_err(|e| e.to_string())?;
+    let mut workspace = policy
+        .workspace(SamplingRequest::scalars(n))
+        .map_err(|e| e.to_string())?;
+    let mut output = vec![-1.0_f64; n];
+    let result = law.sample_n_into(stream, policy, &mut output, &mut workspace);
+    let written = output.iter().filter(|&&x| x >= 0.0).count();
+    Ok((outcome(&result), written))
+}
+
+let (len, n) = (available.round() as u64, requested.round() as usize);
+let base = Pcg64::from_seed(seed.round() as u64);
+let fresh = || BoundedSubstream::for_chunk(&base, 0, len).map_err(|e| e.to_string());
+let mut rows: Vec<Row> = Vec::new();
+for output in [OutputPolicy::Atomic, OutputPolicy::Incremental] {
+    let call = format!("sample_n_into（{output:?}）");
+    let mut stream = fresh()?;
+    let (result, written) = into_caller(&mut stream, n, SamplingPolicy::rollback(output))?;
+    let at = position(&stream)?;
+    rows.push((call.clone(), "Rollback".into(), result, written, at));
+    let mut stream = fresh()?;
+    let policy = SamplingPolicy::advance_on_error(output);
+    let (result, written) = into_caller(&mut stream, n, policy)?;
+    let at = position(&stream)?;
+    rows.push((call, "AdvanceOnError".into(), result, written, at));
+}
+// Owned-output forms return a Vec only on success and retain consumed words on failure.
+let law = Uniform::new(0.0_f64, 1.0).map_err(|e| e.to_string())?;
+let mut stream = fresh()?;
+let result = law.sample_n(&mut stream, n);
+let written = result.as_ref().map_or(0, Vec::len);
+let (call, policy) = ("sample_n".to_string(), "None (retain consumption)".to_string());
+rows.push((call, policy, outcome(&result), written, position(&stream)?));
+// To restore an owned-form generator, take a pre-call snapshot and write it back on failure.
+let mut stream = fresh()?;
+let snapshot = stream.snapshot().map_err(|e| e.to_string())?;
+let result = law.sample_n(&mut stream, n);
+if result.is_err() {
+    stream.restore_snapshot(snapshot);
+}
+let written = result.as_ref().map_or(0, Vec::len);
+let call = "snapshot → sample_n → restore_snapshot".to_string();
+let policy = "Restored by caller".to_string();
+rows.push((call, policy, outcome(&result), written, position(&stream)?));
+let columns = serde_json::json!([
+    { "key": "0", "label": "Call" },
+    { "key": "1", "label": "State policy" },
+    { "key": "2", "label": "Result" },
+    { "key": "3", "label": "Changed outputs [count]", "type": "integer" },
+    { "key": "4", "label": "Post-call position [transitions]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "policies" })
+);
+```
+
+With the defaults ($L = 5$, $n = 8$), every call gives `OutOfBounds` at the sixth sample.
+`Atomic` changes no output entries, while `Incremental` writes the five completed samples.
+Choosing `Rollback` restores position 0; `AdvanceOnError` leaves position 5.
+The policies are independent, so combining `Incremental` and `Rollback` leaves five outputs while restoring the generator to its pre-call position.
+On failure, `sample_n` returns no output and leaves the generator advanced by the five consumed transitions.
+Restoring a pre-call snapshot after failure returns position to 0.
+For $L = 8$ and $n = 8$, every combination generates eight samples and reaches position 8.
+Repeating the batch from a generator restored by `Rollback` reproduces the same sample prefix as before failure.
+
+## Summary
+
+The same type and seed give the same sequence, but classical generators reduce seeds to 32 bits or fewer, so different 64-bit seeds need not produce different sequences.
+To reproduce entropy-seeded generators later, record the seed yourself or save the initial state with `export_state`.
+Use `GRN2` bytes for storage across processes and snapshots for restoration within one process.
+To retry from the same position after batch failure, pass `SamplingPolicy::rollback` to `sample_n_into` or snapshot before an owned call; choose `SamplingPolicy::advance_on_error` when counting consumed words.
+
+## Further reading
+
+- [Stream advancement, jumps, and splits](../advance-jump-split/): examine nonoverlapping parallel streams instead of offsetting seeds.
+- [Batch sampling and state handling](oxref:random-algorithms-batches-and-state): examine output policies and workspace rules.
+- [Generator and stream API](../../api/engines-and-streams/): look up contracts of `SeedableRng`, `SerializableState`, and `SnapshotGenerator`.

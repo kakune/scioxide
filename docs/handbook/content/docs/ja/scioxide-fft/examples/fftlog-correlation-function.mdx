@@ -1,0 +1,277 @@
+---
+title: FFTLog でパワースペクトルから相関関数を求める
+description: 等方的な密度ゆらぎのパワースペクトル P(k) から 2 点相関関数 ξ(r) への球 Bessel 変換を次数 1/2 の FFTLog に換算し、べき乗則の閉形式で換算係数とバイアスの選び方を確かめる。
+sidebar:
+  order: 435
+references:
+  fft-fftlog-correlation-mapping: "球-bessel-変換から-fftlog-への換算"
+  fft-fftlog-power-law-check: "べき乗則の閉形式"
+---
+
+宇宙の物質の密度ゆらぎ $\delta(\mathbf{x})$ が統計的に一様かつ等方なら、2 点相関関数 $\xi(r) = \langle\delta(\mathbf{x})\,\delta(\mathbf{x}+\mathbf{r})\rangle$ は距離 $r$ だけで決まる。
+そのパワースペクトル $P(k)$ は $\xi$ の 3 次元 Fourier 変換で、波数の大きさ $k$ だけで決まる。
+観測される $k$ は $10^{-4}$ から $10\,h\,\mathrm{Mpc}^{-1}$、$r$ は $1$ から $10^{3}\,h^{-1}\mathrm{Mpc}$ のように何桁にも広がるので、対数格子の [FFTLog](../../algorithms/fftlog/) が適している。
+
+このページでは、相関関数の式を FFTLog の規約に換算し、べき乗則のスペクトルで換算係数とバイアスの選び方を閉形式と比べて確かめる。
+バリオン音響振動（BAO）を模した合成スペクトルで波数の範囲と相関関数の山の位置の関係を調べる例は、[FFTLog で音響スケールの山を調べる](../fftlog-acoustic-peak/)にある。
+観測データからの宇宙論パラメータの推定は扱わない。
+
+## 単位
+
+波数 $k$ の単位は $h\,\mathrm{Mpc}^{-1}$、距離 $r$ の単位は $h^{-1}\mathrm{Mpc}$ とする。
+$h$ は Hubble 定数を $100\,\mathrm{km\,s^{-1}\,Mpc^{-1}}$ で割った無次元の数で、距離を $h^{-1}\mathrm{Mpc}$ で測ると $h$ の値によらない式になる。
+図と表では $h\,\mathrm{Mpc}^{-1}$ を h/Mpc、$h^{-1}\mathrm{Mpc}$ を Mpc/h と書く。
+パワースペクトル $P(k)$ の単位は体積 $(h^{-1}\mathrm{Mpc})^3$ で、相関関数 $\xi$ は無次元である。
+
+## 球 Bessel 変換から FFTLog への換算
+
+3 次元の Fourier 変換を等方性のもとで角度について積分すると、
+
+$$
+\xi(r) = \frac{1}{2\pi^2} \int_0^\infty k^2 P(k)\, j_0(kr)\,dk, \qquad
+j_0(z) = \frac{\sin z}{z}
+$$
+
+を得る。
+$j_0(z) = \sqrt{\pi/(2z)}\,J_{1/2}(z)$ を代入すると、
+
+$$
+a(k) = k^{3/2} P(k), \qquad
+A(r) = \int_0^\infty a(k)\, J_{1/2}(kr)\, r\,dk, \qquad
+\xi(r) = \frac{A(r)}{(2\pi)^{3/2}\, r^{3/2}}
+$$
+
+となる。
+$A$ は FFTLog の順変換 $\int a(r) J_\mu(kr)\,k\,dr$ で $r$ と $k$ の名前を入れ替えたものなので、次数は $\mu = 1/2$ である。
+API の入力の座標 `log_radius(j)` を $\ln k_j$、出力の座標 `log_frequency(j)` を $\ln r_j$ と読み替える。
+`with_log_radius_center` は入力の中心 $\ln k_c$ を、offset は $\ln(k_c r_c)$ を決める。
+
+次の定義は換算を 1 つの関数にまとめる。
+[音響スケールの例](../fftlog-acoustic-peak/)も同じ関数を使う。
+`correlation_function` は $[k_{\min}, k_{\max}]$ の $n$ 点の対数格子で $P(k)$ を標本化し、FFTLog の出力格子の $r$ と $\xi(r)$ を返す。
+offset は `fftlog_low_ringing_offset` で 0 の近くから選ぶので、$r$ の範囲はおよそ $[1/k_{\max}, 1/k_{\min}]$ になる。
+
+```rust
+//| id: fft-fftlog-correlation-model
+//| kind: definitions
+//| title: P(k) から ξ(r) を次数 1/2 の FFTLog で求める関数
+//| crates: [scioxide-core, scioxide-fft]
+use scioxide_core::{Complex, ExecutionContext};
+use scioxide_fft::{FftDirection, FftLogPlan, FftLogPlanSpec, fftlog_low_ringing_offset};
+
+/// FFTLog の出力格子の距離 r [Mpc/h]、相関関数 ξ(r) [-]、乗数の条件数の対数。
+pub(crate) struct Correlation {
+    pub(crate) radii: Vec<f64>,
+    pub(crate) values: Vec<f64>,
+    pub(crate) log_condition: f64,
+}
+
+/// k ∈ [k_min, k_max] [h/Mpc] の n 点の対数格子で P(k) [(Mpc/h)³] を標本化し、
+/// ξ(r) = (2π)^{−3/2} r^{−3/2} A(r)、A(r) = ∫ k^{3/2} P(k) J_{1/2}(kr) r dk を返す。
+pub(crate) fn correlation_function(
+    power: impl Fn(f64) -> f64,
+    k_min: f64,
+    k_max: f64,
+    n: usize,
+    bias: f64,
+) -> Result<Correlation, String> {
+    let log_step = (k_max / k_min).ln() / (n - 1) as f64;
+    let offset = fftlog_low_ringing_offset(log_step, 0.5, 0.0, bias).map_err(|e| e.to_string())?;
+    let spec = FftLogPlanSpec::new(
+        n,
+        log_step,
+        0.5,
+        offset,
+        Complex::new(bias, 0.0),
+        FftDirection::Forward,
+    )
+    .with_log_radius_center(0.5 * (k_min * k_max).ln());
+    let plan = FftLogPlan::new(spec).map_err(|e| e.to_string())?;
+    // API の入力の格子（log_radius）を波数 k として使う
+    let mut input = Vec::with_capacity(n);
+    for j in 0..n {
+        let k = plan.log_radius(j).map_err(|e| e.to_string())?.exp();
+        input.push(Complex::new(k.powf(1.5) * power(k), 0.0));
+    }
+    let mut output = vec![Complex::new(0.0, 0.0); n];
+    let mut workspace = plan.workspace(()).map_err(|e| e.to_string())?;
+    plan.execute_into(
+        &input,
+        &mut output,
+        &mut workspace,
+        ExecutionContext::sequential(),
+    )
+    .map_err(|e| e.to_string())?;
+    // 出力の格子（log_frequency）を距離 r として読み、ξ = A / ((2π)^{3/2} r^{3/2}) に直す
+    let norm = (2.0 * std::f64::consts::PI).powf(1.5);
+    let mut radii = Vec::with_capacity(n);
+    let mut values = Vec::with_capacity(n);
+    for (j, a) in output.iter().enumerate() {
+        let r = plan.log_frequency(j).map_err(|e| e.to_string())?.exp();
+        radii.push(r);
+        values.push(a.re / (norm * r.powf(1.5)));
+    }
+    let log_condition = plan.diagnostics().log_multiplier_condition;
+    Ok(Correlation {
+        radii,
+        values,
+        log_condition,
+    })
+}
+```
+
+## べき乗則の閉形式
+
+$P(k) = P_0\,(k/k_0)^p$、$P_0 = 1\,(h^{-1}\mathrm{Mpc})^3$、$k_0 = 1\,h\,\mathrm{Mpc}^{-1}$ とする。
+$\int_0^\infty t^{s-1}\sin t\,dt = \Gamma(s)\sin(\pi s/2)$（$-1 < s < 1$）を $s = p + 2$ で使い、Γ の倍数公式と相反公式で書き直すと、
+
+$$
+\xi(r) = \frac{2^p\,\Gamma\!\left(\frac{p+3}{2}\right)}{\pi^{3/2}\,\Gamma\!\left(-\frac{p}{2}\right)} \left(\frac{r}{r_0}\right)^{-(p+3)}, \qquad r_0 = 1\,h^{-1}\mathrm{Mpc}
+$$
+
+になる。
+積分は原点で $p > -3$、無限遠で振動を含めて $p < -1$ のときに収束する（絶対収束には $p < -2$ が要る）。
+$p = -2$ では $\xi(r) = 1/(4\pi r)$ である。
+
+FFTLog の入力は $a(k) = k^{p+3/2}$ なので、バイアスを $q = p + 3/2$ にすると $a(k)\,k^{-q}$ が定数になる。
+定数は周期延長しても段差がなく、出力の $A(r)\,r^{q}$ も定数になるので、FFTLog の結果は丸め誤差の範囲で閉形式に一致する。
+このとき使われる乗数は $\omega = 0$ の 1 つだけで、$U_{1/2}(p + 3/2) = 2^{p+3/2}\,\Gamma((p+3)/2)/\Gamma(-p/2)$ が閉形式の係数を与える。
+したがって、この一致は次数 $\mu = 1/2$、係数 $(2\pi)^{-3/2} r^{-3/2}$、格子の読み替えの正しさを確かめる。
+バイアスを $q = p + 3/2 + \delta$ とずらすと、$a(k)k^{-q} = k^{-\delta}$ の値が格子の左端と右端で $e^{13.8\,\lvert\delta\rvert}$ 倍違うので、周期延長に大きな段差ができる。
+
+次のセルは $k \in [10^{-3}, 10^{3}]\,h\,\mathrm{Mpc}^{-1}$ の 256 点の格子で変換し、閉形式との相対差を求める。
+入力はべき指数 $p$ とバイアスのずれ $\delta$ である。
+閉形式の係数は `scioxide_special::ln_gamma`、べき関数は f64 の固有メソッドで評価する（独立検算）。
+1 つめの図は $\xi(r)$ を両対数で、2 つめの図は相対差を対数軸で描き、2 つの図の $r$ の軸を連動させる。
+$\delta \ne 0$ では FFTLog の $\xi$ が負になる点があり、両対数の図からは除いて件数を表に出す。
+
+```rust
+//| id: fft-fftlog-power-law
+//| ref: fft-fftlog-power-law
+//| title: べき乗則の閉形式でバイアスと換算係数を確かめる
+//| run: reactive
+//| crates: [scioxide-core, scioxide-fft, scioxide-special]
+//| uses: [fft-fftlog-correlation-model]
+//| inputs:
+//|   exponent: {"type":"range","label":"べき指数 p","description":"P(k) = k^p。積分は −3 < p < −1 で収束する。","min":-2.5,"max":-1.5,"step":0.1,"value":-2}
+//|   bias_shift: {"type":"range","label":"バイアスのずれ δ","description":"q = p + 3/2 + δ。0 以外では周期延長に段差ができる。","min":-0.4,"max":0.4,"step":0.2,"value":0}
+//| cases:
+//|   - {"id":"shallow","label":"p = −1.5","description":"ξ ∝ r^{−1.5}。バイアスを合わせれば丸め誤差の程度で一致する。","inputs":{"exponent":-1.5}}
+//|   - {"id":"bias-off","label":"δ = 0.2","description":"周期化した入力 k^{−0.2} の段差で、中央でも 10⁻³ の程度、格子の端では 1 を超える相対差が出る。","inputs":{"bias_shift":0.2}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","approx":{"value":-0.5,"atol":1e-12}}
+//|       - {"artifact":"summary","path":"/rows/0/2","range":{"max":1e-14}}
+//|       - {"artifact":"summary","path":"/rows/0/3","equals":0}
+//|   - case: shallow
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/2","range":{"max":1e-14}}
+//|       - {"artifact":"summary","path":"/rows/0/4","range":{"max":1e-12}}
+//|   - case: bias-off
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/1","approx":{"value":5.73e-3,"rtol":0.01}}
+//|       - {"artifact":"summary","path":"/rows/0/2","approx":{"value":5.87,"rtol":0.01}}
+//|       - {"artifact":"summary","path":"/rows/0/3","equals":14}
+use scioxide_special::ln_gamma;
+
+let p = exponent;
+let bias = p + 1.5 + bias_shift;
+let (k_min, k_max, n) = (1e-3_f64, 1e3_f64, 256_usize);
+// P(k) = (k / 1 h/Mpc)^p [(Mpc/h)³]（入力の生成は f64 の powf）
+let xi = correlation_function(|k| k.powf(p), k_min, k_max, n, bias)?;
+
+// 独立検算: ξ(r) = 2^p Γ((p+3)/2) / (π^{3/2} Γ(−p/2)) r^{−(p+3)}
+let pi = std::f64::consts::PI;
+let log_coefficient = p * 2.0_f64.ln() - 1.5 * pi.ln()
+    + ln_gamma((p + 3.0) / 2.0).map_err(|e| e.to_string())?
+    - ln_gamma(-p / 2.0).map_err(|e| e.to_string())?;
+let coefficient = log_coefficient.exp();
+let (mut fftlog, mut exact, mut relative) = (Vec::new(), Vec::new(), Vec::new());
+let (mut central, mut whole, mut dropped) = (0.0_f64, 0.0_f64, 0_usize);
+for (&r, &value) in xi.radii.iter().zip(&xi.values) {
+    let reference = coefficient * r.powf(-(p + 3.0));
+    let difference = (value - reference).abs() / reference;
+    whole = whole.max(difference);
+    if (0.1..=10.0).contains(&r) {
+        central = central.max(difference);
+    }
+    exact.push([r, reference]);
+    relative.push([r, difference]);
+    // 0 以下の値は両対数の図に描けないので除いて数える
+    if value > 0.0 {
+        fftlog.push([r, value]);
+    } else {
+        dropped += 1;
+    }
+}
+let relative: Vec<[f64; 2]> = relative
+    .into_iter()
+    .filter(|point| point[1] > 0.0)
+    .collect();
+
+emit_line_chart!(
+    &vec![
+        serde_json::json!({ "name": "FFTLog", "points": fftlog, "style": { "showSymbol": true } }),
+        serde_json::json!({ "name": "閉形式", "points": exact, "style": { "lineType": "dashed" } }),
+    ],
+    options = &serde_json::json!({
+        "xLabel": "距離 r [Mpc/h]",
+        "yLabel": "相関関数 ξ(r) [-]",
+        "xType": "log",
+        "yType": "log",
+        "xMin": 1e-3,
+        "xMax": 1e3,
+        "link": { "group": "power-law-r" }
+    })
+);
+emit_line_chart!(
+    &vec![serde_json::json!({ "name": "相対差", "points": relative })],
+    options = &serde_json::json!({
+        "xLabel": "距離 r [Mpc/h]",
+        "yLabel": "|ξ − 閉形式| / 閉形式 [-]",
+        "xType": "log",
+        "yType": "log",
+        "xMin": 1e-3,
+        "xMax": 1e3,
+        "yMin": 1e-17,
+        "yMax": 1e3,
+        "link": { "group": "power-law-r" }
+    })
+);
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "バイアス q [-]", "type": "number", "format": fixed2 },
+    { "key": "1", "label": "相対差の最大（0.1 ≤ r ≤ 10）[-]", "type": "number", "format": sci2 },
+    { "key": "2", "label": "相対差の最大（全格子）[-]", "type": "number", "format": sci2 },
+    { "key": "3", "label": "描かなかった ξ ≤ 0 の点 [個]", "type": "integer" },
+    { "key": "4", "label": "乗数の条件数の対数 [-]", "type": "number", "format": fixed2, "nullText": "∞" }
+]);
+let condition = Some(xi.log_condition).filter(|c| c.is_finite());
+emit_table_with_columns!(
+    columns,
+    vec![(bias, central, whole, dropped, condition)],
+    metadata = serde_json::json!({ "id": "summary" })
+);
+```
+
+既定の $p = -2$、$\delta = 0$ ではバイアスが $q = -0.5$ で、全格子の相対差の最大は $7.6\times 10^{-16}$ である。
+$p = -1.5$（$q = 0$）でも $6.1\times 10^{-16}$ で、丸め誤差の程度で閉形式と一致する。
+$\delta = 0.2$ にすると、中央の $0.1 \le r \le 10\,h^{-1}\mathrm{Mpc}$ でも相対差が $5.7\times 10^{-3}$ 残り、格子の両端では 5.9 に達して、$\xi \le 0$ の点が 14 個出る。
+$\delta = -0.4$ では中央でも相対差が 1.6 になる。
+バイアスを合わせた計算の一致は FFTLog の規約の確認であり、一般のスペクトルで同じ精度が出ることは意味しない。
+乗数の条件数の対数は既定で 2.26 だが、使われる成分が $\omega = 0$ の 1 つだけなので、この一致には影響しない。
+
+## まとめ
+
+等方的な $P(k)$ から $\xi(r)$ への変換は、$a(k) = k^{3/2}P(k)$ を次数 $\mu = 1/2$ の FFTLog で変換し、$(2\pi)^{-3/2} r^{-3/2}$ を掛けて得られる。
+API の入力の格子を波数、出力の格子を距離と読み替え、単位は $h\,\mathrm{Mpc}^{-1}$ と $h^{-1}\mathrm{Mpc}$ の組でそろえる。
+べき乗則では、バイアスを $q = p + 3/2$ に合わせると丸め誤差の程度で閉形式と一致し、換算係数と格子の読み替えを確かめられる。
+バイアスを $0.2$ ずらすだけで格子の端の相対差は 1 を超えるので、一般のスペクトルでは閉形式か範囲を広げた計算で精度を確かめる。
+
+## 次に読むページ
+
+- [FFTLog で音響スケールの山を調べる](../fftlog-acoustic-peak/)：同じ換算で合成スペクトルの相関関数を求め、波数の範囲と点数が誤差と山の位置に与える影響を確かめる。
+- [FFTLog と対数格子](../../algorithms/fftlog/)：バイアス、offset、乗数の零と極が変換の誤差と失敗に与える影響を確かめる。
+- [API ガイド](../../api/)：`FftLogPlan`、`FftLogLimits`、`FftLogDiagnostics` の仕様を一覧で確かめる。

@@ -1,0 +1,715 @@
+---
+title: "Number types, lanes and generic code"
+description: "Contracts for writing a function once for Real and selecting evaluation with f64, Lanes, Dual, MultiDual, Jet or Var. Examine Base, Primal, Mask, LEVEL, value lifting, constructing and reading lanes with BaseReal, LaneMask comparisons and select, Lanes SIMD and bitwise agreement with scalars, and nested-type components."
+sidebar:
+  order: 305
+references:
+  ad-number-types: "number-types-and-nesting"
+  ad-real-contract: "the-real-contract"
+  ad-lifting-values: "value-lifting-and-extraction"
+  ad-base-real: "the-innermost-type-basereal"
+  ad-comparisons-and-select: "comparisons-masks-and-select"
+  ad-generic-code: "writing-generic-code"
+  ad-lanes-simd: "laness-w-and-simd"
+  ad-lane-accuracy: "lane-results-and-scalar-results"
+  ad-nesting-components: "nested-type-components"
+---
+
+With `scioxide-ad`, write the function to differentiate once for a type parameter `R: Real`; the caller chooses the number type for execution.
+Selecting `f64` gives ordinary evaluation, `Dual` gives forward-mode differentiation, and `Var` on a tape gives reverse-mode differentiation.
+Evaluating the same function with SIMD `Lanes` computes several independent points with one operation sequence.
+This page explains the `Real` trait contract shared by all number types, writing generic code, how `Lanes` results correspond to scalar results, and the meaning of nested types.
+The pages beginning with [Forward mode and dual numbers](../forward-mode/) cover each mode's differentiation rules.
+
+## Number types and nesting
+
+`scioxide-ad` provides the following seven number types.
+`S` is an IEEE 754 scalar type, either `f32` or `f64`.
+
+| Type | Contents of one value | `Base` | `Primal` | `LANES` | `LEVEL` |
+|---|---|---|---|---|---|
+| `f32`, `f64` | One IEEE value | Self | Self | 1 | 0 |
+| `Lanes<S, W>` | `W` independent `S` values | Self | Self | `W` | 0 |
+| `Dual<V>` | Value $v$ and one directional derivative $\dot v$ | `V::Base` | `V` | `V::LANES` | `V::LEVEL + 1` |
+| `MultiDual<V, N>` | Value and derivatives in `N` directions | `V::Base` | `V` | `V::LANES` | `V::LEVEL + 1` |
+| `Jet<V, N>` | Normalized Taylor coefficients $c_0, \dots, c_{N-1}$ | `V::Base` | `V` | `V::LANES` | `V::LEVEL + 1` |
+| `Var<'t, V>` | Value on a tape and the position of its defining statement | `V::Base` | `V` | `V::LANES` | `V::LEVEL + 1` |
+
+`Base` is the innermost value type; `Primal` is the value type one level down.
+`LANES` is the number of independent values; `LEVEL` is the number of differentiation levels stacked above `Base`.
+
+The last four are wrapper types retaining derivatives.
+`Dual`, `MultiDual` and `Jet` accept any number type as their inner type `V`.
+The inner type of `Var` is restricted to tape-recordable types (`f32`, `f64`, `Lanes`, and `Dual`, `MultiDual` and `Jet` containing them).
+The trait `TapeValue` represents this set of types ([Reverse mode and tapes](../reverse-mode-and-replay/)).
+Nesting wrapper types obtains quantities such as the following in one evaluation.
+
+- `Dual<Lanes<f64, 8>>` retains a directional derivative at each of 8 independent points (`LEVEL` 1, `LANES` 8).
+- `Dual<Dual<f64>>` retains second derivatives (`LEVEL` 2).
+  Matching inner and outer directions give $f''$; different directions give mixed partial derivatives.
+- `MultiDual<Lanes<f64, W>, N>` retains derivatives in `N` directions at each of `W` points.
+- With outer direction $\mathbf{v}$ and unit vectors for the `N` inner directions, `Dual<MultiDual<f64, N>>` retains `N` components of the Hessian-vector product $\mathbf{H}\mathbf{v}$.
+- `Var<'t, Dual<f64>>` computes Hessian-vector products by forward-over-reverse differentiation, recording dual numbers on a tape ([Second derivatives and Hessian operators](../second-order-derivatives/)).
+- `Jet<Jet<f64, M>, N>` retains mixed Taylor coefficients in two directions ([Taylor jets and higher-order coefficients](../taylor-jets/)).
+
+All inner-type operations use `V` arithmetic, so nested types differentiate the derivative of the evaluated expression again.
+
+## The `Real` contract
+
+`Real<S = f64>` is the trait implemented by the seven number types above.
+Omitting type argument `S` defaults it to `f64`.
+The trait is sealed, so users cannot implement it for their own types.
+To add custom functions to number types, use `map_scalar`, `try_map_scalar`, `combine` or the tape's `ExternalRule` ([Scalar-function derivative rules](../custom-primitives/), [External derivative rules with ExternalRule](../external-rules/)).
+
+`Real` requires the following operations.
+
+- `Copy`, `Debug`, and iterator `Sum` and `Product`.
+- `+`, `-`, `*`, `/`, `%` and unary `-` on `Self` values; `+`, `-`, `*`, `/` and `%` with a scalar `S` on the right.
+  Compound assignments are `+=`, `-=`, `*=` and `/=` with `Self` or `S` on the right; `%=` is not required.
+- 45 unary elementary functions (including `sqrt`, `exp`, `ln`, `sin`, `atan`, `tanh`, `abs`, `floor` and stable transforms `softplus`, `sigmoid`, `logit`, `exprel`, `cosm1`, `sinc`, `sin_pi`), 10 binary functions (`powf`, `hypot`, `atan2`, `min`, `max`, `log`, `logaddexp`, `xlogy`, `xlog1py`, `powm1`), `powi`, `clamp`, `sin_cos` and `azmul`.
+- Comparisons (`lt`, `le`, `gt`, `ge`), `is_finite` and `select`.
+- Value lifting and extraction (`constant`, `passive`, `lift`, `primal`, `base`, `zero`, `one`).
+- `map_scalar`, `try_map_scalar` and `combine` with caller-supplied rules, and `gather` for selecting table values.
+
+Value computations follow IEEE 754 with fixed operation order.
+Operations do not check arguments or return errors.
+Arguments outside the domain (negative numbers for `sqrt` or `ln`, for example) return NaN; NaN and infinity propagate unchanged.
+The only `Real` methods returning `Result` are `combine`, returning `DimensionMismatch` for length mismatches; `gather`, returning `OutOfBounds` for out-of-table indices; and `try_map_scalar`, propagating rule errors unchanged.
+
+Wrapper types compute value components using `Primal` arithmetic.
+Function values therefore do not depend on the differentiation method.
+Values computed with `Dual`, `MultiDual` and `Var` agree bit for bit with evaluating the same function using the inner type (`f64` for `Dual<f64>`).
+Derivatives are computed by evaluating each function's partial derivatives with `Primal` arithmetic and composing them using the chain rule.
+[Forward mode and dual numbers](../forward-mode/) and [Elementary-function derivatives and accuracy](../elementary-functions/) cover partial derivatives and the rules for multiplying them by tangent components.
+
+`PartialEq` and `PartialOrd` are not required by `Real`.
+Use the comparison methods in the next section to compare magnitudes in generic code.
+
+### Value lifting and extraction
+
+Methods constructing number-type values differ in their argument types and retained derivative components.
+
+| Method | Argument type | Result |
+|---|---|---|
+| `R::constant(c)` | Scalar `S` | All lanes are `c`; all derivative components are 0 |
+| `R::zero()`, `R::one()` | None | `R::constant(0)`, `R::constant(1)` |
+| `R::passive(b)` | `R::Base` (may differ per lane) | Derivative components are 0 at all levels |
+| `R::lift(p)` | `R::Primal` | Uses the next inner value `p` as the value component and zeros this level's derivative components. Inner derivatives in `p` are retained |
+| `x.primal()` | None | Next inner value, including inner derivatives |
+| `x.base()` | None | Innermost value (`S` or `Lanes<S, W>`) |
+
+On a tape, values constructed with `constant`, `passive` and `lift` are passive; operations with only passive operands record nothing.
+Insert constants differing per lane, such as random samples or measurements, with `R::passive`.
+Construct constants shared by all lanes with `R::constant(c)` or put them as scalars on the right of operators.
+
+### The innermost type `BaseReal`
+
+`R::Base` is the innermost value type and implements `BaseReal<S>`.
+Only `f32`, `f64` and `Lanes<S, W>` implement `BaseReal` (the trait cannot be implemented externally); each has itself as `Base` and `Primal`.
+The comparison-result type matches that of the wrapper: `R::Base`'s `Mask` equals `R::Mask`.
+`BaseReal` has one method for constructing per-lane values and one for reading them.
+
+| Method | Behavior |
+|---|---|
+| `B::from_fn(f)` | Constructs a value with lane `k` set to `f(k)`. For scalar types, this is `f(0)` |
+| `b.lane(k)` | Returns lane `k` as `Some`. Returns `None` if `k` is at least `LANES` |
+
+In generic code, insert per-lane constants with `R::passive(R::Base::from_fn(f))` and read result lanes with `x.base().lane(k)`.
+`Lanes` also has inherent methods `from_fn` and `lane` with the same names and behavior.
+The next section's cell and the cell in [Lane results and scalar results](#lane-results-and-scalar-results) use these methods to construct and read scalar and `Lanes` values with the same function.
+
+### Comparisons, masks and `select`
+
+`lt`, `le`, `gt` and `ge` compare innermost (base) values per lane, without comparing derivative components.
+Comparisons involving NaN are false.
+The result type `R::Mask` is `bool` for scalar types and `LaneMask<W>` for types containing `Lanes<S, W>`.
+`is_finite` returns the lanes whose values and all derivative components are finite.
+
+Masks implement `Mask` and provide `splat` (set all lanes identically), `any`, `all`, `&`, `|` and `!`.
+`LaneMask<W>` also provides conversions to and from per-lane values through `from_array` and `to_array`.
+
+Per lane, `R::select(mask, a, b)` selects all components of `a` if `mask` is true, and all components of `b` otherwise.
+The resulting derivative is that of the selected branch; selection does not count as a kink.
+Both expressions have already been evaluated, but the unselected side's values and derivatives do not enter the result even if they contain NaN or infinity.
+
+The next cell examines comparisons and `select` with a `Lanes<f64, 4>` whose four lanes contain $(a - 1, a, a + 1, \mathrm{NaN})$.
+The input is the value shift $a \in [-2, 2]$.
+The result of comparison $x > 0$ is received as `LaneMask<4>` and read with `to_array`, `any` and `all`.
+Evaluate `select(x > 0, √x, 0)`, selecting between $\sqrt{x}$ and 0, with `Lanes` and `Dual<Lanes<f64, 4>>`, and also read `is_finite` of $\sqrt{x}$ evaluated with `Dual`.
+Also differentiate the two equal-valued expressions `select(x > 0, x, 0)` and `max(x, 0)` with `Tape<Lanes<f64, 4>>`, comparing gradients and `TapeReport::kinks` (the count of active arguments reaching kinks; [Reverse mode and tapes](../reverse-mode-and-replay/)).
+Read per-lane table values with `BaseReal::lane` and show nonfinite values by name.
+Verify that comparisons in NaN lanes are false, unselected NaN and infinity do not enter values or derivatives, `select` counts no kinks, and `max` counts one at a lane with $x = 0$.
+
+```rust
+//| id: ad-lane-masks
+//| ref: ad-lane-masks
+//| title: "Read Lanes comparisons with LaneMask and compare select and max derivatives and kink counts"
+//| run: reactive
+//| crates: [scioxide-ad, scioxide-core]
+//| inputs:
+//|   shift: {"type":"range","label":"Lane value shift a","description":"The four lane values are (a − 1, a, a + 1, NaN).","min":-2,"max":2,"step":0.5,"value":0}
+//| cases:
+//|   - {"id":"kink-first","label":"a = 1","description":"Lane 0 becomes 0, reaching the kink of max(x, 0).","inputs":{"shift":1}}
+//|   - {"id":"negative","label":"a = −2","description":"No lane satisfies x > 0.","inputs":{"shift":-2}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"lanes","path":"/rows/1/2","equals":"false"}
+//|       - {"artifact":"lanes","path":"/rows/2/2","equals":"true"}
+//|       - {"artifact":"lanes","path":"/rows/3/2","equals":"false"}
+//|       - {"artifact":"lanes","path":"/rows/0/3","equals":0}
+//|       - {"artifact":"lanes","path":"/rows/3/3","equals":0}
+//|       - {"artifact":"lanes","path":"/rows/2/4","approx":{"value":0.5,"atol":1e-15}}
+//|       - {"artifact":"lanes","path":"/rows/1/5","equals":0}
+//|       - {"artifact":"lanes","path":"/rows/1/6","approx":{"value":0.5,"atol":1e-15}}
+//|       - {"path":"/outputs/1/content","equals":"x > 0: any() = true, all() = false. Dual √x is_finite(): [false, false, true, false]. kinks(): select 0, max 1"}
+//|   - case: kink-first
+//|     expect:
+//|       - {"artifact":"lanes","path":"/rows/0/6","approx":{"value":0.5,"atol":1e-15}}
+//|       - {"artifact":"lanes","path":"/rows/1/4","approx":{"value":0.5,"atol":1e-15}}
+//|       - {"path":"/outputs/1/content","equals":"x > 0: any() = true, all() = false. Dual √x is_finite(): [false, true, true, false]. kinks(): select 0, max 1"}
+//|   - case: negative
+//|     expect:
+//|       - {"artifact":"lanes","path":"/rows/2/3","equals":0}
+//|       - {"artifact":"lanes","path":"/rows/2/6","equals":0}
+//|       - {"path":"/outputs/1/content","equals":"x > 0: any() = false, all() = false. Dual √x is_finite(): [false, false, false, false]. kinks(): select 0, max 0"}
+use scioxide_ad::{BaseReal, Dual, LaneMask, Lanes, Real, Tape, TapeOptions};
+use scioxide_core::ExecutionContext;
+
+// Select √x in lanes where x > 0, and 0 otherwise.
+fn clipped_root<R: Real>(x: R) -> R {
+    R::select(x.gt(R::zero()), x.sqrt(), R::zero())
+}
+// Two equal-valued expressions: comparison-based select and max with a kink.
+fn ramp_select<R: Real>(x: R) -> R {
+    R::select(x.gt(R::zero()), x, R::zero())
+}
+fn ramp_max<R: Real>(x: R) -> R {
+    x.max(R::zero())
+}
+// Read lane k of the innermost value with BaseReal::lane. Represent nonfinite values as None.
+fn read<B: BaseReal>(b: B, k: usize) -> Option<f64> {
+    b.lane(k).filter(|v| v.is_finite())
+}
+let flags = |mask: LaneMask<4>| mask.to_array().map(|m| m.to_string()).join(", ");
+
+let x = Lanes::<f64, 4>::from_array([shift - 1.0, shift, shift + 1.0, f64::NAN]);
+// Comparisons return a per-lane LaneMask. NaN lanes are false.
+let positive: LaneMask<4> = x.gt(Lanes::splat(0.0));
+let value = clipped_root(x);
+let tangent = clipped_root(Dual::variable(x)).derivative();
+// is_finite is true in lanes where both the value and derivative are finite.
+let finite = Dual::variable(x).sqrt().is_finite();
+
+// Differentiate both expressions on a tape and read gradients and kink counts.
+let cx = ExecutionContext::sequential();
+let mut tape = Tape::<Lanes<f64, 4>>::new(TapeOptions::new());
+let mut by_select = [Lanes::splat(0.0)];
+tape.gradient_into(|v| Ok(ramp_select(v[0])), &[x], &mut by_select, cx)
+    .map_err(|e| e.to_string())?;
+let select_kinks = tape.report().kinks();
+let mut by_max = [Lanes::splat(0.0)];
+tape.gradient_into(|v| Ok(ramp_max(v[0])), &[x], &mut by_max, cx)
+    .map_err(|e| e.to_string())?;
+let max_kinks = tape.report().kinks();
+
+let rows: Vec<_> = (0..4)
+    .map(|k| {
+        (
+            k,
+            read(x, k),
+            positive.to_array()[k].to_string(),
+            read(value, k),
+            read(tangent, k),
+            read(by_select[0], k),
+            read(by_max[0], k),
+        )
+    })
+    .collect();
+let columns = serde_json::json!([
+    { "key": "0", "label": "lane k", "type": "integer" },
+    { "key": "1", "label": "x [-]", "type": "number", "nullText": "NaN" },
+    { "key": "2", "label": "x > 0（to_array）" },
+    { "key": "3", "label": "select(x > 0, √x, 0) [-]", "type": "number", "nullText": "Nonfinite" },
+    { "key": "4", "label": "Dual derivative of the same expression [-]", "type": "number", "nullText": "Nonfinite" },
+    { "key": "5", "label": "Tape gradient of select(x > 0, x, 0) [-]", "type": "number" },
+    { "key": "6", "label": "Tape gradient of max(x, 0) [-]", "type": "number" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "lanes" })
+);
+emit_text!(format!(
+    "x > 0: any() = {}, all() = {}. Dual √x is_finite(): [{}]. kinks(): select {}, max {}",
+    positive.any(),
+    positive.all(),
+    flags(finite),
+    select_kinks,
+    max_kinks
+));
+```
+
+With the default $a = 0$, lane values are $(-1, 0, 1, \mathrm{NaN})$, and comparison $x > 0$ is true only in lane 2.
+Comparison is false in NaN lane 3, so `select` selects the false-side 0; the input NaN remains in neither value nor derivative.
+Lane 0's $\sqrt{-1}$ is NaN, and lane 1's $\sqrt{x}$ derivative is $+\infty$, but neither is selected, so the `select` value is $(0, 0, 1, 0)$ and the `Dual` derivative is $(0, 0, 0.5, 0)$.
+`is_finite` for $\sqrt{x}$ evaluated with `Dual` is false in lane 1 as well.
+The value 0 is finite, but its derivative is $+\infty$.
+On the tape, in lane 1 with $x = 0$, the `select(x > 0, x, 0)` gradient is the false-side 0, the `max(x, 0)` gradient is the midpoint 1/2 of one-sided derivatives, and `kinks()` is 0 for `select` and 1 for `max`.
+With $a = 1$, lane 0 becomes 0, the `max` gradient there is 1/2, and `kinks()` is 1.
+With $a = -2$, no lane satisfies $x > 0$, so `any()` is also false, and the `select` value and both gradients are 0 in every lane.
+Thus, comparison-based selection can replace an input NaN with a false-side value, leaving no NaN in the result.
+To detect input NaN, check with `is_finite` before selecting.
+
+### Writing generic code
+
+Follow these rules in generic code.
+
+- Put scalars on the right of operators (`x * 2.0`, `-x + 1.0`).
+  `Real` does not require `S: Mul<R>`, so `2.0 * x` compiles only for concrete types (such as `f64`, `Lanes` and `Dual`).
+- The bound `R: Real` means `R: Real<f64>`.
+  Functions for `f32` use `R: Real<f32>`; functions for both take two type parameters, `S: RealScalar` and `R: Real<S>` (`RealScalar` is a scioxide-core trait).
+- Insert per-lane constants (such as random numbers) with `R::passive(z)`.
+- To branch with ordinary `if`, use the bound `R: Real<Mask = bool>`.
+  This bound excludes types containing `Lanes`.
+  Code supporting `Lanes` evaluates both expressions and selects with `R::select`.
+
+[Branches, masks and table lookup](../control-flow/) covers differentiation of branching code and differences in tape recordings.
+
+## `Lanes<S, W>` and SIMD
+
+`Lanes<S, W>` stores `W` independent `S` values in a fixed-size array and performs the same operation sequence on every lane (one SIMD element).
+Each operation is an array loop inlined as safe Rust, allowing the compiler to convert it to SIMD instructions for the build's target features.
+Target features are determined at compile time.
+Using AVX2 on x86-64 requires building with `-C target-cpu=x86-64-v3` (or `native`).
+Default x86-64 builds use SSE2 and are about 1.2–1.7 times slower for code dominated by lane operations.
+
+Construct and extract values as follows.
+
+| Method | Behavior | Failure |
+|---|---|---|
+| `Lanes::splat(v)` | Sets all lanes to `v` | None |
+| `Lanes::from_array(a)` | Constructs from an array of length `W` | None |
+| `Lanes::from_fn(f)` | Sets lane `k` to `f(k)` | None |
+| `Lanes::from_slice(s)` | Constructs from a slice | `DimensionMismatch` when `s.len() != W` |
+| `x.to_array()` | Returns per-lane values as an array | None |
+| `x.lane(k)` | Returns the value of lane `k` | `None` when `k ≥ W` |
+| `x.write_to_slice(out)` | Writes per-lane values into a slice | `DimensionMismatch` when `out.len() != W` |
+
+`f32` and `f64` can be combined with `Lanes` even on the left of operators.
+Placed inside wrappers, as in `Dual<Lanes<f64, W>>` or `MultiDual<Lanes<f64, W>, N>`, they retain derivatives at `W` points simultaneously.
+[Batch evaluation of many items](../batches/) covers packing many independent items into lanes in groups of `W` for evaluation.
+
+### Lane results and scalar results
+
+Each lane uses the same operation sequence, and its result depends only on that lane's arguments.
+Results therefore have identical bits regardless of lane width `W`, lane position or build target features (SSE2 or AVX2).
+
+The relationship to scalar functions depends on the operation.
+
+- The eight functions `exp`, `exp_m1`, `ln`, `ln_1p`, `sin`, `cos`, `tanh` and `powf` use scioxide-core's branch-free lane kernels.
+  Kernel results are within 4 ulp of exact values and may differ from scalar functions in the last few digits.
+  Lanes outside a kernel's domain receive the scalar-function result.
+- All other operations agree bit for bit with scalar functions.
+
+`f32` lane kernels widen values to `f64`, evaluate with `f64` kernels and round back to `f32`.
+The kernels do not use fused multiply-add (FMA), so results also remain unchanged by FMA availability.
+Operations using these kernels internally, such as `sin_cos`, and derivatives whose partials use kernels (such as `cos` in the partial derivative of `sin` or `exp` in that of `tanh`) may also differ in the last digits from scalar types when their inner type contains `Lanes`.
+
+The next cell evaluates the same generic function with scalars `f64` and `f32` and with `Lanes<S, 8>` and `Lanes<S, 2>`, comparing per-lane results.
+The input is the evaluation interval's half-width $R$; evaluation points are the midpoints of 1024 equal subintervals of $[-R, R]$.
+The operations compared are the eight using kernels, six not using them (including a branch with `select`), and the kernel-using composite function $f(x) = \sin(x^2) + e^x/2$ and its derivative (the tangent component of `Dual`).
+The outputs are the number of points differing from scalar results, the maximum ulp difference, and the number of points differing between `W = 8` and `W = 2`.
+The scalar and two `Lanes` widths use the same generic function, packing points into lanes with `BaseReal::from_fn` and extracting results with `BaseReal::lane`.
+The ulp difference is counted independently as the distance between floating-point numbers mapped to ordered integers.
+Verify that non-kernel rows have zero difference from scalars, kernel rows differ by only a few ulp, and `W` introduces no difference.
+
+```rust
+//| id: ad-lanes-scalar-agreement
+//| ref: ad-lanes-scalar-agreement
+//| title: "Evaluate the same generic function with f64 and f32 scalars and Lanes and count per-lane differences"
+//| run: reactive
+//| crates: [scioxide-ad, scioxide-core]
+//| inputs:
+//|   half_width: {"type":"select","label":"Evaluation interval half-width R","description":"Evaluate at 1024 points in [−R, R]. At R = 100, exp reaches about 10⁴³.","options":["1","10","100"],"value":"10"}
+//| cases:
+//|   - {"id":"narrow","label":"R = 1","description":"Compare only evaluation points near 0.","inputs":{"half_width":"1"}}
+//|   - {"id":"wide","label":"R = 100","description":"Even for large arguments, non-kernel operations agree with scalars.","inputs":{"half_width":"100"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"agreement","path":"/rows/8/2","equals":0}
+//|       - {"artifact":"agreement","path":"/rows/13/2","equals":0}
+//|       - {"artifact":"agreement","path":"/rows/13/4","equals":0}
+//|       - {"artifact":"agreement","path":"/rows/0/3","range":{"min":0,"max":8}}
+//|       - {"artifact":"agreement","path":"/rows/4/3","range":{"min":0,"max":8}}
+//|       - {"artifact":"agreement","path":"/rows/0/5","range":{"min":0,"max":2}}
+//|       - {"artifact":"agreement","path":"/rows/15/6","equals":0}
+//|   - case: narrow
+//|     expect:
+//|       - {"artifact":"agreement","path":"/rows/11/2","equals":0}
+//|       - {"artifact":"agreement","path":"/rows/6/3","range":{"min":0,"max":8}}
+//|       - {"artifact":"agreement","path":"/rows/14/6","equals":0}
+//|   - case: wide
+//|     expect:
+//|       - {"artifact":"agreement","path":"/rows/12/2","equals":0}
+//|       - {"artifact":"agreement","path":"/rows/1/3","range":{"min":0,"max":8}}
+//|       - {"artifact":"agreement","path":"/rows/7/6","equals":0}
+use scioxide_ad::{BaseReal, Dual, Lanes, Real};
+use scioxide_core::RealScalar;
+
+// Names of compared operations. Rows 0–7 use lane kernels; rows 8–13 do not.
+const NAMES: [&str; 16] = [
+    "exp x",
+    "exp_m1 x",
+    "ln |x|",
+    "ln_1p |x|",
+    "sin x",
+    "cos x",
+    "tanh x",
+    "|x|^1.5（powf）",
+    "√|x|",
+    "∛x",
+    "atan x",
+    "sinh x",
+    "sigmoid x",
+    "select(x > 0, x, 0)",
+    "f(x) = sin(x²) + eˣ/2",
+    "f′(x) (Dual tangent component)",
+];
+
+// Generic code: put scalars on the right of operators, use R::constant for constants and R::select for branches.
+fn apply<S: RealScalar, R: Real<S>>(k: usize, x: R) -> R {
+    let a = x.abs();
+    match k {
+        0 => x.exp(),
+        1 => x.exp_m1(),
+        2 => a.ln(),
+        3 => a.ln_1p(),
+        4 => x.sin(),
+        5 => x.cos(),
+        6 => x.tanh(),
+        7 => a.powf(R::constant(S::from_f64_ieee(1.5))),
+        8 => a.sqrt(),
+        9 => x.cbrt(),
+        10 => x.atan(),
+        11 => x.sinh(),
+        12 => x.sigmoid(),
+        13 => R::select(x.gt(R::zero()), x, R::zero()),
+        _ => (x * x).sin() + x.exp() * S::HALF,
+    }
+}
+
+// Compute row k's quantity with number type V. The last row is the tangent component of f evaluated with Dual<V>.
+fn row<S: RealScalar, V: Real<S>>(k: usize, x: V) -> V {
+    if k < 15 {
+        apply::<S, V>(k, x)
+    } else {
+        apply::<S, Dual<V>>(14, Dual::variable(x)).derivative()
+    }
+}
+
+// Independent-check tools: IEEE bit patterns and distance between ordered integers (ulp difference).
+fn bits<S: RealScalar>(v: S) -> u64 {
+    if S::MANTISSA_DIGITS == 24 {
+        u64::from((v.into_f64() as f32).to_bits())
+    } else {
+        v.into_f64().to_bits()
+    }
+}
+fn ulps<S: RealScalar>(a: S, b: S) -> u64 {
+    let sign = if S::MANTISSA_DIGITS == 24 {
+        1 << 31
+    } else {
+        1 << 63
+    };
+    let ordered = |v: S| {
+        let raw = bits(v);
+        if raw & sign != 0 {
+            -i128::from(raw & !sign)
+        } else {
+            i128::from(raw)
+        }
+    };
+    u64::try_from(ordered(a).abs_diff(ordered(b))).unwrap_or(u64::MAX)
+}
+
+// Pack points into lanes in groups of B::LANES, evaluate row k and collect per-lane results.
+// For scalar B, evaluate one point at a time; for Lanes<S, W>, evaluate W points at a time.
+fn evaluate<S: RealScalar, B: BaseReal<S>>(k: usize, xs: &[S]) -> Vec<S> {
+    xs.chunks(B::LANES)
+        .flat_map(|chunk| {
+            let y = row::<S, B>(k, B::from_fn(|j| chunk[j]));
+            (0..B::LANES).filter_map(move |j| y.lane(j))
+        })
+        .collect()
+}
+
+// Compare row k at 1024 points and return (points differing from scalars, maximum ulp difference, points differing between W = 8 and W = 2).
+fn compare<S: RealScalar>(k: usize, half_width: f64) -> (u32, u64, u32) {
+    let xs: Vec<S> = (0..1024)
+        .map(|i| S::from_f64_ieee(half_width * ((2 * i + 1) as f64 / 1024.0 - 1.0)))
+        .collect();
+    let same = |a: S, b: S| bits(a) == bits(b) || (a.is_nan() && b.is_nan());
+    let scalar = evaluate::<S, S>(k, &xs);
+    let wide = evaluate::<S, Lanes<S, 8>>(k, &xs);
+    let narrow = evaluate::<S, Lanes<S, 2>>(k, &xs);
+    let (mut differ, mut worst, mut width) = (0, 0, 0);
+    for j in 0..xs.len() {
+        if !same(wide[j], scalar[j]) {
+            differ += 1;
+            worst = worst.max(ulps(wide[j], scalar[j]));
+        }
+        width += u32::from(!same(wide[j], narrow[j]));
+    }
+    (differ, worst, width)
+}
+
+let r: f64 = half_width.parse().map_err(|_| "Cannot read the half-width as a number")?;
+let rows: Vec<_> = (0..NAMES.len())
+    .map(|k| {
+        let (d64, u64_, w64) = compare::<f64>(k, r);
+        let (d32, u32_, w32) = compare::<f32>(k, r);
+        let kernel = if k < 8 || k >= 14 {
+            "Used"
+        } else {
+            "Not used"
+        };
+        (NAMES[k], kernel, d64, u64_, d32, u32_, w64 + w32)
+    })
+    .collect();
+let columns = serde_json::json!([
+    { "key": "0", "label": "Operation" },
+    { "key": "1", "label": "Lane kernel" },
+    { "key": "2", "label": "f64: points differing from scalars [points]", "type": "integer" },
+    { "key": "3", "label": "f64: maximum difference [ulp]", "type": "integer" },
+    { "key": "4", "label": "f32: points differing from scalars [points]", "type": "integer" },
+    { "key": "5", "label": "f32: maximum difference [ulp]", "type": "integer" },
+    { "key": "6", "label": "Points differing between W = 8 and W = 2 [points]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "agreement" })
+);
+```
+
+In browser execution with the default $R = 10$, the six non-kernel rows (including `select`) agree bit for bit with scalars at all 1024 points for both `f64` and `f32`.
+For the eight kernel rows, 0–80 points differ from scalars with `f64` (59 for `exp`, 80 for `powf`) and 0–112 with `f32`; every difference is 1 ulp.
+Differences for the kernel-using composite function $f$ also remain at 1 ulp for `f64` and 2 ulp for `f32`.
+Differences in the derivative $f'(x) = 2x\cos(x^2) + e^x/2$ reach a maximum of 16 ulp for both `f64` and `f32`.
+At $x \approx 1.59$, where the maximum occurs for `f64`, two terms (about $-2.6$ and $2.5$) cancel to yield $f' \approx -0.157$, making a 1 ulp difference in a term relatively large against the small result (at $x \approx 1.88$, the maximum for `f32`, the result is also $f' \approx -0.164$).
+With $R = 1$, the difference reaches 64 ulp in both precisions at $x \approx -0.206$ ($f' \approx -0.0048$), near a zero of $f'$.
+The last column is 0 for every interval and row.
+
+Counts of differing points depend on the scalar-function implementation.
+Scalar `f64` and `f32` elementary functions use standard-library math functions, so native builds give different counts (the figures above are from a browser).
+For lanes inside kernel domains, however, lane kernels return identical bits in native builds and browsers.
+
+## Nested-type components
+
+Dual-number algebra explains why nested dual numbers provide second derivatives.
+With inner infinitesimal $\varepsilon_1$ and outer infinitesimal $\varepsilon_2$ ($\varepsilon_1^2 = \varepsilon_2^2 = 0$), `Dual::variable(Dual::variable(x))` represents $x + \varepsilon_1 + \varepsilon_2$.
+Let $f$ be twice differentiable and substitute $h = \varepsilon_1 + \varepsilon_2$ into its Taylor expansion $f(x + h) = f(x) + f'(x)\,h + \tfrac{1}{2}f''(x)\,h^2 + \cdots$.
+Since $h^2 = 2\varepsilon_1\varepsilon_2$ and $h^3 = 0$, this gives
+
+$$
+f(x + \varepsilon_1 + \varepsilon_2) = f(x) + f'(x)\,\varepsilon_1 + f'(x)\,\varepsilon_2 + f''(x)\,\varepsilon_1 \varepsilon_2
+$$
+
+
+Read the four coefficients by extracting value component `value()` and derivative component `derivative()` in sequence.
+
+| Extraction | Coefficient |
+|---|---|
+| `value().value()` (same as `base()`) | $f(x)$ |
+| `value().derivative()` | Inner directional derivative $f'(x)$ |
+| `derivative().value()` | Outer directional derivative $f'(x)$ |
+| `derivative().derivative()` | $f''(x)$ |
+
+Seeding different inner and outer directions $\mathbf{u}$ and $\mathbf{v}$ makes the last coefficient the mixed partial derivative $\mathbf{u}^\mathsf{T}\mathbf{H}\mathbf{v}$.
+
+`R::lift(p)` retains derivatives of the inner value `p` and zeros outer derivative components.
+Evaluating `R::lift(Dual::variable(x))` with `Dual<Dual<f64>>` retains only the inner-direction $f'(x)$, while outer derivatives and the $f''$ component are 0.
+`R::constant(x)` and `R::passive(x)` zero derivative components at every level.
+
+The next cell evaluates the generic function $f(x) = \sin(x^2) + e^x/2$ with several number types and compares type constants `LEVEL` and `LANES` and extracted components against closed forms.
+The closed forms are
+
+$$
+f'(x) = 2x\cos(x^2) + \tfrac{1}{2}e^x, \qquad f''(x) = 2\cos(x^2) - 4x^2\sin(x^2) + \tfrac{1}{2}e^x
+$$
+
+and the cell evaluates them with `f64`'s inherent methods as reference values.
+The input is evaluation point $x \in [-2, 2]$; lane $k$ of `Lanes<f64, 4>` contains point $x + k h$ ($h = 0.25$).
+Verify that each component agrees with the closed form within rounding error and that the outer derivative of values constructed with `lift` is 0.
+
+```rust
+//| id: ad-nested-components
+//| ref: ad-nested-components
+//| title: "Compare LEVEL, LANES and components of nested number types against closed forms"
+//| run: reactive
+//| crates: [scioxide-ad]
+//| inputs:
+//|   point: {"type":"range","label":"Evaluation point x","description":"Lane k of Lanes<f64, 4> is x + 0.25k.","min":-2,"max":2,"step":0.05,"value":0.3}
+//| cases:
+//|   - {"id":"origin","label":"x = 0","description":"f(0) = 1/2, f′(0) = 1/2, f″(0) = 5/2.","inputs":{"point":0}}
+//|   - {"id":"steep","label":"x = 1.5","description":"A point beyond the peak of sin(x²), where f″ is negative.","inputs":{"point":1.5}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"components","path":"/rows/0/2","equals":0}
+//|       - {"artifact":"components","path":"/rows/3/3","equals":4}
+//|       - {"artifact":"components","path":"/rows/7/2","equals":2}
+//|       - {"artifact":"components","path":"/rows/7/6","approx":{"value":0,"atol":1e-13}}
+//|       - {"artifact":"components","path":"/rows/3/6","approx":{"value":0,"atol":1e-13}}
+//|       - {"artifact":"components","path":"/rows/9/4","equals":0}
+//|   - case: origin
+//|     expect:
+//|       - {"artifact":"components","path":"/rows/2/4","approx":{"value":0.5,"atol":1e-15}}
+//|       - {"artifact":"components","path":"/rows/7/4","approx":{"value":2.5,"atol":1e-14}}
+//|   - case: steep
+//|     expect:
+//|       - {"artifact":"components","path":"/rows/7/6","approx":{"value":0,"atol":1e-12}}
+//|       - {"artifact":"components","path":"/rows/8/6","approx":{"value":0,"atol":1e-13}}
+use scioxide_ad::{Dual, Lanes, Real};
+
+// Generic model f(x) = sin(x²) + eˣ/2. Changing only the number type gives values and derivatives.
+fn model<R: Real>(x: R) -> R {
+    (x * x).sin() + x.exp() * 0.5
+}
+// Read type constants LEVEL and LANES.
+fn shape<R: Real>(_: R) -> (usize, usize) {
+    (R::LEVEL, R::LANES)
+}
+
+let x = point;
+let h = 0.25;
+let pack = Lanes::<f64, 4>::from_fn(|k| x + h * k as f64);
+let plain = model(x);
+let lanes = model(pack);
+let tangent = model(Dual::variable(x));
+let tangent_lanes = model(Dual::variable(pack));
+// Seed 1 in both inner and outer directions: x + ε₁ + ε₂.
+let second = model(Dual::variable(Dual::variable(x)));
+// lift retains inner derivatives and zeros outer derivative components.
+let lifted = model(<Dual<Dual<f64>>>::lift(Dual::variable(x)));
+
+// Independent check: closed forms (reference values evaluated with f64's inherent methods).
+let f = |t: f64| (t * t).sin() + 0.5 * t.exp();
+let d1 = |t: f64| 2.0 * t * (t * t).cos() + 0.5 * t.exp();
+let d2 = |t: f64| 2.0 * (t * t).cos() - 4.0 * t * t * (t * t).sin() + 0.5 * t.exp();
+let last = x + 3.0 * h;
+
+let entries = [
+    ("f64", "Value", shape(plain), plain, f(x)),
+    (
+        "Lanes<f64, 4>",
+        "to_array()[3] = f(x + 3h)",
+        shape(lanes),
+        lanes.to_array()[3],
+        f(last),
+    ),
+    (
+        "Dual<f64>",
+        "derivative() = f′(x)",
+        shape(tangent),
+        tangent.derivative(),
+        d1(x),
+    ),
+    (
+        "Dual<Lanes<f64, 4>>",
+        "derivative().to_array()[3] = f′(x + 3h)",
+        shape(tangent_lanes),
+        tangent_lanes.derivative().to_array()[3],
+        d1(last),
+    ),
+    (
+        "Dual<Dual<f64>>",
+        "base() = f(x)",
+        shape(second),
+        second.base(),
+        f(x),
+    ),
+    (
+        "Dual<Dual<f64>>",
+        "value().derivative() = f′(x)",
+        shape(second),
+        second.value().derivative(),
+        d1(x),
+    ),
+    (
+        "Dual<Dual<f64>>",
+        "derivative().value() = f′(x)",
+        shape(second),
+        second.derivative().value(),
+        d1(x),
+    ),
+    (
+        "Dual<Dual<f64>>",
+        "derivative().derivative() = f″(x)",
+        shape(second),
+        second.derivative().derivative(),
+        d2(x),
+    ),
+    (
+        "Dual<Dual<f64>> constructed with lift",
+        "value().derivative() = f′(x)",
+        shape(lifted),
+        lifted.value().derivative(),
+        d1(x),
+    ),
+    (
+        "Dual<Dual<f64>> constructed with lift",
+        "derivative().value() = 0",
+        shape(lifted),
+        lifted.derivative().value(),
+        0.0,
+    ),
+];
+let rows: Vec<_> = entries
+    .iter()
+    .map(|&(ty, part, (level, width), value, exact)| {
+        (ty, part, level, width, value, exact, value - exact)
+    })
+    .collect();
+let fixed15 = serde_json::json!({ "fractionDigits": 15 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Number type" },
+    { "key": "1", "label": "Extracted component" },
+    { "key": "2", "label": "LEVEL", "type": "integer" },
+    { "key": "3", "label": "LANES", "type": "integer" },
+    { "key": "4", "label": "Computed value [-]", "type": "number", "format": fixed15 },
+    { "key": "5", "label": "Closed form (reference) [-]", "type": "number", "format": fixed15 },
+    { "key": "6", "label": "Difference [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "components" })
+);
+```
+
+With the default $x = 0.3$, computed values agree bit for bit with closed-form evaluation in all 10 rows.
+`LEVEL` increases by 1 each time `Dual` wraps a type, while `LANES` inherits 4 from the inner `Lanes<f64, 4>`.
+The inner and outer derivatives of `Dual<Dual<f64>>` are both $f'(0.3) = 1.2725010435951982$, and `derivative().derivative()` is $f''(0.3) = 2.634478592100706$.
+Values constructed with `lift` retain only the inner $f'$; outer derivative components are 0.
+At $x = 0$, $f = f' = 1/2$ and $f'' = 5/2$ are obtained exactly; the difference is also 0 at $x = 1.5$.
+Bitwise agreement applies to this function at these points; for general functions, partial-derivative rounding order differs from closed-form expressions, so the last digits may differ.
+
+## Summary
+
+Write a function once as `fn f<R: Real>(x: R) -> R`, placing scalars on the right of operators, per-lane constants through `R::passive` and branches through `R::select`; the same code then works with `f64`, `Lanes`, `Dual`, `MultiDual`, `Jet` and `Var`.
+Values are independent of the differentiation method, and wrapper values agree bit for bit with evaluation using the inner type.
+`Lanes` results are independent of lane width; only the eight kernels `exp`, `exp_m1`, `ln`, `ln_1p`, `sin`, `cos`, `tanh` and `powf` and operations using them may differ from scalar results in the last few digits.
+Comparisons return per-lane masks (`LaneMask` for `Lanes`); `select` counts no kinks and selects the false side in NaN lanes, so check input NaN with `is_finite` before selecting.
+For independent checks requiring bitwise agreement with scalars, evaluate with scalar types instead of `Lanes`.
+Second derivatives come from `derivative().derivative()` of `Dual<Dual<f64>>`, while `Dual<Lanes<f64, W>>` differentiates many points; extract components by calling `value()`, `derivative()` and `base()` in sequence.
+
+## Further reading
+
+- [Forward mode and dual numbers](../forward-mode/): examine `Dual` and `MultiDual` rules, the choice between IEEE products and `azmul`, and derivative accuracy.
+- [Reverse mode and tapes](../reverse-mode-and-replay/): examine recording the same generic function with `Var` and obtaining gradients at computational cost independent of input count.
+- [Batch evaluation of many items](../batches/): examine packing independent items into `Lanes` for evaluation and obtaining gradients of sums or means.
+- [Scalar-function derivative rules](../custom-primitives/): examine the accuracy of `map_scalar` and `combine`, which add functions to the sealed `Real` trait.

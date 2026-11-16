@@ -1,0 +1,517 @@
+---
+title: 初等関数と安定変換
+description: スカラー型の 3 段の階層と浮動小数点数の分解、積和の精度の区分、初等関数の振り分けと ULP 仕様、Payne–Hanek 法による周期縮約、打ち消しを避ける安定変換、複素数での誤差の増大因子、配列への一括変換。
+sidebar:
+  order: 350
+references:
+  core-scalar-hierarchy: "スカラー型の階層と精度の区分"
+  core-stable-transforms: "打ち消しを避ける安定変換"
+  core-transform-into: "配列への一括変換-transform_into"
+  core-argument-reduction: "大きな引数の周期縮約"
+  core-elementary-dispatch: "初等関数の振り分けと精度の保証"
+  core-complex-growth-factors: "複素数での誤差の増大因子"
+---
+
+$\cos x - 1$ や $(e^x - 1)/x$ のように、0 の近くで大きさの近い数を引く式は、そのまま計算すると有効数字を失う。
+引数が非常に大きい三角関数では、$\pi/2$ の倍数を引く縮約そのものが誤差を生む。
+`scioxide-core` は初等関数の実装を振り分け表で管理し、打ち消しを避けた安定変換を `checked_*` と同じく `Result` を返す関数として提供する。
+このページはまず、これらの関数が受け取るスカラー型の階層と、積和の精度の区分を定める。
+
+## スカラー型の階層と精度の区分
+
+`scioxide-core` の関数は引数の型に求める機能を 3 段のトレイトで表す。
+
+| トレイト | 実装する型 | 求める機能 |
+|---|---|---|
+| `AlgebraicScalar` | 開いている（下流のクレートも実装できる） | 四則演算と符号反転、`ZERO` と `ONE`、和と積の畳み込み。IEEE の分類や超越関数は求めない |
+| `NumericScalar` | `f32`、`f64`、`Complex32`、`Complex64`（外部からの実装は不可） | 共役、絶対値と二乗ノルム、実部・虚部への分解と組み立て、成分の有限性の検査、実部の型 `Real` |
+| `RealScalar` | `f32`、`f64`（外部からの実装は不可） | 順序、剰余、複合代入（`+=`、`-=`、`*=`、`/=`）、精度の定数、端数処理、初等関数、検査付きの変換、`decompose` |
+
+`Complex32` と `Complex64` は `Complex<f32>` と `Complex<f64>` の別名である。
+既定は `RealScalar` で、複素数を扱える関数だけが `NumericScalar` を受け取る。
+sealed トレイトは外部のクレートが実装できないので、関数は 2 つの IEEE 形式の分類と変換の規則を前提にできる。
+`RealScalar` の四則演算、複合代入、初等関数のメソッドは IEEE 754 に従い、引数を検査しないので、NaN や無限大を返しうる。
+引数と結果を検査するのは `checked_*` と、このページの安定変換のように `Result` を返す関数である。
+型の設計の考え方は[スカラー型とトレイトの仕様](../../../concepts/scalars-and-traits/)にある。
+
+`RealScalar::decompose()` は浮動小数点の演算をせずに値を分類・分解し、`FloatDecomposition` を返す。
+有限値は `Finite { significand, exponent, negative }` で、値は $(-1)^{\text{negative}} \cdot \text{significand} \cdot 2^{\text{exponent}}$ に等しい。
+仮数は正規化数の暗黙の先頭ビットを含む整数で、binary64 では 53 ビット以下、binary32 では 24 ビット以下である。
+ゼロは仮数 0 で符号を保ち、非正規化数とゼロの指数は binary64 で $-1074$、binary32 で $-149$ である。
+無限大は `Infinite { negative }`、NaN は符号とペイロードを持たない `Nan` になる。
+
+精度の区分 `Accuracy` は、積の和を取る演算（scioxide-linalg の行列積やノルム、scioxide-sparse の疎な内積など）が選ぶ 2 つの水準である。
+既定の `Standard` はオーバーフローを避けるために尺度を調整した通常の浮動小数点演算である。
+内積の長さを $k$、$\gamma_k = k\varepsilon/(1 - k\varepsilon)$（$\varepsilon$ は機械イプシロン、$k\varepsilon < 1$）とすると、行列積の成分ごとの誤差は $\gamma_k (|A||B|)_{ij}$ と、非正規化数への丸めによる項の和以下になる。
+設定と命令セットの経路が同じなら、`Standard` の結果はワーカー数によらず同じビットになる。
+`Exact` は積を厳密に累積して最後に 1 回だけ丸めるので、結果は命令セットにもよらない。
+
+## 初等関数の振り分けと精度の保証
+
+`RealScalar` の初等関数メソッドは演算ごとに次の 3 種類のどれかに振り分けられている。
+
+| 種類 | 実装 | 主な演算 |
+|---|---|---|
+| `native` | `std` ありでは標準ライブラリ、`std` なしでは SciOxide のカーネル | `sqrt`、`exp`、`ln`、`sin`、`cos`、`powf`、`hypot`、`acosh` など |
+| `owned` | `std` の有無によらず SciOxide のカーネルや合成 | `powi`、`exp10`、`asinh`、`atanh`、`next_after`、`scalbn` |
+| `intrinsic` | 言語の基本演算 | `signum`、`recip`、`max`、`min`、`clamp`、`copysign`、`to_degrees`、`to_radians` |
+
+SciOxide のカーネルは倍精度で計算し、`f32` では最後に丸める。
+例外は出力の精度へ直接丸める `sqrt` と `mul_add`、ビットを直接扱う `next_after` と `scalbn` である。
+
+[`RealScalar` の精度保証](https://docs.rs/scioxide-core/0.1.0/scioxide_core/trait.RealScalar.html#elementary-accuracy)は、両方のスカラー型で非正規化数を含む有限な結果に適用される。
+`native` と SciOxide のカーネルの結果は、この範囲内で異なりうる。
+
+- 0 ULP（正しく丸めた結果）：`sqrt`、`floor`、`ceil`、`round`、`trunc`、`fract`、`mul_add`、`scalbn`。
+- 4 ULP：`powi`、`powf`、`cbrt`、`hypot`、`exp`、`exp2`、`exp10`、`exp_m1`、`ln`、`log2`、`log10`、`ln_1p`、三角関数・逆三角関数・双曲線関数・逆双曲線関数と `atan2`、`sin_cos`。
+- 16 ULP：任意の底の `log`。
+- `to_degrees` と `to_radians` は尺度の乗算を 1 回行うだけで、ULP 仕様の対象ではない。
+  `copysign` と `next_after` はビットを厳密に扱う。
+
+「$N$ ULP」は真値の位置での浮動小数点数の間隔（非正規化数の範囲では非正規化数の間隔）を ulp として、$|\text{計算値} - \text{真値}| \le N \cdot \mathrm{ulp}$ を意味する。
+これは試験で確かめる精度の保証であり、計算ごとの誤差の証明ではない。
+
+ジェネリックな関数の中では、`f64` の固有メソッドとの取り違えを避けるため `RealScalar::sin(x)` のようにトレイト名を付けて呼ぶ。
+`f64` の固有メソッド `x.sin()` は SciOxide の振り分けを通らない。
+
+## 大きな引数の周期縮約
+
+$\sin x$ や $\cos x$ を評価するには、まず $x = k \cdot \pi/2 + r$（$|r| \le \pi/4$）と分けて象限 $k \bmod 4$ と残り $r$ を求める。
+$\pi/2$ の倍精度近似 $\widehat{\pi/2}$ で $x - k\,\widehat{\pi/2}$ を計算すると、$\widehat{\pi/2}$ の誤差（約 $6 \times 10^{-17}$）が $k$ 倍されて $r$ に入る。
+$x = 10^{22}$ では $k \approx 6 \times 10^{21}$ なので、$r$ の誤差は 1 を超え、結果は意味を失う。
+
+Payne–Hanek 法は $2/\pi$ の二進展開を十分な桁数だけ保持し、$x$ の仮数と必要な部分だけを整数として掛け合わせて、$x \cdot 2/\pi$ の小数部分と象限を直接求める。
+$x \cdot 2/\pi$ の整数部分のうち 4 の倍数は象限に影響しないので、展開の上位の桁は掛けずに捨てられる。
+`scioxide-core` は SciOxide 自身のカーネル（`std` なしの `sin`、`cos` など、および複素数のべき乗で倍精度の範囲を超える位相）で、大きな引数にこの方法を使う。
+展開は `backend::TWO_OVER_PI_LIMBS` で出力に反映されており、上位から順に並んだ 24 ビットの整数 66 個（1584 ビット）からなる。
+連結した整数を $C$ とすると、$2/\pi$ は $C \cdot 2^{-1584}$ と $(C + 1) \cdot 2^{-1584}$ の間にある。
+`backend::reduce_radians(x)` は同じ縮約を行い、象限と、2 つの `f64` に分けた残りを返す。
+
+$$
+\frac{2}{\pi} \approx \sum_{j=0}^{65} C_j\, 2^{-24(j+1)}, \qquad 0 \le C_j < 2^{24}.
+$$
+
+次のセルは $x = 10^{p}$（無次元、$p = 1, \ldots, 22$ では `f64` で厳密に表せる）について、倍精度の $\pi/2$ で縮約してから $\sin$ を取った値と、`RealScalar::sin(x)` を比べる。
+1 つ目の表は選んだ $p$ での 2 つの値、その差、$\sin^2 x + \cos^2 x - 1$ を示す。
+$p = 22$ では既知の値 $\sin(10^{22}) = -0.8522008497671888\ldots$ との差を ulp で示す。
+グラフは $p = 1, \ldots, 22$ のすべてについて 2 つの値の差を対数軸に描き、選んだ $p$ を縦線で示す。
+ブラウザの wasm 環境は `std` ありなので、`RealScalar::sin` は標準ライブラリの実装で評価される。
+
+```rust
+//| id: core-large-argument-reduction
+//| ref: core-large-argument-reduction
+//| title: 大きな引数の縮約誤差
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   exponent: {"type":"range","label":"引数の指数 p（x = 10^p）","description":"x が大きいほど π/2 の近似誤差が縮約で増幅される。","min":1,"max":22,"step":1,"value":22}
+//| cases:
+//|   - {"id":"moderate","label":"x = 10⁵","description":"素朴な縮約の誤差はまだ 10⁻¹² 程度にとどまる。","inputs":{"exponent":5}}
+//|   - {"id":"lost","label":"x = 10¹⁷","description":"素朴な縮約の残りが 0 になり、値が意味を失う。","inputs":{"exponent":17}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/1","approx":{"value":-0.8522008497671888,"atol":1e-15}}
+//|       - {"artifact":"summary","path":"/rows/0/4","range":{"min":-1e-15,"max":1e-15}}
+//|       - {"artifact":"summary","path":"/rows/0/5","range":{"min":0,"max":4}}
+//|       - {"artifact":"sweep","path":"/rows/0/1","equals":1584}
+//|   - case: moderate
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/1","approx":{"value":0.03574879797201651,"atol":1e-14}}
+//|       - {"artifact":"summary","path":"/rows/0/3","range":{"min":0,"max":1e-10}}
+//|       - {"artifact":"summary","path":"/rows/0/5","equals":null}
+//|   - case: lost
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/3","range":{"min":1e-3}}
+//|       - {"artifact":"summary","path":"/rows/0/4","range":{"min":-1e-15,"max":1e-15}}
+use core::f64::consts::FRAC_PI_2;
+use scioxide_core::RealScalar;
+use scioxide_core::backend::TWO_OVER_PI_LIMBS;
+
+// x = 10^p を 10 進表記から正しく丸めて作る（p ≤ 22 では厳密）。
+let power = |p: i32| format!("1e{p}").parse::<f64>().map_err(|e| e.to_string());
+// 倍精度の π/2 で縮約する素朴な方法（比較用、f64 の演算と固有メソッド）。
+let naive_sin = |x: f64| {
+    let k = (x / FRAC_PI_2).round();
+    let reduced = x - k * FRAC_PI_2;
+    match k.rem_euclid(4.0) as u8 {
+        0 => reduced.sin(),
+        1 => reduced.cos(),
+        2 => -reduced.sin(),
+        _ => -reduced.cos(),
+    }
+};
+
+let selected = exponent as i32;
+let x = power(selected)?;
+let (sine, cosine) = (RealScalar::sin(x), RealScalar::cos(x));
+let naive = naive_sin(x);
+// 既知の sin(10²²) との差を、既知の値の位置での ulp で測る。
+let known = -0.852_200_849_767_188_8_f64;
+let ulp = RealScalar::next_after(known.abs(), 1.0) - known.abs();
+let known_gap = (selected == 22).then(|| (sine - known).abs() / ulp);
+let digits = serde_json::json!({ "significantDigits": 17 });
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed1 = serde_json::json!({ "fractionDigits": 1 });
+let only22 = "p = 22 のみ";
+let columns = serde_json::json!([
+    { "key": "0", "label": "引数 x [-]", "type": "number", "format": sci3 },
+    { "key": "1", "label": "RealScalar::sin(x) [-]", "type": "number", "format": digits },
+    { "key": "2", "label": "倍精度の π/2 で縮約した sin [-]", "type": "number", "format": digits },
+    { "key": "3", "label": "2 つの値の差の絶対値 [-]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "sin² + cos² − 1 [-]", "type": "number", "format": sci3 },
+    { "key": "5", "label": "既知値との差 [ulp]", "type": "number", "format": fixed1, "nullText": only22 }
+]);
+emit_table_with_columns!(
+    columns,
+    vec![(
+        x,
+        sine,
+        naive,
+        (sine - naive).abs(),
+        sine * sine + cosine * cosine - 1.0,
+        known_gap,
+    )],
+    metadata = serde_json::json!({ "id": "summary" })
+);
+
+// p = 1, …, 22 の差。0 になった点は対数軸に描けないので数える。
+let (mut curve, mut zero_gaps) = (Vec::new(), 0_u32);
+for p in 1..=22 {
+    let x = power(p)?;
+    let gap = (RealScalar::sin(x) - naive_sin(x)).abs();
+    if gap > 0.0 {
+        curve.push([f64::from(p), gap]);
+    } else {
+        zero_gaps += 1;
+    }
+}
+emit_line_chart!(
+    &vec![serde_json::json!({ "name": "|素朴な縮約 − RealScalar::sin|", "points": curve })],
+    options = &serde_json::json!({
+        "xLabel": "引数の指数 p（x = 10^p）[-]",
+        "yLabel": "2 つの値の差の絶対値 [-]",
+        "yType": "log",
+        "xMin": 1.0,
+        "xMax": 22.0,
+        "annotations": [{ "kind": "line", "axis": "x", "value": exponent, "label": "選んだ p" }]
+    })
+);
+let sweep_columns = serde_json::json!([
+    { "key": "0", "label": "差が 0 でグラフから除いた p [個]", "type": "integer" },
+    { "key": "1", "label": "2/π の展開の長さ（ワード数 × 24）[ビット]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    sweep_columns,
+    vec![(zero_gaps, TWO_OVER_PI_LIMBS.len() * 24)],
+    metadata = serde_json::json!({ "id": "sweep" })
+);
+```
+
+既定の $p = 22$ では、`RealScalar::sin` は既知の値と 4 ULP の仕様の内側で一致し、$\sin^2 x + \cos^2 x - 1$ も丸めの範囲に収まる。
+倍精度の $\pi/2$ で縮約した値は、縮約の残りが 0 になるので 0 を返し、差は $0.85$ に達する。
+
+グラフでは、2 つの値の差が $p$ とともにほぼ 10 倍ずつ増える。
+差は $p = 5$ で $2.4 \times 10^{-12}$、$p = 12$ で $2.5 \times 10^{-5}$ で、$p \ge 16$ では 1 程度になり、素朴な縮約の値は意味を失う。
+これは $\widehat{\pi/2}$ の誤差が $k \approx x \cdot 2/\pi$ 倍されるという見積り $6 \times 10^{-17} \cdot 0.64\, x$ と桁が合う。
+
+## 打ち消しを避ける安定変換
+
+`scioxide-core` は次の安定変換を関数として提供する。
+すべて実数と複素数（`NumericScalar`）を受け付け、非有限な入力を拒否し、`Result` で値を返す。
+
+| 関数 | 値 | 主な用途・定義域 |
+|---|---|---|
+| `cosm1(x)` | $\cos x - 1$ | 小さな角度の補正 |
+| `exprel(x)` | $(e^x - 1)/x$、$x = 0$ で 1 | 指数積分器、熱統計の比 |
+| `sinc(x)` | $\sin x / x$、$x = 0$ で 1 | 非正規化 sinc |
+| `sincpi(x)` | $\sin(\pi x)/(\pi x)$ | 0 でない整数で厳密に 0 |
+| `powm1(x, y)` | $x^y - 1$ | 負の底は整数の指数だけ、底 0 は非負の指数だけ |
+| `xlogy(x, y)` | $x \ln y$ | $x = 0$ なら任意の有限な $y$ で 0。$x \ne 0$ で $y \le 0$ は拒否 |
+| `xlog1py(x, y)` | $x \ln(1 + y)$ | $x = 0$ なら 0。$x \ne 0$ で $y \le -1$ は拒否 |
+| `sigmoid(x)` | $1/(1 + e^{-x})$ | 両側の裾でオーバーフローしない |
+| `log_sigmoid(x)` | $\ln \operatorname{sigmoid}(x)$ | 負の裾を保つ |
+| `softplus(x)` | $\ln(1 + e^{x})$ | 指数のオーバーフローなし |
+| `logit(p)` | $\ln(p / (1 - p))$、$0 < p < 1$ | $p = 1/2$ で $+0$ |
+| `sin_pi`、`cos_pi`、`tan_pi`、`sin_cos_pi` | $\pi$ を単位とする三角関数 | 象限を厳密に縮約。`tan_pi` の極は拒否 |
+| `sin_degrees`、`cos_degrees`、`tan_degrees`、`sin_cos_degrees` | 度を単位とする三角関数 | 同上 |
+
+これに `logaddexp`（[対数和のページ](../logarithmic-reductions/)）を加えた 20 関数が実数の 16 ULP 仕様を持つ。
+ただし `sincpi` の実数版はより強く、正しく丸めた値か、その隣の表現可能数を返す。
+表の関数は引数を `f64` で評価し、結果を出力の型に 1 回だけ丸める。
+非有限な入力は `NonFinite`、表の定義域の外は `DomainError`、結果が有限の範囲を超える場合は `NumericalInstability` になる。
+$\ln(1 + x)$ と $e^x - 1$ は安定変換ではなく `RealScalar::ln_1p` と `RealScalar::exp_m1`（4 ULP）として提供される。
+
+実数専用の `log1mexp(x)` は対数の補数 $\ln(1 - e^x)$ を $x \le 0$ で返す。
+そのまま計算すると、$x$ が 0 に近いときは $1 - e^x$ の引き算で桁落ちし、$x$ が大きな負の数のときは $1 - e^x$ が 1 に丸められて値が 0 になる。
+そこで $x \ge -\ln 2$ では $\ln(-\operatorname{expm1}(x))$、$x < -\ln 2$ では $\operatorname{ln1p}(-e^x)$ で計算する。
+$x = \pm 0$ は $-\infty$、$x = -\infty$ は $-0$ を返す。
+正の $x$ は `DomainError`、NaN と $+\infty$ は `NonFinite` になる。
+この関数は入力のスカラーの精度で計算し、16 ULP 仕様の対象ではない。
+
+`sin_pi` などは引数の整数部分と小数部分を厳密に分けてから評価するので、整数での $\sin(\pi k)$ は厳密に 0 になる。
+これに対し `RealScalar::sin(k * PI)` は $\pi$ の倍精度近似の誤差のため $k \times 1.22 \times 10^{-16}$ 程度の値を返す。
+
+次のセルは $x = 10^{p}$（無次元、$-16 \le p \le -1$）での $\cos x - 1$ と $(e^x - 1)/x$ を、そのままの式と安定変換で比べる。
+参照値は Taylor 級数
+
+$$
+\cos x - 1 = -\frac{x^2}{2} + \frac{x^4}{24} - \cdots, \qquad
+\frac{e^x - 1}{x} = 1 + \frac{x}{2} + \frac{x^2}{6} + \cdots
+$$
+
+を $x^{10}$ と $x^{11}$ の項まで Horner 法で足した値である。
+$|x| \le 0.1$ では打ち切り誤差が $\varepsilon$ より小さく、どちらの級数も打ち消しを含まないので、参照値の誤差は $\varepsilon$ の数倍以内である。
+表は各式の値、参照値、誤差 $|\text{計算値} - \text{参照値}| / (\varepsilon |\text{参照値}|)$ を示す。
+
+```rust
+//| id: core-cosm1-exprel-cancellation
+//| ref: core-cosm1-exprel-cancellation
+//| title: 0 の近くの打ち消しと安定変換
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   log10_x: {"type":"range","label":"入力の指数 p（x = 10^p）","description":"x が小さいほどそのままの式で打ち消しが強くなる。","min":-16,"max":-1,"step":1,"value":-5}
+//| cases:
+//|   - {"id":"rounded-to-one","label":"x = 10⁻⁹","description":"cos x が 1 に丸められ、そのままの式は 0 を返す。","inputs":{"log10_x":-9}}
+//|   - {"id":"mild","label":"x = 10⁻¹","description":"打ち消しが弱く、そのままの式の誤差も ε の数百倍にとどまる。","inputs":{"log10_x":-1}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"errors","path":"/rows/0/3","range":{"min":1e6}}
+//|       - {"artifact":"errors","path":"/rows/1/1","approx":{"value":-4.999999999958333e-11,"rtol":1e-14}}
+//|       - {"artifact":"errors","path":"/rows/1/3","range":{"min":0,"max":16}}
+//|       - {"artifact":"errors","path":"/rows/3/1","approx":{"value":1.0000050000166667,"rtol":1e-14}}
+//|       - {"artifact":"errors","path":"/rows/3/3","range":{"min":0,"max":16}}
+//|   - case: rounded-to-one
+//|     expect:
+//|       - {"artifact":"errors","path":"/rows/0/1","equals":0}
+//|       - {"artifact":"errors","path":"/rows/1/1","approx":{"value":-5e-19,"rtol":1e-14}}
+//|       - {"artifact":"errors","path":"/rows/1/3","range":{"min":0,"max":16}}
+//|   - case: mild
+//|     expect:
+//|       - {"artifact":"errors","path":"/rows/1/1","approx":{"value":-4.995834721974235e-3,"rtol":1e-14}}
+//|       - {"artifact":"errors","path":"/rows/1/3","range":{"min":0,"max":16}}
+//|       - {"artifact":"errors","path":"/rows/3/3","range":{"min":0,"max":16}}
+use scioxide_core::{RealScalar, cosm1, exprel};
+
+// x = 10^p を 10 進表記から正しく丸めて作る。
+let x = format!("1e{}", log10_x as i32)
+    .parse::<f64>()
+    .map_err(|e| e.to_string())?;
+// 参照値: Taylor 級数を Horner 法で足す（|x| ≤ 0.1 で打ち切り誤差は ε 未満）。
+// cos x − 1 = −(x²/2)(1 − (x²/12)(1 − (x²/30)(1 − (x²/56)(1 − x²/90))))
+let x2 = x * x;
+let reference_cosm1 = -0.5
+    * x2
+    * [90.0, 56.0, 30.0, 12.0]
+        .iter()
+        .fold(1.0, |tail, divisor| 1.0 - x2 / divisor * tail);
+// (e^x − 1)/x = 1 + (x/2)(1 + (x/3)(1 + … (1 + x/12)))
+let reference_exprel = (2..=12)
+    .rev()
+    .fold(1.0, |tail, divisor| 1.0 + x / f64::from(divisor) * tail);
+
+let naive_cosm1 = RealScalar::cos(x) - 1.0;
+let stable_cosm1 = cosm1(x).map_err(|e| e.to_string())?;
+let naive_exprel = (RealScalar::exp(x) - 1.0) / x;
+let stable_exprel = exprel(x).map_err(|e| e.to_string())?;
+let rows: Vec<(&str, f64, f64, f64)> = [
+    ("cos(x) − 1", naive_cosm1, reference_cosm1),
+    ("cosm1(x)", stable_cosm1, reference_cosm1),
+    ("(exp(x) − 1) / x", naive_exprel, reference_exprel),
+    ("exprel(x)", stable_exprel, reference_exprel),
+]
+.iter()
+.map(|&(name, value, reference)| {
+    let error = (value - reference).abs() / (f64::EPSILON * reference.abs());
+    (name, value, reference, error)
+})
+.collect();
+let digits = serde_json::json!({ "notation": "scientific", "significantDigits": 17 });
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "式" },
+    { "key": "1", "label": "値 [-]", "type": "number", "format": digits },
+    { "key": "2", "label": "参照値 [-]", "type": "number", "format": digits },
+    { "key": "3", "label": "相対誤差 / ε [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "errors" })
+);
+```
+
+$x = 10^{-5}$ では $\cos x - 1 \approx -5 \times 10^{-11}$ をそのまま計算すると、$\cos x$ を倍精度に丸めた誤差（正しく丸めても最大で約 $5.5 \times 10^{-17}$）が結果に比べて大きく、相対誤差は $\varepsilon$ の約 $4 \times 10^{8}$ 倍になる。
+同じ $x$ で $(e^x - 1)/x$ をそのまま計算すると、相対誤差は $\varepsilon$ の約 $4 \times 10^{4}$ 倍になる。
+$x \le 10^{-8}$ では $\cos x$ が 1 に丸められ、そのままの式は 0 を返す。
+$x = 10^{-1}$ では打ち消しが弱く、そのままの式の誤差は $\cos x - 1$ で $\varepsilon$ の約 50 倍、$(e^x - 1)/x$ で約 4 倍にとどまる。
+安定変換の値は、入力の範囲のどの $p$ でも参照値との相対差が $\varepsilon$ の数倍以内に収まる（ネイティブの実行では最大で $\varepsilon$ の 1 倍）。
+
+## 複素数での誤差の増大因子
+
+複素数の引数 $z = x + iy$ では、関数値の大きさが $|y|$ とともに指数的に増えるものがあり、成分の丸め誤差もそれに応じて大きくなる。
+安定変換の複素数版は、厳密な結果の成分を $(\mathrm{re}, \mathrm{im})$ として、各成分の誤差が
+
+$$
+32\, \varepsilon\, \max(|\mathrm{re}|, |\mathrm{im}|)\, g(z) + 8\eta
+$$
+
+以下という仕様を持つ（$\varepsilon$ は機械イプシロン、$\eta$ は最小の正の非正規化数）。
+増大因子 $g(z)$ は関数ごとに次のとおりである。
+
+| 関数 | $g(z)$ |
+|---|---|
+| `sinc`、`cosm1` | $1 + \lvert \operatorname{Im} z \rvert$ |
+| `sincpi`、$\pi$ 単位の三角関数 | $1 + \pi \lvert \operatorname{Im} z \rvert$ |
+| 度単位の三角関数 | $1 + (\pi/180) \lvert \operatorname{Im} z \rvert$ |
+| `exprel` | $1 + \lvert \operatorname{Re} z \rvert$ |
+| `powm1(z, w)` | $1 + \lvert w \rvert \lvert \ln z \rvert$ |
+| その他 | 1 |
+
+`Complex<T>` の初等関数（`exp`、`ln`、`sin` など）は、有限な引数と表現できる結果に対して、成分ごとに $16\,\varepsilon \max(|\mathrm{re}|, |\mathrm{im}|)\, g$ の仕様を持つ。
+`exp`、`sin`、`cos`、`sinh`、`cosh` では $g = 1 + \max(|\operatorname{Re} z|, |\operatorname{Im} z|)$、べき乗 $z^w$ では $g = 1 + |w| |\ln z|$ である。
+`sqrt`、`ln`、`tan`、`tanh` と逆三角関数・逆双曲線関数では $g = 1$ である。
+
+複素数の除算は、途中の値が範囲に収まる場合だけ通常の式を使い、それ以外は両方の被演算子を 2 のべきで尺度調整してから割る。
+有限な被演算子と 0 でない除数に対し、計算した商 $\hat{q}$ は厳密な商 $q$ について $|\hat{q} - q| \le 8\varepsilon|q| + 4\eta$ を満たす。
+$q$ の成分が表現できる限り、途中でオーバーフロー、アンダーフロー、NaN は生じない。
+無限大、NaN、0 による除算は C99 Annex G に従う。
+
+## 配列への一括変換 `transform_into`
+
+多くの点に同じ安定変換を適用するときは `transform_into(input, transform, policy, output, scratch, cx)` を使う。
+引数は入力、変換、方針、出力、作業領域、実行コンテキストの順に並ぶ。
+
+- 入力は `NdView`、出力は `NdViewMut` で、形が一致しなければならない。
+  入力はブロードキャスト（同じ要素を繰り返し読む配置）でもよく、出力は同じアドレスを 2 度指さない配置でなければならない。
+- `scratch` は要素 1 つにつき 1 つ以上のスカラーを必要とする。
+  形が違う場合と `scratch` が短い場合は `DimensionMismatch` になる。
+- 結果はまず `scratch` に作り、すべての点で `transform` が成功してから出力に写す。
+  1 つでも失敗すれば出力は変わらない。
+- `transform` が返したエラーはそのまま返る。
+  `transform` が非有限な値を返した点は `NonFinite`（`NonFiniteOrigin::Intermediate`）として失敗する。
+- 方針 `policy` が `Auto` のときは要素 1 つを計算量 1 と見積もり、32 要素以上で並列化を検討する。
+  分割は最大 64 個で、スケジュールによって各点の値は変わらない。
+- 取り消しと期限は分割ごとに 256 回の呼び出しにつき少なくとも 1 回確かめる。
+  実行中の `transform` の呼び出しは中断しない。
+
+計算量は要素数に比例し、数値処理でヒープを確保しない。
+配置の規則は[借用レイアウトとアフィン値](../borrowed-layouts-and-affine-values/)、方針とコンテキストは[実行方針・分割・実行コンテキスト](../execution-and-partitions/)にある。
+
+次のセルは $x = 0, 0.25, 0.5, \ldots$ の格子（無次元）に `sin_pi` を `transform_into` で適用し、`RealScalar::sin(PI * x)` と比べる。
+入力は格子点の数である。
+1 つ目の表は各点の 2 つの値とその差を示す。
+2 つ目の表は整数の格子点の数と、そこで厳密な 0 を返した数を関数ごとに示す。
+
+```rust
+//| id: core-pi-unit-transform
+//| ref: core-pi-unit-transform
+//| title: π 単位の正弦を格子へ一括適用する
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   points: {"type":"range","label":"格子点の数","description":"x = 0, 0.25, 0.5, … の点数。","min":4,"max":17,"step":1,"value":9}
+//| cases:
+//|   - {"id":"two-periods","label":"17 点（x ≤ 4）","description":"整数の格子点が 5 個に増える。","inputs":{"points":17}}
+//|   - {"id":"short","label":"4 点（x ≤ 0.75）","description":"整数の格子点は x = 0 だけになる。","inputs":{"points":4}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"grid","path":"/rows/2/1","equals":1}
+//|       - {"artifact":"grid","path":"/rows/4/1","equals":0}
+//|       - {"artifact":"grid","path":"/rows/4/2","approx":{"value":1.2246467991473532e-16,"rtol":1e-6}}
+//|       - {"artifact":"grid","path":"/rows/1/3","range":{"min":0,"max":1e-15}}
+//|       - {"artifact":"zeros","path":"/rows/0/0","equals":3}
+//|       - {"artifact":"zeros","path":"/rows/0/1","equals":3}
+//|       - {"artifact":"zeros","path":"/rows/0/2","equals":1}
+//|   - case: two-periods
+//|     expect:
+//|       - {"artifact":"grid","path":"/rows/16/1","equals":0}
+//|       - {"artifact":"zeros","path":"/rows/0/0","equals":5}
+//|       - {"artifact":"zeros","path":"/rows/0/1","equals":5}
+//|   - case: short
+//|     expect:
+//|       - {"artifact":"grid","path":"/rows/3/1","approx":{"value":0.7071067811865476,"rtol":1e-14}}
+//|       - {"artifact":"zeros","path":"/rows/0/0","equals":1}
+//|       - {"artifact":"zeros","path":"/rows/0/1","equals":1}
+use core::f64::consts::PI;
+use scioxide_core::{
+    ExecutionContext, ExecutionPolicy, NdView, NdViewMut, RealScalar, sin_pi, transform_into,
+};
+
+let n = points as usize;
+let grid: Vec<f64> = (0..n).map(|i| 0.25 * i as f64).collect();
+let shape = [n];
+let mut values = vec![0.0; n];
+let mut scratch = vec![0.0; n];
+let input = NdView::row_major(&grid, &shape).map_err(|e| e.to_string())?;
+let output = NdViewMut::row_major(&mut values, &shape).map_err(|e| e.to_string())?;
+// 引数は入力、変換、方針、出力、作業領域、実行コンテキストの順。
+transform_into(
+    input,
+    sin_pi::<f64>,
+    ExecutionPolicy::Sequential,
+    output,
+    &mut scratch,
+    ExecutionContext::sequential(),
+)
+.map_err(|e| e.to_string())?;
+
+let (mut integers, mut exact_pi, mut exact_radians) = (0_u32, 0_u32, 0_u32);
+let mut rows = Vec::new();
+for (&x, &value) in grid.iter().zip(&values) {
+    // 比較用: π の倍精度近似を掛けてからラジアンの正弦を取る。
+    let radians = RealScalar::sin(PI * x);
+    if RealScalar::fract(x) == 0.0 {
+        integers += 1;
+        exact_pi += u32::from(value == 0.0);
+        exact_radians += u32::from(radians == 0.0);
+    }
+    rows.push((x, value, radians, (value - radians).abs()));
+}
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let digits = serde_json::json!({ "significantDigits": 17 });
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "x [-]", "type": "number", "format": fixed2 },
+    { "key": "1", "label": "sin_pi(x) [-]", "type": "number", "format": digits },
+    { "key": "2", "label": "RealScalar::sin(PI * x) [-]", "type": "number", "format": digits },
+    { "key": "3", "label": "差の絶対値 [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "grid" })
+);
+let zero_columns = serde_json::json!([
+    { "key": "0", "label": "整数の格子点 [個]", "type": "integer" },
+    { "key": "1", "label": "sin_pi が厳密に 0 [個]", "type": "integer" },
+    { "key": "2", "label": "RealScalar::sin(PI * x) が厳密に 0 [個]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    zero_columns,
+    vec![(integers, exact_pi, exact_radians)],
+    metadata = serde_json::json!({ "id": "zeros" })
+);
+```
+
+既定の 9 点（$x \le 2$）では、整数の格子点 $x = 0, 1, 2$ のすべてで `sin_pi` が厳密な 0 を返す。
+`RealScalar::sin(PI * x)` が 0 を返すのは $x = 0$ だけで、$x = 1$ では $1.22 \times 10^{-16}$、$x = 2$ では $-2.45 \times 10^{-16}$ になる。
+整数でない点では 2 つの値の差は $10^{-16}$ 程度で、どちらも丸めの範囲で一致する。
+17 点（$x \le 4$）にすると整数の格子点は 5 個に増え、`sin_pi` は 5 個すべてで厳密な 0 を返す。
+
+## まとめ
+
+`RealScalar` の初等関数は `native`、`owned`、`intrinsic` の 3 種類に振り分けられ、多くの超越関数は 4 ULP、安定変換は 16 ULP の精度の保証を持つ。
+引数の大きな三角関数は Payne–Hanek 法で縮約されるので、$\pi/2$ の近似誤差が象限と残りに入らない。
+0 の近くで打ち消しが起きる式は `cosm1`、`exprel`、`powm1`、`xlog1py` などの安定変換に置き換え、整数や半整数での値が重要な場合は $\pi$ 単位や度単位の三角関数を使う。
+複素数の引数では誤差の限界が $g(z)$ に比例して広がることを、結果の読み方に含める。
+関数を書くときは引数の型を既定で `RealScalar` とし、複素数を扱える場合だけ `NumericScalar` に広げ、積和の精度は `Accuracy` で選ぶ。
+
+## 次に読むページ
+
+- [借用レイアウトとアフィン値](../borrowed-layouts-and-affine-values/)：`transform_into` に渡す `NdView` と `StridedLayout` の検査規則を確かめる。
+- [対数和・重み付き和・正規化](../logarithmic-reductions/)：`logaddexp` と対数和の精度の保証を確かめる。
+- [算術・安定変換・対数和の API](../../api/arithmetic-and-reductions/)：安定変換の全項目とエラー条件を引く。

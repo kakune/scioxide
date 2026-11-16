@@ -1,0 +1,606 @@
+---
+title: 取り消し・回数上限による停止と受理済み反復解の読み方
+description: 共役勾配法を反復回数の上限、作用素の評価回数の上限、取り消し、仮定の破れ、作用素のエラー、入力の誤りで止め、出力先を指定する API の solve_into が Ok と Err のそれぞれで出力に何を書くか、試行記録と受理状態に何が残るかを読み、打ち切ったときに出力に反映される解の誤差を確かめる。
+sidebar:
+  order: 450
+references:
+  linalg-example-attempt-records: "試行記録と受理状態"
+---
+
+大きな方程式を反復法で解くとき、計算は収束の前に止まることがある。
+利用者が中断した場合、反復回数や作用素の評価回数の上限に達した場合、方程式が仮定を満たさずアルゴリズムを続けられない場合である。
+そのとき呼び出し側が知りたいのは、出力に何が入っているかと、それをどの程度信用してよいかである。
+この例題では 1 次元 Poisson 方程式の共役勾配法（CG）をいくつかの方法で止め、出力先を指定する API の `solve_into` が返すレポート、出力、作業領域の記録を読む。
+出力先を指定する API は、出力のベクトル、作業領域、実行コンテキストを呼び出し側が渡す呼び出しの形である（[作業領域・実行コンテキスト・試行記録](oxref:linalg-execution-forms)）。
+
+---
+
+## 検証済みの解と出力の確定
+
+CG は漸化式で残差 $r_k$ を更新するが、丸め誤差のため漸化式の値は真の残差 $b - Ax_k$ から離れていく。
+`CgSolver` は、開始時、50 回の反復ごと、収束の候補になったとき、更新で反復解が変わらなかったとき、反復回数の上限に達したときを検査点とし、そこで真の残差を作用素の評価で計算し直す。
+検査点で真の残差を確かめた反復解を、ここでは検証済みの解と呼ぶ。
+ソルバーは検証済みの解のうち真の残差が最小のもの（等しければ後のもの）を保持する。
+50 回ごとの置き換えは漸化式の残差を真の値に戻すだけで、探索方向と共役性はそのまま保つ。
+検査点の真の残差がそれまでの最小を下回らないときは、最小の残差が丸め誤差による残差の下限に達したかを調べ、達していれば `Stagnation` で止まる。
+この判定は符号を入れ替えた反復解と $A$ の積を 1 回使い、その積も作用素の評価回数に数えられる（下限の式は[丸め誤差による残差の下限](../preconditioned-cg/#丸め誤差による残差の下限)）。
+
+`CgSolver::solve_into` は出力のベクトル $x$ の値を初期値として反復し、`Ok` を返すときだけ $x$ に結果を書く。
+収束した場合は収束を確かめた解を、止まった場合は真の残差が最小の検証済みの解（初期値を含む）を書く。
+`Err` を返すときは $x$ を変更しない。
+`Ok` は収束だけを意味しない。
+反復回数の上限（`IterationLimit`）、評価回数の上限（`EvaluationLimit`）、停滞（`Stagnation`）、取り消しや期限（`ExecutionStopped(reason)`）、曲率 $p^{\mathsf T}Ap \le 0$ のような仮定の破れ（`Breakdown(NonPositiveCurvature)`）で止まった場合も、レポートと解を `Ok` で返す。
+成否はレポートの終了理由 `termination()` で判定し、`is_success()` が真になるのは `Converged` と `LeastSquaresConverged` のときである。
+標準形式の `solve` が使う `IterativeSolveResult::into_converged_solution` は、`ExecutionStopped(reason)` を `ExecutionStopped` のエラーに、ほかの未収束を `ConvergenceFailure` のエラーに変える。
+
+`Err` になるのは、数値計算の前の検査で拒否される形状の不一致（`DimensionMismatch`）や非有限な入力（`NonFinite`）、作用素や前処理が返した非有限値やエラー、作業領域の確保の失敗（`ResourceLimit`、`AllocationFailure`）である。
+最初の残差を計算する評価すら計算回数の上限で拒否された場合は、使える反復解がないので `ConvergenceFailure` になる。
+所有値を返す API の `solve_with_options` は出力と作業領域を自分で確保して同じ手順で計算し、解を `IterativeSolveResult` に入れて返す。
+
+## 試行記録と受理状態
+
+作業領域 `IterativeWorkspace` は呼び出しのたびに二つの記録を残す。
+
+- `last_attempt()` は最後の呼び出しを記録した `AttemptRecord` を返す。
+  `outcome()` は結果を `Succeeded`（成功）、`Stopped`（使える解を残して停止）、`Failed`（数値計算が始まった後のエラー）、`PreflightRejected`（数値計算の前の検査で拒否）に分ける。
+  `counts()` は反復の回数と、作用素と前処理を評価した回数を数え、`PreflightRejected` では 0 になる。
+- `last_accepted()` は、成功または停止した試行の受理状態 `IterativeAccepted` を返し、`Failed` と `PreflightRejected` の後は `None` になる。
+  `solution()` は出力に書いた解、`history()` は残差の履歴、`progress()` は終了理由、反復回数、真の残差、信頼区分を返す。
+
+信頼区分 `PartialResultTrust` は受理状態をどこまで確かめたかを表し、弱い順に `DiagnosticOnly`（残差の主張を持たない診断用の状態）、`Admissible`（アルゴリズム自身の受理条件だけを満たす）、`ResidualChecked`（残差が設定した許容誤差を独立な計算で満たした）、`CertificateVerified`（独立に検証した証明を持つ）である。
+`Display` による表示は `diagnostic-only` や `residual-checked` のような小文字の名前になる。
+CG が `ResidualChecked` を付けるのは、真の残差が許容誤差を満たして収束した解だけである。
+収束せずに止まった場合は、真の残差を確かめた検証済みの解を返しても `Admissible` になり、最初の真の残差を計算する前に止まった場合は `DiagnosticOnly` になる。
+
+## 上限と取り消しの指定
+
+反復回数の上限はソルバーを作るときに `CgSolver::new(tolerance, max_iterations)` の `Budget` で与える。
+`with_execution_options` で `LinalgExecutionOptions::with_iteration_budget` を合成した場合や、`LinalgExecutionContext::with_iteration_budget` でコンテキストに上限を付けた場合は、小さいほうが使われる。
+
+作用素と前処理の評価回数の上限は、scioxide-core の `SolveBudgets` に `BudgetKind::Evaluation` の上限を設定し、`SolveState::begin_solve` で作った、呼び出し側が持つ求解コンテキスト `SolveContext` を `solve_into` に渡して与える（[求解のライフサイクルと計算回数の管理](../../../scioxide-core/algorithms/solve-lifecycle-and-accounting/)）。
+このとき CG はそのコンテキストの中で入れ子の求解として動き、評価の回数は呼び出し側の上限に数えられ、反復の回数は CG 自身の上限だけに数えられる。
+`begin_solve` が取る `SolveIdentity` は途中状態から再開するときに照合する値で、ここでは任意の値を与える。
+
+取り消しは `ExecutionContext::with_cancellation` に渡した `CancellationToken` で要求する。
+ソルバーは求解の開始時と各反復の初めに要求を調べるので、作用素の評価の中で要求された取り消しは次の反復の初めに検出される。
+ブラウザの中のセルは 1 本のスレッドで動き、クロックを持たない。
+そのためこのセルは呼び出しの前の取り消しと、作用素の評価の中から同じスレッドで要求した取り消しだけを示せる。
+別のスレッドからの取り消しと期限による停止は示せない。
+期限はクロックを結び付けたコンテキスト（`with_clock`）に `with_time_limit` で付け、クロックのないコンテキストでは `CapabilityUnavailable` のエラーになる（[取り消し・クロック・期限](../../../scioxide-core/algorithms/cancellation-clocks-and-deadlines/)）。
+期限で止まった反復法の終了理由は `ExecutionStopped(DeadlineReached)` で、出力と記録は取り消しの場合と同じ規則に従う。
+
+## 止め方ごとの結果
+
+次のブロックは二つのセルが共有する定義である。
+`Probe` は scioxide-core の `LinearOperator` を実装した型で、行列を作らずに $A = \operatorname{tridiag}(-1, 2, -1)$（`sign = -1` なら $-A$）を作用させる。
+作用の回数を数え、指定した回の作用の中で取り消しを要求するか、結果に NaN を入れる。
+`poisson` は $-u'' = x$（$u(0) = u(1) = 0$）を内点 $N$ 個で二階差分にした右辺 $b_i = h^2 x_i$ と、離散方程式の厳密解 $u_i = x_i(1 - x_i^2)/6$ を返す（二階差分は三次式に対して厳密）。
+`relative_residual` は評価を数えずに $\lVert b - Ax \rVert_2/\lVert b \rVert_2$ を計算し直す検算用の関数、`termination_name` は終了理由の列挙子名を返す関数である。
+
+```rust
+//| id: linalg-context-contracts-model
+//| kind: definitions
+//| title: 評価を数える 1 次元 Poisson の作用素
+//| crates: [scioxide-core, scioxide-linalg]
+use core::cell::Cell;
+use scioxide_core::{CancellationToken, Dimensions, SciOxideError, LinearOperator};
+use scioxide_linalg::LinearSolveTermination;
+
+/// 行列を作らずに A = tridiag(−1, 2, −1)（sign = −1 なら −A）を作用させる。
+/// 作用の回数を数え、指定した回の作用の中で取り消しを要求するか、NaN を返す。
+pub(crate) struct Probe<'a> {
+    pub(crate) n: usize,
+    pub(crate) sign: f64,
+    pub(crate) calls: Cell<usize>,
+    pub(crate) cancel_at: Option<(usize, &'a CancellationToken)>,
+    pub(crate) nan_at: Option<usize>,
+}
+
+impl Probe<'_> {
+    pub(crate) fn new(n: usize) -> Self {
+        Probe {
+            n,
+            sign: 1.0,
+            calls: Cell::new(0),
+            cancel_at: None,
+            nan_at: None,
+        }
+    }
+}
+
+impl LinearOperator<f64> for Probe<'_> {
+    fn rows(&self) -> usize {
+        self.n
+    }
+
+    fn cols(&self) -> usize {
+        self.n
+    }
+
+    fn apply_workspace_len(&self) -> Result<usize, SciOxideError> {
+        Ok(0)
+    }
+
+    fn apply_into(&self, x: &[f64], y: &mut [f64], _: &mut [f64]) -> Result<(), SciOxideError> {
+        if x.len() != self.n || y.len() != self.n {
+            return Err(SciOxideError::dimension_mismatch(
+                Dimensions::two(self.n, self.n),
+                Dimensions::two(x.len(), y.len()),
+            ));
+        }
+        let call = self.calls.get() + 1;
+        self.calls.set(call);
+        for i in 0..self.n {
+            let left = if i > 0 { x[i - 1] } else { 0.0 };
+            let right = if i + 1 < self.n { x[i + 1] } else { 0.0 };
+            y[i] = self.sign * (2.0 * x[i] - left - right);
+        }
+        if let Some((at, token)) = self.cancel_at
+            && at == call
+        {
+            token.cancel();
+        }
+        if self.nan_at == Some(call) {
+            y[0] = f64::NAN;
+        }
+        Ok(())
+    }
+}
+
+/// −u'' = x、u(0) = u(1) = 0 を内点 n 個で離散化した右辺 b_i = h² x_i と、
+/// 離散方程式の厳密解 u_i = x_i(1 − x_i²)/6（二階差分は三次式に厳密）。
+pub(crate) fn poisson(n: usize) -> (Vec<f64>, Vec<f64>) {
+    let h = 1.0 / (n + 1) as f64;
+    let x = |i: usize| (i + 1) as f64 * h;
+    let b = (0..n).map(|i| h * h * x(i)).collect();
+    let exact = (0..n).map(|i| x(i) * (1.0 - x(i) * x(i)) / 6.0).collect();
+    (b, exact)
+}
+
+/// 終了理由の列挙子名。
+pub(crate) fn termination_name(t: LinearSolveTermination) -> String {
+    match t {
+        LinearSolveTermination::Converged => "Converged".to_string(),
+        LinearSolveTermination::LeastSquaresConverged => "LeastSquaresConverged".to_string(),
+        LinearSolveTermination::ConditionLimit => "ConditionLimit".to_string(),
+        LinearSolveTermination::IterationLimit => "IterationLimit".to_string(),
+        LinearSolveTermination::EvaluationLimit => "EvaluationLimit".to_string(),
+        LinearSolveTermination::Stagnation => "Stagnation".to_string(),
+        LinearSolveTermination::Breakdown(cause) => format!("Breakdown({cause:?})"),
+        LinearSolveTermination::ExecutionStopped(reason) => format!("ExecutionStopped({reason:?})"),
+    }
+}
+
+/// 残差 ‖b − sign·A x‖₂ / ‖b‖₂（作用素の評価を数えない検算用の計算）。
+pub(crate) fn relative_residual(sign: f64, b: &[f64], x: &[f64]) -> f64 {
+    let n = x.len();
+    let mut squared = 0.0;
+    for i in 0..n {
+        let left = if i > 0 { x[i - 1] } else { 0.0 };
+        let right = if i + 1 < n { x[i + 1] } else { 0.0 };
+        let r = b[i] - sign * (2.0 * x[i] - left - right);
+        squared += r * r;
+    }
+    (squared / b.iter().map(|v| v * v).sum::<f64>()).sqrt()
+}
+```
+
+次のセルは $N = 100$ の方程式を、七つの条件で `solve_into` に渡す。
+出力のベクトルは初期値 0 を兼ね、どの条件で書き換えられ、どの条件で変わらないかを確かめる。
+
+1. 上限なし：反復の上限 1000 回。
+2. 反復回数の上限：入力の上限（1〜100 回）。
+3. 評価回数の上限：呼び出し側のコンテキストに入力の上限（1〜200 回）を付ける。
+4. 取り消し：入力で選んだ回の作用の中で取り消しを要求する（0 なら呼び出しの前）。
+5. 負定値の行列：$-A$ で解く。
+6. NaN を返す作用素：30 回目に作用させた結果に NaN を入れる。
+7. 右辺の長さの不一致：長さ $N - 1$ の右辺を渡す。
+
+表は `Ok` か `Err` とエラーの分類、レポートの終了理由と反復回数、試行記録の評価回数と結果、受理状態の信頼区分、レポートの真の残差（$\lVert b \rVert$ に対する相対値）を示す。
+最後の 3 列はレポートとは別に出力を検算した値で、出力の相対残差 $\lVert b - Ax \rVert_2/\lVert b \rVert_2$、厳密解（負定値の行列では $-u$）との差の最大を $\max_i \lvert u_i \rvert$ で割った相対誤差、出力が初期値 0 のままかどうかである。
+
+```rust
+//| id: linalg-context-contracts
+//| ref: linalg-context-contracts
+//| title: CG を上限・取り消し・仮定の破れ・エラーで止めたときの結果と記録
+//| run: reactive
+//| uses: [linalg-context-contracts-model]
+//| crates: [scioxide-core, scioxide-linalg]
+//| inputs:
+//|   iteration_limit: {"type":"range","label":"反復回数の上限","description":"ソルバーに与える Budget。","min":1,"max":100,"step":1,"value":70}
+//|   evaluation_limit: {"type":"range","label":"評価回数の上限","description":"求解コンテキストの SolveBudgets に与える作用素の評価回数。","min":1,"max":200,"step":1,"value":90}
+//|   cancel_after: {"type":"range","label":"取り消しを要求する作用の回","description":"0 なら呼び出しの前に取り消す。","min":0,"max":120,"step":1,"value":0}
+//| cases:
+//|   - {"id":"late-limits","label":"反復 100 回、評価 102 回","description":"反復の上限では収束するが、評価の上限では確認の評価が足りずに初期値が返る。","inputs":{"iteration_limit":100,"evaluation_limit":102}}
+//|   - {"id":"cancel-midway","label":"75 回目の作用で取り消し","description":"反復の途中の取り消しでも、出力は検査点で確かめた解のうち残差が最小のものになる。","inputs":{"cancel_after":75}}
+//|   - {"id":"boundaries","label":"反復 59 回、102 回目の作用で取り消し","description":"上限 59 回では検査点の残差がまだ初期値を上回って初期値が返り、102 回目の作用で要求した取り消しは収束が確定した後にしか調べられない。","inputs":{"iteration_limit":59,"cancel_after":102}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"contracts","path":"/rows/0/2","equals":"Converged"}
+//|       - {"artifact":"contracts","path":"/rows/0/4","equals":103}
+//|       - {"artifact":"contracts","path":"/rows/0/9","range":{"max":1e-13}}
+//|       - {"artifact":"contracts","path":"/rows/1/2","equals":"IterationLimit"}
+//|       - {"artifact":"contracts","path":"/rows/1/6","equals":"admissible"}
+//|       - {"artifact":"contracts","path":"/rows/1/10","equals":"いいえ"}
+//|       - {"artifact":"contracts","path":"/rows/2/2","equals":"EvaluationLimit"}
+//|       - {"artifact":"contracts","path":"/rows/2/9","approx":{"value":1.0,"atol":1e-12}}
+//|       - {"artifact":"contracts","path":"/rows/3/2","equals":"ExecutionStopped(Cancelled)"}
+//|       - {"artifact":"contracts","path":"/rows/3/4","equals":0}
+//|       - {"artifact":"contracts","path":"/rows/3/6","equals":"diagnostic-only"}
+//|       - {"artifact":"contracts","path":"/rows/4/2","equals":"Breakdown(NonPositiveCurvature)"}
+//|       - {"artifact":"contracts","path":"/rows/5/1","equals":"Err(NonFinite)"}
+//|       - {"artifact":"contracts","path":"/rows/5/4","equals":30}
+//|       - {"artifact":"contracts","path":"/rows/5/5","equals":"Failed"}
+//|       - {"artifact":"contracts","path":"/rows/5/6","equals":null}
+//|       - {"artifact":"contracts","path":"/rows/6/1","equals":"Err(DimensionMismatch)"}
+//|       - {"artifact":"contracts","path":"/rows/6/5","equals":"PreflightRejected"}
+//|       - {"artifact":"contracts","path":"/rows/6/9","approx":{"value":1.0,"atol":1e-12}}
+//|   - case: late-limits
+//|     expect:
+//|       - {"artifact":"contracts","path":"/rows/1/2","equals":"Converged"}
+//|       - {"artifact":"contracts","path":"/rows/1/9","range":{"max":1e-13}}
+//|       - {"artifact":"contracts","path":"/rows/2/2","equals":"EvaluationLimit"}
+//|       - {"artifact":"contracts","path":"/rows/2/3","equals":100}
+//|       - {"artifact":"contracts","path":"/rows/2/4","equals":102}
+//|       - {"artifact":"contracts","path":"/rows/2/9","approx":{"value":1.0,"atol":1e-12}}
+//|   - case: cancel-midway
+//|     expect:
+//|       - {"artifact":"contracts","path":"/rows/3/3","equals":73}
+//|       - {"artifact":"contracts","path":"/rows/3/6","equals":"admissible"}
+//|       - {"artifact":"contracts","path":"/rows/3/9","approx":{"value":1.0,"atol":1e-12}}
+//|   - case: boundaries
+//|     expect:
+//|       - {"artifact":"contracts","path":"/rows/1/2","equals":"IterationLimit"}
+//|       - {"artifact":"contracts","path":"/rows/1/8","approx":{"value":1.0,"atol":1e-12}}
+//|       - {"artifact":"contracts","path":"/rows/1/10","equals":"はい"}
+//|       - {"artifact":"contracts","path":"/rows/3/2","equals":"Converged"}
+//|       - {"artifact":"contracts","path":"/rows/3/9","range":{"max":1e-13}}
+use scioxide_core::{
+    AttemptOutcome, Budget, BudgetKind, CancellationToken, ExecutionContext, ProblemToken,
+    ResidualTolerance, SolveBudgets, SolveIdentity, SolveState, algorithm_id,
+};
+use scioxide_linalg::{CgSolver, IterativeWorkspaceRequest, Preconditioning, Vector};
+
+let n = 100_usize;
+let (b, exact) = poisson(n);
+let peak = exact.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+let tolerance = ResidualTolerance::new(0.0, 1e-12).map_err(|e| e.to_string())?;
+let scenarios = [
+    "上限なし",
+    "反復回数の上限",
+    "評価回数の上限",
+    "取り消し",
+    "負定値の行列",
+    "NaN を返す作用素",
+    "右辺の長さの不一致",
+];
+// 試行の結果は列挙子名で示す（終了理由は定義の termination_name）。
+let outcome_name = |o: AttemptOutcome| match o {
+    AttemptOutcome::Succeeded => "Succeeded",
+    AttemptOutcome::Stopped => "Stopped",
+    AttemptOutcome::Failed => "Failed",
+    AttemptOutcome::PreflightRejected => "PreflightRejected",
+    _ => "その他",
+};
+let mut rows = Vec::new();
+for (index, scenario) in scenarios.iter().enumerate() {
+    let token = CancellationToken::new();
+    let mut operator = Probe::new(n);
+    let limit = if index == 1 {
+        iteration_limit.round() as usize
+    } else {
+        1000
+    };
+    match index {
+        3 if cancel_after < 0.5 => token.cancel(),
+        3 => operator.cancel_at = Some((cancel_after.round() as usize, &token)),
+        4 => operator.sign = -1.0,
+        5 => operator.nan_at = Some(30),
+        _ => {}
+    }
+    let solver = CgSolver::new(
+        tolerance,
+        Budget::try_from(limit).map_err(|e| e.to_string())?,
+    );
+    let request = IterativeWorkspaceRequest::operator(&operator).map_err(|e| e.to_string())?;
+    let mut ws = solver.workspace(&request).map_err(|e| e.to_string())?;
+    // 出力のベクトルは初期値 0 を兼ねる。
+    let mut x = Vector::zeros(n).map_err(|e| e.to_string())?;
+    let rhs = if index == 6 { &b[..n - 1] } else { &b[..] };
+    let context = ExecutionContext::sequential().with_cancellation(&token);
+    let result = if index == 2 {
+        // 評価回数の上限は、呼び出し側の求解コンテキストの計算回数の上限として与える。
+        let mut state = SolveState::new();
+        let limit =
+            Budget::try_from(evaluation_limit.round() as usize).map_err(|e| e.to_string())?;
+        let mut budgets = SolveBudgets::unbounded().with_limit(BudgetKind::Evaluation, limit);
+        let identity = SolveIdentity::new(
+            ProblemToken::new(1),
+            algorithm_id!("handbook", "poisson", 1),
+            0,
+            0,
+        );
+        let mut parent = state
+            .begin_solve(context, identity, &mut budgets)
+            .map_err(|e| e.to_string())?;
+        solver.solve_into(
+            &operator,
+            rhs,
+            Preconditioning::None,
+            x.view_mut(),
+            &mut ws,
+            &mut parent,
+        )
+    } else {
+        solver.solve_into(
+            &operator,
+            rhs,
+            Preconditioning::None,
+            x.view_mut(),
+            &mut ws,
+            context,
+        )
+    };
+    // 試行記録: 結果の分類と、作用素・前処理の評価回数。
+    let record = ws.last_attempt().ok_or("試行記録がない")?;
+    let evaluations = record
+        .counts()
+        .total()
+        .and_then(|c| c.total_providers())
+        .map_err(|e| e.to_string())?;
+    // 受理状態: 成功または停止した試行だけが持つ。
+    let trust = ws.last_accepted().map(|a| a.progress().trust().to_string());
+    let (status, termination, iterations, reported) = match &result {
+        Ok(report) => (
+            "Ok".to_string(),
+            Some(termination_name(report.termination())),
+            Some(report.iterations()),
+            report.true_residual().map(|r| r.scaled_norm()),
+        ),
+        Err(e) => (format!("Err({:?})", e.kind()), None, None, None),
+    };
+    // 出力を検算する: 残差と、厳密解（負定値の行列では −u）との差。
+    let output = x.as_slice();
+    let residual = relative_residual(operator.sign, &b, output);
+    let error = output
+        .iter()
+        .zip(&exact)
+        .fold(0.0_f64, |m, (p, q)| m.max((p - operator.sign * q).abs()))
+        / peak;
+    let unchanged = if output.iter().all(|&v| v == 0.0) {
+        "はい"
+    } else {
+        "いいえ"
+    };
+    rows.push((
+        *scenario,
+        status,
+        termination,
+        iterations,
+        evaluations,
+        outcome_name(record.outcome()),
+        trust,
+        reported,
+        residual,
+        error,
+        unchanged,
+    ));
+}
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "条件" },
+    { "key": "1", "label": "結果" },
+    { "key": "2", "label": "終了理由", "nullText": "なし" },
+    { "key": "3", "label": "反復回数 [回]", "type": "integer", "nullText": "なし" },
+    { "key": "4", "label": "評価回数 [回]", "type": "integer" },
+    { "key": "5", "label": "試行の結果" },
+    { "key": "6", "label": "受理状態の信頼区分", "nullText": "なし" },
+    { "key": "7", "label": "レポートの残差 [-]", "type": "number", "format": sci2, "nullText": "なし" },
+    { "key": "8", "label": "出力の残差 [-]", "type": "number", "format": sci2 },
+    { "key": "9", "label": "出力の相対誤差 [-]", "type": "number", "format": sci2 },
+    { "key": "10", "label": "出力は初期値のまま" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "contracts" })
+);
+```
+
+「上限なし」は 100 回で `Converged` になる。
+評価回数は初期残差の 1 回、反復の 100 回、50 回目と 100 回目の検査点の 2 回で、計 103 回である。
+50 回目の真の残差は初期値の残差を上回るので、この検査点で下限の判定が行われる。
+ただし残差が最小の反復解はまだ初期値 $x = 0$ なので、下限の式の積 $A(s \circ x)$ は 0 になり、作用素は評価しない。
+試行の結果は `Succeeded`、信頼区分は `residual-checked` で、相対誤差は $3.5 \times 10^{-15}$ にとどまる。
+丸め誤差がなければ CG は $N = 100$ 回以内で終わり、この問題ではちょうどその回数で収束している。
+
+既定の反復回数の上限 70 回では、`Ok` と `IterationLimit` が返り、試行の結果は `Stopped`、信頼区分は `admissible` である。
+評価回数は 73 回で、上限に達した 70 回目も検査点になる。
+その真の残差 $0.55\lVert b \rVert$ が初期値の残差 $\lVert b \rVert$ より小さいので、出力は 70 回目の解になる（相対誤差 $2.9 \times 10^{-2}$）。
+この問題の残差は 1 回目で $\lVert b \rVert$ の 5.7 倍に増え、59 回目まで $\lVert b \rVert$ を上回る（次の節）。
+そのため上限を 59 回以下にすると、検査点の真の残差がどれも初期値の残差より大きく、出力は初期値のまま（相対残差 1）になる（ケース「反復 59 回、102 回目の作用で取り消し」）。
+
+評価回数の上限 90 回では、89 回目の反復で作用素の評価が拒否されて `EvaluationLimit` になり、出力は初期値のままである。
+評価回数で止まると止まった時点の反復解の真の残差を計算できないので、それまでの検査点（開始時と 50 回目）のうち残差の小さい初期値が返る。
+ケース「反復 100 回、評価 102 回」では、反復回数の上限のほうは 100 回目で収束して `Converged` になる。
+評価回数の上限のほうは、100 回目の反復で収束の候補に達するが確認の評価が足りず、同じく初期値が返る。
+どちらの場合も、返る解はレポートの反復回数の時点の解ではない。
+
+既定の取り消し（呼び出しの前）では、`Ok` と `ExecutionStopped(Cancelled)` が返る。
+作用素を一度も評価しないので、信頼区分は `diagnostic-only`、レポートの残差はなく、出力は初期値のまま変わらない。
+ケース「75 回目の作用で取り消し」では、73 回目の反復で作用素を評価する中で要求された取り消しを、74 回目の反復の初めで検出して止まる。
+信頼区分は `admissible` で、それまでの検査点で残差が最小なのは初期値なので、出力はやはり初期値である。
+102 回目の作用は 100 回目の反復の積である。
+そのため取り消しの回を 102 回以上にすると、100 回目の反復を終えたところで真の残差が許容誤差を満たして収束が確定し、取り消しを調べる 101 回目の反復に進まないので、上限なしと同じ `Converged` になる（ケース「反復 59 回、102 回目の作用で取り消し」）。
+101 回目にすると、要求は 99 回目の反復の中で起こり、100 回目の反復の初めで止まって初期値が返る。
+
+符号を反転した負定値の行列では、最初の反復で曲率 $p^{\mathsf T}Ap$ が負になって `Breakdown(NonPositiveCurvature)` が返り、検証済みの初期値が出力に残る。
+NaN を返す作用素では、30 回目に作用させた結果を検査した時点で `Err(NonFinite)` になる。
+試行の結果は `Failed` で評価回数 30 回が記録されるが、受理状態はなく（`last_accepted()` が `None`）、出力は変わらない。
+右辺の長さが $N - 1$ の場合は `Err(DimensionMismatch)` で、数値計算の前の検査で拒否されて試行の結果は `PreflightRejected`、評価回数は 0、出力は変わらない。
+
+## 打ち切った解の質
+
+CG の $k$ 回目の反復解は Krylov 部分空間 $x_0 + \mathcal K_k(A, r_0)$ の中で誤差の $A$ ノルム $\lVert x - x^\ast \rVert_A$ を最小にし、厳密な算術では反復を増やすほど $A$ ノルムの誤差は単調に減る。
+一方、残差 $\lVert b - Ax_k \rVert_2$ は単調とは限らず、$A$ ノルムの誤差は厳密解を知らなければ測れない。
+ソルバーが止まったときに比べられるのは真の残差だけなので、出力に反映する解は残差で選ばれ、$A$ ノルムの誤差が小さい最新の反復解が捨てられることがある。
+
+次のセルは反復回数の上限 $k$ を 5 から $k_{\max}$（50〜300）まで 5 回ずつ変え、所有値を返す API の `solve_with_options` が出力に反映した解の $A$ ノルムの相対誤差と真の相対残差を測る。
+グラフは上限なしで一度実行したときの残差の履歴（検査点の間は漸化式の値、検査点では真の値）と重ねて描く。
+表は最後の上限での終了理由、反復回数、出力に反映した解の $A$ ノルムの相対誤差と、初期値のまま返った上限の数、出力に反映した解の $A$ ノルムの誤差が前の上限より増えた回数、上限なしの残差の履歴が $\lVert b \rVert$ を超えた最後の反復である。
+
+```rust
+//| id: linalg-truncated-cg-quality
+//| ref: linalg-truncated-cg-quality
+//| title: 上限で打ち切った CG が出力に反映する解の誤差と残差
+//| run: button
+//| uses: [linalg-context-contracts-model]
+//| crates: [scioxide-core, scioxide-linalg]
+//| inputs:
+//|   max_limit: {"type":"range","label":"上限の最大 k_max","description":"上限 5, 10, …, k_max で打ち切る。","min":50,"max":300,"step":50,"value":200}
+//| cases:
+//|   - {"id":"short","label":"k_max = 50","description":"どの上限でも、検査点の残差が初期値を下回らず、初期値が返る。","inputs":{"max_limit":50}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"truncated","path":"/rows/0/0","equals":"Converged"}
+//|       - {"artifact":"truncated","path":"/rows/0/2","range":{"max":1e-12}}
+//|       - {"artifact":"truncated","path":"/rows/0/3","equals":11}
+//|       - {"artifact":"truncated","path":"/rows/0/4","equals":0}
+//|       - {"artifact":"truncated","path":"/rows/0/5","equals":59}
+//|   - case: short
+//|     expect:
+//|       - {"artifact":"truncated","path":"/rows/0/0","equals":"IterationLimit"}
+//|       - {"artifact":"truncated","path":"/rows/0/2","approx":{"value":1.0,"atol":1e-12}}
+//|       - {"artifact":"truncated","path":"/rows/0/3","equals":10}
+use scioxide_core::{Budget, LinearOperator, ResidualTolerance};
+use scioxide_linalg::{CgSolver, Preconditioning};
+
+let n = 100_usize;
+let (b, exact) = poisson(n);
+let b_norm = b.iter().map(|v| v * v).sum::<f64>().sqrt();
+let operator = Probe::new(n);
+let tolerance = ResidualTolerance::new(0.0, 1e-12).map_err(|e| e.to_string())?;
+// 誤差 e = x − u の A ノルム √(eᵀ A e)（検算用。作用素を直接呼ぶ）。
+let energy = |x: &[f64]| -> Result<f64, String> {
+    let e: Vec<f64> = x.iter().zip(&exact).map(|(p, q)| p - q).collect();
+    let mut ae = vec![0.0; n];
+    operator
+        .apply_into(&e, &mut ae, &mut [])
+        .map_err(|e| e.to_string())?;
+    Ok(e.iter().zip(&ae).map(|(p, q)| p * q).sum::<f64>().sqrt())
+};
+let initial = energy(&vec![0.0; n])?;
+// 上限なしの一回の実行で、各反復の残差（漸化式の値と検査点の真の残差）の履歴を得る。
+let unlimited = Budget::try_from(1000_usize).map_err(|e| e.to_string())?;
+let full = CgSolver::new(tolerance, unlimited)
+    .with_history(true)
+    .solve_with_options(&operator, &b[..], Preconditioning::None, None)
+    .map_err(|e| e.to_string())?;
+let history: Vec<[f64; 2]> = full
+    .history()
+    .unwrap_or(&[])
+    .iter()
+    .enumerate()
+    .map(|(k, r)| [k as f64, r / b_norm])
+    .collect();
+let last_above = history
+    .iter()
+    .filter(|p| p[1] > 1.0)
+    .map(|p| p[0] as usize)
+    .max();
+let (mut a_norm, mut residual) = (Vec::new(), Vec::new());
+let (mut increases, mut kept_initial) = (0_usize, 0_usize);
+// 最後の上限のレポートと A ノルムの相対誤差（ループで上書きする）。
+let (mut last, mut last_error) = (full.report(), 1.0);
+for k in (5..=max_limit.round() as usize).step_by(5) {
+    // 上限 k で止めたときに出力に反映される解（検証済みの反復解のうち真の残差が最小のもの）。
+    let budget = Budget::try_from(k).map_err(|e| e.to_string())?;
+    let result = CgSolver::new(tolerance, budget)
+        .solve_with_options(&operator, &b[..], Preconditioning::None, None)
+        .map_err(|e| e.to_string())?;
+    let x = result.solution().as_slice();
+    if x.iter().all(|&v| v == 0.0) {
+        kept_initial += 1;
+    }
+    let ratio = energy(x)? / initial;
+    last_error = ratio;
+    if a_norm
+        .last()
+        .is_some_and(|p: &[f64; 2]| ratio > p[1] * (1.0 + 1e-12))
+    {
+        increases += 1;
+    }
+    // 誤差や残差が 0 の点は対数軸に描けないので除く。
+    if ratio > 0.0 {
+        a_norm.push([k as f64, ratio]);
+    }
+    if let Some(r) = result.report().true_residual().map(|t| t.scaled_norm()) {
+        if r > 0.0 {
+            residual.push([k as f64, r]);
+        }
+    }
+    last = result.report();
+}
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "最後の上限での終了理由" },
+    { "key": "1", "label": "その反復回数 [回]", "type": "integer" },
+    { "key": "2", "label": "その解の A ノルムの相対誤差 [-]", "type": "number", "format": sci2 },
+    { "key": "3", "label": "初期値のまま返った上限の数", "type": "integer" },
+    { "key": "4", "label": "A ノルムの誤差が増えた回数", "type": "integer" },
+    { "key": "5", "label": "履歴が ‖b‖ を超えた最後の反復", "type": "integer", "nullText": "なし" }
+]);
+emit_table_with_columns!(
+    columns,
+    vec![(
+        termination_name(last.termination()),
+        last.iterations(),
+        last_error,
+        kept_initial,
+        increases,
+        last_above
+    )],
+    metadata = serde_json::json!({ "id": "truncated" })
+);
+emit_line_chart!(
+    &vec![
+        serde_json::json!({ "name": "出力に反映した解の ‖x − x*‖_A / ‖x*‖_A", "points": a_norm }),
+        serde_json::json!({ "name": "出力に反映した解の ‖b − Ax‖ / ‖b‖", "points": residual }),
+        serde_json::json!({ "name": "上限なしの実行の残差の履歴 / ‖b‖", "points": history })
+    ],
+    options = &serde_json::json!({
+        "xLabel": "反復回数の上限 k・反復回数 [回]",
+        "yLabel": "相対誤差・相対残差 [-]",
+        "yType": "log",
+        "annotations": [
+            { "kind": "line", "axis": "y", "value": 1e-12, "label": "残差の許容値 10⁻¹²" }
+        ]
+    })
+);
+```
+
+上限なしの実行の残差の履歴は 1 回目で $\lVert b \rVert$ の 5.7 倍に増え、59 回目まで $\lVert b \rVert$ を上回ってから減り、100 回目で許容値 $10^{-12}$ を下回る。
+そのため既定の $k_{\max} = 200$ では、上限 5〜55 回の 11 通りで出力に反映された解は初期値のまま（$A$ ノルムの相対誤差 1）になる。
+上限 60 回で初めて、$A$ ノルムの相対誤差 0.105、残差 $0.96\lVert b \rVert$ の解が出力に反映される。
+その後は上限を増やすごとに誤差も残差も減る。
+残差で選ばれる解は検査点で残差が下がるたびに後の反復解へ移るので、この問題では出力に反映された解の $A$ ノルムの誤差は一度も増えない。
+上限 100 回以上はすべて同じ収束した解で、表の最後の上限での終了理由は `Converged`、反復回数は 100 回になる。
+$k_{\max} = 50$ ではすべての上限で初期値が返り、最後の終了理由は `IterationLimit`（50 回）である。
+
+---
+
+## まとめ
+
+反復法の `solve_into` と `solve_with_options` は上限、取り消し、曲率の破綻で止まっても `Ok` を返すので、成否は `Ok` ではなくレポートの `termination().is_success()` で判定する。
+止まった解の信頼区分は `admissible` にとどまるので、使う前にレポートの真の残差が初期値の残差より小さいかを確かめ、出力が初期値のままなら反復を延ばすか前処理を加える。
+`Err` のときは出力が変わらないので元の値をそのまま使い続けられ、原因は `last_attempt()` の結果（`Failed` か `PreflightRejected`）と評価回数で切り分けられる。
+評価回数の上限は呼び出し側の `SolveContext` の `SolveBudgets` で与えると上限を超える作用の前で止まり、取り消しはコンテキストの `CancellationToken` で要求すると次の反復の初めで止まる。
+出力に反映される解は残差で選ばれ、$A$ ノルムの誤差が小さい後の反復解が捨てられることもあるので、誤差の大きさが要る問題では既知の解や別の推定と比べる。
+
+## 次に読むページ
+
+- [作業領域・実行コンテキスト・試行記録](../../algorithms/workspaces-and-execution/)：密な計算の取り消しと試行記録、作業領域を事前確保する手順を確かめる。
+- [求解のライフサイクルと計算回数の管理](../../../scioxide-core/algorithms/solve-lifecycle-and-accounting/)：入れ子の求解で評価回数と反復回数がどの上限に数えられるかを確かめる。
+- [例題の一覧](../)：ほかの例題と、それぞれが確かめる内容に戻る。

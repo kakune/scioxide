@@ -1,0 +1,557 @@
+---
+title: "Poisson equation and convergence order on an anisotropic plate"
+description: "Assemble steady heat conduction on a square plate with direction-dependent conductivity using structured-grid differences, solve with CG, measure errors and observed orders against a manufactured solution, and check rejection of incompatible loads with all-Neumann boundaries."
+sidebar:
+  order: 430
+references:
+  pde-anisotropic-plate-problem: "anisotropic-conduction-and-manufactured-solution"
+  pde-discrete-eigenvector-prediction: "difference-matrix-and-discrete-eigenvalues"
+  pde-neumann-compatibility-example: "all-neumann-boundaries-and-load-compatibility"
+---
+
+In materials with direction-dependent conductivity, such as fiber-reinforced composite layers, steady temperature follows an anisotropic Poisson equation.
+This example specifies a manufactured solution (chosen first, with source and boundary data derived from the equation) on a unit square and solves the CSR matrix and load assembled by `StructuredFdmPlan` using scioxide-linalg CG.
+Measure maximum and $L^2$ errors on grids with vertex counts $n=9,17,33$ and verify observed order 2.
+Finally, apply a load with nonzero total heating to a plate insulated on every side and observe how `EllipticProblem` reports the absence of a solution as an error.
+
+Other chapters also cover the two-dimensional Poisson equation.
+See the [scioxide-sparse example](../../../scioxide-sparse/examples/poisson-reordering-fill/) for sparse reordering and fill, and the [scioxide-fft example](../../../scioxide-fft/examples/spectral-poisson/) for periodic spectral methods.
+This page focuses on difference convergence order and boundary-condition treatment.
+
+## Anisotropic conduction and manufactured solution
+
+Use dimensionless coordinates divided by plate side length $L$ and conductivities divided by conductivity $k_x$ in direction $x$.
+The conductivity tensor is $K=\mathrm{diag}(1,\kappa)$, where $\kappa=k_y/k_x$ is the anisotropy ratio.
+With volumetric heating $f$, steady temperature $u$ obeys the following boundary-value problem.
+
+$$
+-\nabla\cdot(K\nabla u)=-\frac{\partial^2u}{\partial x^2}-\kappa\frac{\partial^2u}{\partial y^2}=f\quad\text{in }\Omega=(0,1)^2
+$$
+
+Choose manufactured solution $u_*(x,y)=\sin(m_x\pi x)\sin(m_y\pi y)$.
+$m_x$ and $m_y$ count half-wavelengths in each direction.
+Substitution into the equation gives the following source.
+
+$$
+f(x,y)=\pi^2\left(m_x^2+\kappa m_y^2\right)u_*(x,y)
+$$
+
+Compare two boundary conditions.
+One imposes Dirichlet condition $u=0$ on all four sides; $u_*$ vanishes there and satisfies it directly.
+The other uses mixed boundaries, replacing conditions on sides $x=1$ and $y=1$ with conormal-flux condition $\boldsymbol n\cdot K\nabla u=g$.
+$\boldsymbol n$ is the outward unit normal; compute data $g=\boldsymbol n\cdot K\nabla u_*$ from $u_*$.
+For example, side $x=1$ gives $g=m_x\pi\cos(m_x\pi)\sin(m_y\pi y)$.
+`BoundaryCondition::natural` receives this $g$, while `BoundaryCondition::dirichlet` receives the value of $u$.
+
+## Difference matrix and discrete eigenvalues
+
+`StructuredFdmPlan` uses conservative vertex-centered differences, balancing heat over the dual cell around vertex $i$ (the rectangle enclosed by midpoints to neighboring vertices).
+For each face between adjacent vertices, form conductance $k\cdot(\text{face length})/h$ from conductivity $k$ sampled at the face center and add it to the matrix.
+Multiply the source by dual-cell area $|V_i|$ to obtain load $b_i=|V_i|f(\boldsymbol x_i)$.
+On flux-condition sides, each boundary vertex adds $g$ to the load with weights equal to half the lengths of incident boundary edges.
+With grid spacing $h_x=h_y=h$, interior-vertex rows are five-point central differences multiplied by $h^2$.
+
+$$
+\left(2u_{i,j}-u_{i-1,j}-u_{i+1,j}\right)+\kappa\left(2u_{i,j}-u_{i,j-1}-u_{i,j+1}\right)=h^2f_{i,j}
+$$
+
+Dirichlet vertices are eliminated symmetrically, remaining in the matrix as rows with diagonal 1.
+With no advection or reaction the matrix is symmetric, and with at least one Dirichlet side it is positive definite, allowing CG (conjugate gradients).
+Unknowns follow vertex order with direction $x$ varying fastest.
+Interior truncation error is $O(h^2)$, so both maximum and $L^2$ errors are expected to decrease as $O(h^2)$.
+
+For all-Dirichlet boundaries, error can be computed in advance.
+$\sin(m_x\pi x_i)\sin(m_y\pi y_j)$ sampled at grid points is an eigenvector of the discrete operator above, with eigenvalue divided by $h^2$ given by:
+
+$$
+\lambda_h=\frac{4}{h^2}\left[\sin^2\frac{m_x\pi h}{2}+\kappa\sin^2\frac{m_y\pi h}{2}\right]
+$$
+
+The load is $\pi^2(m_x^2+\kappa m_y^2)h^2$ times this eigenvector, so the discrete solution equals grid-point values of $u_*$ multiplied by $\rho=\pi^2(m_x^2+\kappa m_y^2)/\lambda_h$.
+Thus maximum error equals $|\rho-1|\max_{i,j}|u_*(\boldsymbol x_{i,j})|$.
+$\sin z\approx z-z^3/6$ also gives $\rho-1=O(h^2)$.
+Since the load is an eigenvector, CG reaches the discrete solution in one iteration.
+This is a property of the test problem, not a representative CG iteration count.
+Mixed boundaries change boundary-vertex rows, and the load ceases to be an eigenvector.
+
+Both cells use the following definitions for common coefficients, grid assembly, and error computation.
+
+```rust
+//| id: pde-anisotropic-plate-model
+//| kind: definitions
+//| title: "Anisotropic plate coefficients, difference plan, and vertex errors"
+//| crates: [scioxide-core, scioxide-pde, scioxide-spatial]
+use scioxide_core::SciOxideError;
+use scioxide_pde::{
+    BoundaryCondition, BoundaryData, StructuredBoundaries, StructuredFdmCoefficients,
+    StructuredFdmPlan,
+};
+use scioxide_spatial::{AxisSide, AxisTopology, BoundarySet, CoordinateAxis, Grid2d, QuadMesh};
+
+/// Conductivity tensor K = diag(1, κ) (nondimensionalized by x-direction k_x).
+pub(crate) struct Plate {
+    pub(crate) kappa: f64,
+}
+
+impl StructuredFdmCoefficients<f64, f64, 2> for Plate {
+    // Conductivity at the center of a face normal to axis.
+    fn diffusion(&self, axis: usize, _: usize, _: [f64; 2]) -> Result<f64, SciOxideError> {
+        Ok(if axis == 0 { 1.0 } else { self.kappa })
+    }
+}
+
+/// Difference plan for a unit square with n vertices per side.
+/// Where natural[axis][0: start side, 1: end side] is true, impose n·K∇u = flux; otherwise u = 0.
+pub(crate) fn plate_plan(
+    n: usize,
+    kappa: f64,
+    natural: [[bool; 2]; 2],
+    flux: &BoundaryData<f64, f64, 2>,
+) -> Result<StructuredFdmPlan<f64, f64, 2>, SciOxideError> {
+    let axes = [
+        CoordinateAxis::uniform(0.0, 1.0, n)?,
+        CoordinateAxis::uniform(0.0, 1.0, n)?,
+    ];
+    let mesh = QuadMesh::new(Grid2d::new(axes, [AxisTopology::Bounded; 2])?)?;
+    let mut conditions = Vec::new();
+    for (axis, sides) in natural.iter().enumerate() {
+        for (side, &is_natural) in [AxisSide::Start, AxisSide::End].into_iter().zip(sides) {
+            let region = BoundarySet::axis_side(&mesh, axis, side)?;
+            conditions.push(if is_natural {
+                BoundaryCondition::natural(region, flux.clone())
+            } else {
+                BoundaryCondition::dirichlet(region, BoundaryData::zero())
+            });
+        }
+    }
+    let boundaries = StructuredBoundaries::new(&mesh, 1, conditions)?;
+    StructuredFdmPlan::new(mesh, &Plate { kappa }, &boundaries)
+}
+
+/// Vertex errors [x, y, u_h − u*], maximum error, and discrete L² error weighted by dual-cell areas.
+pub(crate) struct NodalErrors {
+    pub(crate) field: Vec<[f64; 3]>,
+    pub(crate) max: f64,
+    pub(crate) l2: f64,
+}
+
+/// Compare values ordered by unknowns (vertices with x varying fastest) against manufactured solution exact.
+pub(crate) fn nodal_errors(
+    plan: &StructuredFdmPlan<f64, f64, 2>,
+    values: &[f64],
+    exact: impl Fn([f64; 2]) -> f64,
+) -> Result<NodalErrors, SciOxideError> {
+    let mut errors = NodalErrors {
+        field: Vec::with_capacity(values.len()),
+        max: 0.0,
+        l2: 0.0,
+    };
+    for (node, (&u, &area)) in values.iter().zip(plan.volumes()).enumerate() {
+        let [x, y] = plan.node_point(node)?;
+        let error = u - exact([x, y]);
+        errors.field.push([x, y, error]);
+        errors.max = errors.max.max(error.abs());
+        errors.l2 += area * error * error;
+    }
+    errors.l2 = errors.l2.sqrt();
+    Ok(errors)
+}
+```
+
+## Grid refinement and observed orders
+
+The next cell selects anisotropy ratio $\kappa$, half-wavelength counts $m_x$ and $m_y$, and boundary conditions, constructing plans on grids $n=9,17,33$.
+`SpatialDiscretization::assemble_csr` returns the eliminated CSR matrix and `load` returns load vector $b$.
+`StructuredFdmPlan::volumes` returns dual-cell areas and `node_point` vertex coordinates, both in unknown order.
+Solve with `CgSolver` (relative residual $10^{-12}$, iteration limit four times unknown count), measuring maximum vertex error and discrete $L^2$ error $\bigl(\sum_i|V_i|e_i^2\bigr)^{1/2}$ weighted by dual-cell areas $|V_i|$.
+The same CG can also be passed to `EllipticProblem` through `EllipticWorkspace::with_linear_solver`, in which case `PdeSolveReport` records termination reason and iteration count.
+This cell demonstrates direct use of the matrix and load.
+Compute observed order from errors $e_1$ and $e_2$ and grid spacings $h_1$ and $h_2$ on adjacent grids using $p=\log(e_1/e_2)/\log(h_1/h_2)$.
+For all-Dirichlet boundaries, also list maximum errors predicted from discrete eigenvalues.
+Finally, judge whether CG termination reasons (`LinearSolveTermination`) satisfy `is_success()` on all three grids.
+Pass error values and the finest-grid error distribution to the next cell.
+
+```rust
+//| id: pde-anisotropic-plate-convergence
+//| ref: pde-anisotropic-plate-convergence
+//| title: "Solve an anisotropic plate on three grids and measure errors and observed orders"
+//| run: reactive
+//| uses: [pde-anisotropic-plate-model]
+//| crates: [scioxide-core, scioxide-linalg, scioxide-pde, scioxide-spatial]
+//| exports: [curves, field]
+//| inputs:
+//|   plate_kappa: {"type":"range","label":"Anisotropy ratio κ = k_y/k_x [-]","description":"Changes relative y-direction conductivity.","min":0.1,"max":10,"step":0.1,"value":4}
+//|   plate_mode_x: {"type":"range","label":"x-direction half-wavelength count m_x [-]","description":"Changes manufactured-solution oscillations in x.","min":1,"max":4,"step":1,"value":1}
+//|   plate_mode_y: {"type":"range","label":"y-direction half-wavelength count m_y [-]","description":"Changes manufactured-solution oscillations in y.","min":1,"max":4,"step":1,"value":2}
+//|   plate_edges: {"type":"select","label":"Boundary conditions","description":"Choose whether sides x = 1 and y = 1 have flux conditions.","options":["All Dirichlet","Mixed"],"value":"All Dirichlet"}
+//| cases:
+//|   - {"id":"mixed","label":"Mixed boundaries","description":"The load ceases to be an eigenvector and CG iterations grow with grid resolution. Observed order remains near 2.","inputs":{"plate_edges":"Mixed"}}
+//|   - {"id":"weak-y","label":"κ = 0.1, m_y = 4","description":"y-direction oscillations become finer and coarse-grid error grows. Predicted and observed maximum errors agree.","inputs":{"plate_kappa":0.1,"plate_mode_y":4}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"orders","path":"/rows/0/1","equals":1}
+//|       - {"artifact":"orders","path":"/rows/2/1","equals":1}
+//|       - {"artifact":"orders","path":"/rows/2/2","approx":{"value":3.0765602e-3,"rtol":1e-6}}
+//|       - {"artifact":"orders","path":"/rows/2/3","approx":{"value":3.0765602e-3,"rtol":1e-6}}
+//|       - {"artifact":"orders","path":"/rows/2/4","approx":{"value":2.0078,"atol":1e-3}}
+//|       - {"artifact":"orders","path":"/rows/2/5","approx":{"value":1.5382801e-3,"rtol":1e-6}}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+//|   - case: mixed
+//|     expect:
+//|       - {"artifact":"orders","path":"/rows/2/1","range":{"min":150,"max":300}}
+//|       - {"artifact":"orders","path":"/rows/2/2","approx":{"value":1.4050105e-2,"rtol":1e-5}}
+//|       - {"artifact":"orders","path":"/rows/2/3","equals":null}
+//|       - {"artifact":"orders","path":"/rows/2/4","approx":{"value":2.0013,"atol":2e-3}}
+//|       - {"artifact":"orders","path":"/rows/2/6","approx":{"value":2.0035,"atol":2e-3}}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+//|   - case: weak-y
+//|     expect:
+//|       - {"artifact":"orders","path":"/rows/0/2","approx":{"value":0.13829098,"rtol":1e-6}}
+//|       - {"artifact":"orders","path":"/rows/2/2","approx":{"value":8.2440249e-3,"rtol":1e-6}}
+//|       - {"artifact":"orders","path":"/rows/2/3","approx":{"value":8.2440249e-3,"rtol":1e-6}}
+use scioxide_core::{Budget, ResidualTolerance};
+use scioxide_linalg::{CgSolver, Preconditioning, Vector};
+use scioxide_pde::{BoundaryData, BoundaryPoint, FieldData, FieldPoint, SpatialDiscretization};
+use std::f64::consts::PI;
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let (kappa, wx, wy) = (plate_kappa, plate_mode_x * PI, plate_mode_y * PI);
+let natural = [[false, plate_edges == "Mixed"]; 2];
+// Manufactured solution u*, source f, and flux g = n·K∇u* (f64 sin and cos as references).
+let exact = move |[x, y]: [f64; 2]| (wx * x).sin() * (wy * y).sin();
+let source = FieldData::time_invariant(move |p: FieldPoint<f64, 2>| {
+    Ok((wx * wx + kappa * wy * wy) * exact(p.point))
+});
+let flux = BoundaryData::time_invariant(move |p: BoundaryPoint<f64, 2>| {
+    let ([x, y], [nx, ny]) = (p.point, p.normal);
+    let along_x = nx * wx * (wx * x).cos() * (wy * y).sin();
+    Ok(along_x + ny * kappa * wy * (wx * x).sin() * (wy * y).cos())
+});
+let (mut rows, mut curves, mut field) = (Vec::new(), [Vec::new(), Vec::new()], Vec::new());
+let mut terminations = Vec::new();
+for n in [9_usize, 17, 33] {
+    let h = 1.0 / (n - 1) as f64;
+    let plan = plate_plan(n, kappa, natural, &flux).map_err(|e| e.to_string())?;
+    let matrix = plan.assemble_csr().map_err(|e| e.to_string())?;
+    let load = Vector::from_vec(plan.load(&source, 0.0).map_err(|e| e.to_string())?);
+    let cg = CgSolver::new(
+        ResidualTolerance::new(0.0, 1e-12).map_err(|e| e.to_string())?,
+        Budget::try_from(4 * plan.unknowns()).map_err(|e| e.to_string())?,
+    );
+    let result = cg
+        .solve_with_options(&matrix, &load, Preconditioning::None, None)
+        .map_err(|e| e.to_string())?;
+    let errors =
+        nodal_errors(&plan, result.solution().as_slice(), exact).map_err(|e| e.to_string())?;
+    // Independent all-Dirichlet prediction: maximum error = |ρ − 1|·max|u*(x_ij)|, ρ = π²(m_x² + κm_y²)/λ_h.
+    let lambda_h =
+        4.0 / (h * h) * ((wx * h / 2.0).sin().powi(2) + kappa * (wy * h / 2.0).sin().powi(2));
+    let peak = errors
+        .field
+        .iter()
+        .fold(0.0_f64, |m, p| m.max(exact([p[0], p[1]]).abs()));
+    let predicted =
+        (!natural[0][1]).then(|| ((wx * wx + kappa * wy * wy) / lambda_h - 1.0).abs() * peak);
+    // Observed order against the preceding grid. Undefined on the first grid.
+    let order = |k: usize, e: f64| {
+        let [h0, e0]: [f64; 2] = curves[k].last().copied()?;
+        Some((e0 / e).ln() / (h0 / h).ln())
+    };
+    let (max_order, l2_order) = (order(0, errors.max), order(1, errors.l2));
+    rows.push((
+        n,
+        result.report().iterations(),
+        errors.max,
+        predicted,
+        max_order,
+        errors.l2,
+        l2_order,
+    ));
+    curves[0].push([h, errors.max]);
+    curves[1].push([h, errors.l2]);
+    terminations.push(result.report().termination());
+    field = errors.field;
+}
+let columns = serde_json::json!([
+    { "key": "0", "label": "Vertices per side n", "type": "integer" },
+    { "key": "1", "label": "CG iterations [count]", "type": "integer" },
+    { "key": "2", "label": "Maximum error [-]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "Predicted maximum error [-]", "type": "number", "format": sci3, "nullText": "—" },
+    { "key": "4", "label": "Maximum-error order [-]", "type": "number", "format": fixed2, "nullText": "—" },
+    { "key": "5", "label": "L² error [-]", "type": "number", "format": sci3 },
+    { "key": "6", "label": "L²-error order [-]", "type": "number", "format": fixed2, "nullText": "—" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "orders" })
+);
+export!(curves, curves);
+export!(field, field);
+let outcome = if terminations.iter().all(|t| t.is_success()) {
+    Outcome::satisfied("CG satisfied relative residual 10⁻¹² on all three grids")
+} else {
+    Outcome::partial("Some CG solves stopped at the iteration limit; errors on those grids use the last iterate")
+};
+emit_outcome!(
+    outcome
+        .status(format!("{:?}", terminations[2]))
+        .diagnostic("CG iterations at n = 33", rows[2].1 as f64, None)
+        .diagnostic("Maximum error at n = 33", rows[2].2, None)
+);
+```
+
+With defaults ($\kappa=4$, $m_x=1$, $m_y=2$, all Dirichlet), maximum errors decrease through $5.06\times10^{-2}$, $1.24\times10^{-2}$, and $3.08\times10^{-3}$, with observed orders 2.03 and 2.01.
+Discrete-eigenvalue predictions agree with observations to more than 12 digits; CG stops in one iteration on every grid.
+Since error is a constant multiple of $u_*$, $L^2$ error is exactly half the maximum error.
+
+With mixed boundaries, CG iterations are 54, 106, and 207, roughly doubling whenever grid spacing halves.
+The iteration bound for CG to reach a fixed relative residual is proportional to the square root of the condition number; the discrete Laplacian has condition number $O(h^{-2})$, so the bound grows as $O(h^{-1})$.
+Maximum errors are $2.24\times10^{-1}$, $5.63\times10^{-2}$, and $1.41\times10^{-2}$, with observed orders 1.99 and 2.00 for maximum error and 2.01 and 2.00 for $L^2$ error.
+Boundary-vertex rows differ from interior rows on flux-condition sides, but total error still decreases at second order.
+For $\kappa=0.1$ and $m_y=4$, coarse-grid maximum error grows to $1.38\times10^{-1}$, but predictions and observations still agree.
+
+The next cell receives and plots errors from the cell above.
+The graph uses log-log error and grid-spacing axes; symbols show observations, while the dashed slope-2 reference line passes through the finest-grid maximum error.
+Observations parallel to the dashed line indicate second-order error reduction.
+The heatmap shows $n=33$ error $u_h-u_*$ with colors centered at zero.
+
+```rust
+//| id: pde-anisotropic-plate-error-plots
+//| ref: pde-anisotropic-plate-error-plots
+//| title: "Plot error dependence on grid spacing and its finest-grid distribution"
+//| run: reactive
+//| crates: []
+//| dependsOn:
+//|   solve: pde-anisotropic-plate-convergence
+let curves: [Vec<[f64; 2]>; 2] =
+    serde_json::from_value(solve["curves"].clone()).map_err(|e| e.to_string())?;
+let field: Vec<[f64; 3]> =
+    serde_json::from_value(solve["field"].clone()).map_err(|e| e.to_string())?;
+// Slope-2 reference line through the finest-grid maximum error.
+let [h, e] = curves[0][2];
+let slope: Vec<[f64; 2]> = curves[0]
+    .iter()
+    .map(|p| [p[0], e * (p[0] / h).powi(2)])
+    .collect();
+emit_line_chart!(
+    &vec![
+        serde_json::json!({
+            "name": "Maximum error",
+            "points": curves[0],
+            "style": { "symbol": "circle" }
+        }),
+        serde_json::json!({
+            "name": "L² error",
+            "points": curves[1],
+            "style": { "symbol": "diamond" }
+        }),
+        serde_json::json!({
+            "name": "Slope 2 (reference)",
+            "points": slope,
+            "style": { "lineType": "dashed" }
+        })
+    ],
+    options = &serde_json::json!({
+        "xLabel": "Grid spacing h [-]",
+        "yLabel": "Error [-]",
+        "xType": "log",
+        "yType": "log"
+    })
+);
+let limit = field
+    .iter()
+    .fold(f64::MIN_POSITIVE, |m, p| m.max(p[2].abs()));
+emit_chart!(
+    serde_json::json!({
+        "kind": "heatmap",
+        "data": field,
+        "xLabel": "Position x/L [-]",
+        "yLabel": "Position y/L [-]",
+        "colorScale": "diverging",
+        "center": 0.0,
+        "colorMin": -limit,
+        "colorMax": limit,
+        "tooltip": true
+    }),
+    metadata = serde_json::json!({ "title": "Error u_h − u* at n = 33 [-]" })
+);
+```
+
+By default, maximum- and $L^2$-error points run parallel to the dashed slope-2 line.
+Heatmap error has the same shape as $u_*$, positive at peaks of $u_*$ and negative at troughs.
+$\sin z<z$ gives $\lambda_h<\pi^2(m_x^2+\kappa m_y^2)$, hence $\rho>1$, so the discrete solution has greater amplitude than $u_*$.
+Selecting mixed boundaries above moves maximum error onto flux-condition side $y=1$, at $(x,y)=(0.5625,1)$.
+
+## All-Neumann boundaries and load compatibility
+
+Insulating all four sides ($\boldsymbol n\cdot K\nabla u=0$) leaves the equation and boundary conditions unchanged when a constant is added to the solution.
+The divergence theorem requires $\int_\Omega f\,dx=-\oint_{\partial\Omega}\boldsymbol n\cdot K\nabla u\,ds=0$, called the compatibility condition.
+If total heating within the plate is nonzero, heat has no escape and no steady solution exists.
+The same occurs after discretization.
+With no reaction or advection and only flux boundaries, matrix $A$ has constant vector $\boldsymbol 1$ in its nullspace; since $A$ is symmetric, the condition for $A u=b$ to have a solution is $\boldsymbol 1^{\mathsf T}b=\sum_ib_i=0$.
+`SpatialDiscretization::has_constant_modes` returns this nullspace; `StructuredFdmPlan::check_constant_mode_compatibility` compares $|\sum_ib_i|$ against $\sum_i|b_i|$ with tolerance $\sqrt{\varepsilon}$ (absolute and relative).
+
+`EllipticProblem` knows this nullspace, so it refuses to solve without a gauge fixing the solution constant (`EllipticGauge::WeightedMean` specifies an area-weighted mean).
+Specify load treatment using `scioxide_linalg::CompatibilityPolicy` on `EllipticOptions::with_compatibility`.
+Default `RequireCompatible` rejects incompatible loads with an error; `Project` replaces $b$ by $b-\boldsymbol 1\,(\boldsymbol 1^{\mathsf T}b)/N$ ($N$ is unknown count) and solves.
+See [Compatibility conditions, gauges, and conservative fluxes for elliptic problems](oxref:pde-projected-rhs) for details.
+
+The next cell gives the plate with $\kappa=4$ and $n=33$ manufactured solution $u_*=\cos(\pi x)\cos(2\pi y)$.
+$u_*$ has zero normal derivative on all four sides and zero area-weighted mean.
+Source is $f=\pi^2(1+4\kappa)u_*+c$, where constant $c$ adds uniform net heating over the plate.
+The load is compatible for $c=0$ and incompatible for $c\ne0$.
+The cell checks total load, tabulates results under both policies, and finally judges whether `RequireCompatible` solved it.
+
+```rust
+//| id: pde-anisotropic-plate-neumann
+//| ref: pde-anisotropic-plate-neumann
+//| title: "Check rejection of incompatible loads on an all-Neumann plate"
+//| run: reactive
+//| uses: [pde-anisotropic-plate-model]
+//| crates: [scioxide-core, scioxide-linalg, scioxide-pde, scioxide-spatial]
+//| inputs:
+//|   plate_net_heat: {"type":"range","label":"Net heating c [-]","description":"Constant added uniformly to the source. Zero gives a compatible load.","min":0,"max":1,"step":0.05,"value":0.2}
+//| cases:
+//|   - {"id":"compatible","label":"c = 0","description":"The load is compatible and RequireCompatible solves it, with O(h²) manufactured-solution error.","inputs":{"plate_net_heat":0}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"load","path":"/rows/0/0","approx":{"value":0.2,"rtol":1e-9}}
+//|       - {"artifact":"policies","path":"/rows/0/1","equals":"DomainError"}
+//|       - {"artifact":"policies","path":"/rows/1/1","equals":"DomainError"}
+//|       - {"artifact":"policies","path":"/rows/1/2","equals":null}
+//|       - {"artifact":"policies","path":"/rows/2/1","equals":"Completed"}
+//|       - {"artifact":"policies","path":"/rows/2/2","approx":{"value":3.7441824e-3,"rtol":1e-5}}
+//|       - {"path":"/outputs/2/state","equals":"failed"}
+//|   - case: compatible
+//|     expect:
+//|       - {"artifact":"load","path":"/rows/0/2","range":{"max":1e-15}}
+//|       - {"artifact":"policies","path":"/rows/0/1","equals":"Compatible"}
+//|       - {"artifact":"policies","path":"/rows/1/1","equals":"Completed"}
+//|       - {"artifact":"policies","path":"/rows/1/2","approx":{"value":3.0765602e-3,"rtol":1e-6}}
+//|       - {"path":"/outputs/2/state","equals":"satisfied"}
+use scioxide_core::{ResidualTolerance, Tolerance};
+use scioxide_linalg::CompatibilityPolicy;
+use scioxide_pde::{
+    BoundaryData, EllipticGauge, EllipticOptions, EllipticProblem, FieldData, FieldPoint,
+    SpatialDiscretization,
+};
+use std::f64::consts::PI;
+
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let (kappa, c) = (4.0, plate_net_heat);
+// Manufactured solution u* = cos(πx)cos(2πy) (f64 cos as a reference) and source with added uniform heating c.
+let exact = |[x, y]: [f64; 2]| (PI * x).cos() * (2.0 * PI * y).cos();
+let source = FieldData::time_invariant(move |p: FieldPoint<f64, 2>| {
+    Ok(PI * PI * (1.0 + 4.0 * kappa) * exact(p.point) + c)
+});
+let plan =
+    plate_plan(33, kappa, [[true; 2]; 2], &BoundaryData::zero()).map_err(|e| e.to_string())?;
+let load = plan.load(&source, 0.0).map_err(|e| e.to_string())?;
+let (sum, scale) = load
+    .iter()
+    .fold((0.0, 0.0), |(s, a), &b| (s + b, a + f64::abs(b)));
+let check = plan.check_constant_mode_compatibility(&load, Tolerance::from_sqrt_epsilon());
+let mut rows = vec![(
+    "Load check".to_string(),
+    match &check {
+        Ok(()) => "Compatible".to_string(),
+        Err(e) => format!("{:?}", e.kind()),
+    },
+    None,
+)];
+let mut accepted = None;
+for (name, policy) in [
+    ("RequireCompatible", CompatibilityPolicy::RequireCompatible),
+    ("Project", CompatibilityPolicy::Project),
+] {
+    let options = EllipticOptions::new()
+        .with_gauge(EllipticGauge::WeightedMean(0.0))
+        .with_compatibility(
+            policy,
+            ResidualTolerance::from_tolerance(Tolerance::from_sqrt_epsilon()),
+        );
+    let row = match EllipticProblem::new(&plan, &source).solve_with_options(&options) {
+        Ok(solution) => {
+            let errors =
+                nodal_errors(&plan, solution.values(), exact).map_err(|e| e.to_string())?;
+            let termination = solution.report().termination().to_string();
+            (name.to_string(), termination, Some(errors.max))
+        }
+        Err(e) => (name.to_string(), format!("{:?}", e.kind()), None),
+    };
+    if policy == CompatibilityPolicy::RequireCompatible {
+        accepted = Some(row.clone());
+    }
+    rows.push(row);
+}
+let load_columns = serde_json::json!([
+    { "key": "0", "label": "Total load Σb [-]", "type": "number", "format": sci3 },
+    { "key": "1", "label": "Sum of absolute load values Σ|b| [-]", "type": "number", "format": sci3 },
+    { "key": "2", "label": "Ratio |Σb|/Σ|b| [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    load_columns,
+    vec![(sum, scale, f64::abs(sum) / scale)],
+    metadata = serde_json::json!({ "id": "load" })
+);
+let columns = serde_json::json!([
+    { "key": "0", "label": "Procedure" },
+    { "key": "1", "label": "Termination reason or error classification" },
+    { "key": "2", "label": "Maximum manufactured-solution error [-]", "type": "number", "format": sci3, "nullText": "No solution" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "policies" })
+);
+let (_, status, error) = accepted.ok_or("Missing RequireCompatible row")?;
+let outcome = match error {
+    Some(e) => Outcome::satisfied("The load is compatible and RequireCompatible solved it").diagnostic(
+        "Maximum manufactured-solution error",
+        e,
+        None,
+    ),
+    None => Outcome::failed("The load violates compatibility and RequireCompatible returned no solution")
+        .explanation("Make total heating zero or solve a modified-load problem with Project."),
+};
+emit_outcome!(
+    outcome
+        .status(status)
+        .diagnostic("Ratio |Σb|/Σ|b|", f64::abs(sum) / scale, None)
+);
+```
+
+With default $c=0.2$, total load is $\sum_ib_i=0.2$, equal to total plate heating $c\cdot|\Omega|$.
+Ratio $|\sum_ib_i|/\sum_i|b_i|=2.95\times10^{-3}$ greatly exceeds tolerance $\sqrt{\varepsilon}\approx1.5\times10^{-8}$, so the check returns `DomainError`.
+The `RequireCompatible` solve uses another scale, comparing projection $|\sum_ib_i|/\sqrt N$ onto the normalized constant vector with $\lVert b\rVert_2$; this also greatly exceeds tolerance, returning `DomainError` and no solution.
+`Project` returns a solution with `Completed`, whose maximum manufactured-solution error is $3.74\times10^{-3}$.
+This solves a problem with a changed load.
+Subtracting the same $c/N$ from every load component gives projected load $b_*+c\,(|V_i|-1/N)$ ($b_*$ is the load for $c=0$; areas sum to 1).
+Boundary-vertex dual cells are at most half the interior size, leaving a load that absorbs heat at the boundary and generates it inside.
+`Completed` indicates solution of the modified linear system, not attainment of a physically meaningful steady solution.
+
+Setting $c=0$ gives total load $-2.8\times10^{-17}$ at the rounding level; `RequireCompatible` also returns a solution with `Completed`.
+Maximum error is $3.08\times10^{-3}$, the same as the all-Dirichlet default.
+$\cos(\pi x)\cos(2\pi y)$ is also an eigenvector of the discrete operator divided by dual-cell area, with the same eigenvalue $\lambda_h$.
+Here `Project` barely changes the load, so both policies give matching results.
+
+## Summary
+
+Manufactured solutions derive sources and boundary data from a chosen solution, allowing direct comparison of difference errors with exact values.
+Extracting the matrix and load through `assemble_csr` and `load` of `StructuredFdmPlan` lets you solve with scioxide-linalg iterative methods and measure errors yourself.
+For both all-Dirichlet and mixed boundaries, maximum and $L^2$ errors decrease at second order over $n=9,17,33$.
+The sine-product manufactured solution is an eigenvector of the discrete operator, giving closed-form error predictions and one CG iteration.
+To examine iteration counts, use a load that is not an eigenvector, as with mixed boundaries.
+For all-Neumann boundaries, check total load with `check_constant_mode_compatibility`, interpret `RequireCompatible` rejection as a heat-balance error, and interpret `Project` results as solutions of a changed-load problem.
+
+## Further reading
+
+- [Multidimensional differences on structured grids](../../algorithms/multidimensional-spatial-plans/) examines derivation and boundary weights of `StructuredFdmPlan` and coupled systems with advection or reaction.
+- [Compatibility conditions, gauges, and conservative fluxes for elliptic problems](oxref:pde-projected-rhs) examines left/right nullspaces, choosing `EllipticGauge`, and how projection changes right-hand sides.
+- [Following the Poisson problem from conservation to grid convergence](../poisson-grid/) compares one-dimensional differences, finite elements, and finite volumes using the same manufactured solution and examines finite-element nodal superconvergence.
+- [The scioxide-sparse Poisson example](../../../scioxide-sparse/examples/poisson-reordering-fill/) examines reordering and fill when solving the same five-point-difference matrix by direct methods.
+- [The scioxide-fft Poisson example](../../../scioxide-fft/examples/spectral-poisson/) solves periodic Poisson equations spectrally and verifies exponential error reduction.

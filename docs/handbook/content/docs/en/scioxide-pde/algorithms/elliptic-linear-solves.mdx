@@ -1,0 +1,272 @@
+---
+title: "Solving elliptic linear systems"
+description: "Tridiagonal, cyclic tridiagonal, and sparse LU direct methods selected by EllipticProblem from matrix structure, backward-error acceptance, three calling patterns and workspaces, and steady and transient result types."
+sidebar:
+  order: 313
+references:
+  pde-elliptic-solver-selection: "default-direct-methods"
+  pde-elliptic-acceptance: "solution-acceptance-checks"
+  pde-elliptic-calls-and-workspaces: "three-calling-patterns-and-workspaces"
+  pde-steady-and-transient-results: "steady-and-transient-result-types"
+---
+
+Every discretization derived in [FDM, FEM, and FVM for elliptic problems](../elliptic-fdm-fem-fvm/) forms a linear system $\mathbf{A}\mathbf{u}=\mathbf{b}$.
+This page explains how `EllipticProblem` solves that system, which checks accept a solution, and what it returns.
+Problems with nullspaces are covered in [Compatibility conditions, gauges, and conservative fluxes for elliptic problems](../compatibility-gauges-and-fluxes/).
+
+## Problems and options
+
+`EllipticProblem::new(&plan, &source)` pairs a prepared plan (a type implementing `SpatialDiscretization`) with a source `FieldData` by borrowing both.
+The solve evaluates the load $\mathbf{b}=\mathbf{b}(0)$ at time 0, assembles the eliminated matrix $\mathbf{A}$, and solves it.
+Returned values contain all unknowns, including Dirichlet values, in the plan's unknown order.
+For a singular matrix with user-supplied nullspace bases, add `with_nullspace(left, right)`.
+
+The defaults of `EllipticOptions::new()` are as follows.
+
+| Setting | Default | Change with |
+|---|---|---|
+| Solution acceptance tolerance (absolute and relative) | $\sqrt{\varepsilon}$ (about $1.5\times10^{-8}$ for `f64`) | `with_residual_tolerance` |
+| Gauge | `EllipticGauge::Unspecified` (rejects problems with a nullspace) | `with_gauge` |
+| Load compatibility | `RequireCompatible`, tolerance $\sqrt{\varepsilon}$ | `with_compatibility` |
+| Iteration limit for an injected iterative method | 1,000 iterations | `with_max_linear_iterations` |
+| Entry limit for sparse LU factors | $64\,(\mathrm{nnz}+n)$ (at least 4096) | `with_direct_limits` |
+| Computation count limits | Unlimited | `with_budgets` |
+
+Here $\varepsilon$ is the scalar type's machine epsilon, $\mathrm{nnz}$ is the matrix nonzero count, and $n$ is the unknown count.
+A finite iteration limit supplied through `with_budgets` also caps the iterative solver's iteration limit.
+
+## Default direct methods
+
+Unless an iterative method is injected, `EllipticProblem` selects a direct method from the assembled matrix's nonzero pattern.
+
+- Tridiagonal: if nonzeros occur only on the diagonal and its immediate neighbors, Gaussian elimination with partial pivoting between adjacent rows solves the system (`tridiagonal-direct`).
+  Factorization and solution each require $O(n)$ operations.
+  One-dimensional FDM, P1 FEM, and FVM matrices (on structured and simplex meshes) have this form when vertices and cells are numbered from left to right.
+- Cyclic tridiagonal: if additional nonzeros occur only in the upper-right and lower-left corners, a cyclic tridiagonal method solves the system (`cyclic-tridiagonal-direct`).
+  Periodic FDM with reaction or advection and no constant mode has this form.
+- Sparse LU factorization: other matrices use sparse LU with reordering to reduce fill (new nonzeros introduced by factorization) (`sparse-lu-direct`).
+  Even in one dimension, P2 FEM orders midpoint values after vertex values, so it is not tridiagonal and uses this method.
+  All matrices in two or more dimensions also use this method.
+
+For structurally known constant modes, the same method solves the remaining system after fixing each component's first unknown to 0, and the gauge is then imposed.
+With user-supplied nullspace bases, sparse LU solves the augmented system formed by bordering the matrix with the bases (`bordered-sparse-lu`).
+`PdeDiagnostics::method()` returns the selected method's name.
+
+## Solution acceptance checks
+
+A direct-method result is accepted only after an independent residual check using the original equation.
+Compare the residual infinity norm with a backward-error scale.
+
+$$
+\|\mathbf{b}-\mathbf{A}\mathbf{u}\|_\infty\le\tau_a+\tau_r\bigl(\|\mathbf{A}\|_\infty\|\mathbf{u}\|_\infty+\|\mathbf{b}\|_\infty\bigr)
+$$
+
+$\tau_a$ and $\tau_r$ are absolute and relative solution acceptance tolerances, both defaulting to $\sqrt{\varepsilon}$.
+Failure to satisfy the condition returns `NumericalInstability` (`Breakdown`) without a solution.
+In an accepted solution's report, `PdeDiagnostics::linear_residual_report()` holds the raw residual and scale, and `scaled_norm()` returns backward error.
+This residual measures error in the algebraic equation, not an estimate of discretization error.
+
+## Three calling patterns and workspaces
+
+There are three ways to call a solve.
+
+- `solve()` solves with defaults and returns all unknown values in a `Vec`.
+  It rejects problems with nullspaces because no gauge can be specified, and treats incomplete solves as errors.
+- `solve_with_options(&options)` returns `EllipticSolution`.
+  `values()` contains all unknown values and `report()` is a `PdeSolveReport` (termination reason, diagnostics, and reliability); `into_parts()` splits them apart.
+- `solve_into(&options, &mut out, &mut workspace, scope)` writes to caller-provided `out` and returns `PdeSolveReport`.
+  Failure leaves `out` unchanged.
+
+`EllipticWorkspace::new()` allocates no memory.
+Repeatedly passing the same workspace to `solve_into` reuses factor storage when refactorizing tridiagonal systems of the same size.
+`EllipticWorkspace::with_linear_solver(solver)` injects an iterative method from `scioxide-linalg` into this workspace and uses it for subsequent solves.
+The iteration limit is the smaller of the method's own limit and the `EllipticOptions` limit.
+If iteration stops at a limit or stagnates, the unconverged approximation is written and returned with an unsuccessful termination reason and reliability `DiagnosticOnly`.
+Read the previous call's record through `last_attempt()`.
+
+Check `PdeTermination` with `is_success()`, which is true only for `Completed`.
+A direct solve passing acceptance checks returns `Completed` with reliability `ResidualChecked`, indicating that the residual was checked.
+
+## Steady and transient result types
+
+Transient problems (`ParabolicProblem`, `HyperbolicProblem`) use result and workspace types paired with those for steady problems.
+
+| Role | Steady | Transient |
+|---|---|---|
+| Owned result | `EllipticSolution`: values and report | `PdeSolution`: final state, values, report, and trajectory |
+| Workspace | `EllipticWorkspace`: factor storage and injected iterative method | `PdeWorkspace`: ODE storage and previous trial record |
+| State | None | `PdeState`: time and ODE coordinates |
+
+`PdeState` holds time `time()`, unfixed unknowns `coordinates()` (followed by velocities for hyperbolic problems), the remaining Rannacher startup end time `startup_end()`, and mesh revision `mesh_token()`.
+`advance` advances this state and leaves the last accepted state even when interrupted.
+`values()` on `PdeSolution` reconstructs all unknowns, including Dirichlet values, from the final state; `state()`, `report()`, and `trajectory()` return the state, report, and output record.
+`PdeWorkspace::new()` also allocates no memory, and one workspace can be used for parabolic and hyperbolic plans.
+`last_accepted()` returns the state accepted during the previous trial.
+Time integration methods and termination reasons are covered in [Time integration of parabolic equations](../parabolic-time-integration/).
+
+## Checking solver selection
+
+The cell below divides $[0,1]$ into $N$ cells, solves steady problems with five plans, and lists selected methods, backward errors, and errors against exact solutions.
+The exact solution of $-u''=1$ with Dirichlet conditions $u(0)=u(1)=0$ is $u=x(1-x)/2$.
+Because it is quadratic, FDM and P1 FEM nodal values and P2 FEM values should match the exact solution within roundoff.
+FVM uses cell-center values and retains $O(h^2)$ discretization error.
+Periodic FDM solves $-u''+u=1$, whose exact solution is $u=1$.
+For the FDM row, the same workspace is passed to `solve_into` twice, and the second result enters the table.
+
+```rust
+//| id: pde-elliptic-direct-solvers
+//| ref: pde-elliptic-direct-solvers
+//| title: "Read default direct methods and backward errors for five plans"
+//| run: reactive
+//| crates: [scioxide-pde, scioxide-spatial, scioxide-core]
+//| inputs:
+//|   cells: {"type":"range","label":"Cell count N [-]","min":4,"max":64,"step":4,"value":16}
+//| cases:
+//|   - {"id":"coarse","label":"N = 4","description":"FVM error is 16 times that at N = 16, while other rows remain at roundoff level.","inputs":{"cells":4}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"solvers","path":"/rows/0/1","equals":"tridiagonal-direct"}
+//|       - {"artifact":"solvers","path":"/rows/3/1","equals":"sparse-lu-direct"}
+//|       - {"artifact":"solvers","path":"/rows/4/1","equals":"cyclic-tridiagonal-direct"}
+//|       - {"artifact":"solvers","path":"/rows/0/4","range":{"min":0,"max":1e-13}}
+//|       - {"artifact":"solvers","path":"/rows/3/4","range":{"min":0,"max":1e-13}}
+//|       - {"artifact":"solvers","path":"/rows/1/4","range":{"min":1e-5,"max":1e-3}}
+//|       - {"path":"/outputs/1/state","equals":"satisfied"}
+//|   - case: coarse
+//|     expect:
+//|       - {"artifact":"solvers","path":"/rows/2/2","equals":5}
+//|       - {"artifact":"solvers","path":"/rows/3/2","equals":9}
+//|       - {"artifact":"solvers","path":"/rows/1/4","range":{"min":1e-3,"max":1e-1}}
+use scioxide_core::ExecutionContext;
+use scioxide_pde::{
+    BoundaryData, BoundaryKind, ConstantDiffusion, EllipticOptions, EllipticProblem,
+    EllipticWorkspace, FieldData, PdeSolveReport, SimplexFemGeometry, SimplexFemOrder,
+    SimplexFemPlan, SpatialDiscretization, StructuredBoundaries, StructuredFdmPlan,
+    StructuredFvmPlan, TaggedBoundaries,
+};
+use scioxide_spatial::{AxisTopology, CoordinateAxis, Grid1d, IntervalMesh, Point, SegmentMesh};
+
+type Row = (String, String, usize, f64, f64);
+// Read method and backward error from the report and add maximum error against the exact solution exact.
+fn row<P: SpatialDiscretization<f64, f64, 1>>(
+    name: &str,
+    plan: &P,
+    values: &[f64],
+    report: &PdeSolveReport<f64>,
+    exact: fn(f64) -> f64,
+) -> Result<Row, String> {
+    if !report.is_success() {
+        return Err(format!("{name}: {}", report.termination()));
+    }
+    let mut error = 0.0_f64;
+    for (i, u) in values.iter().enumerate() {
+        let x = plan.dof_point(i).map_err(|e| e.to_string())?.point[0];
+        error = error.max((u - exact(x)).abs());
+    }
+    let method = report.diagnostics().method().unwrap_or("-").to_owned();
+    let residual = report.diagnostics().linear_residual_report();
+    let backward = residual.ok_or("Missing residual report")?.scaled_norm();
+    Ok((name.to_owned(), method, values.len(), backward, error))
+}
+// Solve with source f = 1 and default settings, then form a row.
+fn solved<P: SpatialDiscretization<f64, f64, 1>>(
+    name: &str,
+    plan: &P,
+    exact: fn(f64) -> f64,
+) -> Result<Row, String> {
+    let source = FieldData::constant(1.0);
+    let solution = EllipticProblem::new(plan, &source)
+        .solve_with_options(&EllipticOptions::new())
+        .map_err(|e| e.to_string())?;
+    row(name, plan, solution.values(), solution.report(), exact)
+}
+let n = cells as usize;
+let parabola: fn(f64) -> f64 = |x| x * (1.0 - x) / 2.0;
+let k = ConstantDiffusion::new(1.0);
+let mesh = |topology| -> Result<SegmentMesh<f64>, String> {
+    let axis = CoordinateAxis::uniform(0.0, 1.0, n + 1).map_err(|e| e.to_string())?;
+    let grid = Grid1d::new([axis], [topology]).map_err(|e| e.to_string())?;
+    SegmentMesh::new(grid).map_err(|e| e.to_string())
+};
+let segment = mesh(AxisTopology::Bounded)?;
+let (dirichlet, zero) = (BoundaryKind::Dirichlet, BoundaryData::zero());
+let ends = StructuredBoundaries::uniform(&segment, 1, dirichlet, zero.clone())
+    .map_err(|e| e.to_string())?;
+// FDM: solve twice with the same workspace. The second solve reuses tridiagonal factor storage.
+let fdm = StructuredFdmPlan::new(segment.clone(), &k, &ends).map_err(|e| e.to_string())?;
+let (one, options) = (FieldData::constant(1.0), EllipticOptions::new());
+let problem = EllipticProblem::new(&fdm, &one);
+let (mut out, mut workspace) = (vec![0.0; fdm.unknowns()], EllipticWorkspace::new());
+let mut solve_fdm = || {
+    let scope = ExecutionContext::sequential_native();
+    problem.solve_into(&options, &mut out, &mut workspace, scope)
+};
+drop(solve_fdm().map_err(|e| e.to_string())?);
+let report = solve_fdm().map_err(|e| e.to_string())?;
+let mut rows = vec![row("FDM（solve_into）", &fdm, &out, &report, parabola)?];
+let fvm = StructuredFvmPlan::new(segment, &k, &ends).map_err(|e| e.to_string())?;
+rows.push(solved("FVM", &fvm, parabola)?);
+let points = (0..=n)
+    .map(|i| Point::new([i as f64 / n as f64]))
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(|e| e.to_string())?;
+let interval = IntervalMesh::new(points, (0..n).map(|i| [i, i + 1]).collect())
+    .map_err(|e| e.to_string())?;
+let tagged =
+    TaggedBoundaries::uniform(&interval, 1, dirichlet, zero).map_err(|e| e.to_string())?;
+for (name, order) in [
+    ("FEM P1", SimplexFemOrder::P1),
+    ("FEM P2", SimplexFemOrder::P2),
+] {
+    let geometry = SimplexFemGeometry::Affine;
+    let fem = SimplexFemPlan::new(interval.clone(), geometry, order, &k, &tagged)
+        .map_err(|e| e.to_string())?;
+    rows.push(solved(name, &fem, parabola)?);
+}
+// Periodic FDM: no boundary conditions; reaction c = 1 removes the constant mode. Exact solution u = 1.
+let ring = mesh(AxisTopology::Periodic)?;
+let none = StructuredBoundaries::new(&ring, 1, vec![]).map_err(|e| e.to_string())?;
+let reactive = ConstantDiffusion::new(1.0).with_reaction(1.0);
+let periodic = StructuredFdmPlan::new(ring, &reactive, &none).map_err(|e| e.to_string())?;
+rows.push(solved("Periodic FDM (c = 1)", &periodic, |_| 1.0)?);
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Plan" },
+    { "key": "1", "label": "Selected method" },
+    { "key": "2", "label": "Unknowns [-]", "type": "integer" },
+    { "key": "3", "label": "Backward error [-]", "type": "number", "format": sci2 },
+    { "key": "4", "label": "Maximum error from exact solution [-]", "type": "number", "format": sci2 }
+]);
+let worst = rows.iter().map(|r| r.3).fold(0.0_f64, f64::max);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "solvers" })
+);
+emit_outcome!(
+    Outcome::satisfied("All five direct solves passed backward-error checks")
+        .status("Completed")
+        .diagnostic("Maximum backward error", worst, None)
+);
+```
+
+At the default $N=16$, FDM, FVM, and P1 FEM used `tridiagonal-direct`, P2 FEM used `sparse-lu-direct`, and periodic FDM used `cyclic-tridiagonal-direct`.
+Every backward error was at most $1.2\times10^{-16}$, much smaller than the acceptance tolerance $\sqrt{\varepsilon}\approx1.5\times10^{-8}$.
+Errors against the exact solution for FDM, P1 FEM, P2 FEM, and periodic FDM were at most $1.4\times10^{-14}$, at roundoff level.
+FVM error is $4.9\times10^{-4}$, equal to $h^2/8$ ($h=1/16$); at $N=4$ it is 16 times larger, $7.8\times10^{-3}$.
+FVM backward error is at the same level as the other rows, so small backward error does not imply small discretization error.
+The FDM row is the second `solve_into` result with the same workspace and passes the check even when factor storage is reused.
+
+## Summary
+
+`EllipticProblem` selects $O(n)$ tridiagonal elimination for tridiagonal matrices, a cyclic method for cyclic tridiagonal matrices, and reordered sparse LU otherwise.
+Even in one dimension, P2 FEM uses sparse LU; check the selected method with `PdeDiagnostics::method()`.
+A solution is returned only after passing the backward-error check, whose value is not discretization error.
+For repeated solves, pass the same `EllipticWorkspace` to `solve_into`; `PdeState` and `PdeWorkspace` play corresponding roles in transient problems.
+
+## Further reading
+
+- [Compatibility conditions, gauges, and conservative fluxes for elliptic problems](../compatibility-gauges-and-fluxes/): inspect gauges imposed after fixing unknowns and diagnostics for problems with constant modes.
+- [Time integration of parabolic equations](../parabolic-time-integration/): learn time integration advancing `PdeState` and its termination reasons.
+- [Multidimensional structured-grid differences](../multidimensional-spatial-plans/): see how matrices requiring sparse LU in two or more dimensions are constructed.

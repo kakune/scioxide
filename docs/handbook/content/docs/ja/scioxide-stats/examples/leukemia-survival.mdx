@@ -1,0 +1,710 @@
+---
+title: 6-MP による白血病の寛解の生存解析
+description: Freireich ら（1963）の 6-MP と偽薬の寛解期間（打ち切りを含む）で、Kaplan–Meier 曲線と区間、Nelson–Aalen の累積ハザード、logrank 検定、Cox 回帰のハザード比を求め、文献の値と照合する
+sidebar:
+  order: 440
+references:
+  stats-leukemia-6mp-trial-data: "6-mp-の臨床試験のデータ"
+  stats-leukemia-error-and-cost: "誤差と計算量"
+  stats-leukemia-km-and-nelson-aalen: "kaplanmeier-推定と-nelsonaalen-推定"
+  stats-leukemia-logrank-and-cox: "logrank-検定と-cox-回帰"
+---
+
+ある事象（再発、死亡、故障）が起きるまでの時間を扱う統計を生存時間解析と呼ぶ。
+追跡が終わった時点で事象がまだ起きていない対象は、事象の時刻が「その時点より後」としか分からない。
+これを右打ち切りと呼び、打ち切りを含むデータでは、単純な平均や割合は事象までの時間を短く見積もる。
+このページでは、生存時間解析の教科書で繰り返し使われる白血病の臨床試験のデータで、打ち切りを正しく扱う推定量と検定を計算し、文献の値と照合する。
+
+データの出典と、例題のコードおよび文献の数値の権利上の扱いは、[ライセンスとデータの出典](../../../reference/licenses/)に記載している。
+
+## 6-MP の臨床試験のデータ
+
+E. J. Freireich ら, "The effect of 6-mercaptopurine on the duration of steroid-induced remissions in acute leukemia", *Blood* 21 (1963), 699–716 は、寛解に入った急性白血病の小児 42 人を、21 組の対に分けて 6-メルカプトプリン（6-MP）と偽薬に無作為に割り付け、寛解が続いた期間（週）を記録した。
+E. A. Gehan, *Biometrika* 52 (1965), 203–223 がこの寛解期間を 2 標本の検定の例として示し、以後 Cox（1972）をはじめ多くの教科書が使っている。
+
+| 群 | 寛解期間 [週]（+ は打ち切り） |
+|---|---|
+| 偽薬（21 人） | 1, 1, 2, 2, 3, 4, 4, 5, 5, 8, 8, 8, 8, 11, 11, 12, 12, 15, 17, 22, 23 |
+| 6-MP（21 人） | 6, 6, 6, 6+, 7, 9+, 10, 10+, 11+, 13, 16, 17+, 19+, 20+, 22, 23, 25+, 32+, 32+, 34+, 35+ |
+
+偽薬群は 21 人全員が再発し、6-MP 群は 9 人が再発、12 人が打ち切りである。
+値は R の MASS パッケージの `gehan` データ（Gehan 1965 の表）と 1 つずつ照合した。
+元の試験は対ごとの逐次検定で設計されたが、ここでは Gehan や Cox と同じく、対を無視した 2 群の比較として扱う。
+
+定義のブロックには、2 群の寛解期間、それを `SurvivalObservation` に直す関数、階段状の図の頂点を作る関数を置く。
+`SurvivalObservation::new(entry, time, outcome)` は、観測区間 $(\mathrm{entry}, \mathrm{time}]$ と、`time` で事象が起きた（`SurvivalOutcome::Event`）か打ち切られた（`SurvivalOutcome::Censored`）かを持つ。
+`entry` が `None` の対象は最初から危険集合に入り、時刻が有限でないか `entry ≥ time` なら `InvalidInput` を返す。
+このデータには遅れた登録（左切断）がないので、`entry` はすべて `None` である。
+
+```rust
+//| id: stats-leukemia-survival-data
+//| kind: definitions
+//| title: 6-MP と偽薬の寛解期間と描画の補助関数
+//| crates: [scioxide-core, scioxide-stats]
+use scioxide_core::SciOxideError;
+use scioxide_stats::{SurvivalObservation, SurvivalOutcome};
+
+/// 偽薬群の寛解期間 [週]。全員が再発した。
+pub(crate) const PLACEBO: [f64; 21] = [
+    1.0, 1.0, 2.0, 2.0, 3.0, 4.0, 4.0, 5.0, 5.0, 8.0, 8.0, 8.0, 8.0, 11.0, 11.0, 12.0, 12.0, 15.0,
+    17.0, 22.0, 23.0,
+];
+/// 6-MP 群の (寛解期間 [週], 再発を観測したか)。false は打ち切り。
+pub(crate) const MERCAPTOPURINE: [(f64, bool); 21] = [
+    (6.0, true),
+    (6.0, true),
+    (6.0, true),
+    (6.0, false),
+    (7.0, true),
+    (9.0, false),
+    (10.0, true),
+    (10.0, false),
+    (11.0, false),
+    (13.0, true),
+    (16.0, true),
+    (17.0, false),
+    (19.0, false),
+    (20.0, false),
+    (22.0, true),
+    (23.0, true),
+    (25.0, false),
+    (32.0, false),
+    (32.0, false),
+    (34.0, false),
+    (35.0, false),
+];
+pub(crate) const GROUPS: [&str; 2] = ["偽薬", "6-MP"];
+/// 各群の最後の追跡時刻 [週]。
+pub(crate) const LAST_FOLLOW_UP: [f64; 2] = [23.0, 35.0];
+
+/// [偽薬, 6-MP] の観測。遅れた登録はない。
+pub(crate) fn groups() -> Result<[Vec<SurvivalObservation<f64>>; 2], SciOxideError> {
+    let observe = |&(time, event): &(f64, bool)| {
+        let outcome = if event {
+            SurvivalOutcome::Event
+        } else {
+            SurvivalOutcome::Censored
+        };
+        SurvivalObservation::new(None, time, outcome)
+    };
+    let placebo: Vec<(f64, bool)> = PLACEBO.iter().map(|&time| (time, true)).collect();
+    Ok([
+        placebo.iter().map(observe).collect::<Result<_, _>>()?,
+        MERCAPTOPURINE
+            .iter()
+            .map(observe)
+            .collect::<Result<_, _>>()?,
+    ])
+}
+
+/// 右連続な階段 (tᵢ, vᵢ) を、時刻 0 の値 start から end までの頂点列にする。
+pub(crate) fn step_points(start: f64, steps: &[(f64, f64)], end: f64) -> Vec<[f64; 2]> {
+    let mut points = vec![[0.0, start]];
+    points.extend(steps.iter().map(|&(t, v)| [t, v]));
+    let [last_time, last_value] = points[points.len() - 1];
+    if end > last_time {
+        points.push([end, last_value]);
+    }
+    points
+}
+
+/// 階段状の区間の帯。帯の x は狭義単調増加でなければならないので、
+/// 各 (tᵢ, vᵢ, 下端, 上端) の直前の値を tᵢ − 10⁻⁶ 週に置いて段にする。
+pub(crate) fn step_band(steps: &[(f64, f64, f64, f64)], end: f64) -> Vec<[f64; 4]> {
+    let mut band = vec![[0.0, 1.0, 1.0, 1.0]];
+    for &(t, value, lower, upper) in steps {
+        let [_, previous, low, high] = band[band.len() - 1];
+        band.push([t - 1e-6, previous, low, high]);
+        band.push([t, value, lower, upper]);
+    }
+    let [last_time, value, low, high] = band[band.len() - 1];
+    if end > last_time {
+        band.push([end, value, low, high]);
+    }
+    band
+}
+```
+
+## Kaplan–Meier 推定と Nelson–Aalen 推定
+
+事象の時刻を $T$ とし、生存関数を $S(t) = P(T > t)$、ハザードを $h(t) = \lim_{\Delta \to 0} P(t \le T < t+\Delta \mid T \ge t)/\Delta$、累積ハザードを $H(t) = \int_0^t h(u)\,du$ と書く。
+連続分布では $S(t) = \exp\{-H(t)\}$ である。
+打ち切りは事象の時刻と独立である（独立な打ち切り）と仮定する。
+この仮定が崩れ、たとえば状態の悪い患者ほど追跡から外れやすいと、以下の推定量はすべて偏る。
+
+事象の起きた相異なる時刻を $t_1 < t_2 < \cdots$ とし、時刻 $t_i$ の直前に危険集合にいる人数を $n_i$、$t_i$ の事象数を $d_i$ とする。
+同じ時刻に事象と打ち切りがあれば、打ち切られた対象も $t_i$ の危険集合に数える（打ち切りは事象の直後に起きたとみなす）。
+Kaplan–Meier の積極限推定と Greenwood の和は
+
+$$
+\hat S(t) = \prod_{t_i \le t} \left(1 - \frac{d_i}{n_i}\right),\qquad
+\hat\sigma^2(t) = \sum_{t_i \le t} \frac{d_i}{n_i(n_i - d_i)}
+$$
+
+であり、$\hat\sigma^2$ は $\ln \hat S(t)$ の分散の推定である（Kaplan and Meier 1958、Klein and Moeschberger 2003 の 4 章）。
+`kaplan_meier_with_options` は各点の区間を log-log 変換で作る。
+$z$ を信頼係数に対応する正規分布の臨界値、$r = z\hat\sigma/|\ln \hat S|$ として、区間は $[\hat S^{\exp(r)}, \hat S^{\exp(-r)}]$ である。
+この区間は $[0, 1]$ からはみ出さず、Greenwood の分散を直接使う区間より小標本で被覆率が名目に近い。
+$\hat S = 0$ では $\ln \hat S$ が定義されないので、`interval` は `None` になる。
+Greenwood の和は $d_i = n_i$ の項を除く。
+
+Nelson–Aalen 推定は累積ハザードを直接推定する。
+
+$$
+\hat H(t) = \sum_{t_i \le t} \frac{d_i}{n_i},\qquad \widehat{\operatorname{Var}}\,\hat H(t) = \sum_{t_i \le t} \frac{d_i}{n_i^2}
+$$
+
+`nelson_aalen_with_options` は区間を $\hat H \exp(\mp z\sqrt{\widehat{\operatorname{Var}}}/\hat H)$ で作る。
+$1 - x \le e^{-x}$ なので $\hat S_{\mathrm{KM}}(t) \le \exp\{-\hat H(t)\}$ であり、$-\ln \hat S_{\mathrm{KM}}$ は $\hat H$ 以上になる。
+2 つの差は、危険集合が小さくなる後半で大きい。
+
+どちらの関数も観測を時刻で並べ替えて（$O(n \log n)$）、1 回の走査（$O(n)$）で全時刻の値を求め、相異なる事象の時刻ごとに 1 点を返す。
+信頼係数を既定の 95% に固定するワンショット呼び出しは `kaplan_meier` と `nelson_aalen` である。
+多くの標本を繰り返し処理するときは、`SurvivalWorkspace` を使い回して出力の配列に書く `kaplan_meier_into` と `nelson_aalen_into` を使う。
+観測が空なら `InvalidInput`、メモリ使用量が `SurvivalOptions::with_max_bytes` の上限を超えると `ResourceLimit` を返す。
+
+下のセルは 2 群の Kaplan–Meier 曲線と Nelson–Aalen 曲線を求め、6-MP 群の曲線を文献の値と比べる。
+文献の値は、D. G. Kleinbaum and M. Klein, *Survival Analysis: A Self-Learning Text*, 3rd ed., Springer, 2012 の 2 章の表の $\hat S(t)$（小数第 4 位）である。
+入力の信頼係数を変えると、区間の幅だけが変わり、$\hat S$ と $\hat H$ は変わらない。
+2 つの図は時間軸を連動させてある。
+
+```rust
+//| id: stats-leukemia-survival-api-1
+//| ref: stats-leukemia-survival-api-1
+//| title: Kaplan–Meier 曲線と Nelson–Aalen 曲線
+//| run: reactive
+//| uses: [stats-leukemia-survival-data]
+//| crates: [scioxide-core, scioxide-stats]
+//| exports: [confidence, km]
+//| inputs:
+//|   confidence_percent: {"type":"range","label":"区間の信頼係数 [%]","description":"Kaplan–Meier と Nelson–Aalen の点ごとの区間の両側の被覆確率。後の Cox 回帰の区間にも使う。","min":80,"max":99,"step":1,"value":95}
+//| cases:
+//|   - {"id":"ninety","label":"90%","description":"区間が狭くなる。推定値は変わらない。","inputs":{"confidence_percent":90}}
+//|   - {"id":"ninety-nine","label":"99%","description":"区間が広くなる。","inputs":{"confidence_percent":99}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"mp-curve","path":"/rows/0/4","approx":{"value":0.857143,"atol":1e-6}}
+//|       - {"artifact":"mp-curve","path":"/rows/6/4","approx":{"value":0.448179,"atol":1e-6}}
+//|       - {"artifact":"mp-curve","path":"/rows/6/6","range":{"max":5e-5}}
+//|       - {"artifact":"mp-curve","path":"/rows/0/7","approx":{"value":0.619718,"atol":1e-5}}
+//|       - {"artifact":"mp-curve","path":"/rows/0/8","approx":{"value":0.951552,"atol":1e-5}}
+//|       - {"artifact":"groups","path":"/rows/0/3","equals":8}
+//|       - {"artifact":"groups","path":"/rows/1/3","equals":23}
+//|       - {"artifact":"groups","path":"/rows/0/4","approx":{"value":3.527182,"atol":1e-5}}
+//|       - {"artifact":"groups","path":"/rows/1/4","approx":{"value":0.752114,"atol":1e-5}}
+//|   - case: ninety
+//|     expect:
+//|       - {"artifact":"mp-curve","path":"/rows/0/4","approx":{"value":0.857143,"atol":1e-6}}
+//|       - {"artifact":"mp-curve","path":"/rows/0/7","range":{"min":0.62,"max":0.7}}
+//|   - case: ninety-nine
+//|     expect:
+//|       - {"artifact":"mp-curve","path":"/rows/0/7","range":{"min":0.5,"max":0.6197}}
+use scioxide_core::RealScalar;
+use scioxide_stats::{
+    ConfidenceProbability, SurvivalOptions, kaplan_meier_with_options,
+    nelson_aalen_with_options,
+};
+
+// Kleinbaum and Klein（2012）の 6-MP 群の Ŝ(t)
+const LITERATURE: [f64; 7] = [0.8571, 0.8067, 0.7529, 0.6902, 0.6275, 0.5378, 0.4482];
+let confidence_value = confidence_percent / 100.0;
+let confidence = ConfidenceProbability::new(confidence_value).map_err(|e| e.to_string())?;
+let options = SurvivalOptions::new();
+let observations = groups().map_err(|e| e.to_string())?;
+let mut summary = Vec::new();
+let mut mp_rows = Vec::new();
+let mut km_layers = Vec::new();
+let mut na_layers = Vec::new();
+let mut km_export = Vec::new();
+for (g, rows) in observations.iter().enumerate() {
+    let km = kaplan_meier_with_options(rows, confidence, options).map_err(|e| e.to_string())?;
+    let na = nelson_aalen_with_options(rows, confidence, options).map_err(|e| e.to_string())?;
+    let end = LAST_FOLLOW_UP[g];
+    // 中央値は Ŝ(t) ≤ 0.5 となる最初の事象の時刻
+    let median = km
+        .iter()
+        .find(|p| p.survival <= 0.5)
+        .map(|p| p.time as usize);
+    let last = na.last().ok_or("事象がない")?;
+    summary.push((
+        GROUPS[g],
+        rows.len(),
+        na.iter().map(|p| p.events).sum::<usize>(),
+        median,
+        last.cumulative_hazard,
+    ));
+    let survival: Vec<(f64, f64)> = km.iter().map(|p| (p.time, p.survival)).collect();
+    let band: Vec<_> = km
+        .iter()
+        .filter_map(|p| {
+            p.interval
+                .map(|ci| (p.time, p.survival, ci.lower(), ci.upper()))
+        })
+        .collect();
+    let curve = step_points(1.0, &survival, end);
+    km_layers.push(serde_json::json!({
+        "id": format!("band-{g}"),
+        "kind": "band",
+        "name": format!("{} の区間", GROUPS[g]),
+        "points": step_band(&band, end)
+    }));
+    km_layers.push(serde_json::json!({
+        "id": format!("km-{g}"),
+        "kind": "line",
+        "name": GROUPS[g],
+        "points": curve,
+        "style": { "step": "end", "showSymbol": false }
+    }));
+    km_export.push(curve);
+    let hazard: Vec<(f64, f64)> = na.iter().map(|p| (p.time, p.cumulative_hazard)).collect();
+    // 比較用: −ln Ŝ_KM（Ŝ = 0 の点は除く）
+    let log_km: Vec<(f64, f64)> = km
+        .iter()
+        .filter(|p| p.survival > 0.0)
+        .map(|p| (p.time, -RealScalar::ln(p.survival)))
+        .collect();
+    na_layers.push(serde_json::json!({
+        "id": format!("na-{g}"),
+        "kind": "line",
+        "name": format!("{} の Ĥ", GROUPS[g]),
+        "points": step_points(0.0, &hazard, end),
+        "style": { "step": "end", "showSymbol": false }
+    }));
+    na_layers.push(serde_json::json!({
+        "id": format!("log-km-{g}"),
+        "kind": "line",
+        "name": format!("{} の −ln Ŝ", GROUPS[g]),
+        "points": step_points(0.0, &log_km, end),
+        "style": { "step": "end", "lineType": "dashed", "showSymbol": false }
+    }));
+    if g == 1 {
+        for (p, &reference) in km.iter().zip(&LITERATURE) {
+            let ci = p.interval.ok_or("区間がない")?;
+            let gap = (p.survival - reference).abs();
+            mp_rows.push((
+                p.time,
+                p.at_risk,
+                p.events,
+                p.censored,
+                p.survival,
+                reference,
+                gap,
+                ci.lower(),
+                ci.upper(),
+            ));
+        }
+    }
+}
+
+let fixed4 = serde_json::json!({ "fractionDigits": 4 });
+let mp_columns = serde_json::json!([
+    { "key": "0", "label": "時刻 t [週]", "type": "number", "format": { "fractionDigits": 0 } },
+    { "key": "1", "label": "危険集合 n [人]", "type": "integer" },
+    { "key": "2", "label": "事象 d [人]", "type": "integer" },
+    { "key": "3", "label": "打ち切り [人]", "type": "integer" },
+    { "key": "4", "label": "Ŝ(t) [-]", "type": "number", "format": fixed4 },
+    { "key": "5", "label": "文献の Ŝ(t) [-]", "type": "number", "format": fixed4 },
+    {
+        "key": "6",
+        "label": "差の絶対値 [-]",
+        "type": "number",
+        "format": { "notation": "scientific", "significantDigits": 2 }
+    },
+    { "key": "7", "label": "区間の下端 [-]", "type": "number", "format": fixed4 },
+    { "key": "8", "label": "区間の上端 [-]", "type": "number", "format": fixed4 }
+]);
+emit_table_with_columns!(
+    mp_columns,
+    mp_rows,
+    metadata = serde_json::json!({ "id": "mp-curve" })
+);
+let group_columns = serde_json::json!([
+    { "key": "0", "label": "群" },
+    { "key": "1", "label": "人数 [人]", "type": "integer" },
+    { "key": "2", "label": "事象 [人]", "type": "integer" },
+    { "key": "3", "label": "中央値 [週]", "type": "integer", "nullText": "未到達" },
+    { "key": "4", "label": "最後の事象での Ĥ [-]", "type": "number", "format": fixed4 }
+]);
+emit_table_with_columns!(
+    group_columns,
+    summary,
+    metadata = serde_json::json!({ "id": "groups" })
+);
+emit_chart!(serde_json::json!({
+    "kind": "xy",
+    "link": { "group": "leukemia-weeks" },
+    "xLabel": "寛解からの時間 t [週]",
+    "yLabel": "生存関数 Ŝ(t)（寛解の継続割合）[-]",
+    "xMin": 0.0,
+    "xMax": 36.0,
+    "yMin": 0.0,
+    "yMax": 1.0,
+    "dataZoom": true,
+    "tooltip": true,
+    "layers": km_layers,
+    "annotations": [{
+        "kind": "line",
+        "axis": "y",
+        "value": 0.5,
+        "label": "Ŝ = 0.5（中央値）",
+        "style": { "lineType": "dotted" }
+    }]
+}));
+emit_chart!(serde_json::json!({
+    "kind": "xy",
+    "link": { "group": "leukemia-weeks" },
+    "xLabel": "寛解からの時間 t [週]",
+    "yLabel": "累積ハザード [-]",
+    "xMin": 0.0,
+    "xMax": 36.0,
+    "yMin": 0.0,
+    "dataZoom": true,
+    "tooltip": true,
+    "layers": na_layers
+}));
+export!(confidence, &confidence_value);
+export!(km, &km_export);
+```
+
+6-MP 群の $\hat S(t)$ は、7 つの事象の時刻すべてで文献の値と小数第 4 位まで一致する（差は丸めの $5 \times 10^{-5}$ 以下）。
+最初の行は $\hat S(6) = 1 - 3/21 = 0.8571$、Greenwood の和は $3/(21 \cdot 18)$ で、95% 区間は 0.620〜0.952 になる。
+中央値は偽薬群 8 週、6-MP 群 23 週で、どちらも文献の値と同じである。
+偽薬群の最後の点（23 週）は $\hat S = 0$ なので区間がなく、図の帯はその手前で終わる。
+
+累積ハザードの図では、偽薬群の $\hat H$ は 23 週で 3.53 に達し、6-MP 群は 35 週まで 0.75 にとどまる。
+破線の $-\ln \hat S_{\mathrm{KM}}$ はいつも実線の $\hat H$ 以上で、危険集合が数人になる後半ほど離れる。
+偽薬群の $\hat H$ がほぼ直線に増えることは、偽薬群のハザードが期間を通じてほぼ一定（約 0.15/週）であることを示す。
+
+## logrank 検定と Cox 回帰
+
+2 群のハザードが等しいという帰無仮説 $h_1(t) = h_2(t)$ を、logrank 検定で調べる。
+各事象の時刻 $t$ で、群 $k$ の危険集合を $r_k$、事象数を $d_k$、$r = r_1 + r_2$、$d = d_1 + d_2$ とする。
+周辺を固定した 2 × 2 表（群 × 事象の有無）の超幾何分布から、
+
+$$
+O_1 = \sum_t d_1,\qquad E_1 = \sum_t \frac{d\,r_1}{r},\qquad
+V = \sum_t \frac{d\,(r-d)\,r_1 r_2}{r^2 (r-1)}
+$$
+
+を足し合わせ、統計量 $(O_1 - E_1)^2 / V$ を自由度 1 の $\chi^2$ 分布と比べる（Mantel 1966）。
+p 値は漸近分布の上側確率で、正確な分布や置換による p 値ではない。
+時点ごとの 2 × 2 表を足し合わせる考え方は、[腎結石の例](../simpsons-paradox/)の Mantel–Haenszel 推定と同じである。
+`logrank_test(first, second)` は $O$、$E$、$V$ と統計量を返し、群が空か $V = 0$（事象がない）なら `InvalidInput` を返す。
+ハザード比が時間とともに変わると、検定の検出力は落ちる。
+
+Cox の比例ハザードモデルは、共変量 $x_i$ を持つ対象のハザードを $h(t \mid x_i) = h_0(t)\exp(x_i^\top\beta)$ とおき、基準ハザード $h_0$ を指定せずに部分尤度で $\beta$ を推定する（Cox 1972）。
+ここでは $x_i = 1$（6-MP）、$x_i = 0$（偽薬）とするので、$\exp(\beta)$ は偽薬に対する 6-MP のハザード比である。
+同じ時刻に $d$ 件の事象があるとき、Breslow 近似は $d$ 個の分母をすべて危険集合の和 $\sum_{j \in R} w_j$（$w_j = \exp(x_j^\top\beta)$）とし、Efron 近似は $k$ 番目の分母を $\sum_{j \in R} w_j - (k/d)\sum_{j \in D} w_j$ とする。
+このデータには 6 週の 3 件、8 週の 4 件などの同時刻の事象があるので、2 つの近似の結果は少し違う。
+
+`PreparedCox::new(observations, design, ties, options)` は負の対数部分尤度 $\ell(\beta)$ を準備し、`FitObjective::value`、`FitDerivatives::gradient`（負のスコア）と `hessian`（観測情報）を評価する。
+指数は指数部の範囲を広げた表現で計算し、共変量は対象どうしの差として入るので、線形予測子が大きくてもあふれない。
+1 回の評価は $O(enp)$（$e$ は事象数、$n$ は観測数、$p$ は共変量の数）である。
+当てはめは `cox_fit_with_options(problem, initial, solver, options)` で、最小化は呼び出し側が渡すソルバー `FitSolver` に任せる。
+ここでは `scioxide-optimize` の `LbfgsBFitSolver`（L-BFGS-B）を渡す。
+ソルバーが `Converged` を返したときだけ `CoxFit::report` が `CoxReport` を返し、観測情報、係数の Wald 区間 $\hat\beta \pm z\,\mathrm{SE}$、ハザード比、基準累積ハザード、Schoenfeld 残差を持つ。
+ワンショット呼び出しの `cox_fit` は収束しなければエラーを返す。
+
+3 つの検定は同じ部分尤度から作れる。
+
+- スコア検定は $U(0)^2 / I(0)$ である（$U$ はスコア、$I$ は観測情報）。
+  Breslow 近似では $U(0) = O_2 - E_2$ となり、logrank の分子と一致する。
+  $I(0) = \sum_t d\,r_1 r_2 / r^2$ は、logrank の $V$ から同時刻の補正 $(r-d)/(r-1)$ を除いた値なので、同時刻の事象がなければ logrank 統計量と一致する。
+- 尤度比検定は $2\{\ell(0) - \ell(\hat\beta)\}$ である。
+- Wald 検定は $\hat\beta^2 / \widehat{\operatorname{Var}}(\hat\beta)$ である。
+
+logrank の値から、ハザード比の 1 段階の近似 $\exp\{(O_2 - E_2)/V\}$（Peto の推定）も作れる。
+これは $\beta = 0$ から Newton 法を 1 回進めた値にあたり、ハザード比が 1 から遠いと偏る。
+
+下のセルは、前のセルの信頼係数と Kaplan–Meier 曲線を受け取り、logrank 検定、3 つの検定、ハザード比を表にする。
+参照値の列は同じ式を Python で独立に計算した値である。
+Efron 近似の値は Kleinbaum and Klein（2012）の 3 章（係数 1.572、標準誤差 0.412、尤度比 16.35）と一致し、logrank 統計量 16.79 は同書の 2 章の値と一致する。
+図は、Cox モデルの生存曲線 $\hat S_0(t)^{\exp(\hat\beta x)}$（破線）を Kaplan–Meier 曲線（実線）に重ねる。
+$\hat S_0$ は偽薬群（$x = 0$）の基準生存関数である。
+比例ハザードが成り立つなら、破線は両群で実線の近くを通る。
+
+```rust
+//| id: stats-leukemia-survival-api-3
+//| ref: stats-leukemia-survival-api-3
+//| title: logrank 検定と Cox 回帰のハザード比
+//| run: reactive
+//| uses: [stats-leukemia-survival-data]
+//| crates: [scioxide-core, scioxide-linalg, scioxide-optimize, scioxide-random, scioxide-stats]
+//| dependsOn:
+//|   curves: stats-leukemia-survival-api-1
+//| inputs:
+//|   ties: {"type":"select","label":"同時刻の事象の扱い","description":"Cox の部分尤度の分母の近似。logrank 検定には影響しない。","options":["Efron","Breslow"],"value":"Efron"}
+//| cases:
+//|   - {"id":"breslow","label":"Breslow 近似","description":"スコア統計量が logrank の分子と一致し、分母だけが違う。","inputs":{"ties":"Breslow"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"tests","path":"/rows/0/1","approx":{"value":16.792941,"atol":1e-5}}
+//|       - {"artifact":"tests","path":"/rows/0/2","approx":{"value":4.17e-5,"rtol":0.01}}
+//|       - {"artifact":"tests","path":"/rows/1/1","approx":{"value":17.246537,"atol":1e-5}}
+//|       - {"artifact":"tests","path":"/rows/2/1","approx":{"value":16.351691,"atol":1e-4}}
+//|       - {"artifact":"tests","path":"/rows/3/1","approx":{"value":14.532617,"atol":1e-3}}
+//|       - {"artifact":"hazard","path":"/rows/0/1","approx":{"value":0.207604,"atol":1e-4}}
+//|       - {"artifact":"hazard","path":"/rows/0/2","approx":{"value":0.092513,"atol":1e-4}}
+//|       - {"artifact":"hazard","path":"/rows/0/3","approx":{"value":0.465873,"atol":1e-3}}
+//|       - {"artifact":"hazard","path":"/rows/1/1","approx":{"value":0.194319,"atol":1e-5}}
+//|       - {"path":"/outputs/3/state","equals":"satisfied"}
+//|   - case: breslow
+//|     expect:
+//|       - {"artifact":"tests","path":"/rows/1/1","approx":{"value":15.930540,"atol":1e-5}}
+//|       - {"artifact":"tests","path":"/rows/2/1","approx":{"value":15.210857,"atol":1e-4}}
+//|       - {"artifact":"hazard","path":"/rows/0/1","approx":{"value":0.221089,"atol":1e-4}}
+//|       - {"path":"/outputs/3/state","equals":"satisfied"}
+use scioxide_core::RealScalar;
+use scioxide_linalg::MatrixView;
+use scioxide_optimize::{LbfgsB, LbfgsBFitSolver, LbfgsBOptions};
+use scioxide_random::{ChiSquared, Survival};
+use scioxide_stats::{
+    ConfidenceProbability, CoxInferenceOptions, CoxTies, FitDerivatives, FitObjective,
+    PreparedCox, SurvivalOptions, cox_fit_with_options, logrank_test,
+};
+
+let confidence_value = curves["confidence"].as_f64().ok_or("信頼係数がない")?;
+let confidence = ConfidenceProbability::new(confidence_value).map_err(|e| e.to_string())?;
+let [placebo, mercaptopurine] = groups().map_err(|e| e.to_string())?;
+let logrank = logrank_test(&placebo, &mercaptopurine).map_err(|e| e.to_string())?;
+
+// 共変量 x: 偽薬 0、6-MP 1。行の順は観測の順
+let observations: Vec<_> = placebo.iter().chain(&mercaptopurine).copied().collect();
+let covariate: Vec<f64> = (0..42).map(|i| if i < 21 { 0.0 } else { 1.0 }).collect();
+let design = MatrixView::from_slice(42, 1, &covariate).map_err(|e| e.to_string())?;
+let method = if ties == "Breslow" {
+    CoxTies::Breslow
+} else {
+    CoxTies::Efron
+};
+let problem = PreparedCox::new(&observations, design, method, SurvivalOptions::new())
+    .map_err(|e| e.to_string())?;
+// β = 0 での負のスコアと観測情報、負の対数部分尤度
+let (mut gradient, mut information) = ([0.0], [0.0]);
+problem
+    .gradient(&[0.0], &mut gradient)
+    .map_err(|e| e.to_string())?;
+problem
+    .hessian(&[0.0], &mut information)
+    .map_err(|e| e.to_string())?;
+let null_value = problem.value(&[0.0], &mut ()).map_err(|e| e.to_string())?;
+
+let mut solver = LbfgsBFitSolver::new(LbfgsB::new(LbfgsBOptions::default()), 1)
+    .map_err(|e| e.to_string())?;
+let options = CoxInferenceOptions::new().with_confidence(confidence);
+let fitted =
+    cox_fit_with_options(&problem, &[0.0], &mut solver, options).map_err(|e| e.to_string())?;
+let fit_report = fitted.fit().report();
+let termination = fit_report.termination();
+let report = fitted
+    .report()
+    .ok_or_else(|| format!("当てはめが {termination:?} で止まり、推論のレポートがない"))?;
+let beta = fitted.fit().parameters().ok_or("係数がない")?[0];
+let variance = report.information().covariance().ok_or("共分散がない")?[0];
+let interval = report.coefficient_intervals().ok_or("区間がない")?[0];
+let minimum = fit_report.objective().ok_or("目的関数値がない")?;
+
+// 参照値: 同じ式の独立計算（Python）。Efron は Kleinbaum and Klein（2012）とも一致する
+let reference = if method == CoxTies::Breslow {
+    [15.930540, 15.210857, 13.578264]
+} else {
+    [17.246537, 16.351691, 14.532617]
+};
+let chi2 = ChiSquared::<f64>::new(1.0).map_err(|e| e.to_string())?;
+let statistics = [
+    ("logrank", logrank.statistic(), Some(16.792941)),
+    (
+        "スコア U(0)²/I(0)",
+        gradient[0] * gradient[0] / information[0],
+        Some(reference[0]),
+    ),
+    (
+        "尤度比 2{ℓ(0) − ℓ(β̂)}",
+        2.0 * (null_value - minimum),
+        Some(reference[1]),
+    ),
+    ("Wald β̂²/Var β̂", beta * beta / variance, Some(reference[2])),
+];
+let mut rows = Vec::new();
+for (name, statistic, value) in statistics {
+    rows.push((
+        name,
+        statistic,
+        chi2.sf(statistic).map_err(|e| e.to_string())?,
+        value,
+    ));
+}
+
+// ハザード比: Cox の最尤推定と Wald 区間、Peto の 1 段階推定、O/E の比（6-MP 対 偽薬）
+let observed = logrank.observed();
+let expected = logrank.expected();
+let step = (observed[1] as f64 - expected[1]) / logrank.variance();
+let z = confidence
+    .normal_critical_value::<f64>()
+    .map_err(|e| e.to_string())?;
+let half = z / RealScalar::sqrt(logrank.variance());
+let ratio_of_rates = (observed[1] as f64 / expected[1]) / (observed[0] as f64 / expected[0]);
+let hazard = vec![
+    (
+        "Cox の最尤推定",
+        report.hazard_ratios()[0],
+        Some(RealScalar::exp(interval.lower())),
+        Some(RealScalar::exp(interval.upper())),
+    ),
+    (
+        "Peto の 1 段階推定 exp{(O₂ − E₂)/V}",
+        RealScalar::exp(step),
+        Some(RealScalar::exp(step - half)),
+        Some(RealScalar::exp(step + half)),
+    ),
+    ("O/E の比 (O₂/E₂)/(O₁/E₁)", ratio_of_rates, None, None),
+];
+
+let fixed3 = serde_json::json!({ "fractionDigits": 3 });
+let fixed4 = serde_json::json!({ "fractionDigits": 4 });
+let test_columns = serde_json::json!([
+    { "key": "0", "label": "検定（自由度 1）" },
+    { "key": "1", "label": "統計量 [-]", "type": "number", "format": fixed4 },
+    {
+        "key": "2",
+        "label": "漸近 p 値 [-]",
+        "type": "number",
+        "format": { "notation": "scientific", "significantDigits": 3 }
+    },
+    { "key": "3", "label": "参照値 [-]", "type": "number", "format": fixed4, "nullText": "なし" }
+]);
+emit_table_with_columns!(
+    test_columns,
+    rows,
+    metadata = serde_json::json!({ "id": "tests" })
+);
+let hazard_columns = serde_json::json!([
+    { "key": "0", "label": "推定量" },
+    { "key": "1", "label": "ハザード比 [-]", "type": "number", "format": fixed4 },
+    {
+        "key": "2",
+        "label": "区間の下端 [-]",
+        "type": "number",
+        "format": fixed3,
+        "nullText": "なし"
+    },
+    {
+        "key": "3",
+        "label": "区間の上端 [-]",
+        "type": "number",
+        "format": fixed3,
+        "nullText": "なし"
+    }
+]);
+emit_table_with_columns!(
+    hazard_columns,
+    hazard,
+    metadata = serde_json::json!({ "id": "hazard" })
+);
+
+let baseline: Vec<(f64, f64)> = report
+    .baseline()
+    .iter()
+    .map(|p| (p.time, p.survival))
+    .collect();
+let ratio = report.hazard_ratios()[0];
+let mut layers = Vec::new();
+for g in 0..2 {
+    let model: Vec<(f64, f64)> = baseline
+        .iter()
+        .map(|&(t, s)| {
+            (
+                t,
+                if g == 0 {
+                    s
+                } else {
+                    RealScalar::powf(s, ratio)
+                },
+            )
+        })
+        .collect();
+    let observed_curve = curves["km"][g].clone();
+    layers.push(serde_json::json!({
+        "id": format!("km-{g}"),
+        "kind": "line",
+        "name": format!("{}（Kaplan–Meier）", GROUPS[g]),
+        "points": observed_curve,
+        "style": { "step": "end", "showSymbol": false }
+    }));
+    layers.push(serde_json::json!({
+        "id": format!("cox-{g}"),
+        "kind": "line",
+        "name": format!("{}（Cox モデル）", GROUPS[g]),
+        "points": step_points(1.0, &model, LAST_FOLLOW_UP[g]),
+        "style": { "step": "end", "lineType": "dashed", "showSymbol": false }
+    }));
+}
+emit_chart!(serde_json::json!({
+    "kind": "xy",
+    "link": { "group": "leukemia-weeks" },
+    "xLabel": "寛解からの時間 t [週]",
+    "yLabel": "生存関数 [-]",
+    "xMin": 0.0,
+    "xMax": 36.0,
+    "yMin": 0.0,
+    "yMax": 1.0,
+    "dataZoom": true,
+    "tooltip": true,
+    "layers": layers
+}));
+
+let outcome = if termination.is_success() {
+    Outcome::satisfied("部分尤度の最小化が勾配の許容誤差を満たした")
+} else {
+    Outcome::partial("部分尤度の最小化が上限で止まった")
+};
+emit_outcome!(
+    outcome
+        .status(format!("{termination:?}"))
+        .diagnostic("負の対数部分尤度 ℓ(β̂)", minimum, None)
+        .diagnostic("係数 β̂", beta, None)
+        .diagnostic("係数の標準誤差", RealScalar::sqrt(variance), None)
+);
+```
+
+既定の Efron 近似では、$\hat\beta = -1.572$（標準誤差 0.412）、ハザード比 0.208（95% 区間 0.093〜0.466）である。
+6-MP 群の再発のハザードは偽薬群の約 5 分の 1 と推定され、区間は 1 を含まない。
+logrank 検定は $O = (21, 9)$、$E = (10.75, 19.25)$、$V = 6.257$ から統計量 16.79、p 値 $4.2 \times 10^{-5}$ を返す。
+スコア検定 17.25、尤度比検定 16.35、Wald 検定 14.53 は、同じ帰無仮説の漸近的に同等な検定で、この標本ではどれも p < 0.001 になる。
+
+Breslow 近似に切り替えると、$\hat\beta = -1.509$、ハザード比 0.221 になり、スコア統計量は 15.93 になる。
+このときスコア $U(0) = O_2 - E_2 = -10.25$ は logrank の分子と一致し、違いは分母（$I(0) = 6.596$ と $V = 6.257$）だけである。
+Peto の 1 段階推定 0.194 と O/E の比 0.239 は、最尤推定 0.208 をはさむ。
+
+図では、Cox モデルの曲線と Kaplan–Meier 曲線の差が両群とも最大 0.08 で、Kaplan–Meier の 95% 区間の半幅（6-MP 群で 0.17〜0.25）より小さく、比例ハザードの仮定に大きな矛盾は見えない。
+数値で確かめるには、`CoxReport::schoenfeld_residuals` の Schoenfeld 残差を事象の時刻に対して並べ、傾向がないかを見る（Grambsch and Therneau 1994）。
+`scioxide-stats` はこの残差を返すが、それに基づく比例ハザードの検定は提供しない。
+
+## 誤差と計算量
+
+- Kaplan–Meier、Nelson–Aalen、logrank は $O(n \log n)$ の並べ替えと $O(n)$ の走査で、値は倍精度で計算する。
+  6-MP 群の $\hat S$ は有理数の積なので、文献の 4 桁の値との差は丸めだけである。
+- 点ごとの区間は各時刻の周辺の区間で、曲線全体を同時に覆う帯ではない。
+  曲線全体の被覆には Hall–Wellner 帯などが必要で、`scioxide-stats` は提供しない。
+- logrank と Cox の検定の p 値は漸近近似である。
+  この標本は 30 件の事象を持ち、近似は妥当と考えられるが、事象が数件のときは置換による p 値（`classical_permutation_test` など）で確かめる。
+- Cox の当てはめでは、部分尤度の 1 回の評価が $O(enp)$ で、L-BFGS-B は反復ごとに値と勾配を評価する。
+  この例は観測 42、事象 30、共変量 1 なので、wasm でも 1 回の実行が 0.2 秒程度で終わる。
+  共変量が 1 つなら Newton 法でも同じ値が得られる。
+  観測情報 $I(\hat\beta)$ の固有値が `CoxInferenceOptions::rank_tolerance` の閾値以下だと、情報は階数落ちと判定され、共分散と区間は `None` になる。
+
+## まとめ
+
+打ち切りを含む寛解期間では、Kaplan–Meier 推定が 6-MP 群の生存曲線を文献の値と小数第 4 位まで一致して再現し、中央値は偽薬群 8 週、6-MP 群 23 週である。
+log-log 区間は信頼係数だけで幅が変わり、$\hat S = 0$ の点では定義されない。
+logrank 検定の統計量 16.79 は、Breslow 近似の Cox のスコア検定と分子が同じで、分母の同時刻の補正だけが違う。
+Cox 回帰は 6-MP のハザード比を 0.208（Efron、95% 区間 0.093〜0.466）と推定し、同時刻の事象の扱いで 0.221（Breslow）に変わる。
+比例ハザードの仮定は、Kaplan–Meier 曲線とモデルの曲線の比較や Schoenfeld 残差で確かめる。
+
+## 次に読むページ
+
+- [生存時間解析と Cox 比例ハザード](../../algorithms/survival-analysis/)：遅れた登録、作業領域の再利用、Cox の基準ハザードと Schoenfeld 残差の定義を確かめる。
+- [例: 腎結石治療の Simpson のパラドックス](../simpsons-paradox/)：logrank 検定の基礎になる 2 × 2 表の層別の考え方を確かめる。
+- [例: 偽発見率の制御](../false-discovery-control/)：多数の群や共変量で検定を繰り返すときの多重性の扱いを確かめる。

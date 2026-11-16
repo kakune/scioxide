@@ -1,0 +1,565 @@
+---
+title: "Reaction-rate sensitivity under nonnegative concentration constraints"
+description: "Compute power-law rate gradients under nonnegative bounds, compare symmetric-to-one-sided node changes and truncation with analytic formulas, examine noninteger order reduction and extrapolation failure, and handle fixed catalyst concentrations with FixedCoordinatePolicy."
+sidebar:
+  order: 425
+references:
+  differentiate-pinned-catalyst: "fixed-catalyst-concentrations"
+  differentiate-boundary-order-loss: "boundary-one-sided-differences-and-order-reduction"
+---
+
+Concentration sensitivities of reaction rates are used in reactor design, rate-constant estimation, and implicit-integration Jacobians.
+Concentrations are nonnegative; evaluating negative concentrations can make noninteger powers such as $c^{1.5}$ NaN or invalidate the model.
+This example differentiates power-law rates with nonnegative concentration bounds supplied by `Bounds`.
+Compare near-boundary nodes and errors with analytic expressions and examine equal lower and upper concentration bounds.
+General boundary selection appears in [Domain boundaries and one-sided differences](../../algorithms/bounds-and-one-sided/).
+
+## Power-law rates
+
+Represent the rate by this power law.
+
+$$
+r(c_A, c_B) = k \, c_A^{\,n} \, c_B \quad [\mathrm{mol/(L \cdot s)}].
+$$
+
+$c_A$ and $c_B$ [mol/L] are reactant concentrations; $n$ is order in $A$, giving total order $n + 1$.
+Noninteger orders arise in empirical models of complex reactions.
+Use rate constant $k = 2.0\,\mathrm{(L/mol)^{n}\,s^{-1}}$, choosing $k$ units so $r$ has units $\mathrm{mol/(L \cdot s)}$.
+Take order $1 \le n \le 3$ and concentration $c_A, c_B \ge 0$.
+The analytic gradient follows, both components in $\mathrm{s^{-1}}$.
+
+$$
+\frac{\partial r}{\partial c_A} = n k \, c_A^{\,n - 1} c_B, \qquad \frac{\partial r}{\partial c_B} = k \, c_A^{\,n}.
+$$
+
+For noninteger $n$, $c_A^{\,n}$ is nonsmooth at $c_A = 0$.
+Order-$j$ derivatives scale with $c_A^{\,n - j}$, so derivatives $j > n$ diverge at $c_A \to 0$.
+Taylor series around $c_A > 0$ converges only within distance $c_A$ to singularity $c_A = 0$.
+
+The following definitions serve this page's three cells.
+`rate` represents $r$, raising only the first concentration to $n$ and multiplying remaining concentrations linearly; `rate_slope` gives analytic $\partial r / \partial c_A$; `one_sided_value` gives the boundary one-sided formula derived next.
+`rate` uses SciOxide `RealScalar::powf`; check `rate_slope` and `one_sided_value` use f64 inherent methods.
+
+```rust
+//| id: differentiate-power-rate-model
+//| kind: definitions
+//| title: "Power-law rates and boundary one-sided formulas"
+//| crates: [scioxide-core]
+use scioxide_core::RealScalar;
+
+/// Rate constant k [(L/mol)ⁿ s⁻¹]; each added concentration increases the (L/mol) unit power by one.
+pub(crate) const RATE_CONSTANT: f64 = 2.0;
+
+/// Rate r = k c₀ⁿ c₁ c₂ … [mol/(L·s)]; negative c₀ and noninteger n produce NaN.
+pub(crate) fn rate(order: f64, concentrations: &[f64]) -> f64 {
+    let others: f64 = concentrations[1..].iter().product();
+    RATE_CONSTANT * RealScalar::powf(concentrations[0], order) * others
+}
+
+/// Reference: ∂r/∂c₀ = n k c₀ⁿ⁻¹ × others, where others multiplies remaining concentrations; zero at c₀ = 0, n > 1.
+pub(crate) fn rate_slope(order: f64, c0: f64, others: f64) -> f64 {
+    if c0 == 0.0 && order > 1.0 {
+        0.0
+    } else {
+        order * RATE_CONSTANT * c0.powf(order - 1.0) * others
+    }
+}
+
+/// Reference at c₀ = 0: (−3r(0) + 4r(h) − r(2h))/(2h) = (4 − 2ⁿ) hⁿ⁻¹ k others / 2.
+pub(crate) fn one_sided_value(order: f64, h: f64, others: f64) -> f64 {
+    (4.0 - 2.0_f64.powf(order)) / 2.0 * h.powf(order - 1.0) * RATE_CONSTANT * others
+}
+```
+
+## Difference nodes near boundaries
+
+`FiniteDifference` defaults to central differences with step $h = \varepsilon^{1/3} \max(1, \lvert c_A \rvert)$.
+For $c_A \le 1$ this is $h = \varepsilon^{1/3} \approx 6.06 \times 10^{-6}$ mol/L.
+With lower bound 0 supplied by `Bounds`, nodes depend on whether negative room $c_A$ fits the step.
+
+- **Symmetric** $\{-h, 0, h\}$ ($c_A \ge h$): ordinary central differences, leading truncation $h^2 r'''/6$.
+- **One-sided** $\{0, h, 2h\}$ ($c_A < h$): insufficient negative room switches to three inward nodes with the same second order.
+  Weights are $(-3, 4, -1)/(2h)$, with the same shape at boundary $c_A = 0$ and just inside.
+
+Both have the base as center node; value $r(c_A)$ is shared by all gradient components, requiring two calls per coordinate.
+Three-point weights $w_k$ follow from $\sum_k w_k = 0$, $\sum_k w_k \delta_k = 1$, and $\sum_k w_k \delta_k^2 = 0$, where $\delta_k$ denotes displacements.
+Inserting the cubic Taylor term gives leading truncation $(r'''/6) \sum_k w_k \delta_k^3$.
+Symmetry gives $\sum_k w_k \delta_k^3 = h^2$ and $h^2 r'''/6$; one-sided $\{0, h, 2h\}$ gives $\sum_k w_k \delta_k^3 = -2h^2$ and hence $-h^2 r'''/3$.
+Shrinking only negative displacement to $c_A$ is avoided because weights grow as $1/c_A$ and rounding increases near boundaries ([Domain boundaries and one-sided differences](oxref:differentiate-bounded-fixed-nodes)).
+If any coordinate admits no nodes, such as equal bounds, return `InvalidInput` (argument `bounds`, `UnsupportedConfiguration`) without any function call.
+
+Adaptive `AdaptiveDifference` uses the same selection each level.
+Levels with step above $c_A$ are one-sided; those at most $c_A$ are symmetric; shape changes restart extrapolation ([Boundaries for adaptive, directional, and node differences](oxref:differentiate-bounded-other-methods)).
+Neither shape shrinks steps to $c_A$, avoiding extra function rounding just inside boundaries.
+
+## Boundary one-sided differences and order reduction
+
+Second-order one-sided accuracy assumes $r$ of class $C^3$, but $c_A^{\,n}$ is nonsmooth at $c_A = 0$ for noninteger $n$.
+Since $r(0) = 0$, directly substituting powers gives the one-sided value.
+
+$$
+\frac{-3 r(0) + 4 r(h) - r(2h)}{2h} = \frac{4 h^n - (2h)^n}{2h} k c_B = \frac{4 - 2^n}{2} \, h^{n - 1} \, k c_B .
+$$
+
+For $n > 1$, $\partial r / \partial c_A = 0$, so this value is the error itself.
+Error scales as $h^{n-1}$; for $1 < n < 3$ order drops from 2 to $n - 1$.
+At $n = 1.5$ order is 0.5, with default error $0.586 \sqrt{h}\, k c_B \approx 2.88 \times 10^{-3}\,\mathrm{s^{-1}}$ ($c_B = 1$ mol/L).
+At $n = 1$, value $k c_B$ matches exactly.
+At $n = 2$, the coefficient $4 - 2^n$ vanishes; the function is quadratic, so the formula is exact.
+At $n = 3$, error $-2 h^2 k c_B$ matches $-h^2 r'''/3$ ($r''' = 6 k c_B$), restoring order 2.
+
+## Gradients near boundaries
+
+The next cell fixes $c_B = 1$ mol/L, varies $c_A$ from 0 to 0.1 mol/L, and computes gradients with `FiniteDifference::gradient`.
+Record $c_A$ displacement per call; tabulate node shape, negative displacement $h_-$, and maximum positive displacement.
+One-sided nodes have no negative displacement and maximum $2h$.
+At the boundary, truncation prediction is one-sided value minus exact value; inside, use $\lvert r''' \rvert h^2 / 6$ for symmetric or $\lvert r''' \rvert h^2 / 3$ for one-sided nodes.
+Interior predictions appear only when Taylor series reach every node (integer $n$ or maximum displacement below $c_A$); otherwise show “Not applicable”.
+Bounds may be disabled, showing error kinds and causes for failed rows.
+
+```rust
+//| id: differentiate-bounded-rate
+//| ref: differentiate-bounded-rate
+//| title: "Reaction-rate gradients and nodes under nonnegative concentration bounds"
+//| run: reactive
+//| uses: [differentiate-power-rate-model]
+//| crates: [scioxide-core, scioxide-differentiate]
+//| inputs:
+//|   order: {"type":"range","label":"Reaction order n","description":"Order in c_A; noninteger values are nonsmooth at c_A = 0.","min":1.0,"max":3.0,"step":0.25,"value":1.5}
+//|   bounded: {"type":"checkbox","label":"Supply concentration bounds c ≥ 0","description":"Disabling evaluates negative concentrations near the boundary.","value":true}
+//| cases:
+//|   - {"id":"unbounded","label":"No bounds","description":"Rows with c_A < h evaluate negatives, produce NaN, and stop with DifferentiationFailure.","inputs":{"bounded":false}}
+//|   - {"id":"cubic","label":"n = 3","description":"For polynomials, interior one-sided errors match prediction |r'''| h²/3.","inputs":{"order":3.0}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"rates","path":"/rows/0/1","equals":"One-sided"}
+//|       - {"artifact":"rates","path":"/rows/0/6","approx":{"value":2.883e-3,"rtol":1e-3}}
+//|       - {"artifact":"rates","path":"/rows/0/7","approx":{"value":2.883e-3,"rtol":1e-3}}
+//|       - {"artifact":"rates","path":"/rows/1/1","equals":"One-sided"}
+//|       - {"artifact":"rates","path":"/rows/1/2","equals":null}
+//|       - {"artifact":"rates","path":"/rows/1/3","approx":{"value":1.2110909e-5,"rtol":1e-6}}
+//|       - {"artifact":"rates","path":"/rows/1/7","equals":null}
+//|       - {"artifact":"rates","path":"/rows/2/1","equals":"Symmetric"}
+//|       - {"artifact":"rates","path":"/rows/2/6","approx":{"value":4.58e-6,"rtol":0.01}}
+//|       - {"artifact":"rates","path":"/rows/2/7","approx":{"value":4.58e-6,"rtol":0.01}}
+//|   - case: unbounded
+//|     expect:
+//|       - {"artifact":"rates","path":"/rows/0/4","equals":null}
+//|       - {"artifact":"rates","path":"/rows/0/8","equals":"DifferentiationFailure (cause NonFinite)"}
+//|       - {"artifact":"rates","path":"/rows/1/8","equals":"DifferentiationFailure (cause NonFinite)"}
+//|       - {"artifact":"rates","path":"/rows/2/6","approx":{"value":4.58e-6,"rtol":0.01}}
+//|   - case: cubic
+//|     expect:
+//|       - {"artifact":"rates","path":"/rows/0/6","approx":{"value":1.467e-10,"rtol":1e-3}}
+//|       - {"artifact":"rates","path":"/rows/1/6","approx":{"value":1.467e-10,"rtol":0.05}}
+//|       - {"artifact":"rates","path":"/rows/1/7","approx":{"value":1.467e-10,"rtol":1e-3}}
+use scioxide_core::{Bounds, SciOxideError, SciOxideErrorView};
+use scioxide_differentiate::FiniteDifference;
+
+let cb = 1.0_f64;
+let bounds =
+    Bounds::new(vec![(Some(0.0), None), (Some(0.0), None)]).map_err(|e| e.to_string())?;
+let describe = |e: SciOxideError| match e.view() {
+    SciOxideErrorView::DifferentiationFailure { cause, .. } => {
+        format!("{:?} (cause {:?})", e.kind(), cause.kind())
+    }
+    _ => format!("{:?}", e.kind()),
+};
+let mut rows = Vec::new();
+for ca in [0.0, 1e-6, 1e-4, 1e-2, 0.1] {
+    // Record c_A sample displacement δ; c_B samples have δ = 0.
+    let mut offsets = Vec::new();
+    let result = FiniteDifference::default().gradient(
+        |c: &[f64], y: &mut [f64]| {
+            offsets.push(c[0] - ca);
+            y[0] = rate(order, c);
+            Ok::<(), SciOxideError>(())
+        },
+        &[ca, cb],
+        bounded.then_some(&bounds),
+        None,
+    );
+    let below = offsets.iter().fold(0.0_f64, |a, &d| a.max(-d));
+    let above = offsets.iter().fold(0.0_f64, |a, &d| a.max(d));
+    let exact = rate_slope(order, ca, cb);
+    let (value, failure) = match result {
+        Ok(r) => (r.values().map(|g| g[0]), None),
+        Err(e) => (None, Some(describe(e))),
+    };
+    let nodes = match (value.is_some(), below == 0.0) {
+        (false, _) => None,
+        (true, true) => Some("One-sided"),
+        (true, false) => Some("Symmetric"),
+    };
+    // Truncation prediction: boundary one-sided minus exact; interior |r'''| |Σ w δ³| / 6.
+    // Σ w δ³ is h² for symmetric {−h, 0, h} and −2h² for one-sided {0, h, 2h}; h is half maximum displacement.
+    // r''' = k n(n − 1)(n − 2) c_Aⁿ⁻³; integer orders with zero coefficient give zero even at c_A = 0.
+    let coefficient = RATE_CONSTANT * order * (order - 1.0) * (order - 2.0);
+    let third = if coefficient == 0.0 {
+        0.0
+    } else {
+        coefficient * ca.powf(order - 3.0)
+    };
+    let moment = if below > 0.0 {
+        below * above
+    } else {
+        above * above / 2.0
+    };
+    let predicted = match nodes {
+        Some("One-sided") if ca == 0.0 => {
+            Some((one_sided_value(order, above / 2.0, cb) - exact).abs())
+        }
+        Some(_) if order.fract() == 0.0 || above < ca => {
+            Some((third * cb).abs() * moment / 6.0)
+        }
+        _ => None,
+    };
+    rows.push((
+        ca,
+        nodes,
+        (below > 0.0).then_some(below),
+        value.map(|_| above),
+        value,
+        exact,
+        value.map(|v| (v - exact).abs()),
+        predicted,
+        failure,
+    ));
+}
+let sci1 = serde_json::json!({ "notation": "scientific", "significantDigits": 1 });
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let sci6 = serde_json::json!({ "notation": "scientific", "significantDigits": 6 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "c_A [mol/L]", "type": "number", "format": sci1 },
+    { "key": "1", "label": "Nodes", "nullText": "—" },
+    { "key": "2", "label": "Negative displacement h₋ [mol/L]", "type": "number", "format": sci3, "nullText": "None" },
+    { "key": "3", "label": "Maximum positive displacement [mol/L]", "type": "number", "format": sci3, "nullText": "—" },
+    { "key": "4", "label": "∂r/∂c_A difference [1/s]", "type": "number", "format": sci6, "nullText": "Error" },
+    { "key": "5", "label": "∂r/∂c_A analytic [1/s]", "type": "number", "format": sci6 },
+    { "key": "6", "label": "Error [1/s]", "type": "number", "format": sci2, "nullText": "—" },
+    { "key": "7", "label": "Truncation prediction [1/s]", "type": "number", "format": sci2, "nullText": "Not applicable" },
+    { "key": "8", "label": "Error", "nullText": "None" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "rates" })
+);
+```
+
+At default $n = 1.5$, row $c_A = 0$ is one-sided with maximum positive $2h = 1.21 \times 10^{-5}$ mol/L.
+Difference value $2.88 \times 10^{-3}\,\mathrm{s^{-1}}$ is its error and matches the one-sided formula above.
+At $c_A = 10^{-6}$ the boundary is closer than step $h = 6.06 \times 10^{-6}$, giving inward nodes $\{c_A, c_A + h, c_A + 2h\}$.
+Nodes lie beyond Taylor radius $c_A$, invalidating prediction; error $1.04 \times 10^{-3}\,\mathrm{s^{-1}}$ reaches 35% of analytic $3 \times 10^{-3}$.
+This arises from boundary nonsmoothness of $c_A^{1.5}$; second-order estimates fail while nodes exceed convergence radius.
+At $c_A \ge 10^{-4}$, symmetric central nodes return; errors $4.59 \times 10^{-6}$, $4.58 \times 10^{-9}$, $1.45 \times 10^{-10}$ match prediction $h^2 \lvert r''' \rvert / 6$ within 0.2%.
+Symmetric rows have $h_- = h \le c_A$, while one-sided rows have no nodes on the negative-displacement side, so no negative concentration is evaluated.
+
+Without bounds, rows $c_A = 0$ and $10^{-6}$ have negative displacement $h$ exceeding $c_A$, making $c_A^{1.5}$ NaN at negative concentrations.
+Differences stop with `DifferentiationFailure` caused by nonfinite function values `NonFinite`.
+Rows $c_A \ge 10^{-4}$ give identical values with or without bounds.
+At $n = 3$, polynomial $r$ has one-sided errors $1.47 \times 10^{-10}$ at both $c_A = 0$ and $10^{-6}$, matching $\lvert r''' \rvert h^2 / 3 = 2 h^2 k c_B$.
+Symmetric error $7.33 \times 10^{-11}$ at $c_A \ge 10^{-4}$ is half as large, keeping just-interior errors within twice distant-interior errors.
+
+## Steps and error orders
+
+At $c_A = 0$, the next cell varies steps with `DifferenceStep::absolute` from $10^{-1}$ to $10^{-8}$ mol/L and plots one-sided errors logarithmically.
+Owned `derivative` accepts no bounds; use single-coordinate `gradient` to supply them.
+Dashed curves show $\lvert (4 - 2^n) h^{n - 1} k c_B / 2 \rvert$, and observed orders use endpoint error ratios.
+At $n = 2$ the formula is exact with zero errors, unplottable logarithmically, so this order is omitted from choices.
+Count and exclude zero errors, displaying counts in the table.
+
+Also call `AdaptiveDifference::gradient` there to test whether extrapolation removes these errors.
+Adaptive extrapolation assumes one-sided errors expand in the integer powers $h^2, h^3, \dots$ and eliminates those terms successively.
+Here error has only term $h^{n-1}$, violating the assumption.
+The lower table gives adaptive termination, value, estimate, actual error against analytic zero, and calls; final outcome follows termination.
+
+```rust
+//| id: differentiate-boundary-order
+//| ref: differentiate-boundary-order
+//| title: "One-sided orders and adaptive extrapolation at zero concentration"
+//| run: reactive
+//| uses: [differentiate-power-rate-model]
+//| crates: [scioxide-core, scioxide-differentiate]
+//| inputs:
+//|   order: {"type":"select","label":"Reaction order n","description":"Change order n − 1 and coefficient 4 − 2ⁿ.","options":["1.25","1.5","1.75","2.25","2.5","2.75"],"value":"1.5"}
+//| cases:
+//|   - {"id":"steep","label":"n = 2.75","description":"Slope rises to 1.75 and 4 − 2ⁿ becomes negative; adaptation still stops at the limit.","inputs":{"order":"2.75"}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"order","path":"/rows/0/2","approx":{"value":0.5,"atol":0.005}}
+//|       - {"artifact":"order","path":"/rows/0/4","equals":0}
+//|       - {"artifact":"errors","path":"/spec/series/0/points/0/1","approx":{"value":0.3705,"rtol":1e-3}}
+//|       - {"artifact":"adaptive","path":"/rows/0/0","equals":"RefinementLimit"}
+//|       - {"artifact":"adaptive","path":"/rows/0/3","range":{"min":0.01}}
+//|       - {"path":"/outputs/3/state","equals":"partial"}
+//|   - case: steep
+//|     expect:
+//|       - {"artifact":"order","path":"/rows/0/2","approx":{"value":1.75,"atol":0.005}}
+//|       - {"artifact":"adaptive","path":"/rows/0/0","equals":"RefinementLimit"}
+//|       - {"path":"/outputs/3/state","equals":"partial"}
+use scioxide_core::{Bounds, SciOxideError, RealScalar};
+use scioxide_differentiate::{AdaptiveDifference, DifferenceStep, FiniteDifference};
+
+let order: f64 = order.parse().map_err(|_| "Cannot read order")?;
+let cb = 1.0_f64;
+let bounds = Bounds::new(vec![(Some(0.0), None)]).map_err(|e| e.to_string())?;
+let f = |c: &[f64], y: &mut [f64]| {
+    y[0] = rate(order, &[c[0], cb]);
+    Ok::<(), SciOxideError>(())
+};
+let (mut observed, mut predicted, mut dropped) = (Vec::new(), Vec::new(), 0);
+for j in 0..=28 {
+    let h = RealScalar::powf(10.0, -1.0 - 0.25 * j as f64);
+    let step = DifferenceStep::absolute(h).map_err(|e| e.to_string())?;
+    let result = FiniteDifference::default()
+        .with_step(step)
+        .gradient(f, &[0.0], Some(&bounds), None)
+        .map_err(|e| e.to_string())?;
+    // Analytic zero makes absolute difference value the error; logarithmic axes omit zeros.
+    let error = result.values().ok_or("Derivative not published")?[0].abs();
+    if error > 0.0 {
+        observed.push([h, error]);
+    } else {
+        dropped += 1;
+    }
+    predicted.push([h, one_sided_value(order, h, cb).abs()]);
+}
+let (first, last) = (observed[0], observed[observed.len() - 1]);
+let slope = RealScalar::ln(first[1] / last[1]) / RealScalar::ln(first[0] / last[0]);
+let fixed2 = serde_json::json!({ "fractionDigits": 2 });
+let fixed3 = serde_json::json!({ "fractionDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Reaction order n", "type": "number", "format": fixed2 },
+    { "key": "1", "label": "Predicted order n − 1", "type": "number", "format": fixed2 },
+    { "key": "2", "label": "Observed order", "type": "number", "format": fixed3 },
+    { "key": "3", "label": "Plotted points", "type": "integer" },
+    { "key": "4", "label": "Excluded zero-error points", "type": "integer" }
+]);
+let summary = vec![(order, order - 1.0, slope, observed.len(), dropped)];
+emit_table_with_columns!(
+    columns,
+    summary,
+    metadata = serde_json::json!({ "id": "order" })
+);
+emit_chart!(
+    serde_json::json!({
+        "kind": "line",
+        "series": [
+            { "name": "One-sided error", "points": observed, "style": { "showSymbol": true } },
+            { "name": "Prediction |4 − 2ⁿ| hⁿ⁻¹ k c_B / 2", "points": predicted, "style": { "lineType": "dashed" } }
+        ],
+        "xLabel": "Step h [mol/L]",
+        "yLabel": "∂r/∂c_A error [1/s]",
+        "xType": "log",
+        "yType": "log",
+        "dataZoom": true,
+        "tooltip": true
+    }),
+    metadata = serde_json::json!({ "id": "errors" })
+);
+// Adaptive at the same point; values and estimates publish even at the level limit.
+let adaptive = AdaptiveDifference::default()
+    .gradient(f, &[0.0], Some(&bounds))
+    .map_err(|e| e.to_string())?;
+let report = adaptive.report();
+let value = adaptive.values().ok_or("Adaptive value not published")?[0];
+let estimate = adaptive.errors().ok_or("Error estimate not published")?[0];
+let termination = report.termination().to_string();
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Termination reason" },
+    { "key": "1", "label": "Value [1/s]", "type": "number", "format": sci3 },
+    { "key": "2", "label": "Estimated error [1/s]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "Actual error [1/s]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "Evaluations [count]", "type": "integer" }
+]);
+let adaptive_row = vec![(
+    termination.clone(),
+    value,
+    estimate,
+    value.abs(),
+    report.evaluations(),
+)];
+emit_table_with_columns!(
+    columns,
+    adaptive_row,
+    metadata = serde_json::json!({ "id": "adaptive" })
+);
+let outcome = if report.is_success() {
+    Outcome::satisfied("Adaptive estimated error met tolerance")
+} else {
+    Outcome::partial("Adaptive differences stopped at the level limit before tolerance")
+        .explanation("Values and estimates publish, but hⁿ⁻¹ errors survive extrapolation and estimates are not bounds.")
+};
+emit_outcome!(
+    outcome
+        .status(termination)
+        .diagnostic("Estimated error", estimate, Some("1/s"))
+        .diagnostic("Actual error", value.abs(), Some("1/s"))
+        .diagnostic("Evaluations", report.evaluations() as f64, None)
+);
+```
+
+At default $n = 1.5$, observed order is 0.500 and all 29 errors coincide with dashed predictions.
+At $n = 2.75$, observed order is 1.750.
+Coefficient $4 - 2^n$ is positive at $n < 2$ and negative at $n > 2$, placing differences above analytic 0 at $n < 2$ and below at $n > 2$.
+Order reduction reflects boundary nonsmoothness, not an algorithm defect.
+At $n = 1.5$, tenfold error reduction needs hundredfold step reduction.
+
+Adaptation uses all 16 levels and stops with `RefinementLimit` after $1 + 2 \cdot 16 = 33$ calls.
+Initial $0.5$ mol/L shrinks only to $0.5/1.4^{15} \approx 3.2 \times 10^{-3}$ after 16 levels, so value $3.94 \times 10^{-2}\,\mathrm{s^{-1}}$ has greater error than default fixed $2.88 \times 10^{-3}$.
+Estimate $7.25 \times 10^{-3}$ is about one fifth of actual error, understating it.
+At $n = 2.75$ too, estimate $3.31 \times 10^{-6}$ is below actual $4.09 \times 10^{-6}$.
+At nonsmooth boundaries, do not read adaptive estimates as bounds; use analytic derivatives or known-order fixed formulas with selected steps.
+
+## Fixed catalyst concentrations
+
+For catalyst rate $r = k \, c_A^{\,n} c_B \, c_{\mathrm{cat}}$, assume catalyst concentration fixed at $c_{\mathrm{cat}} = 0.5$ mol/L, with equal bounds.
+One extra concentration factor changes $k = 2.0$ units to $\mathrm{(L/mol)^{n+1}\,s^{-1}}$.
+`FiniteDifference` handles equal-bound coordinates through `FixedCoordinatePolicy` passed to `with_fixed_coordinates`.
+
+- **`RequireStencil` (default)**: unplaceable coordinate nodes give `InvalidInput` (argument `bounds`, `UnsupportedConfiguration`) before function calls.
+- **`FeasibleZero`**: sets that coordinate's partial to 0 and does not sample it.
+  Only gradients and scalar first derivatives accept it; other operations give `InvalidInput` (`self`, `Inconsistent`), and gradients without supplied bounds give `InvalidInput` (`bounds`, `Inconsistent`).
+
+`FeasibleZero` returns the gradient restricted to feasible directions preserving fixed coordinates, not the original $\partial r / \partial c_{\mathrm{cat}} = k c_A^{\,n} c_B$.
+This projects $\nabla r$ onto the feasible-direction subspace.
+
+The next cell takes $c_A$ as input, computes gradients under both policies, and compares them with the original function's analytic gradient.
+Set $n = 1.5$ and $c_B = 1$ mol/L.
+Compare reported counts with actual function calls.
+
+```rust
+//| id: differentiate-pinned-species
+//| ref: differentiate-pinned-species
+//| title: "Gradient policies for a fixed catalyst concentration"
+//| run: reactive
+//| uses: [differentiate-power-rate-model]
+//| crates: [scioxide-core, scioxide-differentiate]
+//| inputs:
+//|   ca: {"type":"range","label":"Concentration c_A [mol/L]","description":"Zero c_A makes its partial use the boundary one-sided formula.","min":0.0,"max":2.0,"step":0.25,"value":1.0}
+//| cases:
+//|   - {"id":"on-bound","label":"c_A = 0","description":"The c_A component becomes one-sided error 1.44 × 10⁻³ rather than analytic zero.","inputs":{"ca":0.0}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"policies","path":"/rows/0/1","equals":null}
+//|       - {"artifact":"policies","path":"/rows/0/5","equals":0}
+//|       - {"artifact":"policies","path":"/rows/0/6","equals":"InvalidInput（bounds, UnsupportedConfiguration）"}
+//|       - {"artifact":"policies","path":"/rows/1/1","approx":{"value":1.5,"rtol":1e-8}}
+//|       - {"artifact":"policies","path":"/rows/1/2","approx":{"value":1.0,"rtol":1e-8}}
+//|       - {"artifact":"policies","path":"/rows/1/3","equals":0}
+//|       - {"artifact":"policies","path":"/rows/1/4","equals":5}
+//|       - {"artifact":"policies","path":"/rows/1/5","equals":5}
+//|       - {"artifact":"policies","path":"/rows/2/5","equals":null}
+//|       - {"artifact":"policies","path":"/rows/2/3","approx":{"value":2.0,"rtol":1e-12}}
+//|   - case: on-bound
+//|     expect:
+//|       - {"artifact":"policies","path":"/rows/1/1","approx":{"value":1.4415e-3,"rtol":1e-3}}
+//|       - {"artifact":"policies","path":"/rows/2/1","equals":0}
+use scioxide_core::{Bounds, SciOxideError, SciOxideErrorView};
+use scioxide_differentiate::{FiniteDifference, FixedCoordinatePolicy};
+
+let order = 1.5_f64;
+let c = [ca, 1.0, 0.5];
+let bounds = Bounds::new(vec![
+    (Some(0.0), None),
+    (Some(0.0), None),
+    (Some(0.5), Some(0.5)),
+])
+.map_err(|e| e.to_string())?;
+let mut rows = Vec::new();
+for (name, policy) in [
+    ("RequireStencil", FixedCoordinatePolicy::RequireStencil),
+    ("FeasibleZero", FixedCoordinatePolicy::FeasibleZero),
+] {
+    let mut calls = 0_usize;
+    let result = FiniteDifference::default()
+        .with_fixed_coordinates(policy)
+        .gradient(
+            |p: &[f64], y: &mut [f64]| {
+                calls += 1;
+                y[0] = rate(order, p);
+                Ok::<(), SciOxideError>(())
+            },
+            &c,
+            Some(&bounds),
+            None,
+        );
+    rows.push(match result {
+        Ok(r) => {
+            let g = r.values().ok_or("Gradient not published")?;
+            let evaluations = r.report().evaluations();
+            (
+                name,
+                Some(g[0]),
+                Some(g[1]),
+                Some(g[2]),
+                Some(evaluations),
+                Some(calls),
+                None,
+            )
+        }
+        Err(e) => {
+            let detail = match e.view() {
+                SciOxideErrorView::InvalidInput {
+                    argument, reason, ..
+                } => format!("{:?}（{}, {:?}）", e.kind(), argument.as_str(), reason),
+                _ => format!("{:?}", e.kind()),
+            };
+            (name, None, None, None, None, Some(calls), Some(detail))
+        }
+    });
+}
+// Reference: original gradient (n k c_Aⁿ⁻¹ c_B c_cat, k c_Aⁿ c_cat, k c_Aⁿ c_B), using f64 inherent methods.
+let power = RATE_CONSTANT * ca.powf(order);
+rows.push((
+    "Original function, analytic",
+    Some(rate_slope(order, ca, c[1] * c[2])),
+    Some(power * c[2]),
+    Some(power * c[1]),
+    None,
+    None,
+    None,
+));
+let fixed6 = serde_json::json!({ "fractionDigits": 6 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Policy" },
+    { "key": "1", "label": "∂r/∂c_A [1/s]", "type": "number", "format": fixed6, "nullText": "—" },
+    { "key": "2", "label": "∂r/∂c_B [1/s]", "type": "number", "format": fixed6, "nullText": "—" },
+    { "key": "3", "label": "∂r/∂c_cat [1/s]", "type": "number", "format": fixed6, "nullText": "—" },
+    { "key": "4", "label": "Reported evaluations [count]", "type": "integer", "nullText": "—" },
+    { "key": "5", "label": "Counted calls [count]", "type": "integer", "nullText": "—" },
+    { "key": "6", "label": "Error", "nullText": "None" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "policies" })
+);
+```
+
+At default $c_A = 1$ mol/L, `RequireStencil` gives `InvalidInput` (`bounds`, `UnsupportedConfiguration`) without function calls.
+`FeasibleZero` returns $(1.5, 1, 0)\,\mathrm{s^{-1}}$ in 5 calls: one base and two each for $c_A$ and $c_B$, matching actual calls.
+Component 3 is 0 rather than original partial $k c_A^{1.5} c_B = 2$, expressing an immovable coordinate.
+At $c_A = 0$, component 1 becomes $1.44 \times 10^{-3}$ rather than analytic zero.
+This equals one-sided error $2.88 \times 10^{-3}$ multiplied by $c_{\mathrm{cat}} = 0.5$.
+In optimization with equal-bound variables, interpret this as the gradient projected onto feasible directions.
+
+## Summary
+
+Nonnegative bounds `Bounds` keep `FiniteDifference` from evaluating outside, switching symmetric triples to inward triples when boundary distance is below the step.
+Both are second-order formulas with leading $h^2 r'''/6$ ($-h^2 r'''/3$ one-sided), giving predictable interior-scale errors just inside boundaries for smooth functions.
+Noninteger $c^n$ is nonsmooth at the boundary, giving error $(4 - 2^n) h^{n-1} k c_B / 2$ and reduced order $n - 1$.
+These errors survive adaptive extrapolation and estimates understate actual errors; do not treat estimates as bounds for boundary values stopping with `RefinementLimit`.
+Without bounds, negative near-boundary concentrations give `DifferentiationFailure`; equal-bound coordinates give default `InvalidInput`, or projected gradients with zero partials under `FeasibleZero`.
+
+## Further reading
+
+- [Domain boundaries and one-sided differences](../../algorithms/bounds-and-one-sided/): examine node selection, including adaptive, directional, and node methods.
+- [Taylor expansion and step-size selection](../../algorithms/taylor-and-step-size/): examine smoothness assumptions behind orders and default steps.
+- [Selecting analytic, automatic, and finite-difference derivatives by policy](../derivative-strategy-planck/): proceed to derivative-source policies.

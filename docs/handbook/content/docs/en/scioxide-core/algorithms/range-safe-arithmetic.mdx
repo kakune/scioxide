@@ -1,0 +1,532 @@
+---
+title: "Exact accumulation and range-safe arithmetic"
+description: "Fixed-size integer RangeAccumulator, checked single-rounding arithmetic, endpoint-preserving affine combinations, LASSQ-type scaled norms, cancellation-free quadratic root formulas, and residual contracts."
+sidebar:
+  order: 330
+references:
+  core-quadratic-roots: "quadratic-roots-and-residual-contracts"
+  core-compensated-summation: "compensated-sums-and-exact-accumulation"
+  core-range-accumulator: "loss-of-small-contributions-and-fixed-size-integer-accumulators"
+  core-checked-arithmetic: "accuracy-contracts-for-checked-arithmetic"
+  core-scaled-norm: "lassq-type-scaled-norms"
+  core-affine-ratio: "endpoint-preserving-affine-combinations"
+---
+
+Mathematically equivalent formulas can produce different floating-point results.
+Even when the final result fits, overflowing intermediate products or sums produce `inf` or `NaN`.
+Adding terms with very different magnitudes can round away the smaller term (loss of small contributions).
+Range-safe arithmetic in `scioxide-core` avoids these problems by retaining exact intermediates and rounding once at the end, or separating significands and exponents to keep intermediates in range.
+[Floating-point numbers and condition numbers](../../../concepts/floating-point-and-conditioning/) covers general concepts such as unit roundoff $u$ and cancellation.
+
+## Loss of small contributions and fixed-size integer accumulators
+
+Summing $a = 10^{16}$, $b = 1$, and $c = -10^{16}$ left-to-right gives zero: spacing in double precision near $10^{16}$ is 2, so $10^{16} + 1$ rounds to $10^{16}$ (the real sum is 1).
+
+`RangeAccumulator` stores finite floating-point values as integer digits, eliminating this error.
+
+- It holds positive and negative digit arrays (limbs), each containing 100 64-bit words.
+  The least significant bit has weight $2^{-3222}$, covering products as small as $(2^{-1074})^3$ for three double-precision values.
+- Each significand is added without rounding to words selected by its exponent.
+  Products `add_product` and triple products `add_triple_product` also accumulate exactly as integer significand products.
+- `finish()` subtracts negative digits from positive digits and converts to the target type with one round-to-nearest, ties-to-even operation.
+  Exact cancellation returns $+0$.
+- Storage is fixed-size on the stack, without heap allocation.
+  Each update and `merge` of two states takes constant time independently of input length.
+- Since `merge` is exact, partitioned partial sums merge to the same result in any order.
+
+Non-finite inputs are rejected as `NonFinite` (`NonFiniteOrigin::Input`) before modifying state.
+If the final result exceeds the type's finite range, `finish()` returns `NumericalInstability` (`Overflow`).
+`finish()` only borrows state, preserving the accumulated value.
+Updates and `merge` return the same error on limb-capacity overflow, but carry headroom prevents this for sums of inputs whose lengths fit memory.
+Failed updates and `merge` preserve state.
+
+`finish_scaled()` retrieves out-of-range sums as extended-range `Scaled`; `finish_quotient(d)` divides by $d$ and rounds the quotient once.
+
+`checked_sum` returns the exact sum rounded to nearest, ties to even, in time proportional to input length.
+Up to two terms use one IEEE addition.
+Three terms use TwoSum (an error-free sum/residual transformation); four or more use Ogita–Rump–Oishi compensated Sum2, returning its candidate only when the error bound identifies one rounding target uniquely.
+Otherwise exact accumulation is used, giving identical results on every path.
+`checked_sum_of_products` similarly uses error-free products and rounding checks for up to four pairs, falling back to exact accumulation when checks are inconclusive.
+
+The following cell plots the surviving fraction of $s$ in left-to-right $L + s - L$, varying $L$ from $10^8$ to $10^{20}$.
+Input is exponent $p$ of small term $s = 10^p$ (integers from $-2$ to 5).
+The first chart shows surviving fraction $((L + s) - L)/s$; the second shows spacing from $L$ to its upper neighbor divided by $s$.
+Both share horizontal coordinate $L$.
+For three $L$ values, the table compares left-to-right sums, `checked_sum`, and two `RangeAccumulator` states combined through `merge`, checking both latter results equal $s$.
+
+```rust
+//| id: core-summation-cancellation
+//| ref: core-summation-cancellation
+//| title: "How much of a small term survives addition to a large term"
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   small_exponent: {"type":"range","label":"Small term exponent p [-]","description":"Place s = 10^p between L and −L.","min":-2,"max":5,"step":1,"value":0}
+//| cases:
+//|   - {"id":"small-term","label":"s = 0.01","description":"Even at L = 10⁸, left-to-right summation loses low-order digits of s.","inputs":{"small_exponent":-2}}
+//|   - {"id":"large-term","label":"s = 10⁵","description":"Even at L = 10¹⁸, most of s survives.","inputs":{"small_exponent":5}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"sums","path":"/rows/1/1","equals":0}
+//|       - {"artifact":"sums","path":"/rows/1/2","equals":1}
+//|       - {"artifact":"sums","path":"/rows/2/3","equals":1}
+//|   - case: small-term
+//|     expect:
+//|       - {"artifact":"sums","path":"/rows/0/1","approx":{"value":0.01,"rtol":1e-6}}
+//|       - {"artifact":"sums","path":"/rows/2/2","approx":{"value":0.01,"rtol":1e-14}}
+//|       - {"artifact":"sums","path":"/rows/2/1","equals":0}
+//|   - case: large-term
+//|     expect:
+//|       - {"artifact":"sums","path":"/rows/2/1","approx":{"value":1e5,"rtol":1e-3}}
+//|       - {"artifact":"sums","path":"/rows/2/3","approx":{"value":1e5,"rtol":1e-14}}
+use scioxide_core::{RangeAccumulator, RealScalar, checked_sum};
+
+let s = RealScalar::powi(10.0_f64, small_exponent as i32);
+let mut retained = Vec::new();
+let mut gap_ratio = Vec::new();
+for index in 0..=96 {
+    let l = RealScalar::powf(10.0_f64, 8.0 + index as f64 * 12.0 / 96.0);
+    // Fraction of s surviving left-to-right floating-point summation.
+    retained.push([l, ((l + s) - l) / s]);
+    // Spacing from L to its upper neighbor divided by s.
+    let gap = RealScalar::next_after(l, f64::INFINITY) - l;
+    gap_ratio.push([l, gap / s]);
+}
+emit_line_chart!(
+    &vec![serde_json::json!({ "name": "((L + s) − L) / s", "points": retained })],
+    options = &serde_json::json!({
+        "link": { "group": "large-term" },
+        "xLabel": "Large term L [-]",
+        "yLabel": "Surviving fraction [-]",
+        "xType": "log"
+    })
+);
+// When spacing / s exceeds 2, s is below half a spacing and rounds away.
+emit_line_chart!(
+    &vec![serde_json::json!({ "name": "Spacing / s", "points": gap_ratio })],
+    options = &serde_json::json!({
+        "link": { "group": "large-term" },
+        "xLabel": "Large term L [-]",
+        "yLabel": "Spacing to L's neighbor / s [-]",
+        "xType": "log",
+        "yType": "log",
+        "annotations": [{ "kind": "line", "axis": "y", "value": 2.0, "label": "s = spacing / 2" }]
+    })
+);
+
+let mut rows = Vec::new();
+for exponent in [8, 16, 18] {
+    let l = RealScalar::powi(10.0_f64, exponent);
+    let terms = [l, s, -l];
+    let exact = checked_sum(&terms).map_err(|e| e.to_string())?;
+    // Accumulate [L, s] and [−L] separately and combine with merge.
+    let mut left = RangeAccumulator::new();
+    left.add(l).map_err(|e| e.to_string())?;
+    left.add(s).map_err(|e| e.to_string())?;
+    let mut right = RangeAccumulator::new();
+    right.add(-l).map_err(|e| e.to_string())?;
+    left.merge(&right).map_err(|e| e.to_string())?;
+    let merged = left.finish().map_err(|e| e.to_string())?;
+    rows.push((l, (l + s) - l, exact, merged));
+}
+let sci1 = serde_json::json!({ "notation": "scientific", "significantDigits": 1 });
+let digits = serde_json::json!({ "significantDigits": 6 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Large term L [-]", "type": "number", "format": sci1 },
+    { "key": "1", "label": "Left-to-right sum (L + s) − L [-]", "type": "number", "format": digits },
+    { "key": "2", "label": "checked_sum [-]", "type": "number", "format": digits },
+    { "key": "3", "label": "Merge of two partitions [-]", "type": "number", "format": digits }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "sums" })
+);
+```
+
+At the default $s = 1$, spacing is at most 1 over $L < 2^{53} \approx 9.0 \times 10^{15}$, so the surviving fraction is 1.
+Where spacing equals 2 (points on the second chart's horizontal line), $L + 1$ is a midpoint and ties-to-even rounding gives $L$ or $L + 2$, producing a fraction of 0 or 2.
+At $L > 2^{54} \approx 1.8 \times 10^{16}$, where spacing is at least 4, $s$ is below half a spacing and the fraction is zero.
+The table's left-to-right sum is 1 at $L = 10^{8}$ and zero at $L = 10^{16}$ and $10^{18}$; `checked_sum` and `merge` columns equal 1 for every $L$.
+
+At $s = 0.01$, the left-to-right sum for $L = 10^{8}$ is $0.0100000054$; rounding at spacing $1.5 \times 10^{-8}$ changes significant digits of $s$ from the eighth onward.
+At $s = 10^{5}$, the left-to-right sum for $L = 10^{18}$ is 99968, a multiple of spacing 128.
+Left-to-right sums can take only integer multiples of spacing, so the surviving fraction forms steps as spacing approaches $s$ and becomes zero when spacing / $s$ exceeds 2.
+For every $s$, the `checked_sum` and `merge` columns match $s$.
+
+## Compensated sums and exact accumulation
+
+`CompensatedSum` uses Neumaier compensation, retaining only two scalars: a main sum and rounding residual.
+Start from `ZERO`, repeatedly apply `add`, and read with `total`.
+`parts` and `from_parts` save and restore both finite components.
+Each operation has constant work without allocation; failed additions preserve both components.
+
+Use `compensated_reduce` to sum multiple quantities in one pass.
+It builds `N` `CompensatedSum` values from an iterator of length-`N` arrays.
+Each column uses four TwoSum lanes, merged in fixed order every 256 rows, giving consistent results between calls (rounding may differ from sequential `add` updates).
+
+Compensation retains first-order rounding errors but works at working precision, guaranteeing neither exact sign nor correct rounding.
+Choose `RangeAccumulator` for an exact sum with one rounding.
+
+`PromotingCompensatedSum` uses `CompensatedSum` in ordinary range, promoting once to `ScaledAccumulator` by exactly transferring both components on a subnormal product or overflow.
+When adding terms individually through `add_value` or `add_product`, terms preceding promotion need not be re-added.
+Iterator constructors `from_values` and `from_products` rescan cloned iterators when range is exceeded.
+This supports wide exponents but remains working-precision compensation, not exact accumulation.
+
+`PromotingProduct` likewise moves products to `Scaled` when intermediates become subnormal or overflow.
+It rounds per factor, unlike an exact product rounded only at the end.
+Both are fixed-size values, reporting non-finite input as `NonFinite` and exponents beyond `i64` as `NumericalInstability` (`ExponentOutOfRange`).
+
+`fast_mul_add` uses FMA when `HARDWARE_FMA` is true for the target; otherwise it computes product and sum separately.
+The latter rounds twice and cannot replace `checked_mul_add` or an error-free product residual.
+Use it in approximate algorithms permitting two roundings.
+
+## Accuracy contracts for checked arithmetic
+
+`checked_*` functions accept finite inputs only and report unrepresentable final results as `NumericalInstability` (`Overflow`).
+Non-finite input produces `NonFinite`; division by zero produces `DomainError`.
+Functions marked “one rounding” return the mathematical value rounded to nearest, ties to even (0 ULP from the correctly rounded result, at most 0.5 ULP from the mathematical value).
+Sums, products, dot products, and quotients return exact zero as $+0$; negative nonzero values rounded to zero become $-0$.
+
+| Function | Computed value | Accuracy contract |
+|---|---|---|
+| `checked_sum` | $\sum_i x_i$ | One rounding |
+| `checked_sum_of_products` | $\sum_i a_i b_i$ | One rounding. Length mismatches produce `DimensionMismatch` |
+| `checked_difference` | $a - b$ | One rounding |
+| `checked_difference_of_products` | $ab - cd$ | One rounding |
+| `checked_mul_add` | $ab + c$ | One rounding (IEEE fused multiply-add for `std`, accumulator for `no_std`, with identical results) |
+| `checked_float_product` | $ab$ | One rounding |
+| `checked_float_product_factors` | $\prod_{i=1}^{n} x_i$ | $\gamma_{n-1} \lvert P \rvert + \eta/2$. Empty products equal 1 |
+| `checked_float_quotient` | $a / b$ | One rounding |
+| `checked_product_quotient` | $ab / c$ | Within 4 ULP ($\gamma_2 \lvert Q \rvert + \eta/2$) |
+| `checked_midpoint` | $(a + b) / 2$ | One rounding without overflow |
+| `checked_affine` | $(1-t)a + tb$, $t \in [0, 1]$ | One rounding. $t = 0, 1$ returns endpoints themselves; out-of-range $t$ produces `InvalidInput` |
+| `checked_affine_ratio` | $\bigl((d-n)a + nb\bigr)/d$, integer $0 \le n \le d$ | One rounding. $n = 0, d$ returns endpoints themselves; $d = 0$ or $n > d$ produces `InvalidInput` |
+| `checked_scalbn` | $x \cdot 2^n$ | One rounding (rounding occurs only for subnormal or zero results) |
+| `checked_next_after` | Adjacent representable number | Exact |
+| `checked_scaled_norm` | $\lVert \mathbf{x} \rVert_2$ | [LASSQ error bounds](#lassq-type-scaled-norms) |
+| `checked_quadratic_roots` | Roots of $ax^2 + bx + c = 0$ | [Residual bounds](oxref:core-quadratic-roots) |
+
+Here $P$ and $Q$ are exact product and quotient, $u = \varepsilon / 2$ unit roundoff, $\gamma_k = k u / (1 - k u)$ ($ku < 1$), and $\eta$ the smallest positive subnormal.
+The $\eta/2$ term appears only for subnormal results.
+
+`checked_float_product_factors` decomposes factors into significands and exponents, multiplying significands in input order, summing exponents separately, and restoring scale once at the end.
+Intermediate products therefore neither overflow nor underflow.
+Significands round after every multiplication: $n$ factors cause $n - 1$ roundings, bounding relative error by $(1 + u)^{n-1} - 1 \le \gamma_{n-1}$.
+Error grows proportionally to factor count.
+`checked_product_quotient` likewise computes with normalized significands without forming products $ab$.
+
+`ProductSum<S>` retains exact sums of real or complex two- and three-factor products, rounding each component once through `finish()`.
+Expanding complex products into real and imaginary parts allows complex inner products with one rounding per component.
+
+## Endpoint-preserving affine combinations
+
+Midpoints, interior division points, and equally spaced grid points in $[a, b]$ recur in interpolation, bisection, and quadrature nodes.
+$(a + b)/2$ can overflow in $a + b$.
+$a + t(b - a)$ can overflow in $b - a$ and may fail to recover $b$ at $t = 1$.
+Repeatedly adding step $h = (b - a)/d$ accumulates the rounding error in $h$ proportionally to the point index.
+
+`checked_midpoint`, `checked_affine`, and `checked_affine_ratio` all round exact values once.
+Single rounding is monotone, keeping results between the endpoints inclusively and preventing overflow.
+
+`checked_affine_ratio(left, right, n, d)` computes $\bigl((d - n)\,\mathrm{left} + n\,\mathrm{right}\bigr)/d$ with integer weights.
+Weights $d - n$ and $n$ remain exact `usize` integers, even with more bits than the significand.
+Not converting ratio $n/d$ to floating point first ensures one rounding of the mathematical division point even for unrepresentable ratios such as $1/3$.
+$n = 0$ and $n = d$ return `left` and `right` bit for bit.
+Construct equally spaced point $i$ through `checked_affine_ratio(left, right, i, d)`.
+
+The following cell constructs three grids dividing interval $[0, 1]$ into $d$ equal parts.
+Input is integer subdivision count $d$ (3–1000).
+Here point $i$ equals $i/d$, so one double-precision division `i / d` is a correctly rounded reference.
+For each method, the table shows the count of differing points, maximum reference difference in local ulp spacing, and endpoint minus 1.
+
+```rust
+//| id: core-affine-ratio-grid
+//| ref: core-affine-ratio-grid
+//| title: "Constructing equally spaced grid points three ways"
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   divisions: {"type":"range","label":"Subdivision count d [-]","description":"Divide [0, 1] into d equal parts, giving d + 1 points.","min":3,"max":1000,"step":1,"value":10}
+//| cases:
+//|   - {"id":"fine-grid","label":"d = 1000","description":"Repeated-step errors accumulate with point count.","inputs":{"divisions":1000}}
+//|   - {"id":"missed-endpoint","label":"d = 49","description":"Even left + i·h fails to recover endpoint 1.","inputs":{"divisions":49}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"grid","path":"/rows/2/1","equals":0}
+//|       - {"artifact":"grid","path":"/rows/2/3","equals":0}
+//|       - {"artifact":"grid","path":"/rows/0/3","approx":{"value":-1.11e-16,"atol":1e-18}}
+//|   - case: fine-grid
+//|     expect:
+//|       - {"artifact":"grid","path":"/rows/2/1","equals":0}
+//|       - {"artifact":"grid","path":"/rows/2/2","equals":0}
+//|       - {"artifact":"grid","path":"/rows/0/2","range":{"min":1}}
+//|   - case: missed-endpoint
+//|     expect:
+//|       - {"artifact":"grid","path":"/rows/2/1","equals":0}
+//|       - {"artifact":"grid","path":"/rows/2/3","equals":0}
+//|       - {"artifact":"grid","path":"/rows/1/3","approx":{"value":-1.11e-16,"atol":1e-18}}
+use scioxide_core::{RealScalar, checked_affine_ratio};
+
+let d = divisions as usize;
+let (left, right) = (0.0_f64, 1.0_f64);
+let step = (right - left) / d as f64;
+// Rows are repeated stepping, left + i·h, and checked_affine_ratio.
+let mut differing = [0_u32; 3];
+let mut worst = [0.0_f64; 3];
+let mut last = [left; 3];
+let mut running = left;
+for i in 0..=d {
+    // Reference: points on [0, 1] equal i/d; one IEEE division gives correct rounding.
+    let reference = i as f64 / d as f64;
+    let ulp = RealScalar::next_after(reference, f64::INFINITY) - reference;
+    let ratio = checked_affine_ratio(left, right, i, d).map_err(|e| e.to_string())?;
+    last = [running, left + i as f64 * step, ratio];
+    for (method, value) in last.into_iter().enumerate() {
+        let error = (value - reference).abs() / ulp;
+        if error > 0.0 {
+            differing[method] += 1;
+        }
+        worst[method] = RealScalar::max(worst[method], error);
+    }
+    running += step;
+}
+let names = ["Repeatedly add step h", "left + i·h", "checked_affine_ratio"];
+let rows: Vec<(&str, u32, f64, f64)> = (0..3)
+    .map(|method| {
+        (
+            names[method],
+            differing[method],
+            worst[method],
+            last[method] - right,
+        )
+    })
+    .collect();
+let fixed1 = serde_json::json!({ "fractionDigits": 1 });
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Method" },
+    { "key": "1", "label": "Points differing from reference [count]", "type": "integer" },
+    { "key": "2", "label": "Maximum difference [ulp]", "type": "number", "format": fixed1 },
+    { "key": "3", "label": "Endpoint − 1 [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "grid" })
+);
+```
+
+At the default $d = 10$, repeating step $h = 0.1$ makes four of eleven points differ by 1 ulp; the endpoint is $1 - 1.1 \times 10^{-16}$ rather than 1.
+`left + i·h` differs by 1 ulp at three points.
+`checked_affine_ratio` matches every reference point and gives endpoint exactly 1.
+
+At $d = 1000$, repeated stepping differs at 992 of 1001 points, accumulating up to 7 ulp.
+`left + i·h` stays within 1 ulp but differs at 144 points.
+At $d = 49$, even `left + i·h` gives endpoint $1 - 1.1 \times 10^{-16}$.
+This 1 ulp discrepancy matters when subsequent processing assumes endpoint `right`, such as boundary evaluation or connecting adjacent intervals.
+`checked_affine_ratio` matches references at every point for every $d$.
+
+## LASSQ-type scaled norms
+
+Direct $\lVert \mathbf{x} \rVert_2 = \sqrt{\sum_i x_i^2}$ overflows $x_i^2$ beyond the largest double (about $1.8 \times 10^{308}$) for $x_i = 10^{200}$, and makes $x_i^2$ zero for $x_i = 10^{-200}$.
+`ScaledNorm` and `checked_scaled_norm` retain $\lVert \mathbf{x} \rVert_2 = s \sqrt{q}$ through scale $s$ and normalized sum of squares $q$.
+$s$ is the largest absolute component added so far, with $q \ge 1$ ($s = q = 0$ if all components are zero).
+For a new component $x \ne 0$, update as follows.
+
+- If $|x| \le s$, use $q \leftarrow q + (|x| / s)^2$.
+- If $|x| > s$, use $q \leftarrow 1 + q\,(s / |x|)^2$ and $s \leftarrow |x|$.
+
+These are the update rules.
+Squared ratios never exceed 1, preventing square overflow.
+Underflowing squared ratios are negligible relative to $q \ge 1$ and included in the error bound below.
+`finish()` returns $s \sqrt{q}$, producing `NumericalInstability` (`Overflow`) only when the norm exceeds finite range.
+`checked_scaled_norm` updates `ScaledNorm` in time proportional to component count.
+
+Two states combine through `merge`; merging in partition-index order gives identical results independently of executor.
+Failed updates and merges preserve state.
+
+Error depends on summation order and grows proportionally to component count.
+Let $m$ count nonzero component updates and nontrivial merges; with $k = 8m + 8$, when $ku < 1$,
+
+$$
+\bigl|\, \widehat{\lVert \mathbf{x} \rVert} - \lVert \mathbf{x} \rVert_2 \,\bigr| \le \gamma_k \lVert \mathbf{x} \rVert_2 + \frac{\eta}{2}
+$$
+
+
+This bound includes rounding of ratios, squares, addition, square roots, and the final product.
+In double precision, $m = 10^6$ gives $\gamma_k \approx 8.9 \times 10^{-10}$.
+For $ku \ge 1$, no useful relative error bound applies.
+
+## Quadratic roots and residual contracts
+
+The quadratic formula for $ax^2 + bx + c = 0$ ($a \ne 0$),
+
+$$
+x_\pm = \frac{-b \pm \sqrt{D}}{2a}, \qquad D = b^2 - 4ac
+$$
+
+subtracts nearby quantities in one numerator when $b^2 \gg 4|ac|$.
+Rounding error in $\sqrt{D} \approx |b|$ is about $u|b|$, while the subtraction result is only $2|a|$ times the small root $x_{\rm s} \approx -c/b$, of order $2|ac|/|b|$.
+First-order estimates therefore amplify the small root's relative error to order $u\, b^2 / (2|ac|)$, leaving no significant digits at $b^2 \gtrsim 2|ac|/u$.
+
+Avoid cancellation by computing only the root where $-b$ and $\pm\sqrt{D}$ share a sign, then obtain the other through Vieta's relation $x_1 x_2 = c/a$.
+
+$$
+q = -\frac{1}{2}\left( b + \operatorname{sign}(b)\sqrt{D} \right), \qquad x_1 = \frac{q}{a}, \qquad x_2 = \frac{c}{q}
+$$
+
+Both terms in $q$ have the same sign, giving $|q| \ge |b|/2$ and avoiding cancellation in $q$.
+$x_2 = c/q$ also contains no subtraction, preserving small-root accuracy even when root magnitudes are widely separated.
+For $b = 0$, roots are $\pm\sqrt{D}/(2a)$ without cancellation to begin with.
+
+`checked_quadratic_roots(a, b, c)` computes roots with this $q$ formula when $D > 0$.
+For $D < 0$, returns conjugate roots with real part $-b/(2a)$ and imaginary parts $\pm\sqrt{-D}/(2|a|)$.
+Cancellation remains in computing $D = b^2 - 4ac$ itself: nearby $b^2$ and $4ac$ can even corrupt the sign of $D$, misclassifying real versus complex roots.
+Check the sign and error of $D$ in two stages.
+
+1. For `std` with every coefficient magnitude in $[2^{-200}, 2^{200}]$ ($[2^{-24}, 2^{24}]$ for `f32`), compute $D$ in double precision from FMA product residuals and TwoSum.
+   Use this $D$ only when its computed error bound is sufficiently small relative to $|D|$.
+2. Otherwise, accumulate $b^2$ and $-4ac$ exactly in `RangeAccumulator` to decide the sign, then take an exponent-scaled square root.
+   If exactly $D = 0$, return repeated root $-b/(2a)$.
+
+Computation uses constant time and fixed stack storage without heap allocation.
+$a = 0$ produces `InvalidInput`, non-finite coefficients produce `NonFinite`, and roots outside the finite range produce `NumericalInstability` (`Overflow`).
+
+Success returns both roots in array `[Complex<S>; 2]`.
+Real roots also use `Complex<S>`, with exactly zero components set to $+0$ (real-root imaginary parts are $+0$).
+Nonzero components underflowing to zero retain their mathematical signs.
+Real roots ascend, conjugates place positive imaginary part first, and repeated roots appear twice.
+Both roots are finite.
+
+Near repeated roots, conditioning is very large, so forward accuracy cannot be guaranteed in ULP.
+Instead, every returned root $z$ has a residual guarantee for $p(z) = az^2 + bz + c$.
+With $x = |\operatorname{Re} z| + |\operatorname{Im} z|$ and $T = |a| x^2 + |b| x + |c|$, the sum of absolute real and imaginary parts of $p(z)$ is at most
+
+$$
+32\, \varepsilon\, T + (2|a|x + |b|)\, \eta + |a|\, \eta^2
+$$
+
+
+$\varepsilon$ is machine epsilon; the $\eta$ term represents rounding root components into subnormals or zero.
+For a simple root $z$, first-order forward error is approximately this residual divided by $|p'(z)| = |2az + b|$, growing as $p'(z)$ approaches zero near a repeated root.
+
+The following cell sets $a = c = 1$ and $b = -10^p$, comparing direct quadratic-formula roots with `checked_quadratic_roots`.
+Input is integer exponent $p$ (2–16); larger $p$ separates roots $x \approx 10^{-p}$ and $x \approx 10^{p}$ further.
+For small and large roots, the table shows both methods' values, absolute residuals, and residual bounds for `checked_quadratic_roots` roots.
+Residuals are independently checked by exact `RangeAccumulator` evaluation of $az^2 + bz + c$, rounded once.
+
+```rust
+//| id: core-quadratic-residual-contract
+//| ref: core-quadratic-residual-contract
+//| title: "Cancellation in small roots and residual bounds"
+//| run: reactive
+//| crates: [scioxide-core]
+//| inputs:
+//|   b_exponent: {"type":"range","label":"Coefficient exponent p [-]","description":"b = −10^p. Larger p separates the two roots further.","min":2,"max":16,"step":1,"value":8}
+//| cases:
+//|   - {"id":"lost-root","label":"p = 16","description":"The quadratic formula's small root becomes zero.","inputs":{"b_exponent":16}}
+//|   - {"id":"close-roots","label":"p = 2","description":"The root ratio is 10⁴, leaving significant digits even in the quadratic formula.","inputs":{"b_exponent":2}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"roots","path":"/rows/0/2","approx":{"value":1e-8,"rtol":1e-14}}
+//|       - {"artifact":"roots","path":"/rows/0/1","approx":{"value":7.45e-9,"rtol":1e-2}}
+//|       - {"artifact":"roots","path":"/rows/0/4","range":{"min":0,"max":1.5e-14}}
+//|       - {"artifact":"roots","path":"/rows/1/4","range":{"min":0,"max":142}}
+//|   - case: lost-root
+//|     expect:
+//|       - {"artifact":"roots","path":"/rows/0/1","equals":0}
+//|       - {"artifact":"roots","path":"/rows/0/3","equals":1}
+//|       - {"artifact":"roots","path":"/rows/0/2","approx":{"value":1e-16,"rtol":1e-14}}
+//|       - {"artifact":"roots","path":"/rows/0/4","range":{"min":0,"max":1.5e-14}}
+//|   - case: close-roots
+//|     expect:
+//|       - {"artifact":"roots","path":"/rows/0/2","approx":{"value":0.010001000200050014,"rtol":1e-14}}
+//|       - {"artifact":"roots","path":"/rows/0/4","range":{"min":0,"max":1.5e-14}}
+use scioxide_core::{RangeAccumulator, RealScalar, checked_quadratic_roots};
+
+let (a, c) = (1.0_f64, 1.0_f64);
+let b = -RealScalar::powi(10.0_f64, b_exponent as i32);
+// Real roots ascend; both imaginary parts are +0.
+let [small, large] = checked_quadratic_roots(a, b, c).map_err(|e| e.to_string())?;
+
+// Comparison: use the quadratic formula directly with intrinsic f64 methods, causing cancellation in the small root.
+let root_disc = (b * b - 4.0 * a * c).sqrt();
+let naive_small = (-b - root_disc) / (2.0 * a);
+let naive_large = (-b + root_disc) / (2.0 * a);
+
+// Check: accumulate a z² + b z + c exactly and round once (real roots have zero imaginary part).
+let residual = |z: f64| -> Result<f64, String> {
+    let mut sum = RangeAccumulator::new();
+    sum.add_triple_product(a, z, z).map_err(|e| e.to_string())?;
+    sum.add_product(b, z).map_err(|e| e.to_string())?;
+    sum.add(c).map_err(|e| e.to_string())?;
+    Ok(sum.finish().map_err(|e| e.to_string())?.abs())
+};
+// Residual bound 32 ε T + (2|a|x + |b|) η + |a| η².
+let bound = |z: f64| {
+    let x = z.abs();
+    let t = a.abs() * x * x + b.abs() * x + c.abs();
+    let eta = f64::from_bits(1);
+    32.0 * f64::EPSILON * t + (2.0 * a.abs() * x + b.abs()) * eta + a.abs() * eta * eta
+};
+let mut rows = Vec::new();
+for (name, naive, root) in [
+    ("Small root", naive_small, small.re),
+    ("Large root", naive_large, large.re),
+] {
+    rows.push((
+        name,
+        naive,
+        root,
+        residual(naive)?,
+        residual(root)?,
+        bound(root),
+    ));
+}
+let digits = serde_json::json!({ "notation": "scientific", "significantDigits": 7 });
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "Root" },
+    { "key": "1", "label": "Quadratic formula [-]", "type": "number", "format": digits },
+    { "key": "2", "label": "checked_quadratic_roots [-]", "type": "number", "format": digits },
+    { "key": "3", "label": "Quadratic formula residual [-]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "Checked residual [-]", "type": "number", "format": sci3 },
+    { "key": "5", "label": "Residual bound [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "roots" })
+);
+```
+
+At the default $p = 8$, the direct formula's small root is $7.45 \times 10^{-9}$, about 25% from the true root (approximately $10^{-8}$), giving residual about 0.25.
+This discrepancy fits the estimate $u\,b^2/(2|ac|) \approx 0.55$ above.
+The small root from `checked_quadratic_roots` is $1.000000 \times 10^{-8}$, with residual $7.9 \times 10^{-17}$ below bound $1.4 \times 10^{-14}$.
+Both methods give large root $10^{8}$, with residual 1 within bound 142.
+The residual bound scales with $T$, so residual 1 for the large root at $T \approx 2 \times 10^{16}$ corresponds relatively to $5 \times 10^{-17}$.
+
+At $p \ge 9$, $b^2 - 4$ rounds to $b^2$, making the direct small root zero and its residual exactly $c = 1$.
+Even at $p = 16$, the small root from `checked_quadratic_roots` is $10^{-16}$ with residual $2.1 \times 10^{-17}$.
+At $p = 2$, the direct small root agrees to about 12 digits, but residual $1.2 \times 10^{-13}$ exceeds bound $1.4 \times 10^{-14}$ for `checked_quadratic_roots` roots.
+
+## Summary
+
+Accumulate differently scaled sums and cancellation-prone dot products exactly through `checked_sum`, `checked_sum_of_products`, or `RangeAccumulator`, rounding once at the end.
+Merge partitioned partial sums through `merge` on `RangeAccumulator` states for partition-independent results.
+Use `checked_float_product_factors` or `checked_product_quotient` for product chains or expressions such as $ab/c$ with out-of-range intermediates, reading errors in ULP or $\gamma_k$ bounds.
+Construct midpoints, division points, and equally spaced grids through `checked_midpoint`, `checked_affine`, or `checked_affine_ratio` to preserve endpoints and keep results between them.
+`checked_quadratic_roots` uses cancellation-free quadratic formulas, with residual bounds for both returned roots.
+Assess forward error separately near repeated roots.
+
+## Further reading
+
+- [Extended-range values and logarithmic and projective representations](../extended-range-values/): Check how to receive out-of-range results in `Scaled` or `LogValue`.
+- [Logarithmic sums, weighted sums, and normalization](../logarithmic-reductions/): Check exponential sums combined with exact accumulation.
+- [Protect intermediate values before the final result](../../examples/range-safe-arithmetic/): Try sums, norms, and products with out-of-range intermediates individually.
+- [The common-ion effect and solubility of sparingly soluble salts](../../examples/common-ion-solubility/): Check small quadratic roots and residual contracts in chemical equilibria.
+- [Arithmetic, stable transformation, and logarithmic sum APIs](../../api/arithmetic-and-reductions/): Look up all `checked_*` and accumulator items.

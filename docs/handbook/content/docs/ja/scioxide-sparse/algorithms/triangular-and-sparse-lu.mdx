@@ -1,0 +1,491 @@
+---
+title: 疎三角代入と疎 LU 分解
+description: 疎な三角系の代入と後退誤差、到達集合による解の非零パターン、Gilbert–Peierls の左向き疎 LU 分解と部分ピボット、記号解析・数値分解・再分解の分担、上限と準備を一括して行うコンストラクター。
+sidebar:
+  order: 315
+references:
+  sparse-lu-stages: "記号解析分解再分解"
+  sparse-partial-pivoting: "部分ピボット"
+  sparse-reach: "疎な右辺と到達集合"
+  sparse-triangular-substitution: "三角系の代入"
+---
+
+一般の正方な疎行列 $\mathbf{A}$ の連立一次方程式 $\mathbf{A}\mathbf{x} = \mathbf{b}$ を直接法で解くには、行と列を並べ替えた LU 分解
+
+$$
+\mathbf{P}\mathbf{A}\mathbf{Q} = \mathbf{L}\mathbf{U}
+$$
+
+を作り、二つの三角系 $\mathbf{L}\mathbf{z} = \mathbf{P}\mathbf{b}$、$\mathbf{U}\mathbf{w} = \mathbf{z}$ を解いて $\mathbf{x} = \mathbf{Q}\mathbf{w}$ とする。
+ここで $\mathbf{L}$ は対角が 1 の下三角行列、$\mathbf{U}$ は上三角行列、$\mathbf{P}$ と $\mathbf{Q}$ は置換行列である。
+疎行列では、消去の途中で元は 0 だった位置に非零が生じる（**フィル**）。
+`SparseLu` は、既定では列の順序 $\mathbf{Q}$ を構造だけからフィルが少なくなるように選び、行の順序 $\mathbf{P}$ を値を見て数値的な安定性のために選ぶ。
+このページでは、三角系の代入とその誤差、右辺が疎なときの解の非零パターン、三角系の代入を列ごとに繰り返す Gilbert–Peierls の疎 LU 分解、記号解析と再分解の使い分けを説明する。
+
+## 三角系の代入
+
+下三角行列 $\mathbf{L}$ の系 $\mathbf{L}\mathbf{x} = \mathbf{b}$ は、上の行から順に
+
+$$
+x_i = \frac{1}{l_{ii}} \left( b_i - \sum_{j < i,\ l_{ij} \ne 0} l_{ij}\, x_j \right), \qquad i = 0, 1, \dots, n - 1
+$$
+
+と解ける（前進代入）。
+上三角行列では下の行から順に同じ計算をする（後退代入）。
+保存した成分ごとに積と差を 1 回ずつ計算し、各行で 1 回割るので、手間は $O(n + \mathrm{nnz}(\mathbf{L}))$ である。
+
+代入は後退安定である。
+実数の三角行列を浮動小数点演算で代入すると、計算した $\hat{\mathbf{x}}$ は
+
+$$
+(\mathbf{L} + \Delta\mathbf{L})\,\hat{\mathbf{x}} = \mathbf{b}, \qquad |\Delta\mathbf{L}| \le \gamma_r\, |\mathbf{L}|
+$$
+
+を満たす（Higham の 8 章、アンダーフローがない場合）。
+ここで絶対値と不等号は成分ごとにとり、$\gamma_k$ は [記号](oxref:sparse-notation) の誤差限界の係数、$r$ は $\mathbf{L}$ の 1 行に保存した成分の数の最大値（$r \le n$）である。
+すなわち $\hat{\mathbf{x}}$ は、$\mathbf{L}$ の各成分を相対的に $\gamma_r$ 以下だけ動かした三角系の厳密解である。
+後退誤差の考え方は [浮動小数点と条件数](../../../concepts/floating-point-and-conditioning/) にある。
+
+前進誤差は三角行列の条件数の分だけ大きくなりうる。
+Skeel の条件数 $\mathrm{cond}(\mathbf{L}, \mathbf{x}) = \| |\mathbf{L}^{-1}|\,|\mathbf{L}|\,|\mathbf{x}| \|_\infty / \|\mathbf{x}\|_\infty$ を使うと、一次の近似で $\|\hat{\mathbf{x}} - \mathbf{x}\|_\infty / \|\mathbf{x}\|_\infty \lesssim \mathrm{cond}(\mathbf{L}, \mathbf{x})\, \gamma_r$ となる。
+対角が 1 で対角より下がすべて $-1$ の下三角行列のように、成分の大きさがそろっていても $\mathbf{L}^{-1}$ の成分が $2^{n-2}$ まで増え、条件数が $n$ について指数的に増える例がある。
+そのため、解の精度は後退誤差とは別に条件数で見積もる。
+
+`SparseTriangular::new(matrix, triangle, diagonal)` は CSR 行列 `matrix` を所有し、`Triangle::Lower`・`Upper` で三角の向きを、`DiagonalKind::Explicit`・`Unit` で対角を行列から読むか 1 とみなすかを指定して、検査した三角行列を作る。
+正方でない行列は `DimensionMismatch` で拒む。
+選んだ三角の外の成分と、`Unit` なのに保存した対角は `InvalidInput` で拒む。
+`Explicit` で対角が欠けているか 0 のときは `Singular` で拒む。
+
+出力先を指定する API の `solve_into(rhs, operation, options, output, workspace, scope)` は、`SparseOperation` の `Normal`、`Transpose`、`Adjoint` で $\mathbf{L}$、$\mathbf{L}^{\mathsf{T}}$、$\mathbf{L}^{\mathsf{H}}$ のどれを解くかを選ぶ。
+転置と随伴の代入は、CSR 行列が保持している列方向の索引（`opposite_traversal()`）で同じ格納を列の向きにたどり、転置の写しを作らない。
+作業領域は右辺 1 本につき $2n$ 個のスカラーで、`workspace(rhs)` で作るか、`workspace_requirements(rhs)` の `scalar_len()` の長さの配列を `SparseSolveWorkspace::borrowed` で借りる。
+標準形式の `solve`、`solve_transpose`、`solve_adjoint` は解を新しい配列で返す。
+呼び出しの形の名前は [呼び出しの形](oxref:sparse-execution-forms) で定義している。
+どの形も右辺を密なベクトルとして受け取って全行を順に走査するので、右辺が疎でも手間は $O(n + \mathrm{nnz}(\mathbf{L}))$ である。
+
+## 疎な右辺と到達集合
+
+右辺 $\mathbf{b}$ が疎で、解 $\mathbf{x}$ の非零の位置が事前に分かれば、0 になる成分の計算を省ける。
+$\mathbf{L}$ の非零パターンを、$l_{ij} \ne 0$（$i > j$）のときに辺 $j \to i$ を持つ有向グラフ $G(\mathbf{L})$ とみなす。
+$\mathbf{L}$ は下三角なので、このグラフに閉路はない。
+前進代入の式から、$x_i$ が 0 でない値を取りうるのは、$b_i \ne 0$ であるか、$x_j \ne 0$ となる $j$ から辺 $j \to i$ があるときに限られる。
+これを番号の小さい頂点から順にたどると、Gilbert と Peierls の定理
+
+$$
+\{ i : x_i \ne 0 \} \subseteq \mathrm{Reach}_{G(\mathbf{L})}\bigl(\{ j : b_j \ne 0 \}\bigr)
+$$
+
+が得られる。
+包含の右辺は $b_j \ne 0$ となる頂点から辺をたどって到達できる頂点の集合（**到達集合**）である。
+包含が真の包含になるのは、ある頂点で複数の寄与が打ち消し合って解の成分がちょうど 0 になる場合で、その 0 は先の頂点にも伝わりうる。
+値の打ち消しを考えない構造の上では、等号が成り立つ。
+
+到達集合は深さ優先探索で求まり、探索の帰りがけの順を逆にすると、代入を進めてよい順（位相順序）が得られる。
+$\mathbf{L}$ を列ごとに格納しておき、到達集合の頂点 $j$ を位相順序で処理して、$x_j$ を確定してから $\mathbf{L}$ の第 $j$ 列の寄与を残りの成分から引く。
+こうすると、探索と代入の手間は到達した頂点の数とそれらの列の非零の数、すなわち実際の積和の回数に比例し、$n$ には比例しない。
+`scioxide-sparse` はこの代入を疎 LU 分解と疎 Cholesky 分解の内部で使い（Cholesky では到達集合を消去木から求める）、疎な右辺の代入を公開 API としては提供しない。
+疎な右辺にも `SparseTriangular` の全行を走査する代入を使う。
+
+### 到達集合と打ち消し
+
+次のセルは 6 頂点の有向非巡回グラフ $0 \to 1$、$0 \to 2$、$1 \to 3$、$2 \to 3$、$2 \to 4$、$3 \to 5$ を非零パターンに持つ下三角行列（対角は 2、$l_{32}$ 以外の辺の成分は $-1$）を作り、右辺 $\mathbf{b} = 4\mathbf{e}_s$ で代入する。
+入力は始点 $s$（0〜5）と、$l_{32}$ を $-1$ から $+1$ に変えるかどうかである。
+$+1$ にすると、$s = 0$ のとき頂点 3 で二つの経路 $0 \to 1 \to 3$ と $0 \to 2 \to 3$ の寄与が打ち消し合う。
+代入は出力先を指定する API の `solve_into` で行い、作業領域は呼び出し側の配列を借りる。
+検算として、深さ優先探索で $\mathrm{Reach}(\{s\})$ を独立に求めて解の非零の位置と比べ、辺の一覧から $\mathbf{L}\hat{\mathbf{x}}$ を計算して残差 $\|\mathbf{L}\hat{\mathbf{x}} - \mathbf{b}\|_\infty$ を求める。
+一つ目の表は頂点ごとの値、二つ目の表は到達集合の大きさ、解の非零の数、到達集合の外にある非零の数（定理により 0）、残差である。
+
+```rust
+//| id: sparse-triangular-reach
+//| ref: sparse-triangular-reach
+//| title: 疎三角代入の非零の位置と到達集合
+//| run: reactive
+//| crates: [scioxide-core, scioxide-sparse]
+//| inputs:
+//|   rhs_source: {"type":"range","label":"右辺の非零の位置 s","description":"右辺を b = 4eₛ とする。","min":0,"max":5,"step":1,"value":0}
+//|   cancel: {"type":"checkbox","label":"l₃₂ = +1 にする（s = 0 で頂点 3 の寄与が打ち消し合う）","value":false}
+//| cases:
+//|   - {"id":"cancellation","label":"l₃₂ = +1","description":"頂点 3 で二つの経路の寄与が打ち消し合い、到達集合に含まれる頂点 3 と 5 の解が 0 になる。","inputs":{"cancel":true}}
+//|   - {"id":"middle-source","label":"s = 2","description":"始点を頂点 2 にすると、到達集合は {2, 3, 4, 5} に縮む。","inputs":{"rhs_source":2}}
+//|   - {"id":"sink-source","label":"s = 5","description":"出次数 0 の頂点から始めると、到達集合はその頂点だけになる。","inputs":{"rhs_source":5}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"solution","path":"/rows/0/2","equals":2}
+//|       - {"artifact":"solution","path":"/rows/3/2","equals":1}
+//|       - {"artifact":"solution","path":"/rows/5/2","equals":0.5}
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":6}
+//|       - {"artifact":"summary","path":"/rows/0/1","equals":6}
+//|       - {"artifact":"summary","path":"/rows/0/2","equals":0}
+//|       - {"artifact":"summary","path":"/rows/0/3","equals":0}
+//|   - case: cancellation
+//|     expect:
+//|       - {"artifact":"solution","path":"/rows/3/2","equals":0}
+//|       - {"artifact":"solution","path":"/rows/5/2","equals":0}
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":6}
+//|       - {"artifact":"summary","path":"/rows/0/1","equals":4}
+//|       - {"artifact":"summary","path":"/rows/0/2","equals":0}
+//|   - case: middle-source
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":4}
+//|       - {"artifact":"summary","path":"/rows/0/1","equals":4}
+//|       - {"artifact":"solution","path":"/rows/1/2","equals":0}
+//|   - case: sink-source
+//|     expect:
+//|       - {"artifact":"summary","path":"/rows/0/0","equals":1}
+//|       - {"artifact":"solution","path":"/rows/5/2","equals":2}
+use scioxide_core::{DiagonalKind, ExecutionContext, Triangle};
+use scioxide_sparse::{
+    DuplicatePolicy, ExplicitZeroPolicy, SparseBuilder, SparseOperation, SparseSolveOptions,
+    SparseSolveWorkspace, SparseTriangular,
+};
+
+let n = 6;
+let s = rhs_source as usize;
+// (i, j, l_ij) は辺 j → i（i > j）を表す。
+let l32 = if cancel { 1.0 } else { -1.0 };
+let edges = [
+    (1, 0, -1.0_f64),
+    (2, 0, -1.0),
+    (3, 1, -1.0),
+    (3, 2, l32),
+    (4, 2, -1.0),
+    (5, 3, -1.0),
+];
+let mut builder = SparseBuilder::new(n, n);
+for i in 0..n {
+    builder.push(i, i, 2.0_f64).map_err(|e| e.to_string())?;
+}
+for &(i, j, v) in &edges {
+    builder.push(i, j, v).map_err(|e| e.to_string())?;
+}
+let l = builder
+    .finish_csr(DuplicatePolicy::Reject, ExplicitZeroPolicy::Drop)
+    .map_err(|e| e.to_string())?;
+let factor = SparseTriangular::new(l, Triangle::Lower, DiagonalKind::Explicit)
+    .map_err(|e| e.to_string())?;
+
+let mut b = vec![0.0_f64; n];
+b[s] = 4.0;
+let mut x = vec![0.0_f64; n];
+// 右辺 1 本の作業領域（2n 個）を呼び出し側の配列から借りる。
+let requirements = factor
+    .workspace_requirements(1)
+    .map_err(|e| e.to_string())?;
+let mut scratch = vec![0.0_f64; requirements.scalar_len()];
+let mut workspace = SparseSolveWorkspace::borrowed(&mut scratch);
+factor
+    .solve_into(
+        &b,
+        SparseOperation::Normal,
+        SparseSolveOptions::new(),
+        &mut x,
+        &mut workspace,
+        ExecutionContext::sequential(),
+    )
+    .map_err(|e| e.to_string())?;
+
+// 独立検算 1: 深さ優先探索で s から到達できる頂点を求める。
+let mut reached = vec![false; n];
+let mut stack = vec![s];
+while let Some(j) = stack.pop() {
+    if !reached[j] {
+        reached[j] = true;
+        stack.extend(edges.iter().filter(|e| e.1 == j).map(|e| e.0));
+    }
+}
+// 独立検算 2: 辺の一覧から L x を組み立て、残差 ‖L x − b‖∞ を求める。
+let mut lx: Vec<f64> = x.iter().map(|v| 2.0 * v).collect();
+for &(i, j, v) in &edges {
+    lx[i] += v * x[j];
+}
+let residual = lx
+    .iter()
+    .zip(&b)
+    .fold(0.0_f64, |m, (p, q)| m.max((p - q).abs()));
+
+let rows: Vec<(usize, f64, f64, &str, &str)> = (0..n)
+    .map(|i| {
+        let reach = if reached[i] {
+            "含まれる"
+        } else {
+            "含まれない"
+        };
+        let nonzero = if x[i] != 0.0 { "非零" } else { "0" };
+        (i, b[i], x[i], reach, nonzero)
+    })
+    .collect();
+let columns = serde_json::json!([
+    { "key": "0", "label": "頂点 i", "type": "integer" },
+    { "key": "1", "label": "bᵢ [-]", "type": "number" },
+    { "key": "2", "label": "xᵢ [-]", "type": "number" },
+    { "key": "3", "label": "Reach({s})" },
+    { "key": "4", "label": "xᵢ ≠ 0" }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "solution" })
+);
+let count = |f: &dyn Fn(usize) -> bool| (0..n).filter(|&i| f(i)).count();
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let summary = serde_json::json!([
+    { "key": "0", "label": "到達集合の大きさ [個]", "type": "integer" },
+    { "key": "1", "label": "解の非零の数 [個]", "type": "integer" },
+    { "key": "2", "label": "到達集合の外の非零 [個]", "type": "integer" },
+    { "key": "3", "label": "‖Lx̂ − b‖∞ [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    summary,
+    vec![(
+        count(&|i| reached[i]),
+        count(&|i| x[i] != 0.0),
+        count(&|i| x[i] != 0.0 && !reached[i]),
+        residual,
+    )],
+    metadata = serde_json::json!({ "id": "summary" })
+);
+```
+
+既定の $s = 0$ では、到達集合は 6 頂点すべてで、解 $\hat{\mathbf{x}} = (2, 1, 1, 1, 0.5, 0.5)$ の非零の位置と一致する。
+打ち消しを有効にすると $x_3 = -(l_{31} x_1 + l_{32} x_2)/2 = -(-1 + 1)/2 = 0$ となり、頂点 3 とその先の頂点 5 は到達集合に含まれるのに解は 0 になる。
+このとき非零は 4 個、到達集合は 6 頂点で、包含は真の包含になる。
+$s = 2$ では到達集合は $\{2, 3, 4, 5\}$ に縮み、$s = 5$ のような出次数 0 の頂点から始めると到達集合はその頂点だけになる。
+どの入力でも、到達集合の外の非零は 0 個である。
+成分の値はすべて 2 進で正確に表せるので、表の $x_i$ は丸めを含まない厳密な値で、残差も 0 になる。
+
+## 左向きの疎 LU 分解
+
+Gilbert–Peierls の分解は、$\mathbf{L}$ と $\mathbf{U}$ を左の列から一列ずつ作る（左向き）。
+列の順序 $\mathbf{Q}$ は記号解析で決め、第 $j$ 段では $\mathbf{A}\mathbf{Q}$ の第 $j$ 列 $\mathbf{a}$ を使う。
+すでに求めた $\mathbf{L}$ の $j$ 本の列と、まだ求めていない列の位置の単位ベクトルを並べた行列を $\mathbf{L}_j$ とし（行をピボットの順に並べると下三角になる）、三角系
+
+$$
+\mathbf{L}_j\, \mathbf{x} = \mathbf{a}
+$$
+
+を解く。
+解 $\mathbf{x}$ のうち、すでにピボットに選んだ行の成分が $\mathbf{U}$ の第 $j$ 列の対角より上の成分になり、残りの行の成分が第 $j$ 列のピボットの候補になる。
+$\mathbf{a}$ は疎なので、この三角系は前節の到達集合で解ける。
+到達集合の深さ優先探索がたどる辺は、すでに求めた $\mathbf{L}$ の列の非零だけである。
+
+Gilbert と Peierls は、この方法の手間が実際の積和の回数と $O(n + \mathrm{nnz}(\mathbf{A}))$ の和に比例することを示した。
+手間は $n^2$ のような行列の大きさの式ではなく並べ替えとピボットで実際に生じたフィルで決まる。
+
+### 部分ピボット
+
+ピボットの候補のうち絶対値（複素数では $|z|$）が最大の行 $p$ を第 $j$ 段のピボットに選び、大きさが等しければ元の行番号の小さい方を選ぶ。
+選んだ行の値で
+
+$$
+u_{jj} = x_p, \qquad l_{ij} = \frac{x_i}{u_{jj}} \quad (i \text{ は残りの候補の行})
+$$
+
+とする。
+これが部分ピボットで、乗数は $|l_{ij}| \le 1$ を満たす。
+候補がないか、すべて厳密に 0 なら、その段で `Singular` を返す。
+0 でない乗数が丸めで 0 になる場合は `NumericalInstability`（`Underflow`）を、値が表せる範囲を超える場合は `NumericalInstability`（`Overflow`）を返す。
+厳密に 0 になった $\mathbf{L}$ と $\mathbf{U}$ の成分は保存しないので、保存した要素数は到達集合の大きさの合計より少ないことがある。
+
+実数の行列でアンダーフローがなければ、計算した因子は成分ごとに
+
+$$
+\mathbf{P}(\mathbf{A} + \Delta\mathbf{A})\mathbf{Q} = \hat{\mathbf{L}}\hat{\mathbf{U}}, \qquad |\Delta\mathbf{A}| \le \gamma_n\, \mathbf{P}^{\mathsf{T}} |\hat{\mathbf{L}}|\,|\hat{\mathbf{U}}|\, \mathbf{Q}^{\mathsf{T}}
+$$
+
+を満たす（Higham の 9 章）。
+部分ピボットでは $|\hat{\mathbf{L}}|$ の成分は 1 以下だが、$\hat{\mathbf{U}}$ の成分は消去の途中で大きくなりうる。
+消去の途中に現れる成分の最大値を $\mathbf{A}$ の成分の最大値で割った**成長因子** $\rho_n$ は、部分ピボットで最悪 $2^{n-1}$ に達するが、実際の問題ではたいてい小さい。
+
+疎な直接法の多くは、疎性を保つために、最大値の $\tau$ 倍以上の候補ならフィルの少ない行を選んでよい閾値付きの部分ピボットを使う。
+`SparseLu` は閾値付きのピボットを提供せず、常に絶対値が最大の候補を選ぶ。
+そのため安定性は通常の部分ピボットと同じだが、ピボットの行がフィルの少ない行とは限らない。
+フィルを減らす手段は列の順序で、記号解析の `SparseOrdering` で選ぶ。
+行列が Hermitian なら、下三角の因子だけを計算して保存する [疎 Cholesky 分解とブロック LDL 分解](../symmetric-factorizations/) を使える。
+
+## 記号解析・分解・再分解
+
+`SparseLu` の計算は構造だけを見る記号解析と値を使う数値分解に分かれる。
+記号解析で決まるのは列の順序 $\mathbf{Q}$ だけで、行の順序 $\mathbf{P}$、$\mathbf{L}$ と $\mathbf{U}$ の非零パターン、フィルの量は数値分解のピボットで決まる。
+そのため、記号解析は因子の大きさを予測しない。
+
+1. `SparseLuSymbolic::analyze(pattern, ordering, limits)` は正方な構造 `pattern`（`a.structural_pattern()`）を受け取り、列の順序 $\mathbf{Q}$ を決めて、列ごとに走査する索引を作る。
+   `ordering` は `SparseOrdering::FillReducing`（既定、$\mathbf{A} + \mathbf{A}^{\mathsf{T}}$ の構造に近似最小次数法 AMD を適用した順序）、`Natural`（元の順序）、`Supplied(&q)`（与えた置換、$\mathbf{B}_{ij} = \mathbf{A}_{i, q_j}$）である。
+   保存された 0 も構造に含める。
+   正方でない構造と長さの違う置換は `DimensionMismatch`、解析と順序付けの一時的な領域がバイト数の上限を超えると `ResourceLimit` で拒む。
+2. 標準形式の `SparseLu::factor(symbolic, matrix)` は記号解析を所有して数値分解を行い、成功すれば因子を返す。
+   スコープ付き API の `factor_scoped(symbolic, matrix, options, scope)` は、同じ分解を `SparseSolveOptions` と実行コンテキスト `scope` の下で行う。
+   どちらも因子と一時的な作業領域を確保する。
+   因子の `row_permutation()` は行の順序 $p$、`symbolic().column_permutation()` は列の順序 $q$（どちらも $p[\text{新}] = \text{旧}$）、`factor_entries()` は保存した $\mathbf{L}$ と $\mathbf{U}$ の要素数（$\mathbf{L}$ の単位対角を除く）を返す。
+   `lower_entries()` と `upper_entries()` は並べ替えたあとの座標で $(i, j, l_{ij})$ と $(i, j, u_{ij})$ を列の順に返す。
+3. `refactor(matrix, options, workspace, scope)` は、記号解析と構造が厳密に一致する新しい値の行列で分解をやり直す。
+   候補の因子を作業領域 `SparseLuWorkspace` に作り、成功したときだけ因子と入れ替えるので、失敗しても直前の因子（置換を含む）はそのまま使える。
+   構造の違う行列は `InvalidInput`、形の違う行列と、次数・構造の要素数・`max_factor_entries` の違う記号解析のために事前確保した作業領域は `DimensionMismatch` で拒む。
+   事前確保したあとの再分解は確保しない。
+   値が変われば、ピボットの行もフィルも変わりうる。
+
+作業領域は `symbolic.workspace(())` で作るか、`SparseLuWorkspace::new()` を `workspace_requirements(())` が返す `SparseLuRequirements` に対して `try_reserve` で事前確保する。
+`SparseLuRequirements` は記号解析・因子・作業領域の論理バイト数（`symbolic_bytes()`、`factor_bytes()`、`workspace_bytes()` とその和の `total_bytes()`）を返し、作業領域は 2 つ目の因子を含む。
+`factor` は記号解析を所有するので、同じ記号解析から別の因子を作るときは `try_clone()` で写しを作る。
+最初の分解でも確保をなくすには、`SparseLuWorkspace::prepare(symbolic)` で記号解析を作業領域に渡して因子の分まで事前確保しておき、その `factor_scoped(matrix, options, scope)` で因子を作る。
+この `factor_scoped` は確保せず、失敗しても記号解析と領域を作業領域に残す。
+構造の違う行列に移るときは、`reprepare_natural(Some(factor), pattern, limits)` で因子の領域を作業領域に戻し、自然順の記号解析に作り直す。
+すでに持つ領域が足りれば、この呼び出しも次の `factor_scoped` も確保しない。
+
+必須の上限 `SparseLuLimits::new(max_factor_entries, max_workspace_bytes)` は、$\mathbf{L}$ と $\mathbf{U}$ の要素数と、記号解析・因子・作業領域を合わせた論理バイト数を制限する。
+`max_factor_entries` は因子の領域の大きさでもあり、因子と作業領域はこの要素数の領域を最初に事前確保する。
+上限を超えるフィルは数値分解の途中で `ResourceLimit` になり、密行列に近いフィルでメモリを使い果たす前に止まる。
+求解の作業領域を所有する形（`factor.workspace(rhs)`）で作ると、その大きさもバイト数の上限に数える。
+`SparseSolveOptions::with_budgets` で反復回数の上限を与えると、分解は 1 列ごとに 1 回、求解は右辺ごとに 1 回と数え、上限に達すると `ConvergenceFailure`（`IterationLimit`）を返す。
+`with_accuracy` は消去と代入の算術を選び、`with_execution_policy` は `solve_block_into` の右辺を並列に解くかどうかを選ぶ。
+分解そのものはつねに逐次に行う。
+
+求解の形と作業領域は三角系と同じで、出力先を指定する API の `solve_into(rhs, operation, options, output, workspace, scope)` が $\mathbf{A}$、$\mathbf{A}^{\mathsf{T}}$、$\mathbf{A}^{\mathsf{H}}$ の系を選び、右辺 1 本につき $2n$ 個のスカラーの `SparseSolveWorkspace` を使う。
+`solve_block_into` は列優先の複数の右辺をまとめて解き、すべての列が成功したときにまとめて出力に書く。
+標準形式の `solve(rhs)`、`solve_transpose(rhs)`、`solve_adjoint(rhs)` は、既定のオプションで解を新しい配列に返す。
+因子は `LinearOperator` と `AdjointOperator` を実装し、$\mathbf{A}^{-1}$ と $\mathbf{A}^{-\mathsf{H}}$ の作用として反復解法に渡せる。
+
+準備を一括して行うコンストラクター `SparseLu::new(&a)` は、`FillReducing` の記号解析と数値分解をバイト数の上限なしで行う。
+因子の要素数の上限は $\mathrm{nnz}(\mathbf{A}) + n$ から始め、`ResourceLimit` のたびに倍にし、どの因子も超えない $n^2$ で止める。
+試行は高々 $\lceil \log_2 n \rceil + 1$ 回で、失敗した試行の列はやり直しになる。
+結果は十分な上限で `analyze` と `factor` を呼んだ場合と同じ因子である。
+ワンショット関数 `solve(&a, &b)` は `SparseLu::new(&a)` の因子で一度だけ解き、右辺の長さが違えば `DimensionMismatch`、右辺に NaN や無限大があれば `NonFinite` を返す。
+
+### 再分解でのピボットの変化と失敗時の保持
+
+次のセルは $\mathbf{A}(a) = \begin{pmatrix} a & 1 \\ 2 & 4 \end{pmatrix}$ を自然順で一度だけ記号解析し、$a$ を変えて `refactor` を繰り返す。
+段は $a = 4$、入力の $a$（0.5〜5）、$a = 0.5$ の順で、最後の $\mathbf{A}(0.5)$ は行列式 $4a - 2 = 0$ の特異な行列である。
+各段のあと、因子に残っている値 $a$ の系を、厳密解 $(1, 1)$ を与える右辺 $\mathbf{b} = (a + 1, 6)^{\mathsf{T}}$ で解き、厳密解との差の最大を示す。
+再分解が失敗した段では、因子は直前に受理した $a$ のまま残る。
+表の $u_{00}$ と $u_{11}$ は、`upper_entries()` から読んだ $\mathbf{U}$ の対角（その段の因子のピボット）である。
+
+```rust
+//| id: sparse-lu-refactor-pivoting
+//| ref: sparse-lu-refactor-pivoting
+//| title: 疎 LU の再分解によるピボットの変化と失敗時の因子の保持
+//| run: reactive
+//| crates: [scioxide-core, scioxide-sparse]
+//| inputs:
+//|   second_diagonal: {"type":"range","label":"2 段目の対角成分 a","description":"|a| < 2 で行が入れ替わり、a = 0.5 で A(a) は特異になる。","min":0.5,"max":5.0,"step":0.5,"value":1.0}
+//| cases:
+//|   - {"id":"tie","label":"a = 2","description":"候補の大きさが等しく、行番号の小さい第 0 行が選ばれて行は入れ替わらない。","inputs":{"second_diagonal":2.0}}
+//|   - {"id":"singular-step","label":"a = 0.5","description":"2 段目でも再分解が失敗し、因子は 1 段目の a = 4 のまま残る。","inputs":{"second_diagonal":0.5}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"steps","path":"/rows/0/2","equals":"[0, 1]"}
+//|       - {"artifact":"steps","path":"/rows/0/4","approx":{"value":3.5,"atol":1e-15}}
+//|       - {"artifact":"steps","path":"/rows/1/2","equals":"[1, 0]"}
+//|       - {"artifact":"steps","path":"/rows/1/4","approx":{"value":-1.0,"atol":1e-15}}
+//|       - {"artifact":"steps","path":"/rows/2/1","equals":"Singular"}
+//|       - {"artifact":"steps","path":"/rows/2/5","equals":1}
+//|       - {"artifact":"steps","path":"/rows/2/6","range":{"max":1e-15}}
+//|   - case: tie
+//|     expect:
+//|       - {"artifact":"steps","path":"/rows/1/2","equals":"[0, 1]"}
+//|       - {"artifact":"steps","path":"/rows/1/4","approx":{"value":3.0,"atol":1e-15}}
+//|   - case: singular-step
+//|     expect:
+//|       - {"artifact":"steps","path":"/rows/1/1","equals":"Singular"}
+//|       - {"artifact":"steps","path":"/rows/1/2","equals":"[0, 1]"}
+//|       - {"artifact":"steps","path":"/rows/2/5","equals":4}
+//|       - {"artifact":"steps","path":"/rows/2/6","range":{"max":1e-15}}
+use scioxide_core::ExecutionContext;
+use scioxide_sparse::{
+    DuplicatePolicy, ExplicitZeroPolicy, SparseBuilder, SparseLu, SparseLuLimits,
+    SparseLuSymbolic, SparseOperation, SparseOrdering, SparseSolveOptions,
+};
+
+let mut builder = SparseBuilder::new(2, 2);
+builder
+    .extend(&[0, 0, 1, 1], &[0, 1, 0, 1], &[4.0_f64, 1.0, 2.0, 4.0])
+    .map_err(|e| e.to_string())?;
+// Preserve で構造を固定し、値だけを変えて再分解する。
+let mut a = builder
+    .finish_csr(DuplicatePolicy::Reject, ExplicitZeroPolicy::Preserve)
+    .map_err(|e| e.to_string())?;
+// 記号解析は一度だけ行う。因子の要素数の上限は 2×2 の密な L と U に足りる 8。
+let symbolic = SparseLuSymbolic::analyze(
+    a.structural_pattern(),
+    SparseOrdering::Natural,
+    SparseLuLimits::new(8, 1 << 16),
+)
+.map_err(|e| e.to_string())?;
+let (options, scope) = (SparseSolveOptions::new(), ExecutionContext::sequential());
+let mut work = symbolic.workspace(()).map_err(|e| e.to_string())?;
+let mut factor = SparseLu::factor(symbolic, a.view()).map_err(|e| e.to_string())?;
+let mut solve_work = factor.workspace(1).map_err(|e| e.to_string())?;
+
+let mut rows = Vec::new();
+let mut accepted = 4.0_f64;
+for diagonal in [4.0, second_diagonal, 0.5] {
+    // values() の格納順で位置 0 が a₀₀。
+    a.set_value(0, diagonal).map_err(|e| e.to_string())?;
+    let status = match factor.refactor(a.view(), options, &mut work, scope) {
+        Ok(()) => {
+            accepted = diagonal;
+            "受理".to_string()
+        }
+        Err(e) => format!("{:?}", e.kind()),
+    };
+    // 因子に残っている A(accepted) の系を、厳密解 (1, 1) を与える右辺で解く。
+    let mut x = [0.0_f64; 2];
+    factor
+        .solve_into(
+            &[accepted + 1.0, 6.0],
+            SparseOperation::Normal,
+            options,
+            &mut x,
+            &mut solve_work,
+            scope,
+        )
+        .map_err(|e| e.to_string())?;
+    let error = (x[0] - 1.0).abs().max((x[1] - 1.0).abs());
+    let pivots: Vec<f64> = factor
+        .upper_entries()
+        .filter(|&(i, j, _)| i == j)
+        .map(|(_, _, value)| value)
+        .collect();
+    let order = format!("{:?}", factor.row_permutation());
+    rows.push((
+        diagonal, status, order, pivots[0], pivots[1], accepted, error,
+    ));
+}
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "対角 a [-]", "type": "number" },
+    { "key": "1", "label": "再分解" },
+    { "key": "2", "label": "行の順序 p" },
+    { "key": "3", "label": "u₀₀ [-]", "type": "number" },
+    { "key": "4", "label": "u₁₁ [-]", "type": "number" },
+    { "key": "5", "label": "因子が表す a [-]", "type": "number" },
+    { "key": "6", "label": "厳密解との差 [-]", "type": "number", "format": sci2 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "steps" })
+);
+```
+
+既定の $a = 1$ では、1 段目（$a = 4$）は $|4| \ge 2$ なので行は入れ替わらず、$p = [0, 1]$、$u_{11} = 4 - (2/4) \cdot 1 = 3.5$ になる。
+2 段目は $|1| < 2$ なので第 1 行がピボットに選ばれて $p = [1, 0]$ になり、$u_{00} = 2$、$u_{11} = 1 - (1/2) \cdot 4 = -1$ である。
+どちらの段も厳密解との差は 0 である。
+3 段目は第 0 列で $|0.5| < 2$ により第 1 行が選ばれ、第 1 列のピボット $1 - (0.5/2) \cdot 4 = 0$ が厳密に 0 になるので、`Singular` で失敗する。
+失敗しても因子は 2 段目のまま残り、$a = 1$ の系を解き直すと同じ解が得られる。
+$a = 2$ では候補の大きさが等しいので行番号の小さい第 0 行が選ばれ、行は入れ替わらない。
+$a = 0.5$ では 2 段目も失敗し、3 段目のあとも因子は 1 段目の $a = 4$ のままである。
+
+## まとめ
+
+疎な三角系の代入は後退安定で手間は $O(n + \mathrm{nnz})$ だが、前進誤差は三角行列の条件数の分だけ大きくなりうるので、解の精度は条件数と合わせて見積もる。
+右辺が疎なとき解の非零は到達集合に含まれ、`SparseLu` はこの性質で各列の三角系を解くので、分解の手間は実際の積和の回数で決まる。
+`SparseLu` のピボットは閾値なしの部分ピボットで、記号解析が決めるのは列の順序（既定は $\mathbf{A} + \mathbf{A}^{\mathsf{T}}$ の AMD）だけなので、`max_factor_entries` はピボットによるフィルを見込んで与える。
+構造が同じで値だけが変わる問題では、記号解析を一度だけ行い、事前確保した `SparseLuWorkspace` で `refactor` を繰り返す。
+`refactor` が失敗しても直前の因子は使えるので、特異になった値を捨てて前の因子で計算を続けられる。
+
+## 次に読むページ
+
+- [疎 Cholesky 分解とブロック LDL 分解](../symmetric-factorizations/)：Hermitian 行列で、消去木から構造を事前に決める Cholesky 分解と、慣性の数え方を確かめる。
+- [並べ替えと彩色](../orderings-and-coloring/)：列の順序がフィルを決める仕組みと、AMD と RCM の考え方を確かめる。
+- [直接分解](../../api/factorizations/)：三角系、LU の記号解析・因子・作業領域・上限の全項目の仕様を引く。

@@ -1,0 +1,299 @@
+---
+title: "Transformations, rejection, and tail control for continuous distributions"
+description: "Inverse-transform sampling, the 256-layer Ziggurat method, construction from exponential, normal, and gamma variates, the Marsaglia–Tsang method, heavy-tailed laws and moments, and sample inspection using equal-probability bin counts."
+sidebar:
+  order: 310
+references:
+  random-continuous-heavy-tails: "heavy-tails-and-moments"
+  random-continuous-inversion: "inverse-transform-sampling"
+  random-continuous-variate-combinations: "combining-variates"
+  random-continuous-ziggurat: "the-256-layer-ziggurat-method"
+---
+
+Samples from continuous distributions are constructed by mapping uniform random numbers $U$ through a quantile function (inverse-transform sampling), selecting points under a density (rejection sampling), or combining variates that can already be generated.
+Expressing a density or CDF in a formula and generating samples in finite-precision floating-point arithmetic without compromising endpoints or tails are separate problems.
+This page explains these three methods used by continuous distributions in `scioxide-random` and their numerical considerations.
+The rules for converting generator words to $U$ are in [Uniform words and conversion to floating point](oxref:random-algorithms-uniform-conversion).
+
+## Inverse-transform sampling
+
+If a CDF $F$ is continuous, then for $U \sim \mathrm{Uniform}(0, 1)$, $X = Q(U)$ follows $F$.
+Here, $Q(p) = \inf\{x : F(x) \ge p\}$ is the generalized inverse (quantile function) of $F$; since $Q(u) \le x$ and $u \le F(x)$ are equivalent,
+
+$$
+P(Q(U) \le x) = P(U \le F(x)) = F(x)
+$$
+
+
+$Q$ is computed by `Quantile::quantile`.
+`InverseSurvival::isf` finds the point corresponding to upper-tail probability $p$ (the solution of $S(x) = 1 - F(x) = p$) without forming $1 - p$.
+Thus upper-tail points retain relative accuracy even when $1 - p$ rounds to 1, as for $p = 10^{-300}$.
+
+Laws with closed-form quantiles also use those formulas for sampling.
+`Cauchy` takes $U$ from the open interval $(0, 1)$ and uses different expressions on either side of the center to avoid poles of $\tan$.
+
+$$
+Q(u) = \begin{cases} x_0 - \gamma / \tan(\pi u) & (u < 1/2) \\ x_0 + \gamma / \tan(\pi (1 - u)) & (u > 1/2) \end{cases}
+$$
+
+Here, $x_0$ is the location and $\gamma$ the scale.
+In both expressions, the argument of $\tan$ lies in $(0, \pi/2)$ and decreases toward the tails, avoiding rounding of $u - 1/2$.
+For location $x_0$ and scale $s$, `Logistic` evaluates $s\,\operatorname{logit}(u) + x_0$ ($\operatorname{logit}(u) = \ln\{u/(1 - u)\}$) with a fused multiply-add.
+Since endpoint $u = 0$ produces infinity, these laws use uniform random numbers excluding 0 through `Rng::next_open_float`.
+For laws whose quantiles require a numerical solve (such as `DoubleParetoLogNormal`), `quantile` uses numerical inversion, with work bounded by `LawOptions`.
+Numerical inversion is explained in [LawOptions and numerical inversion](oxref:random-laws-options-and-inversion).
+
+## The 256-layer Ziggurat method
+
+Normal and exponential samples are generated with the Ziggurat method.
+This method covers the area under a decreasing density $f$ (on the side $x \ge 0$) with 256 horizontal layers of equal area.
+Writing the layer area as $V$ and cutoff as $R$, the bottom layer is a strip of width $V/f(R)$ and height $f(R)$, representing the combined areas of the rectangle on $[0, R)$ and the tail beyond $R$.
+Layer $i$ above it ($i = 255, \dots, 1$) is a rectangle of width $x_i$ extending from height $f(x_i)$ to $f(x_{i-1})$ ($x_{255} = R$, with smaller indices denoting narrower upper layers).
+Solving the rectangle area equation $x_i\{f(x_{i-1}) - f(x_i)\} = V$ determines successive layer endpoints starting at $x_{255} = R$ by
+
+$$
+x_{i-1} = f^{-1}\!\left( \frac{V}{x_{i}} + f(x_{i}) \right), \qquad V = R f(R) + \int_R^\infty f(x)\,dx
+$$
+
+with $f(x) = e^{-x^2/2}$ for the normal distribution and $f(x) = e^{-x}$ for the exponential distribution.
+$R$ is chosen so that the top layer closes exactly at $f(0)$, meaning the recurrence gives $x_0 = 0$; in `f64`, it is $R = 3.6541528853610088$ for normal and $R = 7.69711747013105$ for exponential.
+The tables are constructed at 100-digit precision for normal and 120-digit precision for exponential, then rounded to `f32` and `f64` and stored as IEEE bit patterns.
+
+Since the layers have equal area, choosing a layer uniformly and a horizontal coordinate $x = u\,x_i$ in its rectangle (where $u$ is uniform on $[0, 1)$) gives the horizontal coordinate of a uniform point in the covered region.
+If $x < x_{i-1}$, the point lies within the width of the layer above and is below the density regardless of height, so it is accepted immediately.
+The top layer ($i = 1$) has $x_0 = 0$ and no inner region, so every point proceeds to the next test.
+Otherwise, the point is in a wedge; choose height $y$ uniformly from $[f(x_i), f(x_{i-1})]$ and accept only if $y < f(x)$.
+A point in the bottom layer with $x \ge R$ corresponds to the tail area and is generated separately from the tail distribution.
+Accepted $x$ has a distribution proportional to density $f$, with no approximation in the algorithm itself.
+
+The fast path for a sample uses just one uniform word.
+`f64` uses a 64-bit uniform word and `f32` a 32-bit word, partitioned into nonoverlapping bit fields.
+The lowest 8 bits select layer $i$.
+For normal sampling, bit 8 gives the sign, and the 52 bits from bit 9 upward (23 bits for `f32`) determine $u$.
+Exponential sampling has no sign, so bits from bit 8 upward are used for $u$.
+The $x < x_{i-1}$ test compares against an integer table of ratios $x_{i-1}/x_i$ expressed in significand units, without evaluating transcendental functions.
+
+The normal tail uses Marsaglia's method.
+Two uniforms produce $E_1, E_2 \sim \mathrm{Exp}(1)$ (a zero uniform restarts from a new word), and $x = R + E_1/R$ is accepted when $2E_2 > (E_1/R)^2$.
+By memorylessness, the exponential tail is $R - \ln U$ and uses one open-interval uniform.
+According to the rustdoc for `Exponential`, approximately 98.9% of exponential samples are accepted using one uniform word, without evaluating a logarithm.
+Every rejection loop stops after 1,024 candidates and returns `ConvergenceFailure` ([Rejection and work limits](oxref:random-algorithms-rejection-limits)).
+
+`Normal::new(μ, σ)` constructs samples as $\sigma z + \mu$ from standard normal variate $z$ using a fused multiply-add, rounding the exact result only once.
+At $\mu = 0$ and $\sigma = 1$, it returns $z$ directly.
+Among laws constructed from a standard exponential variate $E$, `Exponential` returns $E/\lambda$, `WeibullMin` returns $E^{1/c}$, and `Pareto` returns $\exp(E/b)$.
+The Box–Muller transform $Z = \sqrt{-2\ln U_1}\cos(2\pi U_2)$ also produces normal samples, but SciOxide's normal distribution does not use it.
+
+## Combining variates
+
+Samples from a gamma distribution $\mathrm{Gamma}(\alpha, \theta)$ with scale $\theta$ (`Gamma::new(shape, scale)`) use the Marsaglia–Tsang method.
+This method uses the fact that the cubic expression $d(1 + cZ)^3$ of a standard normal variate $Z$ is approximately distributed as $\mathrm{Gamma}(\alpha, 1)$ (the Wilson–Hilferty approximation), correcting the difference by rejection.
+For $\alpha \ge 1$, $d = \alpha - 1/3$ and $c = 1/\sqrt{9d}$ are prepared at construction, and $V = (1 + cZ)^3$ is generated.
+If $1 + cZ \le 0$, the transformation is not monotone and the target density is 0, so reject; for open-interval $U$, if
+
+$$
+U < 1 - 0.0331 Z^4 \quad\text{or}\quad \ln U < \tfrac{1}{2} Z^2 + d\,(1 - V + \ln V)
+$$
+
+accept $\theta d V$.
+The first test is a lower bound on the acceptance probability, accepting most candidates without a logarithm.
+The second test uses the logarithm of the ratio of the transformed density to the normal density, rejecting candidates that also fail this test.
+
+For $\alpha < 1$, multiply a sample from $\mathrm{Gamma}(\alpha + 1)$ by $U^{1/\alpha}$ (Ahrens–Dieter augmentation based on Stuart's theorem).
+`Gamma` adds this augmentation and scale $\theta$ in logarithmic form before exponentiating.
+Thus samples representable after scaling are preserved even if $U^{1/\alpha}$ alone would underflow.
+A positive sample rounding to 0 returns `NumericalInstability` (`Underflow`); exceeding the range returns `Overflow`.
+`ChiSquared::new(k)` is $\mathrm{Gamma}(k/2, 2)$.
+
+`Beta` constructs $G_1/(G_1 + G_2)$ from independent $G_1 \sim \mathrm{Gamma}(\alpha, 1)$ and $G_2 \sim \mathrm{Gamma}(\beta, 1)$.
+With shape parameters below 1, augmentation by $U^{1/\alpha}$ can underflow both variates simultaneously.
+Therefore, if $\alpha < 1$ or $\beta < 1$ at construction, all samples use the logarithmic path, regardless of whether underflow occurs.
+This path keeps augmentation as $\ln U/\alpha$ to form log-odds $L = \ln G_1 - \ln G_2$, computing $1/(1 + e^{-L})$ from $e^{-\lvert L \rvert}$.
+Pairs are never discarded and redrawn, but the resulting probability may round to 0 or 1.
+Regardless of parameters, `BetaPrime` forms $G_a/G_b$ by exponentiating the same log-odds $\ln G_a - \ln G_b$.
+If the final value rounds to 0, it returns `NumericalInstability` (`Underflow`); exceeding the range returns `Overflow`.
+`LogNormal` is the exponential of a normal sample.
+`StudentT` is $T = Z / \sqrt{V/\nu}$ ($V \sim \chi^2_\nu$); if the denominator underflows to 0, it returns `NumericalInstability` (`Underflow`) rather than infinity.
+These laws prepare their samplers once at construction and do not evaluate special functions per sample.
+
+## Heavy tails and moments
+
+The Cauchy distribution has neither a mean nor a variance.
+`Cauchy` implements neither `Mean` nor `Variance`, so code requesting its mean does not compile.
+For Student t, the mean does not exist for $\nu \le 1$ and the variance does not exist for $\nu \le 2$; `mean()` and `variance()` return `DomainError` with reason `Undefined`.
+Inspect samples from these laws using the median, interquartile range, or comparison with the CDF, rather than the sample mean.
+
+Pearson's goodness-of-fit test with equal-probability bins separated by quantiles is suitable for inspecting a sampler.
+Take $K$ bins, with bin $j$ defined as $[Q((j-1)/K), Q(j/K))$.
+When samples follow $F$, each bin count $O_j$ follows the binomial distribution $\mathrm{B}(n, 1/K)$ with expected count $n/K$ and standard deviation $\sqrt{(n/K)(1 - 1/K)}$.
+The statistic
+
+$$
+X^2 = \sum_{j=1}^{K} \frac{(O_j - n/K)^2}{n/K}
+$$
+
+approaches a chi-squared distribution with $K - 1$ degrees of freedom as $n \to \infty$.
+Bin boundaries are determined from $F$ without fitted parameters, so no degrees of freedom are subtracted.
+
+The following cell generates $n$ samples from the selected law using `sample_n` and counts them in $K = 20$ equal-probability bins.
+The inputs are the law, sample size $n$, and random seed.
+The bar chart shows counts, a line at the expected count $n/20$, and a band of expected count $\pm 2$ standard deviations.
+The table shows $X^2$, the 2.5% and 97.5% quantiles of chi-squared with 19 degrees of freedom, upper-tail probability $P(\chi^2_{19} \ge X^2)$, and $z$, the sample mean standardized by the theoretical standard error $\sqrt{\mathrm{Var}/n}$.
+Bin boundaries, chi-squared quantiles, and upper-tail probabilities are computed with SciOxide's `quantile` and `sf`.
+
+```rust
+//| id: random-continuous-goodness-of-fit
+//| ref: random-continuous-goodness-of-fit
+//| title: "Inspect continuous-distribution samples using equal-probability bin counts"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-random]
+//| inputs:
+//|   law_name: {"type":"select","label":"Law","options":["Normal N(1, 2²)","Exponential Exp(λ = 2)","Gamma Gamma(0.5, 1)","Gamma Gamma(4, 1)","Beta Beta(2, 5)","Student t（ν = 5）"],"value":"Gamma Gamma(0.5, 1)"}
+//|   sample_count: {"type":"range","label":"Sample size n [count]","min":1000,"max":20000,"step":1000,"value":8000}
+//|   seed: {"type":"range","label":"Random seed [-]","min":1,"max":1000,"step":1,"value":11}
+//| cases:
+//|   - {"id":"student-t","label":"Student t（ν = 5）","description":"X² lies within the interval, but the standardized mean is −2.32, slightly outside ±2.","inputs":{"law_name":"Student t（ν = 5）"}}
+//|   - {"id":"beta-large","label":"Beta(2, 5), n = 20000","description":"Increasing the sample size leaves the distribution of X² unchanged at 19 degrees of freedom.","inputs":{"law_name":"Beta Beta(2, 5)","sample_count":20000}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"fit","path":"/rows/0/0","range":{"min":5,"max":45}}
+//|       - {"artifact":"fit","path":"/rows/0/1","range":{"min":8.906,"max":8.908}}
+//|       - {"artifact":"fit","path":"/rows/0/2","range":{"min":32.851,"max":32.853}}
+//|       - {"artifact":"fit","path":"/rows/0/5","approx":{"value":0.5,"atol":1e-12}}
+//|       - {"artifact":"fit","path":"/rows/0/6","range":{"min":-4,"max":4}}
+//|   - case: student-t
+//|     expect:
+//|       - {"artifact":"fit","path":"/rows/0/0","range":{"min":5,"max":45}}
+//|       - {"artifact":"fit","path":"/rows/0/5","approx":{"value":0.0,"atol":1e-12}}
+//|       - {"artifact":"fit","path":"/rows/0/6","range":{"min":-4,"max":4}}
+//|   - case: beta-large
+//|     expect:
+//|       - {"artifact":"fit","path":"/rows/0/0","range":{"min":5,"max":45}}
+//|       - {"artifact":"fit","path":"/rows/0/5","approx":{"value":0.2857142857,"atol":1e-9}}
+//|       - {"artifact":"fit","path":"/rows/0/6","range":{"min":-4,"max":4}}
+use scioxide_core::RealScalar;
+use scioxide_random::{
+    Beta, Cdf, ChiSquared, Distribution, Exponential, Gamma, Mean, Normal, Quantile,
+    SeedableRng, SplitMix64, StudentT, Survival, Variance,
+};
+
+const BINS: usize = 20;
+
+// Return equal-probability bin counts, X², sample mean, theoretical mean, and standardized mean error for any law type.
+fn check<D>(law: &D, n: usize, seed: u64) -> Result<(Vec<f64>, f64, f64, f64, f64), String>
+where
+    D: Distribution<f64> + Cdf<f64> + Quantile<f64> + Mean<f64> + Variance<f64>,
+{
+    let mut rng = SplitMix64::from_seed(seed);
+    let samples = law.sample_n(&mut rng, n).map_err(|e| e.to_string())?;
+    // Bin boundaries Q(j/K) (j = 1, …, K−1). The first and last bins extend to infinity.
+    let edges = (1..BINS)
+        .map(|j| law.quantile(j as f64 / BINS as f64))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    let mut counts = vec![0.0; BINS];
+    for &x in &samples {
+        counts[edges.partition_point(|&edge| edge <= x)] += 1.0;
+    }
+    let expected = n as f64 / BINS as f64;
+    let chi_square: f64 = counts
+        .iter()
+        .map(|o| RealScalar::powi(o - expected, 2) / expected)
+        .sum();
+    // Divide the sample mean error by the theoretical standard error √(Var/n).
+    let mean = samples.iter().sum::<f64>() / n as f64;
+    let theory = law.mean().map_err(|e| e.to_string())?;
+    let variance = law.variance().map_err(|e| e.to_string())?;
+    let z = (mean - theory) / RealScalar::sqrt(variance / n as f64);
+    Ok((counts, chi_square, mean, theory, z))
+}
+
+let fixed2 = serde_json::json!({ "notation": "standard", "fractionDigits": 2 });
+let fixed3 = serde_json::json!({ "notation": "standard", "fractionDigits": 3 });
+let sig5 = serde_json::json!({ "notation": "standard", "significantDigits": 5 });
+let n = sample_count.round() as usize;
+let seed = seed.round() as u64;
+let (counts, chi_square, mean, theory, z) = match law_name.as_str() {
+    "Normal N(1, 2²)" => check(&Normal::new(1.0, 2.0).map_err(|e| e.to_string())?, n, seed)?,
+    "Exponential Exp(λ = 2)" => check(&Exponential::new(2.0).map_err(|e| e.to_string())?, n, seed)?,
+    "Gamma Gamma(0.5, 1)" => {
+        let law = Gamma::new(0.5, 1.0).map_err(|e| e.to_string())?;
+        check(&law, n, seed)?
+    }
+    "Gamma Gamma(4, 1)" => {
+        let law = Gamma::new(4.0, 1.0).map_err(|e| e.to_string())?;
+        check(&law, n, seed)?
+    }
+    "Beta Beta(2, 5)" => {
+        let law = Beta::new(2.0, 5.0).map_err(|e| e.to_string())?;
+        check(&law, n, seed)?
+    }
+    _ => check(&StudentT::new(5.0).map_err(|e| e.to_string())?, n, seed)?,
+};
+// The 2.5% and 97.5% quantiles of chi-squared with 19 degrees of freedom, and the upper-tail probability of X² (SciOxide reference law).
+let reference = ChiSquared::new((BINS - 1) as f64).map_err(|e| e.to_string())?;
+let low = reference.quantile(0.025).map_err(|e| e.to_string())?;
+let high = reference.quantile(0.975).map_err(|e| e.to_string())?;
+let upper_tail = reference.sf(chi_square).map_err(|e| e.to_string())?;
+// Each bin count follows binomial B(n, 1/K), with standard deviation √((n/K)(1 − 1/K)).
+let expected = n as f64 / BINS as f64;
+let spread = 2.0 * RealScalar::sqrt(expected * (1.0 - 1.0 / BINS as f64));
+let labels: Vec<String> = (1..=BINS).map(|j| j.to_string()).collect();
+emit_bar_chart!(
+    &labels,
+    &counts,
+    options = &serde_json::json!({
+        "xLabel": "Equal-probability bin index j [-]",
+        "yLabel": "Count [count]",
+        "yMin": 0.0,
+        "annotations": [
+            {
+                "kind": "range",
+                "axis": "y",
+                "from": expected - spread,
+                "to": expected + spread,
+                "label": "Expected count ± 2 standard deviations"
+            },
+            {"kind": "line", "axis": "y", "value": expected, "label": "Expected count n/20"}
+        ]
+    })
+);
+let columns = serde_json::json!([
+    { "key": "0", "label": "X² (19 degrees of freedom) [-]", "type": "number", "format": fixed2 },
+    { "key": "1", "label": "2.5% quantile [-]", "type": "number", "format": fixed3 },
+    { "key": "2", "label": "97.5% quantile [-]", "type": "number", "format": fixed3 },
+    { "key": "3", "label": "P(χ²₁₉ ≥ X²) [-]", "type": "number", "format": fixed3 },
+    { "key": "4", "label": "Sample mean [-]", "type": "number", "format": sig5 },
+    { "key": "5", "label": "Theoretical mean [-]", "type": "number", "format": sig5 },
+    { "key": "6", "label": "Standardized mean error z [-]", "type": "number", "format": fixed2 }
+]);
+emit_table_with_columns!(
+    columns,
+    vec![(chi_square, low, high, upper_tail, mean, theory, z)],
+    metadata = serde_json::json!({ "id": "fit" })
+);
+```
+
+The bar chart gives counts in 20 bins; when samples follow the law, each count lies in the expected-count $\pm 2$ standard-deviation band with approximately 95% probability.
+The probability that $X^2$ falls outside the 95% chi-squared interval $[8.91, 32.85]$ with 19 degrees of freedom is about 5%; the probability that the absolute standardized mean error $z$ is at least 2 is about 4.6%.
+With the defaults (Gamma(0.5, 1), $n = 8\,000$, seed 11), $X^2 = 16.65$ (upper-tail probability 0.614) and $z = -1.23$.
+Selecting Student t ($\nu = 5$) with the same seed and sample size gives $X^2 = 16.41$ (upper-tail probability 0.630), but $z = -2.32$ slightly exceeds $\pm 2$.
+The probability of $\lvert z \rvert \ge 2.32$ is approximately 2.0%, so this value alone does not indicate a sampler error.
+For exponential Exp(2), $X^2 = 29.93$ (upper-tail probability 0.053), inside the interval but near its upper end.
+For Beta(2, 5) with $n = 20\,000$, $X^2 = 20.55$ and $z = 1.05$; even as sample size increases, the reference for $X^2$ retains 19 degrees of freedom.
+A result outside the interval for one seed need not be an error; suspect the sampler only when this repeatedly occurs across different seeds.
+
+## Summary
+
+Samples from laws with closed-form quantiles use inverse-transform sampling with open-interval $U$; normal and exponential samples use the 256-layer Ziggurat method, accepting most samples with a single uniform word.
+Gamma, beta, Student t, and related laws combine normal, exponential, and gamma variates, with samplers prepared at construction.
+Gamma and beta distributions with shape parameters below 1 use logarithmic sampling paths, preserving representable samples even when intermediate variates underflow.
+Nonexistent moments are distinguished by an absent trait implementation or an error `DomainError`, so inspect laws lacking a usable mean or variance through quantiles and counts.
+Read equal-probability-bin $X^2$ and standardized mean errors as distributions across seeds, rather than judging by a single seed.
+
+## Further reading
+
+- [LawOptions and numerical inversion](oxref:random-laws-options-and-inversion): examine numerical inversion for laws without closed-form quantiles and its work limits.
+- [Classical continuous-distribution families](../continuous-law-families/): examine parameters, domains, and moments of each law.
+- [Continuous-distribution API](../../api/continuous-laws/): look up parameters and capabilities of each law.

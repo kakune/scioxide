@@ -1,0 +1,491 @@
+---
+title: "Eigenproblems and Schur decomposition"
+description: "Hermitian eigenvalue stability, tridiagonalization, QL, divide and conquer, bisection, Golub–Welsch first components, power methods and Rayleigh quotients, Hessenberg reduction and Francis QR for general matrices, balancing, shifted Hessenberg solves, left/right eigenvectors and condition estimates, and Schur reordering."
+sidebar:
+  order: 345
+references:
+  linalg-hermitian-eigen: "hermitian-eigenvalues"
+  linalg-power-rayleigh: "power-method-and-rayleigh-quotients"
+  linalg-tridiagonal-golub-welsch: "tridiagonal-matrices-and-golubwelsch"
+  linalg-general-eigen-qr: "general-matrices-hessenberg-reduction-and-francis-qr"
+  linalg-nonnormal-eigen-sensitivity: "nonnormal-eigenvalue-sensitivity"
+  linalg-schur-invariant-subspaces: "schur-decomposition-and-invariant-subspaces"
+  linalg-hessenberg-shifted-solves: "shifted-hessenberg-solves"
+---
+
+The eigenproblem $Av = \lambda v$ determines natural vibration frequencies, stationary states and mixing rates of Markov chains, and stability of linear systems.
+Hermitian and other matrices differ sharply in both eigenvalue properties and computational algorithms.
+This page explains theory and algorithms for both cases, `scioxide-linalg` types and iteration limits, and eigenvalue sensitivity to perturbations in nonnormal matrices.
+The generalized eigenproblem $Av = \lambda Bv$ is covered on the [next page](../generalized-eigenproblems/).
+Calling forms (standard, with-options, and caller-provided-output) are defined in [Workspaces, execution contexts, and attempt records](oxref:linalg-execution-forms).
+
+---
+
+## Hermitian eigenvalues
+
+A Hermitian matrix $A = A^{\mathsf H}$ is unitarily diagonalizable ($A = V \Lambda V^{\mathsf H}$), has real eigenvalues, and admits orthonormal eigenvectors.
+Its eigenvalues are stable under perturbation: Weyl's inequality gives $\lvert \lambda_i(A + E) - \lambda_i(A) \rvert \le \lVert E \rVert_2$ for ascending eigenvalues and any Hermitian $E$.
+The Davis–Kahan $\sin\theta$ theorem bounds eigenvector changes on the scale of $\lVert E \rVert_2 / \mathrm{gap}$ ($\mathrm{gap}$ is distance to other eigenvalues), so individual eigenvectors associated with close eigenvalues are hard to determine.
+
+Standard `HermitianEigenDecomposition::decompose(&a, input)` computes eigenvalues and eigenvectors; `HermitianEigenvaluesResult::compute(&a, input)` computes eigenvalues only.
+Positional argument `input` (`HermitianInput`) explicitly specifies how to interpret input as Hermitian.
+`Exact` checks exact conjugate symmetry and real diagonals; forms such as `Triangle(Triangle::Lower)` (`Triangle` is a scioxide-core type) read only the selected triangle.
+`Projected(policy)` replaces input with $(A + A^{\mathsf H})/2$ and records change magnitude $\lVert A - (A + A^{\mathsf H})/2 \rVert_F$ in `projection_report()`.
+If `policy` is `HermitianProjectionPolicy::Within(tolerance)`, a change exceeding tolerance gives `InvalidInput`.
+Computation follows these steps.
+
+1. Divide $A$ by its maximum absolute entry and reduce to real symmetric tridiagonal form by Householder similarities (one column at a time through order 64; width-32 panels with matrix-product updates for larger orders).
+2. Solve the tridiagonal eigenproblem.
+   Values only use square-root-free Pal–Walker–Kahan QL/QR iteration; eigenvectors use implicit QL through order 32 and divide and conquer for larger orders.
+3. Selecting eigenpairs at ascending indices $i \le k < j$ through `HermitianEigenOptions::with_index_range(EigenIndexRange::new(i, j)?)`, or specifying `with_eigenvalue_accuracy(EigenvalueAccuracy::Relative)`, uses Sturm bisection and inverse iteration.
+4. Back-transform eigenvectors through the reduction transformations.
+   When an index range selects $k$ vectors, only selected columns are transformed, costing $O(n^2 k)$.
+
+The computational algorithm depends only on order and job, independently of the instruction set.
+Time complexity is $O(n^3)$ and storage $O(n^2)$.
+Pass options to with-options `decompose_with_options(&a, input, &HermitianEigenOptions)` and `compute_with_options`.
+`EigenvalueAccuracy::Absolute` (default) stops relative to the whole spectrum's scale; `Relative` stops relative to each eigenvalue's magnitude, better preserving small eigenvalues of graded tridiagonal matrices.
+Dense tridiagonalization is only normwise backward stable, however, so selecting `Relative` does not give relative accuracy for small eigenvalues of arbitrary dense matrices.
+Select eigenvalue order through `EigenvalueOrder` (ascending by default).
+Each eigenvector has 2-norm 1 and phase fixed so its largest-magnitude component (last on a tie) is positive real.
+
+Iteration limits cover the total QL/QR sweeps, secular-equation iterations, bisection, and inverse iteration per call; defaults scale with $m = \max(n, 1)$ for order $n$.
+
+| Job | Default limit [iterations] |
+|---|---|
+| Full-spectrum values only, or vectors for $n \le 32$ | $30m$ |
+| Full-spectrum vectors for $n > 32$ (divide and conquer) | $30m\,(1 + \lceil \log_2 \lceil m/24 \rceil \rceil)$ |
+| Index range or `Relative` | $m\,(E_{\max} - E_{\min} + p + 32)$. $2182m$ for `f64`, $332m$ for `f32` |
+
+In the final row, $E_{\max}, E_{\min}$ are the binary exponents of the largest finite number and smallest subnormal, and $p$ is significand precision; the limit allows bisection over the full floating-point range followed by inverse iteration.
+Replace the limit through `with_execution_options(LinalgExecutionOptions::new().with_iteration_budget(..))`.
+Reaching a limit or inverse iteration failing its residual bound gives `ConvergenceFailure`; inverse iteration losing a direction or eigenvalues overflowing on restoring original units gives `NumericalInstability`.
+Inputs incompatible with their interpretation (not exactly Hermitian under `Exact` or with imaginary diagonals) give `InvalidInput`.
+
+Read successful computation work through `EigenReport`.
+`iterations()` reports this computation's own iteration count; `counts()` separates own count `own()` and nested computation count `nested()`.
+Factorization types' `report()` returns `None` for empty results never computed; values-only results' `report()` always returns a report.
+Values-only results split through `into_parts()` into reusable output `HermitianEigenvaluesBuffer` and a report ([Eigenvalue output buffers](oxref:linalg-eigenvalue-buffers)).
+Obtain workspace for caller-provided-output `decompose_into` and `HermitianEigenvaluesBuffer::compute_into` from `HermitianEigenWorkspaceRequest::new(n, &options)`.
+
+### Tridiagonal matrices and Golub–Welsch
+
+Solve tridiagonal matrices directly through `HermitianEigenDecomposition::tridiagonal(&diag, &off_diag)` without constructing dense matrices.
+`off_diag` is a subdiagonal of length $n - 1$; length mismatch gives `DimensionMismatch`.
+Use `HermitianEigenvaluesResult::tridiagonal(&diag, &off_diag)` for eigenvalues alone.
+Full spectra use square-root-free Pal–Walker–Kahan QL/QR in $O(n^2)$ time; with-options `tridiagonal_with_options` specifying an index range or `Relative` uses Sturm bisection to full working precision.
+Before bisection, exact power-of-two scaling replaces division by the largest entry; it raises the largest entry magnitude to $[1, 2)$ when all entry magnitudes are below 1, and scales down if Gershgorin bounds or residuals could overflow.
+This preserves accuracy even in the smallest entries of graded matrices.
+Both use $O(n)$ storage.
+Caller-provided-output `HermitianEigenvaluesBuffer::tridiagonal_into` reuses storage, with requirements from `HermitianEigenWorkspaceRequest::tridiagonal(n, &options)`.
+
+`HermitianEigenFirstComponents::tridiagonal(&diag, &off_diag)` returns eigenvalues and only the first component of each unit eigenvector.
+Applying implicit-QL rotations only to the first eigenvector-matrix row costs $O(n^2)$ time and $O(n)$ storage, below the full eigendecomposition's $O(n^3)$ and $O(n^2)$.
+These are the quantities used by Golub–Welsch.
+For the Jacobi matrix of an orthogonal-polynomial family (a tridiagonal matrix of three-term recurrence coefficients), eigenvalues are Gauss nodes; squared first components multiplied by zeroth weight moment $\mu_0$ give quadrature weights.
+First-component signs are unspecified; for repeated eigenvalues, individual components are not unique, but their squared sum over the eigenspace is unique.
+`eigenvalues()` and `first_components()` have matching order; `report()` returns `EigenReport` for the last successful computation.
+With-options `tridiagonal_with_options` accepts order, deflation tolerance (the threshold for treating subdiagonal entries as zero and splitting problems), and iteration limits, but rejects index ranges or `Relative` with `InvalidInput`.
+The default iteration limit is $30\max(n, 1)$ sweeps.
+Obtain workspace for caller-provided-output `tridiagonal_into` from `HermitianEigenWorkspaceRequest::tridiagonal` with full spectrum and `Absolute`.
+Gauss quadrature nodes and weights are covered in [Gaussian quadrature and Clenshaw–Curtis rules](../../../scioxide-integrate/algorithms/gaussian-and-clenshaw-curtis/).
+
+## Power method and Rayleigh quotients
+
+For just the eigenvalue of largest magnitude, the simplest method is power iteration $x_{k+1} = A x_k / \lVert A x_k \rVert$.
+For eigenvalue magnitude ratio $q = \lvert \lambda_2 \rvert / \lvert \lambda_1 \rvert < 1$, the sine of the angle between $x_k$ and $v_1$ decreases as $O(q^k)$.
+For Hermitian matrices, Rayleigh-quotient $\rho_k = x_k^{\mathsf H} A x_k$ error is proportional to the squared angle sine and decreases as $O(q^{2k})$.
+Convergence is slow when $q$ is near 1; shift-invert $(A - \sigma I)^{-1}$ accelerates it by emphasizing eigenvalues near $\sigma$ ([A few eigenpairs of large operators](../partial-spectra/)).
+
+The following cell applies power iteration to symmetric matrix $A = H \Lambda H$ of shape $30 \times 30$ constructed with prescribed eigenvalues.
+$H = I - 2uu^{\mathsf T}/u^{\mathsf T}u$ ($u_i = \sqrt{i}$) is a Householder reflection and $\Lambda = \operatorname{diag}(1, q, q(1 - 1/n), q(1 - 2/n), \dots)$, so $\lambda_1 = 1$, $\lambda_2 = q$, and $v_1 = He_1$ are known.
+Inputs are ratio $q$ (0.5–0.99) and iteration count $K$ (10–200).
+Compute products with `mul_vec`, normalization with `norm2`, and Rayleigh quotients with standard `dotc_left`.
+Compute the reference eigenvector with `HermitianEigenDecomposition` and compare with closed form $He_1$.
+Rounding makes $A$ not exactly symmetric, so explicitly select interpretation `HermitianInput::Triangle(Triangle::Lower)`.
+The first table gives reference eigenvalue/eigenvector differences from closed forms and `EigenReport` iterations; the second gives iteration-$K$ errors and reference values decreasing from iteration 1 by $q^{K-1}$ and $q^{2(K-1)}$.
+The plot shows angle sines and Rayleigh-quotient errors on logarithmic axes; dashed lines give reference slopes.
+
+```rust
+//| id: linalg-power-iteration-rayleigh
+//| ref: linalg-power-iteration-rayleigh
+//| title: "Convergence of power-method directions and Rayleigh quotients"
+//| run: reactive
+//| crates: [scioxide-core, scioxide-linalg]
+//| inputs:
+//|   ratio: {"type":"range","label":"Eigenvalue ratio q = λ₂/λ₁","description":"λ₁ = 1, λ₂ = q, and the remaining eigenvalues are smaller than q.","min":0.5,"max":0.99,"step":0.01,"value":0.9}
+//|   steps: {"type":"range","label":"Iteration count K","description":"Number of power iterations.","min":10,"max":200,"step":10,"value":100}
+//| cases:
+//|   - {"id":"fast","label":"q = 0.5","description":"Rayleigh-quotient error reaches the rounding level within a few dozen iterations.","inputs":{"ratio":0.5}}
+//|   - {"id":"slow","label":"q = 0.99","description":"Even after 100 iterations the angle sine exceeds 0.1.","inputs":{"ratio":0.99}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"reference","path":"/rows/0/1","range":{"max":1e-14}}
+//|       - {"artifact":"reference","path":"/rows/0/2","range":{"max":1e-14}}
+//|       - {"artifact":"final","path":"/rows/0/1","range":{"min":1e-6,"max":3e-5}}
+//|       - {"artifact":"final","path":"/rows/0/2","range":{"min":1e-12,"max":1e-9}}
+//|   - case: fast
+//|     expect:
+//|       - {"artifact":"final","path":"/rows/0/1","range":{"max":1e-14}}
+//|       - {"artifact":"final","path":"/rows/0/2","range":{"max":1e-14}}
+//|   - case: slow
+//|     expect:
+//|       - {"artifact":"final","path":"/rows/0/1","range":{"min":0.1,"max":0.4}}
+//|       - {"artifact":"final","path":"/rows/0/2","range":{"min":1e-4,"max":1e-2}}
+use scioxide_core::Triangle;
+use scioxide_linalg::{HermitianEigenDecomposition, HermitianInput, Matrix, Vector};
+
+let n = 30_usize;
+let steps = steps.round() as usize;
+// A = H Λ H (H is a Householder reflection), Λ = diag(1, q, q(1 − 1/n), …).
+let u: Vec<f64> = (0..n).map(|i| ((i + 1) as f64).sqrt()).collect();
+let uu: f64 = u.iter().map(|x| x * x).sum();
+let h = |i: usize, k: usize| (if i == k { 1.0 } else { 0.0 }) - 2.0 * u[i] * u[k] / uu;
+let lambda: Vec<f64> = (0..n)
+    .map(|k| match k {
+        0 => 1.0,
+        1 => ratio,
+        _ => ratio * (1.0 - (k - 1) as f64 / n as f64),
+    })
+    .collect();
+let entries = (0..n * n)
+    .map(|idx| {
+        (0..n)
+            .map(|k| h(idx / n, k) * lambda[k] * h(k, idx % n))
+            .sum()
+    })
+    .collect();
+let a = Matrix::from_vec(n, n, entries).map_err(|e| e.to_string())?;
+
+// Reference: largest eigenvalue/eigenvector from eigendecomposition (closed forms λ₁ = 1, v₁ = H e₁).
+// Product rounding makes A not exactly symmetric; explicitly read only the lower triangle.
+let eigen =
+    HermitianEigenDecomposition::decompose(&a, HermitianInput::Triangle(Triangle::Lower))
+        .map_err(|e| e.to_string())?;
+let report = eigen.report().ok_or("No eigendecomposition report")?;
+let lambda1 = eigen.eigenvalues()[n - 1];
+let v1: Vec<f64> = (0..n)
+    .map(|i| eigen.eigenvectors().as_slice()[i * n + n - 1])
+    .collect();
+let closed_form_gap = (0..n)
+    .map(|i| (v1[i].abs() - h(i, 0).abs()).abs())
+    .fold(0.0_f64, f64::max);
+let sci2 = serde_json::json!({ "notation": "scientific", "significantDigits": 2 });
+let digits16 = serde_json::json!({ "significantDigits": 16 });
+let reference = serde_json::json!([
+    { "key": "0", "label": "λ₁ (eigendecomposition) [-]", "type": "number", "format": digits16 },
+    { "key": "1", "label": "|λ₁ − 1| [-]", "type": "number", "format": sci2 },
+    { "key": "2", "label": "max | |v₁| − |He₁| | [-]", "type": "number", "format": sci2 },
+    { "key": "3", "label": "Eigendecomposition iterations [count]", "type": "integer" }
+]);
+emit_table_with_columns!(
+    reference,
+    vec![(
+        lambda1,
+        (lambda1 - 1.0).abs(),
+        closed_form_gap,
+        report.iterations()
+    )],
+    metadata = serde_json::json!({ "id": "reference" })
+);
+
+let mut x = Vector::from_vec(vec![1.0_f64; n]);
+let (mut angle, mut rayleigh) = (Vec::new(), Vec::new());
+let (mut first, mut last) = ((0.0_f64, 0.0_f64), (0.0_f64, 0.0_f64));
+for k in 1..=steps {
+    let y = a.view().mul_vec(&x).map_err(|e| e.to_string())?;
+    let norm = y.view().norm2().map_err(|e| e.to_string())?;
+    x = Vector::from_vec(y.as_slice().iter().map(|v| v / norm).collect());
+    let ax = a.view().mul_vec(&x).map_err(|e| e.to_string())?;
+    let error = (x.view().dotc_left(&ax).map_err(|e| e.to_string())? - lambda1).abs();
+    // Compute sine from the norm of the component orthogonal to v₁ (avoids cancellation in 1 − cos²).
+    let c: f64 = x.as_slice().iter().zip(&v1).map(|(p, q)| p * q).sum();
+    let sine = x
+        .as_slice()
+        .iter()
+        .zip(&v1)
+        .map(|(p, q)| (p - c * q).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    if k == 1 {
+        first = (sine, error);
+    }
+    last = (sine, error);
+    // Omit zero values, which cannot appear on a logarithmic axis.
+    if sine > 0.0 {
+        angle.push([k as f64, sine]);
+    }
+    if error > 0.0 {
+        rayleigh.push([k as f64, error]);
+    }
+}
+// Reference slopes: decrease from iteration 1 by q^(k−1) and q^(2(k−1)).
+let model = |k: usize, power: i32| ratio.powi(power * (k as i32 - 1));
+let model_angle: Vec<[f64; 2]> = (1..=steps)
+    .map(|k| [k as f64, first.0 * model(k, 1)])
+    .collect();
+let model_rayleigh: Vec<[f64; 2]> = (1..=steps)
+    .map(|k| [k as f64, first.1 * model(k, 2)])
+    .collect();
+let series = vec![
+    serde_json::json!({ "name": "sin ∠(x_k, v₁)", "points": angle }),
+    serde_json::json!({
+        "name": "q^k slope",
+        "points": model_angle,
+        "style": { "lineType": "dashed" }
+    }),
+    serde_json::json!({ "name": "|ρ_k − λ₁|", "points": rayleigh }),
+    serde_json::json!({
+        "name": "q^(2k) slope",
+        "points": model_rayleigh,
+        "style": { "lineType": "dashed" }
+    }),
+];
+emit_line_chart!(
+    &series,
+    options = &serde_json::json!({
+        "xLabel": "Iteration k [count]",
+        "yLabel": "Error [-]",
+        "yType": "log"
+    })
+);
+let final_columns = serde_json::json!([
+    { "key": "0", "label": "K [iterations]", "type": "integer" },
+    { "key": "1", "label": "sin ∠(x_K, v₁) [-]", "type": "number", "format": sci2 },
+    { "key": "2", "label": "|ρ_K − λ₁| [-]", "type": "number", "format": sci2 },
+    { "key": "3", "label": "Reference sine [-]", "type": "number", "format": sci2 },
+    { "key": "4", "label": "Reference Rayleigh quotient [-]", "type": "number", "format": sci2 }
+]);
+let final_row = (
+    steps,
+    last.0,
+    last.1,
+    first.0 * model(steps, 1),
+    first.1 * model(steps, 2),
+);
+emit_table_with_columns!(
+    final_columns,
+    vec![final_row],
+    metadata = serde_json::json!({ "id": "final" })
+);
+```
+
+Computed $\lambda_1$ agrees with closed-form 1 within $4.4 \times 10^{-16}$; its eigenvector agrees with $He_1$ within $3.1 \times 10^{-16}$.
+`EigenReport` records 62 iterations, well below default limit $30m = 900$.
+At default $q = 0.9$, the angle sine decreases about $\log_{10} 0.9 \approx -0.046$ decimal orders per iteration and Rayleigh-quotient error about twice as fast; after 100 iterations they reach $1.6 \times 10^{-5}$ and $2.7 \times 10^{-11}$ respectively.
+Reference values extended from iteration 1 are $2.8 \times 10^{-5}$ and $4.3 \times 10^{-10}$; early iterations also reduce components at or below $\lambda_3$, so actual errors decrease faster than the dashed lines.
+
+At $q = 0.5$, Rayleigh-quotient error falls below $10^{-15}$ at iteration 24 and angle sine at iteration 50, then both plateau near rounding level $10^{-16}$.
+At $q = 0.99$, even 100 iterations leave angle sine 0.22 and Rayleigh-quotient error $4.8 \times 10^{-4}$.
+Increasing to 200 iterations reduces the angle sine for $q = 0.9$ to $4.3 \times 10^{-10}$ and brings Rayleigh-quotient error to rounding level $2.2 \times 10^{-16}$.
+Iterations with exactly zero Rayleigh-quotient error are omitted from logarithmic plots; there are seven for $q = 0.5$, $K = 100$.
+
+## General matrices: Hessenberg reduction and Francis QR
+
+Non-Hermitian matrices can also be transformed to upper-triangular $T$ by a unitary $Q$ (Schur's theorem, $A = QTQ^{\mathsf H}$).
+The diagonal of $T$ contains eigenvalues; real matrices use real Schur form (quasi-upper-triangular), representing complex conjugate pairs in $2 \times 2$ blocks.
+First reduce by Householder transformations to Hessenberg form (zero below the first subdiagonal), then eliminate subdiagonal entries by QR until quasi-upper-triangular.
+Real matrices use Francis double-shift QR, handling conjugate pairs with real arithmetic; complex matrices use single-shift complex QR.
+Local convergence is generally quadratic, compared with cubic convergence for Hermitian tridiagonal matrices.
+
+Balancing `GeneralEigenBalancing` in `GeneralEigenOptions` is similarity transformation $D^{-1} P^{\mathsf T} A P D$ with permutation $P$ and diagonal power-of-two $D$.
+`Permute` permutes separable rows and columns to isolate eigenvalues readable from the diagonal; `Scale` balances row/column 2-norms by powers of two; default `PermuteAndScale` applies both in order; `None` does nothing.
+Similarity preserves eigenvalues; power-of-two scaling adds no rounding error and reduces errors for matrices with widely differing scales.
+Scale products and reciprocals stay in the normal range without erasing nonzero entries.
+The matrix is divided by its largest absolute entry, balanced, and scaled again before QR, so the deflation tolerance applies to this matrix.
+Results return to original coordinates; permutations and scales remain in `permutation()` and `scale_factors()` of `GeneralEigenBalanceMetadata` (`balancing()`).
+
+Standard `GeneralEigenvaluesResult::compute(&a)` returns eigenvalues only; complex eigenvalues of real matrices are exact conjugate pairs.
+`GeneralEigenDecomposition::decompose(&a)` also computes eigenvectors from the same Schur form, using back substitution for right eigenvectors and forward substitution for left eigenvectors.
+Select sides with `GeneralEigenOptions::with_eigenvectors(GeneralEigenvectorSelection::{Left, Right, Both})` (default `Right`) passed to with-options `decompose_with_options(&a, &options)`.
+Eigenvectors are complex even for real matrices, have 2-norm 1, and phase fixed so the largest-magnitude component (last on a tie) is positive real.
+`right_residuals()` returns each right eigenvector's relative residual $\lVert Ax - \lambda x \rVert_\infty / ((\lVert A \rVert_\infty + \lvert\lambda\rvert) \lVert x \rVert_\infty)$ for the scaled matrix; `left_residuals()` returns $\lVert A^{\mathsf H} y - \bar\lambda y \rVert_\infty / ((\lVert A \rVert_1 + \lvert\lambda\rvert) \lVert y \rVert_\infty)$ for left eigenvector $y$ ($\lVert A^{\mathsf H} \rVert_\infty = \lVert A \rVert_1$).
+Results are checked before returning.
+Any relative residual above $32\max(n, 1)$ times the residual tolerance (`with_residual_tolerance`, default derived from machine epsilon), or numerically dependent eigenvectors in balanced coordinates, gives `NumericalInstability` (`DefectiveEigenbasis`).
+Defective matrices and nearly defective matrices with numerically dependent eigenvectors fail this check; compute eigenvalues alone or use Schur decomposition.
+`eigenvector_condition_estimates()` returns the empirical estimate $\min(1, \mathrm{gap}/\lVert A \rVert_\infty)$ per eigenvector; $\mathrm{gap}$ is the distance to the nearest other eigenvalue.
+The default QR limit is $30\max(n, 1)$ iterations; reaching it gives `ConvergenceFailure`.
+Obtain workspace for caller-provided-output `decompose_into` and `GeneralEigenvaluesBuffer::compute_into` from `GeneralEigenWorkspaceRequest::new(n, &options)`, adding an $n \times n$ matrix for each requested eigenvector side.
+
+### Shifted Hessenberg solves
+
+Besides eigenvalues, Hessenberg form also supports computing $(\sigma I - A)^{-1} B$ for many shifts $\sigma$.
+For example, evaluating transfer function $C(\sigma I - A)^{-1}B$ at many frequencies $\sigma = \mathrm{i}\omega$ requires only solving $(\sigma I - H) X = Q^{\mathsf H} B$ per shift after one reduction $A = QHQ^{\mathsf H}$.
+Since $H$ has just one subdiagonal, partially pivoted elimination compares only adjacent rows at each step; with $m$ right-hand-side columns, each shift costs $O(n^2 + n^2 m)$, avoiding repeated $O(n^3)$ dense LU factorizations.
+
+The components for this computation are in low-level `backend::hessenberg`.
+`reduce(a.view(), context)` constructs $H$ and $Q$ of $A = QHQ^{\mathsf H}$ from a finite square matrix in $O(n^3)$; invalid shapes, non-finite values, context cancellation, or deadlines return errors, and allocation failure returns `AllocationFailure`.
+`HessenbergView::new(h.view())` checks once that $H$ is square, finite, and zero below the first subdiagonal, recording it as upper triangular if the first subdiagonal is also zero.
+`solve_shifted(view, shift, columns, &mut rhs, &mut factor)` overwrites row-major $n \times m$ right-hand sides `rhs` with solutions $X$.
+`factor` is scratch storage of at least $n^2$ elements, used for a copy of $\sigma I - H$ on each call; $H$ itself remains unchanged.
+Upper-triangular $H$ skips elimination and uses back substitution only; pivot selection compares complex magnitudes through $\max(\lvert \mathrm{Re}\,z \rvert, \lvert \mathrm{Im}\,z \rvert)$.
+Short scratch storage or right-hand-side length other than $n m$ gives `DimensionMismatch`, non-finite right-hand sides give `NonFinite`, non-finite shifts or intermediates give `NumericalInstability`, and exactly zero pivots give `Singular`.
+`backend` is a low-level component used by other SciOxide crates; failures may leave right-hand sides and scratch storage modified, and it has no rank policy, residual/condition diagnostics, or execution-count accounting.
+
+## Nonnormal eigenvalue sensitivity
+
+Nonnormal $A$ ($A^{\mathsf H} A \ne A A^{\mathsf H}$) can have perturbation-sensitive eigenvalues.
+For a simple eigenvalue $\lambda_i$ with right eigenvector $x_i$ and left eigenvector $y_i$, perturbation $E$ gives the first-order approximation
+
+$$
+\lvert \Delta\lambda_i \rvert \lesssim \frac{\lVert E \rVert_2}{s_i}, \qquad s_i = \frac{\lvert y_i^{\mathsf H} x_i \rvert}{\lVert x_i \rVert_2 \lVert y_i \rVert_2}
+$$
+
+
+Hermitian matrices have $x_i = y_i$ and hence $s_i = 1$; smaller $s_i$ means poorer eigenvalue conditioning (Wilkinson's $s(\lambda)$).
+When both left and right vectors are requested through `GeneralEigenvectorSelection::Both`, `GeneralEigenDecomposition` returns $s_i$ through `eigenvalue_condition_estimates()`.
+
+The following cell adds a perturbation of component magnitude $\delta$ to an upper-bidiagonal matrix with diagonal $1, 2, \dots, n$ and superdiagonal $\alpha$, comparing eigenvalue changes with $n\delta / s_i$.
+The prescribed-sign perturbation $E$ satisfies $\lVert E \rVert_2 \le \lVert E \rVert_F = n\delta$.
+Eigenvalues remain the diagonal values $1, 2, \dots, n$; increasing $\alpha$ strengthens nonnormality.
+Eigenvalue $\lambda_j = j + 1$ (0-based indices) has right eigenvector components $x_{j-m} = \alpha^m/m!$ and left eigenvector components $y_{j+m} = (-\alpha)^m/m!$ ($m \ge 0$); since $y_j^{\mathsf H} x_j = 1$, the following closed form is known:
+
+$$
+s_j = \Bigl(\sum_{m=0}^{j} \frac{\alpha^{2m}}{(m!)^2}\Bigr)^{-1/2} \Bigl(\sum_{m=0}^{n-1-j} \frac{\alpha^{2m}}{(m!)^2}\Bigr)^{-1/2}
+$$
+
+
+Inputs are $\alpha$ (0–6), order $n$ (3–12), and perturbation exponent $e$ ($\delta = 10^{e}$, $-14$ to $-6$).
+The table compares estimated $s_i$ with closed-form $s_i$, distance $\lvert \Delta\lambda_i \rvert$ to the perturbed eigenvalue nearest $\lambda_i$, and first-order bound $n\delta/s_i$.
+
+```rust
+//| id: linalg-nonnormal-sensitivity
+//| ref: linalg-nonnormal-sensitivity
+//| title: "Eigenvalue perturbations and condition estimates for nonnormal matrices"
+//| run: reactive
+//| crates: [scioxide-linalg]
+//| inputs:
+//|   coupling: {"type":"range","label":"Superdiagonal α","description":"Nonnormality strength. α = 0 gives a diagonal matrix.","min":0,"max":6,"step":0.5,"value":3}
+//|   order: {"type":"range","label":"Degree n","description":"Eigenvalues are 1, 2, …, n.","min":3,"max":12,"step":1,"value":8}
+//|   perturbation_exponent: {"type":"range","label":"e in perturbation magnitude 10^e","description":"Magnitude of perturbations added to every entry.","min":-14,"max":-6,"step":1,"value":-10}
+//| cases:
+//|   - {"id":"normal","label":"α = 0","description":"The diagonal matrix has s_i = 1; eigenvalue changes are on the perturbation scale.","inputs":{"coupling":0}}
+//|   - {"id":"strong-coupling","label":"α = 6","description":"Central s_i falls to 3.6 × 10⁻⁴; eigenvalues move over a thousand times the perturbation.","inputs":{"coupling":6}}
+//| tests:
+//|   - case: default
+//|     expect:
+//|       - {"artifact":"sensitivity","path":"/rows/0/1","approx":{"value":0.12198324317856824,"rtol":1e-8}}
+//|       - {"artifact":"sensitivity","path":"/rows/3/1","approx":{"value":0.017887179974519887,"rtol":1e-8}}
+//|       - {"artifact":"sensitivity","path":"/rows/2/3","range":{"max":3.6e-8}}
+//|   - case: normal
+//|     expect:
+//|       - {"artifact":"sensitivity","path":"/rows/3/1","approx":{"value":1,"rtol":1e-12}}
+//|       - {"artifact":"sensitivity","path":"/rows/3/3","approx":{"value":1e-10,"rtol":1e-3}}
+//|   - case: strong-coupling
+//|     expect:
+//|       - {"artifact":"sensitivity","path":"/rows/3/1","approx":{"value":3.6327720298445846e-4,"rtol":1e-6}}
+//|       - {"artifact":"sensitivity","path":"/rows/3/3","range":{"min":1e-8,"max":2.2e-6}}
+use scioxide_linalg::{
+    GeneralEigenDecomposition, GeneralEigenOptions, GeneralEigenvaluesResult,
+    GeneralEigenvectorSelection, Matrix,
+};
+
+let n = order.round() as usize;
+let delta = 10.0_f64.powf(perturbation_exponent);
+let base = |k: usize| {
+    let (i, j) = (k / n, k % n);
+    if i == j {
+        (i + 1) as f64
+    } else if j == i + 1 {
+        coupling
+    } else {
+        0.0
+    }
+};
+let a = Matrix::from_vec(n, n, (0..n * n).map(base).collect()).map_err(|e| e.to_string())?;
+// Deterministic-sign perturbation E (entry magnitude δ, ‖E‖₂ ≤ nδ).
+let sign = |k: usize| if (k * 7 + 3) % 5 < 2 { -1.0 } else { 1.0 };
+let perturbed = Matrix::from_vec(
+    n,
+    n,
+    (0..n * n).map(|k| base(k) + delta * sign(k)).collect(),
+)
+.map_err(|e| e.to_string())?;
+let options = GeneralEigenOptions::new().with_eigenvectors(GeneralEigenvectorSelection::Both);
+let exact = GeneralEigenDecomposition::decompose_with_options(&a, &options)
+    .map_err(|e| e.to_string())?;
+let moved = GeneralEigenvaluesResult::compute(&perturbed).map_err(|e| e.to_string())?;
+let conditions = exact
+    .eigenvalue_condition_estimates()
+    .ok_or("No condition estimate")?;
+// Independent reference: closed-form s_j (sum of norm squares Σ (α^m/m!)²).
+let norm = |count: usize| {
+    let (mut term, mut sum) = (1.0_f64, 1.0_f64);
+    for m in 1..=count {
+        term *= coupling / m as f64;
+        sum += term * term;
+    }
+    sum.sqrt()
+};
+let mut rows = Vec::new();
+for (j, (lambda, cond)) in exact.eigenvalues().iter().zip(conditions).enumerate() {
+    let s = cond.reciprocal().value();
+    let closed = 1.0 / (norm(j) * norm(n - 1 - j));
+    // Distance to the perturbed eigenvalue nearest λ_j.
+    let shift = moved
+        .eigenvalues()
+        .iter()
+        .map(|z| (z.re - lambda.re).hypot(z.im - lambda.im))
+        .fold(f64::INFINITY, f64::min);
+    rows.push((lambda.re, s, closed, shift, n as f64 * delta / s));
+}
+let sci3 = serde_json::json!({ "notation": "scientific", "significantDigits": 3 });
+let columns = serde_json::json!([
+    { "key": "0", "label": "λ_i [-]", "type": "number", "format": { "fractionDigits": 0 } },
+    { "key": "1", "label": "s_i (estimate) [-]", "type": "number", "format": sci3 },
+    { "key": "2", "label": "s_i (closed form) [-]", "type": "number", "format": sci3 },
+    { "key": "3", "label": "|Δλ_i| [-]", "type": "number", "format": sci3 },
+    { "key": "4", "label": "n δ / s_i [-]", "type": "number", "format": sci3 }
+]);
+emit_table_with_columns!(
+    columns,
+    rows,
+    metadata = serde_json::json!({ "id": "sensitivity" })
+);
+```
+
+Estimated $s_i$ agrees with closed form within relative $10^{-14}$ at defaults, both cases, and endpoints of each input.
+At $\alpha = 0$, the matrix is diagonal (normal) with $s_i = 1$, and eigenvalue changes approximately match perturbation magnitude $10^{-10}$.
+With defaults $\alpha = 3$ and $n = 8$, central-eigenvalue $s_i$ falls to $1.8 \times 10^{-2}$ and maximum change grows to $3.4 \times 10^{-9}$.
+At $\alpha = 6$ ($n = 8$), central $s_i$ falls to $3.6 \times 10^{-4}$; perturbation $10^{-10}$ moves eigenvalues by up to $1.4 \times 10^{-7}$.
+Changes stay below first-order bound $n\delta / s_i$ in every case; as predicted, eigenvalues with smaller $s_i$ tend to move more.
+With defaults $\alpha = 3$ and $n = 8$, increasing the perturbation to $10^{-6}$ gives maximum change $3.4 \times 10^{-5}$; decreasing it to $10^{-14}$ gives $3.1 \times 10^{-13}$, both approximately proportional to perturbation and consistent with the first-order bound in this range.
+
+## Schur decomposition and invariant subspaces
+
+Standard `SchurDecomposition::decompose(&a)` returns $T$ (`t()`) and $Q$ (`q()`) of $A = QTQ^{\mathsf H}$, eigenvalues (`eigenvalues()`), and diagonal-block sequence (`blocks()`).
+For complex matrices, $T$ is upper triangular; for real matrices, $T$ is quasi-upper-triangular.
+Real matrices store conjugate pairs in standardized $2 \times 2$ blocks $\begin{bmatrix} a & b \\ c & a \end{bmatrix}$ of `SchurBlock::RealTwoByTwo` ($bc < 0$, eigenvalues $a \pm \mathrm{i}\sqrt{\lvert b \rvert \lvert c \rvert}$); individual real or complex eigenvalues use `SchurBlock::OneByOne`.
+Eigenvalues follow the order left by QR; each $2 \times 2$ block places the positive imaginary part first.
+Balancing would make $Q$ nonunitary, so Schur decomposition omits it.
+The `SchurOptions` in with-options `decompose_with_options(&a, &SchurOptions)` holds only deflation tolerance and execution controls; the default QR limit is $30\max(n, 1)$ iterations.
+
+The first $k$ columns of $Q$ form an orthonormal basis of the invariant subspace for eigenvalues of $T$'s leading $k \times k$ block, borrowed through `invariant_subspace(k)`.
+$k$ above matrix order or splitting a real $2 \times 2$ block gives `InvalidInput`.
+`reorder(&selection)` returns a copy with selected eigenvalues moved to the top left by adjacent block exchanges and report `SchurReorderReport`, never splitting conjugate pairs.
+Exchanges use unitary similarities from small Sylvester equations, accepted only after weak and strong backward-error tests; unstable exchanges give `NumericalInstability` (`IllConditioned`).
+`reorder` returns a copy, so failure preserves the original decomposition.
+With-options `reorder_with_options(&selection, &SchurReorderOptions)` defaults to work limit 30 000 units (attempted exchanges plus Sylvester-operator applications for condition estimation); reaching it gives `ConvergenceFailure`.
+Caller-provided-output `reorder_in_place` modifies the same decomposition, with workspace from `SchurWorkspaceRequest::reorder`.
+
+The report returns selected-eigenvalue count `selected_dimension()`, exchange count `swaps()`, and work used `iterations()`.
+Specifying `SchurReorderOptions::with_condition_estimates(Estimation::Estimate)` adds the reciprocal condition number $1/\sqrt{1 + \lVert R \rVert_F^2}$ of the selected eigenvalue cluster (`cluster_condition()`; $R$ solves $T_{11} R - R T_{22} = T_{12}$) and a 1-norm estimate of separation $\operatorname{sep}(T_{11}, T_{22}) = 1/\lVert S^{-1} \rVert$ from the remainder (`separation()`, $S(R) = T_{11}R - RT_{22}$).
+Both are estimates, not proven bounds; small separation makes the invariant subspace perturbation-sensitive.
+
+---
+
+## Summary
+
+For Hermitian matrices, use `HermitianEigenDecomposition` and explicitly set symmetry interpretation through `HermitianInput`; specify index ranges or `Relative` only when selected eigenvalues or relative accuracy of small eigenvalues are needed.
+Tridiagonal problems needing only eigenvalues and first components, such as Gauss nodes and weights, use `HermitianEigenFirstComponents` in $O(n^2)$ time and $O(n)$ storage.
+Power-method convergence depends on ratio $q = \lvert \lambda_2 \rvert / \lvert \lambda_1 \rvert$; when $q$ is near 1, choose shift-invert or partial-spectrum methods.
+When nonnormality is suspected, compute both eigenvector sides with `GeneralEigenvectorSelection::Both` and estimate eigenvalue sensitivity $\lVert E \rVert_2 / s_i$ from $s_i$.
+For nearly defective matrices failing eigenvector checks or problems needing invariant subspaces, use `SchurDecomposition` and `reorder`.
+Iteration limits give `ConvergenceFailure`, so use `EigenReport` iteration counts to check remaining headroom.
+
+## Further reading
+
+- [Generalized eigenproblems and QZ decomposition](../generalized-eigenproblems/): check vibrations with mass matrices and descriptor-system eigenvalues with singular $B$.
+- [A few eigenpairs of large operators](../partial-spectra/): check methods computing only a few eigenvalues through products alone.
+- [Normal modes of coupled oscillators and localized light-impurity modes](../../examples/vibration-modes/): check applications of Hermitian eigenproblems to mechanics.
